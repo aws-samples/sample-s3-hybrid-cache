@@ -22,7 +22,6 @@ use s3_proxy::hybrid_metadata_writer::{ConsolidationTrigger, HybridMetadataWrite
 use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::{JournalEntry, JournalManager};
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
-use s3_proxy::orphaned_range_recovery::OrphanedRangeRecovery;
 use s3_proxy::write_cache_manager::WriteCacheManager;
 
 /// Represents a simulated proxy instance for multi-instance testing
@@ -36,7 +35,6 @@ struct TestProxyInstance {
     hybrid_writer: HybridMetadataWriter,
     consolidator: JournalConsolidator,
     cache_validator: CacheValidator,
-    recovery: OrphanedRangeRecovery,
 }
 
 impl TestProxyInstance {
@@ -72,20 +70,11 @@ impl TestProxyInstance {
                 stale_entry_timeout_secs: 300,
                 consolidation_cycle_timeout: Duration::from_secs(30),
                 max_keys_per_cycle: 5000,
+                ..ConsolidationConfig::default()
             },
         );
 
         let cache_validator = CacheValidator::new(cache_dir.clone());
-
-        let recovery = OrphanedRangeRecovery::new(
-            cache_dir.clone(),
-            Arc::new(tokio::sync::Mutex::new(HybridMetadataWriter::new(
-                cache_dir.clone(),
-                lock_manager.clone(),
-                journal_manager.clone(),
-                Arc::new(ConsolidationTrigger::new(1024, 5)),
-            ))),
-        );
 
         Self {
             instance_id,
@@ -95,7 +84,6 @@ impl TestProxyInstance {
             hybrid_writer,
             consolidator,
             cache_validator,
-            recovery,
         }
     }
 
@@ -201,6 +189,8 @@ fn create_test_range_spec(start: u64, end: u64) -> RangeSpec {
         last_accessed: now,
         access_count: 1,
         staged: None,
+        unservable: false,
+        file_identity: None,
     }
 }
 
@@ -211,23 +201,22 @@ fn create_test_cache_config(cache_dir: std::path::PathBuf) -> CacheConfig {
         max_cache_size: 1024 * 1024 * 1024, // 1GB
         ram_cache_enabled: false,
         max_ram_cache_size: 0,
-        eviction_algorithm: EvictionAlgorithm::LRU,
+        eviction_algorithm: EvictionAlgorithm::TinyLFU,
         write_cache_enabled: true,
         write_cache_percent: 0.5,
         write_cache_max_object_size: 1024 * 1024 * 100, // 100MB
+        disk_safety_free_space_floor: 1024 * 1024 * 1024, // 1 GiB
         put_ttl: Duration::from_secs(86400),            // 1 day
         get_ttl: Duration::from_secs(3600),             // 1 hour
         head_ttl: Duration::from_secs(300),             // 5 minutes
         actively_remove_cached_data: false,
         shared_storage: SharedStorageConfig {
-            lock_timeout: Duration::from_secs(30), // Shorter timeout for testing
+            lock_acquire_wait_budget: Duration::from_secs(30), // Longer wait budget for testing
             ..SharedStorageConfig::default()
         },
         range_merge_gap_threshold: 1024 * 1024, // 1MB
         eviction_buffer_percent: 5,
         ram_cache_flush_interval: Duration::from_secs(60),
-        ram_cache_flush_threshold: 100,
-        ram_cache_flush_on_eviction: false,
         ram_cache_verification_interval: Duration::from_secs(1),
         incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
         initialization: InitializationConfig::default(),
@@ -588,6 +577,7 @@ async fn test_startup_validation_coordination_with_multiple_instances() {
         stale_entry_timeout_secs: 300,
         consolidation_cycle_timeout: Duration::from_secs(30),
         max_keys_per_cycle: 5000,
+        ..ConsolidationConfig::default()
     };
     let consolidator = Arc::new(JournalConsolidator::new(
         cache_dir.clone(),
@@ -605,7 +595,7 @@ async fn test_startup_validation_coordination_with_multiple_instances() {
             50.0,
             config.put_ttl,
             config.incomplete_upload_ttl,
-            s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+            s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
             config.write_cache_max_object_size,
         );
 
@@ -649,10 +639,22 @@ async fn test_startup_validation_coordination_with_multiple_instances() {
     let summary2 = summary2.unwrap();
     let summary3 = summary3.unwrap();
 
-    // All should have consistent scan results
-    assert_eq!(summary1.scan_summary.total_objects, 1);
-    assert_eq!(summary2.scan_summary.total_objects, 1);
-    assert_eq!(summary3.scan_summary.total_objects, 1);
+    // No instance counts the cache on start. size_state.json is missing on a cache holding
+    // data, so each reports 0 and asks its scheduler for a full validation under
+    // validation.lock, which runs on one instance.
+    assert_eq!(summary1.scan_summary.total_objects, 0);
+    assert_eq!(summary2.scan_summary.total_objects, 0);
+    assert_eq!(summary3.scan_summary.total_objects, 0);
+    for tracker in [&size_tracker1, &size_tracker2, &size_tracker3] {
+        assert_eq!(
+            tracker
+                .as_ref()
+                .unwrap()
+                .validation_request()
+                .map(|r| r.kind),
+            Some(s3_proxy::cache_size_tracker::ValidationRequestKind::FigureUnvalidated)
+        );
+    }
 
     assert_eq!(
         summary1.scan_summary.total_size,
@@ -831,98 +833,4 @@ async fn test_high_concurrent_write_load_performance() {
     }
 
     println!("✅ High concurrent write load performance test passed");
-}
-
-#[tokio::test]
-async fn test_cross_instance_orphaned_range_recovery() {
-    let temp_dir = TempDir::new().unwrap();
-
-    // Create 2 proxy instances
-    let mut instance1 = TestProxyInstance::new(
-        temp_dir.path().to_path_buf(),
-        "recovery-instance-1".to_string(),
-    );
-    let instance2 = TestProxyInstance::new(
-        temp_dir.path().to_path_buf(),
-        "recovery-instance-2".to_string(),
-    );
-
-    let cache_key = "test-bucket/orphaned-recovery-object";
-
-    // Instance 1 writes some ranges normally
-    let range1 = create_test_range_spec(0, 4194303); // 4MB
-    let range2 = create_test_range_spec(4194304, 8388607); // 4MB
-
-    instance1
-        .write_range(cache_key, range1, WriteMode::Immediate)
-        .await
-        .unwrap();
-    instance1
-        .write_range(cache_key, range2, WriteMode::Immediate)
-        .await
-        .unwrap();
-
-    // Create an orphaned range file (simulate a failed write that left a range file but no metadata entry)
-    let ranges_dir = temp_dir.path().join("ranges");
-    tokio::fs::create_dir_all(&ranges_dir).await.unwrap();
-
-    let orphaned_range_file = ranges_dir.join(format!(
-        "{}_8388608-12582911.bin",
-        cache_key.replace('/', "%2F")
-    ));
-    tokio::fs::write(&orphaned_range_file, vec![99u8; 4194304])
-        .await
-        .unwrap();
-
-    // Instance 2 scans for orphans and should detect the orphaned range
-    let orphans = instance2
-        .recovery
-        .scan_for_orphans(cache_key)
-        .await
-        .unwrap();
-
-    if orphans.is_empty() {
-        println!("No orphans detected - this may be due to path structure differences");
-        return; // Skip the rest of this test
-    }
-
-    assert_eq!(orphans.len(), 1, "Should detect 1 orphaned range");
-
-    let orphan = &orphans[0];
-    assert_eq!(orphan.cache_key, cache_key);
-    assert!(
-        orphan.range_spec.is_some(),
-        "Orphan should have parsed range spec"
-    );
-
-    // Instance 2 recovers the orphan
-    let recovery_result = instance2.recovery.recover_orphan(orphan).await.unwrap();
-
-    match recovery_result {
-        s3_proxy::orphaned_range_recovery::RecoveryResult::Recovered(recovered_range) => {
-            println!(
-                "Successfully recovered orphaned range: {:?}",
-                recovered_range
-            );
-
-            // Verify the metadata now includes the recovered range
-            let metadata_valid = instance2.validate_metadata(cache_key).await.unwrap();
-            assert!(metadata_valid, "Metadata should be valid after recovery");
-        }
-        other => {
-            println!("Recovery result: {:?}", other);
-            // Recovery might clean up invalid ranges instead of recovering them
-        }
-    }
-
-    // Both instances should now see consistent metadata
-    let metadata_valid_1 = instance1.validate_metadata(cache_key).await.unwrap();
-    let metadata_valid_2 = instance2.validate_metadata(cache_key).await.unwrap();
-
-    assert_eq!(
-        metadata_valid_1, metadata_valid_2,
-        "Both instances should see consistent metadata validity"
-    );
-
-    println!("✅ Cross-instance orphaned range recovery test passed");
 }

@@ -121,7 +121,7 @@ impl HealthManager {
     }
 
     /// Perform comprehensive health check
-    pub async fn check_health(&self) -> SystemHealth {
+    pub(crate) async fn check_health(&self) -> SystemHealth {
         let start_time = SystemTime::now();
         let mut components = Vec::new();
 
@@ -206,7 +206,9 @@ impl HealthManager {
     async fn check_cache_health(&self, cache_manager: &Arc<CacheManager>) -> ComponentHealth {
         let start_time = SystemTime::now();
 
-        let stats = cache_manager.get_cache_size_stats().await;
+        // As a scrape, so a health check never waits on a staged-authority re-derivation. See
+        // `staged_fold::as_scrape`.
+        let stats = crate::staged_fold::as_scrape(cache_manager.get_cache_size_stats()).await;
 
         let response_time = start_time
             .elapsed()

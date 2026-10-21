@@ -1,40 +1,41 @@
-# Access Log Format
+# Access log format
 
-The proxy writes an S3-style server access log, so tooling built for S3 access logs
-mostly works. Two differences matter before you point a parser at it:
+Hybrid Cache for Amazon S3 writes an S3-style server access log, so tooling built for S3 access
+logs mostly works. Two differences matter before you point a parser at it:
 
-- The record has **25 space-separated fields** and has **no `version_id`**, so positions
-  do not line up with S3's documented layout past the front of the record.
-- **Seven fields are never populated** and are always a literal `-`. They exist for
-  format compatibility, not because the proxy knows their value.
+- The record has 25 fields and no `version_id`, so positions do not line up with S3's documented
+  layout past the front of the record.
+- Seven fields are never populated and always hold a literal `-`. They exist for format
+  compatibility.
 
 Application logs are a separate stream in a different format; see
-[CONFIGURATION.md — Logging Configuration](CONFIGURATION.md#logging-configuration).
+[Logging configuration](CONFIGURATION.md#logging-configuration).
 
 ## Record layout
 
-One record per line, single space between fields. Absent values are a literal hyphen
-(`-`), never a zero-width field.
+One record per line, with a single space between fields. An absent value is a literal hyphen
+(`-`), never an empty field. Fields 3 (`time`), 15 (`referer`) and 16 (`user_agent`) can contain
+spaces inside their brackets or quotes, so split on the delimiters rather than on whitespace.
 
-| # | Field | Quoting | What the proxy actually writes |
+| # | Field | Quoting | What the proxy writes |
 |---|---|---|---|
-| 1 | `bucket_owner` | | **The bucket name**, not an owner ID. The proxy has no way to resolve a canonical owner |
+| 1 | `bucket_owner` | | The bucket name, not an owner ID. The proxy cannot resolve a canonical owner |
 | 2 | `bucket` | | Bucket parsed from the request URI |
 | 3 | `time` | `[...]` | `[19/Aug/2026:13:01:39 +0000]`, format `%d/%b/%Y:%H:%M:%S %z`, UTC |
 | 4 | `remote_ip` | | Client address as seen by the proxy |
 | 5 | `requester` | | Always `-` |
-| 6 | `request_id` | | A UUID v4 generated per request. **Not** S3's request ID, so it cannot be correlated with an S3-side log |
+| 6 | `request_id` | | A UUID v4 generated per request, not S3's request ID, so it cannot be correlated with an S3-side log |
 | 7 | `operation` | | `REST.{METHOD}.OBJECT`. See the caveat below |
-| 8 | `request_uri` | `"..."` | The request URI, path and query. **Not** a `"GET /path HTTP/1.1"` request line. Presigned params redacted, see below |
+| 8 | `request_uri` | `"..."` | The request URI, path and query, not a `"GET /path HTTP/1.1"` request line. Presigned parameters are redacted, see below |
 | 9 | `http_status` | | Status returned to the client |
-| 10 | `error_code` | | **The numeric status as a string** (e.g. `404`) on any non-2xx, `-` otherwise. Not an S3 error code like `NoSuchKey` |
+| 10 | `error_code` | | The numeric status as a string (for example `404`) on any non-2xx response, `-` otherwise. Not an S3 error code like `NoSuchKey` |
 | 11 | `bytes_sent` | | Response `content-length`; `0` for HEAD |
 | 12 | `object_size` | | Response `content-length`, or `0` when the header is absent or unparseable |
 | 13 | `total_time` | | Milliseconds from request start to response construction |
-| 14 | `turn_around_time` | | **Identical to `total_time`** — the same value is passed to both |
+| 14 | `turn_around_time` | | Identical to `total_time`: the same value is passed to both |
 | 15 | `referer` | `"..."` | Client `Referer` header, sanitized |
 | 16 | `user_agent` | `"..."` | Client `User-Agent` header, sanitized |
-| 17 | `host_id` | | The proxy instance's hostname |
+| 17 | `host_id` | | The proxy's hostname |
 | 18 | `signature_version` | | Always `-` |
 | 19 | `cipher_suite` | | Always `-` |
 | 20 | `authentication_type` | | Always `Anonymous` |
@@ -46,22 +47,18 @@ One record per line, single space between fields. Absent values are a literal hy
 
 ### Fields that carry no information
 
-Fields 5, 18, 19, 22, 23, 24, and 25 are hardcoded and never populated from the request.
-Field 20 is hardcoded to `Anonymous`. Do not build a dashboard dimension on any of them.
+Fields 5, 18, 19, 22, 23, 24 and 25 are hardcoded and never populated from the request. Field 20
+is hardcoded to `Anonymous`. Build no dashboard dimension on any of them.
 
-Two of these are worth calling out because their names suggest otherwise:
-
-- **`tls_version` and `cipher_suite` are `-` even on the TLS-terminating listener.**
-  Traffic through `tls_proxy_port` is decrypted by the proxy and does route through the
-  same logging path, but the negotiated version and cipher are not threaded into the log
-  record. There is currently no way to see TLS parameters in the access log.
-- **`source_region` was added in 1.6.8 and is always `-`.** `UPGRADING.md` correctly flags
-  that release as changing the field count, so parsers did need updating, but the field
-  has never carried a value.
+- `tls_version` and `cipher_suite` are `-` even for requests through the TLS proxy listener
+  (port 3129). Those requests go through the same logging path, but the record does not include
+  the negotiated version or cipher.
+- `source_region` is always `-`. It is present in every record and counted in the field total, so
+  a parser has to account for it, but it carries no value.
 
 ### `operation` is always `.OBJECT`
 
-The operation string is derived from the HTTP method alone:
+The operation string comes from the HTTP method alone:
 
 | Method | `operation` |
 |---|---|
@@ -71,52 +68,54 @@ The operation string is derived from the HTTP method alone:
 | `DELETE` | `REST.DELETE.OBJECT` |
 | anything else | `REST.{METHOD}.OBJECT` |
 
-So a bucket-level list is logged as `REST.GET.OBJECT`, and a multipart
-`CreateMultipartUpload` as `REST.POST.OBJECT`. S3's own logs distinguish
-`REST.GET.BUCKET`, `REST.POST.UPLOAD`, and similar; this log does not. To tell operations
-apart, parse `request_uri` (field 8) rather than trusting `operation`.
+So a bucket-level list is logged as `REST.GET.OBJECT`, and a `CreateMultipartUpload` as
+`REST.POST.OBJECT`. S3's own logs distinguish `REST.GET.BUCKET`, `REST.POST.UPLOAD` and similar;
+this log does not. To tell operations apart, parse `request_uri` (field 8).
 
-Note this differs from the request taxonomy used for the per-bucket metrics counters,
-which *does* discriminate list from object GET and `UploadPart` from `PutObject`. See
-[METRICS.md](METRICS.md).
+The per-bucket metrics counters use a different request taxonomy, which does distinguish a list
+from an object GET and `UploadPart` from `PutObject`; see
+[Per-bucket traffic metrics](METRICS.md).
 
 ### No `version_id` field
 
-S3's record includes `version_id`; this one does not, and it carries no separate object
-key field either — the key is inside `request_uri`. Verify field positions against a real
-record from this proxy rather than against S3's documentation. A whitespace split yields
-25 tokens on every record, including ones where most optional values are `-`.
+S3's record includes `version_id`; this one does not, and it has no separate object key field
+either: the key is inside `request_uri`. Check field positions against a real record from the
+proxy rather than against S3's documentation. A plain whitespace split yields at least 26 tokens,
+because the `time` value always contains one space, and more when `referer` or `user_agent`
+contain spaces. With `awk`, `http_status` is `$10`, not `$9`.
 
 ### Field-count changes break parsers
 
-New fields are appended at the end, so a parser reading the first N fields positionally
-survives an addition, while one asserting an exact count or indexing from the end does
-not. `source_region` (field 25) arrived in 1.6.8. Check
-[UPGRADING.md](UPGRADING.md) when adopting a new release.
+New fields are appended at the end, so a parser that reads the first N fields by position keeps
+working after an addition, while one that asserts an exact count or indexes from the end does
+not. Check [Upgrading](UPGRADING.md) when adopting a new release.
 
 ## Escaping and redaction
 
-Three transformations are applied before a line is written, all to stop a
-client-controlled string from corrupting the log.
+Three transformations run before a line is written, all to stop a client-controlled string from
+corrupting the log.
 
 ### Presigned URL parameters are redacted
 
-In field 8, three query parameters have their values replaced with the literal
-`REDACTED`. Matching is case-insensitive and applied after percent-decoding the parameter
-name, so encoded variants are caught:
+In field 8, these query parameters have their values replaced with the literal `REDACTED`.
+Matching is case-insensitive and runs after percent-decoding the parameter name, so encoded
+variants are caught:
 
 - `X-Amz-Signature`
 - `X-Amz-Credential`
 - `X-Amz-Security-Token`
+- `Signature` and `AWSAccessKeyId`, the SigV2 presigned URL parameters
 
-```
+`Expires` stays visible.
+
+```text
 "/my-bucket/key?X-Amz-Signature=REDACTED&X-Amz-Expires=3600"
 ```
 
-The parameter *name* is written as it appeared, so a percent-encoded name stays encoded
-while its value is still redacted. Other `X-Amz-*` parameters — `X-Amz-Expires`,
-`X-Amz-Date`, `X-Amz-Algorithm`, `X-Amz-SignedHeaders` — are logged in full; they are not
-secrets. A bare parameter with no `=` passes through unchanged.
+The parameter name is written as it appeared, so a percent-encoded name stays encoded while its
+value is still redacted. Other `X-Amz-*` parameters (`X-Amz-Expires`, `X-Amz-Date`,
+`X-Amz-Algorithm`, `X-Amz-SignedHeaders`) are logged in full; they are not secrets. A bare
+parameter with no `=` passes through unchanged.
 
 ### Free-text fields are escaped
 
@@ -125,110 +124,111 @@ characters are escaped to keep the value inside its quotes and on one line:
 
 | Input | Written as |
 |---|---|
-| CR | `\r` (literal backslash then `r`) |
-| LF | `\n` (literal backslash then `n`) |
+| CR | `\r` (a literal backslash, then `r`) |
+| LF | `\n` (a literal backslash, then `n`) |
 | `"` | `\"` |
 
-A parser must un-escape these two fields, and must not treat `\"` inside them as a
-closing quote. No other field is escaped, because every other field is proxy-generated.
+A parser must un-escape these two fields and must not treat `\"` inside them as a closing quote.
+No other field is escaped, because the proxy generates every other field itself.
 
 ### Nothing else is masked
 
-Object keys are logged verbatim inside `request_uri`. If your key namespace embeds
-customer identifiers, tokens, or email addresses, those reach the access log. Keep them
-out of key names or restrict access to the log directory. The proxy sets its umask to
-`0o077` at startup so log files are owner-only, but that is a filesystem control, not
-redaction.
+Object keys are logged verbatim inside `request_uri`. If your key names embed customer
+identifiers, tokens or email addresses, those reach the access log. Keep them out of key names,
+or restrict access to the log directory. The proxy sets its umask to `0o077` at startup, so log
+files are readable by their owner only, but that is a file permission, not redaction.
 
 ## File layout and rotation
 
-```
+```text
 {access_log_dir}/YYYY/MM/DD/{YYYY-MM-DD-HH-MM-SS}-{hostname}
 ```
 
-Partitioned by UTC date. The filename timestamp is the time of the **first entry** in
-that file; the hostname suffix keeps instances sharing a volume from colliding. Files
-have no extension.
+Files are partitioned by UTC date and have no extension. The timestamp in a file's name is the
+time of the first entry in that file, and the hostname suffix keeps proxies that share a log
+directory from colliding.
 
-Within a rotation window the proxy appends to the current file. A new file starts when
-the date partition rolls over or when `access_log_file_rotation_interval` elapses. A new
-file is created via temp-file-plus-rename, so a reader never sees a partially created
-file; appends within a window are ordinary appends.
+Within a rotation window the proxy appends to the current file. A new file starts when the date
+partition rolls over or when `access_log_file_rotation_interval` elapses. A new file is created
+with a temporary file and a rename, so a reader never sees a partly created file; appends within
+a window are ordinary appends.
 
-Records are buffered in RAM and flushed on `access_log_flush_interval`, or when the
-buffer reaches `access_log_buffer_size` entries, whichever comes first. Two consequences:
+Records are buffered in RAM and flushed every `access_log_flush_interval`, or when the buffer
+reaches `access_log_buffer_size` entries, whichever comes first. Two consequences follow:
 
-- **Recent requests may not be on disk.** Absence of a record is not evidence a request
-  did not happen until a flush interval has passed.
-- **Records are ordered by flush batch**, not strictly by completion time. Sort on field
-  3 if you need chronological order.
+- **Access logs are best-effort, as Amazon S3 server access logs are.** The proxy tries to write
+  a record for every request. A request that finishes while the logger is busy hands its record
+  to a background task, which waits up to 30 seconds. A record that still cannot be written, or
+  that finds 10,000 records already waiting, is dropped and counted in
+  `request_metrics.access_log_records_dropped`. Recent records may not be on disk until the next
+  flush, so a missing record does not prove a request did not happen.
+- **Records are ordered by flush batch**, not strictly by completion time. Sort on field 3 for
+  chronological order.
 
-On graceful shutdown the buffer is flushed; if that fails, the count of lost entries is
-reported in the application log.
+On a graceful shutdown the buffer is flushed; if that fails, the application log reports how
+many entries were lost. A record still waiting on the background hand-off when the process stops
+is lost and is not counted.
 
 ## Multi-instance aggregation
 
-Each instance writes its own filename under the same date directory, so a shared volume
-accumulates one file series per host:
+Each proxy writes its own files under the same date directory, so a shared log directory holds
+one file series per proxy:
 
 ```bash
-cat "$ACCESS_LOG_DIR"/2026/08/19/*   # Every instance, one date
+cat "$ACCESS_LOG_DIR"/2026/08/19/*  # Every proxy, one date
 ```
 
-Because instances buffer independently, records from different hosts interleave
-arbitrarily. Sort by field 3 across the whole set rather than relying on per-file order.
+Because proxies buffer independently, records from different hosts interleave in no fixed order.
+Sort the whole set by field 3 rather than relying on the order within a file.
 
 ## Retention applies to the directory, not to the writer
 
-`access_log_retention_days` is a property of `access_log_dir`. The cleanup sweep runs
-whether or not this instance is writing access logs, so setting
-`access_log_enabled: false` stops new records but does **not** stop old files being
-reaped. A deployment that disabled access logging and left files behind will see them
-removed on the first cleanup pass after upgrading to 2.6.0 — see
-[UPGRADING.md](UPGRADING.md).
+`access_log_retention_days` is a property of `access_log_dir`. The cleanup sweep runs whether or
+not this proxy writes access logs, so `access_log_enabled: false` stops new records while old
+files are still removed. The first sweep removes every expired file already in the directory, so
+copy off anything you need to keep, or raise `access_log_retention_days`, before starting the
+proxy on an existing log directory.
 
-Only files matching the naming convention above are removed. Anything else in
-`access_log_dir` is left alone regardless of age, so an unrelated file placed there is
-never deleted.
+Only files that match the naming convention above are removed. Anything else in `access_log_dir`
+is left alone whatever its age, so an unrelated file placed there is never deleted.
 
-The sweep also covers files written by **other** instances, which is what makes an
-orphaned series reapable at all: a host that is decommissioned leaves files no live
-instance would otherwise claim. A file this instance did not write gets one extra day of
-grace before it becomes a candidate, so a badly skewed clock on one host cannot reach a
-live peer's in-retention files.
-
-The effective guarantee is therefore:
+The sweep also covers files written by other proxies, so the files of a decommissioned host are
+still removed. A file this proxy did not write gets one extra day of grace before it becomes a
+candidate, so a badly skewed clock on one host cannot reach a live peer's files that are still
+within retention:
 
 | File | Deleted after |
 |---|---|
-| Written by this instance | `access_log_retention_days` |
-| Written by another instance (or an orphan) | `access_log_retention_days` + 1 day |
+| Written by this proxy | `access_log_retention_days` |
+| Written by another proxy, including a decommissioned one | `access_log_retention_days` + 1 day |
 
-**For a compliance-driven hard cap at N days, configure `N - 1`.** The +1 day of grace is
-deliberate and is not configurable.
+For a compliance-driven hard limit of N days, configure `N - 1`. The extra day of grace is not
+configurable.
 
-The same rules apply to `app_log_retention_days` and `app_log_dir`, including the
-per-hostname subdirectories the application log uses.
+The same rules apply to `app_log_retention_days` and `app_log_dir`, including the per-hostname
+subdirectories the application log uses.
 
 ## Related configuration
 
 | Field | Effect |
 |---|---|
 | `logging.access_log_dir` | Root directory |
-| `logging.access_log_enabled` | `false` writes no access log at all. Does **not** disable retention cleanup |
+| `logging.access_log_enabled` | `false` writes no access log. Retention cleanup still runs |
 | `logging.access_log_mode` | `all`, or `cached_only` to log only cache hits |
-| `logging.access_log_flush_interval` | Buffer flush cadence |
+| `logging.access_log_flush_interval` | How often the buffer is flushed |
 | `logging.access_log_buffer_size` | Entries before a forced flush |
-| `logging.access_log_file_rotation_interval` | New-file cadence within a date |
-| `logging.access_log_retention_days` | Age at which the cleanup task deletes files matching the naming convention, anywhere in `access_log_dir`. Add a day for files written by another instance |
+| `logging.access_log_file_rotation_interval` | How often a new file starts within a date |
+| `logging.access_log_retention_days` | Age at which the cleanup task deletes files matching the naming convention, anywhere in `access_log_dir`. Add a day for files written by another proxy |
 
-Only the directory has an environment override (`ACCESS_LOG_DIR`). The others must be set
-in the config file — see
-[CONFIGURATION.md — Environment Variable Reference](CONFIGURATION.md#environment-variable-reference).
+Only the directory has an environment variable override (`ACCESS_LOG_DIR`); set the others in the
+configuration file. See
+[Environment variable reference](CONFIGURATION.md#environment-variable-reference).
 
 ## See also
 
-- [CONFIGURATION.md — Logging Configuration](CONFIGURATION.md#logging-configuration) — every `logging.*` field
-- [METRICS_REFERENCE.md](METRICS_REFERENCE.md) — counters, which are cheaper than parsing logs for aggregate figures
-- [METRICS.md](METRICS.md) — per-bucket traffic accounting, including the request taxonomy that `operation` does not reflect
-- [UPGRADING.md](UPGRADING.md) — releases that changed the record layout
+- [Logging configuration](CONFIGURATION.md#logging-configuration): every `logging.*` field
+- [Metrics reference](METRICS_REFERENCE.md): counters, which are cheaper than parsing logs for
+  aggregate figures
+- [Per-bucket traffic metrics](METRICS.md): per-bucket accounting, including the request taxonomy
+  that `operation` does not reflect
+- [Upgrading](UPGRADING.md): releases that changed the record layout

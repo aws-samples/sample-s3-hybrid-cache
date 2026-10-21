@@ -184,7 +184,7 @@ pub fn check_streaming_capacity(
 /// # Requirements
 ///
 /// - Requirement 2.5: Log bypass decisions
-pub fn log_bypass_decision(cache_key: &str, reason: &BypassReason) {
+pub(crate) fn log_bypass_decision(cache_key: &str, reason: &BypassReason) {
     warn!("Bypassing cache for key '{}': {}", cache_key, reason);
 }
 

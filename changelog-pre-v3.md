@@ -1,0 +1,3290 @@
+# Changelog (releases before 3.0.0)
+
+Historical release history for Hybrid Cache for Amazon S3, covering every public release
+up to and including **2.8.4**. It is closed: nothing new is added here.
+
+3.0.0 starts a fresh [CHANGELOG.md](CHANGELOG.md). Look there for 3.0.0 and later, and
+for in-flight work under `[Unreleased]`.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+> **On the two meanings of `2.8.1` and `2.8.2`.** The entries below are the **public**
+> releases of those numbers, shipped from `release/2.8.x` off the 2.8.0 commit to close
+> [GitHub issue #19](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/19).
+> The same two numbers were also used earlier by internal-only builds for entirely
+> different work; those never shipped and their notes are folded into the `[Unreleased]`
+> section of `CHANGELOG.md` pending consolidation into 3.0.0. Where an internal label is
+> cited elsewhere in the repo (fleet gates, spec annotations), it refers to those internal
+> builds, not to the public entries here. Public 2.8.3 and 2.8.4 followed from the same
+> branch and carry only the changes recorded below; none of the `[Unreleased]` changes is in them.
+
+## [2.8.4] - 2026-10-05
+### Fixed
+- A GET or HEAD whose pooled connection S3 had already closed is now retried once on a new
+  connection instead of returning a 502. Requests with a body are never retried, and that first
+  lost connection no longer counts toward `ip_failure_threshold`. A failed send to S3 now logs the
+  error's full cause. See [GitHub PR #21](https://github.com/aws-samples/sample-s3-hybrid-cache/pull/21),
+  diagnosed and fixed by Shobhit Pandey ([@shobhit-polybee](https://github.com/shobhit-polybee)).
+### Changed
+- `connection_pool.idle_timeout` accepts 1 to 300 seconds (was 10 to 300), so it can be set below
+  S3's idle close.
+## [2.8.3] - 2026-10-05
+### Fixed
+- Signed PUTs and multipart operations no longer re-read the system certificate bundle on every
+  request. The OS trust store is now loaded once per process and shared, which removes a CPU cost
+  that capped signed write throughput on busy hosts. A change to the OS trust store now takes
+  effect after a restart for signed writes, as it already did for reads. See
+  [GitHub issue #20](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/20), reported and
+  fixed by James Connor ([@megakid](https://github.com/megakid)).
+### Security
+- Bumped `rustls` to 0.23.45 (RUSTSEC-2026-0285).
+## [2.8.2] - 2026-09-10
+**Upgrade impact:** the first read of an object cached by a PUT or multipart upload now makes one
+extra round trip to S3 (a conditional request) before serving, where previously it was served
+straight from cache with no S3 contact at all. Subsequent reads of the same object are unaffected.
+No configuration change is required.
+
+### Fixed
+- A GET or HEAD of an object cached by a PUT or multipart upload returned without a
+  `Last-Modified` header, because S3's write responses never include one and nothing previously
+  revalidated to learn it. GET now issues a conditional request on first read and backfills the
+  header from the response; HEAD no longer serves such an entry from cache until the header is
+  known. See
+  [GitHub issue #19](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/19), reported by
+  James Connor ([@megakid](https://github.com/megakid)), who also shared a working fix this
+  release is based on.
+
+## [2.8.1] - 2026-09-10
+### Fixed
+- Multipart uploads from clients that send a `Transfer-Encoding: chunked` request body (observed
+  with `pyarrow.parquet`, S3FileSystem) failed on the first `UploadPart` with `IncompleteBody` and
+  never got the trailer-based checksum S3 was told to expect. The proxy was re-sending that body
+  without the HTTP chunk framing it needs; it now re-establishes chunk framing (and the trailer
+  section) on the way to S3. `PutObject`/`UploadPart` requests using `Content-Length` (the AWS CLI,
+  boto3) were never affected. Also recognizes two additional trailer-carrying signature sentinels in
+  `x-amz-content-sha256`, so a client sending one of them without a redundant `Content-Encoding:
+  aws-chunked` header is classified correctly. See
+  [GitHub issue #19](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/19), diagnosed by
+  James Connor ([@megakid](https://github.com/megakid)).
+
+## [2.8.0] - 2026-08-31
+
+**Upgrade impact:** expired reads revalidate instead of re-downloading, so body transfers fall
+while conditional requests rise; orphan range files are kept at startup rather than swept, so
+watch free space on a cache volume that accumulates them; and the `Consolidation cycle:` and
+`Consolidation cycle complete:` log lines change fields. No configuration change is required to
+keep running.
+
+### Added
+
+- `docs/LOCAL_NVME_CACHE.md`, a guide to running a fleet on local NVMe instance store instead of
+  a shared cache volume. Each proxy caches to its own disk and an affinity router gives every
+  object and page one owner, so aggregate capacity is the sum of the disks. Covers the routing
+  prerequisite, instance-family choice and cost comparison, preparing and sizing the instance
+  store, the settings that change, and what fleet churn costs when a cache does not survive
+  instance replacement. No code change: this documents a deployment the existing build already
+  supports.
+
+### Changed
+
+- `docs/AWS_DEPLOYMENT.md` now recommends Graviton network-optimized instances (`c8gn`, `m8gn`)
+  in place of `c6in`/`m6in`: same vCPU and memory, double the sustained network bandwidth, for
+  roughly 5% more cost. No code change; existing `c6in`/`m6in` deployments are unaffected and
+  keep working.
+- Orphan range files are kept at startup rather than swept, so a range file another instance has
+  just written and not yet consolidated stays intact. The periodic orphan recovery scan
+  (`cache.shared_storage.orphan_recovery_enabled`) is unchanged.
+
+### Removed
+
+- The bytes-evicted figure from the consolidation cycle's result and its two log lines. Eviction
+  runs as a background task the cycle does not wait for, so bytes freed are reported by
+  `Background eviction completed:` instead. `Consolidation cycle:` now reports
+  `eviction_triggered=true|false` in place of `evicted=<bytes>`, and `Consolidation cycle
+  complete:` drops `bytes_evicted`.
+
+### Fixed
+
+- An expired cache entry is revalidated with a conditional request and served from cache on a
+  `304`, rather than re-downloaded in full, and `ttl_revalidations_total` counts each one. Range
+  requests forward the client's `Range` header unchanged, including suffix and open-ended forms
+  and ranges covered by a SigV4 signature. See
+  [GitHub issue #17](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/17).
+- A ranged read of an already-cached full object honours a lowered or zeroed `get_ttl`, so a
+  `cache_rules.json` change takes effect immediately.
+- A changed object detected during a range revalidation invalidates every cached extent covering
+  the request.
+- A client's own `If-None-Match` or `If-Modified-Since` on a range request is preserved rather
+  than replaced by the proxy's cached validators.
+- Corrected the documented way to trust the TLS proxy listener's certificate. `AWS_CA_BUNDLE`
+  configures the connection to the endpoint URL, which is plain HTTP when routing through
+  `HTTP_PROXY`, so it never applied to the proxy hop, and neither `--no-verify-ssl` nor
+  botocore's `proxies_config` in `~/.aws/config` could substitute for it — the latter is not
+  read from the config file by any client, AWS CLI included, only from an explicit Python
+  `Config` object. Install the certificate in the client host's system trust store. The examples
+  that address the proxy directly as an `https://` endpoint URL are unaffected, and
+  `AWS_CA_BUNDLE` remains correct for those. See
+  [GETTING_STARTED.md](docs/GETTING_STARTED.md#configuring-clients-to-trust-the-certificate).
+- A multipart upload part whose `Content-Length` is missing or malformed is measured as it
+  streams, and staging stops if it would take the cache past `cache.max_cache_size`. The part is
+  forwarded to S3 byte for byte and its response returned unchanged either way, so the only
+  difference is whether a copy is kept.
+- The cached-object count reports the objects that remain after the validation scan, excluding
+  entries the same pass removed. Cache size in bytes is unaffected.
+- Cache eviction keeps the metadata entry for a range whose file it could not delete, so the
+  space stays accounted for and the next pass retries the delete. A range whose file was already
+  gone is still removed, so an object with a stale entry remains evictable.
+- Cache eviction subtracts only the range files it removed cleanly, `ranges_evicted` in the
+  eviction summary counts the same set, and a range that could not be deleted is logged as a
+  warning naming its object.
+
+## [2.7.0] - 2026-08-27
+
+**Upgrade impact:** cache size reporting is now accurate and self-consistent, and several
+figures change value as a result. No cached object is removed, no cache wipe is needed, and
+no configuration change is required.
+
+- `write_cache.resident_bytes` and `cache.write_cache_size` now reflect what is actually
+  staged. Both drop, often substantially, once a full validation scan runs, and from then on
+  they track uploads, overwrites and removals as they happen. Deployments that overwrite the
+  same keys frequently see the largest drop.
+- `cache.total_cache_size` is now the bytes held on the shared cache volume, and reads
+  identically on every instance sharing that volume. `cache.read_cache_size` is now the
+  non-staged remainder of it, so `total = read + write_cache` holds exactly.
+  `cache.ram_cache_size` is reported separately and is deliberately outside that sum.
+- Absolute-threshold alarms on any of those fields need rebaselining. A dashboard that
+  stacked the four cache gauges, or added `read_cache_size` to `write_cache_size` to get a
+  total, was double-counting and should be corrected.
+- On a cache at or near its configured `cache.max_cache_size`, signed and presigned PUTs now
+  bypass write-through caching, so a read of a just-uploaded object may be a cache miss where
+  it was previously a hit. Uploads themselves are unaffected: the body still streams to S3 and
+  S3's response is returned unchanged. A cache with headroom behaves as before.
+- The `/health` cache component can now report `Degraded` on a genuinely full cache. HTTP
+  status codes are unchanged (`Degraded` returns 200), so load balancer health checks are
+  unaffected.
+- Cached range metadata gains one optional field recording write-cache membership per range.
+  Existing cache files stay readable, older releases ignore the field, and data already on
+  the volume keeps the previous behaviour until it is next written.
+
+### Added
+
+- **`cache.max_cache_size_limit`** in `/metrics` and as an OTLP gauge: the configured
+  `cache.max_cache_size`, so cache utilisation is computable from `/metrics` alone and the
+  denominator behind the `/health` cache percentage is visible. `0` means no limit is
+  configured. Documented in [METRICS_REFERENCE.md](docs/METRICS_REFERENCE.md#cache) and
+  [OTLP_METRICS.md](docs/OTLP_METRICS.md).
+- **`write_cache.graduations_total`** in `/metrics`: how many objects have left the staging
+  tier by being read. Read together with `staged_entries` it shows the tier draining, which a
+  gauge alone cannot distinguish from an idle proxy. Documented in
+  [METRICS_REFERENCE.md](docs/METRICS_REFERENCE.md#write_cache).
+- **`write_cache.ledger_entries`** in `/metrics`: the length of the staging record the write
+  cache uses to select objects for reclamation.
+- **`eviction_coordination.staging_evictions_skipped_lock_held`** in `/metrics`: reclamation
+  passes skipped because another instance held the eviction lock.
+- Write-cache size corrections applied by a validation scan are now logged, so recurring
+  drift is visible without comparing state files by hand.
+- **[REQUEST_AWARE_ROUTING.md](docs/REQUEST_AWARE_ROUTING.md)**, a new guide to putting
+  HAProxy in front of a fleet: it encrypts the client hop, removes the per-GB load balancer
+  charge on cache hits when run on the client host, and hashes on object key and byte range
+  so every read of a page goes to one instance, which a Layer 4 balancer cannot do. Includes
+  a tested configuration. Optional and sample code; nothing changes for existing deployments.
+
+### Changed
+
+- **A full write cache no longer stops new uploads being cached.** The write cache allocation
+  (`cache.write_cache_percent`) is now a target rather than a hard limit. An upload is cached
+  even when the allocation is already full, and the excess is reclaimed in the background by
+  removing the oldest staged objects that have not yet been read; objects whose write cache
+  TTL expired without ever being read are reclaimed first. Reclamation begins at
+  `cache.eviction_trigger_percent` of the allocation and runs until usage reaches
+  `cache.eviction_target_percent`, the same two settings the read cache uses. This matches how
+  the download path already behaves: no limit on admission, space reclaimed once past a
+  threshold.
+
+  One bound still declines to cache, and only one: available space. A write-through upload is
+  skipped when caching it would take the cache past `cache.max_cache_size`, or when the cache
+  volume has less than 1 GiB free beyond what the object needs. Skipping is reported as
+  `disk_safety` in `signed_put.skipped_puts_total`, and `/health` reports the cache component
+  as `Degraded` while it is happening, so a volume that has run out of space is visible rather
+  than silent. Uploads themselves are never affected. `capacity_refused` is retired from that
+  counter's reason set.
+
+- **Reclaiming space in the write cache now costs time proportional to what is removed**,
+  rather than to the size of the whole cache. The proxy keeps a compact append-only record of
+  what it has staged and selects candidates from that. The record is a hint only: each
+  candidate is re-checked against the authoritative metadata before anything is deleted, so an
+  entry that has since been read, replaced or removed is skipped. No action is required on
+  upgrade. The record starts empty and is populated from the cache itself by the first full
+  validation scan, which also repairs it if entries are ever lost.
+
+- **The write cache allocation is enforced across all instances sharing a cache volume,
+  continuously.** It is now evaluated against the staged bytes recorded for the volume as a
+  whole on every background maintenance cycle, rather than against a per-instance figure
+  reconciled only at startup. A deployment whose staged working set has drifted above its
+  configured percentage will see reclamation begin where none happened before; raise
+  `cache.write_cache_percent` if that larger working set is intended.
+
+- The metadata read performed on the first read of a written object no longer blocks a request
+  worker.
+
+- A failed write-cache transition is now logged rather than silently discarded.
+
+### Fixed
+
+- **Write-cache size accounting now decreases as well as increases.** The figure is reduced
+  when a staged object is first read and becomes an ordinary read-cached object, when it is
+  removed to reclaim space, when it expires or is invalidated before ever being read, and when
+  it is replaced by a newer upload of the same key. Previously it only ever grew, so on a
+  long-running deployment it could climb past the allocation and stop new objects being cached
+  while little or nothing was actually staged. The first-read decrement is applied once per
+  object even when several instances read the same object at the same moment, and the cached
+  object count now decreases alongside the size. A deployment that had reached that state
+  recovers on its own with no cache wipe; see
+  [EVICTION.md](docs/EVICTION.md#recovery-from-an-inflated-write-cache-figure) for the timeline
+  and for the manual path if you would rather not wait for the next validation scan.
+
+- **Objects written through the cache are counted when they are written, and counted once.**
+  Single-object upload paths write the cache entry directly so that an immediate read is served
+  from cache, and that shortcut previously left them out of both the total and write-cache
+  figures; multipart uploads already recorded both. Credits are now deduplicated across every
+  path, so completing a multipart upload for an already-cached key, re-caching a full object
+  after a miss, or caching a range another instance already holds on shared storage each count
+  once rather than adding a phantom copy.
+
+- **Re-caching bytes that were previously removed counts again.** A range removed by eviction,
+  invalidation or overwrite now releases its already-counted marker, so caching that range
+  again is recorded. Invalidate-then-re-read is the ordinary flow for an object that changed in
+  S3, and the cache had been under-reporting itself for it. Because the limit is enforced
+  against that figure, that could admit more data than `cache.max_cache_size`.
+
+- **Validation scans re-ground the write-cache size.** A full scan recomputes it from the cache
+  on disk, a rolling scan extrapolates it the same way it does the total, and the write-cache
+  figure is clamped so it can never exceed the total of which it is a subset.
+
+- **Write-cache membership is recorded per range**, at the moment data is cached, rather than
+  once per object. The two differ for an object uploaded through the cache that later had a
+  *different* part of it downloaded: the downloaded part belongs to the read cache, and is no
+  longer counted toward the write-cache figure. Objects entirely uploaded or entirely
+  downloaded — the common cases — are unaffected. Range metadata written by earlier releases
+  keeps the previous behaviour until it is rewritten, so the figure converges as data is
+  refreshed.
+
+- **`cache.total_cache_size` and `cache.read_cache_size` no longer count the same bytes
+  twice.** The total was previously the read, write-cache and RAM figures added together, but
+  those are not independent: staged bytes were part of the read figure, and the RAM figure
+  counts copies of bytes also held on disk. The total is now the bytes on the shared cache
+  volume, and the read figure is the non-staged remainder, so the two partition the volume and
+  an object moves between them on first read without changing the total.
+
+- **The PUT cache-capacity check now reads the maintained cache size.** Both the signed and
+  presigned upload paths skip write-through caching when an object will not fit in the
+  remaining capacity; they now compute usage from the maintained figure rather than from fields
+  populated only on another path. If that read fails the request is cached as before rather than
+  refused, and the failure is logged.
+
+- **The `/health` cache component now reports actual usage.** Usage is the bytes on the shared
+  cache volume as a percentage of `cache.max_cache_size` (the same pair the cache's own
+  capacity and eviction decisions use), and the component reports `Degraded` above 95%. It
+  previously reported `Cache usage: NaN%` and `Healthy` at any utilisation. A deployment with no
+  `cache.max_cache_size` configured reports `Healthy` and states that no limit is set.
+
+- **Refusing a write-through PUT is now immediate**, rather than first reading and parsing every
+  cached object's metadata on the shared volume, which had been adding several seconds to each
+  refusal on a cache holding a few thousand objects. That scan also could not tell which
+  instance had staged an entry, so no instance now removes staged data another instance cached
+  on a shared volume on the strength of its own local counter.
+
+- **An upload is no longer refused because of a figure carried over from startup.** The
+  in-flight upload counter now starts at zero, which is correct for a process with no uploads in
+  flight, and residency is read from the shared cache state instead. Previously the counter was
+  seeded from resident bytes and never released, so it could sit at its limit from the moment
+  the proxy started and decline write-through caching indefinitely. The startup summary reports
+  both figures separately.
+
+- **An object read shortly after being overwritten is no longer an intermittent cache miss.**
+  Removal records now apply only to the copy they were written for. An overwrite that keeps the
+  object the same length reuses the same byte range, and the record could previously match the
+  replacement and remove it from the cache index a few seconds later. Reads were always served
+  correctly; this surfaced as an occasional slow read.
+
+- **Cache bookkeeping recorded while an object is uploaded is retained.** Size changes, access
+  counts and TTL refreshes made during an upload now reach the shared cache journal, and
+  concurrent uploads serialise their journal appends so one upload's entries cannot overwrite
+  another's.
+
+- **Superseded range files are removed when an object is cached in full.** When a full-object
+  copy replaces the partial ranges already cached for a key, the old range files are now deleted
+  and their bytes deducted whether or not the object's ETag changed. Previously a changed object
+  left its old range files on disk, unreferenced, until the background orphan sweep reclaimed
+  them.
+
+- **`write_cache.staged_entries` no longer drifts upward over time.** The gauge now decrements
+  on all four ways an entry can leave the staging tier — first read, replacement, reclamation,
+  and expiry or invalidation — rather than on first read alone. This is observability only; the
+  gauge feeds no caching or eviction decision.
+
+## [2.6.3] - 2026-08-23
+
+### Changed
+
+- **Build toolchain bumped from Rust 1.96 to 1.98.** No behavior change; this is a
+  scheduled, isolated toolchain bump per the pre-push checklist's toolchain-currency
+  policy. Fixed six new clippy lints the newer compiler surfaced on existing code:
+  four `useless_borrows_in_formatting` in a test helper, one `drain_collect` in the
+  RAM range tier's deferred access-reorder buffer, and one `result_large_err` on an
+  internal range-fetch helper (suppressed with justification rather than reworked,
+  since boxing the error type would ripple through every call site for no functional
+  benefit).
+
+## [2.6.2] - 2026-08-23
+
+### Fixed
+
+- **Stale RAM range data could be served after the proxy detected an object had
+  changed.** When a cached object's ETag no longer matched, the proxy invalidated the
+  object's range files and metadata on disk but left the RAM copies of those ranges in
+  place, so a later read could return the previous version's bytes. The RAM range cache
+  has no expiry of its own, so such an entry persisted until it was evicted for capacity
+  or the proxy restarted. Range invalidation now clears the RAM tier as well, on the
+  ETag-mismatch path and on both paths that retry after S3 rejects a proxy-issued
+  precondition. Reads of unchanged objects are unaffected.
+
+## [2.6.1] - 2026-08-22
+
+### Fixed
+
+- **Upgrade impact:** Only affects deployments running with `metrics.otlp.enabled:
+  true`. Metrics now reach your collector where previously none did, so expect
+  telemetry volume and collector cost to rise from zero. Each instance now reports
+  its own `service.instance.id`, so a Prometheus OTLP receiver that had been folding
+  every instance into one `instance` label now produces one series per instance —
+  update dashboards and alarms built on the old single series.
+
+- **OTLP metrics export never sent a payload.** The exporter's HTTP client required
+  a Tokio reactor, but `opentelemetry_sdk`'s `PeriodicReader` exports from its own
+  plain thread, which has none. The first export panicked (`there is no reactor
+  running, must be called from the context of a Tokio 1.x runtime`), the reader
+  thread died, and nothing was posted for the life of the process — the only trace
+  was a single panic line at startup. The exporter now uses a blocking HTTP client,
+  which the reader thread supports.
+
+- **OTLP resource attributes now include `service.instance.id`** (the hostname).
+  Prometheus's OTLP receiver derives the `instance` label from that attribute alone,
+  so metrics from multiple proxy instances previously collapsed into a single series.
+
+  Thanks to [@fenos](https://github.com/fenos) for diagnosing and fixing both issues.
+
+## [2.6.0] - 2026-08-21
+
+### Fixed
+
+- **Upgrade impact:** The first log cleanup pass after upgrading deletes log files
+  older than the configured retention that were previously being kept indefinitely:
+  files left behind by instances no longer running, access log files from a period
+  when access logging was enabled and has since been turned off, and — on a
+  deployment currently running with `access_log_enabled: false` — app log files,
+  because the same gate skipped both sweeps. Retention defaults to 30 days, so this
+  applies whether or not you set it. To keep anything older, copy it off or raise
+  `access_log_retention_days` / `app_log_retention_days` (maximum 365) **before**
+  upgrading.
+
+  Retention now applies to the whole of `access_log_dir` and `app_log_dir` rather
+  than only to files this instance is currently writing, and no longer depends on
+  `access_log_enabled`. Only files matching the documented naming convention are
+  removed; anything else in those directories is left alone regardless of age. A file
+  written by another instance gets one extra day of grace, so configure `N - 1` for a
+  hard cap at N days. See
+  [`docs/ACCESS_LOG_FORMAT.md`](docs/ACCESS_LOG_FORMAT.md).
+
+- Multipart uploads through the proxy are now cached. Previously the upload
+  succeeded and reads were correct, but nothing was cached, so multipart objects
+  were served from S3 on every read. Recording parts is also faster and no longer
+  scales with an upload's part count.
+
+  Uploads with very large part counts take longer to finalise than small ones, so a
+  larger part size is worth preferring for very large objects.
+
+- A `HEAD` request for a single part of a multipart object (`?partNumber=N`) could
+  cause later reads of that object to return only that part's bytes with HTTP 200,
+  until the cache entry expired. Part-scoped requests are now forwarded without
+  consulting or populating the whole-object cache entry, and response-specific
+  headers are no longer stored as object metadata. A part-scoped `HEAD` now returns
+  that part's length and the object's part count.
+
+  **No action is required on upgrade.** Affected entries are detected and repaired
+  against S3 on the first read, so no cache flush or configuration change is needed.
+
+### Changed
+
+- Documentation updates.
+## [2.5.0] - 2026-08-19
+
+**Upgrade impact:** Review `server.max_concurrent_requests` if you set it explicitly —
+a permit now covers a request's whole transfer rather than just its setup, and the
+default changes from 200 to 1000. Remove `server.max_buffered_request_body_bytes` if you
+set it: it is deprecated and has no effect, so if you lowered it to reject large
+uploads, S3's own limits apply instead. Update any probe or scraper that uses an
+unconfigured path or a non-GET method on the health and metrics listeners, which now
+return 404 and 405. An upstream IP dropped after repeated failures now returns only
+when a recovery probe succeeds, rather than at the next DNS refresh. Presigned PUT
+uploads now succeed instead of returning 403, and every upload path streams, so proxy
+memory during an upload no longer scales with body size.  `cache.ram_cache_hit_rate_percent` on
+`/metrics` is now a 0–100 percentage rather than a 0.0–1.0 fraction, so a dashboard
+that multiplied it by 100 to correct the old scale now reads 100x high.
+
+### Added
+
+- **In-flight memory ceiling** (`server.max_inflight_buffer_bytes`, default `0` =
+  disabled). Some paths buffer a whole body or range in memory rather than
+  streaming it, and nothing previously bounded their combined size across
+  concurrent requests. When set, a request that would push the running total over
+  the ceiling is rejected with 503 `SlowDown` and `Retry-After` before any upstream
+  connection opens. A claim is held until its response body reaches the client or the
+  client disconnects, so a slow reader's memory is counted for as long as it is held.
+  With upload paths now streaming, the budget covers response-side buffering almost
+  exclusively. Any ceiling of 1 MiB or above is accepted, so the sizing guidance in
+  `docs/CONFIGURATION.md` is usable even on a small instance. `/metrics` gains an
+  `inflight_memory` section for sizing it. See `docs/CONFIGURATION.md`, which now
+  covers this budget, the streaming-path permits, and the RAM cache together.
+
+- **Permit utilisation metrics**: `permits_total`, `permits_held`,
+  `permits_available`, and `permits_held_peak`, distinct from the TCP connection
+  count. The dashboard's `Requests: N / M` tile now shows permits held against the
+  configured limit, with connections shown alongside.
+
+- **Request metrics expose bounded completion outcomes**: cumulative 4xx, 5xx,
+  rejection, cache-hit, and cache-miss counts, with no labels derived from object
+  keys, paths, buckets, hosts, or client addresses. The rejection counter covers
+  every shed, including sheds caused by the in-flight memory ceiling.
+
+### Changed
+
+- **`server.max_concurrent_requests` now bounds a request's full transfer, not
+  just its setup, and its default rises from 200 to 1000.** A permit is now held
+  until the response body completes — including the streamed transfer to the client
+  and the background cache write — and is released on normal completion, early
+  client disconnect, or error. Because each permit is held far longer, the old
+  default of 200 admits far fewer concurrent transfers than before; 1000 comes from
+  a fleet measurement of peak concurrent transfers plus headroom. If you set this
+  explicitly, review it against `permits_held_peak` under your own load.
+
+### Deprecated
+
+- **`server.max_buffered_request_body_bytes` has no effect and will be removed in a
+  future release.** Its stated purpose was memory protection, but every upload path now
+  streams, so lowering it saved no memory and only rejected valid uploads with 413.
+  An existing config file setting it still parses and starts; a value other than the old
+  5 GiB default logs a startup warning naming the field. Upload size is now governed by
+  S3's own limits: a body above S3's 5 GiB single-part `PUT` and `UploadPart` maximum is
+  rejected with 413 `EntityTooLarge` before any upstream connection opens. No replacement
+  field is added.
+
+### Fixed
+
+- **Uploads routed around the cache now stream, and presigned PUT works.** Every
+  upload path that does not write through the cache — objects too large to cache, SSE-C
+  uploads, keys with `write_cache_enabled: false`, uploads without an `Authorization`
+  header, browser form uploads, and the multipart create and abort calls — read the
+  entire body into memory before contacting S3, so a rejected 512 MiB upload still cost
+  512 MiB of proxy memory. All of them now stream the body to S3 frame by frame, so peak
+  memory is bounded by the per-connection buffer rather than the object size, and all of
+  them now share S3's own 5 GiB single-part limit instead of a private one — a large
+  `UploadPart` was previously rejected with 413 at an internal ~128 MiB cap.
+  Write-through caching is unchanged where it applied.
+
+  Presigned PUT was a casualty of the same path: a presigned URL returned 403
+  `AccessDenied` through the proxy while working direct to S3, because the forwarded
+  request dropped the query string and with it `X-Amz-Signature`. Uploads without an
+  `Authorization` header are now forwarded verbatim — request line, headers, and query
+  string unchanged — so the signature survives the hop. Presigned GET was never affected.
+  Browser form uploads (`POST` to the bucket) go the same way: forwarded verbatim and
+  streamed, but not cached, because a `multipart/form-data` body is an envelope rather
+  than the object bytes; the first read of that object through the proxy caches it as a
+  normal cache miss. See `docs/CACHING.md`.
+
+  The small bodies still read whole (DELETE and the other non-upload verbs) now size
+  their buffer from the declared `Content-Length` instead of growing it by repeated
+  reallocation, which previously peaked at roughly 1.67× the body size.
+
+- **Range reads spanning evicted cached extents now refetch missing bytes.** A
+  range request could return HTTP 500 after partial eviction left a hole between
+  cached ranges. The proxy now validates the unchanged object, fetches the
+  missing bytes, and returns the requested range.
+
+- **HEAD responses stay cacheable after their TTL window.** Freshness was compared
+  against the object's original cache time, so every HEAD past `head_ttl` was a miss
+  regardless of how recently the entry had been refreshed. HEAD now anchors
+  freshness to its most recent refresh, matching GET.
+
+- **Health and metrics listeners enforce their configured endpoints.** Each serves
+  only `GET` at its configured `endpoint`; other paths return 404 and other methods
+  405 with `Allow: GET`, so a health scrape can't be mistaken for metrics data.
+
+- **Unhealthy upstream IPs now recover by probe, with the cooldown backoff actually applied**:
+  An IP excluded after `connection_pool.ip_failure_threshold`
+  consecutive failures was returned to rotation by the next DNS refresh (every
+  `pool_check_interval`, default 10s), which also reset all recovery state. A
+  persistently unreachable IP was therefore re-admitted every 10s and spent more
+  requests failing, and `health_probe_initial_cooldown` /
+  `health_probe_max_cooldown` had no observable effect. A DNS refresh now keeps
+  health exclusions in place, and once an excluded IP's cooldown elapses the proxy
+  probes it directly — a full connect and TLS handshake to the same port and
+  transport live traffic would use. A successful probe returns the IP to rotation
+  immediately; a failed one doubles its cooldown up to
+  `health_probe_max_cooldown`, so a dead IP is retried progressively less often.
+  IPs that leave DNS while excluded are dropped from tracking.
+
+- **A partially specified `compression`, `health`, `metrics`, or `metrics.otlp`
+  section now parses.** Writing one of these sections with only some of its fields
+  set — for example `compression:` with just `enabled: true` — failed startup with a
+  message naming a field the config file never mentioned. Omitting a section
+  entirely always worked. Any field left out of these four sections now falls back
+  to its documented default, matching every other section.
+
+- **`cache.ram_cache_hit_rate_percent` on `/metrics` reports the RAM tier as a
+  percentage.** It was published as a 0.0–1.0 fraction under a `_percent` name, and
+  was separately overwritten with the *overall* cache hit rate by the request
+  accounting path, so it could report disk-and-RAM hits combined, or a non-zero rate
+  on a deployment with the RAM cache disabled. It is now sourced only from RAM-tier
+  hit and miss counts and scaled to 0–100. The dashboard's RAM hit-rate panel was
+  correct throughout and is unchanged.
+
+- **Documentation: Broad ranging updates**:
+  Load-balancer TLS patterns now agree across guides, NFS mount requirements now cover cross-host file locking and updated guidance for FSx for OpenZFS and EFS, general clarification  and deduplication.
+
+- **The FSx for OpenZFS userdata example now mounts with `nconnect=16`.**
+  `docs/examples/userdata-fsxz.sh` omitted it, so an instance bootstrapped from that
+  example verbatim used a single TCP connection to the file system and capped
+  disk-cache reads near 625 MB/s — the exact condition the rest of the documentation
+  tells you to avoid. The EFS example is unchanged and correctly has no `nconnect`;
+  it now says so explicitly, since the option is neither supported nor needed there.
+
+### Security
+
+- **RUSTSEC-2026-0258 resolved**: bumped the transitive `h2` dependency from
+  `0.4.12` to `0.4.16`. A peer could send an unbounded stream of empty HTTP/2 DATA
+  frames, consuming CPU without advancing the connection; availability-only impact
+  on the request-serving path. No API changes were required: `h2` is reached only
+  through `hyper`, and no proxy code needed to adapt.
+
+## [2.4.3] - 2026-08-13
+
+### Added
+
+- **Docker deployment guide** (`docs/DOCKER.md`). Documents building and running the
+  proxy in a container as an alternative to the systemd path: a multi-stage
+  Dockerfile with dependency-layer caching, distroless runtime image choice and
+  tradeoffs, environment-variable override reference, cache-volume persistence
+  requirements, non-root privilege model for port binding, a `docker compose`
+  example, bind-address gotchas for containerised services, shared-cache NFS mount
+  options, TLS cert mounting, upgrade flow, and Kubernetes notes.
+
+### Fixed
+
+- **Hedged upstream requests now cover signed range requests.** Clients that
+  sign their `Range` header did not get a hedge when a rule enabled hedging for the key — only unsigned range requests and full-object GETs did. Signed range
+  requests now hedge the same way, so a slow origin triggers a hedged retry
+  regardless of how the client issues its range request.
+
+- **Documentation.** Clarified range header signing in caching.md, and removed headline references to page widening since this feature requires custom or unusual clients.
+
+## [2.4.2] - 2026-08-11
+
+### Fixed
+- **Signed PUT and multipart uploads failed on a fresh process until an unrelated
+  GET had been served.** The first signed write to a host returned 502 `BadGateway`
+  "Failed to resolve S3 endpoint", logging `no distributed IP available`; once any
+  GET for that host had been served, writes succeeded. The signed-write path read
+  the per-host IP distributor but nothing on that path populated it — only the GET
+  path did, as a side effect of its own fallback. It now resolves the host on
+  demand instead of failing. 
+  Reported as [#15](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/15).
+
+## [2.4.1] - 2026-08-03
+
+### Security
+
+- **Documented what a cleartext hop actually exposes, and changed the recommended
+  load-balancer pattern accordingly.** Documentation only — no code or default
+  behaviour changes. Previously every mention of a plaintext hop said only "deploy
+  on a trusted network", which is an instruction rather than a risk statement, so
+  readers had no basis for judging whether their network qualified. Two places
+  understated it: `README.md` claimed the plain-HTTP client→proxy leg worked
+  "without compromising security" (conflating SigV4 *authentication* with
+  *confidentiality*), and `docs/GETTING_STARTED.md` recommended the one
+  load-balancer pattern that forwards cleartext to the proxy as the default for
+  "most deployments", with no security caveat.
+  - New [What a Cleartext Hop Exposes](docs/ARCHITECTURE.md#what-a-cleartext-hop-exposes)
+    section under Security Considerations enumerates what an observer captures
+    (bucket and object key, the `Authorization` header including the caller's access
+    key ID, object payloads both directions, presigned URL parameters), what is not
+    exposed (the secret access key is never transmitted), and what an observer can do
+    — replay a captured request against S3 within the SigV4 15-minute window, or a
+    captured presigned URL for its full remaining validity. Includes a per-hop table
+    of which hops are cleartext and the encrypted alternative for each.
+  - **Added Pattern 3 (load balancer terminates and re-encrypts)** to
+    `docs/GETTING_STARTED.md`, which was previously undocumented. It gives Pattern 1's
+    certificate convenience (client-facing cert stays in ACM, no `AWS_CA_BUNDLE` on
+    clients) with an encrypted internal hop, because an NLB TLS target group does not
+    validate the target's certificate — so the proxy's cert can be self-signed,
+    long-lived, and needs no SAN matching the client-facing name. **Pattern 3 is now
+    the recommended default**; Pattern 1 is documented as appropriate only where the
+    LB→proxy segment has been consciously accepted as trusted. The comparison table
+    gains an explicit "LB→proxy hop" row and a "Backend cert validated?" row.
+  - New `docs/AWS_DEPLOYMENT.md` (see Added below) presents both encrypted NLB
+    configurations (TCP passthrough and TLS re-encrypt) with guidance on choosing,
+    and warns that a `TLS` listener with a `TCP` target group decrypts at the NLB.
+    The security-group section notes that only 3129 need be reachable behind a load
+    balancer using the TLS listener, since leaving port 80 open there is an
+    unnecessary cleartext path.
+  - Added a Security Considerations entry to the docs index (`docs/README.md`), which
+    previously had none.
+
+
+### Added
+
+- **Hedged upstream requests** (`cache_rules.json` + `config.yaml`): opt in per key pattern to race a second upstream fetch against a slow original on cache-miss GETs, serving whichever returns first. Reduces p99/p99.9 latency for workloads sensitive to upstream tail latency. Off by default — requires an explicit rule. Three new per-rule fields in `cache_rules.json`: `hedging_enabled` (bool), `hedge_trigger_after` (duration, default 250ms), `hedge_max_per_request` (integer, default 1). One new startup field in `config.yaml`: `connection_pool.hedged_requests.max_inflight_fraction` (default `0.1`) — a per-instance ratio cap that suppresses new hedges when in-flight hedges exceed the fraction of in-flight fetches (the first hedge is always admitted regardless of the cap). Hedging covers all cache-miss fetch paths: full-object GET/HEAD, complete and partial range GETs, page-widened fills, and part-number GETs. PUT/POST/DELETE are never hedged. An existing deployment with no rules file or a config file without the new field behaves exactly as before. Validated on every rules load: `hedge_trigger_after` must be > 0 and < `upstream_first_byte_timeout`; an invalid file is rejected in favour of the last-known-good rule set. Composes with `page_widening` on the same prefix. Documented in `docs/CONFIGURATION.md`, `docs/CONNECTION_POOLING.md`, `docs/cache-rules-schema.json`, and `config/cache_rules.example.json`. Surfaced on the dashboard and `/metrics` JSON (`hedged_requests.{issued, won, suppressed}`).
+
+- **AWS deployment guide** (`docs/AWS_DEPLOYMENT.md`): prescriptive recommendations for deploying against a cross-region S3 bucket or an S3-compatible store outside AWS. Covers FSx for OpenZFS HA sizing (throughput tiers, cached-read multiplier, IOPS), the EFS alternative with a cost break-even model, EC2 fleet bootstrap and service configuration, client routing via Route 53 private hosted zones or NLB with end-to-end encryption (including Auto Scaling patterns for both), origin-specific configuration for both use cases, mount requirements, and CloudWatch monitoring. Includes example userdata scripts for FSx and EFS (`docs/examples/userdata-fsxz.sh`, `docs/examples/userdata-efs.sh`). Added to the docs index (`docs/README.md`).
+
+### Fixed
+
+- **TLS proxy listener rejected HTTP-forwarded requests to port-80 endpoints.**
+  When a client used `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://...`
+  (the recommended encrypted-caching configuration), the TLS listener rejected
+  the request with "port 80 not allowed". The port-80 listener was unaffected.
+  The CONNECT handler on port 3129 continues to enforce its existing destination
+  policy (port 443 only, IP-range blocking, optional hostname allowlist).
+
+## [2.4.0] - 2026-07-29
+
+**Upgrade impact:** the `max_ram_cache_size` default rises from 256 MiB to
+512 MiB (+256 MiB RAM per instance), and a client-supplied `If-Range` whose
+validator does not match the cached ETag now costs an S3 round trip instead of
+being answered from cache. No config change required; see the two entries below.
+
+Adds page-aligned range caching (range read widening), an opt-in, per-key
+optimization for analytics-style access patterns (Parquet/ORC footer +
+column-chunk reads). Also lands a RAM cache admission guarantee — any single
+entry up to 64 MiB is now always admitted — which required raising the
+default `max_ram_cache_size`.
+
+### Added
+
+- **Page-aligned range caching (range read widening).** A small ranged GET
+  (requested length below a configurable page size `P`, default 16 MiB) can
+  now be widened to a fixed-size, page-aligned fetch on a per-key basis via
+  two new `cache_rules.json` rule fields: `page_widening` (bool, default
+  `false`) and `page_size` (bytes, default 16 MiB, must be `<= 64 MiB`). The
+  whole page is cached (disk and RAM); the client is always served exactly
+  the bytes it requested. Off by default and never enabled globally — only
+  a matching rule turns it on, because amplification is workload-dependent
+  (a large win when reads cluster within a page; a cost when reads are
+  scattered). Only genuinely missing, not-in-flight bytes are fetched from
+  S3; concurrent sub-page reads coalesce onto a single fetch; a failed
+  widened fetch falls back to the client's original range so widening never
+  turns a would-be-successful request into a failure. See
+  [`docs/CACHE_READ_PATHS.md` — Page-Aligned Range Caching](docs/CACHE_READ_PATHS.md#page-aligned-range-caching)
+  and [`docs/examples/page-aligned-parquet-rules.json`](docs/examples/page-aligned-parquet-rules.json).
+- **New `page_cache.*` metrics**: `widened_requests`, `bytes_prefetched`
+  (plus a derived amplification ratio), `page_hits`, `skipped_signed_range`,
+  `fallbacks`, `ram_page_promotions`, `ram_page_promotion_skipped`. Available
+  from the `/metrics` endpoint and the dashboard's `/api/cache-stats` payload;
+  there is no dedicated dashboard card for them, and they are not OTLP-exported.
+- **RAM cache 64 MiB admission ceiling.** The proxy now unconditionally
+  guarantees that any single RAM cache entry up to 64 MiB
+  (`RAM_CACHE_ADMISSION_CEILING = 67108864` bytes, a compile-time constant,
+  not a config field) is admitted rather than silently dropped — regardless
+  of whether page-aligned range caching is enabled for any key. It works by
+  clamping the effective RAM cache shard count so
+  `max_ram_cache_size / effective_shard_count >= 64 MiB`, logging a warning
+  when this reduces concurrency below the configured
+  `ram_cache_shard_count`. Admission is not retention: to keep `N` concurrent
+  hot large entries resident, size `max_ram_cache_size >= N * 64 MiB`.
+- **Dashboard rule settings now show the remaining per-rule fields.** The
+  "Settings" expander on each cache-rule row lists page widening, page size,
+  and "Local conditions" (`evaluate_conditions_from_cache`) for rules that
+  set them. `evaluate_conditions_from_cache` was settable but invisible in
+  the dashboard; when on, the proxy answers conditional requests for matching
+  keys from cached metadata instead of forwarding them to S3, so this matters
+  when auditing which prefixes skip S3-side credential revalidation.
+
+### Fixed
+
+- **`If-Range` precondition ignored on a cache hit.** The GET/HEAD conditional
+  dispatch classified only `If-Match`, `If-None-Match`, `If-Modified-Since`, and
+  `If-Unmodified-Since`, so a Range GET carrying `If-Range` alone was served
+  from cache as a `206` without the precondition ever being evaluated — even
+  when the client's validator did not match the current object, where RFC 7233
+  §3.2 requires `Range` to be ignored and the full representation returned with
+  `200`. `If-Range` is now classified as a conditional, and is dispatched on the
+  same terms as `If-Match` under `evaluate_conditions_from_cache` (Mode B, the
+  default): when the cached ETag strong-matches the validator the range is
+  served from cache with no S3 round trip; every other case — mismatch, an
+  HTTP-date or weak validator, nothing cached, or Mode A — forwards to S3. A
+  mismatch must forward because RFC 7233 §3.2 then requires the full current
+  body, which the cache may not hold. Unlike `If-Match`, a matching `If-Range`
+  does not refresh TTL or bypass expiry: it asserts which version a `Range`
+  applies to, not that the representation is fresh. When the range turns out to
+  be only partially cached, the gap fetches are pinned with a proxy-injected
+  `If-Match` on the matched ETag rather than the client's `If-Range` (unless
+  `If-Range` was signed, where stripping it would break the signature): a stale
+  `If-Range` on a gap fetch makes S3 return the full object with `200`, which the
+  buffered fetch path reads into memory in full before discarding it as a
+  non-`206`. Regression tests cover the stale and matching cases, each
+  non-comparable validator form, and the partial-cache gap fetch.
+- **TinyLFU inversion in the write-cache eviction path.** The scoring fix
+  shipped in 2.3.1 covered the RAM tier (`shard_find_tinylfu_victim`) and the
+  disk tier (`RangeSpec::tinylfu_score`), but missed a third site:
+  `WriteCacheManager::calculate_eviction_score` still computed
+  `access_count * 1000 / idle_secs`, which inverts the ranking: a write-cached
+  entry accessed 100 times but idle for two hours scored 13, against 1000 for a
+  fresh single-read entry, so the hot entry was evicted first. All three tiers
+  now use the shared `decayed_frequency` helper
+  (`access_count >> min(idle_secs / 3600, 63)`).
+
+  Affects write-cached objects only when `eviction_algorithm: "tinylfu"` is
+  configured; LRU is unaffected. Regression tests cover the hot-versus-fresh
+  ordering, monotonicity in idle time, and agreement with the shared helper.
+
+### Changed
+
+- **`config/config.example.yaml` now matches the built-in defaults.** Two fields in
+  the shipped example disagreed with the code defaults: `put_ttl` was `1d` against a
+  default of 1 hour, and `compression.threshold` was `4096` against a default of
+  `1024`. The example now carries the default values.
+
+  **No behaviour change for an existing deployment** — an existing `config.yaml`
+  states these fields explicitly and keeps its own values. New deployments copying
+  the example get 1 hour and 1024; set the fields explicitly to keep the previous
+  example values. A test now asserts each example value equals its `Default` impl, so
+  this cannot drift again.
+
+  The example's description of the write-cache TTL as "refreshed when objects are
+  accessed via GET" was also incorrect: the `put_ttl` to `get_ttl` move is a one-time
+  transition on the first GET, not a repeating refresh.
+
+- **Documentation corrections across `docs/`.** Every file was checked against `src/`
+  and `config/config.example.yaml`. The corrections an operator may have configured
+  against:
+
+  - Config fields that do not exist were removed: the `cache.distributed_eviction`
+    block, `metadata_lock_timeout_seconds`, `shared_storage.enabled`, and
+    `validation_time_of_day`. The real controls are
+    `shared_storage.eviction_lock_timeout` and
+    `shared_storage.metadata_lock_timeout_ms`. Troubleshooting no longer suggests
+    tuning `max_connections_per_ip`, which has no effect.
+  - Corrected defaults: dashboard `bind_address` `127.0.0.1` (was documented
+    `0.0.0.0`; health and metrics do default to `0.0.0.0`),
+    `range_merge_gap_threshold` 1 MiB (was 256 KB), `max_idle_per_host` 100 (was 10),
+    `idle_timeout` 55s (was 60s), `consolidation_interval` 5s (was 30s),
+    `incomplete_upload_ttl` 1 day and configurable (was described as hardcoded
+    1 hour), eviction target 80% via `eviction_target_percent` (was 90% via the
+    deprecated `eviction_buffer_percent`).
+  - Write-through caching is documented as enabled by default and complete;
+    `DEVELOPER.md` previously recommended against it over three defects fixed in
+    1.16.0 and 2.0.0.
+  - Descriptions of removed behaviour are gone: pre-2.3.1 TinyLFU scoring, local 304
+    generation for `If-None-Match`, and waiter fallback to a duplicate S3 fetch.
+
+  The remaining changes are editorial — the 2.4.0 metrics and RAM-default reference
+  pages, `docs/README.md` indexing, link fixes, and removal of internal task IDs and
+  status markers.
+
+- **Default `max_ram_cache_size` raised from 256 MiB to 512 MiB.** This is a
+  binary-only-upgrade footprint increase: a deployment that does not pin
+  `max_ram_cache_size` explicitly will use +256 MiB of RAM per instance
+  after upgrading. The new default keeps the default `ram_cache_shard_count`
+  of 8 at 8 *effective* shards under the new 64 MiB admission-ceiling clamp
+  (512 MiB / 8 = 64 MiB per shard — no clamp), preserving pre-upgrade RAM
+  cache concurrency. Memory-constrained fleets that must stay at 256 MiB
+  should pin `max_ram_cache_size: 268435456` explicitly and will run with 4
+  effective shards.
+
+## [2.3.1] - 2026-07-27
+
+Fixes a TinyLFU eviction-scoring inversion present in both cache tiers (RAM
+and disk): a genuinely hot-but-idle entry could be evicted before a
+freshly-read one-hit-wonder, because the old score divided frequency by
+recency (`access_count * 1000 / recency`) instead of decaying it.
+
+### Fixed
+
+- **TinyLFU inversion: idle-hot entries no longer evicted before a fresh
+  one-hit read**, in both the RAM tier (`shard_find_tinylfu_victim`) and the
+  disk/shared-storage tier (`RangeSpec::tinylfu_score`,
+  `sort_range_candidates_for_tinylfu`). The new score is
+  `access_count >> min(idle_secs / 3600, 63)` (halves per hour of idle
+  time), computed by a single shared helper (`decayed_frequency` in
+  `cache.rs`) instead of the two duplicated divided-score formulas.
+
+### Changed
+
+- **RAM-tier windowed-frequency machinery removed**, superseded by the
+  decay-based scoring above: `EvictionState.tinylfu_window`,
+  `tinylfu_frequencies`, `tinylfu_window_size`, and the window-size
+  heuristic in `RamCacheShard::new`. Victim scoring now reads
+  `access_count`/`last_accessed` atomics directly.
+
+### Removed
+
+- **Vestigial `RangeSpec.frequency_score` field removed.** It was written
+  in ~15 places but never read for eviction. `.meta` files remain backward
+  compatible in both directions: old `.meta` files containing
+  `frequency_score` still parse (serde ignores the unknown field), and a
+  rolled-back older binary reading a new `.meta` without the field still
+  parses (the field carried `#[serde(default)]`). No config change — the
+  `eviction_algorithm: TinyLFU` token is unchanged; `TINYLFU_HALF_LIFE_SECS`
+  (3600s / 1 hour) is a compile-time constant, not a new config field.
+
+## [2.3.0] - 2026-07-20
+
+Makes content-aware compression fully functional. The extension denylist for
+already-compressed formats (images, video, audio, archives, documents,
+executables) had no effect on any live write path — every write went through
+`compress_content_aware_with_metadata`, which always LZ4-compressed
+regardless of extension. `compression.threshold`, and the
+`compression.enabled` flag on one reconstruction path, were similarly
+disconnected from the write path. This release wires the denylist and
+threshold into live writes, adds a `cache_rules.json`-driven override, and
+adds integrity checksums to the newly-enabled compression-skip path.
+
+### Changed (behavior)
+
+- **The built-in extension denylist is now enforced on writes.** Previously,
+  every write compressed regardless of file extension — `.jpg`, `.zip`,
+  `.mp4`, and every other "already compressed" format were LZ4-compressed
+  anyway, because `CompressionHandler::should_compress_content()` (the only
+  reader of the denylist) had no callers on the write path. Newly written
+  entries for denylisted extensions are now skipped for compression by
+  default, reducing CPU cost on writes; disk usage may shift for workloads
+  dominated by such content. Existing cache entries are unaffected — reads
+  are driven solely by each entry's stored per-entry algorithm tag, never by
+  current configuration.
+- **`compression.threshold` now takes effect.** It was previously hardcoded
+  to `1024` bytes in `HttpProxy::new`, ignoring any configured value.
+  Configured thresholds now apply.
+- **`cache_rules.json`'s `compression_enabled` field now wins over the
+  built-in denylist in both directions.** A rule explicitly setting
+  `compression_enabled: true` for a matching key now forces compression of
+  otherwise-denylisted extensions (e.g. force-compress `.jpg` keys); a rule
+  setting `false` continues to disable compression as before. This is the
+  intended operator override mechanism — there is no separate
+  extension-list configuration field.
+- **Compression-skip writes are now checksummed instead of raw.** A
+  `cache_rules.json` rule setting `compression_enabled: false` already
+  worked pre-2.3.0 and wrote data uncompressed — but as raw bytes with no
+  frame or checksum (tagged `CompressionAlgorithm::None`). The
+  newly-enabled denylist/threshold skip paths (above) would have hit the
+  same gap. Both now go through a new **store-mode LZ4 frame** — a
+  standard LZ4 frame with uncompressed ("stored") data blocks, carrying
+  the same xxhash32 content checksum as compressed frames, without
+  invoking the LZ4 block compressor. Corruption is now detected on read
+  for all compression-skip cases. Entries written by pre-2.3.0 proxies
+  (tagged `CompressionAlgorithm::None`, no frame) remain readable; no
+  write path produces that tag anymore.
+- **`create_configured_disk_cache_manager` now honors `compression.enabled`.**
+  It previously hardcoded `compression_enabled: true` for disk-cache
+  managers rebuilt after initial construction, ignoring the config entirely
+  on that path.
+- **Compression statistics in `/metrics` and OTLP are now live.** They were
+  previously frozen at startup-time (mostly zero) values, because the
+  snapshot handed to health/metrics reporting was a value clone that never
+  observed later mutations, and the dominant streaming write path bypassed
+  the stats-tracking code entirely. `decompression_failures` is now
+  incremented on real decode failures (it was previously always zero).
+
+### Removed
+
+- **`compression.content_aware` config field removed.** It never had any
+  effect in any version of this proxy — verified that no production code
+  path ever read it; content-aware filtering was always applied
+  unconditionally. It is still accepted in YAML via a deprecation alias so
+  existing config files keep parsing; a startup warning is logged if
+  present, and the value is ignored.
+- Dead code removed from `src/compression.rs` and `src/cache.rs` with no
+  production callers: `should_recompress_entry`, `compress_cache_entry(_with_handler)`,
+  `decompress_cache_entry(_with_handler)`, `compress_data`,
+  `compress_data_with_fallback`, `compress_data_content_aware(_with_fallback)`,
+  `CompressionHandler::new_with_content_aware`,
+  `is_content_aware_compression_enabled`, `set_compression_threshold`,
+  `set_compression_enabled`, `set_preferred_algorithm`,
+  `CompressionHandler::calculate_compression_ratio`, `wrap_in_frame` (its
+  encoder setup was identical to the real compression path, so it never
+  actually skipped compression either — superseded by the new store-mode
+  frame encoder), an unreachable `"tar.gz"` match arm in the built-in
+  denylist (extension extraction only ever returns the final dot-suffix, so
+  `.tar.gz` was already matching via `"gz"`), the entire `cache_writer` module
+  (`CacheWriter`, superseded by `disk_cache`'s incremental range writer),
+  `CompressionHandler::should_compress`, `get_skipped_extensions`,
+  `get_compression_threshold`, and `decompress_data_with_fallback`,
+  `DiskCacheManager::get_compression_handler`,
+  `CacheManager::decompress_ram_cache_entry`, the write-only `RamCacheManager`
+  struct (a leftover of the sharded refactor whose fields were never read), the
+  never-incremented `compression_time_ms` stat field (removed from
+  `CompressionStats`, `CompressionMetrics`, and the `/metrics` export), the
+  unused `IncrementalRangeWriter.content_path` field, and the buffered
+  `CacheManager::promote_range_to_ram_cache` (production uses the frame-verbatim
+  `promote_range_to_ram_cache_frame`). Test coverage that exercised the removed
+  helpers was migrated to the live paths rather than dropped.
+  `SignedPutHandler::cache_upload_part` — also production-dead (parts are cached
+  through the streaming part sink) — was moved behind `#[cfg(test)]` rather than
+  deleted: it remains the part-population helper for the multipart test suite
+  (including the same-part-race concurrency regression) and no longer ships in
+  the production binary.
+
+### Fixed
+
+- **S3 keys containing a colon** were previously misclassified for
+  compression purposes by `extract_path_from_cache_key`, which split the
+  cache key at the first `:` — truncating any object key that legitimately
+  contains one. It now strips only the known proxy-appended suffix patterns
+  (`:part:<n>`, `:range:<start>-<end>`).
+- **Compression stats from the disk-cache write paths now reach `/metrics`.**
+  Every per-operation `DiskCacheManager` (built by
+  `create_configured_disk_cache_manager`) constructed its own
+  `CompressionHandler` with a *fresh* stats `Arc`, so `store_range` and the
+  streaming writers counted into short-lived `Arc`s that were dropped with the
+  manager and never observed by the `/metrics` snapshot. Only the buffered
+  in-`CacheManager` paths were visible. The disk-cache manager now shares the
+  `CacheManagerInner` stats `Arc` (new
+  `DiskCacheManager::new_with_shared_stats`), so all write paths contribute to
+  the reported counters.
+- **RAM-tier reads now decompress by the entry's algorithm tag.** Range reads
+  from the RAM cache called an LZ4 frame decoder unconditionally on any entry
+  flagged `compressed`. A legacy `CompressionAlgorithm::None`-tagged range
+  (raw, unframed bytes written by a pre-2.3.0 proxy) that was promoted into RAM
+  verbatim would therefore fail to decode — surfacing as a request error on one
+  read path and a silent cache miss on the other. Both RAM read paths now
+  dispatch on the entry's `compression_algorithm`, returning `None`-tagged
+  bytes verbatim (matching the disk read path and the full-object promotion
+  path).
+- **RAM cache eviction metric now reflects real evictions.** After the sharded
+  RAM-cache refactor, `ShardedRamCache::stats()` hard-coded `eviction_count: 0`
+  / `last_eviction: None`, so the exported `ram_cache_evictions` metric and the
+  dashboard figure were permanently zero regardless of actual eviction
+  activity. Evictions are now counted per shard and aggregated, so the metric
+  tracks RAM-cache pressure.
+
+## [2.2.4] - 2026-07-10
+
+### Security
+
+- **GHSA-w9wp-h8wv-79jx / CVE-2026-48504 resolved**: Bumped `opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` / `opentelemetry-semantic-conventions` from `0.29` to `0.32` (fixed in `opentelemetry_sdk 0.32.1`). Unbounded allocation when parsing oversized inbound W3C `baggage` headers; availability-only impact. Test-only OTLP metric assertions in `src/otlp.rs` were updated for the new API; no production behavior changed.
+
+## [2.2.3] - 2026-06-25
+
+Dashboard improvements: per-bucket traffic table gains a dedicated "S3 Transfer Saved" column backed by a new `bytes_saved` counter, total requests now includes PUTs, and long application log messages are horizontally scrollable. A new `X-Cache: HIT` response header on all cache-hit responses is the mechanism that powers `bytes_saved` tracking and provides a direct cache-hit signal to downstream clients.
+
+### Added
+
+- **`X-Cache: HIT` response header**: all responses served from the proxy cache now include `x-cache: HIT`. This applies to full-object 200 responses (`serve_full_object_from_cache`), range 206 responses (RAM path, streaming path, buffered path), and HEAD responses served from cached metadata. Responses fetched from S3 do not include this header. The header is visible to any HTTP client (curl, AWS SDK, CDN) and is the signal the proxy uses internally to populate the new `bytes_saved` counter.
+
+- **Per-bucket `bytes_saved` metric**: `BucketTrafficStats` gains a new cumulative counter that tracks bytes served from cache per bucket. Unlike `bytes_served` (all GET bytes delivered to clients, including S3 fetches), `bytes_saved` counts only bytes from GET cache hits — the S3 transfer cost the proxy avoided. The difference `bytes_served - bytes_saved` gives bytes actually fetched from S3. Zero for PUTs and UploadPart. Exposed in the `/metrics` JSON and `/api/bucket-traffic` endpoint alongside the existing counters.
+
+### Changed
+
+- **Dashboard: "S3 Transfer Saved" column in per-bucket traffic table**: the per-bucket table now shows three byte columns — **Bytes Downloaded** (all GET bytes to clients, i.e., `bytes_served`), **S3 Transfer Saved** (`bytes_saved`: cache-hit GET bytes only), and **Bytes Uploaded** (`bytes_uploaded`). Previously there was a single "Bytes Served" column.
+
+- **Dashboard: Total Requests includes PUTs**: the "Total Requests" stat in the Overall Statistics card now counts GET + HEAD + PUT (previously GET + HEAD only). PUT count is sourced from `SignedPutMetrics.cached_puts_total + bypassed_puts_total`, which covers both PutObject and UploadPart. A new `put_total` field is also exposed in the `OverallStats` API response.
+
+- **Dashboard: Application log message column is horizontally scrollable**: long messages no longer get clipped at the cell boundary. The log table is now `table-layout: fixed` with explicit column widths for Timestamp, Level, and Target, giving the Message column all remaining space. Messages are wrapped in a `div` with `overflow-x: auto` and `white-space: nowrap`, so the full text is always reachable by scrolling regardless of message length.
+
+- **Dashboard: "Cache Rules and Bucket Stats" renamed to "Cache Rules".** The per-bucket traffic rollup rows (showing hit/miss counts per bucket) have been removed from this section — that information is now covered by the Per-Bucket Traffic table's `bytes_saved` column, which is the more accurate and comprehensive signal. The section now only appears when `cache_rules.json` has at least one configured rule, and each row represents a single rule pattern with its settings and how often it has matched.
+
+### Fixed
+
+- **Dashboard: global cache hit/miss counters now populated.** `Total Requests`, `Get Hits`, `Get Misses`, and `Cache Hit Rate` in the Overall Statistics card were stuck at 0 because `CacheManager.update_statistics()` was missing from the write-through full-object cache-hit path. Consolidated all scattered `update_statistics()` calls into a single exit-point call in `handle_request`, keyed on the `served_from_cache` flag derived from the `X-Cache: HIT` response header (the same source as the per-bucket `bytes_saved` counter). This single-site accounting relies on every cache-hit path setting `X-Cache: HIT`, including the metadata-only HEAD cache-hit path (see Added); without that header a HEAD cache hit is counted as a miss and `head_hits` stays 0.
+
+## [2.2.2] - 2026-06-24
+
+Download bandwidth QoS: operators can now cap the aggregate cache-miss origin download rate and share it fairly across callers or buckets using deficit round-robin scheduling. The feature is **disabled by default** (`max_bytes_per_sec = 0`); a binary-only upgrade changes no behavior until the operator opts in.
+
+### Added
+
+- **Download bandwidth QoS** (`download_bandwidth` config section): limits the aggregate bytes-per-second the proxy pulls from S3 on cache misses and divides that budget fairly across fairness classes using a deficit round-robin (DRR) scheduler. Cache hits are unaffected; only cache-miss origin downloads are throttled.
+
+- **Per-request fairness key** (caller XOR bucket): when `download_bandwidth.caller_id.enabled: true`, requests that carry a valid `app/<value>` token in the User-Agent header are keyed on that caller identity, regardless of which bucket they access. Requests without a valid app-id fall back to the S3 bucket as the fairness key. Caller- and bucket-derived keys are namespaced internally so a caller value equal to a bucket name never collides. The caller value is validated against an optional operator-configured regex and a configurable max-length (default 64); invalid values fall back silently to the bucket key. The feature defaults to **disabled** (bucket-only fairness).
+
+- **Streaming backpressure enforcement**: throttling is applied by withholding `Poll::Pending` from the cache-miss origin stream, so TCP flow control slows the S3 upstream connection. The throttle wrapper (`ThrottleStream`) is positioned downstream of `TeeStream` so the existing idle watchdog cannot be falsely triggered by throttle-induced pauses.
+
+- **Size-aware lease acquisition**: for known-length responses (`Content-Length` / `Content-Range`), the token-bucket lease is bounded by `min(1 MiB, remaining_bytes)`, so small requests never over-acquire budget from the shared pool. Unknown-length streams fall back to a cumulative-bytes heuristic. Unused lease balance is refunded on stream end or drop.
+
+- **Static `cap/N` fleet sharing**: each proxy instance divides the configured aggregate ceiling by the live instance count `N` derived from per-instance heartbeat files in a dedicated `cache_dir/qos/heartbeats/` directory (kept outside `metadata/`, so it is untouched by the cache-metadata consolidation/eviction/journal-cleanup sweeps and by a cache reset). A periodic cold-path task (default 30 s cadence) writes its `{instance_id}.qos` heartbeat, counts `.qos` files fresh within `instance_staleness` as `N`, and reaps clearly-dead heartbeats (past `max(instance_staleness × 10, 10 min)`, e.g. from a restarted PID) in the same pass. The per-instance ceiling is floored to ≥1 for any non-zero aggregate, so it never truncates to 0 (which would read as disabled). Coordination loss falls back to `fleet.fallback_instance_count` (default 1), never to unlimited. The share-computation function is isolated so demand-weighted reconciliation (Phase B) can replace it later without changing enforcement.
+
+- **Observability**: a `download_bandwidth` section is added to the `/metrics` JSON endpoint and the `/api/bandwidth` dashboard endpoint, containing `enabled`, `instance_ceiling_bps`, `failopen_total`, per-class byte counters (bounded by `max_tracked_classes`), and a `residual_bytes` overflow total. OTLP gauges `download_bandwidth.instance_ceiling_bps`, `download_bandwidth.failopen_total`, and `download_bandwidth.class_bytes` (with `class` attribute) are exported when OTLP is enabled.
+
+- **New config fields** (all `#[serde(default)]`, backward compatible; disabled by default):
+  - `download_bandwidth.max_bytes_per_sec` (u64, default `0` = unlimited/disabled)
+  - `download_bandwidth.caller_id.enabled` (bool, default `false`)
+  - `download_bandwidth.caller_id.validation_regex` (string, default `None`)
+  - `download_bandwidth.caller_id.max_len` (usize, default `64`)
+  - `download_bandwidth.max_tracked_classes` (usize, default `1024`)
+  - `download_bandwidth.fleet.fallback_instance_count` (u32, default `1`; **set to fleet size on a fleet**)
+  - `download_bandwidth.fleet.instance_staleness` (duration, default `"30s"`)
+  - `download_bandwidth.fleet.refresh_interval` (duration, default `"30s"`)
+
+### Fixed
+
+- **Journal flush now fdatasyncs** (`sync_data`) before returning, making buffered
+  cache-hit metadata updates durable on shared storage and fixing a CI
+  read-after-write flake on overlay2 storage drivers.  The failing test was
+  `cache_hit_update_buffer::tests::test_multiple_flushes_append`, which asserted 2
+  journal lines immediately after two sequential `force_flush` calls; the overlay2
+  driver returned a stale page-cache read with no intervening `fsync`.  Cost is one
+  `fdatasync` per 5 s flush interval per instance (off the request hot path — a
+  million cache hits in 5 s collapse to one batched write + one sync); the flush
+  interval must not be reduced to sub-second without revisiting this.
+
+## [2.2.1] - 2026-06-23
+
+Per-bucket traffic metrics: the proxy now tracks cumulative GET/PUT bandwidth and request counts per bucket (and optionally per prefix), surfacing them in the `/metrics` JSON endpoint, the operational dashboard, and optionally via OTLP export. Every new config field has a serde default, so existing config files parse unchanged on upgrade.
+
+### Added
+
+- **Per-bucket traffic metrics**: The proxy accumulates cumulative counters per bucket for object reads and object/part writes — `bytes_served`, `bytes_uploaded`, `get_requests`, and `put_requests`. Counters mirror S3's `BytesDownloaded`, `BytesUploaded`, `GetRequests`, and `PutRequests`, making them directly comparable to S3 CloudWatch metrics for cache-savings inference. Scope is intentionally limited to GET (object reads) and PUT (PutObject and UploadPart); HEAD, DELETE, LIST, and the multipart lifecycle POSTs are not counted. A GET is counted only when it carries an object key, so bucket-level list-objects GETs are excluded. Each request is recorded exactly once: GET at the HTTP/TLS request-completion site, PUT/UploadPart in the signed write-through handler (where the request-body byte count is available).
+
+- **`/metrics` JSON** now includes a `bucket_traffic` section with four counter fields per bucket (`bytes_served`, `bytes_uploaded`, `get_requests`, `put_requests`). Key format: `"bucket"` (no prefix) or `"bucket/prefix"` (prefix attribution active).
+
+- **Dashboard `/api/bucket-traffic` endpoint** and a new "Per-Bucket Traffic" table in the operational dashboard, with an overflow indicator when the series cap is reached.
+
+- **OTLP per-bucket observable counters** (opt-in via `metrics.otlp.per_bucket_enabled: true`): four `ObservableCounter<u64>` instruments (`s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, `s3proxy.put_requests`) with `bucket` attribute always present and `prefix` attribute when prefix attribution is active. In-memory accounting and local observability are always active regardless of this flag. The SDK reports cumulative temporality; no manual delta map.
+
+- **Optional prefix dimension** (`metrics.per_bucket.bucket_prefixes`): assigns object keys to the longest matching configured prefix within their bucket. When no prefix matches, traffic is attributed at the bucket level. Resolves using longest-prefix-match.
+
+- **Bounded cardinality** (`metrics.per_bucket.max_series`, default `100`): once the series cap is reached, new bucket+prefix combinations are folded into a `__other__` overflow series. Total traffic is conserved (no counts dropped); series count is bounded at `max_series + 1`. A `warn!` is logged once on first overflow activation.
+
+- **New config fields** (all `#[serde(default)]`, backward compatible):
+  - `metrics.otlp.per_bucket_enabled` (bool, default `false`) — OTLP export gate for per-bucket counters
+  - `metrics.per_bucket.max_series` (usize, default `100`) — cardinality cap
+  - `metrics.per_bucket.bucket_prefixes` (map, default `{}`) — per-bucket prefix lists for prefix-level attribution
+
+## [2.2.0] - 2026-06-22
+
+A security-hardening pass, cache-metadata-resilience changes, RAM cache sharding
+for throughput, cross-region throughput fixes, and a fix that makes conditional
+ranged-GET downloads — notably the AWS CLI CRT transfer client — populate and serve
+from the cache. The proxy now serves `If-Match` requests from cache by default
+(`evaluate_conditions_from_cache` defaults to `true`). Every config addition has a
+serde default, and the single default change is backward compatible (an explicit
+setting in an existing config is preserved), so existing config files parse and run
+unchanged on upgrade.
+
+### Security
+
+- **[Critical] Multipart uploadId path-traversal prevention**: All three multipart
+  handlers validate the client-supplied `uploadId` with `is_safe_path_component`
+  before any filesystem path construction. A malicious `uploadId` (path separators,
+  `..`, NUL, or control characters) is rejected — the request is forwarded to S3
+  unmodified and all local cache filesystem work is skipped.
+- **[High] systemd unit hardening**: `config/s3-proxy.service` adds sandbox directives
+  (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+  `PrivateDevices`, `ProtectKernelTunables`, `ProtectKernelModules`,
+  `ProtectControlGroups`, `RestrictAddressFamilies`) and a `ReadWritePaths` allowlist
+  scoped to the cache and log directories. The service still runs as `User=root` for
+  port 80/443 binding; see `docs/GETTING_STARTED.md` for the privilege-drop option.
+- **[High] Presigned URL masking in logs**: All `uri` references in log macros are
+  wrapped with `mask_presigned_params()`, so `X-Amz-Credential`, `X-Amz-Signature`,
+  and `X-Amz-Security-Token` are never logged in cleartext. The masking fast-path now
+  also detects percent-encoded leading characters (`%58`/`%78`).
+- **[High] Pre-epoch presigned date rejection**: `parse_amz_date` rejects negative
+  timestamps (dates before 1970-01-01) before the `as u64` cast that would otherwise
+  wrap to a far-future expiry.
+- **[High] Destination policy IP gaps closed**: Block `0.0.0.0/8`, IPv4-mapped IPv6
+  (`::ffff:x.x.x.x`, routed to the IPv4 classifier), and the IPv6 unspecified address
+  (`::`). Closes IMDS/loopback reachability via IPv4-mapped notation or the zero
+  network range.
+- **[High] DNS TOCTOU elimination in TCP proxy**: The SNI passthrough path reuses the
+  policy-validated IPs from `DestinationPolicy::check()` for the outbound connect
+  instead of re-resolving, closing a check-to-connect window. Endpoint-override IPs
+  are also validated before use.
+- **[High] Bounded CompleteMultipartUpload body**: New `cache.max_complete_body_bytes`
+  (default 10 MiB) caps the Complete XML body before buffering; oversized bodies are
+  rejected with HTTP 413.
+- **[High] HTTP-path destination policy**: The HTTP forwarding path applies the same
+  `DestinationPolicy::check` as the CONNECT/SNI paths, blocking SSRF to IMDS,
+  loopback, and private ranges. Gated by `connect_allowlist` — skipped when no
+  allowlist is configured, so general forward-proxy use can opt out. S3 public
+  endpoints always pass.
+- **[Low] Additional hardening**: dashboard log XSS escaping (`level`/`target`);
+  `get_metadata_path` returns `Result` instead of panicking on malformed keys; OTLP
+  headers redacted in config `Debug` output; symlink-safe filesystem writes
+  (`create_new` / `symlink_metadata` checks); range-file path-traversal validation on
+  deserialized metadata; `connection_pool.max_registered_endpoints` cap (default
+  10,000); and access-log CR/LF/quote escaping for `referer`/`user_agent`.
+
+### Added
+
+- **Non-blocking metadata I/O**: `get_metadata` runs filesystem reads and JSON parsing
+  in `spawn_blocking` under a concurrency semaphore (`cache.metadata_io_concurrency`,
+  default 32). This fixes the synchronized 60-second warm-cache stalls where one slow
+  or large NFS `.meta` read pinned worker threads, starving request-serving tasks and
+  preventing the consolidation-cycle timeout from firing. The consolidator's key
+  concurrency is reduced from 64 to 32 to match.
+- **Metadata resilience**: a size cap (`cache.max_metadata_file_bytes`, default 4 MiB)
+  rejects oversized `.meta` files in O(stat) without reading them; confidently-corrupt
+  `.meta` files (oversize, legacy schema, or stable parse failure) self-heal on the
+  GET miss path via atomic tmp+rename (HEAD-only paths remove them). New metrics:
+  `metadata_heal_overwrite_total`, `corruption_metadata_by_reason`.
+- **Per-key consolidation timeout**: each key in a consolidation cycle is bounded by
+  `tokio::time::timeout` so one pathological key cannot consume the whole cycle budget;
+  skipped keys retry on the next cycle.
+- **Mid-stream idle watchdog**: TeeStream enforces `connection_pool.upstream_idle_timeout`
+  (default 5s) — if the upstream produces no bytes within the window the stream is
+  aborted so the client's retry logic engages. Cache-writer backpressure does not trip
+  it, and a partial body is never committed. Metrics:
+  `upstream_idle_abort_total{phase=mid_stream}`, `upstream_idle_retry_total`.
+- **`bind_address` for the health and metrics servers** (default `"0.0.0.0"`): set
+  `"127.0.0.1"` to restrict these endpoints to loopback.
+- **`cache.ram_cache_shard_count`** (default 8, range 1–256): number of independent RAM
+  cache shards. Per-shard capacity = `max_ram_cache_size / ram_cache_shard_count`;
+  objects larger than the per-shard capacity are dropped.
+- **Partial range prefix salvage (`cache.partial_range_commit_ratio`, default 0.5)**:
+  when a streamed range cache write ends early — the client cancelled or the mid-stream
+  idle watchdog aborted the stream — but at least this fraction of the requested bytes
+  arrived in order, the proxy now commits the received prefix as a smaller valid range
+  `[start, start + received - 1]` instead of discarding the whole range. This lets a
+  single high-throughput download (notably the AWS CLI CRT client, which opens many
+  parallel range connections — any of which can be cut short by the proxy's idle
+  watchdog or CRT's adaptive part cancellation)
+  populate the cache even when some part requests are cut short. The salvaged prefix is
+  recorded with its true bounds, so it is never served as a complete range — a later
+  request for the missing tail fetches it from S3 and merges. `1.0` keeps the legacy
+  exact-only behaviour; `0.0` commits any non-empty prefix. This is an intentional
+  refinement of the `cache-metadata-resilience` Req 5 contract: the read path may now
+  persist a *smaller* valid range, but never a truncated range labelled with the full
+  requested length. The write-through PUT path is unchanged — a truncated upload is
+  never cached.
+
+### Performance
+
+- **RAM cache sharding**: replaced the single global mutex with a per-shard
+  `tokio::sync::RwLock` and `Arc<Bytes>` zero-copy reads — `get()` is an O(1) refcount
+  bump and the shard lock is released before decompression. Per-entry `last_accessed`
+  and `access_count` are atomics updated under a read lock, with LRU/TinyLFU reordering
+  deferred to `put()`. In a single-proxy same-AZ benchmark (`c6in.16xlarge` proxy and
+  client, 16 GiB RAM cache, 64 MiB objects), RAM cache-hit throughput rose from ~6.3
+  Gbps to ~56.9 Gbps at 50 concurrent connections (~9×) and now scales approximately
+  linearly with connection count up to the client NIC limit, rather than plateauing at
+  ~6 Gbps from 10 connections onward.
+
+### Changed
+
+- **`evaluate_conditions_from_cache` default changed to `true`**: The proxy now serves `If-Match` requests from cache by default when the cached ETag matches and the data is fully cached. This is the optimal setting for the AWS CLI CRT client (which stamps `If-Match` on every ranged GET) and reduces S3 round trips on cache-warm downloads. Operators who want strict S3-authoritative condition evaluation for every request can opt out with `evaluate_conditions_from_cache: false`. **Backward compatible:** if the field is explicitly set in an existing `config.yaml` or `cache_rules.json`, the explicit value is preserved — only omitted-field installs adopt the new default.
+
+### Fixed
+
+- **Cross-region single-stream throughput cap (TCP receive-window auto-tuning)**: the
+  default `connection_pool.tcp_recv_buffer_size` is now `None`, leaving `SO_RCVBUF`
+  unset so the Linux kernel auto-tunes the TCP receive window (DRS) up to
+  `net.core.rmem_max`. Pinning `SO_RCVBUF` (the old 256 KB default) disabled
+  auto-tuning, freezing the window at ~56 KB and capping a single high-RTT stream at
+  ~3.9 Mbps over a 116 ms RTT; auto-tuning restores ~150 Mbps. Backward compatible —
+  the field remains `Option<usize>` and an explicit value still pins `SO_RCVBUF`.
+- **Download coordination: flight key held until cache commit**: the coordination
+  guard for full-object and range requests is now held until the cache write commits,
+  not released on response construction. Eliminates redundant S3 fetches (and potential
+  502s under CRT load) when a request arrives during the ~1–2s commit window.
+- **Conditional (`If-Match`/`If-None-Match`) requests now populate the cache**: a
+  conditional GET, HEAD, or ranged GET was routed to a non-caching forward path
+  (introduced in ~v1.14.0 with conditional-request handling), so from that release on it
+  was answered from S3 but never written to the cache. The AWS CLI CRT client stamps
+  `If-Match` on every ranged GET of a multi-part download — pinning every part to the
+  single object version it learned from its initial HeadObject, so the download never
+  mixes bytes across versions — so for CRT, the recommended high-throughput client, every
+  ranged GET was conditional and therefore uncached: repeated large-object downloads all
+  ran at the cache-miss rate. Conditional requests are now
+  dispatched by header class. `evaluate_conditions_from_cache = false`:
+  every conditional is forwarded to S3 with all headers intact (SigV4 signature
+  preserved); `200`/`206` is cached; `304`/`412` are forwarded without caching.
+  `evaluate_conditions_from_cache = true`: an `If-Match` request where the cached ETag
+  matches and the data is fully cached is served from cache (the CRT fast path — no S3
+  call, TTL refreshed); `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since`
+  always forward to S3. TTL/version reconciliation: a `200`/`206` is cached under S3's
+  response ETag — if that ETag differs from a stale cached entry, the cache lookup
+  invalidates the old ranges and replaces them with the fresh content; a `304` refreshes
+  the cached entry's TTL only when the `304`'s ETag matches the cached ETag (otherwise
+  the stale entry is invalidated on the next non-conditional miss). Resolves the "CRT
+  large-object caching" known issue.
+
+### Removed
+
+- **Dead inline-body disk write path**: removed `store_cache_entry` and
+  `atomic_write_cache_entry` (and the `compress_cache_entry`, `decompress_cache_entry`,
+  `get_cache_entry`, and `extract_file_extension` helpers used only by them). These
+  serialized the entire `CacheEntry` — including its `body: Option<Vec<u8>>` — into the
+  `.meta` file, the root cause of the 5.4 MB `.meta` files found in the 2026-06-17
+  investigation. Only test code called them; the live write path (`store_range`) writes
+  separate LZ4 `.bin` files and small (~2 KB) `NewCacheMetadata` `.meta` files.
+
+### Documentation
+
+- Dashboard documented as unauthenticated and read-only, with the network-restriction
+  requirement for non-loopback binds and the `127.0.0.1` + SSH-tunnel option for secure
+  remote monitoring (`docs/DASHBOARD.md`, `docs/ARCHITECTURE.md`,
+  `config/config.example.yaml`). No behavior or default change.
+
+## [2.1.0] - 2026-06-12
+
+### Added
+- **`connection_pool.upstream_overrides`: per-destination upstream transport overrides** (GitHub #7): A new optional config map lets the proxy front S3-compatible stores that are not reachable over verified TLS on port 443 — stores served over plaintext HTTP, over validated HTTPS on a non-443 port, or over unvalidated HTTPS (self-signed certificates on trusted networks). Each entry is keyed on a host matcher and port and declares the upstream transport (`scheme`, and for HTTPS `validate_tls`). The override lookup is the sole transport switch for a request: the proxy resolves the destination `(host, port)` against the map and falls back to verified-TLS-on-443 egress when no entry matches. `validate_tls` defaults to `true`, so an HTTPS override is secure unless validation is explicitly waived. Protection-waiving modes (plaintext HTTP and unvalidated HTTPS) emit a startup warning and are intended for local development and trusted networks only. The feature is opt-in, default-off, and additive: with no overrides configured, every destination keeps the existing verified-TLS-on-443 behaviour, identical to a build without this feature. Resolves GitHub #7.
+
+  The upstream port comes from the request. In forward-proxy mode the absolute-form request authority carries the upstream `host:port`, so the proxy dials whatever port the client targets. In standard (hosts-file) mode the proxy takes the port from the `Host` header (defaulting to 80, the caching-egress origin port) and accepts client connections only on its configured `http_port` and `https_port`, so a client aimed at a non-standard upstream port is not intercepted there. The transport itself — plaintext, validated TLS, or unvalidated TLS — is selectable by configuration on whatever port the request targets in both modes.
+
+  Backward compatible: the field has a serde default (empty map), so existing config files parse and run unchanged — no config edits required on upgrade.
+
+- **Streaming signed-write path: bounded memory independent of object size**: Single-part `PUT` and `UploadPart` now stream the request body to the upstream and tee it to the write-through cache incrementally, instead of buffering the whole body in RAM before forwarding. The upstream still receives the original client bytes byte-for-byte (the SigV4 signature is untouched); only the cache branch decodes aws-chunked, now via an incremental decoder. Per-request memory is `O(per-connection buffer)` rather than `O(object size)`, so a large upload no longer scales proxy resident memory with the object size, and worst-case fleet memory is bounded by `max_concurrent_requests × write_cache_tee_channel_depth × frame`. Cache-failure isolation is preserved: any cache-branch problem (capacity skip, SSE-C bypass, decode error, write-cache-disabled rule, decoded-length mismatch) abandons the tee and keeps streaming verbatim to the upstream, returning the upstream response unchanged. `CompleteMultipartUpload` still buffers its small completion XML (bounded by the body-size cap), and the multipart correctness gates are unchanged.
+
+- **`server.write_cache_tee_channel_depth`: per-connection streaming-write buffer knob**: New optional field (default `5` frames) bounding the depth of the streaming write-cache tee channel. The per-connection streaming-cache budget is one in-flight frame plus this many queued frames, where a frame is a single forwarded request-body frame bounded by the HTTP read buffer, so the default keeps per-connection streaming memory on par with the GET path and independent of object size. The downstream cache writer reuses `compression_batch_size` for LZ4 batching rather than duplicating it. The field has a serde default, so existing config files parse and run unchanged on upgrade. Documented in `config/config.example.yaml` and `docs/CONFIGURATION.md`.
+
+### Changed
+- **`server.max_buffered_request_body_bytes` now means "accepted/streamed", not "held in RAM"**: The cap is still enforced — a signed-write body exceeding it is rejected with HTTP 413 `EntityTooLarge` — but the accepted body is now streamed to the upstream and tee'd to the cache incrementally rather than buffered whole in memory. The field's name, default (5 GiB), and 413 behaviour are unchanged; only the implementation and the documented meaning are clarified. No config edits required on upgrade.
+
+### Fixed
+- **Streaming signed-write path could wedge the async runtime on small instances**: The streaming write-cache path performed its blocking filesystem work — LZ4 batch compression, `File::write_all`, flush, and the atomic `.tmp`→final rename — and the multipart `upload.lock` advisory `flock` directly on the Tokio worker threads. On a 2-worker runtime (the default on a 2-vCPU host such as `m6in.large`), two concurrent large PUTs pinned both workers in synchronous EFS writeback, starving the runtime: the `/health` endpoint timed out and the SIGTERM handler never ran. Fixed by draining the cache tee channel and running all sink writes and the finalize/rename on a `spawn_blocking` thread, and by acquiring and holding the multipart `upload.lock` flock (plus the finalize and size-tracker update it guards) on a blocking thread under a bounded 30s timeout. The async worker stays free to poll other tasks — including `/health` and shutdown — while cache I/O blocks. Added a worker-constrained regression test (`worker_threads = 2`, concurrent streamed writes) that deadlocks if the blocking work returns to the async workers.
+- **OTLP metrics export was silently disabled on every boot**: The OTLP exporter failed to initialize with `OTLP build failed: no http client specified` and then continued running, so no metrics ever reached the configured endpoint (CloudWatch Agent or otherwise). Root cause: `opentelemetry-otlp`'s `default` feature pulls in `reqwest-blocking-client`, whose blocking HTTP client cannot be constructed inside the Tokio runtime; in 0.29 that path is preferred over the async client and fails, falling through to "no http client specified". Fixed by depending on `opentelemetry-otlp` with `default-features = false` and an explicit minimal feature set (`metrics`, `http-proto`, `reqwest-client`), so the async reqwest client is used. Added a regression test that asserts the exporter initializes successfully inside a Tokio runtime. No config change required; existing `metrics.otlp` settings now take effect as documented.
+
+## [2.0.0] - 2026-06-02
+
+Glob cache match patterns (GitHub #8, #9). **If you never used per-bucket `_settings.json`, this upgrade requires no action** — behaviour is unchanged and the new rules file is optional. This is a **breaking change** only for operators who used `_settings.json` (including `prefix_overrides`): that mechanism is removed and replaced by a single, hot-reloadable `cache_dir/cache_rules.json` of ordered glob rules matched against the full `{bucket}/{object_key}` cache key. There is no auto-migration; translate your configuration by hand. See the before/after example below and `docs/CONFIGURATION.md` / `docs/CACHING.md` before upgrading.
+
+### Added
+- **Metrics: cache rules reload health, eager invalidation, and TTL revalidation counters**: New `cache_rules` section in `/metrics` JSON and OTLP export tracks the lifecycle of `cache_rules.json` hot-reloads: `reloads_total`, `reload_failures_total`, `on_fallback` (1 when the running ruleset is a stale fallback after a failed load), and `rules_loaded`. New `cache.read_disabled_invalidations_total` counts successful eager cache purges triggered by `read_cache_enabled=false` rules. New `cache.ttl_revalidations_total` counts TTL-driven conditional revalidations against S3 (freshness expired → conditional GET/HEAD). Per-bucket hit/miss counters now track all buckets (not only those with the removed `_settings.json`). The per-request `record_bucket_cache_access` path no longer re-resolves settings — it accepts the already-resolved `SettingsSource`, honouring the resolve-once-per-request contract.
+
+### Changed
+- **BREAKING CHANGE — per-bucket `_settings.json` removed, replaced by `cache_dir/cache_rules.json`**: The proxy no longer reads `cache_dir/metadata/{bucket}/_settings.json` (or its `prefix_overrides`). Cache settings now come from a single optional `cache_dir/cache_rules.json` containing an ordered `rules` list. Each rule is a glob `pattern` plus an optional subset of the same settings fields the old per-bucket file carried (`get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`). The rules file inherits the existing edit-and-go reload model (lazy poll on a staleness threshold, last-known-good retained on an invalid edit), so the restart-free upgrade contract is unchanged. This collapses two long-standing requests into one engine: applying one rule across many buckets without duplicating a file into each (#9), and matching a static segment in the middle of a partially-dynamic key (#8).
+
+  **Patterns match the full cache key `{bucket}/{object_key}`** (no leading slash), so the bucket name is part of the match surface:
+  - A literal bucket prefix is a per-bucket rule: `mybucket/temp/**`.
+  - A leading `**` or `*` is a cross-bucket rule: `**/logs/**` matches `logs/` in every bucket.
+  - A wildcard before a literal segment matches a middle segment: `**/credit-cards/**`.
+
+  **Glob syntax** (anchored to the whole key, case-sensitive): `*` matches a run of non-`/` characters (one path segment), `**` matches a run including `/` (crosses segments), `?` matches one non-`/` character, and every other character is a literal.
+
+  **Anchored, not prefix**: the old `prefix_overrides` used `starts_with`, so `/temp/` matched everything beneath it. Globs are anchored to the entire key, so to match "everything under `temp/`" you must write `mybucket/temp/**`. Writing `mybucket/temp` matches only the exact key `mybucket/temp`, and `mybucket/temp/` matches only that exact string — neither matches `mybucket/temp/file.txt`.
+
+  **Precedence is first-match-per-field**: for each settings field independently, the value comes from the earliest rule in list order that sets it; unset fields fall through to later matching rules and finally to the YAML `cache:` scalar defaults. Put specific rules above broad ones. With no `cache_rules.json` (or `rules: []`), every field resolves to the YAML `cache:` defaults.
+
+  **No auto-migration.** Existing `_settings.json` files are ignored after upgrade. If any are found under `cache_dir/metadata/` at startup, the proxy logs a one-time warning pointing to this migration note; it does not read or honour them.
+
+  Before — `cache_dir/metadata/mybucket/_settings.json` (a per-bucket file with a `prefix_overrides` entry that zeroed the GET TTL under `/temp/`):
+
+  ```json
+  {
+    "prefix_overrides": [
+      { "prefix": "/temp/", "get_ttl": "0s" }
+    ]
+  }
+  ```
+
+  After — `cache_dir/cache_rules.json` (one full-key glob rule; note `mybucket/temp/**`, not `mybucket/temp`):
+
+  ```json
+  {
+    "rules": [
+      { "pattern": "mybucket/temp/**", "get_ttl": "0s" }
+    ]
+  }
+  ```
+
+  Full details, including the cache-key forms for regional access points, MRAPs, and S3-compatible hosts: `docs/CONFIGURATION.md`, `docs/CACHING.md`, the rules schema at `docs/cache-rules-schema.json`, and the worked example at `config/cache_rules.example.json`.
+
+- **`bucket_settings_staleness_threshold` retained**: The config field keeps its name (via a serde alias, conceptually "rules staleness") and now governs how often `cache_rules.json` is re-read. No YAML config edits are required to adopt or omit this feature.
+
+- **Resolved cache settings apply on the next read, not at write time**: Cache rules are re-resolved on every read request, so a `cache_rules.json` edit takes effect on already-cached objects on the next GET/HEAD after the staleness window — no restart, no manual cache wipe. Freshness is evaluated against the **current** resolved TTL (`now - created_at` vs `get_ttl` for GET, `head_ttl` for HEAD), not the `expires_at` / `head_expires_at` baked at write time, so `get_ttl=0` / `head_ttl=0` force conditional revalidation against S3 on every GET / HEAD, and a reduced TTL expires an already-cached object once `now - created_at` exceeds it. Resolving `read_cache_enabled=false` for a key that has a cached copy not only stops serving it but **eagerly deletes** the cached entry (range files + metadata, via the DELETE invalidation path) and forwards to S3 — on both the default gate and the conditional-request (`evaluate_conditions_from_cache`) path, for GET and HEAD alike — so a no-cache rule is self-cleaning. The read path reuses the single per-request `ResolvedSettings` (resolve-once preserved) and all comparisons are read-only (no metadata rewrite on read). `read_cache_enabled=true` within the current window, and unchanged rules, behave exactly as before.
+
+- **Proxy identification Referer header renamed**: The `Referer` header added to requests forwarded to S3 now uses the correct product name: `Hybrid Cache for Amazon S3/{version} ({hostname})` (was `s3-hybrid-cache/{version} ({hostname})`). If you query S3 Server Access Logs by Referer (e.g. Athena `WHERE referer LIKE ...`), update your pattern to match the new prefix.
+
+### Fixed
+- **Write-cache GET TTL revalidation**: The first GET of a write-through-cached object now correctly honors `get_ttl=0` (revalidates and authenticates against S3) instead of serving from cache. Previously, the write-cache-to-read-cache TTL transition (`refresh_write_cache_ttl`) fired asynchronously *after* the freshness check, so the first GET saw the `put_ttl`-based `expires_at` and returned a cache hit. The transition now runs synchronously *before* the freshness check at both decision-gate call sites, so `expires_at` is reset to `now + get_ttl` before the Fresh/Expired decision. For `get_ttl=0` this makes the object immediately expired, triggering conditional revalidation on every GET as documented. Non-zero `get_ttl` objects are unaffected (they remain fresh after transition when `now + get_ttl` is in the future). This was a pre-existing bug made more visible by cache rules, which let operators target specific prefixes with `get_ttl=0`.
+- **A reduced `get_ttl` / `head_ttl` was ignored for already-cached objects**: A pre-existing defect (present in 1.x with `_settings.json` too): the read-path freshness check compared the stored write-time `expires_at` / `head_expires_at` to `now` and never re-resolved the current TTL, so lowering a freshness TTL did not shorten the life of objects already in cache — they stayed "fresh" until the original window elapsed or they were evicted, contradicting the documented meaning of `get_ttl=0` / `head_ttl=0` ("validate against S3 on every request"). Freshness is now evaluated against the current resolved TTL on every read (see the new read-time application behavior under Changed), so a tightened or zeroed TTL takes effect on the next GET/HEAD.
+
+## [1.16.4] - 2026-06-01
+
+Build-toolchain pin and clippy fixes for Rust 1.96. No production code changes — `src/` runtime behavior is unchanged (all fixes are style-level lints and test code), so the upgrade contract is unaffected.
+
+### Fixed
+- **Clippy lint fixes (Rust 1.96)**: Resolved 6 lints promoted to errors by `-D warnings` under the newer toolchain in CI's `rust:latest` image. Four `clippy::manual_option_zip` sites in `src/http_proxy.rs` (header-map construction) rewritten to use `Option::zip`. One `clippy::filter_next_back` in a `src/cache.rs` property test rewritten to `Iterator::rfind`. One `clippy::unnecessary_unwrap` (unwrap-after-`is_ok`) in `tests/cache_size_tracking_integration_test.rs` rewritten to `if let Ok`. These were pre-existing — the code predated the lints; CI surfaced them when `rust:latest` advanced to 1.96.
+
+### Changed
+- **Pinned the build toolchain to Rust 1.96**: Added `rust-toolchain.toml` (channel `1.96`, with `rustfmt`/`clippy`) and changed the CI base image from `rust:latest` to `rust:1.96` in `.gitlab-ci.yml`. Local builds and CI now use the same compiler, so new clippy lints no longer appear unannounced on a `rust:latest` bump (this is the third such recurrence — see 1.16.2 for Rust 1.95). The toolchain pin is the *build* version and is distinct from the MSRV floor (`rust-version = "1.89"` in `Cargo.toml`); bump the pin and the CI image together, deliberately, running the full pre-push checklist each time.
+
+## [1.16.3] - 2026-06-01
+
+Test coverage release. No production code changes — `src/` runtime logic is unchanged, so the upgrade contract is unaffected (`cargo build --release` → copy binary → `systemctl restart`, no config edits).
+
+### Added
+- **Inline unit tests for `tcp_proxy.rs`** (13 tests): TLS ClientHello SNI extraction (valid hostnames, non-handshake records, truncated input, non-ClientHello handshake type, non-hostname SNI extension type) plus `format_bytes` unit boundaries and `format_addr` IPv4-mapped-IPv6 simplification. Previously this 773-line module had no inline coverage and was only exercised indirectly via TLS passthrough integration tests.
+- **Inline unit tests for `shutdown.rs`** (12 tests): broadcast subscriber accounting (`subscriber_count`, subscribe/drop), `initiate_shutdown`/`force_shutdown` with no components registered (minimal-config case), signal broadcast delivery, and `ShutdownSignal` state transitions including the closed-channel path that must unblock rather than hang.
+- **Inline unit tests for `health.rs`** (8 tests): `determine_overall_status` precedence (Unhealthy > Degraded > Healthy, empty = Healthy), `check_health` with no subsystems registered, result caching, and `SystemHealth`/`HealthStatus` JSON serialization (including the `skip_serializing_if` on `ip_distribution`).
+
+### Changed
+- **`docs/DEVELOPER.md` testing section**: Replaced the stale "Coverage: 236 tests passing" figure with a description of the suite structure (inline `#[cfg(test)]` modules in 40+ `src/` modules plus 130+ files under `tests/`) and grep-able commands to get current counts, so the number cannot go stale again. Added a Coverage subsection documenting local `cargo-llvm-cov` usage.
+
+## [1.16.2] - 2026-05-11
+
+### Fixed
+- **Clippy lint fixes (Rust 1.95)**: Resolved 13 `clippy::unnecessary_sort_by` and `clippy::manual_checked_ops` warnings promoted to errors by `-D warnings`. Replaced `sort_by(|a, b| ...)` with `sort_by_key` in `background_recovery.rs`, `cache_validator.rs`, `connection_pool.rs`, `dashboard.rs`, `journal_consolidator.rs`, and `journal_manager.rs`. Replaced manual guard-then-divide patterns with `checked_div().unwrap_or(0)` in `cache_initialization_coordinator.rs`, `cache_validator.rs`, and `metrics.rs`.
+
+## [1.16.1] - 2026-05-11
+
+### Security
+- **RUSTSEC-2026-0097 fully resolved — OTel stack upgraded to 0.29**: Bumped `opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` / `opentelemetry-semantic-conventions` from `0.27` to `0.29`. `opentelemetry_sdk 0.29` depends on `rand 0.9`, eliminating the last runtime reach path for the unsound `rand 0.8` advisory. The `tonic 0.12` transitive path (via `opentelemetry-otlp 0.27`) is also gone — `opentelemetry-otlp 0.29` no longer pulls in `tonic`. The only remaining `rand 0.8.5` in the lock file is `quickcheck 1.0.3` (dev-dependency, test-only; no runtime exposure). `cargo audit` now exits 0 with an empty `ignore` list in `.cargo/audit.toml`. API changes in `src/otlp.rs`: `PeriodicReader::builder()` no longer accepts a runtime argument (removed); `Resource::new(vec![...])` replaced with `Resource::builder_empty().with_attributes(vec![...]).build()` (the `new` constructor was made private in 0.29).
+
+## [1.16.0] - 2026-05-09
+
+Comprehensive security, correctness, and hardening release addressing 34 findings from a code review. Minor version bump because the `max_waiter_resubscriptions` config addition and the public API changes to `WriteCacheManager`, `metadata_lock_manager`, and `aws_chunked_decoder` are net-new surface (all defaulted; existing configs parse unchanged).
+
+### Security
+- **CONNECT / SNI destination restriction (Req 1)**: The TLS proxy listener and HTTPS passthrough listener now reject destinations outside port 443 and outside the public internet by default. New `src/destination_policy.rs` module classifies resolved IPs against link-local (169.254.0.0/16, fe80::/10), loopback (127.0.0.0/8, ::1), and private (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7) ranges; destinations where every resolved IP falls in a prohibited range are rejected with HTTP 403 (CONNECT) or silent TCP shutdown (SNI). IPs present in `endpoint_overrides` are exempt so PrivateLink ENIs and on-prem object stores continue to work. New optional `server.tls.connect_allowlist` field accepts glob patterns (e.g. `*.amazonaws.com`) for operator-configured hostname restriction — absent by default, so operators running MinIO, Ceph RGW, Wasabi, or Backblaze B2 are not broken out of the box. Closes the IMDS credential-exfiltration path (Appendices A and B of the review).
+- **Presigned URL credential masking in logs (Req 15)**: `mask_presigned_params()` helper in `src/logging.rs` redacts `X-Amz-Signature`, `X-Amz-Credential`, and `X-Amz-Security-Token` values to `REDACTED` before writing to access logs or the four audited `info!` callsites in `src/http_proxy.rs`. Case-insensitive parameter name matching; handles percent-encoded param names; fast-path returns URI unchanged when no sensitive params are present.
+- **Request body size cap (Req 11)**: New `server.max_buffered_request_body_bytes` config field (default **5 GiB**, `#[serde(default)]`), matching the S3 single-part PUT and UploadPart maximum so the proxy is transparent to all valid S3 clients. `read_request_body_bounded()` in `src/signed_request_proxy.rs` replaces unbounded `body.collect().to_bytes()` calls in signed-PUT and signed-request paths; fast-rejects on `Content-Length` header before reading any body bytes. Returns HTTP 413 with S3-compatible `EntityTooLarge` XML on exceed. Operators on memory-constrained instances can lower the default.
+- **SigV4 authorization header parsing (Req 12)**: `is_sigv4_algorithm()` now requires the header to start with `AWS4-HMAC-SHA256 ` or `AWS4-ECDSA-P256-SHA256 ` (algorithm + space) AND contain `Credential=`, `SignedHeaders=`, and `Signature=` components. A random string containing the substring `AWS4-HMAC-SHA256` no longer routes through the signed code path.
+- **Dashboard bind default 127.0.0.1 (Req 13)**: `DashboardConfig::default().bind_address` changed from `0.0.0.0` to `127.0.0.1`. Operators exposing the dashboard beyond localhost must now explicitly override `server.dashboard.bind_address` and are responsible for the network restriction. README Network access section updated to document ports 8080 (health), 8081 (dashboard), 9090 (metrics).
+- **Process umask 0o077 at startup (Req 14)**: `src/main.rs` now calls `libc::umask(0o077)` as the first statement in `main()`, before config load or any file creation. All files created by the proxy now have owner-only permissions (0600 for files, 0700 for directories) regardless of the inherited umask. `#[cfg(unix)]`; non-Unix platforms emit a warning to stderr.
+
+### Fixed — data integrity and distributed correctness
+- **Truncated body rejection on streaming GET (Req 2)**: New length-validation gate in the streaming GET fallback path of `src/http_proxy.rs` compares accumulated byte count to the declared `Content-Length` (or `Content-Range` end-start+1) before commit. On mismatch, emits a structured `warn!` with `cache_key`, `declared_length`, `accumulated_length`, and `cause`, then calls `cache_writer.discard()`. Responses with neither header are now discarded rather than committed. No more silent truncation serving cached-but-incomplete bodies as complete.
+- **Atomic durable cache commit (Req 4)**: `Cache_Writer::commit()` in `src/cache_writer.rs` rewritten. New sequence: flush → `sync_all` on `.bin.tmp` → rename to `.bin` → write `.meta.tmp` → `sync_all` → rename to `.meta`. On any failure, a new `cleanup_on_failure()` helper removes `.bin.tmp`, `.meta.tmp`, and the already-renamed `.bin` if present, guaranteeing no orphan `.bin` without `.meta`. Startup cleanup in `src/background_recovery.rs::cleanup_orphan_bin_files()` scans `ranges/` and removes any `.bin` without a corresponding `.meta` (handles crashes between the two renames).
+- **Cross-host metadata lock ownership (Req 3)**: `is_lock_stale()` in `src/metadata_lock_manager.rs` rewritten to never consult local PID existence for remote-owned lockfiles. Same-host staleness: PID check via `kill(pid, 0)`. Different-host staleness: wall-clock timeout only, using the new `metadata_lock_timeout_ms` config field (default 30_000). New `LockFileContent` JSON payload records `instance_id`, `hostname`, `pid`, `acquired_at_ms`, and monotonic `fence_epoch`. `break_stale_lock()` never deletes a cross-host lockfile — it overwrites content in-place with an incremented epoch, fsyncs, and re-reads to verify. Fence-epoch verification on acquisition rejects takeover if the post-write read sees a different epoch (another host raced us). New `MetadataLock::refresh_heartbeat()` updates `acquired_at_ms` during long operations to prevent false timeout-based takeovers.
+- **UUID-fenced distributed eviction lock (Req 5)**: `try_acquire_global_eviction_lock()` in `src/cache.rs` writes a fresh UUID v4 + `acquired_at_ms` + hostname to the lockfile, fsyncs, then re-reads to verify the UUID matches. New `verify_eviction_fence()` method is called before every batched filesystem mutation in the eviction pass and returns `ProxyError::EvictionFenceLost` on UUID mismatch, aborting the pass immediately. `release_global_eviction_lock()` only truncates the lockfile if the current UUID still matches its own. The `eviction_lock_timeout` config field is now wired into stale-takeover logic (was previously dead). Protects against NFS lockd reset scenarios where two hosts believe they hold the lock simultaneously.
+- **ETag list parsing for conditional requests (Req 6)**: `parse_etag_list()`, `etag_list_strong_match()`, `etag_list_weak_match()` in `src/http_proxy.rs` correctly handle comma-separated ETag lists per RFC 7232. State-machine splits on commas outside double quotes; classifies each entry as Strong, Weak, or Invalid; returns positive match if any entry matches. Replaces the old whole-string equality that caused `If-Match: "a", "b", W/"c"` to never match any entry. Conditional request evaluation in `evaluate_client_conditions_against_cache()` now uses the list-aware versions.
+- **Download coordinator waiter re-subscription (Req 7)**: Timeout handling in `forward_get_head_with_coordination`, `forward_part_with_coordination`, and `forward_range_with_coordination` in `src/http_proxy.rs` no longer falls back to an independent S3 fetch on timeout. New `InFlightTracker::try_resubscribe()` atomically re-subscribes a timed-out waiter to the in-flight fetch when the FetchGuard is still registered. New `download_coordination.max_waiter_resubscriptions` config field (default 3) caps re-subscriptions; on exhaustion the waiter receives HTTP 504 Gateway Timeout instead of silently launching a duplicate fetch.
+
+### Fixed — crash prevention
+- **TTL arithmetic overflow safety (Req 8)**: New `safe_expiry(base: SystemTime, ttl: Duration) -> SystemTime` helper in `src/cache_types.rs` uses `checked_add` with a 10-year (315_360_000 seconds) clamp. Replaced all 12 `SystemTime + Duration` callsites in `src/cache.rs` and `src/cache_types.rs`. Startup config validation in `CacheConfig::validate()` rejects `get_ttl`, `put_ttl`, `head_ttl`, and `incomplete_upload_ttl` values exceeding 315_360_000 seconds with a clear error naming the offending field. Large TTL values in config no longer crash the proxy on first use.
+- **Presigned URL validation hardening (Req 26)**: `parse_presigned_url()` in `src/presigned_url.rs` validates `X-Amz-Algorithm` is exactly `AWS4-HMAC-SHA256`, caps `X-Amz-Expires` at 604_800 seconds (7 days), rejects values ≤ 0, and uses `checked_add` for the expiry computation (returns `ExpiryOverflow` instead of panicking). New structured error enum `PresignedUrlError` with seven variants.
+- **AWS chunked decoder trailer parsing + length verification (Req 27)**: `decode_aws_chunked()` in `src/aws_chunked_decoder.rs` now parses trailer `key: value\r\n` lines after the zero-size chunk until the terminal `\r\n`, collects them into `Vec<(String, String)>`, caps the trailer section at 8192 bytes, and verifies `pos == body.len()` — returning `LengthMismatch` if any bytes remain unconsumed. Return type changed to `AwsChunkedDecodeResult { data, trailers }` so callers can access trailers (e.g. `x-amz-checksum-*`).
+- **HTTP chunked transfer decoder bounds (Req 17)**: `decode_chunked_body_bounded()` in `src/signed_request_proxy.rs` enforces `ChunkedDecodeConfig { max_chunk_size: 16 MiB, max_total_decoded: 100 MiB }` and returns structured `ChunkedDecodeError` (`ChunkTooLarge`, `BodyTooLarge`, `TruncatedBeforeTerminator`, `MalformedChunkSize`) instead of silent truncation. Callers receiving a decode error must not commit to cache or return 200.
+- **Integer overflow in range and retry arithmetic (Req 29)**: `range_handler.rs:456` uses `current.end.saturating_add(1)`. Retry backoff in two `signed_request_proxy.rs` sites uses `attempt.min(20)` + `checked_shl` + `saturating_mul`, capped at 60 seconds.
+
+### Fixed — concurrency correctness
+- **Write cache capacity accounting (Req 9)**: `src/write_cache_manager.rs` rewritten. New single atomic `try_reserve(size) -> Option<WriteReservation>` entry point replaces the racy `ensure_capacity` + `reserve_capacity` two-step. Uses `compare_exchange_weak` in a CAS loop; concurrent reservations can never together exceed the configured cap. Returns an RAII `WriteReservation` handle that releases capacity on `Drop` via saturating subtraction, so cancellation or panic mid-upload auto-releases. Rate-limited `warn!` (once per 60s via a global `AtomicU64`) on underflow detection. Removed `ensure_capacity`, `reserve_capacity`, `release_capacity` from the public API; all callers updated. `can_write_cache_accommodate()` retained as a deprecated legacy helper.
+- **IP health tracker recovery with exponential cooldown (Req 28)**: `IpHealthTracker` in `src/connection_pool.rs` now tracks unhealthy IPs with `unhealthy_at: Instant` + `cooldown: Duration`. Once cooldown elapses, an IP becomes a probe candidate; a successful probe clears the unhealthy state and failure count, while a failed probe doubles the cooldown (capped at `health_probe_max_cooldown`, default 300s). New config fields: `connection_pool.health_probe_initial_cooldown` (default 5s) and `health_probe_max_cooldown` (default 300s), both `#[serde(default)]`. (Correction: the probing described here was not reached in this release. Excluded IPs continued to be reintroduced by the next DNS refresh, and these two fields had no observable effect. Probe-based recovery became active in 2.5.0.)
+
+### Fixed — operational correctness
+- **Background task shutdown integration (Req 10)**: `BackgroundRecoverySystem::start()` in `src/background_recovery.rs` now accepts a `broadcast::Receiver<()>` from the `ShutdownCoordinator` and uses `tokio::select!` to stop on shutdown. Background recovery no longer runs past `shutdown_timeout` and no longer gets force-killed mid-write. `ShutdownCoordinator::subscriber_count()` exposes the broadcast receiver count for test assertions.
+- **Atomic journal rewrites (Req 18)**: `cleanup_consolidated_entries()` in `src/journal_consolidator.rs` uses a temp-file + sync_all + rename sequence for both the full-truncation path and the partial-rewrite path. Replaces direct `tokio::fs::write` on the live journal. On failure, original journal untouched; best-effort `.tmp` removal.
+- **Cross-instance access visibility for eviction (Req 19)**: Default `cache.ram_cache_flush_interval` shortened from 60s to 10s. `is_cache_entry_active()` in `src/cache.rs` now scans journal files under `metadata/_journals/` for recent `AccessUpdate` entries within 2× the flush interval, so a cache entry actively accessed on another instance within the last 20 seconds is protected from eviction even if its flushed mtime appears stale.
+- **Content-Type from S3 response, not client request (Req 16)**: `extract_metadata()` in `src/signed_request_proxy.rs` now reads `Content-Type` from the S3 response headers in the write-through PUT path, falling back to `application/octet-stream` if absent. Prevents cache poisoning where a client sending the wrong Content-Type on PUT would corrupt the cached entry for subsequent GETs.
+- **Explicit error handling for discarded results (Req 25)**: Replaced `let _ = invalidate_head_cache_entry_unified(...)` at three sites in `src/cache.rs` with `if let Err(e) = ... { warn!(...) }`. Replaced `let _ = std::fs::rename(...)` in the HEAD invalidation commit path with full error propagation (log, cleanup, return error). Audited remaining `let _ = ...` patterns on `Result` in `src/cache.rs` and documented each best-effort case.
+
+### Changed
+- **Product display name**: Renamed user-facing strings from "S3 Hybrid Cache" to "Hybrid Cache for Amazon S3" across `README.md`, `docs/*.md`, `docs/bucket-settings-schema.json`, `config/config.example.yaml`, the library header doc comment (`src/lib.rs`), the dashboard HTML `<title>` and `<h1>` (`src/dashboard.rs`), the dashboard integration and property tests (`tests/dashboard_integration_test.rs`, `tests/dashboard_property_test.rs`), and the startup/shutdown log lines in `src/main.rs` (startup log is now `Starting Hybrid Cache for Amazon S3 server v<version> (built: <timestamp>)`). The Cargo package name (`s3-proxy`), the produced binary filename (`target/release/s3-proxy`), systemd unit (`s3-proxy.service`), and all deployment scripts are unchanged — this is a display-only rename and does not affect the upgrade contract. Upgrade is still `cargo build --release` → copy binary → `systemctl restart`, no config edits required. The `journalctl -u s3-proxy | grep Starting` verification command continues to work; its expected output string is now "Starting Hybrid Cache for Amazon S3 server".
+- **Config surface cleanup (Req 20)**: Deprecated (but retained for backward compatibility) the following unused fields: `cache.eviction_buffer_percent`, `metrics.{include_cache_stats, include_compression_stats, include_connection_stats}`, `connection_pool.max_connections_per_ip`, `dashboard.max_log_entries`. All have `#[serde(default)]` so omitting them parses unchanged. `Config::log_deprecated_fields()` emits a `warn!` at startup for each deprecated field set to a non-default value. Removed the `metadata_lock_timeout_seconds` section from `docs/CONFIGURATION.md`. Corrected the eviction target documentation to 80%.
+- **README TLS version statement (Req 21)**: Clarifies outbound TLS to `endpoint_overrides`-matched hosts is locked to TLS 1.2; all other hosts negotiate TLS 1.2 or TLS 1.3.
+- **Version control hygiene (Req 22)**: Removed `Cargo.lock` from `.gitignore` and committed it (binary crate). Added `!docs/bucket-settings-schema.json` negation so the schema is tracked.
+- **CI pipeline quality gates (Req 23)**: `.gitlab-ci.yml` now has sequential `fmt`, `clippy`, `build`, `test` stages (all `--release`), preserving the existing SAST template. Any failure blocks the pipeline.
+- **TLS connector builder deduplicated (Req 24)**: `build_tls_config_for_host()` in `src/https_connector.rs` is the single source of truth for per-host TLS version selection. Replaced four duplicated callsites across `http_proxy.rs` and `s3_client.rs`.
+- **Dependency cleanup (Req 30)**: Removed unused `anyhow` and `pin-project` from `[dependencies]`. Moved `quickcheck`, `quickcheck_macros`, `rcgen`, and `hex` to `[dev-dependencies]`. Replaced `serde_yaml` with the actively maintained `serde_yaml_ng` fork (API-compatible drop-in).
+- **Portable build script (Req 31)**: `build.rs` uses `chrono::Utc::now().format(...)` instead of shelling out to `/bin/date`. Build script no longer requires a system `date` binary. Output format preserved.
+- **Log verbosity calibrated (Req 33)**: Demoted per-request `info!` logs (cache HIT/MISS, bypass, conditional evaluation, presigned URL expired) to `debug!`. Demoted expected-occasional `warn!` logs (unsupported method, presigned URL validation failure, cache error fallback, per-request cache lookup errors) to `debug!`. Retained startup, shutdown, and threshold-crossing events at `info!`/`warn!`. Reduces default log volume on a busy proxy.
+- **Examples declared in Cargo.toml (Req 34)**: Added `[[example]]` sections for `cache_key_sanitization_demo` and `presigned_url_demo`. `cargo build --release --examples` now succeeds for all four example binaries.
+
+### Added — tests
+- `tests/test_tls_proxy_listener.rs` — 38 unit tests for `DestinationPolicy` (Req 32.4).
+- `tests/test_presigned_url.rs` — 23 unit tests for presigned URL validation (Req 32.2).
+- `tests/test_signed_put_handler.rs` — 8 unit tests for request body cap (Req 32.3).
+- `tests/test_otlp.rs` — 8 unit tests for the OTLP exporter (Req 32.1).
+- `tests/eviction_lock_fencing_test.rs` — 13 unit tests for UUID-fenced eviction lock.
+- `tests/etag_list_parsing_property_test.rs` — 5 quickcheck property tests for ETag list parsing.
+- Property tests added to existing modules: destination policy (3), truncated body rejection (3), TTL overflow safety (1), presigned URL overflow (1), write cache monotonicity (1), presigned URL masking (1), AWS chunked decoder (2). All use `quickcheck` (dev-dependency).
+- Config parsing regression test for the `serde_yaml` → `serde_yaml_ng` migration asserts every major section of `config/config.example.yaml` parses to the expected struct values.
+
+### Upgrade Notes
+This release is fully backward-compatible. No config edits are required:
+- All new config fields have `#[serde(default)]`.
+- Deprecated config fields continue to parse (as no-ops, with a startup `warn!`).
+- The dashboard bind default change is a security hardening (`0.0.0.0` → `127.0.0.1`); if your deployment exposes the dashboard beyond localhost, explicitly set `server.dashboard.bind_address: "0.0.0.0"` in your config and restrict access via firewall or security group.
+- The TTL validation on startup rejects values exceeding 10 years. If your config contains a TTL larger than that (unusual), reduce it or the proxy will fail to start with a clear error message naming the offending field.
+- The `max_buffered_request_body_bytes` default is **5 GiB** (S3 protocol maximum), so all valid S3 single-part PUTs and UploadPart requests work transparently. Operators on memory-constrained instances can lower this in config.
+
+## [1.15.3] - 2026-05-06
+
+### Security
+- **Documented deferrals for RUSTSEC-2025-0134 and RUSTSEC-2026-0097**: Added `.cargo/audit.toml` with explicit, commented `ignore` entries for the two advisories that 1.15.2 listed as out-of-scope. `cargo audit` now exits 0 on a clean tree without losing visibility of the deferrals — each entry names the reach path, the resolution plan, and the trigger for removing the suppression. No source-code or dependency changes; this is a bookkeeping change only.
+- **RUSTSEC-2026-0097 path 1 resolved — `tower 0.4 → 0.5`**: Bumped the direct `tower` dependency from `0.4` to `0.5` in `Cargo.toml`. `tower 0.5` depends on `rand 0.9`, eliminating the `rand 0.8` reach path through the proxy's direct `tower` dep. `tower 0.4.13` remains transiently via `tonic → opentelemetry-otlp`; that path is resolved in the OpenTelemetry upgrade below. No source-code changes — `tower::Service` trait is unchanged between 0.4 and 0.5 and `src/https_connector.rs` uses only the bare trait.
+- **RUSTSEC-2025-0134 resolved — `rustls-pemfile` removed**: Migrated direct PEM parsing in `src/tls_proxy_listener.rs::load_tls_config` from `rustls_pemfile::{certs, private_key}` to `rustls::pki_types::pem::PemObject` (`CertificateDer::pem_file_iter`, `PrivateKeyDer::from_pem_file`). Bumped `rustls-native-certs` from `0.7` to `0.8`, which drops its own `rustls-pemfile` dependency. `rustls-pemfile` is no longer present anywhere in the dependency graph. Extracted a shared `src/tls_trust_store.rs::load_root_cert_store()` helper to consolidate the three `rustls_native_certs::load_native_certs()` call sites in `s3_client.rs` and `http_proxy.rs`. Behaviour change: individual cert parse failures during OS trust store loading now log as `warn!` and are skipped rather than aborting the load; the load fails only when zero certs are available. No config changes. `tls_handshake_preservation_test.rs` passes unchanged.
+- **RUSTSEC-2026-0097 path 2 resolved — `opentelemetry 0.24 → 0.27`**: Bumped the OTel stack from `opentelemetry 0.24` / `opentelemetry_sdk 0.24` / `opentelemetry-otlp 0.17` / `opentelemetry-semantic-conventions 0.16` to the `0.27` tuple. The `0.27` stack does not depend on `rand 0.8`, eliminating the runtime reach path. API changes in `src/otlp.rs`: exporter construction migrated from `opentelemetry_otlp::new_exporter().http()...build_metrics_exporter(...)` to `MetricExporter::builder().with_http()...build()`; instrument creation migrated from `.init()` to `.build()`; `HOST_NAME` semantic-convention constant replaced with the raw string `"host.name"` (the constant is not in the stable attribute set for 0.27). All instrument names are unchanged. `tonic 0.12` remains a transitive dep of `opentelemetry-otlp 0.27` and still pulls in `tower 0.4.13` and `rand 0.8`, but tonic is not used at runtime by the proxy's OTLP exporter (HTTP/protobuf path). The remaining `rand 0.8` reach is `quickcheck 1.0.3` (dev-dependency, test-only) and the tonic transitive path (not runtime); both are suppressed in `.cargo/audit.toml` with documented removal triggers.
+
+### Fixed
+- **README TLS version statement corrected**: The README previously did not specify outbound TLS version behavior. Corrected to state that outbound TLS to `endpoint_overrides`-matched hosts is locked to TLS 1.2 (for compatibility), while outbound TLS to all other hosts negotiates TLS 1.2 or TLS 1.3 (highest mutually supported version). No code changes — this documents existing behavior.
+
+## [1.15.2] - 2026-05-06
+
+### Security
+- **RUSTSEC-2026-0041 — lz4_flex 0.11.5 (CVSS 8.2, yanked)**: Decompressing malformed LZ4 frames could leak uninitialized memory or stale output-buffer bytes into the HTTP response body. Fixed by bumping `lz4_flex` to `0.11.6` in `Cargo.toml`. No source-code changes; the `FrameDecoder`/`FrameEncoder`/`FrameInfo`/`BlockMode` API used by `src/compression.rs` is unchanged across this release.
+- **RUSTSEC-2026-0104, RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0049 — rustls-webpki 0.103.8**: Four advisories covering a reachable panic in CRL parsing, URI/wildcard name-constraint bypass, and a CRL distribution-point matching bug. Fixed by running `cargo update -p rustls -p tokio-rustls -p ureq -p rustls-webpki`, which advanced `rustls` from 0.23.35 → 0.23.40 and `rustls-webpki` from 0.103.8 → 0.103.13. No `Cargo.toml` edits required; the existing caret constraints already permitted the patched versions. No source-code changes.
+- **RUSTSEC-2024-0421 — idna 0.4.0**: Accepts Punycode labels that decode to pure-ASCII, enabling IDN homograph bypasses in hostname handling. Reached only through `trust-dns-resolver 0.23` → `trust-dns-proto 0.23`. Fixed by migrating the DNS stack from `trust-dns-resolver = "0.23"` to `hickory-resolver = "0.26"` (the maintained successor). `idna` is now `1.1.0`. Source-code changes are mechanical renames in four files: `src/connection_pool.rs`, `src/tcp_proxy.rs`, `src/error.rs`, `src/logging.rs`. The public API surface (`TokioResolver`, `ResolverConfig`, `ResolverOpts`, `NameServerConfig`, `EndpointOverrides`) is functionally identical; no config fields changed.
+
+**Out-of-scope advisories (addressed in 1.15.3):**
+- RUSTSEC-2025-0134 `rustls-pemfile 2.2.0` — unmaintained. Resolved in 1.15.3.
+- RUSTSEC-2026-0097 `rand 0.8.5` — unsound with custom logger. Reached via `tower`, `opentelemetry_sdk`, and `quickcheck`. Runtime paths resolved in 1.15.3; `quickcheck` (dev-dep only) remains suppressed.
+
+### Added
+- `tests/dependency_advisories_bug_condition_test.rs`: regression guard that reads `Cargo.lock` and asserts none of the three formerly-vulnerable versions (`lz4_flex 0.11.5`, `rustls-webpki 0.103.8`, `idna 0.4.0`) are present. Fails immediately with a named advisory message if any version is accidentally downgraded in the future.
+- `tests/lz4_roundtrip_preservation_test.rs`: quickcheck property tests for LZ4 round-trip correctness (`decompress(compress(X)) == X`) and concatenated-frame round-trip (simulating the `IncrementalRangeWriter` framing path). Covers single-frame and multi-frame paths with fixed fixtures at 1 byte, 63 bytes, 64 bytes, 1 KiB, and 1 MiB+1.
+- `tests/tls_handshake_preservation_test.rs`: standalone TLS handshake test using an `rcgen`-generated self-signed cert and a `tokio-rustls` client. Verifies that the `rustls`/`rustls-webpki` upgrade does not break local TLS termination.
+- `tests/dns_resolution_preservation_test.rs`: `EndpointOverrides` exact-match and suffix-match correctness test (always runs, no network required). Live DNS resolution test for `s3.amazonaws.com` and `s3.us-east-1.amazonaws.com` (gated with `#[ignore]`, run with `cargo test -- --ignored`).
+
+## [1.15.1] - 2026-05-06
+
+### Fixed
+- **Coordinated-waiter IAM bypass under TTL=0 coalescing**: When `download_coordination.enabled=true` and `get_ttl=0`, waiters in a coalesced flight received cached bytes without their signed request ever reaching S3 — an IAM bypass. The waiter wakeup path in `forward_get_head_with_coordination`, `forward_range_with_coordination`, and `forward_part_with_coordination` now routes through a new validated-serve contract: every waiter issues its own signed conditional (`If-None-Match` + `If-Modified-Since`) to S3 before any cached body is served. S3 dispatches 304 (serve from cache), 200 (serve fresh body), or 4xx (return S3's response unchanged). Invalid credentials correctly receive 401/403 instead of cached data.
+- **Expired-cache stampede (no coordination on inline revalidation)**: Concurrent requests hitting an expired cache entry each independently performed a full conditional revalidation to S3, producing N authoritative round-trips instead of 1. The inline expired-revalidation branches in the full-object and range GET paths are now wrapped in `InFlightTracker::try_register` (gated on `download_coordination.enabled=true`): the first request becomes the fetcher (performs the authoritative conditional), subsequent requests become waiters and issue their own signed conditionals via the validated-serve path after the fetcher completes.
+- **Tautological quickcheck property in `signed_request_proxy.rs`**: `prop_signature_detection_failure_handling` used `TestResult::from_bool(!result || true)` which always passes regardless of the function's return value, making the property meaningless. Fixed to `TestResult::from_bool(true)` with a comment clarifying the intent: the property passes as long as `is_range_signed` does not panic on arbitrary input.
+
+### Added
+- Four new coalescing metrics counters: `waiter_conditional_304`, `waiter_conditional_200`, `waiter_conditional_4xx`, `waiter_conditional_error`. These track the outcome of each waiter's signed conditional request and are exported via the existing metrics endpoint and OTLP alongside existing coalescing stats.
+
+### Changed
+- **Code quality: clippy and formatting cleanup**: Resolved all `cargo clippy --all-targets --all-features -- -D warnings` violations and `cargo fmt` formatting drift. Changes are purely mechanical — no behavioral differences. Categories addressed: `bool_assert_comparison`, `useless_vec`, `map_or` → `is_some_and`, `manual_range_contains` → `.contains()`, `field_reassign_with_default`, `unnecessary_get_then_check` → `contains_key`, `collapsible_str_replace`, `redundant_guard`, `needless_range_loop`, `ptr_arg` (`&mut Vec<T>` → `&mut [T]`), `type_complexity` (type alias for `TeeStream`'s pending-send future), `items_after_test_module` (`range_handler.rs`), `too_many_arguments` (`#[allow]` on public API functions and quickcheck property tests), `result_large_err` (`#[allow]` on `validate_host_header`), `only_used_in_recursion` (`#[allow]` on `cleanup_directory_recursive`), `permissions_set_readonly_false` (`#[allow]` in test cleanup), `doc_lazy_continuation`, `manual_strip` (`strip_prefix` in `expand_tilde`), `redundant_pattern_matching` (`is_err()`), `this_match_could_be_written_as_let`, `unneeded_late_init`, `cloned_ref_to_slice_refs` (`std::slice::from_ref`), `file_opened_with_create_but_truncate_not_defined` (added `.truncate(false)` to all lock-file `OpenOptions` calls), `unnecessary_if_let` / `manual_flatten` (`.flatten()` on directory-entry iterators), `assertions_on_constants`, `comparison_is_useless_due_to_type_limits`. Also installed `cargo-audit` and added a `pre-push-checklist.md` steering file.
+
+
+## [1.15.0] - 2026-05-02
+
+### Changed
+- **Product display name**: Renamed user-facing strings from "S3 Proxy" to "S3 Hybrid Cache" across `README.md`, `docs/*.md`, `docs/bucket-settings-schema.json`, `config/config.example.yaml`, the library header doc comment (`src/lib.rs`), and the startup/shutdown log lines in `src/main.rs` (startup log is now `Starting S3 Hybrid Cache server v<version> (built: <timestamp>)`). The Cargo package name (`s3-proxy`), the produced binary filename (`target/release/s3-proxy`), systemd unit (`s3-proxy.service`), and all deployment scripts are unchanged — this is a display-only rename and does not affect the upgrade contract. Upgrade is still `cargo build --release` → copy binary → `systemctl restart`, no config edits required. The `journalctl -u s3-proxy | grep Starting` verification command continues to work; its expected output string is now "Starting S3 Hybrid Cache server".
+
+## [1.14.2] - 2026-04-30
+
+### Changed
+- **Deployment documentation**: Added `Binary Portability` and `Upgrading` sections to `docs/GETTING_STARTED.md` covering the portable `target/release/s3-proxy` executable (glibc/arch constraints), the rebuild → replace → restart flow, `--version` and startup-log verification, and rolling-restart guidance for multi-instance fleets. README `Quick Start` points at the new sections. Establishes the upgrade contract: config is backward-compatible across versions, so no config edits are required on upgrade.
+- **New steering rule `config-compatibility.md`**: Codifies the contract above as a design requirement — all new config fields must have `#[serde(default)]` or `#[serde(default = ...)]`, no breaking renames without a deprecation alias, no semantic changes to existing fields. Motivated by the 1.13.1 regression where missing struct-level `#[serde(default)]` on `CacheConfig` / `LoggingConfig` / `ConnectionPoolConfig` broke minimal configs.
+
+## [1.14.1] - 2026-04-29
+
+### Fixed
+- **S3 Transfer Acceleration and virtual-hosted-style addressing now cache correctly** (supersedes the 1.14.0 "Confirmed unsupported" note). Root cause: `CacheManager::generate_cache_key` only inspected AP/MRAP hostname patterns and fell through to a flat, un-prefixed cache key for every other virtual-hosted Host. That path handled three hostname families — S3 Transfer Acceleration (`<bucket>.s3-accelerate.amazonaws.com`, `.dualstack` variant), regional virtual-hosted (`<bucket>.s3.<region>.amazonaws.com`, `.dualstack` variant), and legacy global (`<bucket>.s3.amazonaws.com`) — so any client using the default virtual-hosted addressing mode (most AWS SDKs) silently broke caching: requests succeeded, but the cache key was malformed (`test-obj.bin` instead of `<bucket>/test-obj.bin`), `[PATH_RESOLUTION]` WARNs fired, and range cache writes were skipped. Added `extract_virtual_hosted_bucket` alongside `extract_access_point_prefix`; wired into `generate_cache_key` after the AP/MRAP check so AP/MRAP behaviour is preserved. Accelerate variants require DNS-compliant (no-dot) bucket names per AWS; regional and legacy variants allow dots per general-purpose bucket naming rules. All four addressing styles — path-style, regional virtual-hosted, accelerate, and legacy global — now produce identical cache keys for the same bucket+key, so cache entries are shared across styles. Upstream request forwarding is unchanged (proxy still sends each request to the Host the client signed for). Backward-compatible: regional virtual-hosted traffic was already routed through the proxy via existing `*.s3.<region>.amazonaws.com` wildcards and now caches correctly. Accelerate traffic reaches the proxy through the same three client routing options as regular S3 — `HTTP_PROXY`, DNS zone, or hosts file — with one wrinkle: Route 53 does not host a private zone for `s3-accelerate.amazonaws.com`, so the DNS-zone option needs a VPC-level resolver (CoreDNS, Unbound) for that name. See `docs/GETTING_STARTED.md#s3-transfer-acceleration`. Most deployments will prefer regional virtual-hosted endpoints instead. Spec: `.kiro/specs/s3-transfer-acceleration-support/`.
+
+### Changed
+- **Documentation updates** reflecting the new behaviour: README FAQ, `docs/GETTING_STARTED.md` (new S3 Transfer Acceleration subsection pointing readers at the existing Option A/B/C client-routing framework with a note on the Route 53 limitation), `docs/CACHING.md` (cache key format is now `{bucket}/{object_key}` for every recognised S3 addressing style). The `--endpoint-url http://s3.<region>.amazonaws.com` tip for forcing path-style remains valid as a deliberate choice, not a workaround.
+
+## [1.14.0] - 2026-04-29
+
+### Added
+- **SSE-C bypass**: Requests carrying `x-amz-server-side-encryption-customer-*` headers now bypass the cache entirely (GET/HEAD/PUT). The proxy has no way to decrypt SSE-C data, and the path-only cache key would otherwise let a later request served from cache receive plaintext encrypted under a different key. Detection is header-based and case-insensitive; S3 continues to enforce key matching on forwarded requests.
+- **Full-object partial-cache merge**: A GET with no Range and partial cached coverage now synthesizes `Range: bytes=0-{total_size-1}` and routes through the existing merge path so only the missing bytes are fetched from S3. Gated on three hard-coded conditions: (1) `range` must not appear in the request's SigV4 SignedHeaders (synthesizing a Range would otherwise invalidate the signature), (2) cached fraction ≥ 10 % of `total_size`, (3) `total_size` ≤ 128 MiB. Below the threshold or outside the gates, behaviour is unchanged (unconditional fetch from S3).
+- **`evaluate_conditions_from_cache` setting** (default `false`). Configurable globally in `cache.evaluate_conditions_from_cache` and per-bucket/prefix in `_settings.json`. When `true` and the cached object is unexpired and has the validator the client referenced (ETag for `If-Match` / `If-None-Match`, Last-Modified for `If-Modified-Since` / `If-Unmodified-Since`), the proxy evaluates those headers against cached metadata and returns 304 / 412 / 200 locally without contacting S3 (RFC 7232 §6 precedence). Expired cache, missing validators, and client cache-bypass headers fall back to forward-to-S3. Default `false` preserves strict RFC 7232 consistency (proxy never decides based on cached metadata). ETag comparison strips a single pair of surrounding double-quotes from both sides before comparing opaque values, so a client-supplied unquoted etag (as sent by AWS CLI v2's `--if-match` / `--if-none-match`) matches the quoted form cached from S3.
+- **Confirmed S3 Transfer Acceleration is unsupported**: Transfer Acceleration endpoints (`<bucket>.s3-accelerate.amazonaws.com` and the `.dualstack` variant) are not covered by the DNS routing examples, so clients with acceleration enabled bypass the proxy. When routing is added manually, the proxy receives the request and forwards it successfully, but fails to extract the bucket from the `s3-accelerate` hostname — caching breaks. End-to-end test confirmed this: request succeeded, cache key malformed (`test-obj.bin` instead of `<bucket>/test-obj.bin`), range data not cached. Added an `S3 Transfer Acceleration` section to `docs/GETTING_STARTED.md`, a cross-reference in `docs/CONFIGURATION.md`, and an FAQ entry in `README.md` noting the feature is not supported. A spec for adding support is tracked in `.kiro/specs/s3-transfer-acceleration-support/`.
+
+### Fixed
+- **Range + conditional headers silently ignored client `If-Match`**: the old "only route to conditional path if not a range request" carve-out meant `serve_range_from_cache` served cached bytes without evaluating client conditional headers. Range + conditional requests now route through the same always-forward path as non-range requests, so S3 is authoritative for every conditional. Warm-cache `If-Match` mismatches now correctly return 412 instead of 206.
+- **412 leak on proxy-injected If-Match**: When the partial-cache-merge path injected `If-Match: <cached-etag>` to protect the merged response against mid-flight ETag drift and S3 returned 412 (the object changed on S3 between cache population and the merge fetch), the proxy forwarded the 412 to the client even though the client never sent a conditional header. The merge path now marks proxy-injected `If-Match` and `If-Unmodified-Since` with internal sentinel headers; on 412 the proxy invalidates the stale cache and retries once without the injected headers. Client-supplied conditionals continue to pass 412 through unchanged.
+- **Stale Rust toolchain requirement in `docs/GETTING_STARTED.md`**: Prerequisites documented `Rust 1.70+`, but the `fs2` crate's `FileExt::unlock` collides with the now-stable `std::fs::File::unlock` (stabilized in Rust 1.89), causing `error[E0658]: use of unstable library feature 'file_lock'` on any toolchain older than 1.89. Updated the Prerequisites section to `Rust 1.89+` with a short explanatory note, and added `rust-version = "1.89"` to `Cargo.toml` so `cargo` enforces the floor and reports a clean toolchain error rather than a confusing `E0658`. A future `fs2 → fs4` migration will lower this floor back to 1.75.
+
+### Removed
+- **Dead conditional-validation code in `s3_client.rs`**: `ConditionalHeaders` struct, `ConditionalValidationResult` enum, `build_conditional_headers`, `validate_conditional_headers`, `extract_conditional_headers`, `detect_metadata_mismatch`, `parse_http_date`, and the `conditional_headers` field on `S3RequestContext`. These were leftovers from the pre-always-forward design and only referenced by their own tests.
+
+## [1.13.2] - 2026-04-28
+
+### Fixed
+- **HTTPS connector used OS resolver instead of configured DNS**: The `CustomHttpsConnector` hostname fallback path (used when IP distribution has not yet resolved IPs, or when `ip_distribution_enabled: false`) called `tokio::net::lookup_host()`, which reads `/etc/hosts`. If `/etc/hosts` mapped S3 hostnames to `127.0.0.1` (common in proxy deployments), outbound HTTPS requests failed with `TLS handshake failed ... received fatal alert: InternalError`. The connector now uses the pool manager's `trust_dns_resolver` (Google/Cloudflare DNS by default, bypasses `/etc/hosts`), matching the HTTP proxy's resolution behaviour.
+- **Example config had `ip_distribution_enabled: false`**: The example config incorrectly set `ip_distribution_enabled: false` with a comment claiming the default was `false`. The actual code default is `true`. Users copying from the example config got IP distribution disabled, routing all requests through the hostname resolution path (which had the DNS bug above). Fixed to `true` with correct comment.
+
+### Changed
+- **Added `dns_servers` to example config**: The `connection_pool.dns_servers` setting was supported in code and documented but missing from `config/config.example.yaml`. Added it as a commented-out option with a note about PrivateLink use cases.
+
+## [1.13.1] - 2026-04-27
+
+### Fixed
+- **`config.compression.enabled` now actually disables compression**: The CacheManager constructor in `http_proxy.rs` passed a hardcoded `true` for `compression_enabled`, ignoring the YAML setting. Setting `compression.enabled: false` had no effect on the incremental cache-write path. The constructor now reads `config.compression.enabled`. Per-bucket `_settings.json` overrides continue to take precedence.
+- **Minimal config files now actually work**: `CacheConfig`, `LoggingConfig`, and `ConnectionPoolConfig` required every field in YAML despite having complete `Default` impls, because the struct-level `#[serde(default)]` attribute was missing. All three structs now carry `#[serde(default)]`, so omitted fields fall through to the `Default` impl. A three-field config (`cache.cache_dir`, `logging.access_log_dir`, `logging.app_log_dir`) now parses successfully.
+
+### Changed
+- **Async file close in `commit_incremental_range`**: The NFS4 `close()` syscall triggers synchronous dirty-page writeback (`nfs4_file_flush` → `nfs_wb_all`), which accounted for ~29% of sampled CPU during cache-miss workloads. The file close is now deferred to a fire-and-forget `spawn_blocking` task after `flush()` + rename. `flush()` remains synchronous (pushes data to the NFS client cache before the `.bin` becomes visible via rename). If the proxy crashes before the deferred close completes, the `.bin` may be truncated — readers get a decompression error and re-fetch from S3 (additional cache miss, never incorrect client data).
+
+### Performance
+Measured on 3× m6in.2xlarge proxies with FSx for OpenZFS (10 GiB/s, 64k IOPS), m6in.16xlarge client, CRT transfer client (`target_bandwidth = 100Gb/s`), syncing 40 GiB (8× 5 GiB files) from eu-west-1 to us-west-2 through the proxy fleet:
+
+| Config | Cache miss throughput |
+|---|---|
+| 1.12.0 compression-on (README baseline) | ~1.1 GiB/s |
+| 1.13.1 compression-on | ~1.25 GiB/s |
+| 1.13.1 compression-off | ~1.25 GiB/s |
+
+At 8× m6in.2xlarge proxies (same FSx):
+
+| Config | Cache miss throughput |
+|---|---|
+| 1.12.0 compression-on (README baseline) | ~2.0 GiB/s |
+| 1.13.1 compression-on | ~2.1 GiB/s |
+| 1.13.1 compression-off | ~2.4 GiB/s avg (1.8–2.7 range) |
+
+Flamegraph profiling with compression disabled shows the proxy at ~0.76 of 8 vCPUs utilized. The dominant remaining cost is NFS `close()` → `nfs4_file_flush` → `nfs_wb_all` (synchronous dirty-page writeback on file close during `commit_incremental_range`), accounting for ~29% of sampled CPU. This is the next optimization target.
+
+## [1.13.0] - 2026-04-27
+
+Cache-miss throughput improvements: all three cache-miss write paths now use incremental, batched, non-blocking writes, and cache-commit concurrency no longer serializes through a global write lock.
+
+### Added
+- **`cache.compression_batch_size` config field** (default 1 MiB, valid range 64 KiB to 16 MiB). Controls how many bytes the incremental cache writer accumulates in RAM before producing a single LZ4 frame. Larger values improve compression ratio and reduce per-frame overhead; smaller values reduce per-request peak memory. Documented in `config/config.example.yaml` and `docs/CONFIGURATION.md`. Rejected with a descriptive error at startup if outside the valid range.
+
+### Changed
+- **Batched LZ4 framing in `IncrementalRangeWriter`**: Previously `write_range_chunk` produced one LZ4 frame per hyper body chunk (~8–64 KiB), so a 100 MiB range emitted thousands of tiny frames. The writer now accumulates incoming bytes into an in-memory buffer sized by `compression_batch_size` and emits one LZ4 frame per buffer-fill. `commit_incremental_range` flushes any residual buffer as a final frame. On-disk wire format is unchanged (concatenated LZ4 frames); no cache invalidation required.
+- **`commit_incremental_range` now takes `&self`**: Relaxed from `&mut self`. All internal mutation is serialized by finer-grained locks (`HybridMetadataWriter` async `Mutex`, `SizeAccumulator` atomics + dedup set). All three production call sites now acquire a read lock instead of a write lock, so N concurrent cache-miss commits proceed in parallel.
+- **Partial-range and signed-range cache-miss paths converted to incremental writes**: Previously accumulated the full range body into a `Vec<u8>` before calling `store_range`. Both paths now use `begin_incremental_range_write` → `spawn_blocking` chunk loop → `commit_incremental_range(&self)`. Cache writes overlap S3 transfer; per-request peak memory is bounded by `compression_batch_size` regardless of range size.
+- **Non-blocking cache-write I/O**: All three miss paths now drive LZ4 encoding and sync file I/O from `spawn_blocking` tasks, so per-chunk compression + NFS writes don't stall Tokio runtime workers.
+
+### Testing
+- Property tests: batched-write byte-identity, equivalence to single-shot `store_range`, residual flush on commit, concurrent commit size accounting (distinct ranges), dedup under concurrent commit (same range), `compression_batch_size` validation. All use `quickcheck` with 4–16 concurrent commits.
+- Integration test `tests/cache_miss_incremental_e2e.rs` exercises the partial-range and signed-range flows end to end with a 50 MiB body.
+- Inline unit tests in `src/disk_cache.rs` for below-threshold, at-threshold, residual-flush, compression-disabled, and abort-after-partial-batch scenarios.
+
+## [1.12.1] - 2026-04-27
+
+### Security
+- **aws-chunked decoder overflow**: `decode_aws_chunked` panicked on a crafted PUT body whose first chunk header declared a size near `usize::MAX` (e.g. `ffffffffffffffff;chunk-signature=0\r\n`). `pos + chunk_size` wrapped silently, the EOF check passed, and the subsequent slice index panicked, taking down the request-handling task. All `pos + N` arithmetic in `src/aws_chunked_decoder.rs` now uses `usize::checked_add`, returning `AwsChunkedError::UnexpectedEof` on overflow. No behavioural change for well-formed bodies. Added two unit tests (`usize::MAX` and `usize::MAX - 1` chunk headers) plus a quickcheck property test asserting the decoder never panics on any byte sequence.
+- **Cache key path traversal**: `parse_cache_key` passed the bucket segment of a cache key verbatim to `PathBuf::join`, so a request path like `/../etc/passwd` would produce a sharded cache path one level above the configured `cache_dir`. Added a `validate_bucket_segment` helper in `src/disk_cache.rs` that rejects `.`, `..`, empty, `/`, `\`, NUL, and any ASCII control character (0x00–0x1F, 0x7F). Called from `parse_cache_key` after the split, so every downstream caller is covered. S3-valid bucket names (matching `[a-z0-9.\-_]`) are unaffected.
+- **IPv6-safe Host header parsing**: `validate_host_header` split the `Host` header on the first `:`, which returned `"["` as the hostname for any IPv6 client (`Host: [::1]:8081`). The rewritten request was malformed, IPv6 clients couldn't use the proxy, and the cache key prefix was nonsensical. Added a `parse_host_header` helper that understands all RFC 7230 / RFC 3986 Host forms: bracketed IPv6 with or without port, plain hostname, IPv4, and rejects unclosed brackets, stray `]`, unbracketed IPv6, and invalid ports. Added a `format_authority_host` helper in `src/s3_client.rs` that re-brackets IPv6 literals when composing the downstream URI in `build_s3_request_context` and `build_s3_request_context_with_operation`. 12 unit tests + 1 property test for `parse_host_header`, 3 unit tests for `format_authority_host`, and 3 integration tests for the full IPv6 round-trip through `build_s3_request_context`.
+
+### Fixed
+- **Panic on malformed cache keys in cache-path helpers**: Four helpers — `JournalConsolidator::get_metadata_file_path`, `JournalConsolidator::get_range_file_path`, `HybridMetadataWriter::get_metadata_file_path`, and `MetadataLockManager::get_metadata_file_path` — called `panic!` when given a cache key without the expected `bucket/object` shape, turning a malformed request into a per-request task crash. All four now return `Result<PathBuf>` and propagate `ProxyError::CacheError` from `parse_cache_key`. Callers in `Result`-returning functions propagate with `?`; callers in background loops (consolidation, validation) log at WARN level and skip the entry without aborting the cycle. Added a `proxy_error_to_response` helper in `src/http_proxy.rs` that maps `ProxyError::CacheError` to HTTP 400 with S3 `InvalidArgument` body for request-path callers. Added unit tests in each of the three files verifying `Err` is returned for a single-segment key, plus integration tests in `tests/path_traversal_integration_test.rs` and `tests/aws_chunked_overflow_integration_test.rs`.
+
+## [1.12.0] - 2026-04-26
+
+### Added
+- **Rolling validation scan**: Self-tuning, time-bounded alternative to the daily full validation scan. When a full scan exceeds the configured `validation_max_duration` (default 4 hours), the next cycle automatically switches to rolling mode — scanning a subset of L1 shard directories per cycle and resuming from a persistent cursor on the next invocation. Full coverage is achieved over multiple daily cycles. When rolling mode estimates that a full scan would fit within the budget again, it switches back. Configured via a single knob: `shared_storage.validation_max_duration` (valid range: 10 minutes – 23 hours). Adaptive batch sizing uses the previous cycle's scan rate to estimate how many directories fit within the time budget. Proportional size correction reconciles tracked cache size from partial scan results without large swings. Rolling state (cursor, scan rate, rotation count) is persisted in the existing `validation.json`. Added 6 property-based tests covering mode selection, config validation, directory selection, batch estimation, cursor persistence, and proportional correction. Added 4 integration tests covering end-to-end rolling scan, cursor continuity, backward compatibility, and mode transitions.
+
+## [1.11.3] - 2026-04-25
+
+### Changed
+- **Per-destination TLS version selection for PrivateLink**: TLS 1.3 is now used for regular S3 endpoints while PrivateLink destinations (matched by `endpoint_overrides`) use TLS 1.2. Previously, when any `endpoint_overrides` were configured, all outbound TLS was locked to 1.2. The proxy now builds two TLS connectors at startup — a default (1.2+1.3) and a PrivateLink-only (1.2) — and selects per connection based on whether the target hostname matches an override. Applies to the hyper connection pool (`CustomHttpsConnector`), signed PUT forwarding, and signed GET forwarding paths.
+
+## [1.11.2] - 2026-04-25
+
+### Added
+- **Suffix (wildcard) patterns in `endpoint_overrides`**: Config keys starting with `*.` are now treated as suffix patterns that match any hostname ending with that suffix. For example, `"*.s3.us-west-2.amazonaws.com": ["10.0.1.100"]` routes all virtual-hosted bucket hostnames in us-west-2 through the specified PrivateLink ENI without requiring per-bucket entries. Exact matches take precedence over suffix matches; among suffix matches the longest (most specific) suffix wins. Extracted a shared `EndpointOverrides` struct used by both the HTTP caching path (`connection_pool.rs`) and the HTTPS TCP passthrough path (`tcp_proxy.rs`), eliminating duplicated parsing logic in `https_proxy.rs`. Added unit tests for exact match, suffix match, exact-wins-over-suffix, and longest-suffix-wins semantics.
+
+## [1.11.1] - 2026-04-24
+
+### Fixed
+- **SigV4A (AWS4-ECDSA-P256-SHA256) requests treated as unsigned**: The SigV4 detection helpers in `signed_request_proxy::is_aws_sigv4_signed` and `is_range_signed`, the referer-injection guards in `http_proxy` and `signed_put_handler`, and the streaming payload check in `aws_chunked_decoder::is_aws_chunked` all hard-coded the classic `AWS4-HMAC-SHA256` algorithm label. MRAP requests (the AWS CLI picks SigV4A automatically for any MRAP ARN) therefore bypassed every signed-request code path: range signatures weren't recognized so the proxy could modify the `Range` header and break the signature, proxy-identification `Referer` headers could be injected even when `referer` was in `SignedHeaders`, and `aws-chunked` streaming PUT bodies tagged with `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` weren't decoded for caching. Introduced a shared `is_sigv4_algorithm` helper that matches both `AWS4-HMAC-SHA256` and `AWS4-ECDSA-P256-SHA256`; the `SignedHeaders=` parse logic is identical for both so no other changes were required. Added unit tests covering SigV4A detection, SigV4A range-signing (present and absent), and the SigV4A streaming-payload sentinel. Host-based MRAP cache-key routing (`{alias}.mrap/`) was already supported and is unchanged.
+- **TLS handshake failure against VPC interface endpoints (PrivateLink)**: When `endpoint_overrides` pointed the proxy at a VPC interface endpoint ENI, the outbound TLS connector offered TLS 1.3 in its ClientHello. VPC interface endpoints only support TLS 1.2 and drop the connection on a TLS 1.3-only handshake, producing `tls handshake eof`. When `endpoint_overrides` is non-empty the proxy now locks all outbound TLS to 1.2 via `rustls::ClientConfig::builder_with_protocol_versions(&[&TLS12])`. Regular S3 endpoints support TLS 1.2 so there is no functional regression. Enabled the `tls12` feature on `rustls` and `tokio-rustls` crates (previously only TLS 1.3 was compiled in).
+
+## [1.11.0] - 2026-04-24
+
+### Fixed
+- **Multipart write-through cache: concurrent same-part-number race**: When two `UploadPart` requests for the same `uploadId` and same part number arrived concurrently on a shared cache volume — possible with a buggy client issuing parallel retries, a custom non-SDK client that explicitly parallelizes same-part writes, or duplicate requests produced upstream of the proxy — the part file rename and the tracker update in `cache_upload_part` ran outside the same critical section. Interleaved ordering could leave the on-disk bytes from upload A paired with upload B's ETag in the tracker, producing a cache entry that passed the finalize-time ETag check but served the wrong bytes on subsequent reads. The part file write and tracker update now run together inside the existing `upload.lock` critical section, so the bytes-on-disk and the tracker ETag are updated atomically. Added `test_cache_upload_part_concurrent_same_part_keeps_file_and_tracker_consistent` which uses two handler instances on a shared cache dir to drive the race and verifies on-disk content always matches the tracker's recorded ETag.
+- **Multipart UploadPart: bodies starting with a hex digit could be mis-stripped**: The previous `handle_upload_part` used a byte-sniffer that looked for a hex digit followed by `\r\n` at the start of the body and, if found, stripped the leading chunk-size framing before caching. For genuinely aws-chunked bodies this was correct; for any non-chunked body that happened to start with those bytes (small probability but nonzero for binary content), the first few bytes would be removed from the cached copy while S3 received the unmodified body — leading to a cached entry silently diverging from S3. Replaced the sniffer with the `aws_chunked_decoder` module the non-multipart PUT path already uses: detection is header-based (`content-encoding` / `x-amz-content-sha256`), the decoded length is validated against `x-amz-decoded-content-length` when present, and failures record `record_cache_bypass("aws_chunked_decode_error")` and skip caching that part rather than cache potentially-corrupt bytes. S3 receives the unmodified original body in all cases.
+
+### Tests
+- **`test_load_range_data_large_range`: removed wall-clock timing assertion**: The test asserted a 10MB range load completes in under 100ms, which reliably passed in isolation but failed under parallel test execution due to disk/CPU contention. The hard-coded threshold cited no product requirement and conflated correctness with performance. Removed the timing check; correctness assertions (data round-trips intact) are retained. Performance regression detection belongs in a benchmark, not a unit test.
+
+## [1.10.1] - 2026-04-15
+
+### Added
+- **Proxy-only mode**: New `server.mode: "proxy_only"` option starts only the HTTP forward proxy listener (default port 3128) without binding to ports 80 or 443. No `sudo`, DNS changes, or `/etc/hosts` modifications needed — clients set `HTTP_PROXY=http://127.0.0.1:3128` to route S3 traffic through the proxy. TLS listener (port 3129) remains available in both modes. Includes config validation for port conflicts, privileged port warnings, and documented shared NFS cache HA pattern as an alternative to DNS multi-value routing.
+
+### Changed
+- **RAM cache hit: eliminated redundant data clone**: `RamCache::get()` previously cloned the full `RamCacheEntry` (including the `Vec<u8>` data buffer) twice per hit — once to extract from the HashMap, and again to reinsert with updated access metadata. Refactored to update `last_accessed` and `access_count` in-place via `get_mut()`, reducing to a single clone for the caller return value.
+- **Replaced `rand` with `fastrand`**: Removed `rand` crate dependency to resolve Dependabot security advisory (unsound aliased mutable reference in ThreadRng reseeding, affecting `rand >= 0.7.0, < 0.9.3`). All usages replaced with the existing `fastrand` dependency which was already used elsewhere in the codebase.
+
+## [1.10.0] - 2026-04-10
+
+### Added
+- **TLS proxy listener with HTTP_PROXY support**: New configurable TLS-terminating listener (default port 3129) that accepts encrypted client connections using the proxy's own certificate, then processes decrypted HTTP through the caching pipeline. Clients set `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com` — the SDK signs against the real S3 hostname at the HTTP level, the proxy decrypts, caches, and forwards to S3 over HTTPS. SigV4 signatures remain valid because they are computed over HTTP-level content, not the transport layer. Configured via `server.tls` in YAML config with `enabled`, `tls_proxy_port`, `cert_path`, and `key_path` fields. Forward proxy URI detection also works on the HTTP listener (port 80) for private networks where TLS between client and proxy is unnecessary.
+- **CONNECT passthrough on TLS listener**: When `HTTPS_PROXY` is set, SDKs send `CONNECT` requests to establish end-to-end encrypted tunnels. The TLS listener now handles these as TCP passthrough (same as port 443) — the request succeeds but bypasses the cache. This prevents a hard failure when `HTTPS_PROXY` is used instead of `HTTP_PROXY`.
+- **TLS config validation**: Validates cert/key paths are non-empty when TLS is enabled, rejects port 0, and detects port conflicts with HTTP, HTTPS, health, metrics, and dashboard ports.
+- **Property-based tests**: 8 quickcheck property tests covering URI detection, component extraction, cache key equivalence, header preservation, TLS config serialization, config validation, port conflict detection, and certificate loading error messages.
+
+### Fixed
+- **`test_store_range_invalid_range` test failure**: Fixed test that expected an error for data smaller than the requested range, but `store_range` intentionally clamps the range end in this case (matching S3's behavior of returning fewer bytes than requested). Changed test to use data larger than the range to trigger the actual mismatch error path.
+
+## [1.9.9] - 2026-03-24
+
+### Changed
+- **OTLP metrics: removed superfluous metrics**: Dropped `cache.cache_hit_rate_percent`, `cache.ram_cache_hit_rate_percent`, `cache.total_requests`, `cache.ram_cache_max_size`, `cache.metadata_cache_max_entries`, `request_metrics.requests_per_second`, and `request_metrics.max_concurrent_requests`. Hit rates are derivable from hits/misses in CloudWatch metric math; max sizes and max concurrent are config constants that don't belong in time-series data; `requests_per_second` was a cumulative average (total/uptime) that trends toward zero over time, not a real rate.
+- **OTLP metrics: added health/error signals**: Added `cache.corruption_metadata_total`, `cache.corruption_missing_range_total`, `cache.disk_full_events_total`, `cache.lock_timeout_total`, `cache.write_failures_total`, `cache.etag_mismatches_total`, `cache.range_invalidations_total`, and `cache.incomplete_uploads_evicted`. These were tracked internally but never exported, making cache health invisible in CloudWatch.
+- **OTLP metrics: added `cache.s3_requests_saved`**: Exports the headline value-add metric (disk hits + metadata hits) that was shown in the dashboard but missing from OTLP.
+- **Dashboard: horizontally aligned flow rows**: HEAD and GET flow rows (RAM card, arrows, Disk card, S3 card) now align across columns. Restructured HTML to emit elements in row order inside a CSS grid rather than two independent flex columns, so each tier sits on the same horizontal baseline regardless of content height differences between columns.
+- **Dashboard: info-box isolation**: Clicking ⓘ on a stat no longer expands identically-named stats in the other column (e.g. "Hit Rate" in HEAD was also opening "Hit Rate" in GET). Help state is now tracked by unique element ID instead of label text.
+- **Dashboard: per-prefix hit/miss stats**: The Bucket and Prefix Overrides table now shows accurate per-prefix HEAD and GET hit rates. Previously, prefix rows duplicated the bucket-level totals. Stats are now tracked separately per prefix (keyed by `bucket/prefix`) and populated from a new `prefix_cache_stats` map in `MetricsManager`.
+- **Dashboard: fixed double-counting in whole-proxy HEAD/GET totals**: `update_statistics` was called from internal cache lookup functions (`get_cached_response`, `get_range_data`, HEAD miss path, disk miss path, and a store path), causing the top-level counters to fire multiple times per HTTP request. Moved all `update_statistics` calls exclusively to `http_proxy.rs` request handlers, consistent with where `record_bucket_cache_access` already lived. Whole-proxy totals now match bucket-level totals.
+- **Dashboard: fixed HEAD/GET miscounting in bucket and prefix stats**: Several `record_bucket_cache_access` call sites in `http_proxy.rs` hardcoded `is_head = false`, causing HEAD cache hits to be counted as GET hits in the per-bucket and per-prefix stats. Fixed the RAM cache hit path, buffered range path, and coalescing waiter paths to pass `method == Method::HEAD`. Whole-proxy totals and bucket/prefix totals now agree on the HEAD/GET split.
+
+### Fixed
+- **HEAD TTL prefix override not applied**: `resolve_settings` in `cache.rs` passed the full cache key path (e.g. `/bucket/many/prefix/key`) to `BucketSettingsManager::resolve`, but prefix matching in `cascade` compared against just the object key. The bucket name prefix was never stripped, so `prefix_overrides` entries in `_settings.json` never matched. Fixed by stripping `/{bucket}/` from the path before calling `resolve`, consistent with how tests and documentation define prefix patterns (e.g. `many/10x100M/`).
+- **Prefix override validation rejected valid prefixes**: `BucketSettings::validate()` required all `prefix_overrides` entries to start with `/`, but after the path-stripping fix the object key has no leading slash. Removed the leading-slash requirement — only empty prefixes are now rejected.
+- **Dashboard: Disk Metadata hit rate inflated in HEAD column**: `headDiskHitRate` used `headDiskHits + headMisses` as the denominator, but `metadata_cache.misses` counts all RAM misses (requests that reached disk), not just disk misses. The correct denominator is `headRamMisses` (all RAM misses = disk hits + S3 fetches). Also fixed `headTotal` (was `ramHits + diskHits + ramMisses`, double-counting disk hits), `headRamHitRate` (same double-count), and `S3 Fetch` count (was showing RAM misses instead of `ramMisses - diskHits`).
+- **Dashboard: HEAD column inflated by GET metadata lookups**: `metadata_cache.hits`, `misses`, and `disk_hits` were shared between HEAD requests (`get_head_cache_entry_unified`) and GET metadata prefetches (`get_metadata_cached`). Added separate `head_hits`, `head_misses`, `head_disk_hits` counters incremented only from the HEAD path. The HEAD dashboard column now uses these HEAD-specific counters; the generic counters remain for internal tracking.
+
+## [1.9.8] - 2026-03-23
+
+### Fixed
+- **IP distribution never activated**: The background DNS refresh task was never started in `main.rs`, so `ip_distribution_enabled: true` had no effect — the `ConnectionPoolManager` always had an empty distributor and every request fell back to hostname-based forwarding. Added the background task using `pool_check_interval` (default 10s).
+- **DNS refresh could not bootstrap itself**: `refresh_dns` only iterated endpoints already in `resolved_ips`, but `resolved_ips` was only populated by `refresh_endpoint_dns`. On startup it was always empty, making the refresh loop a no-op even if called. Added `register_endpoint` which performs an immediate DNS resolve and seeds `resolved_ips`. Called from `try_forward_request` on first miss for any new hostname.
+- **Health tracker failures not cleared on DNS refresh**: When `refresh_endpoint_dns` restored IPs after a DNS cycle, stale failure counts for those IPs persisted in `IpHealthTracker`. A previously-excluded IP could be immediately re-excluded on its first request after restoration. `S3Client::refresh_dns` now calls `health_tracker.clear()` after each successful pool refresh.
+- **Health check falsely reporting `Degraded` at startup**: The connection pool health check marked the system `Degraded` whenever `ip_distributors` was empty, which is the normal state before any request arrives. Now only reports `Degraded` when an endpoint is registered but has zero IPs (DNS resolution failed for a known endpoint). Empty distributor at startup is `Healthy`.
+
+## [1.9.7] - 2026-03-20
+
+### Changed
+- **Dashboard: flow-chart layout for cache statistics**: Replaced the flat 4-card grid with a two-column flow-chart showing HEAD and GET request paths separately. Each column shows RAM → Disk → S3 Fetch with hit/miss counts, hit rates, and flow arrows. Per-column totals and overall hit rate at the bottom. Overall Statistics section shows total requests, cached objects, Total Cache Size, Write Cache, S3 savings, and uptime.
+- **Dashboard: metadata cache disk hits counter**: New `disk_hits` metric tracks metadata lookups that missed RAM but were served from unexpired `.meta` files on disk. Previously these were invisible — counted as a RAM miss with no corresponding hit anywhere.
+- **Dashboard: per-bucket table HEAD TTL column**: Added HEAD TTL column to the Per-Bucket Cache Settings table. Previously only GET TTL was shown despite HEAD TTL being available in the API response and detail view.
+- **Dashboard: click-to-expand help text**: Replaced hover-over `title` tooltips with ⓘ icons that toggle inline help text on click. Works on mobile and is more discoverable than hover tooltips.
+- **Dashboard: stale refreshes help text**: Updated to clarify that stale refreshes count as RAM misses but may still be disk hits, rather than the previous incorrect "does not affect hit rate" wording.
+- **Dashboard: bucket overrides section redesign**: Renamed "Per-Bucket Cache Settings" to "Bucket and Prefix Overrides". Flattened bucket-level and prefix-level overrides into one table showing Bucket, Prefix, HEAD hit rate ("x% of y"), GET hit rate ("x% of y"), with a "Settings" button that expands to show TTLs and cache flags inline. Removed redundant "Cache Statistics" and "Application Logs" h2 headings.
+- **Per-bucket cache hit/miss recording for HEAD requests**: HEAD cache hits and misses now call `record_bucket_cache_access` and `update_statistics`, fixing the per-bucket counters that were always zero for HEAD-heavy workloads.
+
+## [1.9.6] - 2026-03-18
+
+### Changed
+- **Rate-limited S3 forwarding error logs**: All "Failed to forward request to S3" error paths now route through a single rate-limited helper that emits at most one log line per 60 seconds with an occurrence count and the most recent request's URI, method, and error. Previously, 10+ call sites used direct `error!()` calls that spammed logs during S3 connectivity issues. The helper uses `try_lock` on a `Mutex` to store the latest example without blocking the hot path.
+
+### Fixed
+- **Cached objects counter not reconciled when size drift is zero**: The daily validation scan only called `update_size_from_validation` (which corrects `cached_objects`) when the scanned size differed from the tracked size. With accumulator-based size tracking producing zero drift, the object count was never corrected — it accumulated double-counts from multi-instance consolidation and OOM restarts (1,076k tracked vs 691k actual). Now always reconciles `cached_objects` from the validation scan's `.meta` file count regardless of size drift.
+
+## [1.9.5] - 2026-03-17
+
+### Changed
+- **Parallel validation scan**: Replaced sequential `WalkDir` with parallel L1 shard directory traversal using rayon. The previous approach used a single-threaded directory walk feeding into parallel file processing via `par_bridge()`, bottlenecked by sequential NFS `readdir` calls. Now enumerates L1 directories upfront and walks each in parallel, overlapping NFS round-trips across rayon threads. Measured improvement from ~35 min to ~10 min for 691k objects on EFS.
+- **Stale HEAD-only metadata cleanup during daily validation**: During the daily consistency validation scan, HEAD-only `.meta` files (no cached object data) that have been expired for more than 1 day are now automatically removed. These entries have no body data to serve and waste disk space and NFS I/O on every scan.
+- **Consolidation lock: try-lock instead of acquire-with-retry**: Per-key metadata lock acquisition in `consolidate_object_with_files` now uses a single non-blocking attempt (`try_acquire_lock`) instead of exponential backoff with up to 5 retries (`acquire_lock`). If the lock is held by another instance, the key is skipped and retried next cycle. Eliminates ~150ms worst-case backoff per contended key, improving throughput under multi-instance contention.
+- **Journal cleanup: file-level skip optimization**: `cleanup_consolidated_entries` now tracks which journal files were seen during discovery. Files not in the discovery set (e.g., created after discovery started) are skipped entirely without any I/O. Files where no entries were consolidated are also skipped. Only files with consolidated entries are re-read and rewritten. Reduces cleanup I/O from O(total_journal_size) to O(files_with_consolidated_entries).
+- **Discovery tracks per-file entry counts**: `discover_pending_cache_keys_indexed_capped` now counts total parseable entries per journal file during the discovery pass (no extra I/O — piggybacks on the existing read). This metadata is passed to cleanup for file-level optimization decisions.
+
+### Added
+- **Dashboard: S3 Requests Saved counter**: New "S3 Requests Saved" metric in the "Overall Statistics" dashboard section shows the total number of GET and HEAD requests served from cache instead of forwarding to S3. Displayed below the existing "S3 Transfer Saved" (bytes) counter.
+
+### Fixed
+- **OOM kills from discovery reading all journal files past key cap**: The `discover_pending_cache_keys_indexed_capped` change to track per-file entry counts removed the inner-loop `break` when the key cap was reached. Instead of stopping mid-file at 5000 keys, discovery continued parsing and deserializing every JSON line in every journal file to get accurate entry counts. With 840 MB of stale journal files from previous crashes, this allocated hundreds of MB of `JournalEntry` objects per 5-second cycle, causing RSS to grow to 30 GB before OOM kill. Restored the inner-loop `break` — entry counts for partially-read files will be incomplete, but cleanup falls through to entry-by-entry matching for those files. Also added `cleanup_dead_instance_journals()` during `initialize()` to remove journal files from dead PIDs (checked via `kill(pid, 0)`), preventing stale journal accumulation after crashes.
+- **Cached objects counter not incrementing for HEAD-then-consolidate pattern**: The counter only incremented when consolidation created a new `.meta` file. When the HEAD handler created a HEAD-only `.meta` (no ranges) first, consolidation saw the file already existed and skipped the increment. Now checks if the metadata had zero ranges before consolidation and counts adding the first range as a new cached object.
+- **Redundant NFS stat in consolidation**: Removed `metadata_path.exists()` call that preceded `load_or_create_metadata` — the range count is now checked from the already-loaded metadata, eliminating one NFS round-trip per consolidated key.
+
+## [1.9.4] - 2026-03-15
+
+### Fixed
+- **Consolidation "zero progress" under high small-object load**: The 30s cycle deadline previously wrapped `buffer_unordered().collect()`, discarding all completed work when the deadline fired. With 100k+ pending keys, every cycle discovered all keys, processed none before the 30s timeout, and discarded the batch — resulting in zero progress indefinitely. Replaced with incremental `stream.next()` polling against a deadline so completed keys are counted, cleaned up, and logged even when the deadline fires.
+- **Unbounded journal discovery causing NFS I/O waste**: Added `max_keys_per_cycle` (default 5000) cap to discovery. Stops reading journal files once the cap is reached (including mid-file), reducing discovery from O(100k) NFS reads to O(5k). Without this, discovery of 66k+ keys consumed 20s+ of the 30s deadline, leaving only seconds for actual key processing (~192 keys/cycle). With the cap, cycles process up to 5000 discovered keys within the deadline.
+- **Discovery eating into processing deadline**: Moved the 30s deadline to before the discovery phase so the total cycle (discovery + processing + cleanup) is bounded. Previously discovery ran outside the deadline and could consume most of the wall-clock time.
+- **Noisy `trust_dns_proto` warnings**: Suppressed `trust_dns_proto` WARN logs (e.g., "failed to associate send_message response to the sender") by setting the crate to ERROR level. These are benign DNS multiplexing artifacts under high concurrency.
+- **Cached objects counter: NFS contention and batching**: Moved `increment_cached_objects` from per-key (one NFS lock + read + write per new object) to a single batched call after the cycle completes. Reduces NFS lock operations from N to 1 per cycle. The counter still only increments for genuinely new objects (first `.meta` file creation); re-consolidation of existing objects does not double-count.
+- **HEAD handler overwriting consolidated ranges via NFS attribute cache**: `store_head_cache_entry_unified` used `metadata_path.exists()` to decide whether to update or create a `.meta` file. On NFS, `exists()` can return `false` due to attribute caching even when the file was recently written by consolidation on another instance. This caused the HEAD handler to create a HEAD-only `.meta` (empty ranges) that overwrote the consolidated version, losing cached range data. Replaced with a direct `read_from_disk` attempt that bypasses the NFS attribute cache.
+- **MetadataCache caching HEAD-only entries without ranges**: The HEAD handler stored metadata with empty ranges in the MetadataCache (RAM). Any subsequent range lookup hitting that RAM entry within the 5s refresh window would see `ranges=0` and miss, even if the disk `.meta` had been updated by consolidation with range data. Fixed by not caching empty-ranges metadata in RAM — HEAD-only entries are written to disk but not stored in the MetadataCache. Metadata is only cached in RAM once consolidation adds ranges, ensuring range lookups always benefit from the cache.
+
+### Changed
+- **Dashboard**: Moved "Total Cached Objects" from "Disk Cache: Object Ranges" to "Overall Statistics" section.
+- **Log levels**: Downgraded consolidation cycle deadline, S3 request retry, and per-key consolidation failure messages from WARN to INFO — these are expected operational behavior under load, not error conditions. Rate-limited the "Request limit exceeded, returning 429" warning to once per minute to reduce log noise during burst traffic.
+- **Range clamping for oversized range requests**: When a client requests a range larger than the object (e.g., `Range: bytes=0-52428799` for a 10-byte object), S3 returns only the available bytes. The proxy now clamps the cache range end to match the actual data received instead of failing with a validation error.
+- **S3 forward error logging**: Rate-limited "Failed to forward request to S3" errors to once per minute with occurrence count. Added URI and method to the error message for debugging.
+- **Validation metadata**: Fixed `metadata_files_scanned` always reporting 0 in `validation.json`.
+
+## [1.9.3] - 2026-03-12
+
+### Changed
+- **Removed `max_keys_per_run` cap**: The consolidator now processes all discovered pending cache keys each cycle, relying on the 30-second `consolidation_cycle_timeout` as the sole backpressure mechanism. The previous 50-key-per-cycle limit was removed. Note: under very high small-object load (100k+ pending keys), this caused the timeout to fire before any keys completed — addressed in 1.9.4 with discovery capping and incremental streaming.
+- **`KEY_CONCURRENCY_LIMIT` raised from 8 to 64**: Increases parallelism for NFS-latency-bound per-key consolidation, overlapping I/O round-trips for higher throughput.
+- **HashSet cleanup optimization**: `cleanup_consolidated_entries` now uses a `HashSet` for O(1) per-entry matching instead of O(m) linear scan, reducing cleanup from O(n·m) to O(n).
+
+## [1.9.2] - 2026-03-12
+
+### Fixed
+- **Consolidation cycle O(N²) journal scan eliminated**: `discover_pending_cache_keys` now builds a `HashMap<cache_key, Vec<PathBuf>>` index in a single pass over all journal files. Each key's consolidation then reads only the files that contain entries for that key, instead of re-scanning all journal files for every key.
+- **Unused `mut` warning in `initialize()`**: Removed spurious `mut` on `state` binding in the `Ok` arm of `load_size_state()`.
+
+### Changed
+- **Startup scan skip when validation is fresh**: On warm restart (validation ran within 23h), Phase 2 now loads cache size from `size_state.json` instead of walking all `.meta` files on EFS. Eliminates the slow initialization scan on every proxy restart.
+- **Cold startup reconciles size_state.json**: On cold restart (validation stale >23h), the full metadata scan result is written to `size_state.json` via `update_size_from_validation`. Eviction decisions use accurate size immediately rather than waiting for the next daily validation.
+
+## [1.9.1] - 2026-03-11
+
+### Added
+- **Dashboard: Total Cached Objects metric**: New "Total Cached Objects" counter in the "Disk Cache: Object Ranges" dashboard section shows the number of distinct S3 objects (unique cache keys) currently stored on disk. Tracked in `SizeState.cached_objects`, incremented when consolidation writes a new metadata file, decremented when eviction deletes a metadata file, and recalculated from `.meta` file count on startup (upgrade path) and during daily validation scans.
+
+## [1.9.0] - 2026-03-10
+
+### Changed
+- **RwLock for ConnectionPoolManager**: Replaced `Mutex` with `RwLock` across `S3Client`, `CustomHttpsConnector`, and all downstream consumers. The hot path (`get_distributed_ip`, `get_hostname_for_ip`) now acquires a read lock, eliminating per-request serialization. Write locks are only taken for DNS refresh and IP exclusion.
+- **Idle timeout 30s → 55s**: Default `idle_timeout` increased to 55s to align with S3's ~60s server-side timeout, reducing premature connection eviction from hyper's pool.
+- **TCP keepalive via socket2**: New connections apply `SO_KEEPALIVE` (idle=15s, interval=5s, retries=3) before TLS handshake. Dead connections are detected at the TCP layer before hyper tries to reuse them.
+- **TCP receive buffer tuning**: `SO_RCVBUF` set to 256KB by default on new connections for improved large-object throughput. Configurable via `tcp_recv_buffer_size`.
+- **IP health tracking with automatic exclusion**: New `IpHealthTracker` records consecutive failures per IP. After 3 failures (configurable via `ip_failure_threshold`), the IP is removed from the round-robin distributor. DNS refresh (every 60s) restores excluded IPs automatically.
+- **Eager IpDistributor initialization**: `endpoint_overrides` distributors are now initialized at construction time instead of lazily on first request, enabling `get_distributed_ip(&self)` without `&mut self`.
+
+### Removed
+- **Shadow connection pool**: Removed `ConnectionPool`, `Connection`, `HealthMetrics`, `PerformanceMetrics`, `ConnectionPriority`, `ConnectionSelectionCriteria`, `LoadBalancingStrategy`, `DnsResolutionCache`, `IpAddressInfo`, and all associated methods (`get_connection`, `get_or_create_connection`, `release_connection`, `select_best_ip`, `calculate_ip_score`, `get_expired_connections`, `cleanup_idle_connections`, `close_all_connections`, `monitor_connection_health`, `get_multiple_connections`, `get_health_metrics`). These tracked phantom state disconnected from hyper's actual connection pool.
+
+### Added
+- New config fields: `keepalive_idle_secs`, `keepalive_interval_secs`, `keepalive_retries`, `tcp_recv_buffer_size`, `ip_failure_threshold`
+- Dependency: `socket2 = "0.5"` (TCP socket option configuration)
+
+## [1.8.6] - 2026-03-04
+
+### Fixed
+- **Revalidation 403/401 no longer invalidates cache**: When S3 returns 403 Forbidden or 401 Unauthorized during TTL-expiry revalidation, the proxy returns the error to the client without removing cached data. A credentials failure is not a data change — cached data remains valid for other authorized callers.
+
+## [1.8.5] - 2026-03-04
+
+### Fixed
+- **Non-streaming PUT missing S3 response headers in cache**: The non-streaming PUT cache path stored an empty `response_headers` map in metadata. S3 response headers (`x-amz-server-side-encryption`, `x-amz-version-id`, checksums, etc.) are now captured and stored, matching the signed PUT handler behavior. Checksum headers from the request are merged as fallback.
+
+## [1.8.4] - 2026-03-04
+
+### Fixed
+- **PUT write-cache ignores bucket-level `put_ttl` override**: The non-streaming PUT cache path (`store_write_cache_entry`) used the global `put_ttl` instead of resolving per-bucket settings. Bucket-level `put_ttl` overrides in `_settings.json` now apply correctly.
+
+## [1.8.3] - 2026-03-04
+
+### Fixed
+- **ETag-based cache revalidation**: TTL-expired objects now send `If-None-Match` (ETag) alongside `If-Modified-Since` during revalidation. Closes stale-data window when two writes to the same key occur within one second (identical `Last-Modified` timestamps).
+- **HEAD-triggered range invalidation**: When a HEAD response returns a different ETag or content-length than cached, all cached ranges for that key are cleared immediately. Prevents serving stale range data after object overwrites.
+- **PUT response ETag capture**: The non-streaming PUT handler now captures ETag from S3 response headers instead of request headers, ensuring correct ETag is stored in cache metadata.
+
+## [1.8.2] - 2026-03-02
+
+### Fixed
+- **PERF logging actually moved to DEBUG**: Fixed v1.7.9 sed command that failed to match multiline `info!(\n    "PERF` pattern. All 9 PERF log lines now correctly use `debug!` macro.
+
+### Changed
+- **Idle consolidation detection**: Consolidation cycle skips entirely when no pending work (zero accumulator deltas and no journal files). Reduces metadata IOPS to near-zero during idle periods.
+
+## [1.8.1] - 2026-03-01
+
+### Fixed
+- **Backpressure-aware TeeStream**: Replaced `try_send` (non-blocking, drops chunks when channel full) with `send().await` via stored future in `poll_next`. When the cache write channel is full, the stream applies backpressure to the S3 response, slowing the client download to match disk write speed. Guarantees zero dropped chunks — every range is fully cached on first download. Client speed is unaffected when disk can keep up.
+
+## [1.8.0] - 2026-03-01
+
+### Fixed
+- **Large file cache regression**: Reverted signed range and unsigned range cache write paths from IncrementalRangeWriter (chunk-by-chunk with RwLock contention) back to buffered accumulation (Vec + single store_range). Fixes 5GB files caching 0-32% of ranges on first download. Root cause: hundreds of concurrent tokio::spawn tasks contending for the DiskCacheManager write lock during commit, causing task starvation. Full GET path retains IncrementalRangeWriter (single task, no contention).
+
+## [1.7.9] - 2026-03-01
+
+### Changed
+- **PERF logging moved to DEBUG level**: Request-level PERF timing lines now log at DEBUG instead of INFO. Set `log_level: "debug"` to enable. Reduces log noise in production while keeping the diagnostic capability available.
+
+## [1.7.8] - 2026-03-01
+
+### Changed
+- **IP distribution enabled by default**: `ip_distribution_enabled` now defaults to `true`. Per-IP connection pools are active out of the box.
+- **Cache backpressure logging**: Replaced per-chunk "Cache channel full" warnings with a single summary at stream end showing dropped chunks/bytes count. Size mismatch commit failures downgraded to DEBUG (the backpressure warning already covers it). Error message now explains the root cause.
+
+## [1.7.7] - 2026-03-01
+
+### Added
+- **Per-IP connection pool distribution**: New `ip_distribution_enabled` config option rewrites request URI authorities to individual S3 IP addresses, causing hyper to create separate connection pools per IP. Distributes load across all DNS-resolved IPs using round-robin selection. Preserves TLS SNI and Host header for SigV4 compatibility. Falls back to hostname-based routing when no IPs are available.
+- **IP distribution observability**: Per-IP connection counts in health check endpoint, info-level logging for IP lifecycle events (DNS refresh, health exclusion, exclusion expiry), debug-level logging of selected IP per request.
+- **IP distribution configuration**: `max_idle_per_ip` (default 10, range 1-100) controls idle connections per IP pool. Works with both DNS-resolved IPs and static `endpoint_overrides`.
+
+## [1.7.6] - 2026-03-01
+
+### Changed
+- **Always stream S3 responses**: Removed 1 MiB streaming threshold — all S3 responses now stream regardless of size. Default `allow_streaming` changed from `false` to `true`. Eliminates buffering delay for all response sizes.
+
+## [1.7.5] - 2026-03-01
+
+### Fixed
+- **Signed range streaming**: Signed range requests (AWS CLI) now stream S3 responses directly to client instead of buffering the entire range in memory. This was the root cause of ~200 MB/s cache miss throughput — each 8 MiB range was fully downloaded before any bytes reached the client.
+
+## [1.7.4] - 2026-02-28
+
+### Added
+- **Request-level PERF timing**: INFO-level `PERF` log lines on every GET data path showing timing breakdown (ram_lookup_ms, metadata_ms, disk_open_ms, stream_setup_ms, s3_fetch_ms, data_load_ms). Grep with `journalctl -u s3-proxy | grep PERF` to diagnose throughput bottlenecks.
+
+## [1.7.3] - 2026-02-28
+
+### Fixed
+- **Dashboard active requests**: Read active connections counter directly from the atomic instead of cached metrics, so the dashboard shows real-time values immediately.
+
+## [1.7.2] - 2026-02-28
+
+### Added
+- **Concurrent requests metric**: Active requests counter (`active_requests / max_concurrent_requests`) exposed on dashboard header, `/api/system-info`, `/metrics` JSON, and OTLP/CloudWatch.
+
+## [1.7.1] - 2026-02-28
+
+### Changed
+- **Streaming decompression for cache hits**: `stream_range_data` now uses `FrameDecoder` with chunked reads in a `spawn_blocking` task, yielding decompressed data through an mpsc channel instead of materializing the full range in memory.
+- **Stream-to-disk caching for cache misses**: Background cache writes use new `IncrementalRangeWriter` to compress and write chunks as they arrive from S3, eliminating full-range accumulation in memory.
+- **Async file I/O**: `load_range_data` uses `tokio::fs::read()` instead of blocking `std::fs::read()`, preventing NFS latency from stalling tokio worker threads.
+- **Connection pool default increase**: `max_idle_per_host` default raised from 10 to 100, validation range widened from 1–50 to 1–500.
+- **Streaming chunk size**: Default chunk size increased from 512 KiB to 1 MiB for better throughput.
+
+### Added
+- **Per-request memory documentation**: `config.example.yaml` and `docs/CONFIGURATION.md` document per-request memory usage (~5 MiB) with sizing formula and example calculations for `max_concurrent_requests`.
+
+## [1.7.0] - 2026-02-28
+
+### Added
+- **Configurable log retention**: Separate `access_log_retention_days` and `app_log_retention_days` settings (default 30, range 1–365) allow independent control over access log and application log disk usage.
+- **Background log cleanup task**: Spawns a periodic cleanup task at startup (`log_cleanup_interval`, default 24h, range 1h–7d). Runs immediately on startup, then at each interval. Deletes expired files, removes empty date-partition directories, logs results, and continues on I/O errors. Application log cleanup is hostname-scoped for safe multi-instance shared storage.
+- **Access log file rotation**: `access_log_file_rotation_interval` (default 5m, range 1m–60m) consolidates access log flushes within a time window into the same file, reducing small file proliferation under low traffic.
+
+## [1.6.9] - 2026-02-28
+
+### Removed
+- **Dead code cleanup**: Removed ~4,000 lines of unreachable code across 20 modules — 147 public functions, 2 enums, and cascading private functions/types/imports that were only called by the removed code. No behavioral changes; all removed code was verified unreachable from both `main.rs` and the test suite.
+- **`start_max_lifetime_task`**: Removed unwired background task for connection max lifetime enforcement. Updated CONNECTION_POOLING.md to reflect that `max_lifetime` config is accepted but not actively enforced (Hyper's idle timeout handles connection rotation).
+
+## [1.6.8] - 2026-02-27
+
+### Changed
+- **Access log `source_region` field**: Added `source_region` as the 25th field in S3 server access log records, matching the current AWS S3 log format spec. Always emits `-` since the proxy cannot determine request origin region (PrivateLink, Direct Connect, and non-AWS IPs are also `-` in real S3 logs).
+
+## [1.6.7] - 2026-02-25
+
+### Security
+- Updated `bytes` 1.11.0 → 1.11.1 (CVE-2026-25541: integer overflow in `BytesMut::reserve`)
+- Updated `time` 0.3.44 → 0.3.47 (CVE-2026-25727: stack exhaustion in RFC 2822 parsing)
+
+## [1.6.6] - 2026-02-25
+
+### Added
+- **`endpoint_overrides` config option**: Static hostname-to-IP mappings that bypass DNS resolution for S3 endpoints. Useful for S3 PrivateLink deployments where the proxy cannot use DNS to resolve S3 endpoints to PrivateLink ENI IPs (e.g., on-prem without Route 53 Resolver inbound endpoints). Works for both HTTP (connection pool) and HTTPS (TCP passthrough) traffic. Load-balances across multiple IPs per hostname.
+
+### Changed
+- Updated PrivateLink documentation in GETTING_STARTED.md and CONFIGURATION.md to document `endpoint_overrides` as alternative to Route 53 Resolver
+- Added `endpoint_overrides` example to `config/config.example.yaml`
+
+## [1.6.5] - 2026-02-24
+
+### Fixed
+- **Multipart upload part isolation**: Parts from concurrent multipart uploads to the same S3 key with different upload_ids no longer overwrite each other. Parts are now stored in upload-specific directories (`mpus_in_progress/{upload_id}/part{N}.bin`) instead of the shared `ranges/` directory. On CompleteMultipartUpload, parts are moved to their final `ranges/` location with byte offset names. Cleanup (abort/expiration) is simplified to a single `remove_dir_all()`.
+
+### Changed
+- Removed `range_file_path` field from `CachedPartInfo` struct (path is now deterministic from upload_id + part_number)
+- Simplified `cleanup_multipart_upload()` and `cleanup_incomplete_multipart_cache()` to single directory removal
+- Simplified incomplete upload eviction in `cache_size_tracker`, `cache.rs`, and `write_cache_manager`
+
+## [1.6.4] - 2026-02-23
+
+### Fixed
+- **Path-style AP/MRAP alias SigV4 signature preservation**: Path-style access point alias requests (e.g., `--endpoint-url http://s3-accesspoint.eu-west-1.amazonaws.com` with alias in path) are now forwarded to S3 without host or path rewriting. Previously, the proxy reconstructed a virtual-hosted upstream host and stripped the alias from the path, which broke the AWS SigV4 signature (signed for the original host/path). S3 handles path-style AP routing natively; the alias in the first path segment provides correct cache key namespacing without rewriting.
+
+## [1.6.3] - 2026-02-23
+
+### Fixed
+- **Journal consolidation TtlRefresh/AccessUpdate validation**: Object-level journal operations (TtlRefresh, AccessUpdate) are now validated by checking metadata file existence instead of range file existence. Previously, these operations used dummy range coordinates (0-0) which never matched actual range files, causing consolidation to skip them entirely.
+- **Test suite JournalConsolidator initialization**: Removed erroneous `CacheManager.initialize()` calls from ~25 test files that don't set up JournalConsolidator. Fixed `eviction_buffer_test` to use `new_with_shared_storage` with correct `max_cache_size_limit`. Fixed flock-based lock release assertions in `global_eviction_lock_test`.
+
+## [1.6.2] - 2026-02-22
+
+### Fixed
+- **Cache key namespace collision**: Access point cache key folders now include AWS reserved suffixes (`-s3alias` for regional APs, `.mrap` for MRAPs) to prevent collision with S3 bucket names. Previously, bare AP/MRAP identifiers could match bucket names, causing cross-namespace cache collisions.
+
+### Added
+- **Path-style AP alias support**: Requests with Host `s3-accesspoint.{region}.amazonaws.com` and an AP alias (ending in `-s3alias`) in the first path segment are now detected. The proxy reconstructs the correct upstream host, strips the alias from the forwarded path, and uses the alias as the cache key folder.
+- **Path-style MRAP alias support**: Requests with Host `accesspoint.s3-global.amazonaws.com` and an MRAP alias (ending in `.mrap`) in the first path segment are now detected. The proxy reconstructs the upstream host (stripping `.mrap` from the hostname), strips the alias from the forwarded path, and uses the alias as the cache key folder.
+- **AP/MRAP documentation updates**: Updated `docs/CACHING.md` with reserved suffix approach, path-style alias detection, and known ARN-vs-alias cache key divergence limitation. Updated `docs/GETTING_STARTED.md` with AP alias and MRAP alias usage examples.
+
+## [1.6.1] - 2026-02-22
+
+### Fixed
+- **Graceful shutdown now fully wired**: Cache manager and connection pool were never registered with the shutdown coordinator, making cache lock release (Step 3) and connection pool closure (Step 4) dead code during shutdown. Both are now wired via `set_cache_manager()` and `set_connection_pool()`.
+- **HTTP/HTTPS/TCP proxy accept loops are shutdown-aware**: All proxy `start()` methods now accept a `ShutdownSignal` and use `tokio::select!` to break the accept loop on shutdown. Previously, these infinite loops were killed by task cancellation with no cleanup.
+- **HTTP proxy drains in-flight connections on shutdown**: After stopping the accept loop, the HTTP proxy waits up to 5 seconds for active connections (tracked via `active_connections` counter) to complete before returning.
+- **Health and metrics servers are shutdown-aware**: Both servers now accept a `ShutdownSignal` and break their accept loops on shutdown, matching the existing dashboard server pattern.
+- **Background tasks stop cleanly on shutdown**: Cache hit update buffer flush and journal consolidation background tasks now listen for the shutdown signal and break their loops. The cache hit buffer performs a final flush before stopping.
+- **Process waits for shutdown coordinator to complete**: `main()` now awaits the shutdown coordinator task instead of using `tokio::select!` that could exit before teardown finished.
+- **Shutdown coordinator type alignment**: `ShutdownCoordinator` now uses `Arc<CacheManager>` and `Arc<Mutex<ConnectionPoolManager>>` to match the actual types used throughout the system, instead of the previously mismatched `Arc<RwLock<...>>` wrappers.
+
+## [1.6.0] - 2026-02-17
+
+### Fixed
+- **Access point and MRAP cache key collisions**: Cache keys for S3 Access Point and Multi-Region Access Point (MRAP) requests are now prefixed with the access point identifier extracted from the Host header. Regional AP requests (`{name}-{account_id}.s3-accesspoint.{region}.amazonaws.com`) use `{name}-{account_id}/` as the prefix. MRAP requests (`{mrap_alias}.accesspoint.s3-global.amazonaws.com`) use `{mrap_alias}/` as the prefix. Previously, all access point requests with the same object path produced identical cache keys regardless of which access point they came from, causing cross-access-point data collisions. Regular path-style and virtual-hosted-style requests are unaffected.
+
+### Added
+- **Access point documentation**: Updated `docs/CACHING.md` with access point cache key prefixing details. Updated `docs/GETTING_STARTED.md` with DNS routing, `--endpoint-url` usage, and hosts file / Route 53 configuration for access points and MRAPs.
+
+## [1.5.3] - 2026-02-17
+
+### Fixed
+- **S3 error responses no longer cached**: The streaming GET path attempted to cache S3 error responses (403, 500, etc.) as if they were object data, causing "data size mismatch" errors in `store_range`. The error body (~8KB XML) was collected and passed to `store_range` which rejected it due to size mismatch with the expected range. Now checks `status.is_success()` before setting up the TeeStream cache channel, matching the existing behavior in the buffered response path.
+
+## [1.5.2] - 2026-02-17
+
+### Changed
+- **Object-level cache expiration**: Expiration is now tracked at the object level (`NewCacheMetadata.expires_at`) instead of per-range (`RangeSpec.expires_at`). All cached ranges of the same object share a single freshness state. Simplifies expiration checks and TTL refresh after 304 responses.
+- **Removed per-range expires_at**: The `expires_at` field, `is_expired()`, and `refresh_ttl()` methods are removed from `RangeSpec`. Eviction fields (`last_accessed`, `access_count`, `frequency_score`) remain per-range.
+- **Expiration check API**: `check_range_expiration(cache_key, start, end)` replaced by `check_object_expiration(cache_key)`. `refresh_range_ttl(cache_key, start, end, ttl)` replaced by `refresh_object_ttl(cache_key, ttl)`.
+
+### Fixed
+- **Metadata read failures treated as expired (security fix)**: If the proxy cannot read or deserialize metadata during an expiration check, it now treats the cached data as expired and forwards the request to S3. Previously, metadata read errors were silently treated as "not expired," which could serve stale or unauthorized data — particularly dangerous with `get_ttl=0` buckets.
+- **Correct TTL in all metadata creation paths**: Metadata created by the hybrid metadata writer and journal consolidator now uses the resolved per-bucket TTL instead of a ~100-year sentinel. Journal entries carry `object_ttl_secs` so consolidation creates metadata with the correct `expires_at`. Orphan recovery uses `Duration::ZERO` (force revalidation) since the original TTL is unknown.
+
+## [1.5.1] - 2026-02-16
+
+### Fixed
+- **Zero-TTL bypass removal**: Removed three bypass blocks in `http_proxy.rs` that skipped cache lookup when `get_ttl=0` or `head_ttl=0`. Zero-TTL requests now go through the normal cache flow with immediate expiration and conditional revalidation via `If-Modified-Since`, enabling 304 bandwidth savings.
+- **Full-object GET expiration checking**: Added expiration check to the full-object GET path (previously missing). Cached full-object data is now validated with S3 before serving when expired, matching the existing range request behavior.
+- **TTL refresh after 304 uses resolved per-bucket TTL**: The TTL refresh after a 304 Not Modified response now uses the resolved per-bucket `get_ttl` instead of the global `config.cache.get_ttl`. Prevents zero-TTL bucket data from being refreshed with the global TTL (e.g., 10 years).
+
+### Changed
+- **Documentation**: Updated `docs/CACHING.md` "Zero TTL Revalidation" section to describe correct behavior. Added "Settings Apply at Cache-Write Time" subsection. Added cache-write-time note to `docs/CONFIGURATION.md`.
+
+## [1.5.0] - 2026-02-15
+
+### Added
+- **Bucket-level cache settings**: Per-bucket and per-prefix cache configuration via `_settings.json` files at `cache_dir/metadata/{bucket}/_settings.json`. Configure TTLs, read/write caching, compression, and RAM cache eligibility per bucket with hot reload (no proxy restart). Settings cascade: Prefix → Bucket → Global.
+- **Zero TTL revalidation**: `get_ttl: "0s"` caches data on disk but revalidates with S3 on every request. Saves bandwidth on 304 Not Modified responses.
+- **Read cache control**: `read_cache_enabled: false` makes the proxy act as a pure pass-through for GET requests (no disk or RAM caching). Supports allowlist pattern with global `read_cache_enabled: false` and per-bucket overrides.
+- **Per-bucket metrics**: `bucket_cache_hit_count` and `bucket_cache_miss_count` counters for buckets with `_settings.json` files.
+- **Dashboard bucket stats table**: Sortable table with per-bucket hit/miss stats, resolved settings, and expandable prefix overrides. `/api/bucket-stats` API endpoint.
+- **JSON schema**: `docs/bucket-settings-schema.json` for IDE validation of `_settings.json` files.
+- **Example settings files**: Six example configurations in `docs/examples/`.
+
+### Changed
+- **Dashboard renamed**: "S3 Proxy Dashboard" → "S3 Hybrid Cache".
+- **Compression control**: Per-bucket `compression_enabled` setting. `CompressionAlgorithm::None` variant for uncompressed storage.
+
+### Removed
+- **TTL overrides**: Removed `ttl_overrides` YAML config and `TtlOverride` struct. Replaced by bucket-level cache settings.
+
+## [1.4.5] - 2026-02-11
+
+### Changed
+- **Percentage metrics renamed**: `cache_hit_rate` → `cache_hit_rate_percent`, `ram_cache_hit_rate` → `ram_cache_hit_rate_percent`, `success_rate` → `success_rate_percent` in `/metrics` JSON and OTLP. Makes units explicit in metric names.
+- **RAM cache always compresses**: RAM cache now uses LZ4 compression regardless of the global `compression.enabled` flag, saving memory for compressible data even when disk compression is disabled.
+- **OTLP_METRICS.md updated**: Replaced stale placeholder metric names with actual metric names matching the `/metrics` JSON API.
+
+### Removed
+- Dead code: `extract_path_from_cache_key` in RAM cache (unused after compression change).
+
+## [1.4.4] - 2026-02-11
+
+### Fixed
+- **Request metrics always zero**: `record_request()` was never called from the HTTP proxy, so `request_metrics.total_requests`, `successful_requests`, `failed_requests`, `average_response_time_ms`, and `requests_per_second` were always 0 in `/metrics` JSON, OTLP, and CloudWatch. Added `record_request()` call at the end of `handle_request()` with actual elapsed time and success/failure status.
+
+## [1.4.3] - 2026-02-11
+
+### Added
+- **Per-tier cache metrics in /metrics and OTLP**: The `/metrics` JSON endpoint and OTLP export now include RAM cache stats (`ram_cache_hits`, `ram_cache_misses`, `ram_cache_evictions`, `ram_cache_max_size`), metadata cache stats (`metadata_cache_hits`, `metadata_cache_misses`, `metadata_cache_entries`, `metadata_cache_max_entries`, `metadata_cache_evictions`, `metadata_cache_stale_refreshes`), and `bytes_served_from_cache`. These match the dashboard's per-tier breakdown — all three surfaces (dashboard, `/metrics`, OTLP) now use the same data source.
+
+## [1.4.2] - 2026-02-11
+
+### Changed
+- **OTLP metric names match /metrics JSON API**: OTLP gauge names now use the JSON field path from the `/metrics` endpoint (e.g. `cache.cache_hits`, `coalescing.waits_total`, `request_metrics.total_requests`). Removed the `cache_type` dimension on `cache.size` — each size field is a separate metric (`cache.total_cache_size`, `cache.read_cache_size`, `cache.write_cache_size`, `cache.ram_cache_size`). All metrics share only the resource attributes (`host.name`, `service.name`, `service.version`).
+
+### Fixed
+- **RAM cache serving corrupted data for non-compressible files**: `compress_data_content_aware_with_fallback` returned `was_compressed = false` for content-types that skip compression (zip, jpg, etc.), even though the data was wrapped in LZ4 frame format with uncompressed blocks. On RAM cache retrieval, the `compressed: false` flag caused the LZ4 frame bytes to be served directly to clients without decompression, triggering `AWS_ERROR_S3_RESPONSE_CHECKSUM_MISMATCH`. The flag now correctly returns `true` whenever data is in frame format, since `FrameDecoder` is always needed to unwrap it.
+
+## [1.4.1] - 2026-02-11
+
+### Fixed
+- **Broken conditional request validation in S3 client**: `parse_http_date()` in `s3_client.rs` always returned `SystemTime::now()` instead of parsing the date string, making `If-Modified-Since` and `If-Unmodified-Since` comparisons meaningless. Now uses the `httpdate` crate (already used in `cache.rs`).
+
+### Removed
+- **Dead per-IP request metrics in S3 client**: Removed `connection_ip` from `S3Response`, `record_request_success()`, `record_request_failure()`, and `extract_ip_from_error()`. These fed per-IP health metrics in the pool manager, but the feedback loop was broken — Hyper's opaque connection pool prevented accurate IP attribution, so success metrics were always attributed to `0.0.0.0` and failure metrics to `127.0.0.1`. The pool manager's DNS resolution and IP selection for new connections (via `CustomHttpsConnector`) continue to work correctly.
+
+## [1.4.0] - 2026-02-11
+
+### Added
+- **Real OTLP metrics export**: Replaced placeholder OTLP exporter with a working implementation using the OpenTelemetry SDK. Exports cache, request, connection pool, compression, coalescing, and process metrics to any OTLP-compatible collector (CloudWatch Agent, Prometheus, OpenTelemetry Collector) via HTTP protobuf. Enable with `metrics.otlp.enabled: true` and point `endpoint` to your collector.
+
+### Fixed
+- **OpenTelemetry dependencies on Linux/macOS**: OpenTelemetry crates were accidentally scoped under `[target.'cfg(windows)'.dependencies]`, preventing compilation on non-Windows platforms. Moved to main `[dependencies]` section. Added `rt-tokio` feature to `opentelemetry_sdk` for async periodic export.
+
+## [1.3.1] - 2026-02-11
+
+### Fixed
+- **Dashboard disk cache misses always showing 0**: Disk cache miss count was calculated as `get_misses - ram_misses`, but RAM misses include both "miss RAM, hit disk" and "miss RAM, miss disk" cases, making `ram_misses >= get_misses` and the subtraction always 0. Disk misses now correctly use `get_misses` directly since every overall cache miss is also a disk miss.
+
+## [1.3.0] - 2026-02-10
+
+### Changed
+- **BREAKING: LZ4 frame format migration**: All cached data now uses LZ4 frame format with content checksum (xxHash-32) for integrity verification on every cache read. Existing cache must be flushed before upgrading (`rm -rf cache_dir/*`). Old block-format `.bin` files are not compatible with the new frame decoder.
+- **Simplified versionId handling**: Requests with `?versionId=` bypass cache entirely (no cache read, no cache write). Removes the previous version-matching logic that compared cached `x-amz-version-id` headers. Bypass metric reason unified to `versioned_request`.
+- **Non-compressible data uses frame format**: Content-aware compression now wraps non-compressible data (JPEG, PNG, etc.) in LZ4 frame format with uncompressed blocks instead of storing raw bytes. All `.bin` files use frame format regardless of compressibility.
+- **Compression when globally disabled**: When `compression.enabled: false`, data is still wrapped in LZ4 frame format with uncompressed blocks for integrity checksums.
+
+### Fixed
+- **Signed DELETE cache invalidation**: `aws s3 rm` (signed DELETE with SigV4) now invalidates proxy cache on success. Previously, only unsigned DELETE requests triggered cache invalidation.
+
+### Removed
+- **`--compression-enabled` CLI flag**: Use `COMPRESSION_ENABLED` env var or `compression.enabled` config option instead.
+- **`CompressionAlgorithm::None` variant**: All cached data uses LZ4 frame format. The `None` variant is removed; metadata records `Lz4` for all entries.
+- **`get_cached_version_id()` method**: Dead code after versionId bypass simplification.
+
+## [1.2.7] - 2026-02-10
+
+### Added
+- **Proxy identification header**: Adds a `Referer` header (`s3-hybrid-cache/{version} ({hostname})`) to requests forwarded to S3. Appears in S3 Server Access Logs for usage tracking and per-instance debugging. Skips injection when the header already exists or is included in SigV4 `SignedHeaders`. Configurable via `server.add_referer_header` (default: `true`).
+
+### Fixed
+- **Cache hit/miss statistics accuracy**: Coalescing waiter paths now correctly record cache hits when serving from cache and cache misses only when falling back to S3. Previously, all requests entering the coordination path were counted as misses regardless of outcome.
+
+## [1.2.6] - 2026-02-10
+
+### Changed
+- **Validation scan: streaming parallel processing**: Daily validation scan no longer collects all `.meta` file paths into a `Vec` before processing. Uses `WalkDir` as a streaming iterator with rayon's `par_bridge()` to process files in parallel as they're discovered. Memory usage is O(rayon_threads) instead of O(total_files). Atomic counters accumulate results lock-free. Progress logged every 100K files. Scales to PB-sized caches with hundreds of millions of metadata files.
+
+### Fixed
+- **Coalescing waiters re-fetching from S3**: After a fetcher completed, waiters called `forward_get_head_to_s3_and_cache` which always goes to S3 — defeating the purpose of coalescing. Waiters now try the cache first via `serve_from_cache_or_s3`, only falling back to S3 on cache miss. Part-number waiters now try `lookup_part` before falling back. This eliminates redundant S3 fetches and the associated size over-counting from duplicate `store_range` calls.
+- **Size tracking: persistent dedup across flush windows**: The `add_range` dedup `HashSet` was cleared every 5 seconds on flush, allowing the same range to be counted again in the next window. The dedup set now persists until the daily validation scan resets it.
+
+## [1.2.5] - 2026-02-10
+
+### Changed
+- **RAM cache auto-disabled when get_ttl=0**: When `get_ttl` is set to `0s`, the RAM data cache is automatically disabled during config loading. RAM cache has no TTL check on the hit path and would serve stale data, bypassing the per-request S3 validation that `get_ttl=0` requires. The MetadataCache (for `.meta` object metadata) remains active regardless.
+
+### Fixed
+- **Cross-instance size over-counting**: Before adding to the size accumulator, check if the range file already exists on disk. If another instance already cached the same range on shared storage, skip the size increment. Reduces stampede over-counting from 23× to near-accurate. The `exists()` check is essentially free on NFS with `lookupcache=pos` (positive lookups are cached).
+
+## [1.2.4] - 2026-02-10
+
+### Fixed
+- **Stale range data after PUT overwrite**: When an object is overwritten via PUT, the proxy now invalidates all cached range data (RAM and disk) for that cache key. Previously, old range files from prior GET requests survived the overwrite and could be served to clients, causing checksum mismatches. The fix adds prefix-based RAM cache invalidation (`invalidate_by_prefix`) to remove all `{cache_key}:range:*` entries, and ensures the metadata cache is refreshed after storing new PUT data.
+- **Stampede size tracking (same instance)**: Range request waiters now recompute cache overlap after the fetcher completes instead of reusing the stale overlap from before the wait. Prevents waiters from re-fetching from S3 and double-counting size via `accumulator.add()` for data already cached by the fetcher.
+- **Stampede size tracking (cross instance)**: `SizeAccumulator` now deduplicates range writes within each flush window (~5 seconds) using a `(cache_key_hash, start, end)` set. When multiple instances write the same range to shared storage, only the first write per flush window increments the size delta. The dedup set is cleared on flush. Existing `add()` and `subtract()` paths are unchanged.
+
+## [1.2.3] - 2026-02-10
+
+### Fixed
+- **Dashboard property tests**: Updated tests to match current API — removed reference to deleted `cache_effectiveness` field, added `DashboardConfig` parameter to `ApiHandler::new`, added `cache_stats_refresh_ms` and `logs_refresh_ms` fields to `SystemInfoResponse` initializers.
+
+## [1.2.2] - 2026-02-10
+
+Closed off edge cases around part uploads and downloads, accelerated cache hits for Get Part requests, handled potential signing of range header, and optimized parallel requests for the same cache miss.
+
+### Added
+- **Download coordination (coalescing)**: When multiple concurrent requests arrive for the same uncached resource, only one request fetches from S3 while others wait. Covers full-object GETs, range requests (signed and unsigned), and part-number requests. Waiters serve from cache after the fetcher completes, reducing redundant S3 fetches. Configurable via `download_coordination.enabled` (default: true) and `download_coordination.wait_timeout_secs` (default: 30s).
+- **Coalescing metrics**: New metrics track download coordination effectiveness: `waits_total`, `cache_hits_after_wait_total`, `timeouts_total`, `s3_fetches_saved_total`, `average_wait_duration_ms`, `fetcher_completions_success`, `fetcher_completions_error`. Exposed via `/metrics` endpoint.
+- **Part ranges storage**: Multipart object parts now store exact byte ranges (`part_ranges: HashMap<u32, (u64, u64)>`) instead of assuming uniform part sizes. Enables accurate cache lookups for objects with variable-sized parts.
+- **CompleteMultipartUpload filtering**: During multipart completion, only parts referenced in the request are retained. Unreferenced cached parts are deleted. ETag validation ensures cached parts match the request.
+- **Content-Range parsing**: GET responses with `partNumber` parameter now parse the `Content-Range` header to store accurate byte ranges for external objects (not uploaded through proxy).
+
+### Changed
+- **ETag mismatch handling**: When storing a range with a different ETag than existing cached data, the proxy now invalidates existing ranges and caches the new data instead of returning an error. This handles object overwrites gracefully.
+- **Range modification documentation**: Updated config comment to clarify dual-mode design: range consolidation applies only to unsigned requests; signed requests preserve exact Range headers for signature validity.
+
+### Removed
+- **Request delay behavior**: Removed the 5-second sleep and 503 retry mechanism for concurrent part requests. Replaced by InFlightTracker-based download coordination which is more efficient and doesn't block requests.
+
+## [1.2.1] - 2026-02-10
+
+### Fixed
+- **Dashboard disk cache hit rate**: Disk cache stats now subtract RAM cache hits/misses from the overall totals, showing disk-tier-only performance. Previously the disk section displayed combined RAM+disk numbers.
+
+### Changed
+- **Dashboard overall stats**: Removed redundant "Cache Hit Rate" from overall statistics section. RAM and disk hit rates are shown separately in their respective sections.
+
+## [1.2.0] - 2026-02-09
+
+Stabilized multi-instance size tracking, fixed over-eviction race conditions, added streaming disk cache and parallel NFS operations for performance, improved dashboard accuracy, and reduced log noise. Shared-storage cache coordination is fully operational.
+
+## [1.1.51] - 2026-02-09
+
+### Changed
+- **Dead code cleanup**: Removed 2 unused modules (`streaming_tee`, `performance_logger`), 4 unused functions, 1 deprecated method with zero callers, 9 unused struct fields, and their associated test file. Fixed incorrect `#[allow(dead_code)]` on `DiskCacheManager.write_cache_enabled` (field is actually used). Zero behavior change.
+
+## [1.1.50] - 2026-02-09
+
+### Changed
+- **Lock file cleanup logging**: Downgraded "Failed to remove lock file on drop" from `warn!` to `debug!` when the error is `NotFound`. On shared NFS storage, another instance may have already cleaned up the lock file — this is expected, not an error.
+
+## [1.1.49] - 2026-02-09
+
+### Fixed
+- **Range validation with zero content_length**: When cached metadata has `content_length: 0` (not yet populated), the proxy passed `Some(0)` to range parsing which rejected every range as "Start position exceeds content length". Now treats `content_length == 0` as unknown and skips range validation, forwarding to S3 instead.
+
+### Changed
+- **Range parse error logging**: Downgraded "Invalid range specification" from `warn!` to `debug!` since the proxy correctly forwards these to S3. Added `content_length` context to the log. Added `cache_key` to the forwarding-to-S3 debug message.
+
+## [1.1.48] - 2026-02-09
+
+### Fixed
+- **Eviction stale file handle recovery (complete)**: Extended ESTALE recovery to cover both `open()` and `lock_exclusive()` calls during batch eviction lock acquisition. Previously only `open()` was retried; now the full open+lock sequence is retried once on stale NFS file handles.
+
+### Changed
+- **Eviction log deduplication**: Downgraded inner batch eviction lock failure messages (`disk_cache` and `BATCH_EVICTION`) from `warn!` to `debug!`. The top-level `EVICTION_ERROR` remains at `warn!`, eliminating triple-logging of the same error.
+
+## [1.1.47] - 2026-02-09
+
+### Fixed
+- **Cache initialization coordinator size mismatch**: The `CacheConfig` passed to `CacheInitializationCoordinator` had a hardcoded 1 GB `max_cache_size` instead of reading the actual configured value from `inner.statistics.max_cache_size_limit`. This caused incorrect "Cache over capacity" warnings at startup when the configured limit differed from 1 GB.
+
+### Changed
+- **Log noise reduction (continued)**: Downgraded two remaining range-miss `warn!` messages to `debug!`: "Range file missing (will fetch from S3)" in `disk_cache.rs` and "Range spec not found for streaming" in `http_proxy.rs`. These are normal cache miss scenarios with graceful fallback, not operational concerns.
+
+## [1.1.46] - 2026-02-09
+
+### Fixed
+- **Eviction stale file handle recovery**: Batch delete lock acquisition now recovers from stale NFS file handles (ESTALE/os error 116) by deleting the stale lock file and retrying once, preventing eviction from getting stuck when lock files have invalid handles on shared storage.
+
+### Changed
+- **Log noise reduction**: Downgraded "Range file missing" (fetching from S3), "Range file missing for streaming" (falling back to buffered), "Failed to create stream for range" (fallback), and "Eviction freed no ranges" from `warn!` to `debug!`. These are normal cache miss / eviction scenarios with graceful recovery, not operational concerns.
+
+## [1.1.45] - 2026-02-09
+
+### Changed
+- **Dashboard: Disk Revalidated metric**: Renamed "Stale Refreshes" to "Disk Revalidated" and changed from raw count to percentage of total metadata lookups. Updated tooltip to accurately describe the TTL-based revalidation mechanism.
+
+## [1.1.44] - 2026-02-09
+
+### Fixed
+- **RAM Cache Range Fix — Streaming Path**: The streaming path (`serve_range_from_cache`) bypassed RAM cache entirely for ranges >= `disk_streaming_threshold` (1 MiB). It never checked RAM, never promoted disk hits to RAM, and never recorded RAM hit/miss statistics. Added `get_range_from_ram_cache` and `promote_range_to_ram_cache` methods to CacheManager. The streaming path now checks RAM cache before disk I/O (serving hits as buffered 206 responses), collects streamed chunks on disk hits and promotes to RAM cache after completion (skipping promotion for ranges exceeding `max_ram_cache_size`), and records RAM cache hits/misses for dashboard statistics from both streaming and buffered paths.
+
+## [1.1.43] - 2026-02-09
+
+### Fixed
+- **Dashboard: Metadata Cache Hit/Miss Counters**: Dashboard was using `head_hits`/`head_misses` from CacheManager statistics (which were never incremented for HEAD hits) instead of the MetadataCache's own hit/miss counters. Switched to `metadata_cache.metrics()` counters which are correctly tracked.
+
+## [1.1.42] - 2026-02-09
+
+### Fixed
+- **Streaming Disk Cache Hit Counter**: The streaming range cache hit path (`serve_range_from_cache`) was not calling `update_statistics`, so disk cache hits for ranges >= `disk_streaming_threshold` (1 MiB) were not counted. Dashboard showed near-zero hit rate despite hundreds of streaming hits per second in logs.
+
+### Changed
+- **Dashboard: RAM Metadata Cache Card**: Renamed title from "Metadata Cache" to "RAM Metadata Cache", updated subtitle to "In-memory cache for .meta objects (HEAD + GET)", corrected tooltips to say "metadata lookups" instead of "HEAD requests". Added "Cached Entries" line showing current/max entries.
+
+## [1.1.41] - 2026-02-09
+
+### Fixed
+- **Over-Eviction Race Condition**: Sequential evictions read stale `size_state.json`, causing cache to drop to ~37% instead of target 80%. Both eviction paths now update `size_state.json` directly under the eviction lock via `flush_and_apply_accumulator`. Write-path eviction (`evict_if_needed`) now re-reads size after lock acquisition and uses configurable trigger threshold.
+
+## [1.1.40] - 2026-02-09
+
+### Changed
+- **Dashboard: Tooltip Descriptions on All Stats**: Every stat item in the cache statistics dashboard now shows a descriptive tooltip on hover, explaining what the metric means and how it's calculated.
+- **Dashboard: Configurable Refresh Intervals**: JavaScript now reads `cache_stats_refresh_ms` and `logs_refresh_ms` from the `/api/system-info` endpoint, so YAML config values actually drive the dashboard refresh behavior instead of hardcoded 5s/10s.
+- **Dashboard: RAM Cache Subtitle**: Changed from "Metadata and data" to "Object range data (GET responses)" to accurately reflect that the RAM cache stores GET response body data, not metadata.
+- **Dashboard: Metadata Cache Card Title**: Changed from "Disk Cache: Object Metadata" to "Metadata Cache" with subtitle "HEAD request hit/miss tracking" — it's a RAM cache, not disk, and the hit/miss stats track HEAD requests specifically.
+- **Dashboard: Total Disk Size Label**: Changed "Read Cache Size" to "Total Disk Size" — the underlying value (`size_state.total_size`) includes both read and write cache. Write cache size shown separately as a subset.
+- **Dashboard: Write Cache Merged into Disk Cache Card**: Removed the separate Write Cache tile. Write cache size now displays inside the "Disk Cache: Object Ranges" card alongside total disk size.
+- **Dashboard: Write Cache Description**: Updated from "PUT operations (multipart uploads)" to accurately describe that write cache holds MPUs in progress and PUT objects not yet read via GET.
+- **Dashboard: Renamed WriteCacheStats.entries to evicted_uploads**: The API field was misleadingly named `entries` but actually contained `incomplete_uploads_evicted`. Renamed to `evicted_uploads` for accuracy.
+- **Dashboard: Stale Refreshes Displayed**: Metadata cache stale refreshes now shown in the UI (previously API-only).
+- **Dashboard: Overall Stats Labels**: "Total Requests" renamed to "Cache Requests (GET + HEAD)" with combined count. "Cache Effectiveness" renamed to "Cache Hit Rate" with clarifying tooltip that it reflects GET operations only.
+- **Dashboard Documentation Rewrite**: Fixed concurrent connection limit (50, not 10), removed Docker section, documented `/api/logs` query parameters and `/api/system-info` response fields, added text search feature documentation.
+
+## [1.1.39] - 2026-02-09
+
+### Changed
+- **Metadata Pass-Through in handle_range_request**: Load metadata once via `get_metadata_cached()` and pass through the call chain (`has_cached_ranges`, `find_cached_ranges`, `serve_range_from_cache`). NFS reads per cache hit reduced from ~5 to ~1.
+- **Skip Full-Object Cache Check for Large Files**: When `content_length` exceeds `full_object_check_threshold` (default 64 MiB), skip the full-object cache check and proceed directly to range-specific lookup. Avoids scanning hundreds of cached ranges unnecessarily.
+- **Connection Pool max_idle_per_host Default 1→10**: Keeps more idle TLS connections alive to S3, reducing handshake overhead during burst cache misses.
+- **Consolidation Cycle Timeout**: Per-key processing phase in `run_consolidation_cycle()` enforces a configurable timeout (default 30s). On timeout, logs unprocessed key count and proceeds to delta collection and eviction. Unprocessed keys retry next cycle.
+- **Streaming Range Data from Disk Cache**: Cached ranges at or above `disk_streaming_threshold` (default 1 MiB) are streamed in 512 KiB chunks instead of loaded fully into memory. LZ4-compressed ranges are decompressed first, then streamed. RAM cache hits continue to serve from memory.
+
+## [1.1.38] - 2026-02-08
+
+### Changed
+- **Logging: Demoted 9 High-Volume INFO Sites to DEBUG**
+  - Per-chunk "Range stored (hybrid)" in `disk_cache.rs`
+  - Per-entry "SIZE_TRACK: Add COUNTED/SKIPPED" and "SIZE_TRACK: Remove COUNTED" in `calculate_size_delta()`
+  - Per-key "Object metadata journal consolidation completed"
+  - Per-entry "Removing journal entry for evicted range" and "Removing stale journal entry"
+  - Per-call "Atomic size subtract", "Atomic size add", and "Atomic size add (non-blocking)"
+
+- **Consolidation: KEY_CONCURRENCY_LIMIT Increased from 4 to 8**
+  - Processes up to 8 cache keys concurrently via `buffer_unordered(8)`
+  - Reduces wall-clock consolidation time when many keys have few entries each
+
+- **Eviction: Batched Journal Writes by Cache Key**
+  - `write_eviction_journal_entries()` groups entries by cache_key using a HashMap
+  - New `append_range_entries_batch()` method writes all entries for a key in a single file operation
+  - On batch failure for a key, logs warning and continues with remaining keys
+  - Produces identical journal format to individual `append_range_entry()` calls
+
+### Removed
+- **Dead Code: Removed `calculate_size_delta()` and Related Tests**
+  - Removed `calculate_size_delta()` function (superseded by accumulator-based size tracking in v1.1.33)
+  - Removed `ConsolidationResult::success_with_size_delta()` constructor (never called)
+  - Removed `create_journal_entry_with_size()` helper and 12 `test_calculate_size_delta_*` unit tests
+  - Removed `prop_calculate_size_delta_correctness` property test
+  - Cleaned up stale comments referencing `calculate_size_delta`
+
+### Documentation
+- **Updated `docs/CACHING.md`**: Eviction triggers section describes accumulator-based size tracking instead of journal-based approach
+- **Updated `docs/ARCHITECTURE.md`**: Module organization table matches actual `src/` contents; accumulator-based size tracking section verified
+- **Updated `docs/CONFIGURATION.md`**: Cache size tracking section describes accumulator-based approach with per-instance delta files
+
+## [1.1.37] - 2026-02-08
+
+### Changed
+- **Consolidation: Parallel Cache Key Processing**
+  - Consolidation cycle now processes up to 4 cache keys concurrently via `buffer_unordered(4)`
+  - Reduces wall-clock consolidation time when individual keys hit NFS latency spikes
+  - Per-key locks are independent flock-based locks — no contention between concurrent keys
+
+- **Eviction: Re-read Size After Acquiring Global Lock**
+  - `enforce_disk_cache_limits_internal()` re-reads `current_size` after acquiring the global eviction lock
+  - Skips eviction if a previous instance's eviction already brought the cache under the limit
+  - Prevents over-eviction caused by stale size snapshots taken before lock acquisition
+
+- **Eviction: Immediate Accumulator Flush After Eviction**
+  - Calls `size_accumulator.flush()` after eviction completes but before releasing the global eviction lock
+  - Ensures the eviction subtract delta is written to a delta file promptly
+  - Next consolidation cycle collects the delta and updates `size_state.json` before another instance can evict
+
+- **Logging: Reduced SIZE_ACCUM Verbosity**
+  - `SIZE_ACCUM add` and `SIZE_ACCUM subtract` log level changed from INFO to DEBUG
+  - `SIZE_ACCUM flush`, `collect`, and `collect_total` remain at INFO
+  - Reduces log volume by thousands of lines per download test
+
+## [1.1.36] - 2026-02-08
+
+### Fixed
+- **Size Tracking: NFS Stale Read in Delta Collection**
+  - Root cause of 120 MiB (8.6%) size tracking gap identified: NFS stale reads during cross-instance delta file collection
+  - Changed from additive read-modify-write of a single per-instance delta file to append-only unique files per flush
+  - Each `flush()` creates `delta_{instance}_{sequence}.json` — no read of existing file, eliminates stale read race
+  - `collect_and_apply_deltas()` unchanged — already iterates all `delta_*.json` files and deletes after reading
+  - Directory stays bounded: ~3 files per instance between collections (5s flush interval, 5s consolidation interval)
+
+## [1.1.35] - 2026-02-08
+
+### Changed
+- **Eviction Performance: Decoupled Eviction from Consolidation Cycle**
+  - Eviction now runs as a detached `tokio::spawn` task instead of blocking the consolidation cycle
+  - `AtomicBool` guard (`eviction_in_progress`) prevents concurrent eviction spawns using `compare_exchange` with `SeqCst` ordering
+  - `scopeguard` resets the guard on all exit paths (success, error, panic)
+  - Consolidation cycle releases the global lock immediately, eliminating 100+ second lock holds during eviction
+
+- **Eviction Performance: Parallel NFS File Deletes**
+  - `batch_delete_ranges()` now uses `tokio::fs::remove_file` and `tokio::fs::metadata` (async) instead of `std::fs` (sync)
+  - File deletes execute concurrently via `futures::stream::buffer_unordered` with a concurrency limit of 32
+  - Object-level eviction processes up to 8 objects concurrently via `buffer_unordered`
+  - Per-object metadata lock remains held for the entire batch delete operation
+
+- **Eviction Performance: Early Exit Check**
+  - Eviction loop stops processing objects once `total_bytes_freed >= bytes_to_free`
+  - Avoids unnecessary file deletes when actual file sizes exceed `compressed_size` estimates
+
+## [1.1.34] - 2026-02-08
+
+### Fixed
+- **Size Tracking: Delta File Race Condition**
+  - Root cause: Consolidator reset delta files to zero after reading, but an instance could flush a new delta between the read and reset, causing the new value to be overwritten with zero (lost deltas)
+  - Fix: Consolidator now DELETES delta files after reading instead of resetting to zero
+  - Flush now uses additive writes: reads existing delta file, adds new delta, writes back. Handles missing file (deleted by consolidator) gracefully by starting from zero
+  - `reset_all_delta_files()` (validation scan) now deletes files instead of resetting to zero
+  - Removed dead `atomic_update_size_delta(0, 0)` call that was meant to increment consolidation_count but was skipped by early return
+
+### Added
+- **SIZE_ACCUM Logging**: INFO-level logging on every accumulator add, subtract, flush, and collect operation for production traceability
+  - `SIZE_ACCUM add/subtract`: logs each individual size change with byte count and instance ID
+  - `SIZE_ACCUM flush`: logs delta values being flushed to disk
+  - `SIZE_ACCUM collect`: logs per-file delta values read by consolidator, plus total summary
+
+## [1.1.33] - 2026-02-06
+
+### Changed
+- **Size Tracking: Replaced Journal-Based Tracking with In-Memory Accumulator**
+  - Root cause: Journal-based size tracking suffered from timing gaps between when data is written and when size is counted, causing drift in multi-instance environments
+  - Solution: In-memory `AtomicI64` accumulator tracks size at write/eviction time with zero NFS overhead
+  - Size changes recorded immediately via `fetch_add`/`fetch_sub` operations
+  - Each instance flushes accumulated delta to per-instance file (`size_tracking/delta_{instance_id}.json`) every consolidation cycle
+  - Consolidator reads all delta files under global lock, sums into `size_state.json`, resets delta files
+  - Journal entries continue to be processed for metadata updates only (no longer used for size tracking)
+  - Daily validation scan corrects any drift and resets all delta files
+  - Graceful shutdown flushes pending accumulator delta to disk
+
+### Technical Details
+- New `SizeAccumulator` struct in `journal_consolidator.rs` with `add()`, `subtract()`, `add_write_cache()`, `subtract_write_cache()`, `flush()`, `reset()` methods
+- `store_range()` increments accumulator after successful HybridMetadataWriter write
+- `perform_eviction_with_lock()` decrements accumulator using `compressed_size` from `RangeEvictionCandidate`
+- `write_multipart_journal_entries()` increments accumulator for MPU completion ranges
+- `run_consolidation_cycle()` flushes accumulator at cycle start, collects deltas under global lock
+- `consolidate_object()` no longer calls `calculate_size_delta()` for size state updates
+- `update_size_from_validation()` resets all delta files after correcting drift
+- `shutdown()` flushes accumulator before final consolidation cycle
+
+## [1.1.32] - 2026-02-05
+
+### Fixed
+- **Size Tracking: Global Consolidation Lock to Prevent Multi-Instance Race Conditions**
+  - Root cause: Multiple instances could run consolidation cycles simultaneously, processing the same journal entries due to NFS caching delays in journal cleanup
+  - Even with per-cache-key locking, instances would process the same cache_key sequentially (not simultaneously), causing duplicate size counting
+  - Solution: Added global consolidation lock using flock-based file locking
+  - Only one instance can run a consolidation cycle at a time across all instances
+  - Lock file: `{cache_dir}/locks/global_consolidation.lock`
+  - Uses non-blocking try_lock_exclusive() - if lock held, instance skips the cycle
+  - Lock automatically released when cycle completes (via scopeguard RAII)
+  - Added `GlobalConsolidationLock` struct for lock metadata (debugging)
+  - Added `scopeguard` dependency for RAII-based lock release
+
+## [1.1.31] - 2026-02-05
+
+### Fixed
+- **Size Tracking: Fix Over-Counting from Duplicate Journal Entries**
+  - Root cause: `calculate_size_delta()` was counting ALL valid journal entries, but `apply_journal_entries()` skips Add entries where the range already exists in metadata
+  - In multi-instance environments, the same range can have multiple journal entries (from retries or multiple instances), causing size to be counted multiple times
+  - Solution: Only count size delta for entries that actually affect size:
+    - Add entries that were actually applied (not skipped because range already in metadata)
+    - All Remove entries (file was deleted)
+  - Changed `apply_journal_entries()` to return `size_affecting_entries` instead of empty vector
+  - Changed `consolidate_object()` to use `size_affecting_entries` for `calculate_size_delta()`
+
+## [1.1.30] - 2026-02-05
+
+### Fixed
+- **Size Tracking: Fix Double Subtraction on Eviction**
+  - Root cause: Eviction was subtracting bytes_freed twice:
+    1. Directly via `atomic_subtract_size_with_retry()` after eviction
+    2. Via Remove journal entries processed by consolidation
+  - Solution: Removed direct subtraction; let consolidation handle all size updates via journal entries
+  - This maintains single-writer pattern where consolidation is the only component updating size_state.json
+
+## [1.1.29] - 2026-02-05
+
+### Added
+- **Size Tracking: Debug Logging for metadata_written Flag**
+  - Added INFO-level logging to trace size tracking decisions
+  - Logs each Add entry: COUNTED (metadata_written=false) or SKIPPED (metadata_written=true)
+  - Logs each Remove entry with size
+  - Summary log shows add_counted, add_skipped, remove_counted, total_delta
+  - Purpose: Diagnose why v1.1.28 still shows ~7% under-reporting
+
+## [1.1.28] - 2026-02-04
+
+### Fixed
+- **Size Tracking: metadata_written Flag for Accurate Tracking**
+  - Root cause: v1.1.27 used metadata diff (size_after - size_before) but HybridMetadataWriter writes to .meta immediately, so ranges are already present when consolidation runs → delta = 0
+  - Solution: Added `metadata_written: bool` field to JournalEntry
+  - When HybridMetadataWriter succeeds (hybrid mode): `metadata_written: true` → consolidation skips size counting (already in .meta)
+  - When falling back to journal-only: `metadata_written: false` → consolidation counts size
+  - Remove operations always counted (range being deleted)
+  - This correctly handles all scenarios without NFS lock overhead
+
+## [1.1.27] - 2026-02-04
+
+### Fixed
+- **Size Tracking: Fixed Negative Size Delta Bug in v1.1.26**
+  - Root cause: v1.1.26 calculated size_delta from journal entries, but Add entries are cleaned up after consolidation while Remove entries are created later during eviction
+  - When eviction runs, Remove entries subtract size but the corresponding Add entries are already gone
+  - Result: size_delta goes negative, total_size clamps to 0, cache appears empty
+  - Fix: Calculate size_delta from metadata diff (size_after - size_before) instead of journal entries
+  - This correctly handles:
+    - Skipped Adds (range already in metadata from HybridMetadataWriter): delta = 0
+    - Applied Adds (new range): delta = +size
+    - Removes (range deleted): delta = -size
+  - Metadata-based diff is the source of truth for actual changes, avoiding cross-cycle imbalances
+
+## [1.1.26] - 2026-02-04
+
+### Changed
+- **Size Tracking: Reverted to Journal-Based Approach (v1.1.19-style)**
+  - Removed direct size tracking from `store_range_data()` - eliminates per-write NFS lock attempts
+  - Removed `size_tracked` field from `JournalEntry` - no longer needed
+  - Size delta now calculated from journal entries with per-cycle deduplication
+  - Deduplication uses HashSet by (start, end) to handle multiple instances caching same range
+  - This restores download performance (removes ~30% throughput degradation from v1.1.23-v1.1.25)
+  - May over-report size when multiple instances cache same range across consolidation cycles
+  - Over-reporting is safe (eviction triggers early) vs under-reporting (disk fills)
+
+## [1.1.25] - 2026-02-03
+
+### Changed
+- **Size Tracking Performance**: Replaced retry logic with non-blocking try-lock for direct size adds
+  - v1.1.24 used 3 retries with exponential backoff (100-400ms delays) causing 30-90 second consolidation cycles
+  - Now uses non-blocking `try_lock_exclusive()` - returns immediately if lock is busy
+  - If lock busy, sets `size_tracked=false` and lets consolidation handle size tracking
+  - Eliminates lock contention performance degradation in multi-instance deployments
+
+## [1.1.24] - 2026-02-03
+
+### Fixed
+- **Size Tracking Double-Counting**: Fixed bug where v1.1.23's direct size tracking caused double-counting
+  - Root cause: v1.1.23 added direct `atomic_add_size_with_retry()` in `store_range_data()`, but consolidation also adds size via `atomic_update_size_delta()` when processing journal entries
+  - With `WriteMode::JournalOnly`, both paths add size = 2x actual size
+  - Observed: Tracked 1.71 GiB, Actual 6 KB (empty after eviction). Eviction loops forever.
+  - Fix: Added `size_tracked: bool` field to `JournalEntry` (defaults to false for backward compatibility)
+  - When direct add succeeds, `size_tracked: true` is set on the journal entry
+  - Consolidation skips size delta for entries with `size_tracked: true` to avoid double-counting
+
+## [1.1.23] - 2026-02-03
+
+### Fixed
+- **Size Tracking - Add Path Not Updating Size**: Fixed bug where caching new ranges did not update size tracking
+  - Root cause: HybridMetadataWriter writes ranges to `.meta` file immediately, then creates journal entry
+  - When consolidation runs, range is already in metadata, so `size_before == size_after` → `size_delta = 0`
+  - This caused tracked size to under-report by ~20-25% (e.g., 1.40 GiB tracked vs 1.75 GiB actual)
+  - Fix: DiskCacheManager now calls `atomic_add_size_with_retry()` directly after storing a range
+  - This mirrors how eviction works (direct subtract) - both add and subtract now bypass journal-based tracking
+  - Added `atomic_add_size()` and `atomic_add_size_with_retry()` methods to JournalConsolidator
+  - Added `journal_consolidator` field to DiskCacheManager for direct size updates
+
+## [1.1.22] - 2026-02-03
+
+### Fixed
+- **Eviction Size Tracking - Missing Code Path**: Fixed bug where eviction triggered via `evict_if_needed()` did not update size tracking
+  - Root cause: v1.1.21 added subtract code to `enforce_disk_cache_limits_internal()` but missed `evict_if_needed()`
+  - `evict_if_needed()` is called from http_proxy.rs and range_handler.rs before caching new data
+  - When eviction was triggered via this path, `perform_eviction_with_lock()` ran but size was never subtracted
+  - Fix: Added same `atomic_subtract_size_with_retry()` call to `evict_if_needed()` after eviction completes
+
+## [1.1.21] - 2026-02-02
+
+### Fixed
+- **Eviction Size Tracking**: Fixed bug where eviction did not reduce tracked size
+  - Root cause: Eviction updates metadata directly (removes ranges from .meta file), then writes Remove journal entries
+  - When consolidation processes Remove entries, ranges are already gone from metadata
+  - Result: size_before = size_after = 0, so size_delta = 0 (no reduction tracked)
+  - Fix: Directly call `atomic_subtract_size_with_retry(bytes_freed)` after eviction completes
+  - This bypasses the journal-based approach for eviction since eviction already knows exact bytes freed
+  - Consolidation still handles Add entries for size increases; eviction handles size decreases directly
+
+## [1.1.20] - 2026-02-02
+
+### Fixed
+- **Size Tracking Accuracy - Metadata-Based Calculation**: Complete rewrite of size delta calculation to use metadata comparison instead of journal entries
+  - Root cause: Journal-based size tracking was fundamentally flawed in multi-instance deployments
+  - Multiple instances create journal entries for the same range (shared storage, same file path)
+  - Previous fixes (v1.1.18, v1.1.19) tried to deduplicate journal entries but couldn't handle all edge cases
+  - New approach: Calculate size_delta = (sum of compressed_size after) - (sum of compressed_size before)
+  - This measures actual change in metadata, not journal entry counts
+  - Eliminates all double-counting issues regardless of how many instances write journal entries
+  - Simplified apply_journal_entries() by removing complex size tracking logic
+
+## [1.1.19] - 2026-02-02
+
+### Fixed
+- **Size Tracking Double-Counting in Multi-Instance Deployments**: Fixed bug where the same range could be counted multiple times for size tracking
+  - Root cause: When multiple instances cache the same range, each creates a journal entry. v1.1.18 fix counted ALL journal entries for size, even duplicates
+  - Example: Instance A and B both cache range X → two journal entries → size counted twice
+  - Fix: Track which ranges have been counted in each consolidation cycle using a HashSet
+  - Only the first journal entry for each (start, end) range pair is counted for size delta
+  - This applies to both Add and Remove operations to prevent over/under-counting
+  - Fixes the ~350 MB over-reporting observed after v1.1.18 deployment
+
+## [1.1.18] - 2026-02-02
+
+### Fixed
+- **Size Tracking Missed Ranges Written by Hybrid Mode**: Fixed bug where ranges written immediately by HybridMetadataWriter were not counted in size tracking
+  - Root cause: In hybrid mode, metadata is written directly to `.meta` file, then a journal entry is created for redundancy
+  - When consolidation ran, it found the range "already exists" in metadata and skipped adding it to `applied_entries`
+  - Since size delta is calculated only from `applied_entries`, these ranges were never counted
+  - Fix: Add journal entries to `applied_entries` for size tracking even when range already exists in metadata
+  - The presence of a journal entry proves size hasn't been tracked yet (entries are removed after consolidation)
+  - This fixes the ~120MB discrepancy observed after v1.1.17 deployment
+
+## [1.1.17] - 2026-02-02
+
+### Fixed
+- **Full Object Caching Bypassed Journal System (Actual Fix)**: Fixed critical bug where `store_full_object_as_range_new()` wrote directly to disk without creating journal entries
+  - Root cause: v1.1.15 CHANGELOG claimed this was fixed, but the actual code still bypassed the journal system entirely
+  - Two issues fixed:
+    1. `range_spec.file_path` used only filename instead of full relative path (e.g., `object_0-1023.bin` instead of `bucket/XX/YYY/object_0-1023.bin`)
+    2. No journal entries were created after storing metadata, so consolidator never tracked the size
+  - Impact: Full object GET responses cached via this path were never counted in size tracking
+  - Fix: Now computes proper relative path and calls `write_multipart_journal_entries()` after storing metadata
+  - This is the actual fix for the 273MB discrepancy observed after v1.1.16 deployment (which only fixed multipart uploads)
+
+## [1.1.16] - 2026-02-02
+
+### Fixed
+- **Multipart Upload Completion Bypassed Journal System**: Fixed critical bug where CompleteMultipartUpload wrote metadata directly without creating journal entries
+  - Root cause: `finalize_multipart_upload()` in `signed_put_handler.rs` wrote metadata and range files directly, bypassing the journal system
+  - Impact: Multipart uploads were never counted in size tracking, causing size_state.json to under-report
+  - Observed: 273MB discrepancy between actual disk usage (1.46GB) and tracked size (1.28GB)
+  - Fix: Added `write_multipart_journal_entries()` method to JournalConsolidator, called after CompleteMultipartUpload creates metadata
+  - This ensures all multipart upload ranges are tracked via journal entries for consolidation to process
+
+## [1.1.15] - 2026-02-02
+
+### Fixed
+- **Full Object Caching Bypassed Journal System**: Fixed critical bug where `store_full_object_as_range_new()` wrote directly to disk without creating journal entries
+  - Root cause: This method wrote range files and metadata directly, bypassing `DiskCacheManager::store_range()` which creates journal entries for size tracking
+  - Impact: Full object GET responses cached via this path were never counted in size tracking, causing size_state.json to under-report by hundreds of MB
+  - Observed: du showed 2.0GB actual disk usage, size_state.json showed 1.39GB tracked (~711MB under-counted)
+  - Fix: Now uses `DiskCacheManager::store_range()` which properly writes journal entries for consolidation to process
+  - Affected code paths: GET response caching, PUT body caching, write cache entry storage
+
+## [1.1.14] - 2026-01-31
+
+### Fixed
+- **Remove Journal Entries Not Processed**: Fixed bug where Remove journal entries from eviction were not being processed for size tracking
+  - Root cause 1: `validate_journal_entries_with_staleness()` checked if range file exists, but Remove entries have intentionally deleted files
+  - Root cause 2: `apply_journal_entries()` only added Remove entries to `applied_entries` if the range was found in metadata
+  - Fix: Remove operations now bypass file existence check (file is intentionally deleted) and always count for size tracking
+  - This caused size state to show 2.2GB tracked when disk was actually 861MB after eviction
+
+## [1.1.13] - 2026-01-31
+
+### Changed
+- **Journal-Based Size Tracking for Eviction**: Eviction now writes Remove journal entries instead of directly updating size state
+  - Previous approach: Eviction called `atomic_subtract_size_with_retry()` which required locking and could race with consolidation
+  - New approach: Eviction writes Remove entries to journal, consolidation processes them and updates size state
+  - Benefits: Single writer to size_state.json (consolidation only), eliminates race conditions, no lock contention
+  - Added `write_eviction_journal_entries()` method to JournalConsolidator
+  - Consolidation already handles Remove operations via `calculate_size_delta()`
+
+## [1.1.12] - 2026-01-31
+
+### Fixed
+- **Consolidation vs Eviction Race Condition**: Fixed race condition where consolidation's size state update could overwrite eviction's update
+  - Root cause: Consolidation did a non-atomic read-modify-write without holding the `size_state.lock`
+  - Sequence: Consolidation reads 2GB → Eviction subtracts 500MB (writes 1.5GB) → Consolidation adds +10MB to stale 2GB → Consolidation writes 2.01GB, overwriting eviction's 1.5GB
+  - This caused size state to show 1.6GB tracked when disk was actually empty (all data evicted)
+  - Fix: Added `atomic_update_size_delta()` method that uses the same file locking as `atomic_subtract_size()`
+  - Consolidation now uses this atomic method, ensuring sequential consistency with eviction
+
+## [1.1.11] - 2026-01-31
+
+### Fixed
+- **Size State Race Condition During Eviction**: Fixed race condition where size state was updated AFTER releasing the eviction lock
+  - Previous behavior: Release eviction lock → Update size state
+  - This allowed another instance to acquire the lock and read stale size state before the first instance updated it
+  - New behavior: Update size state → Release eviction lock
+  - This ensures sequential consistency - each eviction sees the result of the previous one
+
+## [1.1.10] - 2026-01-30
+
+### Fixed
+- **Critical: Size Tracking Discrepancy (47MB actual vs 1.5GB tracked)**: Fixed bug in journal consolidation that caused massive size tracking inflation
+  - Root cause: `validate_journal_entries_with_staleness()` was adding entries with missing range files but recent timestamps to `valid_entries`
+  - These entries were then processed by `apply_journal_entries()`, which calculated size delta from them
+  - But the range files didn't exist on disk (e.g., due to NFS caching delays), so size was counted for non-existent data
+  - Fix: Entries with missing range files but recent timestamps are now kept in journal for retry (not added to `valid_entries`)
+  - Only entries with existing range files are processed for size delta
+  - Stale entries (missing files + old timestamps) are still removed from journal
+
+## [1.1.9] - 2026-01-28
+
+### Fixed
+- **Consolidation Loop Deadlock During Idle Eviction**: Fixed deadlock where the consolidation loop would hang when triggering eviction during idle periods
+  - Root cause: `enforce_disk_cache_limits()` was calling `consolidate_object()` for pre-eviction journal consolidation, but this was being called from within the consolidation loop itself
+  - When called from the consolidation loop, we just finished consolidating, so pre-eviction consolidation is redundant and can cause blocking
+  - Added `enforce_disk_cache_limits_skip_consolidation()` variant that skips pre-eviction consolidation
+  - `maybe_trigger_eviction()` now uses this variant to avoid the deadlock
+  - Other callers (maintenance operations) still do pre-eviction consolidation for accurate access times
+
+## [1.1.8] - 2026-01-28
+
+### Fixed
+- **Eviction Not Triggering During Idle Periods**: Fixed bug where eviction would not trigger when cache was over capacity but no new data was being added
+  - Previously, eviction was only checked when `size_delta > 0` (cache grew), meaning idle periods with over-capacity cache would never trigger eviction
+  - Now eviction is checked at the end of EVERY consolidation cycle (every 5 seconds), regardless of whether there was activity
+  - Modified `maybe_trigger_eviction()` to accept an optional `known_size` parameter to avoid redundant NFS reads
+  - This ensures cache stays within capacity limits even during read-only workloads or idle periods
+
+## [1.1.7] - 2026-01-28
+
+### Fixed
+- **Critical: Lost Updates in Size State**: Fixed race condition where concurrent evictions from multiple instances caused lost updates to size state
+  - Previous fix (v1.1.4) did read-modify-write without locking, causing multiple instances to read the same value, subtract their bytes_freed, and overwrite each other
+  - Added `atomic_subtract_size()` function that uses file locking (`size_state.lock`) to ensure atomic read-modify-write
+  - This prevents size inflation when multiple instances evict concurrently
+
+## [1.1.6] - 2026-01-28
+
+### Fixed
+- **Critical: TOCTOU Race in Eviction Lock**: Fixed race condition where multiple threads could acquire the eviction lock simultaneously
+  - v1.1.5 fix had a TOCTOU (time-of-check-time-of-use) bug: threads checked `is_some()` then released the mutex before setting `Some`
+  - Now the entire check-and-set operation is atomic within a single mutex guard scope
+  - Restructured to drop the mutex guard before async metrics recording to satisfy Rust's `Send` requirements
+
+## [1.1.5] - 2026-01-28
+
+### Fixed
+- **Critical: Concurrent Eviction Race Condition**: Fixed bug where multiple threads within the same instance could all acquire the eviction lock simultaneously
+  - The `flock`-based lock was per-file-descriptor, not per-process - each thread opened a new file descriptor and got its own lock
+  - This caused multiple concurrent evictions to run, each reading stale size state and writing back incorrect values
+  - Fix: Added check at start of `try_acquire_global_eviction_lock()` to return `false` if `eviction_lock_file` is already `Some`
+  - This ensures only one thread per instance can hold the eviction lock at a time
+
+## [1.1.4] - 2026-01-28
+
+### Fixed
+- **Critical: Eviction Not Updating Size State**: Fixed bug where eviction triggered from `monitor_and_enforce_cache_limits()` did not update the size state
+  - Two code paths could trigger eviction: (1) `JournalConsolidator::maybe_trigger_eviction()` and (2) `CacheManager::monitor_and_enforce_cache_limits()`
+  - Only path (1) was updating the size state after eviction, causing size inflation when eviction happened via path (2)
+  - Observed behavior: After heavy downloads filled the cache, two back-to-back evictions occurred but only the first one's `bytes_freed` was subtracted from size state
+  - Fix: Moved size state update into `enforce_disk_cache_limits()` so ALL eviction paths update the size state
+  - Removed duplicate size state update from `maybe_trigger_eviction()` to prevent double-counting
+
+## [1.1.3] - 2026-01-28
+
+### Fixed
+- **Critical: Size Tracking Double-Counting Bug**: Fixed bug where cache size was inflated because journal entries that were already present in metadata were still counted in size delta
+  - Previously, `calculate_size_delta()` was called on ALL valid journal entries, including entries that were already consolidated in a previous cycle
+  - Now size delta is only calculated from entries that were actually applied (new entries not already in metadata)
+  - This caused `size_state.json` to show sizes much higher than actual disk usage (e.g., 2.5GB tracked vs 565MB actual)
+  - Root cause: Journal entries remain in journal files until cleanup, and were being re-counted on each consolidation cycle
+
+## [1.1.2] - 2026-01-28
+
+### Fixed
+- **Multi-Instance Size Consistency (Complete Fix)**: Removed in-memory size state entirely - disk is now the single source of truth
+  - Previously, each instance maintained its own in-memory `size_state` and could overwrite the shared disk file with stale values during consolidation
+  - This caused size drops of a few hundred MB when one instance's stale in-memory state overwrote another instance's recent updates
+  - Now all size operations (`get_current_size()`, `get_write_cache_size()`, `get_size_state()`) read directly from the shared `size_state.json` file
+  - Eliminates race conditions where instances could see different sizes or overwrite each other's updates
+
+### Changed
+- **`get_current_size()` and `get_write_cache_size()` are now async**: These methods now read from disk instead of in-memory state
+  - Callers must use `.await` when calling these methods
+  - This ensures all instances see the same size values from the shared disk file
+
+## [1.1.1] - 2026-01-27
+
+### Fixed
+- **Multi-Instance Size Consistency**: Dashboard and metrics now read cache size from the shared `size_state.json` file instead of in-memory state
+  - All instances now show the same cache size value
+  - `get_size_state()` reads from disk for multi-instance consistency
+  - `get_current_size()` remains in-memory for hot paths (eviction checks)
+
+- **Dashboard Timestamp Display**: Fixed "Invalid Date" display for Last Consolidation timestamp
+  - JavaScript now correctly handles Rust's SystemTime serialization format (`secs_since_epoch`)
+
+## [1.1.0] - 2026-01-27
+
+### Changed
+- **Journal-Based Size Tracking**: Size tracking is now handled by the JournalConsolidator instead of a separate delta buffer system
+  - Size deltas are calculated from Add/Remove operations in journal entries during consolidation
+  - Size state is persisted to `size_tracking/size_state.json` after each consolidation cycle (every 5s)
+  - Eviction is triggered automatically by the consolidator when cache exceeds capacity
+  - Consolidation interval changed from 30s to 5s for near-realtime size tracking
+  - Use `shared_storage.consolidation_interval` to control frequency (default: 5s)
+
+- **Removed `shared_storage.enabled` Config Option**: Journal-based metadata writes and distributed eviction locking are now always enabled
+  - The `shared_storage.enabled` config option has been removed
+  - All deployments (single-instance and multi-instance) use the same code path
+  - This simplifies the codebase and ensures consistent behavior
+
+- **Consolidation Loop Timing**: Changed from burst catch-up to delay behavior when consolidation takes longer than the interval
+  - Prevents rapid back-to-back consolidation cycles after long evictions
+
+### Removed
+- **Deprecated Size Tracking Config**: Removed `size_tracking_flush_interval` and `size_tracking_buffer_size` config options
+  - These were part of the buffered delta system which has been replaced by journal-based tracking
+
+- **Dead Code Cleanup**: Removed ~200 lines of unused eviction lock methods (`write_global_eviction_lock`, `read_global_eviction_lock`)
+  - These were superseded by flock-based locking via `try_acquire_global_eviction_lock()`
+
+### Migration Notes
+
+**Breaking Change - Cache Directory Migration Required**
+
+This release changes the size tracking architecture. A fresh cache directory is recommended:
+
+1. Stop all proxy instances
+2. Clear the cache directory: `rm -rf /path/to/cache/*`
+3. Update configuration:
+   - Remove `shared_storage.enabled` if present (no longer supported)
+   - Remove `size_tracking_flush_interval` if present (no longer supported)
+   - Remove `size_tracking_buffer_size` if present (no longer supported)
+4. Deploy new version
+5. Start proxy instances
+
+**Old files that will be automatically cleaned up:**
+- `size_tracking/checkpoint.json` - replaced by `size_state.json`
+- `size_tracking/delta-*.log` - no longer used
+
+**New files created:**
+- `size_tracking/size_state.json` - contains total_size, write_cache_size, last_consolidation timestamp
+
+## [1.0.14] - 2026-01-25
+
+### Fixed
+- **Dashboard Object Metadata Hit Rate**: Fixed hit rate calculation to use HEAD request hits/misses instead of RAM metadata cache hits/misses. Now accurately reflects S3 HEAD request cache performance.
+
+## [1.0.13] - 2026-01-25
+
+### Changed
+- **Removed NFS Propagation Delays**: Removed 50ms and 500ms delays in checkpoint sync that were workarounds for NFS visibility issues. With `lookupcache=pos` mount option, `sync_all()` is sufficient for cross-instance file visibility. Reduces checkpoint sync latency by ~550ms.
+
+### Documentation
+- **NFS Mount Requirements**: Added critical documentation for multi-instance deployments requiring `lookupcache=pos` mount option on NFS volumes. This caches positive lookups (file exists) but not negative lookups (file not found), ensuring new files from other instances are immediately visible while maintaining good cache hit performance. Added to CONFIGURATION.md and GETTING_STARTED.md.
+- **Archived Investigation**: Moved INVESTIGATION-JOURNAL-CONSOLIDATION-BUG.md to archived/docs/ after successful resolution of all 5 journal consolidation bugs.
+
+## [1.0.12] - 2026-01-25
+
+### Changed
+- **Reduced Log Noise**: Downgraded benign race condition logs from WARN/ERROR to INFO:
+  - "Failed to read journal file for cleanup" - Expected when another instance already deleted the file
+  - "Failed to break stale lock" - Expected when lock file was already removed by another instance
+  - These race conditions are harmless on shared NFS storage and don't indicate real problems
+
+## [1.0.11] - 2026-01-25
+
+### Fixed
+- **S3 Request Retry on Transient Failures**: Added retry logic (up to 2 retries with backoff) for S3 range requests that fail with connection errors like `SendRequest`. Previously, a single transient failure would return `BadGateway` to the client. Now the proxy retries before giving up.
+
+### Changed
+- **Stale Journal Lock File Cleanup**: Journal consolidation now cleans up orphaned `.journal.lock` files that remain after fresh journal files are deleted. These lock files accumulated during high-concurrency downloads but are now automatically removed.
+
+## [1.0.10] - 2026-01-25
+
+### Fixed
+- **Critical: Cleanup vs Append Race Condition (Bug 5)**: Fixed race condition where journal cleanup could overwrite entries being appended concurrently. The v1.0.9 mutex only protected appends from each other, not from cleanup operations. Now uses file-level locking (`flock`) with a "fresh journal on lock contention" strategy:
+  - Append tries non-blocking lock on primary journal file
+  - If lock is busy (cleanup in progress), creates a fresh journal file with timestamp suffix
+  - Cleanup acquires exclusive lock before read-modify-write
+  - Appends never block - cache writes stay fast during consolidation
+  - Fresh journal files are automatically discovered by consolidator and deleted when empty
+  - Expected to reduce orphaned ranges from ~0.8% to 0%
+
+## [1.0.9] - 2026-01-25
+
+### Fixed
+- **Critical: Journal Append Race Condition (Bug 4)**: Fixed thread-safety issue in `append_range_entry()` where concurrent appends within the same instance could overwrite each other. When multiple threads read the journal file simultaneously, appended their entries, and wrote back, the last writer would overwrite entries from other threads. Added `tokio::sync::Mutex` to serialize journal appends within each instance.
+  - Evidence: Orphaned range `5GB-1:1216348160-1224736767` was stored at 13:41:29.912 with "Range stored (hybrid)" logged, but no journal entry existed - it was overwritten by a concurrent append within milliseconds.
+  - Expected to reduce orphaned ranges from ~0.5% to 0% in high-concurrency scenarios.
+
+## [1.0.8] - 2026-01-25
+
+### Fixed
+- **Critical: Non-Atomic Metadata Write in Journal Consolidator**: Fixed race condition where consolidation could read empty/corrupted metadata files. The `write_metadata_to_disk()` function used `tokio::fs::write()` which is NOT atomic on NFS - readers could see empty or partial files during the write. Now uses atomic write pattern (temp file + rename) like `hybrid_metadata_writer.rs`, ensuring readers always see complete, valid JSON.
+  - Error symptom: "Failed to parse metadata file: EOF while parsing a value at line 1 column 0"
+  - Reduced orphaned ranges from 1.2% to expected 0%
+
+## [1.0.7] - 2026-01-25
+
+### Fixed
+- **Critical: Multi-Instance Consolidation Race Condition**: Fixed race condition where multiple proxy instances consolidating the same cache key simultaneously caused entries to be lost. The lock was acquired AFTER reading journal entries, allowing all instances to read the same entries before any acquired the lock. Now the lock is acquired BEFORE reading entries, ensuring only one instance processes each cache key at a time.
+  - Reduced orphaned ranges from 0.7% to 0% in multi-instance deployments
+  - Instances that can't acquire the lock skip the cache key (another instance is handling it)
+
+## [1.0.6] - 2026-01-25
+
+### Fixed
+- **Critical: Journal Consolidation Losing Ranges**: Fixed bug where 12% of cached ranges were "orphaned" (range files existed but not tracked in metadata). The `cleanup_instance_journals()` function was truncating ALL journal files after consolidation, but `validate_journal_entries()` filtered out entries where range files weren't yet visible due to NFS attribute caching. This caused journal entries to be permanently lost before they could be consolidated.
+  - Added `consolidated_entries` field to `ConsolidationResult` to track which entries were actually processed
+  - New `cleanup_consolidated_entries()` method removes only specific entries that were successfully consolidated
+  - Entries with missing range files (due to NFS caching delays) are now preserved and retried on the next consolidation cycle
+  - Deprecated `cleanup_instance_journals()` which truncated everything unconditionally
+  - Cache hit rate improved from ~88% to ~99% on repeat downloads
+
+## [1.0.5] - 2026-01-24
+
+### Fixed
+- **Critical: NFS Directory Entry Caching Bug**: Removed `.exists()` checks before reading metadata files. The `.exists()` calls caused NFS to cache directory entries, making newly created files invisible to other instances even after journal consolidation. This caused 40%+ cache miss rate on repeat downloads. Now reads files directly, avoiding directory lookups entirely.
+
+## [1.0.4] - 2026-01-24
+
+### Added
+- **Delta File Archiving**: Delta files are now archived with timestamps before truncation during checkpoint consolidation. Archives are kept for the last 20 checkpoints per instance to aid troubleshooting of size tracking discrepancies.
+- **Range Storage Logging**: Added INFO-level logging for successful range storage operations to diagnose cache write failures.
+
+### Changed
+- **Dashboard Cleanup**: Removed "Stale Refreshes" counter (internal metric not useful to users).
+
+## [1.0.3] - 2026-01-24
+
+### Fixed
+- **Dashboard Statistics Accuracy**: Separated HEAD and GET hit/miss counters. "Object Metadata" now shows HEAD request statistics only, "Object Ranges" shows GET request statistics only. Previously both sections showed combined stats, making it appear that GET requests were missing cache when only HEAD metadata was missing.
+
+## [1.0.2] - 2026-01-24
+
+### Fixed
+- **Distributed Lock Reliability**: Replaced file rename-based locking with `flock()` for both eviction and checkpoint locks. The rename approach failed on NFS due to attribute caching, causing 75+ lock errors per minute and allowing multiple instances to evict simultaneously. `flock()` provides reliable distributed locking on NFS4 without consistency issues.
+
+### Changed
+- **Lock Mechanism**: Eviction and checkpoint locks now use persistent files with `flock()` instead of temp file + rename atomicity.
+- **No Delays Needed**: Removed NFS propagation delays (50ms, 100ms, 200ms, 500ms) since `flock()` is atomic and works immediately.
+
+## [1.0.1] - 2026-01-24
+
+### Fixed
+- **Eviction Not Triggered During Read-Only Workloads**: Fixed cache staying over capacity (230%) indefinitely when no new writes occur. Checkpoint sync now triggers eviction check every 30 seconds if cache exceeds limit, ensuring capacity is enforced even during read-only workloads.
+- **Eviction Lock NFS Propagation**: Added 100ms delay after sync_all() before rename to account for NFS propagation time, reducing lock acquisition failures.
+
+### Changed
+- **Reduced Log Noise**: Changed delta buffer flush and cache size recovery logs from INFO to DEBUG level.
+- **Error Severity**: Reduced eviction lock rename failures from ERROR to WARN since they're automatically retried and don't affect functionality.
+- **Terminology**: Changed EFS-specific references to NFS (applies to all network filesystems, not just EFS).
+
+## [1.0.0] - 2026-01-23
+
+### Major Release
+First stable 1.0.0 release with production-ready multi-instance cache coordination and comprehensive bug fixes.
+
+### Fixed
+- **Write Cache Critical Bug**: Fixed PUT operations storing incorrect file paths (filename only instead of full sharded path), causing "Failed to slice cached range data" errors on GET requests after PUT.
+- **Cross-Instance Size Tracking**: Implemented near-realtime multi-instance cache size synchronization with 30-second checkpoint consolidation, randomized coordination, and NFS consistency handling.
+- **NFS Consistency**: Added `flush()` and `sync_all()` to all critical file operations (checkpoint, delta, eviction lock) to ensure data visibility across instances on network filesystems.
+- **Eviction Lock Failures**: Fixed "No such file or directory" errors during eviction lock acquisition by ensuring temp files are synced before rename.
+- **Dashboard Log Parser**: Fixed log viewer to handle tracing's inconsistent spacing (single space for ERROR, double space for INFO/WARN/DEBUG).
+
+### Changed
+- **Checkpoint Interval**: Reduced from 5 minutes to 30 seconds for better cross-instance accuracy.
+- **Checkpoint Coordination**: Added randomized delay (0-5s) and lock-based coordination so only one instance consolidates per interval.
+- **Logging Format**: Added `.compact()` format to tracing configuration.
+- **Reduced Log Noise**: Checkpoint operations use DEBUG level, sync only logs significant changes (>10 MB).
+
+### Removed
+- **Dead Code**: Removed unused `acquire_global_eviction_lock()` and `is_eviction_lock_stale()` methods.
+
+## [0.10.1] - 2026-01-23
+
+### Fixed
+- **EFS Consistency for Checkpoint Writes**: Added `flush()` and `sync_all()` to checkpoint file writes to ensure data is fully committed to EFS before rename, preventing other instances from reading stale checkpoint data.
+- **EFS Consistency for Delta Files**: Added `sync_all()` to delta file writes to ensure data is committed before checkpoint consolidation reads and truncates the files.
+- **Cross-Instance Delta Timing**: Added 5-second wait after acquiring checkpoint lock to ensure all instances have flushed their deltas before consolidation reads them, accounting for random delay spread (0-5 seconds).
+- **EFS Propagation Delay**: Increased checkpoint read delay from 100ms to 500ms to account for EFS eventual consistency when other instances update the checkpoint file.
+
+### Changed
+- **Checkpoint Interval**: Reduced from 60 seconds to 30 seconds for better cross-instance size accuracy with acceptable EFS I/O overhead.
+- **Reduced Log Noise**: Changed checkpoint lock acquisition/skip from INFO to DEBUG level, and only log checkpoint sync when size changes by >10 MB.
+
+### Removed
+- **Dead Code**: Removed unused `acquire_global_eviction_lock()` method that was replaced by `try_acquire_global_eviction_lock()`.
+
+## [0.10.0] - 2026-01-23
+
+### Fixed
+- **Write Cache Range Storage Bug**: Fixed critical bug where PUT operations stored only the filename instead of the full sharded relative path in RangeSpec, causing "Failed to slice cached range data" errors on subsequent GET requests. Now correctly stores paths like `bucket/XX/YYY/object_0-1023.bin`.
+- **Cross-Instance Size Tracking**: Implemented near-realtime cross-node cache size synchronization. Checkpoint process now consolidates deltas from ALL instances every minute (down from 5 minutes), providing accurate size tracking across the cluster without filesystem scanning.
+- **Checkpoint Coordination**: Added randomized delay (0-5 seconds) and lock-based coordination to ensure only ONE instance writes the consolidated checkpoint per minute, preventing wasted work and race conditions. All instances re-read the checkpoint to stay synchronized.
+- **EFS Consistency for Delta Files**: Fixed critical race condition where delta files were being truncated before data was visible on EFS. Added `sync_all()` after delta flush to ensure data is committed to disk before checkpoint consolidation reads and truncates the files.
+- **Eviction Lock EFS Consistency**: Fixed eviction lock failures on EFS/NFS by adding `sync_all()` before rename to ensure temp file is flushed to disk before atomic rename operation.
+- **Dashboard Log Parser**: Fixed dashboard log viewer to handle tracing's inconsistent spacing (single space for ERROR, double space for INFO/WARN/DEBUG) by using `trim_start()` after timestamp extraction.
+
+### Changed
+- **Checkpoint Interval**: Reduced default checkpoint interval from 5 minutes to 1 minute for near-realtime cross-instance size accuracy.
+- **Logging Format**: Added `.compact()` format to tracing configuration for more consistent log formatting.
+
+## [0.9.23] - 2026-01-23
+
+### Fixed
+- **Cache Size Limit vs Current Size Confusion**: Fixed multiple places in the code that were using `total_cache_size` (current usage) when they should have been using `max_cache_size_limit` (configured limit). This affected:
+  - Post-initialization eviction check
+  - Write cache capacity calculation
+  - `evict_if_needed()` threshold calculation
+  - `enforce_disk_cache_limits()` check
+  - `get_maintenance_recommendations()` utilization calculation
+  - Write cache max size recalculation
+- **Startup Over-Capacity Message**: Changed "eviction needed" to "eviction will take place the next time data is cached" for clarity.
+
+## [0.9.22] - 2026-01-22
+
+### Fixed
+- **Dashboard Disk Cache Size Display**: Fixed dashboard showing size/size instead of size/limit. Added `max_cache_size_limit` field to `CacheStatistics` to track the configured limit separately from `total_cache_size` (current usage).
+
+## [0.9.21] - 2026-01-22
+
+### Fixed
+- **Scalable Cache Size Tracking**: Replaced filesystem walks with size tracker for all cache size checks. Previously, `evict_if_needed()`, `get_cache_size_stats()`, `enforce_disk_cache_limits()`, and `get_maintenance_recommendations()` all walked the filesystem to calculate cache size, which doesn't scale to billions of files. Now all these functions use the incremental size tracker (updated on every cache write/delete, corrected daily by validation scan).
+- **Eviction Now Triggers Correctly**: Fixed eviction not triggering because it was using stale checkpoint data. The size tracker's in-memory `current_size` is now used directly, which is updated in real-time as ranges are stored.
+- **MetricsManager Cache Size Tracker**: Wired size tracker to MetricsManager so `cache_size` metrics are populated.
+- **Dashboard Field Fix**: Fixed reference to non-existent `max_cache_size_limit` field in dashboard (now uses `total_cache_size`).
+- **Missing HybridMetadataWriter Getter**: Added `get_hybrid_metadata_writer()` method to CacheManager for background orphan recovery.
+
+## [0.9.18] - 2026-01-22
+
+### Fixed
+- **Cache Size Tracking for Range Storage**: Fixed critical bug where cache size was not being tracked when storing range data through `CacheManager` methods (`store_full_object_as_range_new`, `store_write_cache_entry`, `complete_multipart_upload`). The size tracker was only being updated in `DiskCacheManager.store_range()` but not in the `CacheManager` code paths. This caused the size tracker to show incorrect values (e.g., 702MB when actual disk usage was 1.5GB), preventing eviction from triggering.
+- **Size Tracker Wiring Logging**: Added INFO-level logging when size tracker is wired up to disk cache manager, and WARN-level logging when size tracker is not available for range storage operations.
+
+## [0.9.17] - 2026-01-22
+
+### Fixed
+- **Eviction Lock Logging**: Added INFO-level logging for eviction lock operations to diagnose lock acquisition issues. Logs now show when locks are acquired, when existing locks are found (with elapsed time and timeout), and when stale locks are forcibly acquired.
+
+### Changed
+- **Dashboard Uptime Auto-Refresh**: System info (including uptime) now refreshes automatically every 5 seconds along with other dashboard metrics.
+
+## [0.9.16] - 2026-01-22
+
+### Fixed
+- **Distributed Eviction Over-Eviction**: In shared storage mode, after acquiring the eviction lock, proxies now re-check cache size using the size tracker before proceeding. This prevents over-eviction when multiple proxies detect over-capacity simultaneously - the second proxy will see the cache is already under target and skip eviction.
+- **Dashboard Log Text Filter**: Text filter now searches server-side across all log entries, not just the already-displayed entries. Previously, filtering for "eviction" with level=All would only search the 100 most recent INFO entries; now it searches all entries matching the criteria.
+
+## [0.9.15] - 2026-01-22
+
+### Fixed
+- **Cache Eviction Bug**: Fixed critical bug where cache eviction never triggered because `total_cache_size` was used for both the configured limit and current usage. Added separate `max_cache_size_limit` field to store the configured limit, ensuring eviction triggers correctly when cache exceeds capacity.
+- **RAM Cache Excluded from Disk Total**: `total_cache_size` now only includes disk cache (read + write), not RAM cache, since RAM is separate and doesn't count against disk limit.
+- **Range Spec Journal Fallback**: In shared storage mode, `load_range_data_from_new_storage` now checks journals as fallback when range not found in metadata file, fixing "Range spec not found" warnings caused by race conditions.
+
+### Changed
+- **Dashboard Size Display**: Dashboard now shows cache size with limit (e.g., "1.5 GiB / 1.2 GiB") for both disk cache and RAM cache.
+
+## [0.9.14] - 2026-01-21
+
+### Fixed
+- **Coordinator Max Cache Size**: Cache initialization coordinator now uses actual configured `max_cache_size` instead of hardcoded 1GB, fixing misleading "Cache over capacity" warnings
+
+## [0.9.13] - 2026-01-21
+
+### Changed
+- **Non-Destructive Metadata Error Handling**: Metadata files are no longer deleted when read/parse errors occur
+  - JSON parse failures now retry up to 3 times with 50ms delays (handles partial reads during in-progress writes)
+  - Empty file and I/O errors treated as cache miss without deletion
+  - Prevents race condition where multiple proxies delete valid in-progress metadata writes
+  - Orphan recovery system handles truly corrupt files over time
+
+## [0.9.12] - 2026-01-21
+
+### Fixed
+- **Range File Rename Before Journal Write**: In shared storage mode, range files are now renamed to their final path BEFORE writing the journal entry. This eliminates the race condition where another proxy's consolidator could read a journal entry referencing a file that doesn't exist yet. If journal write fails after rename, the orphan recovery system will clean up the range file.
+
+## [0.9.11] - 2026-01-21
+
+### Fixed
+- **Additional Journal Parse Warnings Downgraded**: All "Failed to parse journal entry" warnings in journal_manager.rs now debug level (4 additional locations)
+
+## [0.9.10] - 2026-01-20
+
+### Fixed
+- **Downgraded Journal Warnings to Debug**: "Failed to read journal file" (stale file handle) and "Journal entry references non-existent range file" warnings are now debug level since they're expected during concurrent writes on shared storage
+
+## [0.9.9] - 2026-01-20
+
+### Fixed
+- **Range Response Metadata Retry**: Added retry logic (5 attempts with increasing delays: 20-80ms) when retrieving cached metadata for range responses, reducing "Could not retrieve cached metadata" warnings during concurrent writes
+
+## [0.9.8] - 2026-01-20
+
+### Fixed
+- **Metadata Read Retry with Delay**: `get_metadata_from_disk()` now retries up to 3 times with 10ms delay for transient errors (empty file, parse errors, I/O errors) before falling back to journal lookup
+
+## [0.9.7] - 2026-01-20
+
+### Fixed
+- **Journal Fallback for Corrupted Metadata Files**: `get_metadata_from_disk()` now tries journal lookup when `.meta` file exists but fails to parse (EOF error, empty file, or corruption during concurrent writes)
+
+## [0.9.6] - 2026-01-20
+
+### Fixed
+- **Journal Metadata Lookup for Range Responses**: `get_metadata_from_disk()` now checks pending journal entries when `.meta` file doesn't exist, eliminating "Could not retrieve cached metadata for range response" warnings during journal consolidation window
+
+## [0.9.5] - 2026-01-20
+
+### Added
+- **Emergency Eviction on ENOSPC**: When disk write fails with "No space left on device", triggers cache eviction (80% target) and retries once before giving up
+- **Post-Eviction Capacity Check**: After eviction completes, verifies sufficient space exists before allowing new cache writes
+- **Hard Capacity Check**: Blocks new cache writes when disk usage exceeds configured max capacity
+
+### Fixed
+- **Journal Metadata Propagation**: Journal entries now include `object_metadata` field, ensuring response headers are preserved when metadata files are created by journal consolidation
+- **Range Response Content-Length**: Fixed incorrect content_length override that caused "Start position exceeds content length" warnings
+- **Journal Lookup Race Condition**: Added fallback journal lookup in `find_cached_ranges()` to check pending journal entries during the consolidation window
+
+### Changed
+- **Orphaned Range Recovery**: Integrated with BackgroundRecoverySystem for scalable sharded scanning of orphaned .bin files
+
+## [0.9.2] - 2026-01-20
+
+### Added
+- **Buffered Access Logging**: Access logs are now buffered in RAM and flushed periodically
+  - Reduces disk I/O on shared storage (EFS/NFS) by batching writes
+  - Configurable flush interval (`access_log_flush_interval`, default: 5s)
+  - Configurable buffer size (`access_log_buffer_size`, default: 1000 entries)
+  - Force flush on graceful shutdown to minimize data loss
+  - Maintains existing S3-compatible log format and date-partitioned directory structure
+
+- **Buffered Size Delta Tracking**: Cache size deltas are now buffered and written to per-instance files
+  - Eliminates lock contention between proxy instances on shared storage
+  - Each instance writes to its own delta file (`size_tracking/delta-{instance_id}.log`)
+  - Configurable flush interval (`size_tracking_flush_interval`, default: 5s)
+  - Configurable buffer size (`size_tracking_buffer_size`, default: 10000 deltas)
+  - Recovery reads all instance delta files and sums with checkpoint
+  - Stale delta files from crashed instances cleaned up based on age
+
+### Changed
+- **Removed `AccessLogWriter`**: Replaced with `AccessLogBuffer` for buffered writes
+- **Removed synchronous delta methods**: `try_append_delta()` and `try_append_write_cache_delta()` replaced with buffered `SizeDeltaBuffer`
+
+### Performance
+- **Shared Storage Optimization**: Significantly reduced disk I/O for EFS/NFS deployments
+  - Access logs: Up to 99% reduction in write operations (1000 entries per flush vs per-request)
+  - Size tracking: Eliminated per-operation disk writes and lock contention
+  - Improved throughput for high-traffic multi-instance deployments
+
+## [0.9.1] - 2026-01-15
+
+### Added
+- **Presigned URL Expiration Rejection**: Proxy now detects and rejects expired AWS SigV4 presigned URLs before cache lookup
+  - Parses `X-Amz-Date` and `X-Amz-Expires` from query parameters
+  - Checks expiration locally without S3 API calls
+  - Returns 403 Forbidden immediately for expired URLs
+  - INFO-level logging with expiration details (seconds expired, signed time, validity duration)
+  - Prevents serving cached data with expired access credentials
+  - Example: `cargo run --release --example presigned_url_demo`
+
+### Documentation
+- **Presigned URL Support**: Added comprehensive documentation in CACHING.md
+  - Explains how presigned URLs interact with caching
+  - Documents two TTL strategies: Long TTL (performance) vs Zero TTL (security)
+  - Clarifies cache key generation (path only, excludes query parameters)
+  - Security considerations for time-limited access control
+  - Early rejection behavior for expired presigned URLs
+
+## [0.9.0] - 2026-01-06
+
+### Added
+- **Per-Instance Part Request Deduplication**: Prevents duplicate S3 requests when concurrent part requests arrive for the same object
+  - When a part request arrives but multipart metadata is missing (object cached via regular GET), the proxy checks if this instance is already fetching any part for the same object
+  - If an active fetch is in progress: waits 5 seconds, then returns HTTP 503 with `Retry-After: 5` header
+  - Maximum 3 deferrals (15 seconds total wait) before forwarding to S3 anyway
+  - The in-flight request populates multipart metadata (`parts_count`, `part_size`) from S3 response headers
+  - Active fetches automatically expire after 60 seconds (stale timeout) to handle edge cases
+  - This is per-instance coordination only - no cross-instance state sharing required
+
+### Changed
+- **Simplified Concurrent Part Request Handling**: Replaced complex cross-instance metadata population coordination with simpler per-instance request deduplication
+  - Previous approach attempted RAM-based cross-instance coordination which doesn't work with shared storage
+  - New approach: each instance independently tracks its own active S3 fetches
+  - More reliable and predictable behavior in multi-instance deployments
+
+### Fixed
+- **Part Requests Incorrectly Served from Range Cache**: Fixed critical bug where part requests without multipart metadata were incorrectly served from cached ranges
+  - Previously, when `lookup_part` returned cache miss, the code fell through to range handling which served the full object data instead of the specific part
+  - This returned incorrect data (full object) with wrong headers (no `x-amz-mp-parts-count`, wrong `Content-Range`)
+  - Now, part requests that miss the cache go directly to S3, bypassing range handling entirely
+  - Part requests are only served from cache when multipart metadata (`parts_count`, `part_size`) is known
+- **Part 1 Not Included in Deduplication**: Fixed bug where part 1 requests bypassed deduplication logic
+  - Previously, part 1 was treated as "single-part object" when multipart metadata was missing
+  - Now ALL part requests without multipart metadata go through deduplication
+  - Ensures only one S3 request is made regardless of which part number arrives first
+
+### Technical Details
+- `ActivePartFetch` struct tracks cache_key, part_number, start time, and deferral count
+- `handle_missing_multipart_metadata` registers active fetch and defers concurrent requests
+- ALL part requests without multipart metadata now go through deduplication (including part 1)
+- After 3 deferrals, forwards to S3 to prevent indefinite blocking
+- `complete_part_fetch` and `fail_part_fetch` methods clean up tracking after S3 response
+- 503 responses include `Retry-After: 5` header for client retry guidance
+
+## [0.8.2] - 2026-01-06
+
+### Fixed
+- **Dead Code Removal**: Cleaned up legacy and unused code
+  - Removed deprecated no-op methods: `refresh_metadata_expiration()`, `merge_overlapping_ranges()`
+  - Removed unused journal cleanup methods: `cleanup_processed_entries()`, `cleanup_invalid_entries()`
+  - Fixed test expectations for shared storage default configuration
+  - All functionality preserved, no breaking changes
+
+## [0.8.1] - 2026-01-05
+
+### Changed
+- **Shared Storage Enabled by Default**: Multi-instance coordination is now enabled by default
+  - `shared_storage.enabled` now defaults to `true` instead of `false`
+  - Provides better safety for multi-instance deployments out of the box
+  - Single-instance deployments can set `shared_storage.enabled: false` to disable coordination overhead
+
+## [0.8.0] - 2026-01-04 - Performance Optimized Shared Cache
+
+### Changed
+- **Faster Cross-Instance Cache Visibility**: Reduced default journal consolidation interval from 30s to 5s
+  - Improves cache hit rates in multi-instance deployments with shared storage (EFS, FSx)
+  - When one instance caches data, other instances see it within ~5s instead of ~30s
+  - Configurable via `shared_storage.consolidation_interval` (valid range: 1-60 seconds)
+  - Tradeoff: Slightly more frequent consolidation I/O for significantly better cache utilization
+- **Consolidation Interval Range**: Changed valid range from 5-300 seconds to 1-60 seconds
+  - Allows sub-5-second consolidation for latency-sensitive workloads
+  - Upper bound reduced since consolidation is fast (~3ms for 200+ entries)
+
+## [0.7.5] - 2026-01-04
+
+### Changed
+- **Faster Cross-Instance Cache Visibility**: Reduced default journal consolidation interval from 30s to 5s
+  - Improves cache hit rates in multi-instance deployments with shared storage (EFS, FSx)
+  - When one instance caches data, other instances see it within ~5s instead of ~30s
+  - Configurable via `shared_storage.consolidation_interval` (valid range: 5-300 seconds)
+  - Tradeoff: Slightly more frequent consolidation I/O for significantly better cache utilization
+
+## [0.7.4] - 2026-01-04
+
+### Changed
+- **Versioned Request Handling**: Requests with `versionId` query parameter now properly validate against cached version
+  - If cached object has matching `x-amz-version-id`: serve from cache (cache hit)
+  - If cached object has different version: bypass cache, forward to S3, do NOT cache response
+  - If no cached object exists: bypass cache, forward to S3, do NOT cache response
+  - Prevents serving wrong version data when requesting specific object versions
+  - Prevents cache pollution with version-specific data that may not be the "current" version
+  - New metrics: `versioned_request_mismatch` and `versioned_request_no_cache` for monitoring
+- **Zero-Copy Cache Writes**: Eliminated unnecessary data copy in CacheWriter when compression is disabled
+  - Previously: `data.to_vec()` copied every chunk even without compression
+  - Now: Writes directly from original slice when no compression needed
+  - Reduces memory allocations and CPU usage during cache-miss streaming
+  - Improves throughput for large file transfers
+
+### Fixed
+- **Version ID Cache Correctness**: Previously, versioned GET requests would incorrectly use cached data regardless of version
+  - Old behavior: `GET /bucket/object?versionId=v2` could return cached data from version v1
+  - New behavior: Only serves from cache if `x-amz-version-id` in cached metadata matches requested `versionId`
+
+## [0.7.3] - 2026-01-04
+
+### Changed
+- **JournalOnly Mode for Range Writes**: Changed cache-miss range metadata writes from `WriteMode::Hybrid` to `WriteMode::JournalOnly`
+  - Eliminates lock contention on shared storage (EFS) during large file transfers
+  - Journal consolidator merges entries asynchronously without blocking streaming
+  - Addresses 4x performance gap (80MB/s vs 300MB/s) caused by metadata lock contention
+  - Each 8MB range write no longer acquires exclusive lock on metadata file
+
+## [0.7.2] - 2026-01-03
+
+### Changed
+- **DiskCacheManager Lock**: Changed from `Mutex` to `RwLock` for improved parallel read performance
+  - Cache lookups (reads) now use `.read().await` allowing concurrent access
+  - Cache mutations (writes) use `.write().await` for exclusive access
+  - Significantly improves throughput for parallel range requests on cache hits
+  - Addresses performance gap where HTTPS (bypassing proxy) was faster than HTTP for parallel downloads
+- **Read Methods**: Changed read-only methods to take `&self` instead of `&mut self`
+  - `load_range_data`, `get_cache_entry`, `get_full_object_as_range` now use `&self`
+  - `decompress_data`, `decompress_with_algorithm` in CompressionHandler now use `&self`
+  - Enables true parallel reads through RwLock
+
+## [0.7.1] - 2026-01-03
+
+### Removed
+- **AccessTracker Module**: Removed redundant `src/access_tracker.rs` module
+  - Time-bucketed access logs in `access_tracking/` directory no longer used
+  - Functionality consolidated into journal system (`CacheHitUpdateBuffer`)
+- **BatchFlushCoordinator**: Removed from RAM cache module
+  - RAM cache access tracking now handled by journal system at DiskCacheManager level
+  - Removed `batch_update_range_access` function from DiskCacheManager
+  - Removed `set_flush_channel`, `start_flush_coordinator`, `shutdown_flush_coordinator` methods
+- **RAM Cache AccessTracker**: Simplified RAM cache by removing internal AccessTracker
+  - `record_disk_access`, `should_verify`, `record_verification`, `pending_disk_updates` now no-ops
+  - Access tracking for disk metadata handled by `record_range_access` in DiskCacheManager
+
+### Changed
+- **Unified Access Tracking**: All cache-hit access tracking now uses journal system
+  - Range accesses recorded via `DiskCacheManager::record_range_access()`
+  - Buffered in `CacheHitUpdateBuffer`, flushed periodically, consolidated to metadata
+  - Eliminates duplicate tracking systems and reduces code complexity
+
+## [0.7.0] - 2026-01-03
+
+### Added
+- **Journal-Based Metadata Updates**: New system for atomic metadata updates on shared storage
+  - Eliminates race conditions when multiple proxy instances share cache storage (EFS/NFS)
+  - RAM-buffered cache-hit updates with periodic flush to per-instance journal files
+  - Background consolidation applies journal entries to metadata files with full-duration locking
+  - Lock acquisition with exponential backoff and jitter for contention handling
+  - New `CacheHitUpdateBuffer` for buffering TTL refresh and access count updates
+  - New journal operations: `TtlRefresh` and `AccessUpdate` for incremental metadata changes
+
+### Changed
+- **Shared Storage Mode**: Cache-hit updates now route through journal system
+  - TTL refreshes buffered in RAM, flushed every 5 seconds to instance journal
+  - Access count updates buffered similarly, applied during consolidation
+  - Single-instance mode retains direct write behavior for performance
+- **Journal Consolidation**: Enhanced to handle new operation types
+  - `TtlRefresh` updates range expiration without replacing range data
+  - `AccessUpdate` increments access count and updates last_accessed timestamp
+  - Conflict resolution skips incremental operations (they don't carry full range data)
+- **Lock Manager**: Added `acquire_lock_with_retry` with configurable backoff
+  - Exponential backoff with jitter prevents thundering herd
+  - Configurable max retries, initial/max backoff, jitter factor
+
+### Fixed
+- **Race Condition**: Concurrent metadata updates on shared storage no longer corrupt data
+- **Conflict Resolution**: TtlRefresh/AccessUpdate operations no longer overwrite existing range data
+
+## [0.6.0] - 2026-01-03
+
+### Changed
+- **Journal RAM Buffering**: Access tracking now buffers entries in RAM before flushing to disk
+  - Entries buffered in memory with periodic flush (every 5 seconds by default)
+  - Dramatically reduces disk I/O on shared storage (EFS/NFS)
+  - Buffer auto-flushes when reaching 10,000 entries
+  - Force flush available for shutdown/testing scenarios
+- **Removed Immediate Metadata Updates**: Access tracking no longer updates metadata files on every access
+  - Metadata updates now happen only during consolidation (every ~60 seconds)
+  - Eliminates per-access disk writes, improving throughput significantly
+  - Access counts and timestamps still accurately tracked via journal consolidation
+- **Simplified Access Tracking Directory Structure**: 
+  - Removed per-instance `.access.{instance_id}` files from metadata directories
+  - All access logs now stored in `access_tracking/{time_bucket}/{instance_id}.log`
+  - Cleaner separation between metadata and access tracking data
+
+### Performance
+- **Reduced Disk I/O**: Up to 99% reduction in disk writes for high-traffic workloads
+- **Lower Latency**: Access recording completes in <1ms (RAM buffer only)
+- **Better Shared Storage Performance**: Optimized for EFS/NFS with batched writes
+
+## [0.5.0] - 2025-01-02
+
+### Added
+- **RAM Metadata Cache**: New in-memory cache for `NewCacheMetadata` objects
+  - Reduces disk I/O by caching frequently accessed metadata in RAM
+  - LRU eviction with configurable max entries (default: 10,000)
+  - Per-key locking prevents concurrent disk reads for same key
+  - Stale file handle recovery with configurable retry logic
+  - Configurable via `metadata_cache` section in config
+
+### Changed
+- **Unified HEAD/GET metadata storage**: HEAD and GET requests now share a single `.meta` file
+  - Independent TTLs: HEAD expiry doesn't affect cached ranges, range expiry doesn't affect HEAD validity
+  - New fields in `NewCacheMetadata`: `head_expires_at`, `head_last_accessed`, `head_access_count`
+  - HEAD access tracking via journal system with format `bucket/key:HEAD`
+- **Directory rename**: `objects/` directory renamed to `metadata/`
+  - Cache will be wiped on upgrade (no migration needed)
+  - All metadata files now stored in `metadata/{bucket}/{XX}/{YYY}/`
+
+### Removed
+- **Legacy HEAD cache**: Removed separate `head_cache/` directory and associated code
+  - Removed `HeadRamCacheEntry`, `HeadAccessStats`, `HeadPendingUpdate`, `HeadAccessTracker` structs
+  - Removed HEAD-specific methods from `RamCache` and `ThreadSafeRamCache`
+  - Removed HEAD cache scanning from `CacheSizeTracker`
+  - Kept `HeadCacheEntry` as return type for backward compatibility
+
+## [0.4.0] - 2024-12-30
+
+### Added
+- **Cache bypass headers support**: Clients can now explicitly bypass the cache using standard HTTP headers
+  - `Cache-Control: no-cache` - Bypass cache lookup but cache the response for future requests
+  - `Cache-Control: no-store` - Bypass cache lookup and do not cache the response
+  - `Pragma: no-cache` - HTTP/1.0 compatible cache bypass (same behavior as no-cache)
+  - Case-insensitive header parsing with support for multiple directives
+  - `no-store` takes precedence when both `no-cache` and `no-store` are present
+  - `Cache-Control` takes precedence over `Pragma` when both headers are present
+  - Headers are stripped before forwarding requests to S3
+  - Configurable via `cache_bypass_headers_enabled` option (enabled by default)
+  - Metrics tracking for bypass reasons (no-cache, no-store, pragma)
+  - INFO-level logging for cache bypass events
+
+### Changed
+- **Unified disk cache eviction**: Replaced dual-mode eviction with unified range-level eviction
+  - Removed arbitrary 3-range threshold that determined eviction mode
+  - All ranges now treated as independent eviction candidates
+  - Consistent LRU/TinyLFU sorting across all objects regardless of range count
+  - Metadata file deleted only when all ranges evicted
+  - Empty directories cleaned up automatically after eviction
+  - Efficient batching: one metadata update per object during eviction
+
+## [0.3.0] - 2024-12-21
+
+### Added
+- **Web-based monitoring dashboard** with real-time cache statistics and log viewing
+  - Accessible at `localhost:8081` (configurable port)
+  - Real-time cache hit rates, sizes, and eviction statistics
+  - Application log viewer with filtering and auto-refresh
+  - System information display (hostname, version, uptime)
+  - No authentication required for internal monitoring
+  - Minimal performance impact (<10MB memory, supports 10 concurrent users)
+- Dashboard configuration options in `config.example.yaml`
+  - Configurable refresh intervals for cache stats and logs
+  - Adjustable maximum log entries display
+  - Bind address and port configuration
+
+### Changed
+- Moved deployment-related files to non-public directory for better organization
+- Updated documentation to reflect dashboard functionality
+- Enhanced repository structure and cleanup
+
+### Removed
+- Old debugging scripts from `old-or-reference/` directory
+
+## [0.2.0] - Previous Release
+
+### Added
+- Multi-tier caching (RAM + disk) with intelligent HEAD metadata caching
+- Sub-millisecond HEAD response times from RAM cache
+- Streaming response architecture for large files
+- Unified TinyLFU eviction algorithm across GET and HEAD entries
+- Intelligent range request optimization with merging
+- Content-aware LZ4 compression with per-entry metadata
+- Connection pooling with IP load balancing
+- Write-through caching for single and multipart object uploads
+- Multi-instance shared cache coordination
+- OpenTelemetry Protocol (OTLP) metrics export
+- Comprehensive test suite with property-based testing
+- Docker deployment support
+- Health check and metrics endpoints
+
+### Features
+- HTTP (Port 80): Full caching with range optimization
+- HTTPS (Port 443): TCP passthrough (no caching)
+- S3-compatible access logs and structured application logs
+- Configurable TTL overrides per bucket/prefix
+- Distributed eviction coordination for multi-instance deployments
+- Performance optimizations for large-scale deployments
+
+## [0.1.0] - Initial Release
+
+### Added
+- Basic S3 proxy functionality
+- Simple caching implementation
+- Core HTTP/HTTPS proxy server
+- Basic configuration system

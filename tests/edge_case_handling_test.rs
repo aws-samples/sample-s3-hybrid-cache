@@ -5,7 +5,9 @@
 //! This test suite verifies:
 //! - Requirement 9.1: Handle corrupted range metadata with default statistics
 //! - Requirement 9.2: Handle insufficient space after eviction (bypass caching)
-//! - Requirement 9.3: Handle metadata lock timeout (break lock after 60s)
+//! - Requirement 9.3: RETIRED. There is no metadata lock timeout and no 60s break-lock rule;
+//!   the protocol `flock`s a permanent shared slot. What is asserted in its place is that a
+//!   legacy per-key `{key}.meta.lock` is inert — see `test_stale_metadata_lock_handling`.
 //! - Requirement 9.4: Ensure .bin file deletion when range is deleted
 //! - Requirement 9.5: Ensure .meta file deletion when last range is deleted
 
@@ -64,8 +66,60 @@ async fn test_insufficient_space_after_eviction() {
     println!("Insufficient space handling is verified in perform_eviction() method");
 }
 
-/// Test that stale metadata locks are broken after 60 seconds
-/// Requirement 9.3: Handle metadata lock timeout (break lock after 60s)
+/// A pre-existing legacy per-key `{key}.meta.lock` is inert: not honoured, not unlinked.
+///
+/// **This test's original subject no longer exists.** It was written for "Requirement 9.3:
+/// handle metadata lock timeout (break lock after 60s)", against a protocol that inferred a
+/// holder's liveness from a lock file's age and broke the lock when it looked stale. That
+/// protocol is retired: `metadata_lock_manager` locks a permanent shared slot under
+/// `_meta_locks/`, holds a payload-free `flock`, and never infers staleness from elapsed
+/// time — so there is no 60-second rule left to assert, and the per-key path this plants is
+/// not written by anything.
+///
+/// The `.meta.lock` name below is therefore deliberate: the point is that a **pre-existing
+/// legacy file at the retired path must not affect the slot-locked path**. Do not rename it
+/// to the slot path, which would delete the only thing the fixture still says.
+///
+/// # What the body asserted before, and why it could never fail
+///
+/// It asserted `update_range_access(..).is_ok()` against metadata whose `ranges` vector was
+/// empty. `update_range_access_direct` returns `Ok(())` from its `!range_found` arm for a key
+/// whose metadata holds no matching range, so the assertion held whether or not the legacy
+/// file existed — and would have held with the legacy file, the metadata file, and the whole
+/// protocol behaving any way at all. It was vacuous from the day it was written.
+///
+/// # What it asserts now
+///
+/// Two arms, on **observable state** rather than on a return value:
+///
+/// - **Arm 1, slot free.** The stored range's `access_count` must rise by one in the `.meta`
+///   on disk, which is the precondition that the call had something to do — the thing the old
+///   body lacked. And the planted legacy file must survive with the same bytes, the same
+///   mtime, and (on unix) the same inode. That is not a tautology: the retired protocol's
+///   stale-detection branches judged a payload-free lock file stale **by mtime** and then
+///   `remove_file`d it, unlinking a live holder's lock, which is the defect six comments in
+///   `src/disk_cache.rs` warn against reintroducing.
+/// - **Arm 2, slot held by a peer.** With this test holding the key's shared slot, the same
+///   call must change nothing. This **observes** which file the operation locks instead of
+///   assuming it: a holder of the shared slot would not exclude an operation that locked the
+///   per-key path, so an update landing here means the lock namespace is not the slot.
+///   `flock` conflicts between two descriptors of one file even inside one process (see
+///   `metadata_lock_manager`'s `nested_meta_lock_acquisition_is_refused`), which is what lets
+///   a single-process fixture hold the slot against the code under test.
+/// - **Arm 3, slot released.** The same call must update again. Without it, arm 2 would pass
+///   if the operation had simply stopped working, and both arms together would pass for the
+///   wrong reason.
+///
+/// # Why this is not a duplicate
+///
+/// `disk_cache`'s `test_delete_cache_entry_basic` asserts only that no per-key `.meta.lock` is
+/// **created**; it never plants one, so it says nothing about a pre-existing file being read
+/// or unlinked. `cache`'s `meta_lock_unlink_sites_are_pinned` is a **source-text** scan that
+/// only counts an unlink when the path derivation is bound with `let` and a `remove_file`
+/// naming that binding follows within twelve lines — so an inline
+/// `remove_file(path.with_extension("meta.lock"))`, or one further down the function, evades
+/// it. `METALOCK-B1`'s tests in `cache` assert slot acquisition on the **deletion** paths, not
+/// on `update_range_access`. This is the runtime guard for this operation.
 #[tokio::test]
 async fn test_stale_metadata_lock_handling() {
     let temp_dir = TempDir::new().unwrap();
@@ -81,12 +135,7 @@ async fn test_stale_metadata_lock_handling() {
 
     disk_cache.initialize().await.unwrap();
 
-    // Create a metadata file
     let cache_key = "test-bucket/test-object";
-    let metadata_path = disk_cache.get_new_metadata_file_path(cache_key);
-    let lock_path = metadata_path.with_extension("meta.lock");
-
-    // Create metadata
     let object_metadata = s3_proxy::cache_types::ObjectMetadata::new(
         "test-etag".to_string(),
         "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
@@ -94,36 +143,156 @@ async fn test_stale_metadata_lock_handling() {
         Some("application/octet-stream".to_string()),
     );
 
-    let now = SystemTime::now();
-    let metadata = s3_proxy::cache_types::NewCacheMetadata {
-        cache_key: cache_key.to_string(),
-        object_metadata,
-        ranges: vec![],
-        created_at: now,
-        expires_at: now + Duration::from_secs(3600),
-        compression_info: s3_proxy::cache_types::CompressionInfo::default(),
-        ..Default::default()
+    // A real cached range through the real producer, so the entry the operation below updates
+    // is the shape production creates. The old fixture hand-wrote a `.meta` with an empty
+    // `ranges` vector, which is what made the call a no-op and the assertion vacuous.
+    disk_cache
+        .store_range(
+            cache_key,
+            0,
+            1023,
+            &vec![7u8; 1024],
+            object_metadata,
+            Duration::from_secs(3600),
+            false,
+        )
+        .await
+        .expect("fixture: storing one range must succeed");
+
+    let metadata_path = disk_cache.get_new_metadata_file_path(cache_key);
+    // The RETIRED per-key path, planted on purpose. Nothing writes this any more; the
+    // protocol locks a permanent shared slot under `_meta_locks/`.
+    let legacy_lock_path = metadata_path.with_extension("meta.lock");
+    let slot_path = s3_proxy::metadata_lock_manager::slot_lock_path(&cache_dir, cache_key);
+    assert_ne!(
+        legacy_lock_path, slot_path,
+        "fixture: the retired per-key path and the slot path must be different files, or \
+         neither arm below distinguishes anything"
+    );
+
+    // Read the access count out of the `.meta` on disk. Deliberately not through a cache
+    // accessor: the state this test is about is what is on the volume.
+    let access_count = || -> u64 {
+        let json = std::fs::read_to_string(&metadata_path)
+            .expect("fixture: the stored entry's .meta must be readable");
+        let meta: s3_proxy::cache_types::NewCacheMetadata =
+            serde_json::from_str(&json).expect("fixture: the stored .meta must parse");
+        meta.ranges
+            .iter()
+            .find(|r| r.start == 0 && r.end == 1023)
+            .expect(
+                "fixture precondition: the stored range must be present in the .meta, or \
+                 `update_range_access` takes its `!range_found` arm and this test is the \
+                 vacuous one it replaced",
+            )
+            .access_count
     };
 
-    std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
-    let json = serde_json::to_string_pretty(&metadata).unwrap();
-    std::fs::write(&metadata_path, json).unwrap();
+    let initial = access_count();
+    assert!(
+        initial > 0,
+        "fixture precondition: a freshly stored range must carry a non-zero access count, \
+         got {initial}"
+    );
 
-    // Create a stale lock file (>60 seconds old)
-    std::fs::write(&lock_path, "stale lock").unwrap();
-
-    // Set the lock file's modification time to 61 seconds ago
+    // Plant the legacy lock file with a distinctive payload, at the age the retired protocol
+    // judged stale. The slot protocol reads neither the path nor the mtime.
+    const LEGACY_PAYLOAD: &str = "stale lock";
+    std::fs::write(&legacy_lock_path, LEGACY_PAYLOAD).unwrap();
     let stale_time = SystemTime::now() - Duration::from_secs(61);
     let stale_filetime = filetime::FileTime::from_system_time(stale_time);
-    filetime::set_file_mtime(&lock_path, stale_filetime).ok();
+    // `expect`, not `ok()`: a silently failed mtime set would make this fixture's "61 seconds
+    // old" claim false while the test still passed.
+    filetime::set_file_mtime(&legacy_lock_path, stale_filetime)
+        .expect("fixture: the planted file's mtime must be settable");
 
-    // Try to update range access - should break stale lock and succeed
-    let result = disk_cache.update_range_access(cache_key, 0, 1023).await;
+    let planted = std::fs::metadata(&legacy_lock_path).unwrap();
+    let planted_mtime = planted.modified().unwrap();
+    #[cfg(unix)]
+    let planted_ino = std::os::unix::fs::MetadataExt::ino(&planted);
 
-    // Should succeed (or return Ok if range doesn't exist)
-    assert!(result.is_ok(), "Should handle stale lock gracefully");
+    let assert_legacy_untouched = |arm: &str| {
+        let now = std::fs::metadata(&legacy_lock_path).unwrap_or_else(|e| {
+            panic!(
+                "{arm}: the legacy per-key .meta.lock was UNLINKED ({e}). The retired \
+                 protocol's stale branches did exactly this to a live holder's lock; nothing \
+                 may unlink a file in this namespace."
+            )
+        });
+        assert_eq!(
+            std::fs::read_to_string(&legacy_lock_path).unwrap(),
+            LEGACY_PAYLOAD,
+            "{arm}: the legacy per-key .meta.lock was rewritten or truncated"
+        );
+        assert_eq!(
+            now.modified().unwrap(),
+            planted_mtime,
+            "{arm}: the legacy per-key .meta.lock's mtime moved, so something wrote or \
+             touched it"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&now),
+            planted_ino,
+            "{arm}: the legacy per-key .meta.lock is a different inode, so it was unlinked \
+             and recreated"
+        );
+    };
 
-    println!("Stale metadata lock handling verified");
+    // ---- Arm 1: the slot is free, so the update must happen and the legacy file must not
+    // ---- be consulted. A legacy file that were honoured as a held lock would skip the
+    // ---- update and leave the count where it started.
+    disk_cache
+        .update_range_access(cache_key, 0, 1023)
+        .await
+        .expect("the slot is free, so the update must be attempted, not refused");
+    assert_eq!(
+        access_count(),
+        initial + 1,
+        "arm 1: the update did not happen with the slot free. A legacy per-key .meta.lock \
+         must not be read, and must not be treated as a held lock"
+    );
+    assert_legacy_untouched("arm 1");
+
+    // ---- Arm 2: a peer holds the key's SHARED SLOT. The operation must be excluded by it,
+    // ---- which is how this test observes the lock namespace rather than assuming it.
+    let peer = s3_proxy::metadata_lock_manager::try_acquire_slot_lock(&cache_dir, cache_key)
+        .expect("fixture: the slot must be free for the peer to take");
+    assert_eq!(
+        peer.lock_file_path(),
+        slot_path.as_path(),
+        "fixture: the peer must hold the very path the code under test acquires, or arm 2 \
+         proves nothing about contention"
+    );
+
+    let held = access_count();
+    disk_cache
+        .update_range_access(cache_key, 0, 1023)
+        .await
+        .expect("a contended slot is skipped, not an error");
+    assert_eq!(
+        access_count(),
+        held,
+        "arm 2: the update landed while a peer held the SHARED SLOT. The operation is \
+         therefore excluding on some other file — the retired per-key path, most likely — so \
+         the slot is not the lock namespace"
+    );
+    assert_legacy_untouched("arm 2");
+
+    // ---- Arm 3: released. The positive control for arm 2 — without it, arm 2 also passes if
+    // ---- the operation stopped working entirely.
+    drop(peer);
+    disk_cache
+        .update_range_access(cache_key, 0, 1023)
+        .await
+        .expect("the slot is free again, so the update must be attempted");
+    assert_eq!(
+        access_count(),
+        held + 1,
+        "arm 3: the update did not resume after the peer released the slot, so arm 2's \
+         non-update is not attributable to contention"
+    );
+    assert_legacy_untouched("arm 3");
 }
 
 /// Test that .bin files are deleted when ranges are evicted
@@ -138,7 +307,7 @@ async fn test_bin_file_deletion_on_eviction() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -146,8 +315,7 @@ async fn test_bin_file_deletion_on_eviction() {
         Duration::from_secs(3600),
         false,
         SharedStorageConfig {
-            lock_timeout: Duration::from_secs(60),
-            lock_refresh_interval: Duration::from_secs(30),
+            lock_acquire_wait_budget: Duration::from_secs(60),
             ..Default::default()
         },
         10.0,
@@ -233,7 +401,7 @@ async fn test_meta_file_deletion_on_last_range_eviction() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -241,8 +409,7 @@ async fn test_meta_file_deletion_on_last_range_eviction() {
         Duration::from_secs(3600),
         false,
         SharedStorageConfig {
-            lock_timeout: Duration::from_secs(60),
-            lock_refresh_interval: Duration::from_secs(30),
+            lock_acquire_wait_budget: Duration::from_secs(60),
             ..Default::default()
         },
         10.0,
@@ -328,7 +495,7 @@ async fn test_stale_eviction_lock_handling() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -336,8 +503,7 @@ async fn test_stale_eviction_lock_handling() {
         Duration::from_secs(3600),
         false,
         SharedStorageConfig {
-            lock_timeout: Duration::from_secs(60),
-            lock_refresh_interval: Duration::from_secs(30),
+            lock_acquire_wait_budget: Duration::from_secs(60),
             ..Default::default()
         },
         10.0,
@@ -404,7 +570,7 @@ async fn test_multiple_range_eviction_meta_deletion() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -412,8 +578,7 @@ async fn test_multiple_range_eviction_meta_deletion() {
         Duration::from_secs(3600),
         false,
         SharedStorageConfig {
-            lock_timeout: Duration::from_secs(60),
-            lock_refresh_interval: Duration::from_secs(30),
+            lock_acquire_wait_budget: Duration::from_secs(60),
             ..Default::default()
         },
         10.0,

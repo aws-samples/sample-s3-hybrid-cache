@@ -466,12 +466,19 @@ fn test_property_preservation_head_ttl_unchanged() {
 //
 // For random cache keys with a cached copy on disk (metadata + range files),
 // calling `invalidate_all_ranges` removes the range .bin files listed in the
-// metadata. This verifies the primitive that Class B relies on: when
-// read_cache_enabled=false, the read path calls invalidate_all_ranges, which
-// must remove cached data from disk.
+// metadata AND the metadata itself. This verifies the primitive that Class B
+// relies on: when read_cache_enabled=false, the read path calls
+// invalidate_all_ranges, which must remove cached data from disk.
 //
 // The property: for any valid cache key with metadata and range files on disk,
-// after `invalidate_all_ranges` the range files no longer exist.
+// after `invalidate_all_ranges` neither the range files nor the `.meta` exist.
+//
+// The `.meta` half was added after the removal was found to be built from the
+// pre-sharding flat path, which does not exist on a sharded cache — so the
+// document survived every invalidation while all three of this test's original
+// assertions passed, because all three were about the `.bin`. The fixture must
+// stay SHARDED for the `.meta` assertion to be able to fail; see the
+// precondition assertion in the loop.
 //
 // **Validates: Requirement 2.3**
 // ============================================================================
@@ -571,6 +578,28 @@ async fn test_property_class_b_invalidation_removes_cached_copy() {
         let content: Vec<u8> = (0..input.content_size).map(|i| (i % 256) as u8).collect();
         std::fs::write(&range_file_path, &content).unwrap();
 
+        // PRECONDITION — the fixture must be SHARDED, and this asserts it rather than
+        // trusting `get_new_metadata_file_path` to stay sharded.
+        //
+        // This is load-bearing for the `.meta` assertion below. The removal used to be built
+        // from the pre-sharding FLAT construction `metadata/{key}.meta`, which on a flat
+        // fixture is the same file the sharded construction resolves to — so a flat fixture
+        // passes with the defect fully present, and asserting on it would reproduce exactly
+        // the vacuity that hid this for the life of the function. Sharded means four
+        // components under `metadata/`: {bucket}/{XX}/{YYY}/{file}.
+        let relative_metadata_path = metadata_path
+            .strip_prefix(temp_dir.path().join("metadata"))
+            .expect("metadata path should live under cache_dir/metadata");
+        assert_eq!(
+            relative_metadata_path.components().count(),
+            4,
+            "fixture must be SHARDED ({{bucket}}/{{XX}}/{{YYY}}/{{file}}.meta) or the \
+             `.meta` assertion below is vacuous — a flat fixture is removed by the \
+             legacy flat path too: key={}, relative_path={:?}",
+            cache_key,
+            relative_metadata_path
+        );
+
         // Verify files exist before invalidation
         assert!(
             metadata_path.exists(),
@@ -596,6 +625,21 @@ async fn test_property_class_b_invalidation_removes_cached_copy() {
             "Range file should NOT exist after invalidation: key={}, path={:?}",
             cache_key,
             range_file_path
+        );
+
+        // And the `.meta` must be gone too. This is the assertion the group was missing:
+        // three assertions covered this function and all three were about the `.bin`, so a
+        // `.meta` removal built from the wrong path construction was invisible. A surviving
+        // `.meta` keeps the superseded ETag — nothing on the production range store path
+        // rewrites `object_metadata` — while listing range entries whose files this call just
+        // deleted, so a later HEAD is answered with the superseded ETag and content_length.
+        assert!(
+            !metadata_path.exists(),
+            "Metadata file should NOT exist after invalidation: key={}, path={:?} — the \
+             range files were removed but the .meta survives, so the entry still claims \
+             coverage for bytes that are gone, under the superseded ETag",
+            cache_key,
+            metadata_path
         );
     }
 }

@@ -58,7 +58,7 @@ impl<B> PermitBody<B> {
     }
 
     /// Retain a buffered-byte ledger reservation until this body is dropped.
-    pub fn with_reservation(mut self, reservation: Reservation) -> Self {
+    pub(crate) fn with_reservation(mut self, reservation: Reservation) -> Self {
         self.reservation = Some(reservation);
         self
     }

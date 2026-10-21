@@ -27,7 +27,7 @@ fn create_test_cache_manager() -> (
         cache_dir.clone(),
         false, // RAM cache disabled for these tests
         0,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,                                 // compression threshold
         true,                                 // compression enabled
         std::time::Duration::from_secs(3600), // GET_TTL

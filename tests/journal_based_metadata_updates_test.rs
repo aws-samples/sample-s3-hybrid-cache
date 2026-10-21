@@ -27,6 +27,8 @@ fn create_test_range_spec(start: u64, end: u64) -> RangeSpec {
         last_accessed: now,
         access_count: 1,
         staged: None,
+        unservable: false,
+        file_identity: None,
     }
 }
 
@@ -76,12 +78,15 @@ async fn test_multi_instance_concurrent_ttl_refreshes() {
         let cache_key_clone = cache_key.to_string();
 
         let handle = tokio::spawn(async move {
+            // One flush window per update: refreshes of one key inside a window coalesce
+            // into one line, and this test counts one line per update.
             for update_idx in 0..updates_per_instance {
                 let ttl = Duration::from_secs(3600 + (instance_idx * 100 + update_idx) as u64);
                 buffer_clone
                     .record_ttl_refresh(&cache_key_clone, ttl)
                     .await
                     .unwrap();
+                buffer_clone.force_flush().await.unwrap();
             }
         });
         handles.push(handle);
@@ -332,10 +337,12 @@ async fn test_consolidation_preserves_entries_with_missing_range_files() {
     // Record TTL refreshes for two different ranges
     // Range 1: 0-8388607 (will have range file)
     // Range 2: 8388608-16777215 (will NOT have range file - simulates NFS caching delay)
+    // Two flush windows: identical refreshes inside one window coalesce into one line.
     buffer
         .record_ttl_refresh(cache_key, Duration::from_secs(3600))
         .await
         .unwrap();
+    buffer.force_flush().await.unwrap();
     buffer
         .record_ttl_refresh(cache_key, Duration::from_secs(3600))
         .await
@@ -606,5 +613,90 @@ async fn test_consolidation_applies_access_update() {
         access_increment,
         initial_access_count + access_increment,
         updated_access_count
+    );
+}
+
+/// A thousand RAM hits on one stored range in one flush window journal as one coalesced
+/// line, and consolidating it raises the range's `access_count` by the thousand and sets
+/// `last_accessed` to the latest hit, as the uncoalesced sequence did. Eviction scores by those
+/// two figures, so its ranking is unchanged.
+#[tokio::test]
+async fn test_coalesced_access_updates_raise_access_count_by_every_hit() {
+    const N: u64 = 1000;
+    let temp_dir = TempDir::new().unwrap();
+    let cache_key = "test-bucket/merge-coalesced-access";
+    let initial_metadata = create_test_metadata(cache_key, 0, 8388607);
+    let initial_access_count = initial_metadata.ranges[0].access_count;
+    let metadata_base_dir = temp_dir.path().join("metadata");
+    let metadata_path =
+        s3_proxy::disk_cache::get_sharded_path(&metadata_base_dir, cache_key, ".meta").unwrap();
+    tokio::fs::create_dir_all(metadata_path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&initial_metadata).unwrap(),
+    )
+    .await
+    .unwrap();
+    let range_path = s3_proxy::disk_cache::get_sharded_path(
+        &temp_dir.path().join("ranges"),
+        cache_key,
+        "_0-8388607.bin",
+    )
+    .unwrap();
+    tokio::fs::create_dir_all(range_path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&range_path, b"test data").await.unwrap();
+    let buffer = CacheHitUpdateBuffer::with_config(
+        temp_dir.path().to_path_buf(),
+        "coalesced-access-instance".to_string(),
+        Duration::from_secs(60),
+        10000,
+    );
+    for _ in 0..N {
+        buffer
+            .record_access_update(cache_key, 0, 8388607, 1)
+            .await
+            .unwrap();
+    }
+    buffer.force_flush().await.unwrap();
+    let journal = temp_dir
+        .path()
+        .join("metadata/_journals/coalesced-access-instance.journal");
+    let content = tokio::fs::read_to_string(&journal).await.unwrap();
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "precondition: {N} hits coalesced into one line"
+    );
+    let line: JournalEntry = serde_json::from_str(lines[0]).unwrap();
+    let consolidator = JournalConsolidator::new(
+        temp_dir.path().to_path_buf(),
+        Arc::new(JournalManager::new(
+            temp_dir.path().to_path_buf(),
+            "consolidator".to_string(),
+        )),
+        Arc::new(MetadataLockManager::new(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+        )),
+        ConsolidationConfig::default(),
+    );
+    let result = consolidator.consolidate_object(cache_key).await.unwrap();
+    assert!(result.success, "Consolidation should succeed");
+    let updated: NewCacheMetadata =
+        serde_json::from_str(&tokio::fs::read_to_string(&metadata_path).await.unwrap()).unwrap();
+    assert_eq!(
+        updated.ranges[0].access_count,
+        initial_access_count + N,
+        "ACCESS COUNT LOST IN COALESCING: {N} hits must raise access_count by {N}"
+    );
+    assert_eq!(
+        updated.ranges[0].last_accessed, line.timestamp,
+        "last_accessed must be the coalesced line's (latest) timestamp"
     );
 }

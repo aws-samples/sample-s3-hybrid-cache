@@ -35,6 +35,15 @@ pub enum ProxyError {
     #[error("Cache error: {0}")]
     CacheError(String),
 
+    /// A cache repair path was asked to rewrite a request header the client covered
+    /// with its SigV4 signature. Doing so turns a valid request into an upstream
+    /// `SignatureDoesNotMatch`, so the repair is refused and the caller fails open by
+    /// forwarding the client's original request unchanged.
+    #[error(
+        "Refusing to rewrite signed request header '{header}' for cache repair: key={cache_key}"
+    )]
+    SignedHeaderRewriteRefused { header: String, cache_key: String },
+
     #[error("Compression error: {0}")]
     CompressionError(String),
 
@@ -68,17 +77,11 @@ pub enum ProxyError {
     #[error("Internal error: {0}")]
     InternalError(String),
 
-    #[error("Service unavailable: {0}")]
-    ServiceUnavailable(String),
-
     #[error("Invalid range: {0}")]
     InvalidRange(String),
 
     #[error("System error: {0}")]
     SystemError(String),
-
-    #[error("Retry after {0} seconds")]
-    RetryAfter(u64),
 
     #[error("Eviction fence lost: {0}")]
     EvictionFenceLost(String),
@@ -108,6 +111,18 @@ pub enum ProxyError {
     InflightCeilingExceeded {
         ceiling_bytes: u64,
         requested_bytes: u64,
+    },
+
+    /// A buffered range merge was refused because the requested length or a cached
+    /// extent's uncompressed size exceeds `http_proxy::BUFFERED_OPERATION_BOUND`
+    /// (buffered-serve-memory-bound R1.2 backstop). Callers forward the request to S3
+    /// uncached; it is never surfaced to a client as an error.
+    #[error(
+        "Buffered-operation bound exceeded: requested_bytes={requested_bytes}, largest_extent_bytes={largest_extent_bytes}"
+    )]
+    BufferedOperationBoundExceeded {
+        requested_bytes: u64,
+        largest_extent_bytes: u64,
     },
 }
 

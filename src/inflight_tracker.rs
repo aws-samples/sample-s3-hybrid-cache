@@ -130,7 +130,10 @@ impl InFlightTracker {
     ///
     /// - 7.1: Re-subscribe waiter when FetchGuard still present
     /// - 7.2: Return None when FetchGuard absent so waiter becomes new fetcher
-    pub fn try_resubscribe(&self, flight_key: &str) -> Option<broadcast::Receiver<FetchResult>> {
+    pub(crate) fn try_resubscribe(
+        &self,
+        flight_key: &str,
+    ) -> Option<broadcast::Receiver<FetchResult>> {
         // The DashMap ref guard holds the shard lock, ensuring the sender
         // cannot be removed between the lookup and the subscribe() call.
         self.pending.get(flight_key).map(|entry| entry.subscribe())
@@ -174,7 +177,7 @@ impl InFlightTracker {
     ///
     /// - 15.3: Use exact byte range to construct flight key
     /// - 15.4: Full-object GET and range GET are independent flight keys
-    pub fn make_range_key(cache_key: &str, start: u64, end: u64) -> String {
+    pub(crate) fn make_range_key(cache_key: &str, start: u64, end: u64) -> String {
         format!("{}:{}-{}", cache_key, start, end)
     }
 
@@ -188,7 +191,7 @@ impl InFlightTracker {
     /// # Returns
     ///
     /// A flight key in the format `"{cache_key}:part{N}"`.
-    pub fn make_part_key(cache_key: &str, part_number: u32) -> String {
+    pub(crate) fn make_part_key(cache_key: &str, part_number: u32) -> String {
         format!("{}:part{}", cache_key, part_number)
     }
 }
@@ -236,11 +239,6 @@ impl FetchGuard {
         let _ = self.sender.send(Err(error));
         // Remove entry from pending map
         self.pending.remove(&self.flight_key);
-    }
-
-    /// Returns the flight key this guard is responsible for.
-    pub fn flight_key(&self) -> &str {
-        &self.flight_key
     }
 }
 

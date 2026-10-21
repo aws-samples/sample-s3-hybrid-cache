@@ -1,6 +1,13 @@
 use chrono::Utc;
 
 fn main() {
+    // Without any rerun-if-changed line Cargo reruns this script when any file in the package
+    // changes, including logs under tmp/, and every rerun recompiles the crate. The version
+    // comes from Cargo.toml, which Cargo tracks itself. `src` is listed so BUILD_TIMESTAMP still
+    // moves whenever the code the binary is built from changes.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src");
+
     // Use semantic version from Cargo.toml
     let version = env!("CARGO_PKG_VERSION");
 

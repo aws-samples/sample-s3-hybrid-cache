@@ -2,11 +2,11 @@
 //!
 //! Provides capacity management and eviction for write-through caching of PUT operations.
 //! Write cache is limited to a configurable percentage of total disk cache and uses
-//! the same eviction algorithm as the read cache (LRU or TinyLFU).
+//! the same eviction algorithm as the read cache (TinyLFU).
 //!
 //! # Requirements
 //! - Requirement 6.1: Write cache capacity limited to percentage of disk cache
-//! - Requirement 6.5: Eviction uses configured algorithm (LRU or TinyLFU)
+//! - Requirement 6.5: Eviction uses configured algorithm (TinyLFU)
 //! - Requirement 4.2, 4.3: Incomplete upload eviction after TTL
 //! - Requirement 9.1: Atomic CAS-loop reservation (no separate check + reserve)
 //! - Requirement 9.2: Single entry point returns reservation handle or "no capacity"
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Rate-limit interval for underflow warnings (seconds).
 /// At most one warning per this interval to avoid log spam.
@@ -31,6 +31,32 @@ const UNDERFLOW_WARN_INTERVAL_SECS: u64 = 60;
 /// Global atomic timestamp (epoch seconds) for rate-limiting underflow warnings.
 /// Shared across all `WriteReservation` drops within the process.
 static LAST_UNDERFLOW_WARN: AtomicU64 = AtomicU64::new(0);
+
+/// Which staged object a `.meta` describes: its ETag and the time it was published staged.
+///
+/// Every staged writer stamps `write_cache_created_at` with the publish time, so a replacing
+/// object differs in it even when its bytes, and therefore its ETag, are identical. A read fill
+/// adding a range to the same object leaves both fields alone, so it does not read as a
+/// replacement. Staging eviction compares the identity its unlocked assessment saw against the
+/// one it finds under the slot lock and declines on a mismatch
+/// (`WriteCacheManager::evict_write_cached_object_if_unchanged`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedObjectIdentity {
+    /// `object_metadata.etag`.
+    pub etag: String,
+    /// `object_metadata.write_cache_created_at`.
+    pub write_cache_created_at: Option<SystemTime>,
+}
+
+impl StagedObjectIdentity {
+    /// The identity of the object `metadata` describes.
+    pub fn of(metadata: &crate::cache_types::NewCacheMetadata) -> Self {
+        Self {
+            etag: metadata.object_metadata.etag.clone(),
+            write_cache_created_at: metadata.object_metadata.write_cache_created_at,
+        }
+    }
+}
 
 /// RAII handle representing a successful capacity reservation in the write cache.
 ///
@@ -186,13 +212,10 @@ pub struct WriteCacheManager {
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
     graduations_total: Arc<AtomicU64>,
 
-    /// Write cache TTL (default: 1 day), refreshed on read access
-    write_ttl: Duration,
-
     /// Incomplete upload TTL (default: 1 day)
     incomplete_upload_ttl: Duration,
 
-    /// Eviction algorithm (same as read cache: LRU or TinyLFU)
+    /// Eviction algorithm (same as read cache: TinyLFU)
     eviction_algorithm: CacheEvictionAlgorithm,
 
     /// Cache directory for file operations
@@ -230,10 +253,11 @@ impl WriteCacheManager {
     /// # Arguments
     /// * `cache_dir` - Base cache directory
     /// * `total_cache_size` - Total disk cache size in bytes
-    /// * `write_cache_percent` - Percentage of total cache for write cache (1-50%)
-    /// * `write_ttl` - TTL for write-cached objects
+    /// * `write_cache_percent` - Percentage of total cache for write cache, used as configured
+    /// * `write_ttl` - TTL for write-cached objects. Logged at startup only; no field keeps it,
+    ///   because nothing in this manager reads it after construction.
     /// * `incomplete_upload_ttl` - TTL for incomplete multipart uploads
-    /// * `eviction_algorithm` - Eviction algorithm to use (LRU or TinyLFU)
+    /// * `eviction_algorithm` - Eviction algorithm to use (TinyLFU)
     /// * `max_object_size` - Maximum object size for write caching
     ///
     /// # Requirements
@@ -247,15 +271,15 @@ impl WriteCacheManager {
         eviction_algorithm: CacheEvictionAlgorithm,
         max_object_size: u64,
     ) -> Self {
-        // Clamp percentage to valid range (1-50%)
-        let clamped_percent = write_cache_percent.clamp(1.0, 50.0);
-        let max_size = ((total_cache_size as f64) * (clamped_percent as f64 / 100.0)) as u64;
+        // No clamp: the bound in force is the configured percent, as in
+        // `CacheManager::get_write_cache_capacity`.
+        let max_size = ((total_cache_size as f64) * (write_cache_percent as f64 / 100.0)) as u64;
 
         info!(
             "WriteCacheManager initialized: max_size={} bytes ({:.1}% of {} total), \
              write_ttl={:?}, incomplete_upload_ttl={:?}, eviction_algorithm={:?}",
             max_size,
-            clamped_percent,
+            write_cache_percent,
             total_cache_size,
             write_ttl,
             incomplete_upload_ttl,
@@ -269,7 +293,6 @@ impl WriteCacheManager {
             staging_evictions_total: Arc::new(AtomicU64::new(0)),
             staging_eviction_bytes_total: Arc::new(AtomicU64::new(0)),
             graduations_total: Arc::new(AtomicU64::new(0)),
-            write_ttl,
             incomplete_upload_ttl,
             eviction_algorithm,
             cache_dir,
@@ -296,7 +319,7 @@ impl WriteCacheManager {
     /// - 10% of total cache for write cache
     /// - 1 day write TTL
     /// - 1 day incomplete upload TTL
-    /// - LRU eviction algorithm
+    /// - the default eviction algorithm (TinyLFU since 3.0.0 — R10.5)
     /// - 256MB max object size
     pub fn new_with_defaults(cache_dir: PathBuf, total_cache_size: u64) -> Self {
         Self::new(
@@ -313,11 +336,6 @@ impl WriteCacheManager {
     /// Get the maximum write cache size
     pub fn max_size(&self) -> u64 {
         self.max_size
-    }
-
-    /// Get the write TTL
-    pub fn write_ttl(&self) -> Duration {
-        self.write_ttl
     }
 
     /// Get the incomplete upload TTL
@@ -348,7 +366,7 @@ impl WriteCacheManager {
     ///
     /// # Requirements
     /// Implements Requirement 6.3
-    pub fn current_usage(&self) -> u64 {
+    pub(crate) fn current_usage(&self) -> u64 {
         self.current_size.load(Ordering::SeqCst)
     }
 
@@ -357,7 +375,7 @@ impl WriteCacheManager {
     /// until graduation (R1) and eviction (R5) accounting land.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
-    pub fn staged_entries(&self) -> u64 {
+    pub(crate) fn staged_entries(&self) -> u64 {
         self.staged_entries.load(Ordering::Relaxed)
     }
 
@@ -365,7 +383,7 @@ impl WriteCacheManager {
     /// write-cache commit (a new `.meta` written with `is_write_cached: true`).
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
-    pub fn increment_staged_entries(&self) {
+    pub(crate) fn increment_staged_entries(&self) {
         self.staged_entries.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -374,7 +392,7 @@ impl WriteCacheManager {
     /// on staging eviction.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
-    pub fn decrement_staged_entries(&self) {
+    pub(crate) fn decrement_staged_entries(&self) {
         self.staged_entries
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(1))
@@ -387,14 +405,14 @@ impl WriteCacheManager {
     /// only — see the field doc for why the split matters.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.4
-    pub fn staging_evictions_total(&self) -> u64 {
+    pub(crate) fn staging_evictions_total(&self) -> u64 {
         self.staging_evictions_total.load(Ordering::Relaxed)
     }
 
     /// Cumulative compressed bytes freed by staging eviction.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.4
-    pub fn staging_eviction_bytes_total(&self) -> u64 {
+    pub(crate) fn staging_eviction_bytes_total(&self) -> u64 {
         self.staging_eviction_bytes_total.load(Ordering::Relaxed)
     }
 
@@ -402,7 +420,7 @@ impl WriteCacheManager {
     /// See the field doc for why this is per-instance and not the accounting authority.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
-    pub fn graduations_total(&self) -> u64 {
+    pub(crate) fn graduations_total(&self) -> u64 {
         self.graduations_total.load(Ordering::Relaxed)
     }
 
@@ -410,7 +428,7 @@ impl WriteCacheManager {
     /// instance performs, at the point the `Graduation` journal entry is written.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
-    pub fn increment_graduations(&self) {
+    pub(crate) fn increment_graduations(&self) {
         self.graduations_total.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -723,9 +741,52 @@ impl WriteCacheManager {
     /// double-debit reaching this site.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 5.1, 5.2, 5.3, 5.4
-    pub(crate) async fn evict_write_cached_object(&self, cache_key: &str) -> Result<u64> {
+    ///
+    /// # Declining a replaced object
+    ///
+    /// Staging eviction decides from an unlocked `.meta` read (`assess_staged_candidate`) and
+    /// acquires the slot afterwards. An object published at the key in between (a multipart
+    /// completion or a re-PUT) would otherwise be evicted whole on the strength of a verdict
+    /// about the object it replaced. With `expected` set, a mismatch returns `Ok(None)` with
+    /// nothing touched: no file removed, no debit, no counter moved. The caller must then not
+    /// retire the candidate's ledger entries, since nothing was consumed.
+    ///
+    /// `Ok(Some(freed))` is an eviction; `expected: None` never declines.
+    pub(crate) async fn evict_write_cached_object_if_unchanged(
+        &self,
+        cache_key: &str,
+        expected: Option<&StagedObjectIdentity>,
+    ) -> Result<Option<u64>> {
         // Read metadata to get range files
         let metadata_path = self.get_metadata_path(cache_key)?;
+
+        // The key's metadata slot lock spans the `.meta` read, the deletion of the files it
+        // names, the `.meta` removal and the debits of what was removed.
+        //
+        // Range files are named `{key}_{start}-{end}.bin`, so a replacing object's range with
+        // the same extent lands at the same path. Unlocked, an eviction that read the old
+        // `.meta` before a multipart completion (or any replacing writer) removed it could delete
+        // by that `.meta`'s `file_path`s after the replacement was renamed and published: the
+        // new object's shared-extent file and the new `.meta` at this path went, and the new
+        // object's other files were left named by nothing. Under the lock the replacement's own
+        // removal-then-rename runs strictly before or after this whole block, so what this
+        // call deletes is always what the `.meta` it read names.
+        //
+        // Lock order: the caller holds the global eviction lock (taken with a non-blocking try,
+        // so nobody waits on it) and read guards on the `WriteCacheManager` `RwLock`s (written
+        // only at initialisation). The slot is the innermost lock and nothing below takes
+        // another lock the slot holders wait on: the debits are the same calls the multipart
+        // completion already makes under this slot. `decrement_cached_objects` (which takes
+        // `size_state.lock`) and the accumulator flush run after the slot is released.
+        //
+        // Bounded by `cache.shared_storage.lock_acquire_wait_budget`. On expiry nothing has been
+        // touched and the eviction reports an error; the staging pass logs it and leaves the
+        // candidate's ledger entries for the next pass.
+        let meta_lock = crate::metadata_lock_manager::acquire_slot_lock_within_budget(
+            &self.cache_dir,
+            cache_key,
+        )
+        .await?;
 
         if !metadata_path.exists() {
             return Err(ProxyError::CacheError(format!(
@@ -740,6 +801,21 @@ impl WriteCacheManager {
 
         let metadata: crate::cache_types::NewCacheMetadata = serde_json::from_str(&content)
             .map_err(|e| ProxyError::CacheError(format!("Failed to parse metadata: {}", e)))?;
+
+        #[cfg(test)]
+        pause_eviction_after_meta_read(cache_key).await;
+
+        if let Some(expected) = expected {
+            let found = StagedObjectIdentity::of(&metadata);
+            if &found != expected {
+                debug!(
+                    "Staging eviction: {} was replaced after it was assessed \
+                     (assessed {:?}, found {:?}); skipping",
+                    cache_key, expected, found
+                );
+                return Ok(None);
+            }
+        }
 
         let mut total_freed: u64 = 0;
         // Ranges whose `.bin` existed AND was removed without error. R5.4: this is the
@@ -823,7 +899,7 @@ impl WriteCacheManager {
                 // R5.2: Remove journal entries, so the shared `.meta` converges and
                 // the other instances observe the removal. Metadata only — these do
                 // not move any size figure (journal-derived size deltas were retired
-                // in favour of the accumulator; see `consolidate_key`).
+                // in favour of the accumulator; see `apply_journal_entries`).
                 if !deleted_ranges.is_empty() {
                     let journal_entries: Vec<(String, u64, u64, u64, String)> = deleted_ranges
                         .iter()
@@ -842,9 +918,15 @@ impl WriteCacheManager {
                         .await;
                 }
 
+                // The `.meta` transaction ends here. The object count takes
+                // `size_state.lock` and the flush writes a delta file; neither reads or
+                // writes this key's `.meta`, so both run with the slot released.
+                drop(meta_lock);
+
                 // R5.2: `cached_objects` converges only when the `.meta` is gone, which
                 // is the same condition read-tier eviction uses (it counts a key as
-                // evicted when a `.meta` appears among the deleted paths).
+                // evicted when a `.meta` appears among the deleted paths). Every parseable
+                // `.meta` is counted, rangeless included, so every unlink debits.
                 if metadata_deleted {
                     consolidator.decrement_cached_objects(1).await;
                 }
@@ -893,7 +975,18 @@ impl WriteCacheManager {
                 .fetch_add(total_freed, Ordering::Relaxed);
         }
 
-        Ok(total_freed)
+        Ok(Some(total_freed))
+    }
+
+    /// `evict_write_cached_object_if_unchanged` with no identity check, reporting freed bytes.
+    /// Test-only: production reaches eviction through the staging pass, which always passes the
+    /// assessed identity.
+    #[cfg(test)]
+    pub(crate) async fn evict_write_cached_object(&self, cache_key: &str) -> Result<u64> {
+        Ok(self
+            .evict_write_cached_object_if_unchanged(cache_key, None)
+            .await?
+            .unwrap_or(0))
     }
 
     /// Get metadata file path for a cache key
@@ -912,279 +1005,370 @@ impl WriteCacheManager {
         })
     }
 
-    /// Evict incomplete multipart uploads older than TTL
+    /// Reap incomplete multipart uploads idle for longer than `incomplete_upload_ttl`.
     ///
-    /// Scans mpus_in_progress/ directory for uploads that have exceeded
-    /// the incomplete_upload_ttl and removes them.
-    ///
-    /// # Returns
-    /// * `Ok(bytes_freed)` - Number of compressed bytes freed
-    /// * `Err` - If eviction fails
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.2, 4.3
+    /// A thin wrapper over [`sweep_incomplete_uploads`], the one implementation, for callers that
+    /// hold a manager. Returns the bytes the reaped directories held. Nothing is released from
+    /// this manager's reservation counter: parts take no write-cache reservation and are not
+    /// credited to the size figures while staged (credit happens at Complete), so there is
+    /// nothing to debit.
     pub async fn evict_incomplete_uploads(&self) -> Result<u64> {
-        let mpus_dir = self.cache_dir.join("mpus_in_progress");
+        Ok(
+            sweep_incomplete_uploads(self.cache_dir.clone(), self.incomplete_upload_ttl)
+                .await
+                .bytes_freed,
+        )
+    }
+}
 
-        if !mpus_dir.exists() {
-            debug!("No mpus_in_progress directory, nothing to evict");
-            return Ok(0);
+/// What one [`sweep_incomplete_uploads`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IncompleteUploadSweep {
+    /// Upload directories reaped.
+    pub evicted: u64,
+    /// Bytes those directories held (logged; nothing is debited, see the sweep's docs).
+    pub bytes_freed: u64,
+    /// Expired-looking uploads left alone because `upload.lock` was held or could not be taken.
+    pub skipped_locked: u64,
+}
+
+/// Prefix of a directory under `mpus_in_progress/` that a sweep has renamed aside for removal.
+const REAPING_PREFIX: &str = ".reaping-";
+
+/// Reap every upload directory under `mpus_in_progress/` idle for longer than `ttl`.
+///
+/// The only incomplete-upload sweep. It runs at startup and as a maintenance pass of the
+/// journal consolidator, on its own interval, independent of the validation scan.
+///
+/// # Age is last activity, not start time
+///
+/// An upload's age is measured from the NEWEST of the directory's mtime, `upload.meta`'s mtime
+/// and every `part{N}.json` record's mtime. `upload.meta` alone is written once, at
+/// CreateMultipartUpload, so it is the upload's start time: judging by it would reap a live
+/// upload as soon as it had been running for the TTL, however recently a part had landed. Each
+/// UploadPart creates and renames entries in the directory and writes a fresh `part{N}.json`.
+///
+/// # A Complete in progress is never reaped
+///
+/// Complete holds `upload.lock` across its part checks and renames. The sweep takes the same lock
+/// with a non-blocking `try_lock` and SKIPS the upload when it is held or when the lock cannot be
+/// opened or taken for any reason, re-reads the age under the lock (a part may have landed while
+/// it waited), and renames the directory aside to `mpus_in_progress/.reaping-<dir>-<host>-<pid>`
+/// while still holding it. Only then does it release the lock and remove the renamed directory.
+/// A Complete that acquires `upload.lock` afterwards finds its staging directory gone and
+/// declines to cache; one that already holds it is never touched.
+///
+/// Creating `upload.lock` (when the upload has none yet) bumps the directory's mtime, so a sweep
+/// that created the lock file excludes the directory mtime from its re-read under the lock.
+///
+/// # No debit
+///
+/// Staged parts take no write-cache reservation and are credited to no size figure until
+/// Complete; the in-progress byte figure is derived live from `part{N}.json` records, so removing
+/// a directory removes its bytes from that figure at its next read. `bytes_freed` is reported
+/// for logging only.
+///
+/// Leftover `.reaping-*` directories (a reaper that died between rename and removal) are removed
+/// unconditionally: nothing names them once renamed.
+pub async fn sweep_incomplete_uploads(cache_dir: PathBuf, ttl: Duration) -> IncompleteUploadSweep {
+    match tokio::task::spawn_blocking(move || sweep_incomplete_uploads_blocking(&cache_dir, ttl))
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            warn!("Incomplete upload sweep did not complete: {}", e);
+            IncompleteUploadSweep::default()
+        }
+    }
+}
+
+/// [`sweep_incomplete_uploads`] on the calling thread. `std::fs` throughout; call it from the
+/// blocking pool.
+pub fn sweep_incomplete_uploads_blocking(
+    cache_dir: &std::path::Path,
+    ttl: Duration,
+) -> IncompleteUploadSweep {
+    let mut outcome = IncompleteUploadSweep::default();
+    let mpus_dir = cache_dir.join("mpus_in_progress");
+    let entries = match std::fs::read_dir(&mpus_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to read mpus_in_progress directory: {}", e);
+            }
+            return outcome;
+        }
+    };
+    let host = gethostname::gethostname().to_string_lossy().to_string();
+    let pid = std::process::id();
+
+    for entry in entries.flatten() {
+        let upload_dir = entry.path();
+        if !upload_dir.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(REAPING_PREFIX) {
+            if let Err(e) = std::fs::remove_dir_all(&upload_dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    debug!("Failed to remove reaped upload {:?}: {}", upload_dir, e);
+                }
+            }
+            continue;
         }
 
-        let mut total_freed: u64 = 0;
-        let mut evicted_count: u64 = 0;
-        let now = SystemTime::now();
-
-        // Read directory entries
-        let mut entries = match tokio::fs::read_dir(&mpus_dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!("Failed to read mpus_in_progress directory: {}", e);
-                return Ok(0);
-            }
+        // Unlocked first look: most directories are live and are skipped without a lock.
+        let first_age = match idle_age(&upload_dir, true) {
+            Some(age) if age > ttl => age,
+            _ => continue,
         };
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let upload_dir = entry.path();
-
-            if !upload_dir.is_dir() {
-                continue;
-            }
-
-            let upload_meta_path = upload_dir.join("upload.meta");
-
-            if !upload_meta_path.exists() {
-                // No metadata file, check directory mtime
-                if let Ok(metadata) = tokio::fs::metadata(&upload_dir).await {
-                    if let Ok(modified) = metadata.modified() {
-                        if let Ok(age) = now.duration_since(modified) {
-                            if age > self.incomplete_upload_ttl {
-                                // Evict this incomplete upload
-                                match self.evict_incomplete_upload(&upload_dir).await {
-                                    Ok(freed) => {
-                                        total_freed += freed;
-                                        evicted_count += 1;
-                                        info!(
-                                            "Evicted incomplete upload (no metadata): dir={:?}, age={:?}, freed={} bytes",
-                                            upload_dir, age, freed
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to evict incomplete upload {:?}: {}",
-                                            upload_dir, e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Read upload metadata to check age
-            if let Ok(content) = tokio::fs::read_to_string(&upload_meta_path).await {
-                if let Ok(tracker) =
-                    serde_json::from_str::<crate::cache_types::MultipartUploadTracker>(&content)
-                {
-                    // Age is measured from the most recent sign of activity, which is
-                    // the NEWEST of the upload directory's mtime and `upload.meta`'s.
-                    //
-                    // The directory is what matters now. `upload.meta` is written once,
-                    // at CreateMultipartUpload, and never touched again — parts write
-                    // their own `part{N}.json` records rather than rewriting it. So its
-                    // mtime is the upload's START time, and using it alone would evict a
-                    // long-running upload out from under itself the moment it passed the
-                    // TTL, however recently a part had landed. The directory's mtime does
-                    // move, because each part creates files in it.
-                    let newest_mtime = {
-                        let mut newest: Option<std::time::SystemTime> = None;
-                        for path in [&upload_dir, &upload_meta_path] {
-                            if let Ok(md) = tokio::fs::metadata(path).await {
-                                if let Ok(modified) = md.modified() {
-                                    if newest.is_none_or(|current| modified > current) {
-                                        newest = Some(modified);
-                                    }
-                                }
-                            }
-                        }
-                        newest
-                    };
-                    let age = match newest_mtime {
-                        Some(modified) => now.duration_since(modified).unwrap_or_default(),
-                        None => now.duration_since(tracker.started_at).unwrap_or_default(),
-                    };
-
-                    if age > self.incomplete_upload_ttl {
-                        // Evict this incomplete upload
-                        match self
-                            .evict_incomplete_upload_with_tracker(&upload_dir, &tracker)
-                            .await
-                        {
-                            Ok(freed) => {
-                                total_freed += freed;
-                                evicted_count += 1;
-                                info!(
-                                    "Evicted incomplete upload: upload_id={}, age={:?}, parts={}, freed={} bytes",
-                                    tracker.upload_id, age, tracker.parts.len(), freed
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to evict incomplete upload {}: {}",
-                                    tracker.upload_id, e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if evicted_count > 0 {
-            info!(
-                "Incomplete upload eviction complete: evicted={} uploads, freed={} bytes",
-                evicted_count, total_freed
-            );
-        }
-
-        Ok(total_freed)
-    }
-
-    /// Evict a single incomplete upload directory
-    async fn evict_incomplete_upload(&self, upload_dir: &PathBuf) -> Result<u64> {
-        let mut total_freed: u64 = 0;
-
-        // Remove all files in the directory
-        let mut entries = tokio::fs::read_dir(upload_dir)
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Failed to read upload dir: {}", e)))?;
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if let Ok(metadata) = tokio::fs::metadata(&path).await {
-                total_freed += metadata.len();
-            }
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Failed to remove file {:?}: {}", path, e);
-            }
-        }
-
-        // Remove the directory
-        if let Err(e) = tokio::fs::remove_dir(upload_dir).await {
-            warn!("Failed to remove upload directory {:?}: {}", upload_dir, e);
-        }
-
-        self.release_capacity_internal(total_freed);
-        Ok(total_freed)
-    }
-
-    /// Evict an incomplete upload with tracker information
-    ///
-    /// Acquires per-upload lock before deletion to prevent race conditions
-    /// with active uploads in shared cache scenarios.
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.2, 4.3, 8a.4
-    async fn evict_incomplete_upload_with_tracker(
-        &self,
-        upload_dir: &PathBuf,
-        tracker: &crate::cache_types::MultipartUploadTracker,
-    ) -> Result<u64> {
-        use fs2::FileExt;
-
-        // Acquire per-upload lock before deletion (Requirement 8a.4)
-        let lock_file_path = upload_dir.join("upload.lock");
+        let lock_path = upload_dir.join("upload.lock");
+        let created_lock = !lock_path.exists();
         let lock_file = match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&lock_file_path)
+            .open(&lock_path)
         {
             Ok(f) => f,
             Err(e) => {
-                warn!(
-                    "Failed to open per-upload lock file for eviction: upload_id={}, error={}",
-                    tracker.upload_id, e
+                debug!(
+                    "Skipping incomplete upload, upload.lock could not be opened: {:?}: {}",
+                    upload_dir, e
                 );
-                // Continue without lock - directory may have been cleaned up already
-                return self.evict_incomplete_upload(upload_dir).await;
+                outcome.skipped_locked += 1;
+                continue;
             }
         };
-
-        // Try to acquire exclusive lock (non-blocking)
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => {
+        match fs4::FileExt::try_lock(&lock_file) {
+            Ok(()) => {}
+            Err(fs4::TryLockError::WouldBlock) => {
                 debug!(
-                    "Acquired per-upload lock for eviction: upload_id={}",
-                    tracker.upload_id
+                    "Skipping incomplete upload, upload.lock is held: {:?}",
+                    upload_dir
                 );
+                outcome.skipped_locked += 1;
+                continue;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Lock is held by another instance - skip this upload
+            Err(fs4::TryLockError::Error(e)) => {
                 debug!(
-                    "Skipping incomplete upload eviction (lock held by another instance): upload_id={}",
-                    tracker.upload_id
+                    "Skipping incomplete upload, upload.lock could not be taken: {:?}: {}",
+                    upload_dir, e
                 );
-                return Ok(0);
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to acquire per-upload lock for eviction: upload_id={}, error={}",
-                    tracker.upload_id, e
-                );
-                // Continue without lock - may fail but won't corrupt data
+                outcome.skipped_locked += 1;
+                continue;
             }
         }
 
-        let mut total_freed: u64 = 0;
+        // Unlocked explicitly when it drops: see `journal_consolidator::unlock_lock_file`.
+        let lock_file = crate::journal_consolidator::UnlockOnDrop(lock_file);
+        // Re-read under the lock: a part may have landed between the first look and the lock.
+        // A directory with no `upload.meta` and no part record whose lock this sweep created has
+        // no signal left but the mtime the creation just moved, so the first look stands for it.
+        let age = match idle_age(&upload_dir, !created_lock).or(Some(first_age)) {
+            Some(age) if age > ttl => age,
+            _ => continue,
+        };
 
-        // Parts are stored inside the upload directory (mpus_in_progress/{upload_id}/part{N}.bin)
-        // Track sizes of part files before removing the directory
-        for part in &tracker.parts {
-            let part_path = upload_dir.join(format!("part{}.bin", part.part_number));
-            if part_path.exists() {
-                if let Ok(metadata) = tokio::fs::metadata(&part_path).await {
-                    total_freed += metadata.len();
-                }
-            }
+        let bytes: u64 = std::fs::read_dir(&upload_dir)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        // Renamed aside while the lock is still held, so no Complete can take the lock and find
+        // the directory half-removed.
+        let aside = mpus_dir.join(format!("{}{}-{}-{}", REAPING_PREFIX, name, host, pid));
+        if let Err(e) = std::fs::rename(&upload_dir, &aside) {
+            warn!(
+                "Failed to rename incomplete upload aside for removal: {:?}: {}",
+                upload_dir, e
+            );
+            continue;
         }
-
-        // Release lock before removing directory (lock file is inside directory)
         drop(lock_file);
-
-        // Remove the upload directory and its contents
-        let freed_from_dir = self.evict_incomplete_upload(upload_dir).await.unwrap_or(0);
-        total_freed += freed_from_dir;
-
-        Ok(total_freed)
+        if let Err(e) = std::fs::remove_dir_all(&aside) {
+            warn!("Failed to remove reaped upload {:?}: {}", aside, e);
+        }
+        outcome.evicted += 1;
+        outcome.bytes_freed += bytes;
+        info!(
+            "Evicted incomplete upload: dir={:?}, idle={:?}, bytes={}",
+            upload_dir, age, bytes
+        );
     }
 
-    /// Run incomplete upload cleanup on startup
-    ///
-    /// This method should be called during cache manager initialization to
-    /// clean up any incomplete uploads that expired while the proxy was down.
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.2, 4.3
-    pub async fn cleanup_incomplete_uploads_on_startup(&self) -> Result<()> {
-        info!("Running incomplete upload cleanup on startup");
+    if outcome.evicted > 0 || outcome.skipped_locked > 0 {
+        info!(
+            "Incomplete upload sweep: evicted={} uploads, bytes={}, skipped_locked={}",
+            outcome.evicted, outcome.bytes_freed, outcome.skipped_locked
+        );
+    }
+    outcome
+}
 
-        match self.evict_incomplete_uploads().await {
-            Ok(freed) => {
-                if freed > 0 {
-                    info!("Startup incomplete upload cleanup freed {} bytes", freed);
-                } else {
-                    debug!("No incomplete uploads to clean up on startup");
-                }
-                Ok(())
-            }
-            Err(e) => {
-                error!("Startup incomplete upload cleanup failed: {}", e);
-                Err(e)
+/// How long an upload directory has been idle: now minus the newest of `upload.meta`'s mtime,
+/// every `part*.json` mtime and (when `include_dir`) the directory's own mtime. `None` when no
+/// signal could be read, which the sweep treats as "not expired".
+fn idle_age(upload_dir: &std::path::Path, include_dir: bool) -> Option<Duration> {
+    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut newest: Option<SystemTime> = None;
+    let mut consider = |t: Option<SystemTime>| {
+        if let Some(t) = t {
+            if newest.is_none_or(|n| t > n) {
+                newest = Some(t);
             }
         }
+    };
+    if include_dir {
+        consider(mtime(upload_dir));
+    }
+    consider(mtime(&upload_dir.join("upload.meta")));
+    if let Ok(entries) = std::fs::read_dir(upload_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("part") && name.ends_with(".json") {
+                consider(entry.metadata().and_then(|m| m.modified()).ok());
+            }
+        }
+    }
+    let newest = newest?;
+    Some(SystemTime::now().duration_since(newest).unwrap_or_default())
+}
+
+/// Test-only pause for [`WriteCacheManager::evict_write_cached_object_if_unchanged`], taken right after
+/// it has read the key's `.meta`: the eviction signals `reached` and waits for `resume`.
+/// Stands for an eviction that is slow between reading the `.meta` and deleting what it
+/// names. Keyed per cache key, consumed on use.
+#[cfg(test)]
+pub(crate) type EvictionPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+pub(crate) static PAUSE_EVICTION_AFTER_META_READ: std::sync::Mutex<Vec<(String, EvictionPause)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn pause_eviction_after_meta_read(cache_key: &str) {
+    let pause = {
+        let mut pending = PAUSE_EVICTION_AFTER_META_READ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .iter()
+            .position(|(k, _)| k == cache_key)
+            .map(|i| pending.remove(i).1)
+    };
+    if let Some((reached, resume)) = pause {
+        let _ = reached.send(());
+        let _ = resume.await;
+    }
+}
+
+#[cfg(test)]
+mod incomplete_upload_sweep_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const TTL: Duration = Duration::from_secs(3600);
+
+    /// An upload directory with `upload.meta`, `part1.bin` and `part1.json`, every mtime
+    /// (directory included) set `age` in the past.
+    fn seed_upload(cache_dir: &std::path::Path, name: &str, age: Duration) -> PathBuf {
+        let dir = cache_dir.join("mpus_in_progress").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("upload.meta"), b"{}").unwrap();
+        std::fs::write(dir.join("part1.bin"), vec![7u8; 4096]).unwrap();
+        std::fs::write(dir.join("part1.json"), b"{}").unwrap();
+        let old = filetime::FileTime::from_system_time(SystemTime::now() - age);
+        for f in ["upload.meta", "part1.bin", "part1.json"] {
+            filetime::set_file_mtime(dir.join(f), old).unwrap();
+        }
+        filetime::set_file_mtime(&dir, old).unwrap();
+        dir
+    }
+
+    /// Positive control for the two tests below: the same fixture, fully expired and
+    /// unlocked, is reaped and leaves no `.reaping-*` directory behind.
+    #[test]
+    fn an_expired_unlocked_upload_is_reaped() {
+        let tmp = TempDir::new().unwrap();
+        let dir = seed_upload(tmp.path(), "expired", TTL * 2);
+        let out = sweep_incomplete_uploads_blocking(tmp.path(), TTL);
+        assert_eq!(out.evicted, 1, "{out:?}");
+        assert!(out.bytes_freed >= 4096, "{out:?}");
+        assert!(!dir.exists());
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join("mpus_in_progress"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "nothing renamed aside may remain: {left:?}"
+        );
+    }
+
+    /// A live upload: `upload.meta` (its START) and the directory are past the TTL, but a part
+    /// record landed just now. Its age is last activity, so it survives.
+    #[test]
+    fn a_live_upload_with_an_old_upload_meta_and_a_fresh_part_record_survives() {
+        let tmp = TempDir::new().unwrap();
+        let dir = seed_upload(tmp.path(), "live", TTL * 2);
+        filetime::set_file_mtime(dir.join("part1.json"), filetime::FileTime::now()).unwrap();
+        // The directory's own mtime stays old: on NFS a part-record rewrite through tmp+rename
+        // does move it, but the record's mtime alone must be enough.
+        filetime::set_file_mtime(
+            &dir,
+            filetime::FileTime::from_system_time(SystemTime::now() - TTL * 2),
+        )
+        .unwrap();
+        let out = sweep_incomplete_uploads_blocking(tmp.path(), TTL);
+        assert_eq!(
+            out.evicted, 0,
+            "a live upload whose part1.json is fresh was reaped by its upload.meta age: {out:?}"
+        );
+        assert!(dir.join("part1.bin").exists());
+    }
+
+    /// An expired upload whose `upload.lock` another descriptor holds (a Complete in
+    /// progress) is skipped, and survives intact.
+    #[test]
+    fn an_upload_whose_lock_is_held_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let dir = seed_upload(tmp.path(), "locked", TTL * 2);
+        let lock_path = dir.join("upload.lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&held).expect("fixture: the peer must take upload.lock");
+        // Creating the lock file moved the directory mtime; put it back so only the lock
+        // stands between the sweep and the upload.
+        filetime::set_file_mtime(
+            &dir,
+            filetime::FileTime::from_system_time(SystemTime::now() - TTL * 2),
+        )
+        .unwrap();
+        let out = sweep_incomplete_uploads_blocking(tmp.path(), TTL);
+        assert_eq!(
+            out.evicted, 0,
+            "an upload whose upload.lock is held by another fd was reaped: {out:?}"
+        );
+        assert_eq!(out.skipped_locked, 1, "{out:?}");
+        assert!(dir.join("part1.bin").exists());
+        drop(held);
+        let out = sweep_incomplete_uploads_blocking(tmp.path(), TTL);
+        assert_eq!(out.evicted, 1, "positive control once released: {out:?}");
     }
 }
 
@@ -1202,16 +1386,18 @@ mod tests {
             10.0,                    // 10%
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             256 * 1024 * 1024,
         );
 
         // 10% of 10GB = 1GB
         assert_eq!(manager.max_size(), 1024 * 1024 * 1024);
         assert_eq!(manager.current_usage(), 0);
-        assert_eq!(manager.write_ttl(), Duration::from_secs(86400));
         assert_eq!(manager.incomplete_upload_ttl(), Duration::from_secs(86400));
-        assert_eq!(*manager.eviction_algorithm(), CacheEvictionAlgorithm::LRU);
+        assert_eq!(
+            *manager.eviction_algorithm(),
+            CacheEvictionAlgorithm::TinyLFU
+        );
     }
 
     #[test]
@@ -1224,7 +1410,6 @@ mod tests {
 
         // Default 10% of 10GB = 1GB
         assert_eq!(manager.max_size(), 1024 * 1024 * 1024);
-        assert_eq!(manager.write_ttl(), Duration::from_secs(86400));
         assert_eq!(manager.incomplete_upload_ttl(), Duration::from_secs(86400));
     }
 
@@ -1277,6 +1462,8 @@ mod tests {
             last_accessed: base_time - Duration::from_secs(3600),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
         let metadata = crate::cache_types::NewCacheMetadata {
             cache_key: cache_key.to_string(),
@@ -1289,6 +1476,111 @@ mod tests {
         };
         let json = serde_json::to_string_pretty(&metadata).unwrap();
         tokio::fs::write(&meta_path, json).await.unwrap();
+    }
+
+    /// Staging eviction assesses a candidate from an unlocked `.meta` read and takes the slot
+    /// afterwards. A re-PUT published in between must survive: the eviction was decided about
+    /// the object it replaced.
+    ///
+    /// The replacement is a same-bytes re-PUT, so its ETag equals the assessed object's and only
+    /// `write_cache_created_at` tells them apart. That is the case an ETag-only identity misses.
+    #[tokio::test]
+    async fn an_object_published_after_assessment_is_not_evicted_on_the_old_verdict() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            1_000_000,
+            10.0,
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::TinyLFU,
+            10 * 1024 * 1024,
+        );
+        let cache_key = "test-bucket/case86-replaced";
+        let size = 4096u64;
+        seed_staged_object(temp_dir.path(), cache_key, size).await;
+
+        let now = SystemTime::now();
+        let candidate = crate::write_ledger::StagedCandidate {
+            cache_key: cache_key.to_string(),
+            oldest_entry_at: now,
+            newest_entry_at: now,
+            identities: vec![(
+                cache_key.to_string(),
+                0,
+                size - 1,
+                now,
+                "host:1".to_string(),
+            )],
+        };
+        let assessment =
+            crate::write_ledger::assess_staged_candidate(temp_dir.path(), &candidate).await;
+        assert_eq!(
+            assessment.verdict,
+            crate::write_ledger::StagedCandidateVerdict::Evictable,
+            "fixture: the old object must assess as evictable"
+        );
+        let assessed = assessment
+            .assessed_identity
+            .clone()
+            .expect("an Evictable assessment carries the identity it was reached on");
+
+        // The re-PUT publishes between the assessment and the eviction's slot acquisition.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        seed_staged_object(temp_dir.path(), cache_key, size).await;
+
+        let meta_path = crate::disk_cache::get_sharded_path(
+            &temp_dir.path().join("metadata"),
+            cache_key,
+            ".meta",
+        )
+        .unwrap();
+        let range_path = crate::disk_cache::get_sharded_path(
+            &temp_dir.path().join("ranges"),
+            cache_key,
+            "_0-end.bin",
+        )
+        .unwrap();
+        let published: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(
+            published.object_metadata.etag, assessed.etag,
+            "fixture: the re-PUT carries the same ETag"
+        );
+
+        let outcome = manager
+            .evict_write_cached_object_if_unchanged(cache_key, Some(&assessed))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            None,
+            "the eviction acted on an object published after its assessment (assessed {:?}, \
+             on disk {:?}); .meta present afterwards: {}, range file present afterwards: {}",
+            assessed,
+            StagedObjectIdentity::of(&published),
+            meta_path.exists(),
+            range_path.exists()
+        );
+        assert!(meta_path.exists(), "the new object's .meta must survive");
+        assert!(
+            range_path.exists(),
+            "the new object's range file must survive"
+        );
+        assert_eq!(manager.staging_evictions_total(), 0);
+
+        // Control: an assessment of the object now on disk does evict it.
+        let reassessed =
+            crate::write_ledger::assess_staged_candidate(temp_dir.path(), &candidate).await;
+        let freed = manager
+            .evict_write_cached_object_if_unchanged(
+                cache_key,
+                reassessed.assessed_identity.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(freed, Some(size));
+        assert!(!meta_path.exists());
     }
 
     /// Staging eviction must count separately from `cache.evictions`
@@ -1305,7 +1597,7 @@ mod tests {
             10.0,
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             10 * 1024 * 1024,
         );
 
@@ -1387,7 +1679,7 @@ mod tests {
             10.0,
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             10 * 1024 * 1024,
         );
         manager.set_journal_consolidator(consolidator.clone());
@@ -1610,7 +1902,7 @@ mod tests {
         consolidator
             .update_size_from_validation(100_000, Some(50_000), Some(7))
             .await;
-        let before = consolidator.get_size_state().await;
+        let before = consolidator.get_size_state().await.unwrap();
         assert_eq!(before.total_size, 100_000, "precondition");
         assert_eq!(before.write_cache_size, 50_000, "precondition");
 
@@ -1623,7 +1915,7 @@ mod tests {
         let freed = manager.evict_write_cached_object(cache_key).await.unwrap();
         assert_eq!(freed, object_size, "precondition: the eviction did happen");
 
-        let after = consolidator.get_size_state().await;
+        let after = consolidator.get_size_state().await.unwrap();
         assert_eq!(
             after.total_size, before.total_size,
             "R5.3: eviction must not subtract from total_size directly — the debit \
@@ -1633,9 +1925,20 @@ mod tests {
             after.write_cache_size, before.write_cache_size,
             "R5.3: nor from write_cache_size"
         );
-        // And the one field it IS allowed to move, per R5.2.
+        // And the one field it IS allowed to move, per R5.2. Since the fix the debit is pending
+        // in the accumulator and the next consolidation cycle applies it, so the published
+        // figure is still 7 here and 7 plus the pending delta is what that cycle publishes.
         assert_eq!(
-            after.cached_objects, 6,
+            after.cached_objects, 7,
+            "eviction's cached_objects debit is applied by the cycle, not per call"
+        );
+        // The eviction flushes the accumulator, so the debit is in a delta file.
+        let pending = consolidator.collect_deltas().await.cached_objects_delta
+            + consolidator
+                .size_accumulator()
+                .current_cached_objects_delta();
+        assert_eq!(
+            pending, -1,
             "R5.2: cached_objects converges, so other instances' counts do not drift"
         );
     }
@@ -1649,7 +1952,7 @@ mod tests {
             10.0,        // 10% = ~100KB max write cache
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             256 * 1024 * 1024,
         );
 
@@ -1695,7 +1998,7 @@ mod tests {
             10.0,   // 10% = 1000 bytes Staging_Bound
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             256 * 1024 * 1024,
         );
         assert_eq!(
@@ -1744,7 +2047,7 @@ mod tests {
             50.0,               // 512 MiB Staging_Bound — deliberately far above the cap
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             1024, // 1 KiB max object size
         );
 
@@ -1806,7 +2109,7 @@ mod tests {
             10.0,               // ~102 MiB Staging_Bound
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             1024, // 1 KiB max object size
         );
 
@@ -1858,7 +2161,7 @@ mod tests {
             10.0,               // 10% = 100MB max write cache
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             1024 * 1024, // 1MB max object size
         );
 
@@ -1902,32 +2205,20 @@ mod tests {
     }
 
     #[test]
-    fn test_capacity_percent_clamping() {
+    fn test_capacity_percent_is_used_as_configured() {
         let temp_dir = TempDir::new().unwrap();
-
-        // Test below minimum (1%)
-        let manager = WriteCacheManager::new(
-            temp_dir.path().to_path_buf(),
-            1000,
-            0.5, // Below 1%
-            Duration::from_secs(86400),
-            Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
-            256 * 1024 * 1024,
-        );
-        assert_eq!(manager.max_size(), 10); // 1% of 1000
-
-        // Test above maximum (50%)
-        let manager = WriteCacheManager::new(
-            temp_dir.path().to_path_buf(),
-            1000,
-            75.0, // Above 50%
-            Duration::from_secs(86400),
-            Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
-            256 * 1024 * 1024,
-        );
-        assert_eq!(manager.max_size(), 500); // 50% of 1000
+        for (percent, expected) in [(0.5f32, 5u64), (30.0, 300), (75.0, 750)] {
+            let manager = WriteCacheManager::new(
+                temp_dir.path().to_path_buf(),
+                1000,
+                percent,
+                Duration::from_secs(86400),
+                Duration::from_secs(86400),
+                CacheEvictionAlgorithm::TinyLFU,
+                256 * 1024 * 1024,
+            );
+            assert_eq!(manager.max_size(), expected, "{percent}% of 1000");
+        }
     }
 
     /// Concurrent reservations must account **exactly**, which is the property that
@@ -1945,10 +2236,10 @@ mod tests {
         let manager = Arc::new(WriteCacheManager::new(
             temp_dir.path().to_path_buf(),
             10_000, // 10KB total
-            100.0,  // Clamped to 50% = 5000 bytes Staging_Bound
+            50.0,   // 5000 bytes Staging_Bound
             Duration::from_secs(86400),
             Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             5000,
         ));
 
@@ -2052,7 +2343,7 @@ mod property_tests {
                 write_percent_clamped,
                 Duration::from_secs(86400),
                 Duration::from_secs(86400),
-                CacheEvictionAlgorithm::LRU,
+                CacheEvictionAlgorithm::TinyLFU,
                 max_write_cache, // Max object size = max write cache for this test
             );
 
@@ -2143,7 +2434,7 @@ mod property_tests {
                 50.0,         // 50% → max_size = capacity
                 Duration::from_secs(86400),
                 Duration::from_secs(86400),
-                CacheEvictionAlgorithm::LRU,
+                CacheEvictionAlgorithm::TinyLFU,
                 max_object_size,
             );
 
@@ -2219,7 +2510,7 @@ mod property_tests {
                 10.0,                                    // 10% write cache
                 Duration::from_secs(86400),              // 1 day write TTL
                 Duration::from_secs(ttl_seconds as u64), // Short incomplete upload TTL
-                crate::cache::CacheEvictionAlgorithm::LRU,
+                crate::cache::CacheEvictionAlgorithm::TinyLFU,
                 256 * 1024 * 1024, // 256MB max object
             );
 
@@ -2227,7 +2518,7 @@ mod property_tests {
             let cache_key = "test-bucket/test-object-eviction";
 
             // Create multipart upload directory and tracker
-            let mpus_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+            let mpus_dir = crate::signed_put_handler::mpu_upload_dir(temp_dir.path(), upload_id);
             tokio::fs::create_dir_all(&mpus_dir).await.unwrap();
 
             // Create part files in the upload directory and tracker
@@ -2241,8 +2532,13 @@ mod property_tests {
                 parts.push(crate::cache_types::CachedPartInfo {
                     part_number: part_num as u32,
                     size: 1024,
+                    // The fixture writes the part uncompressed, so the on-disk length
+                    // matches `size` here. That coincidence is fine for this test,
+                    // which is about TTL eviction rather than byte accounting.
+                    compressed_size: part_data.len() as u64,
                     etag: format!("\"etag-{}\"", part_num),
                     compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+                    file_identity: None,
                 });
             }
 

@@ -1,50 +1,264 @@
-** bytes v1.11.0 - https://github.com/tokio-rs/bytes
-** hyper v1.8.1 - https://github.com/hyperium/hyper
-** tokio v1.48.0 - https://github.com/tokio-rs/tokio
-** tracing v0.1.44 - https://github.com/tokio-rs/tracing
-** http-body-util v0.1.3 - https://github.com/hyperium/http-body
-** httpdate v1.0.3 - https://github.com/pyfisch/httpdate
-** hyper-util v0.1.18 - https://github.com/hyperium/hyper-util
-** hostname v0.3.1 - https://github.com/fengsp/hostname
-** lz4_flex v0.11.5 - https://github.com/PSeitz/lz4_flex
-** tracing-appender v0.2.4 - https://github.com/tokio-rs/tracing
-** tracing-subscriber v0.3.22 - https://github.com/tokio-rs/tracing
-** urlencoding v2.1.3 - https://github.com/kornelski/rust-url-encoding
-** h2 v0.4.12 - https://github.com/hyperium/h2
-** http-body v1.0.1 - https://github.com/hyperium/http-body
-** want v0.3.1 - https://github.com/seanmonstar/want
-** try-lock v0.2.5 - https://github.com/seanmonstar/try-lock
-** tower-service v0.3.3 - https://github.com/tower-rs/tower
-** tower-layer v0.3.3 - https://github.com/tower-rs/tower
-** tower v0.5.2 - https://github.com/tower-rs/tower
-** tower v0.4.13 - https://github.com/tower-rs/tower
-** tower-http v0.6.6 - https://github.com/tower-rs/tower-http
-** tokio-util v0.7.17 - https://github.com/tokio-rs/tokio
-** tokio-stream v0.1.17 - https://github.com/tokio-rs/tokio
-** tokio-test v0.4.4 - https://github.com/tokio-rs/tokio
-** tonic v0.12.3 - https://github.com/hyperium/tonic
-** axum v0.7.9 - https://github.com/tokio-rs/axum
-** axum-core v0.4.5 - https://github.com/tokio-rs/axum
-** async-stream v0.3.6 - https://github.com/tokio-rs/async-stream
-** async-stream-impl v0.3.6 - https://github.com/tokio-rs/async-stream
-** tokio-macros v2.6.0 - https://github.com/tokio-rs/tokio
-** tracing-attributes v0.1.30 - https://github.com/tokio-rs/tracing
-** tracing-core v0.1.34 - https://github.com/tokio-rs/tracing
-** slab v0.4.11 - https://github.com/carllerche/slab
-** pin-utils v0.1.0 - https://github.com/rust-lang-nursery/pin-utils
-** mio v1.1.0 - https://github.com/tokio-rs/mio
-** strsim v0.11.1 - https://github.com/dguo/strsim-rs
-** nu-ansi-term v0.50.3 - https://github.com/nushell/nu-ansi-term
-** sharded-slab v0.1.7 - https://github.com/hawkw/sharded-slab
-** matchers v0.2.0 - https://github.com/hawkw/matchers
-** tracing-log v0.2.0 - https://github.com/tokio-rs/tracing
-** data-encoding v2.9.0 - https://github.com/ia0/data-encoding
-** pem v3.0.6 - https://github.com/jcreekmore/pem-rs
-** fs_extra v1.3.0 - https://github.com/webdesus/fs_extra
-** synstructure v0.13.2 - https://github.com/mystor/synstructure
-** twox-hash v2.1.2 - https://github.com/shepmaster/twox-hash
-** unsafe-libyaml v0.2.11 - https://github.com/dtolnay/unsafe-libyaml
-** dashmap v6.1.0 - https://github.com/xacrimon/dashmap
+## MIT licensed, or licensed under MIT OR another licence of which we choose MIT
+
+** aho-corasick v1.1.4 - https://github.com/BurntSushi/aho-corasick (Unlicense OR MIT)
+** android_system_properties v0.1.5 - https://github.com/nical/android_system_properties (MIT/Apache-2.0)
+** anstream v0.6.21 - https://github.com/rust-cli/anstyle.git (MIT OR Apache-2.0)
+** anstyle v1.0.13 - https://github.com/rust-cli/anstyle.git (MIT OR Apache-2.0)
+** anstyle-parse v0.2.7 - https://github.com/rust-cli/anstyle.git (MIT OR Apache-2.0)
+** anstyle-query v1.1.5 - https://github.com/rust-cli/anstyle.git (MIT OR Apache-2.0)
+** anstyle-wincon v3.0.11 - https://github.com/rust-cli/anstyle.git (MIT OR Apache-2.0)
+** anyhow v1.0.100 - https://github.com/dtolnay/anyhow (MIT OR Apache-2.0)
+** arrayvec v0.7.6 - https://github.com/bluss/arrayvec (MIT OR Apache-2.0)
+** async-trait v0.1.89 - https://github.com/dtolnay/async-trait (MIT OR Apache-2.0)
+** atomic-waker v1.1.2 - https://github.com/smol-rs/atomic-waker (Apache-2.0 OR MIT)
+** autocfg v1.5.0 - https://github.com/cuviper/autocfg (Apache-2.0 OR MIT)
+** base64 v0.22.1 - https://github.com/marshallpierce/rust-base64 (MIT OR Apache-2.0)
+** bitflags v2.11.1 - https://github.com/bitflags/bitflags (MIT OR Apache-2.0)
+** bumpalo v3.19.1 - https://github.com/fitzgen/bumpalo (MIT OR Apache-2.0)
+** bytes v1.11.1 - https://github.com/tokio-rs/bytes (MIT)
+** cc v1.2.50 - https://github.com/rust-lang/cc-rs (MIT OR Apache-2.0)
+** cfg-if v1.0.4 - https://github.com/rust-lang/cfg-if (MIT OR Apache-2.0)
+** chacha20 v0.10.0 - https://github.com/RustCrypto/stream-ciphers (MIT OR Apache-2.0)
+** chrono v0.4.42 - https://github.com/chronotope/chrono (MIT OR Apache-2.0)
+** clap v4.5.53 - https://github.com/clap-rs/clap (MIT OR Apache-2.0)
+** clap_builder v4.5.53 - https://github.com/clap-rs/clap (MIT OR Apache-2.0)
+** clap_derive v4.5.49 - https://github.com/clap-rs/clap (MIT OR Apache-2.0)
+** clap_lex v0.7.6 - https://github.com/clap-rs/clap (MIT OR Apache-2.0)
+** colorchoice v1.0.4 - https://github.com/rust-cli/anstyle.git (MIT OR Apache-2.0)
+** combine v4.6.7 - https://github.com/Marwes/combine (MIT)
+** core-foundation v0.10.1 - https://github.com/servo/core-foundation-rs (MIT OR Apache-2.0)
+** core-foundation v0.9.4 - https://github.com/servo/core-foundation-rs (MIT OR Apache-2.0)
+** core-foundation-sys v0.8.7 - https://github.com/servo/core-foundation-rs (MIT OR Apache-2.0)
+** cpufeatures v0.3.0 - https://github.com/RustCrypto/utils (MIT OR Apache-2.0)
+** critical-section v1.2.0 - https://github.com/rust-embedded/critical-section (MIT OR Apache-2.0)
+** crossbeam-channel v0.5.15 - https://github.com/crossbeam-rs/crossbeam (MIT OR Apache-2.0)
+** crossbeam-deque v0.8.6 - https://github.com/crossbeam-rs/crossbeam (MIT OR Apache-2.0)
+** crossbeam-epoch v0.9.20 - https://github.com/crossbeam-rs/crossbeam (MIT OR Apache-2.0)
+** crossbeam-utils v0.8.21 - https://github.com/crossbeam-rs/crossbeam (MIT OR Apache-2.0)
+** dashmap v6.1.0 - https://github.com/xacrimon/dashmap (MIT)
+** data-encoding v2.9.0 - https://github.com/ia0/data-encoding (MIT)
+** deranged v0.5.5 - https://github.com/jhpratt/deranged (MIT OR Apache-2.0)
+** displaydoc v0.2.5 - https://github.com/yaahc/displaydoc (MIT OR Apache-2.0)
+** either v1.15.0 - https://github.com/rayon-rs/either (MIT OR Apache-2.0)
+** equivalent v1.0.2 - https://github.com/indexmap-rs/equivalent (Apache-2.0 OR MIT)
+** errno v0.3.14 - https://github.com/lambda-fairy/rust-errno (MIT OR Apache-2.0)
+** fastrand v2.3.0 - https://github.com/smol-rs/fastrand (Apache-2.0 OR MIT)
+** find-msvc-tools v0.1.5 - https://github.com/rust-lang/cc-rs (MIT OR Apache-2.0)
+** fnv v1.0.7 - https://github.com/servo/rust-fnv (Apache-2.0 / MIT)
+** form_urlencoded v1.2.2 - https://github.com/servo/rust-url (MIT OR Apache-2.0)
+** fs4 v1.1.0 - https://github.com/al8n/fs4 (MIT OR Apache-2.0)
+** futures v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-channel v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-core v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-executor v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-io v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-macro v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-sink v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-task v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** futures-util v0.3.31 - https://github.com/rust-lang/futures-rs (MIT OR Apache-2.0)
+** getrandom v0.2.16 - https://github.com/rust-random/getrandom (MIT OR Apache-2.0)
+** getrandom v0.3.4 - https://github.com/rust-random/getrandom (MIT OR Apache-2.0)
+** getrandom v0.4.2 - https://github.com/rust-random/getrandom (MIT OR Apache-2.0)
+** h2 v0.4.16 - https://github.com/hyperium/h2 (MIT)
+** hashbrown v0.14.5 - https://github.com/rust-lang/hashbrown (MIT OR Apache-2.0)
+** hashbrown v0.16.1 - https://github.com/rust-lang/hashbrown (MIT OR Apache-2.0)
+** heck v0.5.0 - https://github.com/withoutboats/heck (MIT OR Apache-2.0)
+** hickory-net v0.26.3 - https://github.com/hickory-dns/hickory-dns (MIT OR Apache-2.0)
+** hickory-proto v0.26.3 - https://github.com/hickory-dns/hickory-dns (MIT OR Apache-2.0)
+** hickory-resolver v0.26.3 - https://github.com/hickory-dns/hickory-dns (MIT OR Apache-2.0)
+** hostname v0.3.1 - https://github.com/svartalf/hostname (MIT)
+** http v1.4.0 - https://github.com/hyperium/http (MIT OR Apache-2.0)
+** http-body v1.0.1 - https://github.com/hyperium/http-body (MIT)
+** http-body-util v0.1.3 - https://github.com/hyperium/http-body (MIT)
+** httparse v1.10.1 - https://github.com/seanmonstar/httparse (MIT OR Apache-2.0)
+** httpdate v1.0.3 - https://github.com/pyfisch/httpdate (MIT OR Apache-2.0)
+** hyper v1.8.1 - https://github.com/hyperium/hyper (MIT)
+** hyper-util v0.1.19 - https://github.com/hyperium/hyper-util (MIT)
+** iana-time-zone v0.1.64 - https://github.com/strawlab/iana-time-zone (MIT OR Apache-2.0)
+** iana-time-zone-haiku v0.1.2 - https://github.com/strawlab/iana-time-zone (MIT OR Apache-2.0)
+** idna v1.1.0 - https://github.com/servo/rust-url/ (MIT OR Apache-2.0)
+** idna_adapter v1.2.1 - https://github.com/hsivonen/idna_adapter (Apache-2.0 OR MIT)
+** indexmap v2.12.1 - https://github.com/indexmap-rs/indexmap (Apache-2.0 OR MIT)
+** ipconfig v0.3.2 - https://github.com/liranringel/ipconfig (MIT/Apache-2.0)
+** ipnet v2.11.0 - https://github.com/krisprice/ipnet (MIT OR Apache-2.0)
+** iri-string v0.7.9 - https://github.com/lo48576/iri-string (MIT OR Apache-2.0)
+** is_terminal_polyfill v1.70.2 - https://github.com/polyfill-rs/is_terminal_polyfill (MIT OR Apache-2.0)
+** itertools v0.14.0 - https://github.com/rust-itertools/itertools (MIT OR Apache-2.0)
+** itoa v1.0.16 - https://github.com/dtolnay/itoa (MIT OR Apache-2.0)
+** jni v0.22.4 - https://github.com/jni-rs/jni-rs (MIT OR Apache-2.0)
+** jni-macros v0.22.4 - https://github.com/jni-rs/jni-rs (MIT OR Apache-2.0)
+** jni-sys v0.4.1 - https://github.com/jni-rs/jni-sys (MIT OR Apache-2.0)
+** jni-sys-macros v0.4.1 - https://github.com/jni-rs/jni-sys (MIT OR Apache-2.0)
+** js-sys v0.3.83 - https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys (MIT OR Apache-2.0)
+** lazy_static v1.5.0 - https://github.com/rust-lang-nursery/lazy-static.rs (MIT OR Apache-2.0)
+** libc v0.2.178 - https://github.com/rust-lang/libc (MIT OR Apache-2.0)
+** linux-raw-sys v0.11.0 - https://github.com/sunfishcode/linux-raw-sys (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+** lock_api v0.4.14 - https://github.com/Amanieu/parking_lot (MIT OR Apache-2.0)
+** log v0.4.29 - https://github.com/rust-lang/log (MIT OR Apache-2.0)
+** lz4_flex v0.11.6 - https://github.com/pseitz/lz4_flex (MIT)
+** match_cfg v0.1.0 - https://github.com/gnzlbg/match_cfg (MIT/Apache-2.0)
+** matchers v0.2.0 - https://github.com/hawkw/matchers (MIT)
+** memchr v2.7.6 - https://github.com/BurntSushi/memchr (Unlicense OR MIT)
+** mio v1.1.1 - https://github.com/tokio-rs/mio (MIT)
+** ndk-context v0.1.1 - https://github.com/rust-windowing/android-ndk-rs (MIT OR Apache-2.0)
+** nu-ansi-term v0.50.3 - https://github.com/nushell/nu-ansi-term (MIT)
+** num-conv v0.2.0 - https://github.com/jhpratt/num-conv (MIT OR Apache-2.0)
+** num-traits v0.2.19 - https://github.com/rust-num/num-traits (MIT OR Apache-2.0)
+** once_cell v1.21.3 - https://github.com/matklad/once_cell (MIT OR Apache-2.0)
+** once_cell_polyfill v1.70.2 - https://github.com/polyfill-rs/once_cell_polyfill (MIT OR Apache-2.0)
+** openssl-probe v0.2.1 - https://github.com/rustls/openssl-probe (MIT OR Apache-2.0)
+** parking_lot v0.12.5 - https://github.com/Amanieu/parking_lot (MIT OR Apache-2.0)
+** parking_lot_core v0.9.12 - https://github.com/Amanieu/parking_lot (MIT OR Apache-2.0)
+** percent-encoding v2.3.2 - https://github.com/servo/rust-url/ (MIT OR Apache-2.0)
+** pin-project-lite v0.2.16 - https://github.com/taiki-e/pin-project-lite (Apache-2.0 OR MIT)
+** pin-utils v0.1.0 - https://github.com/rust-lang-nursery/pin-utils (MIT OR Apache-2.0)
+** portable-atomic v1.13.1 - https://github.com/taiki-e/portable-atomic (Apache-2.0 OR MIT)
+** powerfmt v0.2.0 - https://github.com/jhpratt/powerfmt (MIT OR Apache-2.0)
+** ppv-lite86 v0.2.21 - https://github.com/cryptocorrosion/cryptocorrosion (MIT OR Apache-2.0)
+** prefix-trie v0.8.4 - https://github.com/tiborschneider/prefix-trie (MIT OR Apache-2.0)
+** proc-macro2 v1.0.103 - https://github.com/dtolnay/proc-macro2 (MIT OR Apache-2.0)
+** quote v1.0.42 - https://github.com/dtolnay/quote (MIT OR Apache-2.0)
+** r-efi v5.3.0 - https://github.com/r-efi/r-efi (MIT OR Apache-2.0 OR LGPL-2.1-or-later)
+** r-efi v6.0.0 - https://github.com/r-efi/r-efi (MIT OR Apache-2.0 OR LGPL-2.1-or-later)
+** rand v0.10.1 - https://github.com/rust-random/rand (MIT OR Apache-2.0)
+** rand v0.9.4 - https://github.com/rust-random/rand (MIT OR Apache-2.0)
+** rand_chacha v0.9.0 - https://github.com/rust-random/rand (MIT OR Apache-2.0)
+** rand_core v0.10.1 - https://github.com/rust-random/rand_core (MIT OR Apache-2.0)
+** rand_core v0.9.5 - https://github.com/rust-random/rand (MIT OR Apache-2.0)
+** rayon v1.11.0 - https://github.com/rayon-rs/rayon (MIT OR Apache-2.0)
+** rayon-core v1.13.0 - https://github.com/rayon-rs/rayon (MIT OR Apache-2.0)
+** redox_syscall v0.5.18 - https://gitlab.redox-os.org/redox-os/syscall (MIT)
+** regex v1.12.2 - https://github.com/rust-lang/regex (MIT OR Apache-2.0)
+** regex-automata v0.4.13 - https://github.com/rust-lang/regex (MIT OR Apache-2.0)
+** regex-syntax v0.8.8 - https://github.com/rust-lang/regex (MIT OR Apache-2.0)
+** reqwest v0.13.4 - https://github.com/seanmonstar/reqwest (MIT OR Apache-2.0)
+** resolv-conf v0.7.6 - https://github.com/hickory-dns/resolv-conf (MIT OR Apache-2.0)
+** rustc_version v0.4.1 - https://github.com/djc/rustc-version-rs (MIT OR Apache-2.0)
+** rustix v1.1.3 - https://github.com/bytecodealliance/rustix (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+** rustls v0.23.46 - https://github.com/rustls/rustls (Apache-2.0 OR ISC OR MIT)
+** rustls-native-certs v0.8.3 - https://github.com/rustls/rustls-native-certs (Apache-2.0 OR ISC OR MIT)
+** rustls-pki-types v1.13.2 - https://github.com/rustls/pki-types (MIT OR Apache-2.0)
+** rustversion v1.0.22 - https://github.com/dtolnay/rustversion (MIT OR Apache-2.0)
+** same-file v1.0.6 - https://github.com/BurntSushi/same-file (Unlicense/MIT)
+** schannel v0.1.28 - https://github.com/steffengy/schannel-rs (MIT)
+** scopeguard v1.2.0 - https://github.com/bluss/scopeguard (MIT OR Apache-2.0)
+** security-framework v3.7.0 - https://github.com/kornelski/rust-security-framework (MIT OR Apache-2.0)
+** security-framework-sys v2.17.0 - https://github.com/kornelski/rust-security-framework (MIT OR Apache-2.0)
+** semver v1.0.28 - https://github.com/dtolnay/semver (MIT OR Apache-2.0)
+** serde v1.0.228 - https://github.com/serde-rs/serde (MIT OR Apache-2.0)
+** serde_core v1.0.228 - https://github.com/serde-rs/serde (MIT OR Apache-2.0)
+** serde_derive v1.0.228 - https://github.com/serde-rs/serde (MIT OR Apache-2.0)
+** serde_json v1.0.146 - https://github.com/serde-rs/json (MIT OR Apache-2.0)
+** serde_yaml_ng v0.9.36 - https://github.com/acatton/serde-yaml-ng (MIT OR Apache-2.0)
+** sharded-slab v0.1.7 - https://github.com/hawkw/sharded-slab (MIT)
+** shlex v1.3.0 - https://github.com/comex/rust-shlex (MIT OR Apache-2.0)
+** signal-hook-registry v1.4.7 - https://github.com/vorner/signal-hook (MIT OR Apache-2.0)
+** simd_cesu8 v1.1.1 - https://github.com/seancroach/simd_cesu8 (Apache-2.0 OR MIT)
+** simdutf8 v0.1.5 - https://github.com/rusticstuff/simdutf8 (MIT OR Apache-2.0)
+** slab v0.4.11 - https://github.com/tokio-rs/slab (MIT)
+** smallvec v1.15.1 - https://github.com/servo/rust-smallvec (MIT OR Apache-2.0)
+** socket2 v0.5.10 - https://github.com/rust-lang/socket2 (MIT OR Apache-2.0)
+** socket2 v0.6.1 - https://github.com/rust-lang/socket2 (MIT OR Apache-2.0)
+** stable_deref_trait v1.2.1 - https://github.com/storyyeller/stable_deref_trait (MIT OR Apache-2.0)
+** strsim v0.11.1 - https://github.com/rapidfuzz/strsim-rs (MIT)
+** syn v2.0.111 - https://github.com/dtolnay/syn (MIT OR Apache-2.0)
+** synstructure v0.13.2 - https://github.com/mystor/synstructure (MIT)
+** system-configuration v0.6.1 - https://github.com/mullvad/system-configuration-rs (MIT OR Apache-2.0)
+** system-configuration v0.7.0 - https://github.com/mullvad/system-configuration-rs (MIT OR Apache-2.0)
+** system-configuration-sys v0.6.0 - https://github.com/mullvad/system-configuration-rs (MIT OR Apache-2.0)
+** tagptr v0.2.0 - https://github.com/oliver-giersch/tagptr.git (MIT/Apache-2.0)
+** thiserror v1.0.69 - https://github.com/dtolnay/thiserror (MIT OR Apache-2.0)
+** thiserror v2.0.17 - https://github.com/dtolnay/thiserror (MIT OR Apache-2.0)
+** thiserror-impl v1.0.69 - https://github.com/dtolnay/thiserror (MIT OR Apache-2.0)
+** thiserror-impl v2.0.17 - https://github.com/dtolnay/thiserror (MIT OR Apache-2.0)
+** thread_local v1.1.9 - https://github.com/Amanieu/thread_local-rs (MIT OR Apache-2.0)
+** time v0.3.47 - https://github.com/time-rs/time (MIT OR Apache-2.0)
+** time-core v0.1.8 - https://github.com/time-rs/time (MIT OR Apache-2.0)
+** tinyvec v1.10.0 - https://github.com/Lokathor/tinyvec (Zlib OR Apache-2.0 OR MIT)
+** tinyvec_macros v0.1.1 - https://github.com/Soveu/tinyvec_macros (MIT OR Apache-2.0 OR Zlib)
+** tokio v1.48.0 - https://github.com/tokio-rs/tokio (MIT)
+** tokio-macros v2.6.0 - https://github.com/tokio-rs/tokio (MIT)
+** tokio-rustls v0.26.4 - https://github.com/rustls/tokio-rustls (MIT OR Apache-2.0)
+** tokio-stream v0.1.17 - https://github.com/tokio-rs/tokio (MIT)
+** tokio-util v0.7.17 - https://github.com/tokio-rs/tokio (MIT)
+** tower v0.5.2 - https://github.com/tower-rs/tower (MIT)
+** tower-http v0.6.8 - https://github.com/tower-rs/tower-http (MIT)
+** tower-layer v0.3.3 - https://github.com/tower-rs/tower (MIT)
+** tower-service v0.3.3 - https://github.com/tower-rs/tower (MIT)
+** tracing v0.1.44 - https://github.com/tokio-rs/tracing (MIT)
+** tracing-appender v0.2.4 - https://github.com/tokio-rs/tracing (MIT)
+** tracing-attributes v0.1.31 - https://github.com/tokio-rs/tracing (MIT)
+** tracing-core v0.1.36 - https://github.com/tokio-rs/tracing (MIT)
+** tracing-log v0.2.0 - https://github.com/tokio-rs/tracing (MIT)
+** tracing-subscriber v0.3.22 - https://github.com/tokio-rs/tracing (MIT)
+** try-lock v0.2.5 - https://github.com/seanmonstar/try-lock (MIT)
+** twox-hash v2.1.2 - https://github.com/shepmaster/twox-hash (MIT)
+** unicode-ident v1.0.22 - https://github.com/dtolnay/unicode-ident ((MIT OR Apache-2.0) AND Unicode-3.0)
+** unsafe-libyaml v0.2.11 - https://github.com/dtolnay/unsafe-libyaml (MIT)
+** url v2.5.7 - https://github.com/servo/rust-url (MIT OR Apache-2.0)
+** urlencoding v2.1.3 - https://github.com/kornelski/rust_urlencoding (MIT)
+** utf8_iter v1.0.4 - https://github.com/hsivonen/utf8_iter (Apache-2.0 OR MIT)
+** utf8parse v0.2.2 - https://github.com/alacritty/vte (Apache-2.0 OR MIT)
+** uuid v1.19.0 - https://github.com/uuid-rs/uuid (Apache-2.0 OR MIT)
+** walkdir v2.5.0 - https://github.com/BurntSushi/walkdir (Unlicense/MIT)
+** want v0.3.1 - https://github.com/seanmonstar/want (MIT)
+** wasi v0.11.1+wasi-snapshot-preview1 - https://github.com/bytecodealliance/wasi (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+** wasip2 v1.0.1+wasi-0.2.4 - https://github.com/bytecodealliance/wasi-rs (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+** wasip3 v0.4.0+wasi-0.3.0-rc-2026-01-06 - https://github.com/bytecodealliance/wasi-rs (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+** wasm-bindgen v0.2.106 - https://github.com/wasm-bindgen/wasm-bindgen (MIT OR Apache-2.0)
+** wasm-bindgen-futures v0.4.56 - https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures (MIT OR Apache-2.0)
+** wasm-bindgen-macro v0.2.106 - https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro (MIT OR Apache-2.0)
+** wasm-bindgen-macro-support v0.2.106 - https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support (MIT OR Apache-2.0)
+** wasm-bindgen-shared v0.2.106 - https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared (MIT OR Apache-2.0)
+** web-sys v0.3.83 - https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys (MIT OR Apache-2.0)
+** widestring v1.2.1 - https://github.com/VoidStarKat/widestring-rs (MIT OR Apache-2.0)
+** winapi v0.3.9 - https://github.com/retep998/winapi-rs (MIT/Apache-2.0)
+** winapi-i686-pc-windows-gnu v0.4.0 - https://github.com/retep998/winapi-rs (MIT/Apache-2.0)
+** winapi-util v0.1.11 - https://github.com/BurntSushi/winapi-util (Unlicense OR MIT)
+** winapi-x86_64-pc-windows-gnu v0.4.0 - https://github.com/retep998/winapi-rs (MIT/Apache-2.0)
+** windows-core v0.62.2 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-implement v0.60.2 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-interface v0.59.3 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-link v0.2.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-registry v0.6.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-result v0.4.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-strings v0.5.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-sys v0.48.0 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-sys v0.52.0 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-sys v0.60.2 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-sys v0.61.2 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-targets v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-targets v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows-targets v0.53.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_aarch64_gnullvm v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_aarch64_gnullvm v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_aarch64_gnullvm v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_aarch64_msvc v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_aarch64_msvc v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_aarch64_msvc v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_gnu v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_gnu v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_gnu v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_gnullvm v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_gnullvm v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_msvc v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_msvc v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_i686_msvc v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_gnu v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_gnu v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_gnu v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_gnullvm v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_gnullvm v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_gnullvm v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_msvc v0.48.5 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_msvc v0.52.6 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** windows_x86_64_msvc v0.53.1 - https://github.com/microsoft/windows-rs (MIT OR Apache-2.0)
+** winreg v0.50.0 - https://github.com/gentoo90/winreg-rs (MIT)
+** wit-bindgen v0.46.0 - https://github.com/bytecodealliance/wit-bindgen (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+** wit-bindgen v0.51.0 - https://github.com/bytecodealliance/wit-bindgen (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+** zerocopy v0.8.31 - https://github.com/google/zerocopy (BSD-2-Clause OR Apache-2.0 OR MIT)
+** zerocopy-derive v0.8.31 - https://github.com/google/zerocopy (BSD-2-Clause OR Apache-2.0 OR MIT)
+** zeroize v1.8.2 - https://github.com/RustCrypto/utils (Apache-2.0 OR MIT)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -64,22 +278,23 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## Apache-2.0 Licensed Dependencies
+## Apache-2.0 licensed (no MIT option), including crates where Apache-2.0 is the chosen alternative
 
-The following dependencies are licensed under the Apache License, Version 2.0:
-
-- opentelemetry v0.24.0
-- opentelemetry-otlp v0.17.0
-- opentelemetry-semantic-conventions v0.16.0
-- opentelemetry_sdk v0.24.1
-- opentelemetry-proto v0.7.0
-- opentelemetry-http v0.13.0
-- gethostname v0.4.3
-- prost v0.13.5
-- prost-derive v0.13.5
-- sync_wrapper v1.0.2
-
-Apache License, Version 2.0:
+** blake3 v1.8.2 - https://github.com/BLAKE3-team/BLAKE3 (CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception)
+** constant_time_eq v0.3.1 - https://github.com/cesarb/constant_time_eq (CC0-1.0 OR MIT-0 OR Apache-2.0)
+** gethostname v0.4.3 - https://github.com/swsnr/gethostname.rs.git (Apache-2.0)
+** moka v0.12.15 - https://github.com/moka-rs/moka ((MIT OR Apache-2.0) AND Apache-2.0)
+** opentelemetry v0.32.0 - https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry (Apache-2.0)
+** opentelemetry-http v0.32.0 - https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http (Apache-2.0)
+** opentelemetry-otlp v0.32.0 - https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp (Apache-2.0)
+** opentelemetry-proto v0.32.0 - https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto (Apache-2.0)
+** opentelemetry-semantic-conventions v0.32.1 - https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-semantic-conventions (Apache-2.0)
+** opentelemetry_sdk v0.32.1 - https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk (Apache-2.0)
+** prost v0.14.4 - https://github.com/tokio-rs/prost (Apache-2.0)
+** prost-derive v0.14.4 - https://github.com/tokio-rs/prost (Apache-2.0)
+** ring v0.17.14 - https://github.com/briansmith/ring (Apache-2.0 AND ISC)
+** ryu v1.0.21 - https://github.com/dtolnay/ryu (Apache-2.0 OR BSL-1.0)
+** sync_wrapper v1.0.2 - https://github.com/Actyx/sync_wrapper (Apache-2.0)
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -93,45 +308,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-## MIT OR Apache-2.0 Dual Licensed Dependencies
+## ISC licensed
 
-The following dependencies are dual licensed under MIT OR Apache-2.0:
-
-- anyhow v1.0.100
-- chrono v0.4.42
-- serde v1.0.228
-- serde_json v1.0.146
-- serde_yaml v0.9.34+deprecated
-- clap v4.5.53
-- futures v0.3.31
-- hex v0.4.3
-- thiserror v1.0.69
-- time v0.3.44
-- tokio-rustls v0.26.4
-- trust-dns-resolver v0.23.2
-- uuid v1.18.1
-- rcgen v0.13.2
-- pin-project v1.1.10
-- tempfile v3.23.0
-- rustls-pemfile v2.2.0
-- rand v0.8.5
-- rayon v1.11.0
-- regex v1.12.2
-- scopeguard v1.2.0
-- fastrand v2.3.0
-- And many others...
-
-For dual licensed dependencies, we choose the MIT license terms as stated above.
-
-## ISC Licensed Dependencies
-
-The following dependencies are licensed under the ISC License:
-
-- ring v0.17.14 (ISC)
-- rustls-webpki v0.103.8
-- untrusted v0.9.0
-
-ISC License:
+** ring v0.17.14 - https://github.com/briansmith/ring (Apache-2.0 AND ISC)
+** rustls v0.23.46 - https://github.com/rustls/rustls (Apache-2.0 OR ISC OR MIT)
+** rustls-native-certs v0.8.3 - https://github.com/rustls/rustls-native-certs (Apache-2.0 OR ISC OR MIT)
+** rustls-webpki v0.103.16 - https://github.com/rustls/webpki (ISC)
+** untrusted v0.9.0 - https://github.com/briansmith/untrusted (ISC)
 
 Permission to use, copy, modify, and/or distribute this software for any
 purpose with or without fee is hereby granted, provided that the above
@@ -145,14 +328,40 @@ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-## BSD Licensed Dependencies
+## BSD-2-Clause licensed
 
-The following dependencies are licensed under BSD licenses:
+** arrayref v0.3.9 - https://github.com/droundy/arrayref (BSD-2-Clause)
 
-- subtle v2.6.1 (BSD-3-Clause)
-- zerocopy v0.8.27 (BSD-2-Clause OR Apache-2.0 OR MIT)
+Copyright (c) 2015 David Roundy <roundyd@physics.oregonstate.edu>
+All rights reserved.
 
-BSD 3-Clause License:
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the
+   distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## BSD-3-Clause licensed
+
+** subtle v2.6.1 - https://github.com/dalek-cryptography/subtle (BSD-3-Clause)
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -179,89 +388,67 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-## Unlicense / Public Domain Dependencies
+## Unicode-3.0 licensed
 
-The following dependencies are in the public domain:
+** icu_collections v2.1.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** icu_locale_core v2.1.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** icu_normalizer v2.1.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** icu_normalizer_data v2.1.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** icu_properties v2.1.2 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** icu_properties_data v2.1.2 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** icu_provider v2.1.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** litemap v0.8.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** potential_utf v0.1.4 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** tinystr v0.8.2 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** unicode-ident v1.0.22 - https://github.com/dtolnay/unicode-ident ((MIT OR Apache-2.0) AND Unicode-3.0)
+** writeable v0.6.2 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** yoke v0.8.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** yoke-derive v0.8.1 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** zerofrom v0.1.6 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** zerofrom-derive v0.1.6 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** zerotrie v0.2.3 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** zerovec v0.11.5 - https://github.com/unicode-org/icu4x (Unicode-3.0)
+** zerovec-derive v0.11.2 - https://github.com/unicode-org/icu4x (Unicode-3.0)
 
-- memchr v2.7.6 (Unlicense OR MIT)
-- quickcheck v1.0.3 (Unlicense/MIT)
-- quickcheck_macros v1.1.0 (Unlicense OR MIT)
-- aho-corasick v1.1.4 (Unlicense OR MIT)
-- walkdir v2.5.0 (MIT OR Unlicense)
+UNICODE LICENSE V3
 
-For these dependencies, we choose the MIT license terms as stated above.
+COPYRIGHT AND PERMISSION NOTICE
 
-## Unicode License Dependencies
+Copyright © 1991-2023 Unicode, Inc.
 
-The following dependencies use Unicode licenses:
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
 
-- unicode-ident v1.0.22 ((MIT OR Apache-2.0) AND Unicode-3.0)
-- Various ICU crates (Unicode-3.0)
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
 
-Unicode License Agreement - Data Files and Software (2016):
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
 
-See: https://www.unicode.org/license.txt
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
 
-## Other Licenses
-
-### BSL-1.0 (Boost Software License)
-- ryu v1.0.20 (Apache-2.0 OR BSL-1.0)
-
-Boost Software License - Version 1.0:
-
-Permission is hereby granted, free of charge, to any person or organization
-obtaining a copy of the software and accompanying documentation covered by
-this license (the "Software") to use, reproduce, display, distribute,
-execute, and transmit the Software, and to prepare derivative works of the
-Software, and to permit third-parties to whom the Software is furnished to
-do so, all subject to the following:
-
-The copyright notices in the Software and this entire statement, including
-the above license grant, this restriction and the following disclaimer,
-must be included in all copies of the Software, in whole or in part, and
-all derivative works of the Software, unless such copies or derivative
-works are solely in the form of machine-executable object code generated by
-a source language processor.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
-SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
-FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-### Zlib License
-- tinyvec v1.10.0 (Zlib OR Apache-2.0 OR MIT)
-
-For this dependency, we choose the MIT license terms as stated above.
-
-### CC0-1.0 (Creative Commons Zero)
-- dunce v1.0.5 (CC0-1.0 OR MIT-0 OR Apache-2.0)
-
-For this dependency, we choose the Apache-2.0 license terms as stated above.
-
-### MIT-0 (MIT No Attribution)
-- dunce v1.0.5 (CC0-1.0 OR MIT-0 OR Apache-2.0)
-
-For this dependency, we choose the Apache-2.0 license terms as stated above.
-
-### Complex License Combinations
-
-#### ring
-- ring v0.17.14 (ISC)
-
-This dependency uses the ISC license as stated above.
-
-#### rustix
-- rustix v1.1.2 (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
-
-For this dependency, we choose the MIT license terms as stated above.
-
-#### matchit
-- matchit v0.7.3 (MIT AND BSD-3-Clause)
-
-This dependency requires compliance with both MIT and BSD-3-Clause licenses as stated above.
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
 
 ---
 

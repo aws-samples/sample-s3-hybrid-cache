@@ -84,7 +84,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false,
         config.cache.get_ttl,
@@ -521,14 +521,16 @@ logging:
 // the attached Reservation while the payload is still entirely undelivered.
 // They pass only with the ChunkedBytes body, whose frames give hyper's write
 // watermark something to withhold. (unsigned-write-path-streaming Req 6.2;
-// the fleet counterpart is T40g in deployment-verification.sh.)
+// the fleet counterpart is the fleet test in deployment-verification.sh.)
 // ===========================================================================
 
 /// Large enough that the payload cannot be absorbed by hyper's write buffer
 /// plus the loopback socket buffers while the client stalls (client recv
-/// buffer is pinned small below). 16 MiB gives a wide margin over any
-/// plausible autotuned loopback buffering.
-const LARGE_OBJECT_SIZE: usize = 16 * 1024 * 1024;
+/// buffer is pinned small below). Capped at `BUFFERED_OPERATION_BOUND` (8 MiB): an extent above
+/// it is served by the slice stream, which takes no ledger reservation, so these tests would
+/// wait for a reservation that never appears. 8 MiB is still far above hyper's write
+/// queue plus the loopback socket buffers.
+const LARGE_OBJECT_SIZE: usize = 8 * 1024 * 1024;
 const LARGE_PATH_A: &str = "/mybucket/ledger-large-a.bin";
 const LARGE_PATH_B: &str = "/mybucket/ledger-large-b.bin";
 
@@ -758,7 +760,7 @@ async fn reservation_held_while_client_stalls_released_on_drain() {
 /// reservation, the second request is shed with 503 SlowDown + Retry-After.
 /// After the first client disconnects, the same request is admitted.
 ///
-/// This is the in-process counterpart of fleet group T40g, and the direct
+/// This is the in-process counterpart of the fleet test, and the direct
 /// contention proof Requirement 10.2's single-request breach cannot give.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_buffered_range_shed_while_first_reservation_live() {
@@ -772,7 +774,7 @@ async fn second_buffered_range_shed_while_first_reservation_live() {
     )
     .await;
 
-    // Each leg is 16 MiB; the ceiling admits one leg but not two.
+    // Each leg is LARGE_OBJECT_SIZE; the ceiling admits one leg but not two.
     let ceiling = (LARGE_OBJECT_SIZE + LARGE_OBJECT_SIZE / 2) as u64;
     let ledger = Arc::new(InflightLedger::new(ceiling));
     let server = spawn_proxy_server(

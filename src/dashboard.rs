@@ -123,6 +123,7 @@ impl DashboardServer {
         // Track active connections for graceful shutdown
         let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_connections = 50; // Limit concurrent connections to prevent resource exhaustion
+        let mut accept_errors = crate::accept_policy::AcceptErrorLog::new();
 
         loop {
             tokio::select! {
@@ -187,9 +188,7 @@ impl DashboardServer {
                             });
                         }
                         Err(e) => {
-                            error!("Failed to accept dashboard connection: {}", e);
-                            // Add small delay to prevent tight error loops
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            accept_errors.on_accept_error("Dashboard server", &e).await;
                         }
                     }
                 }
@@ -330,7 +329,7 @@ impl StaticFileHandler {
         Self {}
     }
 
-    pub async fn handle_static_request(&self, path: &str) -> Result<Response<String>> {
+    pub(crate) async fn handle_static_request(&self, path: &str) -> Result<Response<String>> {
         let (content, content_type) = match path {
             "/index.html" => (self.get_index_html(), "text/html"),
             "/style.css" => (self.get_style_css(), "text/css"),
@@ -1176,7 +1175,7 @@ async function loadCacheStats() {
         helpCounter = 0; // Reset so IDs are stable across refreshes
         content.innerHTML = renderCacheStats(data);
     } catch (error) {
-        content.innerHTML = `<div class="error">Failed to load cache statistics: ${error.message}</div>`;
+        content.innerHTML = `<div class="error">Failed to load cache statistics: ${escapeHtml(error.message)}</div>`;
     }
     
     loadBucketStats();
@@ -1208,7 +1207,7 @@ async function loadLogs() {
         window.lastLogsData = data;
         content.innerHTML = renderLogs(data);
     } catch (error) {
-        content.innerHTML = `<div class="error">Failed to load logs: ${error.message}</div>`;
+        content.innerHTML = `<div class="error">Failed to load logs: ${escapeHtml(error.message)}</div>`;
     }
 }
 
@@ -1229,7 +1228,7 @@ function renderCacheStats(data) {
         : '';
     const staleHandleDisplay = (data.metadata_cache?.stale_handle_errors || 0) > 0 
         ? statWarn('Stale Handle Errors', formatNumber(data.metadata_cache?.stale_handle_errors || 0),
-            'File handle errors when reading metadata from shared storage (NFS/EFS). Indicates stale NFS file handles that required retry.')
+            'Stale file handles (ESTALE) seen while reading metadata files from shared storage (NFS/EFS), counting each retry. Reads that stayed stale after 3 retries were fetched from S3. Same figure as cache.metadata_read_stale_handles_total on /metrics; per-instance.')
         : '';
     const lastConsolidationDisplay = data.last_consolidation 
         ? stat('Last Consolidation', formatTimestamp(data.last_consolidation),
@@ -1321,7 +1320,7 @@ function renderCacheStats(data) {
             <div class="stat-card overall-card">
                 <h3>Overall Statistics</h3>
                 ${stat('Total Requests', formatNumber(data.overall?.total_requests || 0), 'Total HTTP requests processed (GET + HEAD + PUT).')}
-                ${stat('Cached Objects', data.disk_cache?.cached_objects != null ? formatNumber(data.disk_cache.cached_objects) : 'N/A', 'Number of distinct S3 objects currently stored on disk.')}
+                ${stat('Cached Objects', data.disk_cache?.cached_objects != null ? formatNumber(data.disk_cache.cached_objects) : 'N/A', 'Number of cache metadata (.meta) entries on disk, including HEAD-only entries.')}
                 ${stat('Total Cache Size', (data.disk_cache?.size_human || '0 B') + (data.disk_cache?.max_size_human ? ' / ' + data.disk_cache.max_size_human : ''), 'Total disk cache usage (read + write cache) vs configured maximum.')}
                 ${stat('Write Cache', (data.write_cache?.size_human || '0 B') + ' / ' + (data.write_cache?.max_size_human || '0 B'), 'Disk space used by MPUs in progress and PUT objects not yet read via GET.')}
                 ${stat('S3 Requests Saved', formatNumber(data.overall?.s3_requests_saved || 0), 'Number of S3 requests avoided by serving from cache (GET + HEAD cache hits).')}
@@ -1329,6 +1328,152 @@ function renderCacheStats(data) {
                 ${stat('Uptime', formatUptime(data.overall?.uptime_seconds || 0), 'Time since the proxy process started.')}
                 ${lastConsolidationDisplay}
             </div>
+            ${renderStagedTier(data.staged_tier)}
+        </div>
+    `;
+}
+
+// Percentage bands for the staged range budget. These are percentages of whatever the budget
+// currently is, NOT range counts — the budget itself arrives as `t.range_budget` and is never
+// spelled here, because it is re-derivable and any literal would go stale silently.
+const STAGED_BUDGET_WARN_PERCENT = 75;
+
+function renderStagedTier(t) {
+    if (!t) {
+        return '';
+    }
+
+    // The occupancy denominator is data: whatever the running binary's Staged_Range_Budget is.
+    // Formatting it from `t.range_budget` is the whole point — a template with the number in it
+    // would misreport the moment the budget is re-derived.
+    const budget = formatNumber(t.range_budget);
+    const occupancy = t.range_count == null
+        ? 'unknown / ' + budget
+        : formatNumber(t.range_count) + ' / ' + budget
+            + (t.range_budget_percent == null ? '' : ' (' + t.range_budget_percent.toFixed(1) + '%)');
+    const occupancyHelp = 'Write-cached ranges currently staged, against Staged_Range_Budget. '
+        + 'Write-through caching is DECLINED once the budget is reached, so proximity to it is a '
+        + 'capacity signal, not just a utilisation one. The denominator is read from the running '
+        + 'binary rather than configured.';
+    const nearBudget = t.range_budget_percent != null
+        && t.range_budget_percent >= STAGED_BUDGET_WARN_PERCENT;
+    const occupancyRow = nearBudget
+        ? statWarn('Staged Ranges', occupancy, occupancyHelp)
+        : stat('Staged Ranges', occupancy, occupancyHelp);
+
+    // Completeness first, because it decides how every figure below it should be read. An
+    // incomplete fold publishes a RETAINED figure, and a retained figure rendered as though it
+    // were current is a confident wrong number.
+    let completenessRow;
+    if (t.completeness === 'unknown') {
+        // The elapsed time since the last Complete_Install is what § 16.6.7 asks for beside the
+        // retained figure. It answers "how long has the fold been failing", which the authority age
+        // below does NOT: that one is how stale the figure is, and the two diverge precisely here.
+        completenessRow = statWarn('Figure State', 'UNKNOWN - showing retained figure',
+            'A staged input could not be read, or the last fold attempt did not complete, so the '
+            + 'occupancy above is the last known figure rather than a current one. '
+            + (t.fold_completed_age_secs == null
+                ? 'No completed fold is recorded on this volume. '
+                : 'Last complete fold ' + formatNumber(t.fold_completed_age_secs) + 's ago'
+                  + (t.fold_last_attempt_age_secs == null ? '. '
+                     : ', last attempt ' + formatNumber(t.fold_last_attempt_age_secs) + 's ago. '))
+            + 'Incomplete fold passes: ' + formatNumber(t.fold_incomplete_total) + '.');
+    } else if (t.completeness === 'stale_but_valid') {
+        completenessRow = statWarn('Figure State',
+            'STALE - ' + formatNumber(t.shards_beyond_max_age) + ' shard(s) past the age bound',
+            'A complete figure of an older state: a valid statement about the past, not garbage. '
+            + 'The bound is ' + formatNumber(t.max_authority_age_secs) + 's on the stalest shard.');
+    } else {
+        completenessRow = stat('Figure State', 'CURRENT',
+            'Every shard contributing to the figure was folded within '
+            + formatNumber(t.max_authority_age_secs) + 's.');
+    }
+
+    const ageRow = stat('Authority Age',
+        (t.shard_authority_age_secs == null ? 'N/A' : formatNumber(t.shard_authority_age_secs) + 's')
+        + ' / ' + formatNumber(t.max_authority_age_secs) + 's',
+        'Age of the STALEST shard in the staged figure against its bound. Measured from the last '
+        + 'successful install, never from a pass start or a failed attempt. Freshest shard: '
+        + (t.authority_age_secs == null ? 'N/A' : formatNumber(t.authority_age_secs) + 's') + '.');
+
+    const stagedBytesRow = stat('Staged Bytes',
+        t.staged_bytes == null ? 'unknown' : formatBytes(t.staged_bytes),
+        'Compressed on-disk bytes the staging tier holds, as the fold sees them.');
+
+    const inProgressRow = stat('In-Progress Parts',
+        t.in_progress_part_bytes == null ? 'unknown' : formatBytes(t.in_progress_part_bytes),
+        'Compressed on-disk bytes held by multipart uploads that have not completed. Real '
+        + 'occupancy that the read-tier figures do not count.');
+
+    const declinesRow = t.range_budget_declines_total > 0
+        ? statWarn('Budget Declines', formatNumber(t.range_budget_declines_total),
+            'Write-through admissions this proxy declined because the range budget was reached. '
+            + 'The uploads still succeeded; they were not cached.')
+        : stat('Budget Declines', '0',
+            'Write-through admissions this proxy declined because the range budget was reached.');
+
+    const shardRow = stat('Fold Shards',
+        formatNumber(t.shards) + ' folded, ' + formatNumber(t.shard_visits) + ' visit(s)'
+        + (t.shard_visit_mean_ms == null ? '' : ', mean ' + formatNumber(t.shard_visit_mean_ms) + 'ms'),
+        'Shards carrying a figure, shard visits recorded, and the mean visit duration.');
+
+    const cappedRow = t.shard_budget_capped_total > 0
+        ? statWarn('Shard Budget Capped', formatNumber(t.shard_budget_capped_total),
+            'Fold passes whose per-pass shard budget was clipped by the ceiling. Non-zero means '
+            + 'the age bound is not achievable at this shard population and instance count; '
+            + 'adding proxies divides the shard population.')
+        : stat('Shard Budget Capped', '0',
+            'Fold passes whose per-pass shard budget was clipped by the ceiling.');
+
+    // The fourth row § 16.6.7 asks for, and the only PERMANENT condition on this card.
+    let repairRow;
+    if (t.repair_rotation_reachable === false) {
+        repairRow = statWarn('Repair Rotation', 'UNREACHABLE'
+            + (t.repair_projected_rotation_secs == null ? ''
+                : ' (projected ' + formatNumber(t.repair_projected_rotation_secs) + 's)'),
+            'The ledger-completeness repair rotation cannot complete inside its window at this '
+            + 'shard population, so the staged-authority epoch can never advance. Unlike every '
+            + 'other signal here this does not resolve by waiting.');
+    } else if (t.repair_rotation_reachable == null) {
+        repairRow = stat('Repair Rotation', 'unknown',
+            'The shard population could not be read, so reachability is unknown.');
+    } else {
+        repairRow = stat('Repair Rotation',
+            t.repair_rotation_complete ? 'complete' : 'in progress',
+            'The ledger-completeness repair rotation is reachable'
+            + (t.repair_projected_rotation_secs == null ? ''
+                : ' (projected ' + formatNumber(t.repair_projected_rotation_secs) + 's per rotation)')
+            + '.');
+    }
+
+    const reappendedRow = t.repair_ranges_reappended_total > 0
+        ? statWarn('Ranges Reappended', formatNumber(t.repair_ranges_reappended_total),
+            'Staged ranges found on disk with no ledger entry. Each one had been excluded from '
+            + 'the staged figure, so this is a finding rather than a routine reading.')
+        : '';
+
+    const memoRow = stat('Authority Memo',
+        (t.authority_snapshot_age_secs == null ? 'expired' : t.authority_snapshot_age_secs + 's old')
+        + ', ' + formatNumber(t.authority_snapshot_hits_total) + ' hit(s) / '
+        + formatNumber(t.authority_snapshot_recomputes_total) + ' recompute(s)',
+        'The short-TTL memo in front of the staged figure. "expired" means the next read will go '
+        + 'to shared storage. Read the hit and recompute counts as a ratio: a low hit rate means '
+        + 'the shared-volume reads the memo exists to remove are still being paid.');
+
+    return `
+        <div class="stat-card overall-card">
+            <h3>Staged Write Tier (epoch ${formatNumber(t.staged_authority_epoch)})</h3>
+            ${occupancyRow}
+            ${completenessRow}
+            ${ageRow}
+            ${stagedBytesRow}
+            ${inProgressRow}
+            ${declinesRow}
+            ${shardRow}
+            ${cappedRow}
+            ${repairRow}
+            ${reappendedRow}
+            ${memoRow}
         </div>
     `;
 }
@@ -1406,9 +1551,14 @@ function formatTimestamp(timestamp) {
 }
 
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    // Escapes quotes as well, so the result is safe inside an attribute value.
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 let expandedHelp = new Set();
@@ -1519,7 +1669,7 @@ function renderBucketStats() {
         const tr = document.createElement('tr');
         tr.className = 'prefix-row';
         const settingsBtn = r.settings
-            ? '<button class="stats-btn" onclick="event.stopPropagation();toggleSettings(this,\'' + r.rowKey.replace(/'/g, "\\'") + '\')">Settings</button>'
+            ? '<button class="stats-btn" onclick="event.stopPropagation();toggleSettings(this,\'' + escapeHtml(r.rowKey.replace(/\\/g, '\\\\').replace(/'/g, "\\'")) + '\')">Settings</button>'
             : '';
         tr.innerHTML =
             '<td>' + escapeHtml(r.prefix) + '</td>' +
@@ -1765,10 +1915,13 @@ impl ApiHandler {
         let stats = if let Some(cache_manager) = cache_manager_guard.as_ref() {
             debug!("Cache manager is available, getting cache statistics");
             // Get cache statistics with updated sizes
-            let cache_stats = cache_manager.get_cache_size_stats().await.map_err(|e| {
-                error!("Failed to get cache size stats: {}", e);
-                e
-            })?;
+            // As a scrape: see `staged_fold::as_scrape`.
+            let cache_stats = crate::staged_fold::as_scrape(cache_manager.get_cache_size_stats())
+                .await
+                .map_err(|e| {
+                    error!("Failed to get cache size stats: {}", e);
+                    e
+                })?;
             // Always `Some` from `get_cache_size_stats`; see `cache::CacheSizes` for why
             // the figures are behind an Option at all.
             let cache_sizes = cache_stats.sizes.unwrap_or_default();
@@ -1779,7 +1932,7 @@ impl ApiHandler {
                 cache_stats.ram_cache_size
             );
 
-            let ram_stats = cache_manager.get_ram_cache_stats();
+            let ram_stats = cache_manager.ram_cache_stats().await;
             debug!("RAM cache stats available: {}", ram_stats.is_some());
 
             // Get metadata cache stats
@@ -1816,50 +1969,77 @@ impl ApiHandler {
             let disk_only_get_misses = cache_stats.get_misses;
 
             // Get uptime and PUT request count from metrics manager if available
-            let (uptime_seconds, put_total, page_cache, hedged_requests) = if let Some(
-                metrics_manager,
-            ) =
-                metrics_manager_guard.as_ref()
-            {
-                debug!("Metrics manager is available, getting uptime");
-                let fresh_metrics = metrics_manager.read().await.collect_metrics().await;
-                debug!(
-                    "Fresh metrics collected, uptime: {}",
-                    fresh_metrics.uptime_seconds
-                );
+            let (uptime_seconds, put_total, page_cache, hedged_requests, staged_tier) =
+                if let Some(metrics_manager) = metrics_manager_guard.as_ref() {
+                    debug!("Metrics manager is available, getting uptime");
+                    // `current_metrics`, not `collect_metrics`: the in-process figures are read
+                    // now and the shared-volume ones come from the background collector's latest
+                    // run, so a dashboard refresh never traverses the cache volume. Before that
+                    // run lands, the staged-tier rows show their UNREADABLE sentinels.
+                    let fresh_metrics = metrics_manager.read().await.current_metrics().await;
+                    debug!(
+                        "Fresh metrics collected, uptime: {}",
+                        fresh_metrics.uptime_seconds
+                    );
 
-                let put_total = fresh_metrics
-                    .signed_put
-                    .as_ref()
-                    .map(|sp| sp.cached_puts_total.saturating_add(sp.bypassed_puts_total))
-                    .unwrap_or(0);
+                    let put_total = fresh_metrics
+                        .signed_put
+                        .as_ref()
+                        .map(|sp| sp.cached_puts_total.saturating_add(sp.bypassed_puts_total))
+                        .unwrap_or(0);
 
-                // Use minimum of 1 second for uptime (0 is normal at startup)
-                (
-                    fresh_metrics.uptime_seconds.max(1),
-                    put_total,
-                    fresh_metrics.page_cache,
-                    fresh_metrics.hedged_requests,
-                )
-            } else {
-                warn!("Metrics manager not available in dashboard, this indicates a configuration issue");
-                // Fallback: return 0 to indicate the issue
-                (
-                    0,
-                    0,
-                    crate::metrics::PageCacheMetrics {
-                        widened_requests: 0,
-                        bytes_prefetched: 0,
-                        amplification_ratio: 1.0,
-                        page_hits: 0,
-                        skipped_signed_range: 0,
-                        fallbacks: 0,
-                        ram_page_promotions: 0,
-                        ram_page_promotion_skipped: 0,
-                    },
-                    crate::metrics::HedgingStats::default(),
-                )
-            };
+                    // § 16.6.7's staged-tier rows. Projected off the same collection the `/metrics`
+                    // scrape uses, so the dashboard and `/metrics` cannot disagree about the
+                    // occupancy or the completeness verdict.
+                    let wc = &fresh_metrics.write_cache;
+                    let staged_tier = StagedTierStats {
+                        summary: wc.staged_fold.summary(),
+                        staged_authority_epoch: wc.staged_authority_epoch,
+                        repair_rotation_reachable: wc
+                            .ledger_repair
+                            .ledger_repair_rotation_reachable,
+                        repair_projected_rotation_secs: wc
+                            .ledger_repair
+                            .ledger_repair_projected_rotation_secs,
+                        repair_rotation_complete: wc.ledger_repair.ledger_repair_rotation_complete,
+                        repair_shard_budget_capped_total: wc
+                            .ledger_repair
+                            .ledger_repair_shard_budget_capped_total,
+                        repair_ranges_reappended_total: wc
+                            .ledger_repair
+                            .ledger_repair_ranges_reappended_total,
+                    };
+
+                    // Use minimum of 1 second for uptime (0 is normal at startup)
+                    (
+                        fresh_metrics.uptime_seconds.max(1),
+                        put_total,
+                        fresh_metrics.page_cache,
+                        fresh_metrics.hedged_requests,
+                        Some(staged_tier),
+                    )
+                } else {
+                    warn!("Metrics manager not available in dashboard, this indicates a configuration issue");
+                    // Fallback: return 0 to indicate the issue
+                    (
+                        0,
+                        0,
+                        crate::metrics::PageCacheMetrics {
+                            widened_requests: 0,
+                            bytes_prefetched: 0,
+                            amplification_ratio: 1.0,
+                            page_hits: 0,
+                            skipped_signed_range: 0,
+                            fallbacks: 0,
+                            ram_page_promotions: 0,
+                            ram_page_promotion_skipped: 0,
+                        },
+                        crate::metrics::HedgingStats::default(),
+                        // Not `Default::default()`: an all-zero staged tier would render as a healthy
+                        // "0 ranges of budget, current". Absent means unknown, which is what it is.
+                        None,
+                    )
+                };
 
             // Overall request count: GETs + HEADs (cache hit/miss path) + PUTs
             let total_requests = cache_stats
@@ -1876,10 +2056,9 @@ impl ApiHandler {
             let max_cache_size = cache_stats.max_cache_size_limit;
 
             // Get write cache size and calculate max write cache size
-            // Write cache max is write_cache_percent of total cache (default 10%)
+            // Write cache max is the bound the proxy enforces: write_cache_percent of total cache
             let write_cache_size = cache_sizes.write_cache_size;
-            let write_cache_max_size =
-                (max_cache_size as f64 * cache_stats.max_write_cache_percent as f64 / 100.0) as u64;
+            let write_cache_max_size = cache_manager.get_staging_bound_bytes();
             let write_cache_utilization = if write_cache_max_size > 0 {
                 (write_cache_size as f64 / write_cache_max_size as f64 * 100.0) as f32
             } else {
@@ -1887,18 +2066,27 @@ impl ApiHandler {
             };
 
             // Get last consolidation timestamp and cached_objects count from consolidator if available
-            let (last_consolidation, disk_cached_objects) =
-                if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
-                    let size_state = consolidator.get_size_state().await;
-                    let last_consol = if size_state.last_consolidation > std::time::UNIX_EPOCH {
-                        Some(size_state.last_consolidation)
-                    } else {
-                        None
-                    };
-                    (last_consol, Some(size_state.cached_objects))
-                } else {
-                    (None, None)
-                };
+            let (last_consolidation, disk_cached_objects) = if let Some(consolidator) =
+                cache_manager.get_journal_consolidator().await
+            {
+                // `None` is an unreadable `size_state.json`, not an empty cache, so both
+                // figures are published as absent: the page renders a missing
+                // `cached_objects` as "N/A" and hides a missing `last_consolidation`.
+                // Pinned by `a_failed_size_state_read_renders_cached_objects_as_unavailable`.
+                match consolidator.get_size_state_for_scrape().await {
+                    Some(size_state) => {
+                        let last_consol = if size_state.last_consolidation > std::time::UNIX_EPOCH {
+                            Some(size_state.last_consolidation)
+                        } else {
+                            None
+                        };
+                        (last_consol, Some(size_state.cached_objects))
+                    }
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
 
             CacheStatsResponse {
                 timestamp: SystemTime::now(),
@@ -1938,7 +2126,9 @@ impl ApiHandler {
                     max_entries: metadata_max_entries as u64,
                     evictions: metadata_stats.evictions,
                     stale_refreshes: metadata_stats.stale_refreshes,
-                    stale_handle_errors: metadata_stats.stale_handle_errors,
+                    // The live `.meta` reader's count, not the metadata tier's: the tier's own
+                    // counter was never incremented in production and has been removed.
+                    stale_handle_errors: crate::disk_cache::metadata_read_stale_handles_total(),
                     head_hits: metadata_stats.head_hits,
                     head_misses: metadata_stats.head_misses,
                     head_disk_hits: metadata_stats.head_disk_hits,
@@ -1996,6 +2186,7 @@ impl ApiHandler {
                 last_consolidation,
                 page_cache,
                 hedged_requests,
+                staged_tier,
             }
         } else {
             // Return service unavailable if cache manager is not available
@@ -2038,26 +2229,23 @@ impl ApiHandler {
 
         let start_time = std::time::Instant::now();
 
-        // Get uptime from metrics manager if available with error handling
-        let uptime_seconds =
-            if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
-                match metrics_manager.read().await.get_cached_metrics().await {
-                    Some(cached_metrics) => cached_metrics.uptime_seconds,
-                    None => {
-                        debug!("No cached metrics available for system info, using system time");
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    }
-                }
-            } else {
-                debug!("Metrics manager not available for system info, using system time");
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            };
+        // Uptime and permits_held, from the metrics manager if available. Read through
+        // `current_metrics`, which assembles both live: the last full collection is now up to one
+        // `metrics.collection_interval` old, so reading them from that cache would show a stale
+        // uptime and a stale permit count. Neither touches the cache volume.
+        let live_metrics = match self.metrics_manager.read().await.as_ref() {
+            Some(metrics_manager) => Some(metrics_manager.read().await.current_metrics().await),
+            None => None,
+        };
+        let uptime_seconds = if let Some(live_metrics) = live_metrics.as_ref() {
+            live_metrics.uptime_seconds
+        } else {
+            debug!("Metrics manager not available for system info, using system time");
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        };
 
         // Get active/max concurrent requests directly from atomic counter (real-time)
         let active_requests_val = self
@@ -2070,18 +2258,13 @@ impl ApiHandler {
         let max_concurrent_val = *self.max_concurrent_requests.read().await as u64;
 
         // permits_held: request-concurrency permits held, distinct from the TCP
-        // connection count above. Sourced from the metrics manager's cached snapshot
-        // rather than re-deriving from the semaphore directly, since ApiHandler does
-        // not hold it independently. Requirement: TCA 5.1, 5.5, 5.6
-        let permits_held_val =
-            if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
-                match metrics_manager.read().await.get_cached_metrics().await {
-                    Some(cached_metrics) => cached_metrics.request_metrics.permits_held,
-                    None => 0,
-                }
-            } else {
-                0
-            };
+        // connection count above. Sourced from the metrics manager rather than
+        // re-deriving from the semaphore directly, since ApiHandler does not hold it
+        // independently. Requirement: TCA 5.1, 5.5, 5.6
+        let permits_held_val = live_metrics
+            .as_ref()
+            .map(|m| m.request_metrics.permits_held)
+            .unwrap_or(0);
 
         let system_info = SystemInfoResponse {
             timestamp: SystemTime::now(),
@@ -2116,7 +2299,7 @@ impl ApiHandler {
             })
     }
 
-    pub async fn get_logs(&self, params: LogQueryParams) -> Result<Response<String>> {
+    pub(crate) async fn get_logs(&self, params: LogQueryParams) -> Result<Response<String>> {
         debug!(
             "Dashboard API: logs requested with limit={:?}, level_filter={:?}",
             params.limit, params.level_filter
@@ -2173,7 +2356,7 @@ impl ApiHandler {
     }
 
     /// Return per-bucket cache hit/miss stats and resolved settings summary.
-    pub async fn get_bucket_stats(&self) -> Result<Response<String>> {
+    pub(crate) async fn get_bucket_stats(&self) -> Result<Response<String>> {
         debug!("Dashboard API: bucket stats requested");
 
         let cache_manager_guard = self.cache_manager.read().await;
@@ -2253,7 +2436,7 @@ impl ApiHandler {
     }
 
     /// Return per-bucket traffic stats for `/api/bucket-traffic`.
-    pub async fn get_bucket_traffic(&self) -> Result<Response<String>> {
+    pub(crate) async fn get_bucket_traffic(&self) -> Result<Response<String>> {
         debug!("Dashboard API: bucket traffic requested");
 
         let metrics_manager_guard = self.metrics_manager.read().await;
@@ -2313,7 +2496,7 @@ impl ApiHandler {
     }
 
     /// Return download bandwidth QoS metrics as JSON (`/api/bandwidth`).
-    pub async fn get_bandwidth_metrics(&self) -> Result<Response<String>> {
+    pub(crate) async fn get_bandwidth_metrics(&self) -> Result<Response<String>> {
         debug!("Dashboard API: bandwidth metrics requested");
         let snapshot = crate::bandwidth_limiter::global_limiter().snapshot();
         let body = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
@@ -2654,6 +2837,53 @@ pub struct CacheStatsResponse {
     /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
     #[serde(default)]
     pub hedged_requests: crate::metrics::HedgingStats,
+    /// The staged (write) tier's occupancy against its range budget, its authority age, and its
+    /// completeness verdict.
+    ///
+    /// `null` when the metrics manager is unavailable, which is the same condition under which
+    /// this response's `uptime_seconds` reads 0.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.7.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staged_tier: Option<StagedTierStats>,
+}
+
+/// § 16.6.7's staged-tier rows, as the dashboard consumes them.
+///
+/// # The budget denominator arrives as DATA
+///
+/// `summary.range_budget` is `staged_fold::STAGED_RANGE_BUDGET` read at runtime, and
+/// `summary.range_budget_percent` is derived from it. The front end formats
+/// `range_count / range_budget`, so the requested "write cached ranges over the budget" display
+/// renders whatever the constant currently says. Nothing in this file, in the HTML, or in the JS
+/// spells the number, and
+/// `staged_fold::tests::the_budget_denominator_is_data_and_never_a_literal` fails if anything
+/// starts to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedTierStats {
+    /// The occupancy, age and completeness rows.
+    #[serde(flatten)]
+    pub summary: crate::staged_fold::StagedTierSummary,
+    /// `0` while the incumbent event-sourced counter is the accounting authority, `1` once the
+    /// fold is. An operator comparing two proxies has to read this before comparing figures.
+    pub staged_authority_epoch: u64,
+    /// § 16.6.7's fourth row: whether the ledger-completeness repair rotation **can** complete at
+    /// this shard population.
+    ///
+    /// `Some(false)` is a **permanent** condition where every other signal here is transient — it
+    /// means the staged-authority epoch can never flip and the fleet stays on the event-sourced
+    /// counter indefinitely. `null` means the shard population could not be read.
+    pub repair_rotation_reachable: Option<bool>,
+    /// Projected seconds for one full repair rotation, against a 24-hour window. Carries the
+    /// magnitude the boolean above cannot.
+    pub repair_projected_rotation_secs: Option<u64>,
+    /// Whether the repair rotation currently holds, i.e. whether precondition 3b is satisfied.
+    pub repair_rotation_complete: bool,
+    /// Repair passes whose per-pass shard budget was clipped by the ceiling.
+    pub repair_shard_budget_capped_total: u64,
+    /// **Non-zero is a finding**: staged ranges found on disk with no ledger entry, each one a
+    /// range that had been excluded from the staged figure.
+    pub repair_ranges_reappended_total: u64,
 }
 
 /// Write cache statistics (MPUs in progress and PUT objects not yet read)
@@ -2678,6 +2908,10 @@ pub struct MetadataCacheStats {
     pub max_entries: u64,
     pub evictions: u64,
     pub stale_refreshes: u64,
+    /// Stale file handles observed on `.meta` reads, per-instance — the same figure as
+    /// `cache.metadata_read_stale_handles_total` on `/metrics`. Kept under its existing JSON
+    /// name so `/api/cache-stats` consumers are unaffected; it read a permanent `0` before
+    /// 3.0.0 and now counts. **Non-zero is a finding.**
     pub stale_handle_errors: u64,
     /// HEAD-request-specific counters (subset of hits/misses/disk_hits)
     pub head_hits: u64,
@@ -3141,6 +3375,28 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_html_escapes_quotes() {
+        let handler = StaticFileHandler::new();
+        let js = handler.get_script_js();
+        for needle in [
+            ".replace(/&/g, '&amp;')",
+            ".replace(/</g, '&lt;')",
+            ".replace(/>/g, '&gt;')",
+            ".replace(/\"/g, '&quot;')",
+            ".replace(/'/g, '&#39;')",
+        ] {
+            assert!(js.contains(needle), "escapeHtml must contain {needle}");
+        }
+        assert!(
+            !js.contains("${error.message}"),
+            "error text must be escaped before innerHTML"
+        );
+        assert!(
+            !js.contains("toggleSettings(this,\\'' + r.rowKey"),
+            "rowKey must be HTML-escaped inside the onclick attribute"
+        );
+    }
+    #[test]
     fn test_dashboard_html_escapes_log_level_and_target() {
         let handler = StaticFileHandler::new();
         let js = handler.get_script_js();
@@ -3168,6 +3424,521 @@ mod tests {
         assert!(
             !js.contains("${entry.target}") && !js.contains("${entry.target ||"),
             "entry.target must not appear unescaped in the template"
+        );
+    }
+
+    /// A `/metrics` scrape and a dashboard refresh never walk `mpus_in_progress/`: the
+    /// background collection walks once and both serve its figure, with its age. Counts walks
+    /// across N `current_metrics` calls (what `/metrics` serves) and N dashboard cache-stats and
+    /// system-info refreshes, each cache-stats call on a fresh handler so its 2 s response cache
+    /// cannot hide a walk.
+    #[tokio::test]
+    async fn scrapes_and_dashboard_refreshes_never_walk_mpus_in_progress() {
+        const N: u64 = 5;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new_with_shared_storage(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1_000_000,
+            crate::cache::CacheEvictionAlgorithm::TinyLFU,
+            1024,
+            false,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            4,
+            std::time::Duration::from_secs(5),
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("consolidator set by create_configured_disk_cache_manager")
+            .initialize()
+            .await
+            .unwrap();
+        let dir = cache_manager.get_cache_dir().to_path_buf();
+        for (upload, bytes) in [("case48-a-1", 1_000u64), ("case48-a-2", 2_000)] {
+            let upload = crate::signed_put_handler::mpu_upload_dir(&dir, upload);
+            std::fs::create_dir_all(&upload).unwrap();
+            std::fs::write(
+                upload.join("part1.json"),
+                format!(r#"{{"compressed_size":{bytes}}}"#),
+            )
+            .unwrap();
+        }
+        let mut manager = crate::metrics::MetricsManager::new();
+        manager.set_cache_manager(cache_manager.clone());
+        let manager = Arc::new(RwLock::new(manager));
+
+        let walks = || crate::signed_put_handler::in_progress_walks_for_tests(&dir);
+        let before = walks();
+        let collected = manager.read().await.collect_metrics().await;
+        let by_collection = walks() - before;
+        for _ in 0..N {
+            let _ = manager.read().await.current_metrics().await;
+        }
+        let log_dir = tempfile::TempDir::new().unwrap();
+        for _ in 0..N {
+            let handler = ApiHandler::new(
+                Arc::new(LogReader::new(
+                    log_dir.path().to_path_buf(),
+                    "test-host".to_string(),
+                )),
+                Arc::new(DashboardConfig::default()),
+            );
+            handler.set_cache_manager(cache_manager.clone()).await;
+            handler.set_metrics_manager(manager.clone()).await;
+            handler
+                .get_cache_stats()
+                .await
+                .expect("cache stats respond");
+            handler
+                .get_system_info()
+                .await
+                .expect("system info responds");
+        }
+        let by_requests = walks() - before - by_collection;
+        let served = manager.read().await.current_metrics().await;
+        let served = served.cache.as_ref().expect("cache section");
+        assert_eq!(
+            (
+                by_collection,
+                by_requests,
+                collected
+                    .cache
+                    .as_ref()
+                    .and_then(|c| c.in_progress_part_bytes),
+                served.in_progress_part_bytes,
+                served.in_progress_part_bytes_age_secs.is_some(),
+            ),
+            (1, 0, Some(3_000), Some(3_000), true),
+            "(walks by one collection, walks by {N} scrapes plus {N} dashboard cache-stats and \
+             system-info refreshes, P collected, P served, age served): requests must serve the \
+             collection's figure and never walk"
+        );
+    }
+
+    /// The fold-epoch variant of the test above: with the staged authority latched, a `/metrics`
+    /// scrape, a dashboard cache-stats or system-info refresh, and a `/health` check start no walk
+    /// of `mpus_in_progress/`, neither on the request nor in the authority refresh a scrape
+    /// starts, both with the authority memo expired and with it absent.
+    ///
+    /// Fixture preconditions, each asserted: the epoch is the fold's (otherwise the scrape reads
+    /// the incumbent and never reaches the memo, a vacuous pass), a shard checkpoint exists
+    /// (otherwise the derivation returns before its walk), and the collection's figure carries
+    /// the fold's `P`. Each phase waits for the refresh a scrape may start to install before
+    /// counting, so a background walk is counted rather than outrun.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fold_epoch_scrapes_dashboard_and_health_never_walk_mpus_in_progress() {
+        const N: u64 = 5;
+        const F_BYTES: u64 = 77;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new_with_shared_storage(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1_000_000,
+            crate::cache::CacheEvictionAlgorithm::TinyLFU,
+            1024,
+            false,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            4,
+            std::time::Duration::from_secs(5),
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("consolidator set by create_configured_disk_cache_manager")
+            .initialize()
+            .await
+            .unwrap();
+        let dir = cache_manager.get_cache_dir().to_path_buf();
+        for (upload, bytes) in [("case49-a-1", 1_000u64), ("case49-a-2", 2_000)] {
+            let upload = crate::signed_put_handler::mpu_upload_dir(&dir, upload);
+            std::fs::create_dir_all(&upload).unwrap();
+            std::fs::write(
+                upload.join("part1.json"),
+                format!(r#"{{"compressed_size":{bytes}}}"#),
+            )
+            .unwrap();
+        }
+        crate::staged_fold::seed_shard_figure_for_tests(&dir, "test-bucket", "3f", F_BYTES, 4);
+        assert!(
+            crate::staged_authority::activate(&dir, "host:test").unwrap(),
+            "fixture: activation must flip the epoch"
+        );
+        assert_eq!(
+            crate::staged_authority::read_epoch(&dir),
+            crate::staged_authority::EPOCH_FOLD,
+            "fixture: the request paths reach the authority memo only at epoch 1"
+        );
+        let mut manager = crate::metrics::MetricsManager::new();
+        manager.set_cache_manager(cache_manager.clone());
+        let manager = Arc::new(RwLock::new(manager));
+        let mut health = crate::health::HealthManager::new();
+        health.set_cache_manager(cache_manager.clone());
+
+        let walks = || crate::signed_put_handler::in_progress_walks_for_tests(&dir);
+        let collected = manager.read().await.collect_metrics().await;
+        let fold_figure = crate::staged_fold::authority_figure_for_tests(&dir).await;
+        assert_eq!(
+            (
+                collected.cache.as_ref().map(|c| c.write_cache_size),
+                fold_figure.map(|f| (f.resident_staged_bytes, f.in_progress_part_bytes)),
+            ),
+            (Some(F_BYTES + 3_000), Some((F_BYTES, 3_000))),
+            "fixture: (write_cache_size collected, the fold's (F, P)): the collection must publish \
+             the fold's figure, or the requests below never reach the fold-epoch path"
+        );
+
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let mut by_requests = Vec::new();
+        for (phase, prepare) in [("expired", true), ("absent", false)] {
+            if prepare {
+                assert!(
+                    crate::staged_fold::age_authority_snapshot_for_tests(&dir, 3600),
+                    "fixture: there must be a memo to expire"
+                );
+            } else {
+                crate::staged_fold::invalidate_authority_snapshot_for_tests(&dir);
+            }
+            let before = walks();
+            for _ in 0..N {
+                let _ = manager.read().await.current_metrics().await;
+                let handler = ApiHandler::new(
+                    Arc::new(LogReader::new(
+                        log_dir.path().to_path_buf(),
+                        "test-host".to_string(),
+                    )),
+                    Arc::new(DashboardConfig::default()),
+                );
+                handler.set_cache_manager(cache_manager.clone()).await;
+                handler.set_metrics_manager(manager.clone()).await;
+                handler
+                    .get_cache_stats()
+                    .await
+                    .expect("cache stats respond");
+                handler
+                    .get_system_info()
+                    .await
+                    .expect("system info responds");
+                let _ = health.check_health().await;
+            }
+            // A scrape-started refresh runs in the background: wait (bounded) for its install.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while crate::staged_fold::authority_snapshot_age_secs(&dir).is_none()
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            by_requests.push((phase, walks() - before));
+        }
+        let served = manager.read().await.current_metrics().await;
+        assert_eq!(
+            (
+                by_requests,
+                served.cache.as_ref().map(|c| c.write_cache_size)
+            ),
+            (vec![("expired", 0), ("absent", 0)], Some(F_BYTES + 3_000)),
+            "(walks started by {N} scrapes, {N} dashboard cache-stats and system-info refreshes \
+             and {N} health checks, per memo state; write_cache_size served): in the fold epoch \
+             no request may start a walk of mpus_in_progress/, and the scrape serves the fold's \
+             figure"
+        );
+    }
+
+    async fn cache_stats_json(cache_manager: &Arc<CacheManager>) -> serde_json::Value {
+        // A fresh handler per call: `get_cache_stats` caches its response for two seconds.
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let handler = ApiHandler::new(
+            Arc::new(LogReader::new(
+                log_dir.path().to_path_buf(),
+                "test-host".to_string(),
+            )),
+            Arc::new(DashboardConfig::default()),
+        );
+        handler.set_cache_manager(cache_manager.clone()).await;
+        let response = handler
+            .get_cache_stats()
+            .await
+            .expect("cache stats respond");
+        serde_json::from_str(response.body()).expect("cache stats are JSON")
+    }
+
+    /// A size-state read that FAILS must render as unavailable, not as an empty cache.
+    ///
+    /// "Failed" is `JournalConsolidator::get_size_state` returning `None`: `size_state.json`
+    /// exists but cannot be read or parsed. The dashboard already renders an absent
+    /// `disk_cache.cached_objects` as "N/A" and hides an absent `last_consolidation`, so the
+    /// handler publishes neither.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the handler taking `get_size_state().await.unwrap_or_default()` again, the failed
+    /// read publishes `cached_objects: 0` and the second assertion fails.
+    #[tokio::test]
+    async fn a_failed_size_state_read_renders_cached_objects_as_unavailable() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new_with_shared_storage(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1_000_000,
+            crate::cache::CacheEvictionAlgorithm::TinyLFU,
+            1024,
+            false,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            4,
+            std::time::Duration::from_secs(5),
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        let consolidator = cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("consolidator set by create_configured_disk_cache_manager");
+        consolidator.initialize().await.unwrap();
+        consolidator
+            .update_size_from_validation(4096, None, Some(7))
+            .await;
+
+        let readable = cache_stats_json(&cache_manager).await;
+        assert_eq!(
+            readable["disk_cache"]["cached_objects"].as_u64(),
+            Some(7),
+            "FIXTURE: a readable size state must publish its object count, or the absence \
+             below proves nothing about the failed read"
+        );
+
+        let size_state = temp_dir
+            .path()
+            .join("size_tracking")
+            .join("size_state.json");
+        std::fs::write(&size_state, b"{ not json").unwrap();
+        assert!(
+            consolidator.get_size_state().await.is_none(),
+            "FIXTURE: the corrupted size state must be an unreadable read"
+        );
+
+        let failed = cache_stats_json(&cache_manager).await;
+        assert!(
+            failed["disk_cache"].get("cached_objects").is_none(),
+            "a failed size-state read must publish no cached_objects, which the dashboard \
+             renders as N/A, not {:?}",
+            failed["disk_cache"].get("cached_objects")
+        );
+        assert!(
+            failed.get("last_consolidation").is_none(),
+            "a failed size-state read must publish no last_consolidation"
+        );
+    }
+
+    /// `/api/cache-stats` answers from a response cached for `stats_cache_duration` (2 s),
+    /// so a counter read twice inside that window cannot move, however many hits landed in
+    /// between. The second response says so with `X-Cache: HIT`.
+    ///
+    /// # Why this is pinned
+    ///
+    /// The fleet suite reads `overall.get_hits` on all three proxies, runs a warm
+    /// 64 MiB re-read (8 chunks), and reads again. Once a dashboard scrape stopped
+    /// re-deriving the staged-authority figure inline (`staged_fold::as_scrape`), a
+    /// before-read, the re-read and the after-read fit inside 2 s, and that test read the same
+    /// cached figure twice: `83->83` on four of four runs. A reader that compares two
+    /// dashboard figures must be at least `stats_cache_duration` apart, or must check the
+    /// `X-Cache` header. This test shows the mechanism in-process: the flat reading within
+    /// the window and the moved reading after it.
+    #[tokio::test]
+    async fn cache_stats_counters_are_flat_inside_the_two_second_response_cache() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new_with_shared_storage(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1_000_000,
+            crate::cache::CacheEvictionAlgorithm::TinyLFU,
+            1024,
+            false,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            4,
+            std::time::Duration::from_secs(5),
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        let consolidator = cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("consolidator set by create_configured_disk_cache_manager");
+        consolidator.initialize().await.unwrap();
+
+        // ONE handler for all three reads, as a proxy's dashboard server holds one.
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let handler = ApiHandler::new(
+            Arc::new(LogReader::new(
+                log_dir.path().to_path_buf(),
+                "test-host".to_string(),
+            )),
+            Arc::new(DashboardConfig::default()),
+        );
+        handler.set_cache_manager(cache_manager.clone()).await;
+        assert_eq!(
+            handler.stats_cache_duration,
+            std::time::Duration::from_secs(2),
+            "fixture: the window this test and T47f reason about"
+        );
+
+        async fn read(handler: &ApiHandler) -> (u64, Option<String>) {
+            let response = handler
+                .get_cache_stats()
+                .await
+                .expect("cache stats respond");
+            let x_cache = response
+                .headers()
+                .get("x-cache")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let json: serde_json::Value =
+                serde_json::from_str(response.body()).expect("cache stats are JSON");
+            let hits = json["overall"]["get_hits"]
+                .as_u64()
+                .expect("overall.get_hits is published");
+            (hits, x_cache)
+        }
+
+        let (before, _) = read(&handler).await;
+        // Eight GET hits, the chunk count of the fleet test's 64 MiB / 8 MiB re-read.
+        for _ in 0..8 {
+            cache_manager.update_statistics(true, 8 * 1024 * 1024, false);
+        }
+        let (inside, inside_x_cache) = read(&handler).await;
+        assert_eq!(
+            inside, before,
+            "a read inside the 2 s window serves the cached response, so get_hits cannot move"
+        );
+        assert_eq!(
+            inside_x_cache.as_deref(),
+            Some("HIT"),
+            "the cached response must say it is cached"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        let (after, after_x_cache) = read(&handler).await;
+        assert_eq!(
+            after,
+            before + 8,
+            "a read after the window recomputes and shows every hit"
+        );
+        assert_ne!(after_x_cache.as_deref(), Some("HIT"));
+    }
+
+    /// The write-cache maximum shown is the bound the proxy enforces (30% here), not a fixed 10%.
+    #[tokio::test]
+    async fn dashboard_write_cache_max_follows_write_cache_percent() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new_with_shared_storage(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1_000_000,
+            crate::cache::CacheEvictionAlgorithm::TinyLFU,
+            1024,
+            false,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            30.0,
+            true,
+            std::time::Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            4,
+            std::time::Duration::from_secs(5),
+        ));
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let handler = ApiHandler::new(
+            Arc::new(LogReader::new(
+                log_dir.path().to_path_buf(),
+                "test-host".to_string(),
+            )),
+            Arc::new(DashboardConfig::default()),
+        );
+        handler.set_cache_manager(cache_manager).await;
+        let response = handler
+            .get_cache_stats()
+            .await
+            .expect("cache stats respond");
+        let json: serde_json::Value = serde_json::from_str(response.body()).unwrap();
+        assert_eq!(
+            json["write_cache"]["max_size_bytes"].as_u64(),
+            Some(300_000),
+            "write_cache_percent 30 of max_cache_size 1000000"
         );
     }
 }

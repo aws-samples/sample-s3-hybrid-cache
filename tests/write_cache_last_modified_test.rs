@@ -1,4 +1,4 @@
-//! End-to-end coverage for `.kiro/specs/write-cache-last-modified/`.
+//! End-to-end coverage for the write cache last modified feature.
 //!
 //! Spec: Requirements R1-R9, R11. GitHub issue #19, reported by James Connor
 //! (@megakid), who also implemented a working fix on a 2.8.0 base
@@ -35,6 +35,7 @@ use common::expired_fixture::{
     body_of, conditional_requests, not_modified_with_last_modified, test_config, Fixture, SeedSpec,
 };
 use common::{StubResponse, StubS3Client};
+use s3_proxy::origin_identity::OriginVerdict;
 
 const OBJECT_SIZE: u64 = 4096;
 
@@ -574,5 +575,112 @@ async fn client_supplied_conditional_still_backfills_on_304() {
         "R3.1/R8.1: a 304 produced by the CLIENT's own precondition must still \
          backfill — the backfill is driven by the response, not by who supplied \
          the validator"
+    );
+}
+
+/// R5.1/R5.2 on the part-scoped (`?partNumber=N`) read path.
+///
+/// # Why this needs its own test rather than inheriting the GET coverage above
+///
+/// Every other test in this file exercises a path that reaches
+/// `check_object_expiration`, where this spec's trigger predicate lives.
+/// `CacheManager::lookup_part` **never calls it** — its only freshness input is
+/// `find_cached_ranges(..., RangeLookupPurpose::FreshServe)`, so a predicate change
+/// there provably does nothing here. That makes this a genuinely separate site, not a
+/// second route to the same guard, and it is reachable by a real client: the Rust
+/// transfer manager's DEFAULT download path issues `GET ?partNumber=1` to learn the
+/// stored part size when checksum validation is on, and the Java/PHP transfer managers
+/// expose part-based multipart download directly.
+///
+/// # Three-way, so it cannot pass for the wrong reason
+///
+/// A single "returns None" assertion would also pass if the guard were unconditional,
+/// or if the fixture simply had no cached part to find. The controls separate those:
+///
+/// - **subject** — write-cached, no `Last-Modified` → MISS, so the caller forwards.
+/// - **control A** — write-cached, `Last-Modified` PRESENT → HIT. Proves the fixture
+///   registers a findable part and that the guard is not firing on every write-cached
+///   entry.
+/// - **control B** — READ-cached, no `Last-Modified` → HIT. Pins the `is_write_cached`
+///   conjunct. Without it the guard would fire here too, which
+///   `read_cached_entry_with_no_last_modified_is_not_forced_to_revalidate` forbids for
+///   the GET path and which would silently stop serving legitimately-empty entries
+///   written by an older release.
+///
+/// Spec: write-cache-last-modified. Requirements: 1.2, 1.4, 5.1, 5.2
+#[tokio::test]
+async fn part_scoped_read_of_write_cached_entry_with_no_last_modified_reports_a_miss() {
+    let (start, end) = (0u64, 1023u64);
+
+    // Registers part 1 over the cached extent so the ONLY thing between the lookup and a
+    // serve is the guard under test — the same technique
+    // `part_scoped_lookup_remains_fresh_only_for_expired_entries` uses for stored expiry.
+    async fn lookup_part_1(fixture: &Fixture, cache_key: &str, spec: &SeedSpec) -> bool {
+        fixture.seed(cache_key, spec);
+        let meta_path = fixture.meta_path(cache_key);
+        let mut metadata = fixture.read_meta(cache_key).expect(".meta");
+        metadata.object_metadata.parts_count = Some(1);
+        metadata.object_metadata.part_ranges.insert(1, (0, 1023));
+        std::fs::write(
+            &meta_path,
+            serde_json::to_string_pretty(&metadata).expect("serialize"),
+        )
+        .expect("write .meta");
+        fixture.invalidate_metadata_cache(cache_key).await;
+
+        fixture
+            .cache_manager
+            // `Matches` — this test's subject is the write-cache `Last-Modified` guard, so it
+            // must reach that guard rather than being declined by the origin one.
+            .lookup_part(cache_key, 1, OriginVerdict::Matches)
+            .await
+            .expect("lookup_part must not error")
+            .is_some()
+    }
+
+    let fixture = Fixture::new(test_config(OBJECT_SIZE)).await;
+
+    // Subject: write-cached, no Last-Modified.
+    let subject =
+        SeedSpec::write_cached_no_last_modified(vec![(start, end)], OBJECT_SIZE, "\"part-no-lm\"");
+    assert!(
+        !lookup_part_1(&fixture, "bucket/part-write-cached-no-lm.bin", &subject).await,
+        "R5.1/R5.2: a part-scoped read of a write-cached entry with no effective \
+         Last-Modified must report a MISS so the caller forwards to S3 and the entry \
+         re-caches clean. Serving it would return 206 with no Last-Modified — the \
+         issue-19 symptom — and this path never reaches check_object_expiration, so \
+         nothing else on it would catch that."
+    );
+
+    // Control A: write-cached, Last-Modified present.
+    let mut with_lm = SeedSpec::write_cached_no_last_modified(
+        vec![(start, end)],
+        OBJECT_SIZE,
+        "\"part-with-lm\"",
+    );
+    with_lm.last_modified = "Wed, 01 Jan 2025 00:00:00 GMT".to_string();
+    assert!(
+        lookup_part_1(&fixture, "bucket/part-write-cached-with-lm.bin", &with_lm).await,
+        "CONTROL A: a write-cached entry that DOES have a Last-Modified must still be \
+         served. If this fails the guard is unconditional, or the fixture never \
+         registered a findable part — either way the subject assertion above proves \
+         nothing."
+    );
+
+    // Control B: read-cached, no Last-Modified. Pins the is_write_cached conjunct.
+    let mut read_cached = SeedSpec::write_cached_no_last_modified(
+        vec![(start, end)],
+        OBJECT_SIZE,
+        "\"part-read-cached\"",
+    );
+    read_cached.is_write_cached = Some(false);
+    assert!(
+        lookup_part_1(&fixture, "bucket/part-read-cached-no-lm.bin", &read_cached).await,
+        "CONTROL B: a READ-cached entry with an empty Last-Modified must still be \
+         served — the guard is gated on is_write_cached, matching \
+         check_object_expiration. Dropping that conjunct would stop serving \
+         legitimately-empty entries written by an older release, which \
+         read_cached_entry_with_no_last_modified_is_not_forced_to_revalidate forbids \
+         on the GET path."
     );
 }

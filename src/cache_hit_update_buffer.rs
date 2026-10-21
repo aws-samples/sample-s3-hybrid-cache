@@ -8,6 +8,8 @@
 //! - Periodic flush every 5 seconds (configurable)
 //! - Per-instance journal files (no cross-instance contention on shared storage)
 //! - Batched writes reduce I/O overhead
+//! - Repeated updates to one stored range inside a flush window coalesce into one journal
+//!   line, so the journal load scales with distinct ranges hit, not with the hit rate
 //!
 //! Structure:
 //! ```text
@@ -22,6 +24,7 @@ use crate::cache_types::RangeSpec;
 use crate::compression::CompressionAlgorithm;
 use crate::error::{ProxyError, Result};
 use crate::journal_manager::{JournalEntry, JournalOperation};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,8 +35,65 @@ use tracing::{debug, error};
 /// Default flush interval for RAM buffer (5 seconds)
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 5;
 
-/// Maximum entries in RAM buffer before forcing a flush
+/// Maximum distinct buffered entries (one per cache key, stored range and update kind; see
+/// [`CoalesceKey`]) before an inline flush. This, not the hit rate, bounds the buffer's memory:
+/// a hit on an entry already buffered folds into it and adds nothing.
 const MAX_BUFFER_ENTRIES: usize = 10000;
+
+/// Times a flush try-locks the journal's `.journal.lock` before writing a fresh journal.
+const FLUSH_LOCK_ATTEMPTS: usize = 5;
+
+/// Delay between a flush's lock attempts.
+const FLUSH_LOCK_RETRY: Duration = Duration::from_millis(10);
+
+/// Red-side lever: restore the earlier unlocked `O_APPEND` flush.
+#[cfg(test)]
+const UNLOCKED_FLUSH_LEVER: bool = false;
+
+/// Red-side lever: restore one buffered entry, so one journal line, per recorded update.
+#[cfg(test)]
+const NO_COALESCE_LEVER: bool = false;
+
+/// The earlier flush append, kept only so the lever can show the cleanup race going red.
+#[cfg(test)]
+async fn unlocked_append_for_red_side(
+    journal_path: &std::path::Path,
+    content: &str,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(journal_path)
+        .await?;
+    file.write_all(content.as_bytes()).await?;
+    file.sync_data().await
+}
+
+/// Write one flush's lines to `journal_path` (`{instance_id}.journal`) under its lock.
+async fn append_flush_lines(
+    journal_path: &std::path::Path,
+    instance_id: &str,
+    content: &str,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if UNLOCKED_FLUSH_LEVER {
+        return unlocked_append_for_red_side(journal_path, content).await;
+    }
+    let dir = journal_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("journal path has no parent"))?;
+    crate::journal_manager::append_lines_locked_or_fresh(
+        dir,
+        instance_id,
+        content,
+        FLUSH_LOCK_ATTEMPTS,
+        FLUSH_LOCK_RETRY,
+        true,
+    )
+    .await
+    .map(|_| ())
+}
 
 /// Type of cache-hit update
 #[derive(Debug, Clone, PartialEq)]
@@ -65,26 +125,135 @@ pub struct BufferedCacheHitUpdate {
     pub timestamp: SystemTime,
 }
 
+/// What one flush window folds together: updates of one kind to one stored range of one key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CoalesceKey {
+    cache_key: String,
+    range_start: u64,
+    range_end: u64,
+    ttl_refresh: bool,
+}
+
+/// A buffered entry and the number of recorded updates folded into it.
+#[derive(Debug)]
+struct PendingEntry {
+    update: BufferedCacheHitUpdate,
+    updates: u64,
+}
+
+/// One flush window's entries in first-recorded order, coalesced by [`CoalesceKey`].
+#[derive(Debug, Default)]
+struct PendingBuffer {
+    entries: Vec<PendingEntry>,
+    index: HashMap<CoalesceKey, usize>,
+}
+
+impl PendingBuffer {
+    /// Distinct entries buffered, which is the journal lines the next flush writes.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn take(&mut self) -> Vec<PendingEntry> {
+        self.index.clear();
+        std::mem::take(&mut self.entries)
+    }
+
+    /// Folds `entry`, standing for `updates` recorded updates, into the window.
+    ///
+    /// `AccessUpdate` sums the increments and keeps the latest timestamp; `TtlRefresh` keeps
+    /// the latest refresh. The consolidator applies a key's entries in timestamp order, its
+    /// `AccessUpdate` arm adds `access_increment` to the matching range's `access_count` and
+    /// sets `last_accessed` to the entry's timestamp, and its `TtlRefresh` arm sets
+    /// `expires_at` from consolidation time plus `new_ttl_secs` and `last_accessed` to the
+    /// entry's timestamp. So one folded entry leaves the `.meta` as the sequence would have.
+    ///
+    /// One case differs: hits recorded before an `Update` that replaces the range, or before the
+    /// `Add` of a range not yet in `.meta`, are credited after it in the same window, so
+    /// `access_count` can read slightly high and eviction keeps the range a little longer. This
+    /// is accepted.
+    fn merge(&mut self, entry: BufferedCacheHitUpdate, updates: u64) {
+        #[cfg(test)]
+        if NO_COALESCE_LEVER {
+            self.entries.push(PendingEntry {
+                update: entry,
+                updates,
+            });
+            return;
+        }
+        let key = CoalesceKey {
+            cache_key: entry.cache_key.clone(),
+            range_start: entry.range_start,
+            range_end: entry.range_end,
+            ttl_refresh: matches!(entry.update_type, CacheHitUpdateType::TtlRefresh { .. }),
+        };
+        let Some(&i) = self.index.get(&key) else {
+            self.index.insert(key, self.entries.len());
+            self.entries.push(PendingEntry {
+                update: entry,
+                updates,
+            });
+            return;
+        };
+        let pending = &mut self.entries[i];
+        pending.updates = pending.updates.saturating_add(updates);
+        let newer = entry.timestamp >= pending.update.timestamp;
+        match entry.update_type {
+            CacheHitUpdateType::AccessUpdate { increment: add } => {
+                if let CacheHitUpdateType::AccessUpdate { increment } =
+                    &mut pending.update.update_type
+                {
+                    *increment = increment.saturating_add(add);
+                }
+            }
+            CacheHitUpdateType::TtlRefresh { .. } => {
+                if newer {
+                    pending.update.update_type = entry.update_type;
+                }
+            }
+        }
+        if newer {
+            pending.update.timestamp = entry.timestamp;
+        }
+    }
+}
+
 /// Result of a flush operation
 #[derive(Debug, Default)]
 pub struct FlushResult {
-    /// Number of entries flushed to journal
+    /// Recorded updates this flush wrote to the journal. A coalesced line counts every update
+    /// folded into it, so this compares directly with `updates_recorded`.
     pub entries_flushed: u64,
+    /// Journal lines this flush appended: one per coalesced entry.
+    pub lines_written: u64,
     /// Duration of the flush operation
     pub duration_ms: u64,
     /// Number of errors encountered
     pub errors: u64,
 }
 
-/// Statistics about the cache hit update buffer
+/// Statistics about the cache hit update buffer.
+///
+/// Published on `/metrics` as the `cache_hit_buffer` section; see
+/// [`crate::metrics::CacheHitBufferMetrics`] for the wire names and
+/// `docs/METRICS_REFERENCE.md` for what an operator does with each figure.
 #[derive(Debug, Clone)]
 pub struct CacheHitUpdateBufferStats {
     /// Total updates recorded since creation
     pub updates_recorded: u64,
-    /// Total entries flushed to journal
+    /// Total recorded updates written to the journal (a coalesced line counts every update
+    /// folded into it)
     pub entries_flushed: u64,
-    /// Current buffer size
+    /// Distinct entries currently buffered, each one journal line at the next flush
     pub buffer_size: usize,
+    /// Total entries this instance FAILED to flush since creation, summed over every
+    /// [`CacheHitUpdateBuffer::flush`].
+    ///
+    /// Retained rather than returned-and-discarded: [`FlushResult::errors`] is computed per
+    /// flush and its only consumer was a `debug!` line, so a proxy silently losing every TTL
+    /// refresh and access update — the figures eviction ranks candidates by — published
+    /// nothing an operator could scrape or alert on.
+    pub flush_errors: u64,
 }
 
 /// RAM buffer for cache-hit metadata updates with periodic flush to journal
@@ -99,8 +268,8 @@ pub struct CacheHitUpdateBuffer {
     cache_dir: PathBuf,
     /// Instance ID for this proxy instance
     instance_id: String,
-    /// RAM buffer for updates
-    buffer: Arc<Mutex<Vec<BufferedCacheHitUpdate>>>,
+    /// RAM buffer for updates, coalesced per flush window
+    buffer: Arc<Mutex<PendingBuffer>>,
     /// Last flush time
     last_flush: Arc<RwLock<Instant>>,
     /// Flush interval
@@ -113,6 +282,9 @@ pub struct CacheHitUpdateBuffer {
     updates_recorded: AtomicU64,
     /// Counter for entries flushed
     entries_flushed: AtomicU64,
+    /// Cumulative count of entries a flush failed to write. See
+    /// [`CacheHitUpdateBufferStats::flush_errors`].
+    flush_errors: AtomicU64,
 }
 
 impl CacheHitUpdateBuffer {
@@ -136,13 +308,14 @@ impl CacheHitUpdateBuffer {
         Self {
             cache_dir,
             instance_id,
-            buffer: Arc::new(Mutex::new(Vec::with_capacity(1000))),
+            buffer: Arc::new(Mutex::new(PendingBuffer::default())),
             last_flush: Arc::new(RwLock::new(Instant::now())),
             flush_interval,
             max_buffer_size,
             flush_in_progress: AtomicBool::new(false),
             updates_recorded: AtomicU64::new(0),
             entries_flushed: AtomicU64::new(0),
+            flush_errors: AtomicU64::new(0),
         }
     }
 
@@ -193,7 +366,7 @@ impl CacheHitUpdateBuffer {
     /// Add an entry to the buffer
     async fn add_to_buffer(&self, entry: BufferedCacheHitUpdate) -> Result<()> {
         let mut buffer = self.buffer.lock().await;
-        buffer.push(entry);
+        buffer.merge(entry, 1);
         self.updates_recorded.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -237,12 +410,13 @@ impl CacheHitUpdateBuffer {
 
         let start = Instant::now();
         let mut entries_flushed = 0u64;
+        let mut lines_written = 0u64;
         let mut errors = 0u64;
 
         // Take all entries from the buffer
-        let entries: Vec<BufferedCacheHitUpdate> = {
+        let entries: Vec<PendingEntry> = {
             let mut buffer = self.buffer.lock().await;
-            std::mem::take(&mut *buffer)
+            buffer.take()
         };
 
         if entries.is_empty() {
@@ -263,10 +437,12 @@ impl CacheHitUpdateBuffer {
                     "Failed to create journal directory: path={:?}, error={}",
                     parent, e
                 );
-                // Put entries back in buffer
+                // Put entries back in buffer, folding into any recorded since the take
                 {
                     let mut buffer = self.buffer.lock().await;
-                    buffer.extend(entries);
+                    for pending in entries {
+                        buffer.merge(pending.update, pending.updates);
+                    }
                 }
                 self.flush_in_progress.store(false, Ordering::SeqCst);
                 return Err(ProxyError::CacheError(format!(
@@ -278,20 +454,22 @@ impl CacheHitUpdateBuffer {
 
         // Convert buffered entries to journal entries and build content
         let mut content = String::new();
-        for entry in &entries {
+        for pending in &entries {
+            let entry = &pending.update;
             match self.to_journal_entry(entry) {
                 Ok(journal_entry) => match serde_json::to_string(&journal_entry) {
                     Ok(json) => {
                         content.push_str(&json);
                         content.push('\n');
-                        entries_flushed += 1;
+                        entries_flushed += pending.updates;
+                        lines_written += 1;
                     }
                     Err(e) => {
                         error!(
                             "Failed to serialize journal entry: cache_key={}, error={}",
                             entry.cache_key, e
                         );
-                        errors += 1;
+                        errors += pending.updates;
                     }
                 },
                 Err(e) => {
@@ -299,77 +477,48 @@ impl CacheHitUpdateBuffer {
                         "Failed to create journal entry: cache_key={}, error={}",
                         entry.cache_key, e
                     );
-                    errors += 1;
+                    errors += pending.updates;
                 }
             }
         }
 
-        // Append to journal file
+        // Append to the journal under its `.journal.lock`, the lock consolidator cleanup
+        // holds across its read-then-rename. Unlocked, a flush landing between cleanup's
+        // read and its rename went into the inode the rename discarded.
+        //
+        // The lock is try-locked FLUSH_LOCK_ATTEMPTS times, FLUSH_LOCK_RETRY apart, then the
+        // lines go to a fresh `{instance}:{nanos}.journal` (see
+        // `journal_manager::append_lines_locked_or_fresh`). A JournalManager append holds the
+        // lock for one short write, so the retry nearly always reaches the primary journal
+        // and avoids a fresh file per contended flush; a cleanup can hold it for a whole
+        // journal rewrite, and waiting that out would stall the inline flush below on a
+        // request thread. The wait is bounded at about 40 ms and loses nothing either way.
+        //
+        // fdatasync after every flush for shared-storage durability and read-after-write
+        // visibility (fixes a CI flake on overlay2 storage drivers that can return a stale
+        // page-cache read immediately after an async append with no fsync between write and
+        // read). flush() is a batched background task on a 5 s interval (see main.rs), so a
+        // million cache hits in 5 s collapse to one write + one fdatasync; the only inline
+        // flush (buffer_len >= 10 000 between ticks) absorbs one sync per 10 000 entries.
+        // On EFS/NFS close() already forces a COMMIT per flush. Do NOT reduce the flush
+        // interval below 1 s or the buffer cap below 1 000 without revisiting this cost.
+        // A sync failure is logged, not counted: the bytes are readable.
         if !content.is_empty() {
-            use tokio::io::AsyncWriteExt;
-
-            match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&journal_path)
-                .await
-            {
-                Ok(mut file) => {
-                    if let Err(e) = file.write_all(content.as_bytes()).await {
-                        error!(
-                            "Failed to write to journal file: path={:?}, error={}",
-                            journal_path, e
-                        );
-                        errors += entries_flushed;
-                        entries_flushed = 0;
-                    } else {
-                        // fdatasync after every flush for shared-storage durability and
-                        // read-after-write visibility (fixes a CI flake on overlay2 storage
-                        // drivers that can return a stale page-cache read immediately after
-                        // an async append with no fsync between write and read).
-                        //
-                        // Cost analysis: flush() is a batched background task called on a
-                        // 5 s interval (see main.rs), not per-request. A million cache hits
-                        // in 5 s collapse to one write + one fdatasync. The flush mutex and
-                        // the fact that record_* never waits on flush_in_progress mean
-                        // request threads never block on this sync.
-                        //
-                        // The only inline-flush path (buffer_len >= 10 000 between ticks)
-                        // absorbs one sync per 10 000 entries — a p99.99 blip at most.
-                        //
-                        // On EFS/NFS (the production target), close() already forces a
-                        // COMMIT per flush, so sync_data mostly front-loads a round-trip
-                        // that was already being paid.
-                        //
-                        // ⚠ CAVEAT: this cost is proportional to the flush cadence.
-                        // Do NOT reduce the flush interval below 1 s or the buffer cap
-                        // below 1 000 without revisiting fdatasync overhead.
-                        if let Err(e) = file.sync_data().await {
-                            error!(
-                                "Failed to fdatasync journal file: path={:?}, error={} \
-                                 (bytes are in page cache and readable; sync is best-effort)",
-                                journal_path, e
-                            );
-                            // Do not roll back entries_flushed — data is in the page cache
-                            // and readable by this process. Durability loss on crash is
-                            // the worst case, not a correctness regression.
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to open journal file: path={:?}, error={}",
-                        journal_path, e
-                    );
-                    errors += entries_flushed;
-                    entries_flushed = 0;
-                }
+            if let Err(e) = append_flush_lines(&journal_path, &self.instance_id, &content).await {
+                error!(
+                    "Failed to write to journal file: path={:?}, error={}",
+                    journal_path, e
+                );
+                errors += entries_flushed;
+                entries_flushed = 0;
+                lines_written = 0;
             }
         }
 
         // Update counters and timestamps
         self.entries_flushed
             .fetch_add(entries_flushed, Ordering::Relaxed);
+        self.flush_errors.fetch_add(errors, Ordering::Relaxed);
         {
             let mut last_flush = self.last_flush.write().await;
             *last_flush = Instant::now();
@@ -382,13 +531,14 @@ impl CacheHitUpdateBuffer {
 
         if entries_flushed > 0 || errors > 0 {
             debug!(
-                "Cache hit update buffer flushed: entries={}, duration={}ms, errors={}",
-                entries_flushed, duration_ms, errors
+                "Cache hit update buffer flushed: entries={}, lines={}, duration={}ms, errors={}",
+                entries_flushed, lines_written, duration_ms, errors
             );
         }
 
         Ok(FlushResult {
             entries_flushed,
+            lines_written,
             duration_ms,
             errors,
         })
@@ -408,7 +558,7 @@ impl CacheHitUpdateBuffer {
         // Create a minimal RangeSpec for identification purposes.
         //
         // `staged: None` here is safe and is not an R12.2 violation. Traced through
-        // `consolidate_key` on 2026-08-27: the TtlRefresh and AccessUpdate arms locate
+        // `apply_journal_entries` on 2026-08-27: the TtlRefresh and AccessUpdate arms locate
         // the existing range by `(start, end)` and mutate `last_accessed` /
         // `access_count` **in place** — neither replaces the stored `RangeSpec` — so a
         // cache hit cannot wipe the recorded membership. That is worth checking rather
@@ -426,6 +576,8 @@ impl CacheHitUpdateBuffer {
             last_accessed: entry.timestamp,
             access_count: 0,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         Ok(JournalEntry {
@@ -440,6 +592,7 @@ impl CacheHitUpdateBuffer {
             object_ttl_secs: None, // Cache-hit updates don't set object TTL
             access_increment,
             object_metadata: None, // Cache-hit updates don't need object_metadata - .meta already exists
+            fill_witness: None,
         })
     }
 
@@ -448,19 +601,26 @@ impl CacheHitUpdateBuffer {
         self.flush().await
     }
 
-    /// Get the number of entries currently in the buffer
+    /// Get the number of distinct entries currently in the buffer
     pub async fn buffer_len(&self) -> usize {
         let buffer = self.buffer.lock().await;
         buffer.len()
     }
 
-    /// Get statistics about the buffer
+    /// Get statistics about the buffer.
+    ///
+    /// Read once per `/metrics` collection by
+    /// `MetricsManager::collect_cache_hit_buffer_metrics`, which is this function's only
+    /// production consumer — it had none at all until the `cache_hit_buffer` section was
+    /// published. The only I/O is `buffer_len`'s mutex acquisition; everything else is a
+    /// relaxed atomic load, so it is safe on the collection path.
     pub async fn get_stats(&self) -> CacheHitUpdateBufferStats {
         let buffer_size = self.buffer_len().await;
         CacheHitUpdateBufferStats {
             updates_recorded: self.updates_recorded.load(Ordering::Relaxed),
             entries_flushed: self.entries_flushed.load(Ordering::Relaxed),
             buffer_size,
+            flush_errors: self.flush_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -578,6 +738,60 @@ mod tests {
         assert_eq!(entry2.access_increment, Some(3));
     }
 
+    /// A flush landing inside consolidator cleanup's lock hold, between its read and its
+    /// rename, loses no line. The test plays cleanup: it holds `.journal.lock` (taken the
+    /// way cleanup takes it), flushes, then renames an empty temp over the primary journal
+    /// as cleanup does after reading it. Red side: `UNLOCKED_FLUSH_LEVER`.
+    #[tokio::test]
+    async fn flush_during_cleanup_lock_hold_loses_no_line() {
+        let temp_dir = TempDir::new().unwrap();
+        let buffer = CacheHitUpdateBuffer::with_config(
+            temp_dir.path().to_path_buf(),
+            "case38".to_string(),
+            Duration::from_secs(60),
+            10000,
+        );
+        let journals = temp_dir.path().join("metadata").join("_journals");
+        std::fs::create_dir_all(&journals).unwrap();
+        let primary = journals.join("case38.journal");
+        std::fs::write(&primary, "").unwrap();
+        let lock_path = primary.with_extension("journal.lock");
+
+        // Cleanup has the lock and has read the (empty) journal.
+        let cleanup_lock = crate::journal_manager::lock_journal_lock_file(&lock_path, true)
+            .unwrap()
+            .expect("fixture: cleanup must take the lock");
+
+        buffer
+            .record_access_update("bkt/case38/flush-race", 0, 99, 1)
+            .await
+            .unwrap();
+        let result = buffer.force_flush().await.unwrap();
+        assert_eq!(result.entries_flushed, 1, "fixture: the flush must write");
+
+        // Cleanup's rename: what it read had nothing left, so it replaces the journal.
+        let tmp = primary.with_extension("journal.tmp");
+        std::fs::write(&tmp, "").unwrap();
+        std::fs::rename(&tmp, &primary).unwrap();
+        drop(cleanup_lock);
+
+        let mut found = 0;
+        for entry in std::fs::read_dir(&journals).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "journal") {
+                found += std::fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .filter(|l| l.contains("bkt/case38/flush-race"))
+                    .count();
+            }
+        }
+        assert_eq!(
+            found, 1,
+            "the flushed line was lost to cleanup's rename (flush wrote without the journal lock)"
+        );
+    }
+
     #[tokio::test]
     async fn test_flush_clears_buffer() {
         let temp_dir = TempDir::new().unwrap();
@@ -600,6 +814,186 @@ mod tests {
         assert_eq!(buffer.buffer_len().await, 0);
     }
 
+    /// N access updates for one stored range and M for another, inside one flush
+    /// window, flush as two journal lines carrying increments N and M and each range's latest
+    /// timestamp; two TTL refreshes of one key flush as one line carrying the later TTL.
+    /// Red side: `NO_COALESCE_LEVER` (one line per recorded update).
+    #[tokio::test]
+    async fn repeated_hits_on_a_stored_range_coalesce_to_one_line_per_window() {
+        const N: u64 = 1000;
+        const M: u64 = 250;
+        let key = "test-bucket/merge-coalesce";
+        let temp_dir = TempDir::new().unwrap();
+        let buffer = CacheHitUpdateBuffer::with_config(
+            temp_dir.path().to_path_buf(),
+            "test-instance".to_string(),
+            Duration::from_secs(60),
+            10000,
+        );
+        let mut last_a = SystemTime::UNIX_EPOCH;
+        for _ in 0..N {
+            last_a = SystemTime::now();
+            buffer.record_access_update(key, 0, 1023, 1).await.unwrap();
+        }
+        let mut last_b = SystemTime::UNIX_EPOCH;
+        for _ in 0..M {
+            last_b = SystemTime::now();
+            buffer
+                .record_access_update(key, 1024, 2047, 1)
+                .await
+                .unwrap();
+        }
+        buffer
+            .record_ttl_refresh(key, Duration::from_secs(600))
+            .await
+            .unwrap();
+        buffer
+            .record_ttl_refresh(key, Duration::from_secs(1200))
+            .await
+            .unwrap();
+        let result = buffer.force_flush().await.unwrap();
+        let journal = temp_dir
+            .path()
+            .join("metadata/_journals/test-instance.journal");
+        let content = std::fs::read_to_string(&journal).unwrap();
+        let entries: Vec<JournalEntry> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let access: Vec<&JournalEntry> = entries
+            .iter()
+            .filter(|e| e.operation == JournalOperation::AccessUpdate)
+            .collect();
+        assert_eq!(
+            access.len(),
+            2,
+            "NOT COALESCED: {} AccessUpdate journal lines for {N} + {M} hits on two stored ranges \
+             in one flush window; expected one line per stored range",
+            access.len()
+        );
+        for (start, n, last) in [(0u64, N, last_a), (1024u64, M, last_b)] {
+            let e = access
+                .iter()
+                .find(|e| e.range_spec.start == start)
+                .expect("a line per stored range");
+            assert_eq!(
+                e.access_increment,
+                Some(n),
+                "range {start}: summed increment"
+            );
+            assert!(
+                e.timestamp >= last && e.range_spec.last_accessed == e.timestamp,
+                "range {start}: the line must carry the latest hit's timestamp"
+            );
+        }
+        let ttl: Vec<&JournalEntry> = entries
+            .iter()
+            .filter(|e| e.operation == JournalOperation::TtlRefresh)
+            .collect();
+        assert_eq!(
+            ttl.len(),
+            1,
+            "two TTL refreshes of one key flush as one line"
+        );
+        assert_eq!(ttl[0].new_ttl_secs, Some(1200), "the later refresh wins");
+        assert_eq!(
+            (result.entries_flushed, result.lines_written),
+            (N + M + 2, 3),
+            "entries_flushed counts recorded updates; lines_written counts lines"
+        );
+        assert_eq!(buffer.get_stats().await.entries_flushed, N + M + 2);
+    }
+
+    /// The inline-flush cap counts distinct entries, not calls. 20 hits on one stored
+    /// range against a cap of 5 stay one buffered entry carrying the summed increment, and
+    /// nothing is flushed. Red side: `maybe_flush` comparing `updates_recorded` (calls) with
+    /// `max_buffer_size`.
+    #[tokio::test]
+    async fn hits_on_one_stored_range_never_trip_the_distinct_entry_cap() {
+        const HITS: u64 = 20;
+        let temp_dir = TempDir::new().unwrap();
+        let buffer = CacheHitUpdateBuffer::with_config(
+            temp_dir.path().to_path_buf(),
+            "test-instance".to_string(),
+            Duration::from_secs(60),
+            5,
+        );
+        for _ in 0..HITS {
+            buffer
+                .record_access_update("test-bucket/hit-cap", 0, 1023, 1)
+                .await
+                .unwrap();
+        }
+        let stats = buffer.get_stats().await;
+        assert_eq!(
+            (stats.buffer_size, stats.entries_flushed),
+            (1, 0),
+            "CAP COUNTED CALLS: {HITS} hits on one range against a cap of 5 must stay one \
+             buffered entry with nothing flushed"
+        );
+        assert!(
+            !temp_dir.path().join("metadata/_journals").exists(),
+            "no inline flush may have touched the journal directory"
+        );
+        let result = buffer.force_flush().await.unwrap();
+        assert_eq!((result.entries_flushed, result.lines_written), (HITS, 1));
+        let content = std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join("metadata/_journals/test-instance.journal"),
+        )
+        .unwrap();
+        let entries: Vec<JournalEntry> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].access_increment, Some(HITS));
+    }
+    /// A flush that fails to create the journal directory puts its entries back, and the
+    /// put-back folds with hits recorded afterwards into one entry: 3 hits, a failed flush, 2
+    /// more hits, then one successful flush writes one line with increment 5 and loses nothing.
+    #[tokio::test]
+    async fn failed_directory_create_puts_entries_back_and_they_fold_with_later_hits() {
+        let temp_dir = TempDir::new().unwrap();
+        let buffer = CacheHitUpdateBuffer::with_config(
+            temp_dir.path().to_path_buf(),
+            "test-instance".to_string(),
+            Duration::from_secs(60),
+            10000,
+        );
+        // A file where the `metadata` directory belongs makes create_dir_all fail.
+        let blocker = temp_dir.path().join("metadata");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let key = "test-bucket/hit-putback";
+        for _ in 0..3 {
+            buffer.record_access_update(key, 0, 1023, 1).await.unwrap();
+        }
+        assert!(
+            buffer.force_flush().await.is_err(),
+            "PRECONDITION MISSING: the flush must fail at create_dir_all"
+        );
+        assert_eq!(buffer.buffer_len().await, 1, "put back as one entry");
+        for _ in 0..2 {
+            buffer.record_access_update(key, 0, 1023, 1).await.unwrap();
+        }
+        assert_eq!(buffer.buffer_len().await, 1, "later hits fold into it");
+        std::fs::remove_file(&blocker).unwrap();
+        let result = buffer.force_flush().await.unwrap();
+        assert_eq!((result.entries_flushed, result.lines_written), (5, 1));
+        let content = std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join("metadata/_journals/test-instance.journal"),
+        )
+        .unwrap();
+        let entries: Vec<JournalEntry> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].access_increment, Some(5));
+    }
     #[tokio::test]
     async fn test_auto_flush_on_buffer_full() {
         let temp_dir = TempDir::new().unwrap();

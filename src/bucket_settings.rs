@@ -23,8 +23,9 @@ use regex::RegexSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -39,6 +40,15 @@ pub const DEFAULT_MAX_RULES: usize = 1024;
 ///
 /// Spec: page-aligned-range-cache Requirement 1.4.
 pub const DEFAULT_PAGE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Largest Page a resolved setting may carry: the fixed 64 MiB RAM admission
+/// ceiling. [`CacheRules::validate`] rejects a larger explicit `page_size` on a
+/// rule that enables `page_widening`, but a `page_size` set on a *different*
+/// matching rule (one that leaves `page_widening` unset) is inherited at
+/// resolution and was never checked. Resolution therefore clamps to this value,
+/// and validation WARNs about such rules, so one widened request never holds
+/// more than one bounded Page in memory (spec buffered-serve-memory-bound R1.3).
+pub const MAX_PAGE_SIZE: u64 = crate::ram_cache::RAM_CACHE_ADMISSION_CEILING as u64;
 
 /// Default TTFB threshold after which a hedge is issued: 250ms.
 /// Used when a rule enables `hedging_enabled` without specifying
@@ -88,7 +98,7 @@ where
 
 /// Format a Duration as a human-readable string compatible with `parse_duration`.
 /// Uses the largest whole unit that represents the duration exactly, falling back to seconds.
-pub fn format_duration(d: Duration) -> String {
+pub(crate) fn format_duration(d: Duration) -> String {
     let total_secs = d.as_secs();
     let nanos = d.subsec_nanos();
 
@@ -124,7 +134,7 @@ pub fn format_duration(d: Duration) -> String {
 /// Returns an error for empty/whitespace-only patterns. The output is always
 /// anchored (`^…$`) so a pattern matches only the entire cache key. Matching is
 /// case-sensitive (the regex default), mirroring S3 key semantics.
-pub fn glob_to_regex(pattern: &str) -> Result<String, String> {
+pub(crate) fn glob_to_regex(pattern: &str) -> Result<String, String> {
     if pattern.trim().is_empty() {
         return Err("pattern is empty".to_string());
     }
@@ -132,31 +142,24 @@ pub fn glob_to_regex(pattern: &str) -> Result<String, String> {
     let mut out = String::with_capacity(pattern.len() * 2 + 2);
     out.push('^');
 
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    // Iterate by `char`, never by byte: a pattern may hold multi-byte UTF-8.
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             '*' => {
                 // `**` crosses `/`; `*` stays within a path segment.
-                if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
                     out.push_str(".*");
-                    i += 2;
                 } else {
                     out.push_str("[^/]*");
-                    i += 1;
                 }
             }
-            '?' => {
-                out.push_str("[^/]");
-                i += 1;
-            }
+            '?' => out.push_str("[^/]"),
             other => {
                 // Escape any regex metacharacter; pass through normal chars.
-                // `regex::escape` handles multi-byte chars correctly via the &str slice.
-                let ch_str = &pattern[i..i + other.len_utf8()];
-                out.push_str(&regex::escape(ch_str));
-                i += other.len_utf8();
+                let mut buf = [0u8; 4];
+                out.push_str(&regex::escape(other.encode_utf8(&mut buf)));
             }
         }
     }
@@ -311,6 +314,20 @@ impl CacheRules {
                             crate::ram_cache::RAM_CACHE_ADMISSION_CEILING
                         ));
                     }
+                }
+            } else if let Some(page_size) = rule.page_size {
+                // Not an error (config-compatibility): such a rule loads, and
+                // resolution clamps what it contributes to a widened key.
+                if page_size > MAX_PAGE_SIZE {
+                    warn!(
+                        "rules[{}]: page_size {} exceeds the maximum of {} bytes (64 MiB); a widened key inheriting it uses {} instead",
+                        i, page_size, MAX_PAGE_SIZE, MAX_PAGE_SIZE
+                    );
+                } else if page_size == 0 {
+                    warn!(
+                        "rules[{}]: page_size 0 is invalid; a widened key inheriting it uses the default {} instead",
+                        i, DEFAULT_PAGE_SIZE
+                    );
                 }
             }
         }
@@ -521,7 +538,13 @@ impl RuleSet {
         // page_widening is off by default — never enabled globally, only via
         // an explicit rule (Requirement 1.2). There is no global fallback.
         let page_widening = first(&|r| r.page_widening).unwrap_or(false);
-        let page_size = first_u64(&|r| r.page_size).unwrap_or(DEFAULT_PAGE_SIZE);
+        // Clamp an inherited out-of-range page_size (see MAX_PAGE_SIZE); a 0
+        // inherited from a non-widening rule falls back to the default rather
+        // than dividing by zero on the page grid.
+        let page_size = match first_u64(&|r| r.page_size) {
+            None | Some(0) => DEFAULT_PAGE_SIZE,
+            Some(p) => p.min(MAX_PAGE_SIZE),
+        };
 
         // Hedging is off by default — never enabled globally, only per-key
         // via an explicit rule (hedged-upstream-requests Requirement 1.2).
@@ -572,8 +595,31 @@ struct CachedRules {
     rules: Vec<CacheRule>,
     /// Previous valid rule set, kept as fallback if a reload produces invalid content.
     previous_valid: Option<(RuleSet, Vec<CacheRule>)>,
-    /// Whether a `cache_rules.json` file exists on disk.
-    has_rules_file: bool,
+}
+
+/// The longest a request waits for a stale-triggered `cache_rules.json` reload before it
+/// resolves against the in-memory rules instead. On a healthy volume the read takes
+/// milliseconds, so the request that finds the rules stale still sees an edited file; on a
+/// stalled volume the read keeps running in the background and is applied by the first
+/// request after it completes.
+pub const RULES_RELOAD_WAIT_BOUND: Duration = Duration::from_millis(100);
+
+/// A rules-file read running on the blocking pool.
+struct InflightRead {
+    /// Flips to `true` once `result` holds the read's outcome.
+    done: watch::Receiver<bool>,
+    /// The read's outcome, taken by exactly one request which then applies it.
+    result: Arc<std::sync::Mutex<Option<std::io::Result<String>>>>,
+    started: Instant,
+}
+
+/// How far the in-memory rule set is from needing a read.
+enum RulesState {
+    /// Never loaded: the first load is awaited in full, as it always was.
+    Missing,
+    /// Older than the staleness threshold: reload, waiting at most the bound.
+    Stale,
+    Fresh,
 }
 
 /// Thread-safe manager for loading, caching, and resolving cache rules.
@@ -588,15 +634,18 @@ pub struct BucketSettingsManager {
     global_config: GlobalDefaults,
     /// Maximum number of rules permitted.
     max_rules: usize,
-    /// Single-flight coordination: only one task reloads the rules file at a time.
-    pending_load: Mutex<()>,
+    /// The one rules-file read in flight, if any. Single-flight: a stale request joins the
+    /// read already running rather than starting another. The read runs on the blocking
+    /// pool and outlives the request that started it, so a stalled cache volume holds one
+    /// blocking thread, not a request.
+    inflight_read: std::sync::Mutex<Option<InflightRead>>,
     /// Count of calls to [`resolve`](Self::resolve), incremented once per call.
     /// Used by the resolve-once regression test (Requirement 8.2) to assert that
     /// a multi-range request resolves settings exactly once rather than once per
     /// spawned per-range cache-write task. A single relaxed atomic increment is
     /// off the latency-sensitive matching work and adds no measurable cost.
     resolve_calls: AtomicUsize,
-    // -- Reload health counters (item 3) --
+    // -- Reload health counters --
     /// Total successful rule-file loads since startup.
     reloads_total: AtomicU64,
     /// Total rule-file load failures (parse, validation, compile) since startup.
@@ -622,7 +671,7 @@ impl BucketSettingsManager {
             staleness_threshold,
             global_config,
             max_rules: DEFAULT_MAX_RULES,
-            pending_load: Mutex::new(()),
+            inflight_read: std::sync::Mutex::new(None),
             resolve_calls: AtomicUsize::new(0),
             reloads_total: AtomicU64::new(0),
             reload_failures_total: AtomicU64::new(0),
@@ -636,7 +685,7 @@ impl BucketSettingsManager {
     /// Cache keys have the form "/{bucket}/{key}" or "{bucket}/{key}".
     /// Returns `None` for empty paths or paths that are just "/".
     /// Retained for per-bucket metrics attribution.
-    pub fn extract_bucket(path: &str) -> Option<&str> {
+    pub(crate) fn extract_bucket(path: &str) -> Option<&str> {
         let trimmed = path.strip_prefix('/').unwrap_or(path);
         let bucket = match trimmed.find('/') {
             Some(pos) => &trimmed[..pos],
@@ -664,17 +713,7 @@ impl BucketSettingsManager {
         // the count after all spawned work it cares about has completed.
         self.resolve_calls.fetch_add(1, Ordering::Relaxed);
 
-        let needs_reload = {
-            let cache = self.cache.read().await;
-            match cache.as_ref() {
-                Some(cached) => cached.loaded_at.elapsed() >= self.staleness_threshold,
-                None => true,
-            }
-        };
-
-        if needs_reload {
-            self.load_rules().await;
-        }
+        self.refresh_if_needed().await;
 
         let cache = self.cache.read().await;
         match cache.as_ref() {
@@ -695,37 +734,14 @@ impl BucketSettingsManager {
 
     /// Return the parsed rules (for the dashboard). Triggers a lazy load if needed.
     pub async fn rules(&self) -> Vec<CacheRule> {
-        {
-            let cache = self.cache.read().await;
-            if let Some(cached) = cache.as_ref() {
-                if cached.loaded_at.elapsed() < self.staleness_threshold {
-                    return cached.rules.clone();
-                }
-            }
-        }
-        self.load_rules().await;
+        self.refresh_if_needed().await;
         let cache = self.cache.read().await;
         cache.as_ref().map_or_else(Vec::new, |c| c.rules.clone())
     }
 
-    /// Whether a `cache_rules.json` file exists on disk (triggers a lazy load).
-    pub async fn has_rules_file(&self) -> bool {
-        {
-            let cache = self.cache.read().await;
-            if let Some(cached) = cache.as_ref() {
-                if cached.loaded_at.elapsed() < self.staleness_threshold {
-                    return cached.has_rules_file;
-                }
-            }
-        }
-        self.load_rules().await;
-        let cache = self.cache.read().await;
-        cache.as_ref().is_some_and(|c| c.has_rules_file)
-    }
-
     /// Return a snapshot of cache-rules reload health counters.
     /// Cheap (all atomics, no async lock).
-    pub fn rules_health(&self) -> crate::metrics::CacheRulesMetrics {
+    pub(crate) fn rules_health(&self) -> crate::metrics::CacheRulesMetrics {
         crate::metrics::CacheRulesMetrics {
             reloads_total: self.reloads_total.load(Ordering::Relaxed),
             reload_failures_total: self.reload_failures_total.load(Ordering::Relaxed),
@@ -735,22 +751,113 @@ impl BucketSettingsManager {
         }
     }
 
-    /// Single-flight load of the rules file from disk.
-    async fn load_rules(&self) {
-        let _guard = self.pending_load.lock().await;
+    async fn rules_state(&self) -> RulesState {
+        let cache = self.cache.read().await;
+        match cache.as_ref() {
+            None => RulesState::Missing,
+            Some(cached) if cached.loaded_at.elapsed() >= self.staleness_threshold => {
+                RulesState::Stale
+            }
+            Some(_) => RulesState::Fresh,
+        }
+    }
 
-        // Re-check — another task may have loaded while we waited.
-        {
-            let cache = self.cache.read().await;
-            if let Some(cached) = cache.as_ref() {
-                if cached.loaded_at.elapsed() < self.staleness_threshold {
-                    return;
-                }
+    /// Reload the rules file if the in-memory set is missing or stale.
+    ///
+    /// The first load is awaited in full, as before: with no rule set in memory there is
+    /// nothing to resolve against but the global defaults, and those would ignore any rule
+    /// an operator relies on (a `get_ttl: "0s"` prefix, a `read_cache_enabled: false`
+    /// prefix). A stale reload starts or joins the single in-flight read; only the request
+    /// that started it waits, and for at most [`RULES_RELOAD_WAIT_BOUND`]. Every request
+    /// applies a read that has completed, so a read that outlived its starter takes effect
+    /// on the next request.
+    async fn refresh_if_needed(&self) {
+        let state = self.rules_state().await;
+        if matches!(state, RulesState::Fresh) && !self.has_inflight_read() {
+            return;
+        }
+        if !matches!(state, RulesState::Fresh) {
+            let (started, mut done) = self.start_or_join_read();
+            if matches!(state, RulesState::Missing) {
+                let _ = done.wait_for(|d| *d).await;
+            } else if started
+                && tokio::time::timeout(RULES_RELOAD_WAIT_BOUND, done.wait_for(|d| *d))
+                    .await
+                    .is_err()
+            {
+                warn!(
+                    bound_ms = RULES_RELOAD_WAIT_BOUND.as_millis() as u64,
+                    "cache_rules.json reload did not complete within the bound; \
+                     serving the in-memory rules until it does"
+                );
             }
         }
+        if let Some(read) = self.take_completed_read() {
+            self.apply_read(read).await;
+        }
+    }
 
+    fn has_inflight_read(&self) -> bool {
+        self.inflight_read
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    /// Join the in-flight read, or start one on the blocking pool. Returns whether this call
+    /// started it, and a receiver that flips to `true` when it has finished.
+    fn start_or_join_read(&self) -> (bool, watch::Receiver<bool>) {
+        let mut slot = self.inflight_read.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(read) = slot.as_ref() {
+            return (false, read.done.clone());
+        }
+        let (tx, rx) = watch::channel(false);
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&result);
         let path = self.rules_path();
-        match tokio::fs::read_to_string(&path).await {
+        tokio::task::spawn_blocking(move || {
+            let read = std::fs::read_to_string(&path);
+            *sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
+            let _ = tx.send(true);
+        });
+        *slot = Some(InflightRead {
+            done: rx.clone(),
+            result,
+            started: Instant::now(),
+        });
+        (true, rx)
+    }
+
+    /// Take the in-flight read's outcome if it has finished, clearing the slot so the next
+    /// stale request can start another. A read task that ended without an outcome (it
+    /// panicked) is reported as a read error, so the slot cannot stay occupied forever.
+    fn take_completed_read(&self) -> Option<std::io::Result<String>> {
+        let mut slot = self.inflight_read.lock().unwrap_or_else(|p| p.into_inner());
+        let read = slot.as_ref()?;
+        let outcome = read.result.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match outcome {
+            Some(outcome) => {
+                debug!(
+                    elapsed_ms = read.started.elapsed().as_millis() as u64,
+                    "cache_rules.json read completed"
+                );
+                *slot = None;
+                Some(outcome)
+            }
+            None if read.done.has_changed().is_err() => {
+                *slot = None;
+                Some(Err(std::io::Error::other(
+                    "cache_rules.json read task ended without a result",
+                )))
+            }
+            None => None,
+        }
+    }
+
+    /// Apply one rules-file read: a valid file replaces the rule set, anything else keeps
+    /// the last-known-good one.
+    async fn apply_read(&self, read: std::io::Result<String>) {
+        match read {
             Ok(contents) => match serde_json::from_str::<CacheRules>(&contents) {
                 Ok(parsed) => {
                     let errors = parsed.validate(
@@ -764,36 +871,36 @@ impl BucketSettingsManager {
                                     rule_count = parsed.rules.len(),
                                     "Cache rules loaded from disk"
                                 );
-                                self.store_valid(ruleset, parsed.rules, true).await;
+                                self.store_valid(ruleset, parsed.rules).await;
                             }
                             Err(e) => {
                                 warn!(error = %e, "Cache rules failed to compile, using fallback");
-                                self.use_fallback(true).await;
+                                self.use_fallback().await;
                             }
                         }
                     } else {
                         warn!(errors = ?errors, "Cache rules validation failed, using fallback");
-                        self.use_fallback(true).await;
+                        self.use_fallback().await;
                     }
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to parse cache_rules.json, using fallback");
-                    self.use_fallback(true).await;
+                    self.use_fallback().await;
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No rules file → empty rule set (global defaults for every key).
-                self.store_valid(RuleSet::empty(), Vec::new(), false).await;
+                self.store_valid(RuleSet::empty(), Vec::new()).await;
             }
             Err(e) => {
                 warn!(error = %e, "Failed to read cache_rules.json, using fallback");
-                self.use_fallback(false).await;
+                self.use_fallback().await;
             }
         }
     }
 
     /// Store a freshly loaded valid rule set, preserving the prior one as fallback.
-    async fn store_valid(&self, ruleset: RuleSet, rules: Vec<CacheRule>, has_file: bool) {
+    async fn store_valid(&self, ruleset: RuleSet, rules: Vec<CacheRule>) {
         let rule_count = rules.len();
         let mut cache = self.cache.write().await;
         let previous_valid = cache.as_ref().and_then(|c| {
@@ -808,7 +915,6 @@ impl BucketSettingsManager {
             loaded_at: Instant::now(),
             rules,
             previous_valid,
-            has_rules_file: has_file,
         });
         // Update health counters.
         self.reloads_total.fetch_add(1, Ordering::Relaxed);
@@ -825,7 +931,7 @@ impl BucketSettingsManager {
 
     /// On error, keep the last-known-good rule set (or empty if none), refreshing
     /// the timestamp so we don't hot-loop on a broken file.
-    async fn use_fallback(&self, has_file: bool) {
+    async fn use_fallback(&self) {
         self.reload_failures_total.fetch_add(1, Ordering::Relaxed);
         self.on_fallback.store(true, Ordering::Relaxed);
         let mut cache = self.cache.write().await;
@@ -844,7 +950,6 @@ impl BucketSettingsManager {
             loaded_at: Instant::now(),
             rules,
             previous_valid,
-            has_rules_file: has_file,
         });
     }
 }
@@ -1221,6 +1326,7 @@ mod tests {
         assert_eq!(r.get_ttl, Duration::from_secs(10));
 
         std::fs::write(&path, r#"{"rules": BROKEN"#).unwrap();
+        resolve_until_failures(&mgr, 1).await;
         let r = mgr.resolve("b/key").await;
         assert_eq!(r.get_ttl, Duration::from_secs(10)); // kept
     }
@@ -1240,6 +1346,7 @@ mod tests {
             r#"{"rules": [{"pattern": "a/**"}, {"pattern": "b/**"}]}"#,
         )
         .unwrap();
+        resolve_until_failures(&mgr, 1).await;
         let r = mgr.resolve("b/key").await;
         // Over cap → keep previous valid (get_ttl 10s).
         assert_eq!(r.get_ttl, Duration::from_secs(10));
@@ -1264,10 +1371,97 @@ mod tests {
         assert_eq!(mgr.resolve("b/k").await.get_ttl, Duration::from_secs(10));
 
         std::fs::write(&path, r#"BROKEN"#).unwrap();
+        resolve_until_failures(&mgr, 1).await;
         assert_eq!(mgr.resolve("b/k").await.get_ttl, Duration::from_secs(10));
 
         std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "99s"}]}"#).unwrap();
-        assert_eq!(mgr.resolve("b/k").await.get_ttl, Duration::from_secs(99));
+        // A stale reload serves the in-memory rules if the blocking-pool read outlives
+        // RULES_RELOAD_WAIT_BOUND (100 ms); the next request applies it. Under parallel
+        // suite load the read can miss the bound, so poll for the documented outcome.
+        assert_eq!(
+            resolve_ttl_until(&mgr, Duration::from_secs(99)).await,
+            Duration::from_secs(99)
+        );
+    }
+
+    /// Resolve repeatedly until the TTL equals `want` or 10 s pass; returns the last TTL seen.
+    async fn resolve_ttl_until(mgr: &BucketSettingsManager, want: Duration) -> Duration {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ttl = mgr.resolve("b/k").await.get_ttl;
+            if ttl == want || Instant::now() >= deadline {
+                return ttl;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Resolve `b/k` repeatedly until `done` accepts the settings or 10 s pass; returns the
+    /// last settings seen. A stale reload serves the in-memory rules when the blocking-pool
+    /// read outlives RULES_RELOAD_WAIT_BOUND, and the next request applies it.
+    async fn resolve_until(
+        mgr: &BucketSettingsManager,
+        done: impl Fn(&ResolvedSettings) -> bool,
+    ) -> ResolvedSettings {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = mgr.resolve("b/k").await;
+            if done(&r) || Instant::now() >= deadline {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Resolve until the manager has counted `want` reload failures (or 10 s pass), so a
+    /// test that asserts the last-known-good rules were kept knows the bad file was read.
+    async fn resolve_until_failures(mgr: &BucketSettingsManager, want: u64) {
+        resolve_until_health(mgr, |h| h.reload_failures_total >= want).await;
+    }
+
+    /// Resolve until `done` accepts the reload-health snapshot (or 10 s pass).
+    async fn resolve_until_health(
+        mgr: &BucketSettingsManager,
+        done: impl Fn(&crate::metrics::CacheRulesMetrics) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let _ = mgr.resolve("b/k").await;
+            if done(&mgr.rules_health()) || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Reload keys on staleness, not on file mtime or size: a same-size rewrite carrying
+    /// the previous mtime is still picked up.
+    #[tokio::test]
+    async fn reload_sees_same_size_rewrite_with_identical_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "10s"}]}"#).unwrap();
+        let fixed = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let pin = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(fixed)
+                .unwrap();
+        };
+        pin(&path);
+        let mgr = test_manager_always_reload(tmp.path());
+        assert_eq!(mgr.resolve("b/k").await.get_ttl, Duration::from_secs(10));
+
+        let same_size = r#"{"rules": [{"pattern": "**", "get_ttl": "77s"}]}"#;
+        assert_eq!(same_size.len(), 48);
+        std::fs::write(&path, same_size).unwrap();
+        pin(&path);
+        assert_eq!(
+            resolve_ttl_until(&mgr, Duration::from_secs(77)).await,
+            Duration::from_secs(77)
+        );
     }
 
     #[tokio::test]
@@ -1300,7 +1494,6 @@ mod tests {
         let rules = mgr.rules().await;
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].pattern, "a/**");
-        assert!(mgr.has_rules_file().await);
     }
 
     // ---- legacy _settings.json startup-warning detection (Requirement 7.4) ----
@@ -1424,6 +1617,41 @@ mod tests {
         assert_eq!(r.page_size, 4194304);
     }
 
+    /// An oversize or zero page_size inherited from a rule that does not
+    /// enable widening passes validation, so resolution must clamp it: over
+    /// 64 MiB to MAX_PAGE_SIZE, 0 to the default (buffered-serve-memory-bound).
+    #[tokio::test]
+    async fn resolve_clamps_inherited_page_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [
+                {"pattern": "b/big/**", "page_widening": true},
+                {"pattern": "b/zero/**", "page_widening": true},
+                {"pattern": "b/big/**", "page_size": 1073741824},
+                {"pattern": "b/zero/**", "page_size": 0}
+            ]}"#,
+        )
+        .unwrap();
+        let rules: CacheRules = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("cache_rules.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            rules
+                .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+                .is_empty(),
+            "an inherited page_size is a WARN, not a load failure"
+        );
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("b/big/x").await;
+        assert!(r.page_widening);
+        assert_eq!(r.page_size, MAX_PAGE_SIZE);
+        let r = mgr.resolve("b/zero/x").await;
+        assert!(r.page_widening);
+        assert_eq!(r.page_size, DEFAULT_PAGE_SIZE);
+    }
+
     #[tokio::test]
     async fn resolve_page_widening_hot_reload_picks_up_change() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1441,7 +1669,7 @@ mod tests {
             r#"{"rules": [{"pattern": "**", "page_widening": true, "page_size": 1048576}]}"#,
         )
         .unwrap();
-        let r = mgr.resolve("b/k").await;
+        let r = resolve_until(&mgr, |r| r.page_widening).await;
         assert!(r.page_widening);
         assert_eq!(r.page_size, 1048576);
     }
@@ -1730,7 +1958,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_invalid_hedging_rule_keeps_previous_valid() {
-        // The T21 pattern: an invalid live edit is rejected with the previous
+        // The same pattern as the fleet test: an invalid live edit is rejected with the previous
         // rules retained.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cache_rules.json");
@@ -1750,6 +1978,7 @@ mod tests {
             r#"{"rules": [{"pattern": "**", "hedging_enabled": true, "hedge_trigger_after": "6s"}]}"#,
         )
         .unwrap();
+        resolve_until_failures(&mgr, 1).await;
         let r = mgr.resolve("b/k").await;
         // Previous valid retained.
         assert!(r.hedging_enabled);
@@ -1795,7 +2024,7 @@ mod tests {
 
         // Break the file — next load fails, falls back.
         std::fs::write(&path, r#"NOT JSON"#).unwrap();
-        let _ = mgr.resolve("b/k").await;
+        resolve_until_failures(&mgr, 1).await;
 
         let health = mgr.rules_health();
         assert_eq!(health.reloads_total, 1); // no new success
@@ -1815,7 +2044,7 @@ mod tests {
 
         // Break it.
         std::fs::write(&path, r#"BROKEN"#).unwrap();
-        let _ = mgr.resolve("b/k").await;
+        resolve_until_health(&mgr, |h| h.on_fallback).await;
         assert!(mgr.rules_health().on_fallback);
 
         // Fix it.
@@ -1824,12 +2053,30 @@ mod tests {
             r#"{"rules": [{"pattern": "x/**"}, {"pattern": "**"}]}"#,
         )
         .unwrap();
-        let _ = mgr.resolve("b/k").await;
+        resolve_until_health(&mgr, |h| !h.on_fallback).await;
 
         let health = mgr.rules_health();
         assert_eq!(health.reloads_total, 2);
         assert_eq!(health.reload_failures_total, 1);
         assert!(!health.on_fallback);
         assert_eq!(health.rules_loaded, 2);
+    }
+}
+
+#[cfg(test)]
+mod glob_multibyte_tests {
+    use super::glob_to_regex;
+
+    /// A rule pattern holding 3- and 4-byte UTF-8 characters compiles, and each
+    /// character matches only itself.
+    #[test]
+    fn glob_to_regex_accepts_multibyte_characters() {
+        let re = glob_to_regex("bucket/あ/*🚀.bin").expect("pattern compiles");
+        let compiled = regex::Regex::new(&re).expect("valid regex");
+        assert!(compiled.is_match("bucket/あ/x🚀.bin"));
+        assert!(!compiled.is_match("bucket/い/x🚀.bin"));
+        assert!(!compiled.is_match("bucket/あ/a/x🚀.bin"));
+        let re = glob_to_regex("**/é?").expect("pattern compiles");
+        assert!(regex::Regex::new(&re).unwrap().is_match("a/b/éz"));
     }
 }

@@ -3,7 +3,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use s3_proxy::{
-    background_recovery::{BackgroundRecoveryConfig, BackgroundRecoverySystem},
+    accept_policy::AcceptErrorLog,
     config::{Config, ServerMode},
     dashboard::DashboardServer,
     health::HealthManager,
@@ -11,7 +11,6 @@ use s3_proxy::{
     https_proxy::HttpsProxy,
     logging::LoggerManager,
     metrics::MetricsManager,
-    orphaned_range_recovery::OrphanedRangeRecovery,
     permissions::PermissionValidator,
     shutdown::{ShutdownCoordinator, ShutdownSignal},
     tls_proxy_listener::TlsProxyListener,
@@ -53,6 +52,46 @@ fn endpoint_rejection<B>(request: &Request<B>, endpoint: &str) -> Option<Respons
     None
 }
 
+/// Accept loop shared by the health and metrics listeners.
+///
+/// An accept error never ends the loop: it is logged (rate-limited) and, unless it concerns only
+/// the connection being accepted, followed by a pause. The policy lives in
+/// `s3_proxy::accept_policy`, shared with the dashboard, HTTP, TCP passthrough and TLS listeners.
+///
+/// `accept` yields the next connection, `handle` takes ownership of it (and is expected to
+/// spawn), and the loop ends when `shutdown` resolves. Taking the accept source as a closure
+/// lets a test feed the loop an error followed by a real connection.
+async fn run_accept_loop<S, A, AF, H, SF>(
+    listener_name: &'static str,
+    mut accept: A,
+    mut handle: H,
+    shutdown: SF,
+) -> Result<()>
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = std::io::Result<S>>,
+    H: FnMut(S),
+    SF: std::future::Future,
+{
+    tokio::pin!(shutdown);
+    let mut accept_errors = AcceptErrorLog::new();
+    loop {
+        tokio::select! {
+            accept_result = accept() => {
+                match accept_result {
+                    Ok(stream) => handle(stream),
+                    Err(e) => accept_errors.on_accept_error(listener_name, &e).await,
+                }
+            }
+            _ = &mut shutdown => {
+                info!("{} received shutdown signal", listener_name);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Start health check HTTP server
 async fn start_health_server(
     addr: SocketAddr,
@@ -66,42 +105,35 @@ async fn start_health_server(
 
     info!("Health check server listening on {}", addr);
 
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (stream, _) = accept_result.map_err(|e| {
-                    s3_proxy::ProxyError::IoError(format!("Failed to accept connection: {}", e))
-                })?;
+    let listener = &listener;
+    run_accept_loop(
+        "Health check server",
+        move || async move { listener.accept().await.map(|(stream, _)| stream) },
+        |stream| {
+            let io = TokioIo::new(stream);
+            let health_manager_clone = health_manager.clone();
+            let endpoint = endpoint.clone();
 
-                let io = TokioIo::new(stream);
-                let health_manager_clone = health_manager.clone();
-                let endpoint = endpoint.clone();
-
-                tokio::spawn(async move {
-                    let service = service_fn(move |req| {
-                        let health_manager = health_manager_clone.clone();
-                        let endpoint = endpoint.clone();
-                        async move {
-                            if let Some(response) = endpoint_rejection(&req, &endpoint) {
-                                return Ok(response);
-                            }
-                            health_manager.read().await.handle_health_request(req).await
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let health_manager = health_manager_clone.clone();
+                    let endpoint = endpoint.clone();
+                    async move {
+                        if let Some(response) = endpoint_rejection(&req, &endpoint) {
+                            return Ok(response);
                         }
-                    });
-
-                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-                        error!("Error serving health check connection: {}", e);
+                        health_manager.read().await.handle_health_request(req).await
                     }
                 });
-            }
-            _ = shutdown_signal.wait_for_shutdown() => {
-                info!("Health check server received shutdown signal");
-                break;
-            }
-        }
-    }
 
-    Ok(())
+                if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                    error!("Error serving health check connection: {}", e);
+                }
+            });
+        },
+        shutdown_signal.wait_for_shutdown(),
+    )
+    .await
 }
 
 /// Start metrics HTTP server
@@ -117,46 +149,39 @@ async fn start_metrics_server(
 
     info!("Metrics server listening on {}", addr);
 
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (stream, _) = accept_result.map_err(|e| {
-                    s3_proxy::ProxyError::IoError(format!("Failed to accept connection: {}", e))
-                })?;
+    let listener = &listener;
+    run_accept_loop(
+        "Metrics server",
+        move || async move { listener.accept().await.map(|(stream, _)| stream) },
+        |stream| {
+            let io = TokioIo::new(stream);
+            let metrics_manager_clone = metrics_manager.clone();
+            let endpoint = endpoint.clone();
 
-                let io = TokioIo::new(stream);
-                let metrics_manager_clone = metrics_manager.clone();
-                let endpoint = endpoint.clone();
-
-                tokio::spawn(async move {
-                    let service = service_fn(move |req| {
-                        let metrics_manager = metrics_manager_clone.clone();
-                        let endpoint = endpoint.clone();
-                        async move {
-                            if let Some(response) = endpoint_rejection(&req, &endpoint) {
-                                return Ok(response);
-                            }
-                            metrics_manager
-                                .read()
-                                .await
-                                .handle_metrics_request(req)
-                                .await
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let metrics_manager = metrics_manager_clone.clone();
+                    let endpoint = endpoint.clone();
+                    async move {
+                        if let Some(response) = endpoint_rejection(&req, &endpoint) {
+                            return Ok(response);
                         }
-                    });
-
-                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-                        error!("Error serving metrics connection: {}", e);
+                        metrics_manager
+                            .read()
+                            .await
+                            .handle_metrics_request(req)
+                            .await
                     }
                 });
-            }
-            _ = shutdown_signal.wait_for_shutdown() => {
-                info!("Metrics server received shutdown signal");
-                break;
-            }
-        }
-    }
 
-    Ok(())
+                if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                    error!("Error serving metrics connection: {}", e);
+                }
+            });
+        },
+        shutdown_signal.wait_for_shutdown(),
+    )
+    .await
 }
 
 /// Set process umask to 0o077 so all files are created with owner-only permissions (Req 14).
@@ -177,21 +202,169 @@ fn set_process_umask() {
     eprintln!("WARN: umask not available on this platform; cache files may have permissive modes");
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The name of the ledger-retirement subcommand. `bench-metadata` lives in
+/// `s3_proxy::bench_metadata`.
+const RETIRE_INSTANCE: &str = "retire-instance";
+
+/// `s3-proxy --config <path> retire-instance <instance-id>`.
+///
+/// A separate `clap` command rather than a subcommand of the proxy's own CLI, so the proxy's
+/// startup parse is untouched and this command can never fall through into starting a proxy.
+fn retire_instance_cli() -> clap::Command {
+    clap::Command::new("s3-proxy")
+        .about("Retire a dead write-ledger instance id from staged-authority activation")
+        .arg(
+            clap::Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("FILE")
+                .required(true)
+                .help("The proxy's configuration file; only cache.cache_dir is read"),
+        )
+        .subcommand_required(true)
+        .subcommand(
+            clap::Command::new(RETIRE_INSTANCE)
+                .about(
+                    "Stop a write-ledger instance id with no current ready record from holding \
+                     staged-authority activation back. Refused if any ledger file named for it \
+                     was modified within the last hour.",
+                )
+                .arg(
+                    clap::Arg::new("instance-id")
+                        .required(true)
+                        .value_name("INSTANCE_ID")
+                        .help("{hostname}:{pid}, as write_cache.staged_authority_activation_blocking_instance names it"),
+                ),
+        )
+}
+
+/// `None` when the command line does not ask for `retire-instance`, so normal startup proceeds.
+/// Otherwise the parse: `(config path, instance id)`, or clap's error.
+fn parse_retire_instance(
+    args: &[std::ffi::OsString],
+) -> Option<std::result::Result<(String, String), clap::Error>> {
+    if !args.iter().skip(1).any(|a| a == RETIRE_INSTANCE) {
+        return None;
+    }
+    Some(retire_instance_cli().try_get_matches_from(args).map(|m| {
+        let config = m.get_one::<String>("config").cloned().unwrap_or_default();
+        let id = m
+            .subcommand_matches(RETIRE_INSTANCE)
+            .and_then(|s| s.get_one::<String>("instance-id").cloned())
+            .unwrap_or_default();
+        (config, id)
+    }))
+}
+
+/// Run `retire-instance` and return the process exit code: 0 retired, 1 refused, 2 usage.
+fn run_retire_instance(parsed: std::result::Result<(String, String), clap::Error>) -> i32 {
+    let (config_path, instance_id) = match parsed {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = e.print();
+            return 2;
+        }
+    };
+    let cache_dir = match std::fs::read_to_string(&config_path)
+        .map_err(|e| e.to_string())
+        .and_then(|c| serde_yaml_ng::from_str::<Config>(&c).map_err(|e| e.to_string()))
+    {
+        Ok(mut config) => {
+            // `CACHE_DIR` overrides the file at startup, so it must here too.
+            config.apply_env_overrides();
+            config.cache.cache_dir
+        }
+        Err(e) => {
+            eprintln!("Could not load the configuration file {config_path}: {e}");
+            return 2;
+        }
+    };
+    match s3_proxy::staged_authority::retire_instance(&cache_dir, &instance_id) {
+        Ok(marker) => {
+            println!(
+                "Retired {id}: wrote {path}. It no longer counts against staged-authority \
+                 activation while no write-ledger file named for it is modified after the newest \
+                 modification recorded ({ns} ns since the epoch). Any later write under that id \
+                 voids the marker.",
+                id = marker.instance_id,
+                path = s3_proxy::staged_authority::retired_instances_dir(&cache_dir)
+                    .join(format!("{}.retired", marker.instance_id))
+                    .display(),
+                ns = marker.ledger_last_modified_ns,
+            );
+            0
+        }
+        Err(refusal) => {
+            eprintln!("Refused to retire {instance_id}: {refusal}. Nothing was written.");
+            1
+        }
+    }
+}
+
+/// Bound on the runtime's blocking-pool wait at process exit.
+///
+/// `Drop for BlockingPool` waits for every *running* blocking task with no timeout, and
+/// several of this crate's blocking tasks wait on file locks that live on the **shared**
+/// cache volume — so the holder can be a peer instance, or an NFS client that died holding
+/// the lease. Without a bound, process exit is outside this process's control.
+///
+/// Five seconds, chosen against two ceilings. Below: every blocking task whose work matters
+/// is awaited inside `async_main` before it returns (the graceful path's log flush, final
+/// journal consolidation and lock release are all `await`ed by `ShutdownCoordinator`), and
+/// what can still be outstanding here is local file I/O that completes in milliseconds, so
+/// 5 s is three orders of magnitude of headroom. Above: the graceful path is itself bounded
+/// at 30 s, plus a 500 ms drain, giving a 35.5 s worst-case exit — well inside systemd's
+/// 90 s `TimeoutStopSec` default, so the process *exits* rather than being `SIGKILL`ed.
+const SHUTDOWN_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Entry point.
+///
+/// Deliberately not `#[tokio::main]`: that macro drops the runtime implicitly, and that drop
+/// is an untimed wait on the blocking pool (see `SHUTDOWN_BLOCKING_TIMEOUT`). This builds
+/// the same runtime the macro would — multi-threaded, no explicit `worker_threads` so
+/// tokio's default applies, `enable_all()`, and the same panic message if the build fails —
+/// and ends with a bounded shutdown instead.
+fn main() -> Result<()> {
+    // The one administrative command, handled before any runtime, logging or listener exists
+    // so it cannot start a proxy by accident. Design § 16.6.6 B9.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(parsed) = parse_retire_instance(&args) {
+        set_process_umask();
+        std::process::exit(run_retire_instance(parsed));
+    }
+    // `bench-metadata` likewise exits before any proxy state exists. It is read-only against
+    // the cache volume; see `s3_proxy::bench_metadata`.
+    if s3_proxy::bench_metadata::is_requested(&args) {
+        std::process::exit(s3_proxy::bench_metadata::main_entry(&args));
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(SHUTDOWN_BLOCKING_TIMEOUT);
+    result
+}
+
+async fn async_main() -> Result<()> {
     // Set restrictive umask before any file creation (Req 14)
     set_process_umask();
 
-    // Load configuration
-    let config = Config::load()?;
-
-    // Validate directory permissions before initializing any components (Requirement 21)
-    PermissionValidator::validate_all(
-        &config.cache.cache_dir,
-        &config.logging.access_log_dir,
-        &config.logging.app_log_dir,
-        config.cache.write_cache_enabled,
-    )?;
+    // Load configuration, then validate directory permissions before initializing any
+    // components (Requirement 21). Logging cannot start until the configuration names its
+    // directory and level, so the events both steps emit (the removed, ignored and remapped
+    // field warnings among them) are held here and replayed once it has.
+    let (loaded, startup_events) = s3_proxy::logging::collect_startup_events(|| {
+        let config = Config::load()?;
+        PermissionValidator::validate_all(
+            &config.cache.cache_dir,
+            &config.logging.access_log_dir,
+            &config.logging.app_log_dir,
+            config.cache.write_cache_enabled,
+        )?;
+        Ok::<Config, s3_proxy::ProxyError>(config)
+    });
+    let config = loaded?;
 
     // Initialize logging
     let logging_config = s3_proxy::logging::LoggingConfig {
@@ -217,6 +390,7 @@ async fn main() -> Result<()> {
 
     let mut logger = LoggerManager::new(logging_config);
     logger.initialize()?;
+    startup_events.replay();
 
     info!(
         "Starting Hybrid Cache for Amazon S3 server v{} (built: {})",
@@ -246,7 +420,8 @@ async fn main() -> Result<()> {
         config.cache.cache_dir.display(),
         config.cache.max_cache_size / 1024 / 1024
     );
-
+    // Advisory: an NFS cache volume must be mounted with lookupcache=pos.
+    s3_proxy::permissions::warn_if_nfs_caches_negative_lookups(&config.cache.cache_dir);
     // One-time breaking-change migration warning: the per-bucket `_settings.json`
     // mechanism has been replaced by `cache_dir/cache_rules.json`. Scan once at
     // startup and warn (without reading/honouring the files) if any are present.
@@ -257,9 +432,19 @@ async fn main() -> Result<()> {
             "RAM cache: enabled, max_size={}MB",
             config.cache.max_ram_cache_size / 1024 / 1024
         );
+        // `ram_cache_flush_interval` governs no flush. Its two consumers are the
+        // cross-instance access-activity window (2x it) and the eviction activity
+        // oracle's refresh cadence (half it). Reporting it under a "flush" label
+        // alongside a field nothing read is how tuning a dead knob came to look
+        // like it had taken effect, so this line names the two real effects. The
+        // field's own name stays as it is: renaming a live config key to fix a log
+        // line would be a breaking change for a cosmetic gain.
         info!(
-            "RAM-disk coherency: flush_interval={:?}, flush_threshold={}",
-            config.cache.ram_cache_flush_interval, config.cache.ram_cache_flush_threshold
+            "RAM access-activity window: {:?}; eviction activity oracle refresh: {:?} \
+             (from cache.ram_cache_flush_interval={:?})",
+            config.cache.ram_cache_flush_interval * 2,
+            config.cache.ram_cache_flush_interval / 2,
+            config.cache.ram_cache_flush_interval
         );
     } else {
         info!("RAM cache: disabled");
@@ -272,6 +457,9 @@ async fn main() -> Result<()> {
             config.cache.write_cache_max_object_size / 1024 / 1024,
             config.cache.put_ttl
         );
+        // Derive the first Staged_Range_Budget verdict now, off the request path, so the
+        // first write-through PUTs after a start do not wait on it.
+        s3_proxy::cache::kick_staged_range_budget_verdict(&config.cache.cache_dir);
     } else {
         info!("Write cache: disabled");
     }
@@ -342,6 +530,20 @@ async fn main() -> Result<()> {
     // Wire cache manager and connection pool into shutdown coordinator
     shutdown_coordinator.set_cache_manager(cache_manager_ref.clone());
     shutdown_coordinator.set_connection_pool(connection_pool_ref.clone());
+    // The node-local pending-stamp log, read and re-queued before any listener accepts:
+    // from here on this proxy declines stores and fills of every key it holds a pending stamp
+    // for. Its retries start once `HttpProxy::start` has initialized the cache manager, so their
+    // invalidations reach the size accounting.
+    cache_manager_ref.open_stamp_backlog(&config.logging.local_state_dir);
+    {
+        let cache_manager = cache_manager_ref.clone();
+        let mut ready = http_proxy.ready_receiver();
+        tokio::spawn(async move {
+            if ready.wait_for(|ready| *ready).await.is_ok() {
+                cache_manager.start_stamp_backlog_retries();
+            }
+        });
+    }
 
     // Initialize health manager with component references
     let mut health_manager = HealthManager::new();
@@ -361,6 +563,9 @@ async fn main() -> Result<()> {
         config.metrics.per_bucket.max_series,
         config.metrics.per_bucket.bucket_prefixes.clone(),
     );
+    // The background collector's period, and the base of the slow-collection threshold. Already
+    // clamped by `MetricsConfig::validate_and_clamp` during config load.
+    metrics_manager.set_collection_interval(config.metrics.collection_interval);
 
     // Initialize OTLP if enabled
     if let Err(e) = metrics_manager
@@ -384,13 +589,13 @@ async fn main() -> Result<()> {
         .set_metrics_manager(metrics_manager.clone())
         .await;
 
-    // Set cache size tracker on metrics manager for cache_size metrics
-    if let Some(size_tracker) = cache_manager_ref.get_size_tracker().await {
-        metrics_manager
-            .write()
-            .await
-            .set_cache_size_tracker(size_tracker);
-    }
+    // NOTE: there is deliberately no cache-size-tracker wiring step here.
+    // `MetricsManager` reads the tracker through the cache manager at collection
+    // time instead. A wiring step at this point could only ever observe `None`:
+    // the tracker is created by `CacheManager::initialize()`, which runs inside
+    // the `HttpProxy::start()` task spawned further down this function, so it
+    // has not been built yet. That is what made `cache_size` report `null` for
+    // the life of every process from v1.1.x until 2.8.3. Do not reintroduce it.
 
     // Set metrics manager reference on HTTP proxy for signed PUT caching metrics
     http_proxy.set_metrics_manager(metrics_manager.clone());
@@ -428,14 +633,7 @@ async fn main() -> Result<()> {
                     _ = interval.tick() => {
                         // Flush buffered cache-hit updates to journal
                         match buffer.flush().await {
-                            Ok(result) => {
-                                if result.entries_flushed > 0 {
-                                    debug!(
-                                        "Cache hit update buffer flushed: entries={}, duration={}ms",
-                                        result.entries_flushed, result.duration_ms
-                                    );
-                                }
-                            }
+                            Ok(_) => {}
                             Err(e) => {
                                 warn!("Cache hit update buffer flush failed: {}", e);
                             }
@@ -475,7 +673,31 @@ async fn main() -> Result<()> {
             consolidation_interval.as_secs()
         );
         let mut consolidation_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+        // The lock watchdog runs on its own OS thread, so it still fires when a stuck cycle pins
+        // the tokio worker this task runs on. Stopped when the task leaves its loop at shutdown.
+        let lock_watchdog_threshold = consolidator.lock_watchdog_threshold();
+        let lock_watchdog = consolidator.start_lock_watchdog(lock_watchdog_threshold);
+        info!(
+            "Started consolidation lock watchdog (threshold: {}s)",
+            lock_watchdog_threshold.as_secs()
+        );
+        let mut consolidation_ready = http_proxy.ready_receiver();
         let _journal_consolidation_task = tokio::spawn(async move {
+            // The first tick fires immediately, so wait for `CacheManager::initialize` first:
+            // it runs `consolidator.initialize()` (dead-instance journal and temp reaping) and
+            // gives the consolidator its cache-manager and size-tracker refs, without which a
+            // cycle cannot trigger eviction.
+            let ready = tokio::select! {
+                r = consolidation_ready.wait_for(|ready| *ready) => r.is_ok(),
+                _ = consolidation_shutdown.wait_for_shutdown() => false,
+            };
+            if !ready {
+                info!(
+                    "Journal consolidation background task not started: cache initialization did not complete or shutdown came first"
+                );
+                let _ = tokio::task::spawn_blocking(move || lock_watchdog.stop()).await;
+                return;
+            }
             let mut interval = tokio::time::interval(consolidation_interval);
             // Use Delay behavior: if a cycle takes longer than the interval,
             // skip missed ticks rather than bursting to catch up
@@ -491,12 +713,16 @@ async fn main() -> Result<()> {
                                     // No bytes-evicted figure: eviction is a detached task
                                     // (v1.1.35) and has only just been spawned. The figure is
                                     // logged by that task ("Background eviction completed").
+                                    // `write_cache_delta` is last so the existing fields keep
+                                    // their positions; a write-cache-only cycle that triggers
+                                    // eviction otherwise reads `size_delta=+0` with no figure.
                                     info!(
-                                        "Consolidation cycle: entries={}, size_delta={:+}, eviction_triggered={}, total_cache_size={}",
+                                        "Consolidation cycle: entries={}, size_delta={:+}, eviction_triggered={}, total_cache_size={}, write_cache_delta={:+}",
                                         result.entries_consolidated,
                                         result.size_delta,
                                         result.eviction_triggered,
-                                        result.current_size
+                                        result.current_size,
+                                        result.write_cache_delta
                                     );
                                 }
                             }
@@ -511,6 +737,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Joins within one poll interval (at most 1 s), so off the async worker.
+            let _ = tokio::task::spawn_blocking(move || lock_watchdog.stop()).await;
         });
     } else {
         debug!("Journal consolidation disabled (shared storage mode not enabled)");
@@ -518,7 +746,9 @@ async fn main() -> Result<()> {
 
     // Start background DNS refresh task for IP distribution
     // Periodically re-resolves S3 endpoints so the round-robin distributor stays current
-    // as S3 rotates its IP addresses. Uses pool_check_interval from config (default: 10s).
+    // as S3 rotates its IP addresses. Ticks every pool_check_interval (default: 10s); on
+    // each tick `refresh_dns` re-resolves only the endpoints whose dns_refresh_interval
+    // (default: 60s) has elapsed since their last resolution (connection_pool.rs).
     if config.connection_pool.ip_distribution_enabled {
         let dns_refresh_interval = config.connection_pool.pool_check_interval;
         let dns_refresh_client = s3_client_ref.clone();
@@ -639,51 +869,42 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start background orphan recovery system
-    // This recovers orphaned .bin files that aren't tracked in metadata due to journal consolidation lag
-    if config.cache.shared_storage.orphan_recovery_enabled {
-        let hybrid_writer = cache_manager_ref.get_hybrid_metadata_writer().await;
-        if let Some(writer) = hybrid_writer {
+    // Start the background metrics collector.
+    //
+    // One full collection per `metrics.collection_interval`, starting now. `/metrics` requests and
+    // dashboard refreshes serve its latest result for the shared-volume figures and read every
+    // in-process figure live, and it is the only thing that records the OTLP gauges — so without
+    // it, OTLP exported nothing unless something happened to request /metrics.
+    //
+    // Gated on there being a reader: the /metrics listener, the OTLP exporter, or the dashboard.
+    // With none of the three, nothing can observe a collection, so none is paid for. OTLP is a
+    // reader in its own right, deliberately: `metrics.enabled: false` with `otlp.enabled: true` is
+    // the configuration in which a scrape-driven export could never have run at all.
+    //
+    // Bound at THIS scope, like `_health_task` below, so the handle lives as long as the process.
+    // Spawned after the `metrics_manager.write()` wiring calls above, so they cannot queue behind
+    // the first collection's read guard. The one exception is `set_hedge_metrics`, which
+    // `HttpProxy::set_metrics_manager` issues from a task of its own: it may wait for one
+    // collection, once, and new readers queue behind it for that long (tokio's RwLock is fair).
+    // See `spawn_background_collector` for that bound.
+    let _metrics_collector_task =
+        if config.metrics.enabled || config.metrics.otlp.enabled || config.dashboard.enabled {
             info!(
-                "Starting background orphan recovery system (interval: {}s, max_per_cycle: {})",
-                config
-                    .cache
-                    .shared_storage
-                    .orphan_recovery_interval
-                    .as_secs(),
-                config.cache.shared_storage.orphan_max_per_cycle
+                "Starting background metrics collector (interval: {}s)",
+                config.metrics.collection_interval.as_secs()
             );
-
-            let orphaned_recovery = Arc::new(OrphanedRangeRecovery::new(
-                config.cache.cache_dir.clone(),
-                writer,
-            ));
-
-            let recovery_config =
-                BackgroundRecoveryConfig::from_shared_storage_config(&config.cache.shared_storage);
-
-            let mut background_recovery = BackgroundRecoverySystem::new(
-                orphaned_recovery,
-                recovery_config,
-                config.cache.cache_dir.clone(),
-            );
-
-            // Start the background recovery system with shutdown coordinator subscription
-            let recovery_shutdown_rx = shutdown_coordinator.subscribe();
-            if let Err(e) = background_recovery.start(recovery_shutdown_rx).await {
-                error!("Failed to start background orphan recovery system: {}", e);
-            } else {
-                info!("Background orphan recovery system started successfully");
-            }
+            Some(s3_proxy::metrics::spawn_background_collector(
+                metrics_manager.clone(),
+                config.metrics.collection_interval,
+                ShutdownSignal::new(shutdown_coordinator.subscribe()),
+            ))
         } else {
-            warn!("Cannot start orphan recovery: HybridMetadataWriter not available");
-        }
-    } else {
-        debug!(
-            "Background orphan recovery disabled (orphan_recovery_enabled={})",
-            config.cache.shared_storage.orphan_recovery_enabled
-        );
-    }
+            debug!(
+                "Background metrics collector not started: /metrics, OTLP export and the \
+                 dashboard are all disabled"
+            );
+            None
+        };
 
     // Start health and metrics servers if enabled
     let _health_task = if config.health.enabled {
@@ -691,11 +912,14 @@ async fn main() -> Result<()> {
             "Starting health check server on {}:{}",
             config.health.bind_address, config.health.port
         );
-        let health_bind: std::net::IpAddr = config
-            .health
-            .bind_address
-            .parse()
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        // `Config::load` has already required an IP address here; a value that still
+        // fails to parse stops startup rather than widening the bind.
+        let health_bind: std::net::IpAddr = config.health.bind_address.parse().map_err(|_| {
+            s3_proxy::ProxyError::ConfigError(format!(
+                "health.bind_address must be an IP address, got {:?}",
+                config.health.bind_address
+            ))
+        })?;
         let health_addr = SocketAddr::from((health_bind, config.health.port));
         let health_endpoint = config.health.endpoint.clone();
         let health_manager_clone = health_manager.clone();
@@ -722,11 +946,14 @@ async fn main() -> Result<()> {
             "Starting metrics server on {}:{}",
             config.metrics.bind_address, config.metrics.port
         );
-        let metrics_bind: std::net::IpAddr = config
-            .metrics
-            .bind_address
-            .parse()
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        // `Config::load` has already required an IP address here; a value that still
+        // fails to parse stops startup rather than widening the bind.
+        let metrics_bind: std::net::IpAddr = config.metrics.bind_address.parse().map_err(|_| {
+            s3_proxy::ProxyError::ConfigError(format!(
+                "metrics.bind_address must be an IP address, got {:?}",
+                config.metrics.bind_address
+            ))
+        })?;
         let metrics_addr = SocketAddr::from((metrics_bind, config.metrics.port));
         let metrics_endpoint = config.metrics.endpoint.clone();
         let metrics_manager_clone = metrics_manager.clone();
@@ -778,8 +1005,24 @@ async fn main() -> Result<()> {
                 Ok(tls_listener) => {
                     info!("TLS proxy port: {}", tls_config.tls_proxy_port);
                     let tls_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+                    let mut tls_ready = http_proxy.ready_receiver();
                     Some(tokio::spawn(async move {
-                        if let Err(e) = tls_listener.start(tls_shutdown).await {
+                        // Bind now so early clients queue in the backlog, then accept only
+                        // once the HTTP proxy has finished initializing the shared cache.
+                        let listener = match tls_listener.bind().await {
+                            Ok(listener) => listener,
+                            Err(e) => {
+                                error!("TLS proxy listener failed to bind: {}", e);
+                                return;
+                            }
+                        };
+                        if tls_ready.wait_for(|ready| *ready).await.is_err() {
+                            error!(
+                                "TLS proxy listener not started: cache initialization did not complete"
+                            );
+                            return;
+                        }
+                        if let Err(e) = tls_listener.serve(listener, tls_shutdown).await {
                             error!("TLS proxy listener failed: {}", e);
                         }
                     }))
@@ -885,6 +1128,115 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Red side 1 (wiring half): `async_main` spawns the background metrics collector, outside
+    /// any test-only code, before it waits for shutdown, and with the configured interval.
+    ///
+    /// A source pin rather than a behavioural test because `async_main` binds real ports and runs
+    /// until a signal, so it cannot be driven from a unit test. The collector's own behaviour is
+    /// tested in `metrics.rs` (`the_background_collector_collects_without_any_request`); this is
+    /// the half that catches a collector that works and is never started, which is how an orphan
+    /// sweep once ran zero cycles in 458 boots. Red side: removing the spawn call from
+    /// `async_main` fails the first assertion.
+    #[test]
+    fn the_background_metrics_collector_is_spawned_by_async_main() {
+        let source = include_str!("main.rs");
+        let body_start = source
+            .find("async fn async_main()")
+            .expect("async_main must exist");
+        let body_end = source[body_start..]
+            .find("shutdown_task.await")
+            .map(|i| body_start + i)
+            .expect("async_main must await the shutdown task");
+        let body = &source[body_start..body_end];
+        let spawn = body.find("spawn_background_collector(").expect(
+            "async_main must spawn the background metrics collector before it waits for \
+             shutdown; without it OTLP exports nothing unless /metrics is requested, and every \
+             shared-volume figure on /metrics stays at its UNREADABLE sentinel forever",
+        );
+        assert!(
+            body[spawn..].contains("config.metrics.collection_interval"),
+            "the collector must run at the configured metrics.collection_interval"
+        );
+        let test_module = source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("test module marker");
+        assert!(
+            body_start + spawn < test_module,
+            "the spawn must be in production code, not in the test module"
+        );
+    }
+
+    fn os(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    /// `s3-proxy --config <path> retire-instance <id>` parses to the path and the id; a normal
+    /// startup command line is not taken for it; a missing id or config is a usage error.
+    #[test]
+    fn retire_instance_parses_only_when_asked_for() {
+        let parsed = parse_retire_instance(&os(&[
+            "s3-proxy",
+            "--config",
+            "/etc/s3-proxy/config.yaml",
+            "retire-instance",
+            "ip-172-31-34-221:10268",
+        ]))
+        .expect("requested")
+        .expect("valid");
+        assert_eq!(
+            parsed,
+            (
+                "/etc/s3-proxy/config.yaml".to_string(),
+                "ip-172-31-34-221:10268".to_string()
+            )
+        );
+        assert!(
+            parse_retire_instance(&os(&["s3-proxy", "-c", "/etc/s3-proxy/config.yaml"])).is_none()
+        );
+        assert!(parse_retire_instance(&os(&[
+            "s3-proxy",
+            "--config",
+            "/x.yaml",
+            "retire-instance"
+        ]))
+        .expect("requested")
+        .is_err());
+        assert!(
+            parse_retire_instance(&os(&["s3-proxy", "retire-instance", "host:1"]))
+                .expect("requested")
+                .is_err()
+        );
+    }
+
+    /// A refusal exits 1 and writes nothing; a usage error exits 2.
+    #[test]
+    fn retire_instance_exit_codes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "cache:\n  cache_dir: {}\n",
+                tmp.path().join("cache").display()
+            ),
+        )
+        .unwrap();
+        let code = run_retire_instance(Ok((
+            config.display().to_string(),
+            "host-none:1".to_string(),
+        )));
+        assert_eq!(code, 1, "no ledger file names the id, so it is refused");
+        assert!(!tmp
+            .path()
+            .join("cache/metadata/_shard_state/retired_instances")
+            .exists());
+        let code = run_retire_instance(Ok((
+            tmp.path().join("missing.yaml").display().to_string(),
+            "host:1".to_string(),
+        )));
+        assert_eq!(code, 2);
+    }
+
     #[test]
     fn endpoint_rejection_allows_only_get_on_the_configured_path() {
         let allowed = Request::builder()
@@ -915,5 +1267,71 @@ mod tests {
             endpoint_rejection(&wrong_method, "/ready").expect("wrong method must be rejected");
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers().get("allow").unwrap(), "GET");
+    }
+
+    /// The health and metrics listeners share `run_accept_loop`. An accept error, whether a
+    /// per-connection one (ECONNABORTED) or resource exhaustion (EMFILE), must not end the
+    /// listener: the next real connection is still served.
+    ///
+    /// Red side: a loop that propagates the accept error with `?` returns on the first error,
+    /// drops the listener, and the client's connection is never served.
+    #[tokio::test]
+    async fn a_listener_serves_the_next_connection_after_accept_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let loop_task = tokio::spawn(async move {
+            let listener = listener;
+            let mut injected = vec![
+                std::io::Error::from_raw_os_error(libc::EMFILE),
+                std::io::Error::from_raw_os_error(libc::ECONNABORTED),
+            ];
+            let listener = &listener;
+            let injected = &mut injected;
+            run_accept_loop(
+                "Test listener",
+                move || {
+                    let next_error = injected.pop();
+                    async move {
+                        match next_error {
+                            Some(e) => Err(e),
+                            None => listener.accept().await.map(|(stream, _)| stream),
+                        }
+                    }
+                },
+                |mut stream: tokio::net::TcpStream| {
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"served").await;
+                        let _ = stream.shutdown().await;
+                    });
+                },
+                std::future::pending::<()>(),
+            )
+            .await
+        });
+
+        let served = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut client = tokio::net::TcpStream::connect(addr).await?;
+            let mut body = Vec::new();
+            client.read_to_end(&mut body).await?;
+            Ok::<_, std::io::Error>(body)
+        })
+        .await;
+
+        let loop_state = if loop_task.is_finished() {
+            format!("the accept loop had returned: {:?}", loop_task.await)
+        } else {
+            loop_task.abort();
+            "the accept loop was still running".to_string()
+        };
+        match served {
+            Ok(Ok(body)) if body == b"served" => {}
+            other => panic!(
+                "a connection after two accept errors (ECONNABORTED, then EMFILE) was not \
+                 served ({:?}); {}",
+                other, loop_state
+            ),
+        }
     }
 }

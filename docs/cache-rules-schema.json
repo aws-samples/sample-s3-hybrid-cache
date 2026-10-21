@@ -2,17 +2,18 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/aws-samples/sample-s3-hybrid-cache/cache-rules-schema.json",
   "title": "Hybrid Cache for Amazon S3 Cache Rules",
-  "description": "Ordered list of cache rules for Hybrid Cache for Amazon S3. Place this file at cache_dir/cache_rules.json. Each rule matches a glob pattern against the full cache key {bucket}/{object_key} and supplies an optional subset of cache settings. Resolution is first-match-per-field over the ordered rule list: for each field independently, the value is taken from the earliest rule whose pattern matches and which sets that field, falling through to the global YAML cache: defaults. The file is optional and hot-reloadable; when absent or when rules is empty, every field resolves to the global defaults.",
+  "description": "Cache rules for Hybrid Cache for Amazon S3, read from cache_rules.json in cache_dir. Each rule matches a glob pattern against the cache key {bucket}/{object_key} and sets any subset of the settings below. Rules resolve per field. For each field, the first matching rule that sets it supplies the value. A field that no matching rule sets takes its global value: from config.yaml, or the built-in default for a field with no global setting. The file is optional. The proxy re-reads it on the first lookup after cache.bucket_settings_staleness_threshold (default: 60s) has passed. While the file is absent or rules is empty, every key uses the global values.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "$schema": {
       "type": "string",
-      "description": "Optional JSON Schema reference for IDE validation support."
+      "description": "Optional reference to this schema, for validation in an editor."
     },
     "rules": {
       "type": "array",
-      "description": "Ordered list of cache rules. Order is significant: resolution is first-match-per-field, so place specific rules above broad ones. Defaults to an empty list, which makes every field resolve to the global cache: defaults.",
+      "maxItems": 1024,
+      "description": "Ordered list of at most 1024 rules; a file with more fails validation. Order matters: for each field the first matching rule that sets it wins, so put specific rules above broad ones. An empty list leaves every key on the global values.",
       "items": {
         "$ref": "#/definitions/cache_rule"
       }
@@ -21,7 +22,7 @@
   "definitions": {
     "cache_rule": {
       "type": "object",
-      "description": "One cache rule: a required glob pattern plus an optional subset of cache settings to apply when the pattern matches.",
+      "description": "One rule: a required glob pattern and any subset of the settings below.",
       "required": [
         "pattern"
       ],
@@ -30,7 +31,7 @@
         "pattern": {
           "type": "string",
           "minLength": 1,
-          "description": "Glob pattern matched against the full cache key in the form {bucket}/{object_key} (no leading slash). Glob syntax: '*' matches any run of characters except '/' (one path segment), '**' matches any run including '/' (crosses segments), '?' matches exactly one character except '/', and every other character is a literal (regex metacharacters are escaped, so '.' matches only a literal '.'). Patterns are anchored to the whole key (they match only if they match the entire string) and matching is case-sensitive. A leading literal bucket name (e.g. \"mybucket/temp/**\") scopes a rule to one bucket; a leading wildcard (e.g. \"**/logs/**\") matches across all buckets; a wildcard before a literal segment (e.g. \"**/credit-cards/**\") matches that segment anywhere. Must be non-empty. Note: for access points, MRAPs, and S3-compatible hosts the cache key uses a different leading segment ({name}-{account}-s3alias, {alias}.mrap, or the bare normalized path) - see docs/CACHING.md.",
+          "description": "Glob pattern matched against the whole cache key {bucket}/{object_key}, with no leading slash. '*' matches any run of characters except '/', '**' matches any run including '/', and '?' matches one character except '/'. Every other character matches itself, so '.' matches only a dot. Matching is case-sensitive and must cover the whole key. A leading bucket name (\"mybucket/temp/**\") limits a rule to one bucket, a leading '**' (\"**/logs/**\") matches in every bucket, and '**' before a literal segment (\"**/credit-cards/**\") matches that segment at any depth. Must be non-empty. Keys for access points, Multi-Region Access Points and S3-compatible hosts start with a different first segment ({name}-{account}-s3alias, {alias}.mrap, or the bare normalized path); see docs/CACHING.md.",
           "examples": [
             "**",
             "**/logs/**",
@@ -41,8 +42,8 @@
         },
         "get_ttl": {
           "type": "string",
-          "description": "TTL for cached GET responses. Human-readable duration: e.g. \"0s\", \"30s\", \"5m\", \"1h\", \"7d\". Set to \"0s\" to cache on disk but revalidate with S3 on every request (conditional GET with If-Modified-Since / If-None-Match). When \"0s\", range data is excluded from RAM cache (ram_cache_eligible is forced false).",
-          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "description": "How long a cached GET response is served without contacting S3. A duration such as \"0s\", \"30s\", \"5m\", \"1h\" or \"7d\"; a number without a unit is seconds (see docs/CONFIGURATION.md, Duration format). \"0s\" keeps the object on disk but revalidates it with S3 on every request, and keeps its ranges out of the RAM cache (ram_cache_eligible is forced false).",
+          "pattern": "^\\s*[0-9]+(\\.[0-9]+)?\\s*(ms|millis|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)?\\s*$",
           "examples": [
             "0s",
             "30s",
@@ -53,8 +54,8 @@
         },
         "head_ttl": {
           "type": "string",
-          "description": "TTL for cached HEAD responses. Same duration format as get_ttl. Set to \"0s\" to revalidate HEAD responses with S3 on every request.",
-          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "description": "How long a cached HEAD response is served without contacting S3. Same format as get_ttl. \"0s\" revalidates every HEAD with S3.",
+          "pattern": "^\\s*[0-9]+(\\.[0-9]+)?\\s*(ms|millis|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)?\\s*$",
           "examples": [
             "0s",
             "30s",
@@ -64,8 +65,8 @@
         },
         "put_ttl": {
           "type": "string",
-          "description": "TTL for write-cached PUT responses. Controls how long PUT data is retained on disk for subsequent GET requests.",
-          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "description": "How long an object in the write cache stays cached before its first GET, which moves it to get_ttl. Same format as get_ttl.",
+          "pattern": "^\\s*[0-9]+(\\.[0-9]+)?\\s*(ms|millis|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)?\\s*$",
           "examples": [
             "30s",
             "5m",
@@ -75,33 +76,33 @@
         },
         "read_cache_enabled": {
           "type": "boolean",
-          "description": "Enable or disable read caching for GET responses. When false, GET responses are streamed directly from S3 without caching to disk or RAM, and ram_cache_eligible is forced false. Write caching (PUT) is independent. Default: true (from global config)."
+          "description": "Whether GET responses for matching keys are cached. false streams them from S3 without caching them on disk or in RAM, and forces ram_cache_eligible to false. The write cache is set separately. Default: the global cache.read_cache_enabled (true)."
         },
         "write_cache_enabled": {
           "type": "boolean",
-          "description": "Enable or disable write-through caching for PUT operations. When false, PUT requests are forwarded to S3 but not cached locally. Default: from global config."
+          "description": "Whether PUT requests to matching keys are cached in the write cache. false forwards them to S3 without caching them. Default: the global cache.write_cache_enabled (true)."
         },
         "compression_enabled": {
           "type": "boolean",
-          "description": "Enable or disable LZ4 compression for cached data matching this rule, overriding the built-in default denylist in either direction. The proxy already skips compression by default for already-compressed formats (images, videos, archives, documents, executables - see docs/COMPRESSION.md for the full list); use this field to force compression ON for a normally-denylisted extension, force it OFF for a normally-compressible one, or override per-bucket/prefix regardless of extension. When set here, this value wins over the built-in denylist for matching keys. Default: from global config (compression.enabled)."
+          "description": "Whether cached data for matching keys is LZ4-compressed. This overrides the built-in extension denylist in either direction: true compresses a denylisted extension, and false skips a compressible one. The denylist covers formats that are already compressed, such as images, video, archives, documents and executables; docs/COMPRESSION.md has the full list. Default: the global compression.enabled."
         },
         "ram_cache_eligible": {
           "type": "boolean",
-          "description": "Whether range data for matching keys can be stored in RAM cache. Set to false to reserve RAM cache for higher-priority keys. Automatically forced to false when get_ttl is \"0s\" or read_cache_enabled is false. Default: true."
+          "description": "Whether range data for matching keys may be stored in the RAM cache. false keeps the RAM cache for other keys. Forced to false when get_ttl is \"0s\" or read_cache_enabled is false. Default: true."
         },
         "evaluate_conditions_from_cache": {
           "type": "boolean",
-          "description": "Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since) against cached metadata instead of forwarding to S3. When true, the proxy returns 304/412/200 locally from unexpired cache; when false (default), all conditional requests are forwarded to S3 for strict RFC 7232 semantics. Falls back to forward when cache metadata is expired or missing validators."
+          "description": "Whether a GET, range GET or HEAD whose only conditional header is If-Match or If-Range is answered from the cache. With true, an unexpired entry under a non-zero get_ttl whose ETag matches is served without contacting S3; an If-Range validator must strong-match the cached ETag, and a HEAD also needs its cached HEAD entry within head_ttl. Any other conditional header, a mix of conditional headers, a mismatch or a miss is forwarded to S3. With false, every conditional request is forwarded, so S3 decides every precondition. Default: the global cache.evaluate_conditions_from_cache (true)."
         },
         "page_widening": {
           "type": "boolean",
-          "description": "Enables page-aligned range caching (range read widening) for keys matching this rule. When true, an eligible small ranged GET (requested length less than page_size, unsigned Range, no partNumber) is widened to a fixed-size, page-aligned fetch, and the whole page is cached (disk and RAM) instead of only the requested bytes. Off by default and never enabled globally - only via an explicit rule, because amplification is workload-dependent (a large win when reads cluster within a page, e.g. Parquet/ORC footer + column-chunk reads; a cost when reads are scattered). See docs/CACHING.md 'Page-Aligned Range Caching' for the full mechanism. Default: false."
+          "description": "Turns on page-aligned range caching for matching keys. An eligible small range GET (shorter than page_size, with an unsigned Range header and no partNumber) is widened to a fixed-size, page-aligned fetch, and the whole page is cached on disk and in RAM. It is off by default, and only a rule can turn it on, because widening fetches more bytes than the client asked for. Widening helps when reads fall within one page, such as Parquet or ORC footer and column-chunk reads, and adds transfer when reads are scattered. See docs/CACHE_READ_PATHS.md, Page-aligned range caching. Default: false."
         },
         "page_size": {
           "type": "integer",
           "minimum": 1,
           "maximum": 67108864,
-          "description": "Page size in bytes for page-aligned range caching, used only when page_widening is true. Requests are widened to this fixed, offset-0-anchored grid. Must be greater than 0 and at most 67108864 (64 MiB) - a page can never exceed the RAM cache's hardcoded 64 MiB admission ceiling; a rule enabling page_widening with an out-of-range page_size fails validation. Defaults to 16777216 (16 MiB) when page_widening is enabled without specifying this field.",
+          "description": "Page size in bytes for page-aligned range caching; applies only where page_widening is true. Pages sit on a fixed grid that starts at offset 0. Must be greater than 0 and at most 67108864 (64 MiB, the RAM cache's admission ceiling); a rule that turns on page_widening with a page_size outside that range fails validation. Default: 16777216 (16 MiB).",
           "examples": [
             16777216,
             33554432,
@@ -110,12 +111,12 @@
         },
         "hedging_enabled": {
           "type": "boolean",
-          "description": "Enables hedged upstream requests for keys matching this rule. When true and the original upstream fetch has not returned its first byte within hedge_trigger_after, the proxy issues a second identical fetch and serves whichever responds first. Off by default and never enabled globally - only via an explicit rule, because hedging trades bounded duplicate S3 cost for lower tail latency and the right trigger depends on the workload. See docs/HEDGING.md for the mechanism, the cost governor, and when hedging helps."
+          "description": "Turns on hedged upstream requests for matching keys. When the first S3 fetch has not returned its first byte within hedge_trigger_after, the proxy sends a second identical fetch and serves whichever responds first. It is off by default, and only a rule can turn it on, because each hedge is a duplicate S3 request and the right trigger depends on the workload. See docs/HEDGING.md for the cost governor and when hedging helps. Default: false."
         },
         "hedge_trigger_after": {
           "type": "string",
-          "description": "TTFB threshold after which a hedge is issued, used only when hedging_enabled is true. Must be greater than 0 and strictly less than connection_pool.upstream_first_byte_timeout (default 5s); validated on every rules load. Defaults to 250ms when hedging_enabled is true without specifying this field.",
-          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "description": "Time to first byte after which a hedge is sent; applies only where hedging_enabled is true. Must be greater than 0 and less than connection_pool.upstream_first_byte_timeout (default: 5s); checked each time the rules load. Same format as get_ttl. Default: \"250ms\".",
+          "pattern": "^\\s*[0-9]+(\\.[0-9]+)?\\s*(ms|millis|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)?\\s*$",
           "examples": [
             "250ms",
             "500ms",
@@ -125,7 +126,7 @@
         "hedge_max_per_request": {
           "type": "integer",
           "minimum": 0,
-          "description": "Per-request hedge budget: maximum number of hedges per original client request. For a range GET that fans out into N parallel missing-range sub-fetches, this budget is shared across all N (not per sub-fetch). Defaults to 1 when hedging_enabled is true without specifying this field.",
+          "description": "Most hedges per client request. A range GET that fans out into several missing-range fetches shares one budget across all of them. Default: 1.",
           "examples": [
             1,
             2,

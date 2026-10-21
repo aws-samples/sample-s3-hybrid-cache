@@ -20,7 +20,7 @@ fn create_test_cache_manager() -> (CacheManager, TempDir) {
         temp_dir.path().to_path_buf(),
         false, // RAM cache disabled for these tests
         0,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,                                 // compression threshold
         true,                                 // compression enabled
         std::time::Duration::from_secs(3600), // GET_TTL
@@ -158,7 +158,7 @@ async fn test_complete_multipart_upload_bypassed() {
         false, // RAM cache disabled
         0,
         1024 * 1024, // 1MB max cache size - with 10% write cache = ~100KB capacity
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,                                 // compression threshold
         true,                                 // compression enabled
         std::time::Duration::from_secs(3600), // GET_TTL

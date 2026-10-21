@@ -329,13 +329,7 @@ fn test_part_cache_key_all_styles_identical() {
 }
 
 // ============================================================================
-// Unit tests for the expected helper `extract_virtual_hosted_bucket`.
-//
-// The helper does not exist on unfixed code — these tests would not compile.
-// They are commented out per the task instructions. Task 3.3 will uncomment
-// them once the helper lands in task 3.1.
-//
-// TODO(task 3.3): enable after extract_virtual_hosted_bucket lands in src/cache.rs.
+// Unit tests for the helper `extract_virtual_hosted_bucket`.
 //
 // **Validates: Requirements 1.1, 1.2, 1.3, 2.1, 2.2, 3.1**
 // ============================================================================

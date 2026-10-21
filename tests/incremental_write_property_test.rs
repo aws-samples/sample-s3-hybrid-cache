@@ -116,7 +116,8 @@ fn prop_incremental_write_round_trip() {
                         e
                     ));
                 }
-            };
+            }
+            .expect("the capacity guard admits with an unconfigured floor");
 
             // Write each chunk
             for (i, chunk) in chunks.iter().enumerate() {
@@ -257,7 +258,8 @@ fn prop_incremental_write_equivalence_to_single_shot() {
                         e
                     ));
                 }
-            };
+            }
+            .expect("the capacity guard admits with an unconfigured floor");
 
             for (i, chunk) in chunks.iter().enumerate() {
                 if let Err(e) = DiskCacheManager::write_range_chunk(&mut writer, chunk) {

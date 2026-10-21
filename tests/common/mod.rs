@@ -22,12 +22,12 @@
 ///
 /// Lives under `tests/common/` because it is test-support code and because that
 /// directory is already on the mirror copy list in
-/// `.kiro/steering/general-guidance.md` — a new `tests/` subdirectory would be
+/// the repository guidance — a new `tests/` subdirectory would be
 /// invisible to the mirror's `diff -rq` until it changed, which is the exact drift
 /// class that steering file records.
 pub mod graded_fixture;
 
-/// Cache fixtures for `.kiro/specs/expired-entry-revalidation/`.
+/// Cache fixtures for the expired entry revalidation feature.
 ///
 /// Shared rather than duplicated per test file because the spec's tasks 1, 4, 5,
 /// 6 and 7 all need the same three states (Candidate_Available, Stored_Expired,
@@ -123,15 +123,35 @@ impl StubResponse {
         }
     }
 
-    /// Build a 304 Not Modified response. S3 returns 304 with the ETag and
-    /// Last-Modified of the current object but no body.
+    /// Build a 304 Not Modified response carrying no headers.
     ///
-    /// This constructor carries NO headers at all — it is therefore ALREADY the
-    /// "304 without Last-Modified" case R4/R11.5 need, and R11.5 explicitly
-    /// forbids adding a `last-modified` header here: doing so would remove the
-    /// only way to test R4 through this shared helper. Callers that need a
-    /// realistic `304` (ETag plus Last-Modified) should chain `.with_header(...)`
-    /// themselves, or use [`Self::not_modified_with_last_modified`] below.
+    /// Because it carries NO headers at all, this is ALREADY the "304 without
+    /// `Last-Modified`" case `write-cache-last-modified` R4/R11.5 need, and
+    /// R11.5 explicitly forbids adding a `last-modified` header here: doing so
+    /// would remove the only way to test R4 through this shared helper. A caller
+    /// wanting a realistic `304` (ETag plus `Last-Modified`) should chain
+    /// `.with_header(...)` itself, or use
+    /// `expired_fixture::not_modified_with_last_modified`.
+    ///
+    /// NOTE: despite RFC 9110 §15.4.5 (a 304 carries the validators a 200 would
+    /// have sent), and despite real S3 doing exactly that (measured 2026-08-31,
+    /// `expired-entry-revalidation` R8), this constructor deliberately does
+    /// NOT populate an `ETag`. Two call shapes need to stay distinguishable:
+    ///
+    /// - A test asserting the STATUS-only mainline behaviour a caller does not
+    ///   care about the ETag for (most existing callers).
+    /// - `src/revalidation.rs`'s `classify()`, which is `Undetermined` whenever
+    ///   the response carries no comparable ETag — so a caller that DOES
+    ///   depend on the 304 being read as `Current` (i.e. anything reaching a
+    ///   `serve_*_validated` helper's 304 arm after 2.8.4/2.8.5) must use
+    ///   [`Self::not_modified_with_etag`] instead. Using the bare form there
+    ///   fails with the response falling into the "unexpected status" arm
+    ///   rather than the 304 arm — see
+    ///   `download_coordination_validated_serve_unit_test.rs`'s
+    ///   `range_validated_serve_304_serves_cached_range` and
+    ///   `part_validated_serve_304_serves_cached_part`, both of which hit
+    ///   exactly this when 2.8.5 landed and were switched to the `_with_etag`
+    ///   form.
     pub fn not_modified() -> Self {
         Self {
             status: StatusCode::NOT_MODIFIED,
@@ -140,23 +160,13 @@ impl StubResponse {
             delay: Duration::ZERO,
         }
     }
-
-    /// Build a 304 Not Modified response carrying a `Last-Modified` header, for
-    /// the happy-path backfill tests (R3.1, R3.3).
-    ///
-    /// A DISTINCT constructor from [`Self::not_modified`], per R11.5: adding the
-    /// header to the existing helper instead would remove the only way to
-    /// express R4's undurable case (an origin that never returns
-    /// `Last-Modified` on a `304`) through this shared harness.
-    ///
-    /// Spec: write-cache-last-modified. Requirements: 11.5 (task 5.1)
-    pub fn not_modified_with_last_modified(last_modified: &str) -> Self {
-        Self {
-            status: StatusCode::NOT_MODIFIED,
-            headers: HashMap::from([("last-modified".to_string(), last_modified.to_string())]),
-            body: None,
-            delay: Duration::ZERO,
-        }
+    /// Build a 304 Not Modified response carrying `etag`, matching what real
+    /// S3 actually sends (RFC 9110 §15.4.5, measured against S3 2026-08-31).
+    /// Use this whenever the code under test reads the response's ETag to
+    /// decide cache currency (`src/revalidation.rs::classify`) rather than
+    /// trusting the `304` status alone.
+    pub fn not_modified_with_etag(etag: impl Into<String>) -> Self {
+        Self::not_modified().with_header("etag", etag)
     }
 
     /// Build a 403 Forbidden response. Used to simulate a waiter whose
@@ -231,7 +241,8 @@ impl StubResponse {
 
 /// Builder-style [`S3ClientApi`] stub for in-process tests.
 ///
-/// Matching order: first by exact `If-None-Match` value, then by exact
+/// Matching order: first by exact `If-Match` value (only when a rule is
+/// configured for it), then by exact `If-None-Match` value, then by exact
 /// `Range` value, then by exact `authorization` header value, then the global
 /// default. If no match and no default is configured, a 500 Internal Server
 /// Error is returned so the test fails loudly.
@@ -245,6 +256,9 @@ struct StubInner {
     range_responses: Mutex<HashMap<String, StubResponse>>,
     etag_responses: Mutex<HashMap<String, StubResponse>>,
     auth_responses: Mutex<HashMap<String, StubResponse>>,
+    /// Routed on the exact `If-Match` value, checked before every other rule.
+    /// Models S3 answering a pinned request for a version it no longer holds.
+    if_match_responses: Mutex<HashMap<String, StubResponse>>,
     default_response: Mutex<Option<StubResponse>>,
     /// Defaults to a disabled ledger (matching the trait's default impl), but
     /// can be overridden via [`StubS3Client::with_inflight_ledger`] so
@@ -270,6 +284,7 @@ impl StubS3Client {
                 range_responses: Mutex::new(HashMap::new()),
                 etag_responses: Mutex::new(HashMap::new()),
                 auth_responses: Mutex::new(HashMap::new()),
+                if_match_responses: Mutex::new(HashMap::new()),
                 default_response: Mutex::new(None),
                 inflight_ledger: Mutex::new(Arc::new(
                     s3_proxy::inflight_ledger::InflightLedger::disabled(),
@@ -289,6 +304,21 @@ impl StubS3Client {
             .inflight_ledger
             .lock()
             .expect("stub inflight_ledger poisoned") = ledger;
+        self
+    }
+
+    /// Route requests that carry exactly this `If-Match` value to `response`.
+    /// Checked before every other rule; requests without `If-Match` skip it.
+    pub fn with_response_for_if_match(
+        self,
+        if_match: impl Into<String>,
+        response: StubResponse,
+    ) -> Self {
+        self.inner
+            .if_match_responses
+            .lock()
+            .expect("stub if-match map poisoned")
+            .insert(if_match.into(), response);
         self
     }
 
@@ -356,6 +386,23 @@ impl StubS3Client {
     }
 
     fn resolve_response(&self, context: &S3RequestContext) -> StubResponse {
+        if let Some(if_match) = context
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("if-match"))
+            .map(|(_, v)| v)
+        {
+            if let Some(resp) = self
+                .inner
+                .if_match_responses
+                .lock()
+                .expect("stub if-match map poisoned")
+                .get(if_match)
+            {
+                return resp.clone();
+            }
+        }
+
         // A conditional response models the revalidation request that precedes
         // any hole fetch.
         if let Some(etag) = context
@@ -500,6 +547,16 @@ impl S3ClientApi for StubS3Client {
             .or_else(|| headers.get("Content-Length"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        // As production does (`S3Client::extract_object_metadata_from_response`): a range
+        // response names the object's length in the `Content-Range` total, not in its own
+        // `Content-Length`, which is the length of the part.
+        let content_length = headers
+            .get("content-range")
+            .or_else(|| headers.get("Content-Range"))
+            .and_then(|v| v.strip_prefix("bytes "))
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(content_length);
         let content_type = headers
             .get("content-type")
             .or_else(|| headers.get("Content-Type"))
@@ -633,7 +690,7 @@ pub fn seed_validation_metadata(cache_dir: &std::path::Path) {
 /// # Why this exists
 ///
 /// `CacheManager::store_write_cache_entry` was the production write-through entry
-/// point once — `.kiro/specs/archived/unified-range-write-cache/` records rewiring it
+/// point once — the unified range write cache feature records rewiring it
 /// onto `store_full_object_as_range` — and production later moved to
 /// `SignedPutHandler` without the tests following, so most of the write-cache suite
 /// asserted things about a path customers never took. **It has since been deleted**

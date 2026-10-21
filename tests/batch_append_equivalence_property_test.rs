@@ -67,6 +67,8 @@ impl Arbitrary for ArbitraryJournalEntry {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         let entry = JournalEntry {
@@ -81,6 +83,7 @@ impl Arbitrary for ArbitraryJournalEntry {
             object_ttl_secs: None,
             access_increment,
             object_metadata: None,
+            fill_witness: None,
         };
 
         ArbitraryJournalEntry(entry)

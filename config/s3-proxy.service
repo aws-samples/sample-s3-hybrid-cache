@@ -1,6 +1,14 @@
 [Unit]
-Description=S3 Proxy Service
+Description=Hybrid Cache for Amazon S3
 After=network.target
+
+# Order after the cache and config mounts, and keep the same paths as
+# ReadWritePaths below. Without this the proxy can start before a network mount
+# is ready, create cache_dir on the root file system underneath the mount point,
+# and cache to local disk while reporting healthy; the mount then hides that
+# data. If you point the paths at local directories, systemd finds no mount unit
+# for them and the dependency does nothing.
+RequiresMountsFor=/mnt/cache /mnt/nfs
 
 [Service]
 Type=simple
@@ -9,9 +17,10 @@ Restart=on-failure
 RestartSec=5
 
 # --- Privilege model ---
-# The proxy runs as root to bind ports 80/443. If your deployment uses
-# proxy-only mode (port 3128) or a load balancer that owns 80/443, switch
-# to User=s3proxy / Group=s3proxy and add:
+# The proxy runs as root so that it can bind ports 80 and 443. To run it as a
+# dedicated user instead, set User=s3proxy and Group=s3proxy. In proxy-only
+# mode (port 3128), or when every listener uses an unprivileged port, that is
+# all. To keep binding ports 80 and 443 as that user, also add:
 #   AmbientCapabilities=CAP_NET_BIND_SERVICE
 #   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 User=root
@@ -27,10 +36,22 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
-# --- Filesystem allowlist ---
-# Adjust these paths to match your config.yaml cache_dir and log directories.
-# The proxy needs read-write access to the cache and log directories only.
-ReadWritePaths=/var/cache/s3-proxy /var/log/s3-proxy
+# --- File system allowlist ---
+# Adjust these paths to match the cache_dir and log directories in config.yaml.
+# The proxy needs read-write access to the cache and log directories, plus the
+# state directory below, and nothing else.
+#
+# ProtectSystem=strict makes everything else read-only, so a path missing here
+# fails at write time rather than at startup: the service comes up, then cannot
+# write a log or a cache file. There are two mounts because the cache volume is
+# best kept on its own file system; see the cache_dir comment in
+# docs/examples/config-production.yaml. These paths match that file; on AWS the
+# volumes are named differently (docs/examples/userdata-efs.sh, userdata-fsxz.sh).
+ReadWritePaths=/mnt/cache /mnt/nfs
+# /var/lib/s3-proxy, writable under ProtectSystem=strict: the default
+# logging.local_state_dir, which holds the host-local pending-stamp log. It must be
+# on the instance's own volume, never the cache volume.
+StateDirectory=s3-proxy
 
 # --- Logging ---
 StandardOutput=journal

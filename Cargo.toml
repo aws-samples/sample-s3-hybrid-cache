@@ -1,10 +1,16 @@
 [package]
 name = "s3-proxy"
-version = "2.8.4"
+version = "3.0.0"
 edition = "2021"
-# MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
-# Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
+# MSRV. `time` and `hickory-{resolver,proto,net}` declare rust-version = "1.88", so the floor
+# cannot go below 1.88 whatever this crate does. 1.89 is retained rather than lowered to 1.88:
+# the one-release gain does not justify carrying an obligation to keep a 1.88 release build green.
 rust-version = "1.89"
+# Test targets are declared explicitly below (the [[test]] block at the end of this file), not
+# auto-discovered from tests/*.rs. A test file must be a module of one tests/group_*.rs binary or
+# have a [[test]] entry of its own; a file in neither place is never built or run. Why: linking 255
+# opt-level-3 test crates, each with the whole library, dominates the time of a full test run.
+autotests = false
 
 [dependencies]
 # Async runtime and HTTP server
@@ -25,8 +31,6 @@ ring = "0.17"
 # rustls-native-certs: OS trust store loader (0.8 drops rustls-pemfile dep, resolves RUSTSEC-2025-0134)
 rustls-native-certs = "0.8"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-time = { version = "0.3", features = ["macros"] }
-webpki-roots = "0.26"
 
 # Service abstraction for connection pooling (used by CustomHttpsConnector in https_connector.rs)
 tower = "0.5"
@@ -44,7 +48,7 @@ twox-hash = "2.1.2"
 blake3 = "1.5"
 
 # File locking for shared cache coordination
-fs2 = "0.4"
+fs4 = "1.1"
 
 # Logging
 tracing = "0.1"
@@ -80,7 +84,6 @@ hostname = "0.3"
 libc = "0.2"
 httpdate = "1.0"
 urlencoding = "2.1"
-sha2 = "0.10"
 percent-encoding = "2.3"
 regex = "1.0"
 fastrand = "2.0"
@@ -115,22 +118,20 @@ opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-semantic-conventions = "0.32"
 
-# Platform-specific dependencies
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "handleapi", "winnt"] }
 
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }  # start_paused and time::pause in tests; tokio-test used to enable this
 tempfile = "3.0"
-tokio-test = "0.4"
 filetime = "0.2"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
 rcgen = "0.13"
 hex = "0.4"
-ureq = "2.9"  # For health check HTTP requests in tests
+sha2 = "0.10"  # Content digests in tests only; production code never hashes with it
+webpki-roots = "1"  # Unit tests in https_connector.rs only; production trusts the OS store
 opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio", "testing"] }  # testing enables InMemoryMetricExporter
 
 [[example]]
@@ -173,7 +174,7 @@ lto = false
 # biggest contributor to the link's peak RSS and was OOM-SIGKILLing the link on
 # memory-constrained machines. line-tables-only keeps panic backtraces with
 # file:line while dropping the heavy variable/type DWARF. Pair with
-# CARGO_INCREMENTAL=0 for local runs (see .kiro/steering/testing.md).
+# CARGO_INCREMENTAL=0 for local runs.
 debug = "line-tables-only"
 
 [profile.bench]
@@ -186,3 +187,208 @@ lto = false
 [profile.release]
 lto = false
 codegen-units = 16
+
+# ─── Test targets: group binaries, so a test run links a few dozen crates and not 255 ───
+# `autotests = false` turns off cargo's automatic one-target-per-tests/*.rs rule, which made every
+# test run compile and link 255 opt-level-3 crates that each link the whole library.
+# Each `group_*` target compiles many tests/*.rs files as modules of one binary; the files do not
+# move and their contents are unchanged. The targets listed after the groups keep their own
+# process because their verdict depends on state shared by the whole process (a #[global_allocator],
+# a global tracing subscriber, a process-global counter or a process-wide _for_tests seam) or on a
+# timing budget, so a second file in the same binary could perturb them. The comment above each
+# gives the reason.
+#
+# A new tests/*.rs file is NOT picked up automatically. Register it in one of two ways: add a
+# `#[path = "<file>.rs"]` / `mod <stem>;` pair to the tests/group_*.rs for its subject, or, if it
+# holds process-global state, give it a [[test]] entry below with the reason as a comment.
+[[test]]
+name = "group_config"
+path = "tests/group_config.rs"
+
+[[test]]
+name = "group_eviction"
+path = "tests/group_eviction.rs"
+
+[[test]]
+name = "group_journal"
+path = "tests/group_journal.rs"
+
+[[test]]
+name = "group_keys"
+path = "tests/group_keys.rs"
+
+[[test]]
+name = "group_metrics"
+path = "tests/group_metrics.rs"
+
+[[test]]
+name = "group_multipart"
+path = "tests/group_multipart.rs"
+
+[[test]]
+name = "group_other"
+path = "tests/group_other.rs"
+
+[[test]]
+name = "group_ramtier"
+path = "tests/group_ramtier.rs"
+
+[[test]]
+name = "group_readpath"
+path = "tests/group_readpath.rs"
+
+[[test]]
+name = "group_revalidation"
+path = "tests/group_revalidation.rs"
+
+[[test]]
+name = "group_write"
+path = "tests/group_write.rs"
+
+# Isolated targets: one binary each, reason per line.
+# buffered_serve_memory_bound_test: #[global_allocator] at :97 (one per binary) and process-global buffered_serve_*_total() counters
+[[test]]
+name = "buffered_serve_memory_bound_test"
+path = "tests/buffered_serve_memory_bound_test.rs"
+
+# cache_logging_test: installs a global tracing subscriber with a capturing layer and asserts captured log lines
+[[test]]
+name = "cache_logging_test"
+path = "tests/cache_logging_test.rs"
+
+# cache_lookup_diagnostic_test: installs a global tracing subscriber
+[[test]]
+name = "cache_lookup_diagnostic_test"
+path = "tests/cache_lookup_diagnostic_test.rs"
+
+# connection_keepalive_benchmark: asserts a requests-per-second comparison between two connection modes; the group's parallelism is that measurement's noise floor
+[[test]]
+name = "connection_keepalive_benchmark"
+path = "tests/connection_keepalive_benchmark.rs"
+
+# consolidation_cycle_cost_scaling_test: its own doc comment at :23 requires --test-threads=1 because both tests drive process-global st_size pass state
+[[test]]
+name = "consolidation_cycle_cost_scaling_test"
+path = "tests/consolidation_cycle_cost_scaling_test.rs"
+
+# eviction_activity_set_traversal_test: FAILED 2/3 grouped and passed 3/3 filtered to its own tests in the same binary: asserts a journal-set read count against a ceiling of 2, and the group's neighbours push it to 3
+[[test]]
+name = "eviction_activity_set_traversal_test"
+path = "tests/eviction_activity_set_traversal_test.rs"
+
+# eviction_lock_performance_test: FAILED grouped: asserts a stale-lock-check duration budget, which the group's intra-binary parallelism overruns
+[[test]]
+name = "eviction_lock_performance_test"
+path = "tests/eviction_lock_performance_test.rs"
+
+# hedged_fetch_wiring_test: hedged_fetch::get_global_metrics() process-global singleton; first init enables hedging for the whole process; negative assertions
+[[test]]
+name = "hedged_fetch_wiring_test"
+path = "tests/hedged_fetch_wiring_test.rs"
+
+# invalidate_meta_slot_lock_test: mutates the same process-global slot acquire wait budget (set_slot_acquire_wait_budget)
+[[test]]
+name = "invalidate_meta_slot_lock_test"
+path = "tests/invalidate_meta_slot_lock_test.rs"
+
+# maintenance_passes_off_cycle_test: FAILED grouped, passes alone: times the first consolidation cycle, which is the same process-global st_size fold cadence
+[[test]]
+name = "maintenance_passes_off_cycle_test"
+path = "tests/maintenance_passes_off_cycle_test.rs"
+
+# metadata_lock_metrics_test: reads the same process-global metadata_lock_* counters
+[[test]]
+name = "metadata_lock_metrics_test"
+path = "tests/metadata_lock_metrics_test.rs"
+
+# multipart_write_cache_signed_range_race_e2e: installs a global tracing subscriber and sets process-wide _for_tests seams
+[[test]]
+name = "multipart_write_cache_signed_range_race_e2e"
+path = "tests/multipart_write_cache_signed_range_race_e2e.rs"
+
+# origin_marker_test: origin_identity module-level bypass counters, asserted by equality
+[[test]]
+name = "origin_marker_test"
+path = "tests/origin_marker_test.rs"
+
+# permit_lifetime_integration_test: reads the process-global monotonic permits_held_peak() high-water mark (its own doc comment at :632)
+[[test]]
+name = "permit_lifetime_integration_test"
+path = "tests/permit_lifetime_integration_test.rs"
+
+# put_pre_body_awaits_bounded_test: the origin-marker claim it stalls is first-write-per-bucket-per-process
+[[test]]
+name = "put_pre_body_awaits_bounded_test"
+path = "tests/put_pre_body_awaits_bounded_test.rs"
+
+# ram_verify_ioerror_logging_test: installs a global tracing subscriber
+[[test]]
+name = "ram_verify_ioerror_logging_test"
+path = "tests/ram_verify_ioerror_logging_test.rs"
+
+# slot_lock_guard_conversion_test: reads metadata_lock_*_total() globals and sets the process-global slot acquire wait budget
+[[test]]
+name = "slot_lock_guard_conversion_test"
+path = "tests/slot_lock_guard_conversion_test.rs"
+
+# st_size_fold_cold_volume_start_test: FAILED grouped, passes alone: the st_size fold cadence is process-global (st_size_fold.rs LAST_FOLD_COMPLETED_SECS), so a neighbour's fold makes the volume look fresh
+[[test]]
+name = "st_size_fold_cold_volume_start_test"
+path = "tests/st_size_fold_cold_volume_start_test.rs"
+
+# st_size_fold_enumeration_failure_retry_test: FAILED grouped, passes alone: same process-global st_size fold cadence
+[[test]]
+name = "st_size_fold_enumeration_failure_retry_test"
+path = "tests/st_size_fold_enumeration_failure_retry_test.rs"
+
+# st_size_fold_restart_cadence_test: FAILED grouped, passes alone: same process-global st_size fold cadence
+[[test]]
+name = "st_size_fold_restart_cadence_test"
+path = "tests/st_size_fold_restart_cadence_test.rs"
+
+# st_size_fold_seed_jitter_test: FAILED grouped, passes alone: same process-global st_size fold cadence
+[[test]]
+name = "st_size_fold_seed_jitter_test"
+path = "tests/st_size_fold_seed_jitter_test.rs"
+
+# st_size_fold_test: calls run_st_size_fold directly, which writes the same process-global cadence statics the six above read
+[[test]]
+name = "st_size_fold_test"
+path = "tests/st_size_fold_test.rs"
+
+# st_size_fold_wiring_test: FAILED grouped, passes alone: same process-global st_size fold cadence, reached through a consolidation cycle
+[[test]]
+name = "st_size_fold_wiring_test"
+path = "tests/st_size_fold_wiring_test.rs"
+
+# write_through_headers_and_multipart_test: FAILED grouped, passes alone: await_meta's bounded fixture wait is overrun by the group's wider intra-binary parallelism
+[[test]]
+name = "write_through_headers_and_multipart_test"
+path = "tests/write_through_headers_and_multipart_test.rs"
+
+# volume_stall_breaker_test: sets the process-global volume-stall statics (set_probe_fails_for_tests)
+[[test]]
+name = "volume_stall_breaker_test"
+path = "tests/volume_stall_breaker_test.rs"
+
+# abandoned_stamp_retry_test: set_write_stamp_retry_bounds_for_tests sets process-wide retry bounds
+[[test]]
+name = "abandoned_stamp_retry_test"
+path = "tests/abandoned_stamp_retry_test.rs"
+
+# abandoned_stamp_peer_test: set_write_stamp_retry_bounds_for_tests sets process-wide retry bounds
+[[test]]
+name = "abandoned_stamp_peer_test"
+path = "tests/abandoned_stamp_peer_test.rs"
+# wrong_bytes_serve_path_test: three negative assertions whose verdict is "no .meta appeared within a bounded wait", which the group's wider intra-binary parallelism can push a store past, turning a live defect green
+[[test]]
+name = "wrong_bytes_serve_path_test"
+path = "tests/wrong_bytes_serve_path_test.rs"
+# offset_shifted_range_entry_test: each test's fixture precondition is a bounded wait on a .meta appearing (or, for the journal arm, on one NOT appearing), which the group's wider intra-binary parallelism can push a fold past, turning a live defect green
+[[test]]
+name = "offset_shifted_range_entry_test"
+path = "tests/offset_shifted_range_entry_test.rs"
+# download_coordination_bug_condition_property_test: prop_case_b_expired_cache_stampede and prop_expired_flight_single_authoritative failed in grouped gates under load (on several runs) and pass alone (3 of 3 runs); the group's wider intra-binary parallelism is the difference. Whether the second authoritative round-trip is a product race under load is open
+[[test]]
+name = "download_coordination_bug_condition_property_test"
+path = "tests/download_coordination_bug_condition_property_test.rs"

@@ -1,4 +1,4 @@
-//! Design tests 12 and 13 of `.kiro/specs/write-cache-accounting-and-eviction/design.md`,
+//! Design tests 12 and 13 of the write cache accounting and eviction feature,
 //! plus the cross-instance test the design specifies alongside them (spec task 38).
 //!
 //! These three live together because they need the same thing the inline `src/cache.rs`
@@ -50,7 +50,7 @@ fn manager(cache_dir: &Path, max_cache_size: u64) -> CacheManager {
         false, // RAM cache disabled: it would hold a second copy of the bytes and
         0,     // complicate the size assertions without testing anything here.
         max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,                           // compression_threshold
         true,                           // compression_enabled
         Duration::from_secs(315360000), // get_ttl (~10 years)
@@ -88,7 +88,7 @@ fn manager_with_journal(cache_dir: &Path, max_cache_size: u64) -> CacheManager {
 /// turns on. `last_accessed` is backdated past the admission window so the range is
 /// collectable, and `access_count` is left at the `RangeSpec::new` default of 1 — which is
 /// what a never-read write-through range genuinely carries in production (see open
-/// question 6 in `.kiro/specs/cache-eviction-at-scale/discussion.md`).
+/// question 6 in the cache eviction at scale feature).
 ///
 /// Returns `(meta_path, bin_path, compressed_size)`.
 fn seed_object(
@@ -435,6 +435,142 @@ mod read_tier_covers_staged_entries {
              its Graduation entry — debiting here as well double-counts into undershoot"
         );
     }
+
+    /// **RE-EXPRESSED.** The same property as the test above, asserted
+    /// against the **fold's own summand** instead of against the incremental accumulator's
+    /// flushed delta.
+    ///
+    /// # Why the re-expression is an addition and not a replacement
+    ///
+    /// U5 classified `an_unstaged_entry_debits_the_total_only` RE-EXPRESS on the reading that
+    /// the incremental write-cache debit was being deleted outright. It is not: design
+    /// § 16.6.6's Phase L requires a C-capable binary to maintain the incumbent counter
+    /// **exactly as today** for the whole upgrade window, because a mixed fleet must have one
+    /// authority and that authority is the incumbent's. So the accumulator-delta assertion
+    /// above still guards live code, on every fleet, until the release that removes Phase L —
+    /// and deleting it would have removed coverage of the path that runs today.
+    ///
+    /// What the re-expression adds is the same claim stated in the terms the fold uses, so it
+    /// survives the deletion of the accumulator whenever that comes:
+    ///
+    /// - the retired form asked "did `subtract_write_cache` fire?"
+    /// - this form asks "does the **remaining `.meta` state** still classify the same staged
+    ///   bytes?"
+    ///
+    /// The second question is the one that matters under C, because `write_cache_size` is a
+    /// recomputation over exactly that state — `staged_compressed_size()` is the function the
+    /// fold sums, so this asserts the fold's input directly rather than an event that used to
+    /// stand in for it.
+    ///
+    /// # The fixture makes the two figures diverge
+    ///
+    /// Two objects, one staged and one not, at **different** sizes so a swapped assertion
+    /// cannot land on the right answer. Eviction removes the unstaged one. The fold's summand
+    /// over what remains must be unchanged — it counted only the staged object to begin with —
+    /// while the on-disk byte total falls. Equal sizes would make "unchanged" and "fell by the
+    /// evicted size" the same arithmetic for the staged figure whenever the code was wrong in
+    /// the obvious way.
+    ///
+    /// A failure implicates `is_staged_range_spec` / `staged_compressed_size` in
+    /// `src/cache_types.rs` and read-tier eviction's Step 5 candidate selection: a staged
+    /// object whose `.meta` was disturbed by an unstaged object's eviction would change the
+    /// fold's answer without any debit being involved at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evicting_an_unstaged_range_leaves_the_folds_staged_summand_untouched() {
+        let temp = TempDir::new().unwrap();
+        let m = manager_with_journal(temp.path(), 40 * 1024);
+        // Deliberately different sizes.
+        const READ_SIZE: usize = 64 * 1024;
+        const STAGED_SIZE: usize = 16 * 1024;
+
+        let (staged_meta, staged_bin, staged_compressed) = seed_object(
+            temp.path(),
+            "test-bucket/staged-survivor.bin",
+            STAGED_SIZE,
+            true,
+        );
+        let (_, read_bin, read_compressed) = seed_object(
+            temp.path(),
+            "test-bucket/read-evictee.bin",
+            READ_SIZE,
+            false,
+        );
+
+        // Make the staged object the NEWEST, so TinyLFU's recency tiebreak (equal access_count)
+        // reaches the read object first
+        // and stops once the target is met.
+        //
+        // `seed_object` backdates every range identically, which leaves the eviction order
+        // between two objects arbitrary — and the first version of this test failed on exactly
+        // that: the staged object was reclaimed too and the fixture precondition below fired.
+        // That is not a defect in eviction (read-tier eviction reclaiming a staged entry is
+        // correct, and the sibling test above asserts it does), it is a fixture that did not
+        // control which object it was measuring. Read-tier eviction reclaiming BOTH would make
+        // the summand fall for a legitimate reason and the assertion would be measuring
+        // eviction's appetite rather than the fold's classification.
+        {
+            let mut metadata: s3_proxy::cache_types::NewCacheMetadata =
+                serde_json::from_str(&std::fs::read_to_string(&staged_meta).unwrap()).unwrap();
+            let now = SystemTime::now();
+            metadata.created_at = now;
+            for range in &mut metadata.ranges {
+                range.created_at = now;
+                range.last_accessed = now;
+            }
+            std::fs::write(&staged_meta, serde_json::to_string(&metadata).unwrap()).unwrap();
+        }
+
+        /// The fold's summand for one object, read through the exact predicate the fold uses.
+        fn staged_summand(meta_path: &std::path::Path) -> u64 {
+            let metadata: s3_proxy::cache_types::NewCacheMetadata =
+                serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
+            metadata.staged_compressed_size()
+        }
+
+        // Fixture preconditions. Both are load-bearing: a staged summand of zero would make
+        // "unchanged" vacuous, and equal sizes would make a wrong answer look right.
+        let summand_before = staged_summand(&staged_meta);
+        assert_eq!(
+            summand_before, staged_compressed,
+            "fixture: the staged object must contribute its compressed size to the fold"
+        );
+        assert!(
+            summand_before > 0,
+            "fixture: the fold's summand must be non-zero before eviction"
+        );
+        assert_ne!(
+            staged_compressed, read_compressed,
+            "fixture: the two objects must differ in size, or an assertion that read the \
+             wrong one could still land on the right number"
+        );
+
+        // Over bound on the read tier only. The staged object is not a candidate.
+        seed_size_state(&m, (READ_SIZE + STAGED_SIZE) as u64, staged_compressed).await;
+
+        let freed = m.enforce_disk_cache_limits().await.unwrap();
+        assert!(
+            !read_bin.exists(),
+            "the unstaged range must be the one evicted"
+        );
+        assert!(
+            staged_bin.exists(),
+            "fixture: the staged range must survive, or this asserts nothing about what \
+             eviction left behind"
+        );
+        assert_eq!(freed, read_compressed, "the freed figure is the read range");
+
+        // THE ASSERTION. The fold recomputes from `.meta` state, so the question is whether
+        // that state still says the same thing — not whether an event fired.
+        assert_eq!(
+            staged_summand(&staged_meta),
+            summand_before,
+            "evicting an UNSTAGED range must leave the fold's staged summand unchanged. \
+             Under decision C write_cache_size is a recomputation over exactly this figure, \
+             so a change here is a change to the staged tier's residency with no debit \
+             involved — which is the failure the retired accumulator-delta assertion could \
+             not see."
+        );
+    }
 }
 
 /// Spec task 38: the cross-instance test, constructed so local hygiene cannot pass it.
@@ -616,6 +752,131 @@ mod cross_instance_eviction_targeting {
              data this instance never staged. The retired candidate walk scanned the \
              shared metadata/ tree with no ownership filter and deleted exactly this \
              class of object — demonstrated live on 2026-08-24"
+        );
+    }
+}
+
+/// R13-RED-SIDE: the fold's staged summand, asserted where only a post-eviction defect can
+/// move it.
+///
+/// `evicting_an_unstaged_range_leaves_the_folds_staged_summand_untouched` puts the staged
+/// and unstaged ranges in two different objects, so eviction never rewrites the staged
+/// object's `.meta`. A defect confined to eviction's `.meta` rewrite therefore cannot reach
+/// its headline assertion, and neutering `staged_compressed_size` fires on the fixture
+/// precondition first. This test puts both ranges in ONE object, so read-tier eviction of the
+/// unstaged range takes the partial-object branch of `batch_delete_ranges_expecting`
+/// (`src/disk_cache.rs`, the `retain` followed by `rewrite_metadata_file`) and the surviving
+/// staged range is re-serialised. The assertion reads `staged_compressed_size()`, the
+/// figure the fold sums, on that rewritten document.
+mod r13_headline_mixed_object {
+    use super::*;
+
+    /// Seed one object with two ranges: `[0, staged_len)` staged and hot, and
+    /// `[staged_len, staged_len + read_len)` explicitly unstaged and backdated past the
+    /// admission window. Returns `(meta_path, staged_bin, read_bin)`.
+    fn seed_mixed_object(
+        cache_dir: &Path,
+        cache_key: &str,
+        staged_len: u64,
+        read_len: u64,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let ranges_dir = cache_dir.join("ranges");
+        let backdated = SystemTime::now() - BACKDATE;
+        let now = SystemTime::now();
+        let mut ranges = Vec::new();
+        let mut bins = Vec::new();
+        for (start, len, staged, at) in [
+            (0u64, staged_len, true, now),
+            (staged_len, read_len, false, backdated),
+        ] {
+            let end = start + len - 1;
+            let bin = get_sharded_path(&ranges_dir, cache_key, &format!("_{}-{}.bin", start, end))
+                .expect("sharded range path");
+            let rel = bin
+                .strip_prefix(&ranges_dir)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, vec![0u8; len as usize]).unwrap();
+            let mut range = RangeSpec::new(start, end, rel, CompressionAlgorithm::Lz4, len, len);
+            range.created_at = at;
+            range.last_accessed = at;
+            // Explicit per-range classification: `Some(_)` short-circuits the object flag in
+            // `is_staged_range_parts`, so one object can hold both tiers.
+            range.staged = Some(staged);
+            ranges.push(range);
+            bins.push(bin);
+        }
+        let mut object_metadata = ObjectMetadata::new(
+            "\"test-etag\"".to_string(),
+            "Wed, 26 Aug 2026 00:00:00 GMT".to_string(),
+            staged_len + read_len,
+            Some("application/octet-stream".to_string()),
+        );
+        object_metadata.is_write_cached = true;
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata,
+            ranges,
+            created_at: backdated,
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+            compression_info: Default::default(),
+            ..Default::default()
+        };
+        let meta_path = get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
+            .expect("sharded metadata path");
+        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+        let read_bin = bins.pop().unwrap();
+        let staged_bin = bins.pop().unwrap();
+        (meta_path, staged_bin, read_bin)
+    }
+
+    fn staged_summand(meta_path: &Path) -> u64 {
+        let metadata: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
+        metadata.staged_compressed_size()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evicting_the_unstaged_range_of_a_mixed_object_leaves_its_staged_summand_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let m = manager_with_journal(temp.path(), 40 * 1024);
+        const STAGED_LEN: u64 = 16 * 1024;
+        const READ_LEN: u64 = 64 * 1024;
+        let (meta, staged_bin, read_bin) =
+            seed_mixed_object(temp.path(), "test-bucket/mixed.bin", STAGED_LEN, READ_LEN);
+
+        let before = staged_summand(&meta);
+        assert_eq!(
+            before, STAGED_LEN,
+            "fixture: before eviction the summand is the staged range alone"
+        );
+
+        seed_size_state(&m, STAGED_LEN + READ_LEN, STAGED_LEN).await;
+        let freed = m.enforce_disk_cache_limits().await.unwrap();
+
+        assert!(
+            !read_bin.exists(),
+            "fixture: the unstaged range must be evicted"
+        );
+        assert!(
+            staged_bin.exists() && meta.exists(),
+            "fixture: the staged range and its .meta must survive, so eviction took the \
+             partial-object rewrite branch"
+        );
+        assert_eq!(
+            freed, READ_LEN,
+            "fixture: the freed figure is the unstaged range"
+        );
+
+        let after = staged_summand(&meta);
+        assert_eq!(
+            after, before,
+            "R13 HEADLINE: evicting the unstaged range rewrote the object's .meta and changed \
+             the fold's staged summand from {before} to {after}. The staged tier's residency \
+             moved with no staged byte leaving the disk"
         );
     }
 }

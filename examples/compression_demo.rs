@@ -1,17 +1,14 @@
-//! Compression Demo
+//! Compression demo
 //!
-//! Demonstrates the built-in extension denylist (the *default* layer of the
-//! compression decision) and the store-mode frame mechanism that keeps
-//! denylisted/skipped writes checksummed even though the LZ4 block
-//! compressor never runs for them.
+//! Shows the built-in extension denylist, the default layer of the compression decision, and
+//! the store-mode frame that keeps denylisted and skipped writes checksummed even though the
+//! LZ4 block compressor never runs for them.
 //!
-//! Reworked for the compression-content-aware-fix change: the compression
-//! decision is made by the caller (in production,
-//! `CacheManager::effective_compression`, which layers per-key
-//! `cache_rules.json` overrides on top of this denylist) and passed into
-//! `CompressionHandler::compress_with_metadata`. `should_compress_content`,
-//! `compress_data_content_aware_with_fallback`, and friends were removed as
-//! dead code — they had no production callers.
+//! In the proxy, `CacheManager::effective_compression` makes the decision, layering per-key
+//! `cache_rules.json` overrides on top of this denylist, and passes it to
+//! `CompressionHandler::compress_with_metadata`.
+//!
+//! Run with: cargo run --release --example compression_demo
 
 use s3_proxy::compression::CompressionHandler;
 

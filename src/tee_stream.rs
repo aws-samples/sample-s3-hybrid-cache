@@ -29,12 +29,76 @@ use futures::Stream;
 use hyper::body::Frame;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::Sleep;
 use tracing::{debug, warn};
 
+/// Process-wide cache-tee backpressure counters for the GET-miss path.
+///
+/// Incremented directly at the point backpressure occurs (inside `poll_next`),
+/// rather than read back from a completed `TeeStream` by its caller: the
+/// stream is moved into several wrapper layers (`wrap_origin_stream`,
+/// `StreamBody`, `PermitBody`) immediately after construction, so there is no
+/// call site that still holds the value after the stream finishes. A
+/// process-wide atomic pair, mirroring `LAST_OVER_BOUND_WARN_SECS` in
+/// `crate::metrics`, avoids needing a completion hook.
+///
+/// A non-zero value means the cache writer, not the upstream, was the
+/// bottleneck for at least one GET-miss request.
+///
+/// Spec: cache-eviction-at-scale Requirement 18.4
+static BACKPRESSURE_EVENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKPRESSURE_WAIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of cache-tee backpressure events across all GET-miss
+/// `TeeStream` instances since process start. See `BACKPRESSURE_EVENTS_TOTAL`.
+pub(crate) fn backpressure_events_total_get() -> u64 {
+    BACKPRESSURE_EVENTS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Cumulative milliseconds spent applying cache-tee backpressure across all
+/// GET-miss `TeeStream` instances since process start. See
+/// `BACKPRESSURE_WAIT_MS_TOTAL`.
+pub(crate) fn backpressure_wait_ms_total_get() -> u64 {
+    BACKPRESSURE_WAIT_MS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Upstream idle-watchdog counters, process-wide since start. Published as
+/// `cache.upstream_idle_abort_total_mid_stream`, `cache.upstream_idle_abort_total_pre_stream`
+/// and `cache.upstream_idle_retry_total`.
+///
+/// Atomics for the same reason as the backpressure pair above: the mid-stream abort fires
+/// inside `poll_next`, after the stream has been moved into the response body. The two
+/// pre-stream counters are incremented by the first-byte retry loop in
+/// `HttpProxy::forward_get_head_to_s3_and_cache`: a retry each time the first byte misses
+/// `upstream_first_byte_timeout` with attempts left, and a pre-stream abort when the last
+/// attempt misses it and the client gets a 504.
+static UPSTREAM_IDLE_ABORT_MID_STREAM: AtomicU64 = AtomicU64::new(0);
+static UPSTREAM_IDLE_ABORT_PRE_STREAM: AtomicU64 = AtomicU64::new(0);
+static UPSTREAM_IDLE_RETRY: AtomicU64 = AtomicU64::new(0);
+/// Record a pre-stream first-byte timeout. `retrying` is whether another attempt follows.
+pub(crate) fn note_upstream_first_byte_timeout(retrying: bool) {
+    if retrying {
+        UPSTREAM_IDLE_RETRY.fetch_add(1, Ordering::Relaxed);
+    } else {
+        UPSTREAM_IDLE_ABORT_PRE_STREAM.fetch_add(1, Ordering::Relaxed);
+    }
+}
+/// `cache.upstream_idle_abort_total_mid_stream`. See [`UPSTREAM_IDLE_ABORT_MID_STREAM`].
+pub(crate) fn upstream_idle_abort_total_mid_stream() -> u64 {
+    UPSTREAM_IDLE_ABORT_MID_STREAM.load(Ordering::Relaxed)
+}
+/// `cache.upstream_idle_abort_total_pre_stream`. See [`UPSTREAM_IDLE_ABORT_MID_STREAM`].
+pub(crate) fn upstream_idle_abort_total_pre_stream() -> u64 {
+    UPSTREAM_IDLE_ABORT_PRE_STREAM.load(Ordering::Relaxed)
+}
+/// `cache.upstream_idle_retry_total`. See [`UPSTREAM_IDLE_ABORT_MID_STREAM`].
+pub(crate) fn upstream_idle_retry_total() -> u64 {
+    UPSTREAM_IDLE_RETRY.load(Ordering::Relaxed)
+}
 /// Type alias for the pending send future used for backpressure.
 type PendingSendFuture =
     Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Bytes>>> + Send + Sync>>;
@@ -67,8 +131,6 @@ pub struct TeeStream<S> {
     idle_timeout: Option<Duration>,
     /// Sleep future for the idle watchdog. Reset on every upstream chunk.
     idle_sleep: Option<Pin<Box<Sleep>>>,
-    /// Whether the stream was aborted due to idle timeout
-    idle_aborted: bool,
 }
 
 impl<S> TeeStream<S>
@@ -89,7 +151,6 @@ where
             channel_closed: false,
             idle_timeout: None,
             idle_sleep: None,
-            idle_aborted: false,
         }
     }
 
@@ -98,7 +159,7 @@ where
     /// If the upstream produces no bytes within `idle_timeout`, the stream
     /// terminates (returns an error frame), aborting the client connection.
     /// The cache channel is dropped without finalization.
-    pub fn with_idle_timeout(
+    pub(crate) fn with_idle_timeout(
         inner: S,
         sender: mpsc::Sender<Bytes>,
         idle_timeout: Duration,
@@ -116,18 +177,46 @@ where
             channel_closed: false,
             idle_timeout: Some(idle_timeout),
             idle_sleep,
-            idle_aborted: false,
         }
     }
 
-    /// Get the number of bytes sent through the tee
-    pub fn bytes_sent(&self) -> usize {
-        self.bytes_sent
+    /// Number of times the cache-tee channel was full and the stream had to
+    /// await a pending send, applying backpressure through hyper to the
+    /// client. A non-zero value means the cache writer, not the upstream, was
+    /// the bottleneck for this request.
+    ///
+    /// Spec: cache-eviction-at-scale Requirement 18.4
+    ///
+    /// Test seam: the per-instance figure is only read by the backpressure unit
+    /// test; production publishes the process-wide `backpressure_events_total_get`.
+    #[cfg(test)]
+    pub(crate) fn backpressure_events(&self) -> u64 {
+        self.backpressure_events as u64
     }
 
-    /// Whether the stream was aborted due to idle timeout
-    pub fn was_idle_aborted(&self) -> bool {
-        self.idle_aborted
+    /// Cumulative time this stream spent awaiting a pending cache-tee send
+    /// (i.e. propagating backpressure to the client), in milliseconds.
+    ///
+    /// Spec: cache-eviction-at-scale Requirement 18.4
+    ///
+    /// Test seam, as for `backpressure_events`; production publishes
+    /// `backpressure_wait_ms_total_get`.
+    #[cfg(test)]
+    pub(crate) fn backpressure_wait_ms(&self) -> u64 {
+        self.backpressure_wait.as_millis() as u64
+    }
+
+    /// Resolve a pending backpressure interval: fold the elapsed time into
+    /// this stream's own `backpressure_wait` and into the process-wide
+    /// `BACKPRESSURE_WAIT_MS_TOTAL` counter. Called from every arm that takes
+    /// `self.backpressure_start`, so the global counter never drifts from the
+    /// per-instance one.
+    fn resolve_backpressure_wait(&mut self) {
+        if let Some(start) = self.backpressure_start.take() {
+            let elapsed = start.elapsed();
+            self.backpressure_wait += elapsed;
+            BACKPRESSURE_WAIT_MS_TOTAL.fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -146,9 +235,7 @@ where
             match send_fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(())) => {
                     // Send completed — record backpressure duration
-                    if let Some(start) = self.backpressure_start.take() {
-                        self.backpressure_wait += start.elapsed();
-                    }
+                    self.resolve_backpressure_wait();
                     self.pending_send = None;
                     // Reset idle timer: backpressure time doesn't count as upstream idle.
                     // The upstream was ready (it delivered this chunk), it was the cache
@@ -162,9 +249,7 @@ where
                 }
                 Poll::Ready(Err(_)) => {
                     // Channel closed — stop sending, continue streaming to client
-                    if let Some(start) = self.backpressure_start.take() {
-                        self.backpressure_wait += start.elapsed();
-                    }
+                    self.resolve_backpressure_wait();
                     self.pending_send = None;
                     self.channel_closed = true;
                     // Reset idle timer after backpressure resolution
@@ -188,12 +273,14 @@ where
             if sleep.as_mut().poll(cx).is_ready() {
                 // Idle timeout fired — upstream stalled
                 let timeout = self.idle_timeout.unwrap_or(Duration::from_secs(5));
+                // Once per stream: the body ends here, and hyper does not poll a body again
+                // after it returns `None`.
+                UPSTREAM_IDLE_ABORT_MID_STREAM.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "[UPSTREAM_IDLE_ABORT] Mid-stream idle timeout ({:?}) exceeded, aborting stream. \
                      bytes_sent={}, backpressure_events={}",
                     timeout, self.bytes_sent, self.backpressure_events
                 );
-                self.idle_aborted = true;
                 // Return None to signal stream end. The hyper body will be incomplete,
                 // which causes the client connection to be aborted (RST or incomplete
                 // chunked encoding). The cache channel is dropped without all bytes,
@@ -231,6 +318,7 @@ where
                             Err(mpsc::error::TrySendError::Full(_returned_bytes)) => {
                                 // Channel full — switch to backpressure mode
                                 self.backpressure_events += 1;
+                                BACKPRESSURE_EVENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                                 self.backpressure_start = Some(Instant::now());
 
                                 // Create a send future and store it
@@ -245,17 +333,13 @@ where
                                 let send_fut = self.pending_send.as_mut().unwrap();
                                 match send_fut.as_mut().poll(cx) {
                                     Poll::Ready(Ok(())) => {
-                                        if let Some(start) = self.backpressure_start.take() {
-                                            self.backpressure_wait += start.elapsed();
-                                        }
+                                        self.resolve_backpressure_wait();
                                         self.pending_send = None;
                                         let frame = self.pending_frame.take().unwrap();
                                         Poll::Ready(Some(Ok(Frame::data(frame))))
                                     }
                                     Poll::Ready(Err(_)) => {
-                                        if let Some(start) = self.backpressure_start.take() {
-                                            self.backpressure_wait += start.elapsed();
-                                        }
+                                        self.resolve_backpressure_wait();
                                         self.pending_send = None;
                                         self.channel_closed = true;
                                         let frame = self.pending_frame.take().unwrap();
@@ -384,6 +468,97 @@ mod tests {
         assert_eq!(cache_received[0], Bytes::from("chunk1"));
     }
 
+    /// Spec: cache-eviction-at-scale Requirement 18.4. Asserts the per-instance
+    /// getters and the process-wide counters they feed both move when
+    /// backpressure genuinely occurs, and that the per-instance figures agree
+    /// with what `poll_next`'s own accounting produced.
+    ///
+    /// Per `testing.md` § "Never assert an exact delta on a process-global
+    /// counter", this asserts the global counters moved by AT LEAST this
+    /// instance's contribution (`>=`), not an exact value — other tests in
+    /// this binary can concurrently increment the same process-wide atomics.
+    #[tokio::test]
+    async fn test_tee_stream_backpressure_updates_getters_and_global_counters() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_backpressure_updates_getters_and_global_counters_body(),
+        )
+        .await
+        .expect(
+            "test body must complete within 10s; a hang here means the channel \
+                 or consumer was not closed correctly, not a slow assertion",
+        );
+    }
+
+    async fn run_backpressure_updates_getters_and_global_counters_body() {
+        let before_events = backpressure_events_total_get();
+        let before_wait_ms = backpressure_wait_ms_total_get();
+
+        // Channel capacity 1, and the receiver never drains — every send after the
+        // first genuinely backpressures rather than merely taking a fast path.
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let data = vec![
+            Ok(Frame::data(Bytes::from("chunk1"))),
+            Ok(Frame::data(Bytes::from("chunk2"))),
+            Ok(Frame::data(Bytes::from("chunk3"))),
+        ];
+        let stream = stream::iter(data);
+        let mut tee = TeeStream::new(stream, tx);
+
+        // Drain the client side and the cache side concurrently, with a small
+        // delay on the cache side so the channel genuinely fills at least once.
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            // Deliberately slow: gives poll_next's fast `try_send` path a real
+            // chance to hit `Full` rather than racing an always-ready receiver.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            while let Some(data) = rx.recv().await {
+                received.push(data);
+            }
+            received
+        });
+
+        while (tee.next().await).is_some() {}
+
+        let instance_events = tee.backpressure_events();
+        let instance_wait_ms = tee.backpressure_wait_ms();
+
+        // Drop the stream (and its `sender` field) so the channel closes and the
+        // consumer's `rx.recv()` loop can observe `None` and return, rather than
+        // awaiting forever.
+        drop(tee);
+        let _ = consumer.await.unwrap();
+
+        assert!(
+            instance_events > 0,
+            "expected genuine backpressure with a 1-capacity channel and a delayed \
+             receiver, got 0 backpressure_events on the instance"
+        );
+
+        let after_events = backpressure_events_total_get();
+        let after_wait_ms = backpressure_wait_ms_total_get();
+
+        assert!(
+            after_events >= before_events + instance_events,
+            "process-wide backpressure_events_total_get did not move by at least \
+             this instance's contribution: before={before_events} after={after_events} \
+             instance={instance_events}"
+        );
+        // Wait time is >= 0 by construction (u64), so only assert it moved when
+        // the instance itself recorded nonzero wait — a zero-wait instance
+        // (e.g. the pending send resolves instantly) is a valid outcome and
+        // must not force a false failure here.
+        if instance_wait_ms > 0 {
+            assert!(
+                after_wait_ms >= before_wait_ms + instance_wait_ms,
+                "process-wide backpressure_wait_ms_total_get did not move by at \
+                 least this instance's contribution: before={before_wait_ms} \
+                 after={after_wait_ms} instance={instance_wait_ms}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_tee_stream_channel_closed() {
         let (tx, rx) = mpsc::channel(10);
@@ -441,7 +616,7 @@ mod tests {
         });
 
         let mut tee = TeeStream::with_idle_timeout(stalling_stream, tx, idle_timeout);
-
+        let aborts_before = upstream_idle_abort_total_mid_stream();
         let start = Instant::now();
         let mut received = Vec::new();
         while let Some(result) = tee.next().await {
@@ -467,8 +642,17 @@ mod tests {
             elapsed
         );
 
-        // Confirm the stream was idle-aborted
-        assert!(tee.was_idle_aborted());
+        // The inner stream stalls forever after its first chunk, so the tee
+        // ending at all (asserted by the loop exiting within the bound above)
+        // is the idle abort.
+        // Process-global counter: a lower bound on the delta, since other tests in this
+        // binary may abort concurrently.
+        let aborts_after = upstream_idle_abort_total_mid_stream();
+        assert!(
+            aborts_after > aborts_before,
+            "the idle abort fired but cache.upstream_idle_abort_total_mid_stream did not move \
+             ({aborts_before} -> {aborts_after})"
+        );
     }
 
     /// Test: slow-but-steady transfer (bytes every < timeout) completes successfully.
@@ -520,8 +704,7 @@ mod tests {
         );
         assert_eq!(cache_received.len(), 5, "Cache should receive all 5 chunks");
 
-        // Stream should NOT have been idle-aborted
-        // (can't check was_idle_aborted after drop, but receiving all chunks proves it)
+        // Receiving all chunks proves the stream was not idle-aborted.
     }
 
     /// Test: backpressure does NOT trigger idle abort.
@@ -561,14 +744,14 @@ mod tests {
             }
         }
 
-        // Stream should NOT have been idle-aborted despite backpressure waits > idle_timeout
-        assert!(
-            !tee.was_idle_aborted(),
-            "Backpressure should NOT trigger idle abort"
+        // All chunks delivered to client: an idle abort would have ended the
+        // stream early, so this is also the proof that backpressure waits longer
+        // than idle_timeout did NOT trigger the abort.
+        assert_eq!(
+            client_received.len(),
+            3,
+            "All chunks should reach client; fewer means backpressure triggered an idle abort"
         );
-
-        // All chunks delivered to client
-        assert_eq!(client_received.len(), 3, "All chunks should reach client");
 
         drop(tee);
         let cache_received = consumer.await.unwrap();

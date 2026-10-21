@@ -29,7 +29,7 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
         false, // RAM cache disabled
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600), // GET_TTL
@@ -130,7 +130,7 @@ async fn test_upload_state_is_complete() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -209,7 +209,7 @@ async fn test_put_ttl_is_used_for_expiration() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         get_ttl,
@@ -317,7 +317,7 @@ async fn test_put_cached_objects_not_in_ram_cache() {
         true,               // RAM cache ENABLED
         10 * 1024 * 1024,   // 10MB RAM cache
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -400,7 +400,7 @@ async fn test_put_storage_with_headers() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -480,7 +480,7 @@ async fn test_multiple_put_operations_same_key() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),

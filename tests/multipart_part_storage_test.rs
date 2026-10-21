@@ -179,7 +179,7 @@ async fn test_store_multipart_part_capacity_bypass() -> Result<()> {
         false, // RAM cache disabled
         0,
         10 * 1024 * 1024, // 10MB max cache size
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         std::time::Duration::from_secs(3600),

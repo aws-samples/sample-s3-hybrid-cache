@@ -1,6 +1,6 @@
 //! Request-path coverage for the part-scoped-HEAD cache-poisoning fix.
 //!
-//! Spec: `.kiro/specs/head-partnumber-cache-poisoning/`
+//! Spec: the head partnumber cache poisoning feature
 //!
 //! Why these cannot be `#[cfg(test)]` unit tests: the behaviour under test is a
 //! **routing** decision inside the private `handle_get_head_request` — whether a
@@ -88,7 +88,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false, // compression disabled — stored bytes stay 1:1 with the body
         config.cache.get_ttl,
@@ -328,6 +328,7 @@ fn plant_meta(
         head_last_accessed: Some(now),
         head_access_count: 1,
         head_cached_at: Some(now),
+        last_validated_at: None,
     };
     let path = cache_manager.get_new_metadata_file_path(cache_key);
     std::fs::create_dir_all(path.parent().unwrap()).expect("create metadata dir");

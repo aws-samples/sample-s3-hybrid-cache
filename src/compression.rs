@@ -25,7 +25,7 @@
 //! no write path in this version produces it.
 
 use crate::{ProxyError, Result};
-use lz4_flex::frame::{BlockMode, FrameDecoder, FrameEncoder, FrameInfo};
+use lz4_flex::frame::{BlockMode, BlockSize, FrameDecoder, FrameEncoder, FrameInfo};
 use serde::{Deserialize, Serialize};
 use std::hash::Hasher;
 use std::io::{Read, Write};
@@ -34,12 +34,37 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 use twox_hash::XxHash32;
 
-/// Maximum uncompressed size of a single stored block in a store-mode frame.
-/// Matches lz4_flex's `BlockSize::Max4MB` so the BD byte encodes block-size
-/// code `7` (see the LZ4 frame format table in `lz4_flex`'s
-/// `frame/header.rs`), keeping store-mode frames decodable by any standard
-/// LZ4 frame reader, not just `lz4_flex`.
-const STORE_MODE_MAX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+/// Maximum uncompressed size of one block in every LZ4 frame the proxy writes:
+/// 64 KiB, block-size code `4` in the frame's BD byte.
+///
+/// A frame decoder sizes its working buffers from the block size the frame
+/// header declares, not from the payload: `lz4_flex::frame::FrameDecoder`
+/// reserves one compressed-block and one decompressed-block buffer of that size
+/// for each stream. At 64 KiB blocks that is about 128 KiB per decoded stream;
+/// at the LZ4 maximum of 4 MiB it would be about 8 MiB, whatever the range
+/// length. The frame header carries the block size, so a reader decodes frames
+/// of any block size, including ones written with larger blocks.
+pub(crate) const RANGE_FRAME_MAX_BLOCK_SIZE: usize = 64 * 1024;
+
+/// BD-byte block-size code for [`RANGE_FRAME_MAX_BLOCK_SIZE`] (LZ4 frame
+/// format: 4 = 64 KiB, 5 = 256 KiB, 6 = 1 MiB, 7 = 4 MiB).
+const RANGE_FRAME_BD_BLOCK_SIZE_CODE: u8 = 4;
+
+/// Store-mode frames use the same block size as compressed frames, so a
+/// stored block never exceeds the size the frame header declares.
+const STORE_MODE_MAX_BLOCK_SIZE: usize = RANGE_FRAME_MAX_BLOCK_SIZE;
+
+/// Frame parameters for a compressed range frame: independent blocks, an
+/// xxhash32 content checksum, and [`RANGE_FRAME_MAX_BLOCK_SIZE`] blocks. Every
+/// compressed writer builds its encoder from this, so they all declare the
+/// same block size.
+pub(crate) fn range_frame_info() -> FrameInfo {
+    let mut frame_info = FrameInfo::new();
+    frame_info.content_checksum = true;
+    frame_info.block_mode = BlockMode::Independent;
+    frame_info.block_size = BlockSize::Max64KB;
+    frame_info
+}
 
 /// The high bit of the 4-byte little-endian block-size word marks a block as
 /// stored (uncompressed) rather than compressed. Mirrors
@@ -224,7 +249,7 @@ impl CompressionHandler {
     /// `CacheManager::create_configured_disk_cache_manager`) so its handler's
     /// activity still counts toward the stats snapshot exposed via
     /// `CacheManager::get_compression_handler()`.
-    pub fn new_with_shared_stats(
+    pub(crate) fn new_with_shared_stats(
         compression_threshold: usize,
         compression_enabled: bool,
         stats_source: &CompressionHandler,
@@ -315,7 +340,7 @@ impl CompressionHandler {
     /// see the compression-content-aware-fix spec. The wire format here
     /// matches `lz4_flex::frame`'s encoder exactly (verified
     /// against `lz4_flex-0.11.6/src/frame/{header,compress}.rs`): magic
-    /// number, FLG/BD bytes (independent blocks, content checksum, 4 MiB
+    /// number, FLG/BD bytes (independent blocks, content checksum, 64 KiB
     /// block size), one-byte header checksum (`xxh32(FLG..BD) >> 8`), one or
     /// more stored blocks (4-byte LE size with the high bit set, followed by
     /// the raw bytes), a 4-byte end mark (`0`), and a 4-byte little-endian
@@ -324,15 +349,30 @@ impl CompressionHandler {
     /// produced by this function — stored blocks are a standard part of the
     /// LZ4 frame format, not an lz4_flex extension.
     pub fn encode_store_mode_frame(data: &[u8]) -> Result<Vec<u8>> {
+        Self::encode_store_mode_frame_with_blocks(
+            data,
+            STORE_MODE_MAX_BLOCK_SIZE,
+            RANGE_FRAME_BD_BLOCK_SIZE_CODE,
+        )
+    }
+
+    /// [`Self::encode_store_mode_frame`] with an explicit block size and its
+    /// BD block-size code. The proxy writes only 64 KiB blocks; tests use this
+    /// to build frames with the larger blocks earlier releases wrote, and
+    /// check that those still read back.
+    pub(crate) fn encode_store_mode_frame_with_blocks(
+        data: &[u8],
+        max_block_size: usize,
+        bd_block_size_code: u8,
+    ) -> Result<Vec<u8>> {
         // Frame descriptor: FLG byte (version 01, independent blocks,
-        // content checksum) + BD byte (block size code 7 == 4 MiB).
+        // content checksum) + BD byte (block-size code in bits 4-6).
         const FLG_SUPPORTED_VERSION_BITS: u8 = 0b0100_0000;
         const FLG_INDEPENDENT_BLOCKS: u8 = 0b0010_0000;
         const FLG_CONTENT_CHECKSUM: u8 = 0b0000_0100;
-        const BD_BLOCK_SIZE_MAX_4MB: u8 = 7 << 4;
 
         let flg = FLG_SUPPORTED_VERSION_BITS | FLG_INDEPENDENT_BLOCKS | FLG_CONTENT_CHECKSUM;
-        let bd = BD_BLOCK_SIZE_MAX_4MB;
+        let bd = (bd_block_size_code & 0x07) << 4;
 
         // Header checksum is computed over FLG..BD (no content-size / dict-id
         // fields are written here, matching `FrameInfo::write` with those
@@ -341,17 +381,17 @@ impl CompressionHandler {
         header_hasher.write(&[flg, bd]);
         let header_checksum = (header_hasher.finish() >> 8) as u8;
 
-        let block_count = data.len() / STORE_MODE_MAX_BLOCK_SIZE + 1;
+        let block_count = data.len() / max_block_size.max(1) + 1;
         let mut output = Vec::with_capacity(data.len() + block_count * 4 + 15);
         output.extend_from_slice(&LZ4F_MAGIC_NUMBER.to_le_bytes());
         output.push(flg);
         output.push(bd);
         output.push(header_checksum);
 
-        // One stored block per STORE_MODE_MAX_BLOCK_SIZE chunk. An empty
-        // input produces zero data blocks (matches lz4_flex's own behavior
-        // for an empty write — flush() is a no-op when src_start == src_end).
-        for chunk in data.chunks(STORE_MODE_MAX_BLOCK_SIZE.max(1)) {
+        // One stored block per `max_block_size` chunk. An empty input
+        // produces zero data blocks (matches lz4_flex's own behavior for an
+        // empty write — flush() is a no-op when src_start == src_end).
+        for chunk in data.chunks(max_block_size.max(1)) {
             let block_size_word = (chunk.len() as u32) | BLOCK_UNCOMPRESSED_SIZE_BIT;
             output.extend_from_slice(&block_size_word.to_le_bytes());
             output.extend_from_slice(chunk);
@@ -507,7 +547,7 @@ impl CompressionHandler {
     }
 
     /// Get compression statistics (async version for consistency with other components)
-    pub async fn get_compression_statistics(&self) -> Result<CompressionStats> {
+    pub(crate) async fn get_compression_statistics(&self) -> Result<CompressionStats> {
         Ok(self.stats.snapshot())
     }
 
@@ -536,12 +576,8 @@ impl CompressionHandler {
 
         let compressed_data = match algorithm {
             CompressionAlgorithm::Lz4 => {
-                let mut frame_info = FrameInfo::new();
-                frame_info.content_checksum = true;
-                frame_info.block_mode = BlockMode::Independent;
-
                 let mut output = Vec::new();
-                let mut encoder = FrameEncoder::with_frame_info(frame_info, &mut output);
+                let mut encoder = FrameEncoder::with_frame_info(range_frame_info(), &mut output);
                 encoder.write_all(data).map_err(|e| {
                     ProxyError::CompressionError(format!(
                         "Failed to write data to LZ4 frame encoder: {}",

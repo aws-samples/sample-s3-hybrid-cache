@@ -25,7 +25,7 @@ use crate::{ProxyError, Result};
 static ROOT_CERT_STORE: OnceLock<Arc<RootCertStore>> = OnceLock::new();
 
 /// Return the process-wide OS trust store, loading it on first use.
-pub fn root_cert_store() -> Result<Arc<RootCertStore>> {
+pub(crate) fn root_cert_store() -> Result<Arc<RootCertStore>> {
     if let Some(store) = ROOT_CERT_STORE.get() {
         return Ok(Arc::clone(store));
     }

@@ -7,7 +7,7 @@ use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -581,7 +581,7 @@ impl AccessLogBuffer {
     /// Get the number of entries currently in the buffer
     ///
     /// This is useful for reporting entries lost during shutdown if flush fails.
-    pub fn pending_entries_count(&self) -> usize {
+    pub(crate) fn pending_entries_count(&self) -> usize {
         self.buffer.lock().unwrap().len()
     }
 
@@ -593,7 +593,7 @@ impl AccessLogBuffer {
 
     /// Check if a flush is needed based on the flush interval (for testing)
     #[cfg(test)]
-    pub fn should_flush(&self) -> bool {
+    pub(crate) fn should_flush(&self) -> bool {
         let buffer_len = self.buffer.lock().unwrap().len();
         if buffer_len >= self.max_buffer_size {
             return true;
@@ -640,7 +640,107 @@ pub enum AccessLogMode {
 /// Logger manager for handling all logging operations
 pub struct LoggerManager {
     pub config: LoggingConfig,
-    access_log_buffer: Option<AccessLogBuffer>, // Changed from AccessLogWriter
+    access_log_buffer: Option<Arc<AccessLogBuffer>>,
+}
+
+/// How long an access-log record whose request found the logger busy waits for it, on a
+/// detached task, before it is counted in [`access_log_records_dropped_total`] instead.
+pub const ACCESS_LOG_HANDOFF_WAIT: Duration = Duration::from_secs(30);
+
+/// At most this many records wait for a busy logger at once. Past it a record is counted as
+/// dropped straight away, so a long hold (the retention sweep runs under the logger) cannot
+/// queue one task per request without bound.
+pub const ACCESS_LOG_HANDOFF_LIMIT: usize = 10_000;
+
+/// Access-log records that could not be written: the logger stayed busy for
+/// [`ACCESS_LOG_HANDOFF_WAIT`], or [`ACCESS_LOG_HANDOFF_LIMIT`] records were already waiting
+/// for it. Process-wide, since process start.
+static ACCESS_LOG_RECORDS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Records currently waiting for a busy logger on a hand-off task.
+static ACCESS_LOG_HANDOFFS_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Count one dropped record, with a WARN on the first and every 1000th.
+fn note_access_log_drop(wait: Duration) {
+    let dropped = ACCESS_LOG_RECORDS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped == 1 || dropped.is_multiple_of(1000) {
+        warn!(
+            "Access-log record dropped: the logger stayed busy for {:?}, or {} records were \
+             already waiting for it ({} dropped since start; logged on the first and every \
+             1000th)",
+            wait, ACCESS_LOG_HANDOFF_LIMIT, dropped
+        );
+    }
+}
+
+/// Access-log records dropped since process start (`request_metrics.access_log_records_dropped`).
+pub fn access_log_records_dropped_total() -> u64 {
+    ACCESS_LOG_RECORDS_DROPPED.load(Ordering::Relaxed)
+}
+
+/// Write one access-log record without holding the logger's mutex across an await.
+///
+/// The logger is held only for the synchronous part: choosing the buffer under the
+/// configured mode and building the entry with `build`. The buffer push, and any flush it
+/// triggers, run after the guard is released. When another task holds the logger, the
+/// record is handed to a detached task that waits up to `wait` for it, so the request is not
+/// delayed. A record that still cannot be written is counted, not silently lost. The entry's
+/// `time` is when this function was called, whichever path writes it.
+pub async fn record_access<F>(
+    logger: &Arc<tokio::sync::Mutex<LoggerManager>>,
+    served_from_cache: bool,
+    wait: Duration,
+    build: F,
+) where
+    F: FnOnce(&LoggerManager) -> AccessLogEntry + Send + 'static,
+{
+    let completed_at = Utc::now();
+    let ready = move |guard: &LoggerManager, build: F| {
+        guard.access_log_target(served_from_cache).map(|buffer| {
+            let mut entry = build(guard);
+            entry.time = completed_at;
+            (buffer, entry)
+        })
+    };
+    let ready_now = match logger.try_lock() {
+        Ok(guard) => Ok(ready(&guard, build)),
+        Err(_) => Err(build),
+    };
+    match ready_now {
+        Ok(Some((buffer, entry))) => write_access_record(&buffer, entry).await,
+        Ok(None) => {}
+        Err(build) => {
+            if ACCESS_LOG_HANDOFFS_PENDING.fetch_add(1, Ordering::Relaxed)
+                >= ACCESS_LOG_HANDOFF_LIMIT
+            {
+                ACCESS_LOG_HANDOFFS_PENDING.fetch_sub(1, Ordering::Relaxed);
+                note_access_log_drop(wait);
+                return;
+            }
+            let logger = Arc::clone(logger);
+            tokio::spawn(async move {
+                let target = match tokio::time::timeout(wait, logger.lock()).await {
+                    Ok(guard) => ready(&guard, build),
+                    Err(_) => {
+                        note_access_log_drop(wait);
+                        None
+                    }
+                };
+                ACCESS_LOG_HANDOFFS_PENDING.fetch_sub(1, Ordering::Relaxed);
+                if let Some((buffer, entry)) = target {
+                    write_access_record(&buffer, entry).await;
+                }
+            });
+        }
+    }
+}
+
+async fn write_access_record(buffer: &AccessLogBuffer, entry: AccessLogEntry) {
+    // `log` buffers the entry before it flushes, and a failed flush keeps the entries for
+    // the next one, so an error here does not mean the record was lost.
+    if let Err(e) = buffer.log(entry).await {
+        warn!("Failed to log access entry: {}", e);
+    }
 }
 
 impl LoggerManager {
@@ -652,29 +752,6 @@ impl LoggerManager {
         }
     }
 
-    /// Create a new logger manager from config module types
-    pub fn from_config(config: crate::config::LoggingConfig, hostname: String) -> Self {
-        let logging_config = LoggingConfig {
-            access_log_dir: config.access_log_dir,
-            app_log_dir: config.app_log_dir,
-            access_log_enabled: config.access_log_enabled,
-            access_log_mode: match config.access_log_mode {
-                crate::config::AccessLogMode::All => AccessLogMode::All,
-                crate::config::AccessLogMode::CachedOnly => AccessLogMode::CachedOnly,
-            },
-            hostname,
-            log_level: config.log_level,
-            access_log_flush_interval: config.access_log_flush_interval,
-            access_log_buffer_size: config.access_log_buffer_size,
-            access_log_retention_days: config.access_log_retention_days,
-            app_log_retention_days: config.app_log_retention_days,
-            log_cleanup_interval: config.log_cleanup_interval,
-            access_log_file_rotation_interval: config.access_log_file_rotation_interval,
-        };
-
-        Self::new(logging_config)
-    }
-
     /// Initialize the logging system
     pub fn initialize(&mut self) -> Result<()> {
         // Initialize application logging with tracing
@@ -683,13 +760,13 @@ impl LoggerManager {
         // Initialize access logging if enabled
         if self.config.access_log_enabled {
             // Task 4.3: Pass config values to AccessLogBuffer::new()
-            self.access_log_buffer = Some(AccessLogBuffer::new(
+            self.access_log_buffer = Some(Arc::new(AccessLogBuffer::new(
                 self.config.access_log_dir.clone(),
                 self.config.hostname.clone(),
                 Some(self.config.access_log_flush_interval),
                 Some(self.config.access_log_buffer_size),
                 Some(self.config.access_log_file_rotation_interval),
-            ));
+            )));
         }
 
         info!("Logging system initialized");
@@ -899,6 +976,20 @@ impl LoggerManager {
         Ok(())
     }
 
+    /// The buffer a record should go to under the configured mode, or `None` when this
+    /// request is not logged.
+    fn access_log_target(&self, served_from_cache: bool) -> Option<Arc<AccessLogBuffer>> {
+        let should_log = match self.config.access_log_mode {
+            AccessLogMode::All => true,
+            AccessLogMode::CachedOnly => served_from_cache,
+        };
+        if should_log {
+            self.access_log_buffer.clone()
+        } else {
+            None
+        }
+    }
+
     /// Log an access entry
     pub async fn log_access(&self, entry: AccessLogEntry, served_from_cache: bool) -> Result<()> {
         if let Some(buffer) = &self.access_log_buffer {
@@ -1012,7 +1103,7 @@ impl LoggerManager {
     ///
     /// This is useful for reporting entries lost during shutdown if flush fails.
     /// Returns 0 if access logging is disabled.
-    pub fn pending_entries_count(&self) -> usize {
+    pub(crate) fn pending_entries_count(&self) -> usize {
         if let Some(buffer) = &self.access_log_buffer {
             buffer.pending_entries_count()
         } else {
@@ -1026,6 +1117,10 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "x-amz-signature",
     "x-amz-credential",
     "x-amz-security-token",
+    // SigV2 presigned URLs: the signature is a live credential for the URL's lifetime and
+    // the access key id names the signer. `Expires` is a timestamp and stays visible.
+    "signature",
+    "awsaccesskeyid",
 ];
 
 /// Sanitize a free-text field for safe inclusion in access log lines.
@@ -1058,14 +1153,14 @@ pub(crate) fn sanitize_log_field(field: &str) -> String {
 
 /// Mask sensitive presigned URL query parameters in a URI.
 ///
-/// Replaces the values of `X-Amz-Signature`, `X-Amz-Credential`, and
-/// `X-Amz-Security-Token` with `REDACTED`, preserving parameter names and
+/// Replaces the values of `X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`
+/// and the SigV2 `Signature` and `AWSAccessKeyId` with `REDACTED`, preserving parameter names and
 /// positions. Parameter name matching is case-insensitive and handles
 /// percent-encoded variants.
 ///
 /// URIs without a query string or without any sensitive parameters are
 /// returned unchanged (fast path avoids allocation).
-pub fn mask_presigned_params(uri: &str) -> String {
+pub(crate) fn mask_presigned_params(uri: &str) -> String {
     // Fast path: no query string at all
     let Some(query_start) = uri.find('?') else {
         return uri.to_string();
@@ -1073,20 +1168,21 @@ pub fn mask_presigned_params(uri: &str) -> String {
 
     let query = &uri[query_start + 1..];
 
-    // Fast path: check for likely presigned parameter substrings (case-insensitive).
-    // Also check for percent-encoded hyphens (%2D or %2d) which appear in encoded
-    // parameter names like X%2DAmz%2DSignature, and percent-encoded leading 'X'/'x'
-    // (%58/%78) which would appear as %58-Amz-... or %78-Amz-... in doubly-encoded URLs.
-    let lower = query.to_ascii_lowercase();
-    if !lower.contains("x-amz-s")
-        && !lower.contains("x-amz-c")
-        && !lower.contains("x%2damz%2d")
-        && !lower.contains("%58-amz-")
-        && !lower.contains("%78-amz-")
-        && !lower.contains("%58%2damz")
-        && !lower.contains("%78%2damz")
-    {
-        return uri.to_string();
+    // Fast path: a query with no `%` and none of the sensitive name fragments is returned
+    // as it is. Any `%` sends the query to the slow path, which decodes each parameter name
+    // before comparing it: a name can be percent-encoded at any character (`%53ignature`,
+    // `AWSAccess%4BeyId`), so no substring test on the raw text can rule an encoded name out.
+    // The cheap byte scan for `%` runs first; the lowercase copy is built only when the
+    // query has none, so the common unencoded query costs one scan and one allocation.
+    if !query.as_bytes().contains(&b'%') {
+        let lower = query.to_ascii_lowercase();
+        if !lower.contains("x-amz-s")
+            && !lower.contains("x-amz-c")
+            && !lower.contains("signature")
+            && !lower.contains("awsaccesskeyid")
+        {
+            return uri.to_string();
+        }
     }
 
     let path = &uri[..query_start];
@@ -2017,6 +2113,119 @@ mod mask_presigned_params_tests {
         );
     }
 
+    fn access_log_line_for(request_uri: &str) -> String {
+        let entry = AccessLogEntry {
+            bucket_owner: "owner".to_string(),
+            bucket: "bucket".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-1".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "key".to_string(),
+            request_uri: request_uri.to_string(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 1024,
+            object_size: Some(1024),
+            total_time: 100,
+            turn_around_time: 50,
+            referer: None,
+            user_agent: None,
+            host_id: "host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: None,
+            host_header: None,
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        };
+        AccessLogBuffer::format_entry(&entry)
+    }
+    #[test]
+    fn access_log_masks_sigv2_presigned_signature_and_key_id() {
+        let line = access_log_line_for(
+            "/bucket/photos/cat.jpg?AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Expires=1893456000&Signature=vjbyPxybdZaNmGa%2ByT272YEAiv4%3D", // gitleaks:allow
+        );
+        assert!(
+            !line.contains("vjbyPxybdZaNmGa"),
+            "signature leaked: {line}"
+        );
+        assert!(
+            !line.contains("AKIAIOSFODNN7EXAMPLE"),
+            "key id leaked: {line}"
+        ); // gitleaks:allow
+        assert!(
+            line.contains("/bucket/photos/cat.jpg?"),
+            "object key missing: {line}"
+        );
+        assert!(
+            line.contains("Expires=1893456000"),
+            "Expires must stay visible: {line}"
+        );
+        assert!(line.contains("Signature=REDACTED"), "{line}");
+        assert!(line.contains("AWSAccessKeyId=REDACTED"), "{line}");
+    }
+    #[test]
+    fn access_log_masks_percent_encoded_parameter_names() {
+        for (uri, secret) in [
+            ("/b/k?%53ignature=secretsigv2&Expires=1", "secretsigv2"),
+            (
+                "/b/k?AWSAccess%4BeyId=AKIDV2SECRET&Expires=1",
+                "AKIDV2SECRET",
+            ),
+            (
+                "/b/k?X-Amz-%53ignature=secretsigv4&X-Amz-Expires=300",
+                "secretsigv4",
+            ),
+            ("/b/k?X-Amz-%43redential=AKIDV4SECRET/scope", "AKIDV4SECRET"),
+        ] {
+            let line = access_log_line_for(uri);
+            assert!(!line.contains(secret), "{uri} leaked {secret}: {line}");
+            assert!(line.contains("=REDACTED"), "{line}");
+        }
+        // Control: the unencoded spellings are masked.
+        for (uri, secret) in [
+            ("/b/k?Signature=secretsigv2&Expires=1", "secretsigv2"),
+            ("/b/k?X-Amz-Signature=secretsigv4", "secretsigv4"),
+        ] {
+            let line = access_log_line_for(uri);
+            assert!(!line.contains(secret), "{line}");
+        }
+    }
+
+    #[test]
+    fn plain_query_without_sensitive_names_is_returned_unchanged() {
+        // Observable through the result only: the fast path and slow path return the same
+        // text for a query holding nothing sensitive, so this pins the content, not the path.
+        for uri in [
+            "/b/k?prefix=foo&max-keys=100",
+            "/b/k?prefix=a%2Fb&x-id=GetObject",
+        ] {
+            assert_eq!(mask_presigned_params(uri), uri);
+        }
+    }
+
+    #[test]
+    fn access_log_masks_sigv4_presigned_signature_control() {
+        let line = access_log_line_for(
+            "/bucket/photos/cat.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20260101%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Expires=300&X-Amz-Signature=deadbeef0123", // gitleaks:allow
+        );
+        assert!(!line.contains("deadbeef0123"), "{line}");
+        assert!(!line.contains("AKIAIOSFODNN7EXAMPLE"), "{line}"); // gitleaks:allow
+        assert!(line.contains("X-Amz-Expires=300"), "{line}");
+    }
+    #[test]
+    fn access_log_masks_sigv2_names_in_any_case() {
+        let line = access_log_line_for(
+            "/bucket/key?signature=secretsig&awsaccesskeyid=AKIAIOSFODNN7EXAMPLE&expires=1", // gitleaks:allow
+        );
+        assert!(!line.contains("secretsig"), "{line}");
+        assert!(!line.contains("AKIAIOSFODNN7EXAMPLE"), "{line}"); // gitleaks:allow
+        assert!(line.contains("expires=1"), "{line}");
+    }
     #[test]
     fn masks_security_token() {
         let uri = "/bucket/key?X-Amz-Security-Token=FwoGZXIvYXdzEBY&other=val";
@@ -3394,5 +3603,293 @@ mod access_log_retention_tests {
             "a live instance's hostname directory must never be removed"
         );
         assert!(live_log.exists(), "our current app log must survive");
+    }
+}
+
+#[cfg(test)]
+mod access_record_handoff_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The drop counter and the pending count are process-global; every test here holds this.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn logger(
+        dir: &std::path::Path,
+        mode: AccessLogMode,
+    ) -> Arc<tokio::sync::Mutex<LoggerManager>> {
+        let mut logger = LoggerManager::new(LoggingConfig {
+            access_log_dir: dir.join("access"),
+            app_log_dir: dir.join("app"),
+            access_log_enabled: true,
+            access_log_mode: mode,
+            hostname: "handoff-host".to_string(),
+            log_level: "info".to_string(),
+            access_log_flush_interval: Duration::from_secs(3600),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: 30,
+            app_log_retention_days: 30,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        });
+        logger.initialize().unwrap();
+        Arc::new(tokio::sync::Mutex::new(logger))
+    }
+
+    fn entry(logger: &LoggerManager, uri: &str) -> AccessLogEntry {
+        logger.create_access_log_entry(
+            "GET",
+            "127.0.0.1".to_string(),
+            uri.to_string(),
+            200,
+            0,
+            Some(0),
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Only this module drops records, and it runs serially, so the global deltas are exact.
+    #[tokio::test]
+    async fn a_record_that_cannot_get_the_logger_in_time_is_counted() {
+        let _serial = SERIAL.lock().await;
+        let dir = TempDir::new().unwrap();
+        let logger = logger(dir.path(), AccessLogMode::All);
+        let before = access_log_records_dropped_total();
+        let held = logger.lock().await;
+        record_access(&logger, false, Duration::from_millis(20), |l| {
+            entry(l, "/b/dropped")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = access_log_records_dropped_total();
+        drop(held);
+        assert_eq!(
+            after - before,
+            1,
+            "a record whose hand-off outlived its wait must be counted"
+        );
+        assert_eq!(logger.lock().await.pending_entries_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_contended_record_is_written_once_the_logger_is_free() {
+        let _serial = SERIAL.lock().await;
+        let dir = TempDir::new().unwrap();
+        let logger = logger(dir.path(), AccessLogMode::All);
+        let held = logger.lock().await;
+        let called = Utc::now();
+        // Returns at once: the request is not made to wait for the logger.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            record_access(&logger, false, Duration::from_secs(10), |l| {
+                entry(l, "/b/late")
+            }),
+        )
+        .await
+        .expect("record_access must not wait for a held logger");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let released = Utc::now();
+        drop(held);
+        let mut pending = 0;
+        for _ in 0..100 {
+            pending = logger.lock().await.pending_entries_count();
+            if pending > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pending, 1, "the handed-off record must reach the buffer");
+        let guard = logger.lock().await;
+        let buffer = guard.access_log_buffer.as_ref().unwrap();
+        let time = buffer.buffer.lock().unwrap()[0].time;
+        assert!(
+            time >= called && time < released,
+            "the record keeps the time the request completed, not when the logger came free"
+        );
+    }
+
+    #[tokio::test]
+    async fn past_the_limit_a_contended_record_is_dropped_at_once() {
+        let _serial = SERIAL.lock().await;
+        let dir = TempDir::new().unwrap();
+        let logger = logger(dir.path(), AccessLogMode::All);
+        assert_eq!(ACCESS_LOG_HANDOFFS_PENDING.load(Ordering::Relaxed), 0);
+        let before = access_log_records_dropped_total();
+        let held = logger.lock().await;
+        for _ in 0..ACCESS_LOG_HANDOFF_LIMIT {
+            record_access(&logger, false, Duration::from_secs(30), |l| {
+                entry(l, "/b/waiting")
+            })
+            .await;
+        }
+        assert_eq!(
+            access_log_records_dropped_total() - before,
+            0,
+            "up to the limit, every contended record waits"
+        );
+        record_access(&logger, false, Duration::from_secs(30), |l| {
+            entry(l, "/b/over")
+        })
+        .await;
+        assert_eq!(
+            access_log_records_dropped_total() - before,
+            1,
+            "the record past the limit is counted as dropped without waiting"
+        );
+        drop(held);
+        for _ in 0..500 {
+            if ACCESS_LOG_HANDOFFS_PENDING.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(ACCESS_LOG_HANDOFFS_PENDING.load(Ordering::Relaxed), 0);
+        assert_eq!(access_log_records_dropped_total() - before, 1);
+    }
+
+    #[tokio::test]
+    async fn cached_only_mode_still_skips_a_miss() {
+        let _serial = SERIAL.lock().await;
+        let dir = TempDir::new().unwrap();
+        let logger = logger(dir.path(), AccessLogMode::CachedOnly);
+        record_access(&logger, false, Duration::from_secs(1), |l| {
+            entry(l, "/b/miss")
+        })
+        .await;
+        record_access(&logger, true, Duration::from_secs(1), |l| {
+            entry(l, "/b/hit")
+        })
+        .await;
+        assert_eq!(logger.lock().await.pending_entries_count(), 1);
+    }
+}
+
+/// Log events emitted before the application subscriber exists, held so they can be emitted
+/// once it does.
+///
+/// `async_main` loads and checks the configuration before it can initialise logging, because
+/// the configuration names the log directory and level. With no subscriber installed, every
+/// event from that stretch would be dropped, including the warnings about removed, ignored
+/// and remapped configuration fields. [`collect_startup_events`] records them instead, and
+/// [`StartupEvents::replay`] emits each once, at its level and with its text, after
+/// [`LoggerManager::initialize`]. A replayed event carries this module's target, not its
+/// origin's.
+#[derive(Debug, Default)]
+pub struct StartupEvents {
+    events: Vec<(tracing::Level, String)>,
+}
+
+impl StartupEvents {
+    /// The held events in emission order: level and text.
+    pub fn events(&self) -> &[(tracing::Level, String)] {
+        &self.events
+    }
+    /// Emit every held event through the current subscriber, in order.
+    pub fn replay(self) {
+        for (level, text) in self.events {
+            match level {
+                tracing::Level::ERROR => tracing::error!("{}", text),
+                tracing::Level::WARN => warn!("{}", text),
+                tracing::Level::INFO => info!("{}", text),
+                tracing::Level::DEBUG => debug!("{}", text),
+                _ => tracing::trace!("{}", text),
+            }
+        }
+    }
+}
+
+/// Run `f` with a thread-local subscriber that holds every event `f` emits, at every level.
+/// `f` must not move its logging to another thread: only the calling thread's events are held.
+pub fn collect_startup_events<T>(f: impl FnOnce() -> T) -> (T, StartupEvents) {
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(StartupEventLayer(held.clone()));
+    let value = tracing::subscriber::with_default(subscriber, f);
+    let events = std::mem::take(&mut *held.lock().unwrap_or_else(|e| e.into_inner()));
+    (value, StartupEvents { events })
+}
+
+struct StartupEventLayer(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StartupEventLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut text = StartupEventText::default();
+        event.record(&mut text);
+        let mut line = text.message;
+        line.push_str(&text.fields);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((*event.metadata().level(), line));
+    }
+}
+
+/// An event's `message` field, and any other fields as ` name=value`.
+#[derive(Default)]
+struct StartupEventText {
+    message: String,
+    fields: String,
+}
+
+impl tracing::field::Visit for StartupEventText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        if field.name() == "message" {
+            let _ = write!(self.message, "{:?}", value);
+        } else {
+            let _ = write!(self.fields, " {}={:?}", field.name(), value);
+        }
+    }
+}
+
+/// Events emitted before the application subscriber exists are held, then replayed at
+/// their level and with their text.
+#[cfg(test)]
+mod startup_event_tests {
+    use super::*;
+
+    #[test]
+    fn held_events_keep_their_level_and_text_and_replay_once() {
+        let (value, held) = collect_startup_events(|| {
+            warn!("Configuration field 'cache.x' has been removed");
+            info!("Configuration loaded from file: {}", "/etc/c.yaml");
+            7
+        });
+        assert_eq!(value, 7);
+        assert_eq!(
+            held.events(),
+            &[
+                (
+                    tracing::Level::WARN,
+                    "Configuration field 'cache.x' has been removed".to_string()
+                ),
+                (
+                    tracing::Level::INFO,
+                    "Configuration loaded from file: /etc/c.yaml".to_string()
+                ),
+            ]
+        );
+        let (_, replayed) = collect_startup_events(|| held.replay());
+        assert_eq!(
+            replayed.events(),
+            &[
+                (
+                    tracing::Level::WARN,
+                    "Configuration field 'cache.x' has been removed".to_string()
+                ),
+                (
+                    tracing::Level::INFO,
+                    "Configuration loaded from file: /etc/c.yaml".to_string()
+                ),
+            ]
+        );
     }
 }

@@ -1,1563 +1,593 @@
-# Developer Documentation
+# Developer documentation
 
-Implementation details, architectural decisions, and technical notes for Hybrid Cache for Amazon S3 developers.
+This page is for developers changing Hybrid Cache for Amazon S3: the trade-offs behind its main
+design decisions, the implementation detail a maintainer needs, the known limitations, and how to
+test and debug. [Architecture](ARCHITECTURE.md) is the reference for the core principles
+(transparent forwarder, streaming architecture, unified range storage), the module inventory, the
+system diagram, and the streaming and sharding designs; this page does not repeat them. Code is
+cited by symbol name; read the symbol in `src/` rather than trusting a paraphrase of it.
 
-## Table of Contents
+## Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Key Design Decisions](#key-design-decisions)
-3. [Implementation Details](#implementation-details)
-4. [Performance Optimizations](#performance-optimizations)
-5. [Known Limitations](#known-limitations)
-6. [Testing Strategy](#testing-strategy)
-7. [Debugging Tips](#debugging-tips)
-8. [Code Style Guidelines](#code-style-guidelines)
-9. [Contributing Guidelines](#contributing-guidelines)
-10. [References](#references)
+- [Module organization](#module-organization)
+- [Key design decisions](#key-design-decisions)
+- [Implementation details](#implementation-details)
+- [Optimizations](#optimizations)
+- [Known limitations](#known-limitations)
+- [Testing strategy](#testing-strategy)
+- [Debugging tips](#debugging-tips)
+- [Code style guidelines](#code-style-guidelines)
+- [Contributing guidelines](#contributing-guidelines)
+- [References](#references)
 
-## Architecture Overview
+## Module organization
 
-[ARCHITECTURE.md](ARCHITECTURE.md) is the maintained reference for the core principles
-(transparent forwarder, streaming architecture, unified range storage), the module
-inventory, and the system diagram. This guide does not repeat them — an earlier revision
-did, and the two copies drifted in opposite directions, each carrying an error the other
-had right.
-
-What this guide adds is the *why*: the trade-offs behind each design decision, the
-implementation detail a maintainer needs, and the known limitations.
-
-### Module Organization
-
-For the module inventory, see
-[ARCHITECTURE.md — Module Organization](ARCHITECTURE.md#module-organization). It is
-grouped by subsystem (proxy/protocol, caching, journal, streaming, observability) and
-is the maintained reference; this guide does not repeat it. To list the current modules
-directly:
+[Module organization](ARCHITECTURE.md#module-organization) groups the modules by subsystem (cache
+layer, journal and size accounting, recovery, HTTP proxy, listeners, networking, observability,
+configuration). To list the current modules:
 
 ```bash
 ls src/*.rs
 ```
 
-The two largest modules are `cache.rs` and `http_proxy.rs`. Both contain several
-similar-looking range read paths whose cache-tier behaviour is not visible at the call
-site — see
-[ARCHITECTURE.md — Range Read-Path Map](ARCHITECTURE.md#3a-range-read-path-map) before
-changing any of them.
+The two largest modules are `cache.rs` and `http_proxy.rs`. Both contain several similar-looking
+range read paths whose cache behavior is not visible at the call site. Read the
+[Range read-path map](ARCHITECTURE.md#3a-range-read-path-map) before changing any of them.
 
-## Key Design Decisions
+## Key design decisions
 
-### 1. Streaming Response Architecture
+### Streaming responses
 
-**Problem**: Large files (500MB+) caused AWS SDK throughput timeouts when buffering entire response.
+The design and a sketch of `TeeStream` are in
+[Streaming response architecture](ARCHITECTURE.md#1-streaming-response-architecture); the
+implementation is `src/tee_stream.rs`. When the cache channel is full, `TeeStream` switches to
+backpressure and waits for the cache writer rather than dropping bytes, and counts each switch in
+`BACKPRESSURE_EVENTS_TOTAL`.
 
-**Solution**: TeeStream architecture
-- All S3 responses stream directly to client, regardless of size
-- Data simultaneously sent to background task for caching
-- No buffering of entire response in memory
+Trade-offs:
 
-**Implementation** (`src/tee_stream.rs`):
-```rust
-pub struct TeeStream<S> {
-    inner: S,
-    sender: mpsc::Sender<Bytes>,
-    bytes_sent: usize,
-}
+- A background task per streamed response.
+- A slow cache writer slows the client response through backpressure.
+- A partial cache hit is still buffered, because it is merged.
 
-impl<S> Stream for TeeStream<S>
-where
-    S: Stream<Item = Result<Frame<Bytes>, hyper::Error>> + Unpin,
-{
-    type Item = Result<Frame<Bytes>, hyper::Error>;
+### Bucket-first hash-based sharding
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let inner = Pin::new(&mut self.inner);
+The layout, the reason for BLAKE3 and the capacity figures are in
+[Bucket-first hash-based sharding](ARCHITECTURE.md#2-bucket-first-hash-based-sharding); the
+implementation is `get_sharded_path` in `src/disk_cache.rs`.
 
-        match inner.poll_next(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                // Check if this is a data frame
-                match frame.into_data() {
-                    Ok(data) => {
-                        let bytes = data;
-                        self.bytes_sent += bytes.len();
+- Lookup is O(1) whatever the cache size, and files spread evenly across directories.
+- A bucket's cache can be managed as a directory (`rm -rf cache_dir/metadata/{bucket}/`), and
+  file names do not repeat the bucket name.
+- The cost is up to 1,048,576 leaf directories per bucket, each an inode on the cache volume, and
+  one BLAKE3 hash per lookup.
 
-                        // Try to send to cache channel (non-blocking)
-                        if let Err(e) = self.sender.try_send(bytes.clone()) {
-                            match e {
-                                mpsc::error::TrySendError::Full(_) => {
-                                    warn!("Cache channel full, dropping chunk");
-                                }
-                                mpsc::error::TrySendError::Closed(_) => {
-                                    debug!("Cache channel closed, stopping tee");
-                                }
-                            }
-                        }
+### Unified range storage
 
-                        // Return the original data frame
-                        Poll::Ready(Some(Ok(Frame::data(bytes))))
-                    }
-                    Err(frame) => {
-                        // Non-data frame (trailers, etc), pass through
-                        Poll::Ready(Some(Ok(frame)))
-                    }
-                }
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
+All cached data is stored as ranges, whatever wrote it:
+
+- A PUT is stored as range 0-N at once (the write cache is enabled by default), through
+  `CacheManager::store_put_as_write_cached_range`.
+- A GET stores a full object or a partial range.
+- A multipart upload's parts become ranges on completion, in
+  `SignedPutHandler::finalize_multipart_upload`.
+
+So a range request can be served from any cached data, and a TTL transition rewrites one `.meta`
+and no range file. The cost is larger metadata files (upload state and the parts list) and more
+complex multipart handling (part position calculation).
+
+### Frequency-recency eviction
+
+Pure LRU evicts frequently used entries during a scan, and pure LFU lets one-time reads pollute
+the cache. The proxy uses a simplified frequency-recency hybrid, labelled `tinylfu` in the
+configuration:
+
+- Victims are scored by `decayed_frequency(access_count, idle_secs)` in `src/cache.rs`: the
+  access count halves for every `TINYLFU_HALF_LIFE_SECS` of idle time.
+- The RAM cache picks its victim with `shard_find_tinylfu_victim` in `src/ram_cache.rs`, reading
+  each entry's `access_count` and `last_accessed` atomics at eviction time.
+- The disk cache sorts candidates with `sort_range_candidates_for_tinylfu`, after expiry and
+  compressed size.
+- Counting uses per-entry counters, not a probabilistic sketch.
+
+[Eviction algorithms](EVICTION.md#eviction-algorithms) gives the full ordering for each cache.
+
+This is not the full TinyLFU algorithm from the research paper: it has no Count-Min Sketch, no
+doorkeeper Bloom filter for admission, and no window and main segments (W-TinyLFU). A hot entry
+that is idle keeps a higher score than a one-hit read, so a one-time scan does not flush the
+cache, and the bookkeeping is two atomics per entry. In the RAM cache the score ignores entry
+size, and victim selection scans the shard, O(entries in the shard) where LRU is O(1). GDSF
+(Greedy Dual Size Frequency) was considered for its size-aware byte hit rate and rejected as
+harder to implement and tune.
+
+### Range request merging
+
+On a partial cache hit the proxy fetches only the missing parts from S3:
+
+- It identifies the missing ranges and merges those separated by small gaps
+  (`range_merge_gap_threshold`, default 1 MiB), in `RangeHandler::consolidate_missing_ranges`.
+- It fetches the merged ranges with `RangeHandler::fetch_missing_ranges` and combines cached and
+  fetched bytes with `RangeHandler::merge_range_segments` (`src/range_handler.rs`).
+
+This fetches fewer bytes from S3 than refetching the whole range. The cost is more code, a merge
+that has to buffer rather than stream, and a gap threshold that may need tuning per workload. See
+[Range request gap consolidation](#range-request-gap-consolidation).
+
+### Connection keepalive
+
+A new TCP and TLS connection per request would add a handshake to every request. The proxy reuses
+connections through hyper's connection pool, with per-IP pools. `src/s3_client.rs` builds the
+client with `pool_idle_timeout` from `connection_pool.idle_timeout` (default 55s). The per-host
+and per-IP idle limits and their defaults are in [Connection pooling](CONNECTION_POOLING.md). The
+cost is handling stale connections, rotating connections when DNS changes, and memory for idle
+connections.
+
+### Part number request caching
+
+Parts are stored as ranges in the existing range storage:
+
+- `partNumber` in the query string identifies a GetObject part request.
+- The multipart metadata comes from the S3 response headers (`x-amz-mp-parts-count`,
+  `Content-Range`), and each part is stored as a range at its `Content-Range` offsets.
+- Each part's byte range is recorded in `ObjectMetadata::part_ranges` (a
+  `HashMap<u32, (u64, u64)>`) and looked up by `CacheManager::lookup_part`.
+- Cached parts are served with the same response headers S3 returned.
+
+Repeated requests for a part are served without contacting S3. The costs are more request
+parsing and the multipart fields in the metadata. [Part number requests](#part-number-requests)
+lists when a part request is and is not cached.
+
+### RAM metadata cache
+
+`src/metadata_cache.rs` keeps `NewCacheMetadata` objects in RAM for both HEAD and GET. Each
+`MetadataCacheEntry` records `loaded_at`, `disk_mtime` and `last_accessed` beside the metadata.
+
+- **One `.meta` for HEAD and GET, with independent TTLs.** HEAD freshness uses
+  `head_expires_at` and GET freshness the object-level `expires_at`. A HEAD expiry does not delete
+  the file, because the ranges may still be valid, and a GET expiry does not affect HEAD validity.
+- **LRU, not TinyLFU.** Metadata entries are all about the same size (about 1 to 2 KB), so
+  frequency scoring adds nothing; eviction pops the front of `lru_order`.
+- **No per-key lock on the request path.** `CacheManager::get_metadata_cached` checks the RAM
+  cache and, on a miss, reads the `.meta` without a lock, so concurrent misses for one key each
+  read the file. `MetadataCache::get_or_load`, which does lock per key, has no caller on the
+  request path.
+- **Stale file handle recovery for NFS.** The `.meta` reader retries `ESTALE` up to 3 times
+  (after 50, 100 and 150 ms). A read still stale after that is a cache miss, and the `.meta` is
+  not deleted.
+
+A hot entry's metadata is served from memory with no disk read. The costs are the memory for the
+metadata cache (see [Memory use](CACHE_INTERNALS.md#memory-use)) and up to one refresh interval
+of staleness.
+
+### RAM-disk cache coherency
+
+RAM cache hits do not update disk metadata by themselves, which would skew eviction, and direct
+metadata writes from several proxies on shared NFS storage would race. The proxy batches the
+updates through a journal:
+
+- Cache-hit updates (TTL refresh, access count) are buffered in RAM by `CacheHitUpdateBuffer`
+  (`src/cache_hit_update_buffer.rs`), recorded through `DiskCacheManager::record_range_access` for disk hits. RAM hits are queued for
+  one background task that records them into the buffer with `CacheHitUpdateBuffer::record_access_update`.
+- The buffer is flushed every 5 seconds to a per-proxy journal file under `metadata/_journals/`.
+- `JournalConsolidator` applies journal entries to the metadata files under each key's slot
+  lock; the entry types are `JournalOperation` in `src/journal_manager.rs`. It tries each key's
+  lock once and skips a contended key until the next cycle.
+
+[RAM-disk cache coherency](CACHE_INTERNALS.md#ram-disk-cache-coherency) describes the mechanism
+in full. The costs are a delay before statistics reach the `.meta` (the 5-second buffer plus the
+consolidation interval), memory for pending updates up to the 10,000-entry buffer ceiling, and
+background I/O for consolidation.
+
+### Coordinated cache initialization
+
+`src/cache_initialization_coordinator.rs` runs startup in sequential, logged phases with shared
+validation utilities. A starting proxy does not walk the cache: it reads the saved size
+state and, where that is missing or stale, asks the validation scheduler for a scan. Startup time
+therefore does not grow with the cache. The cost is coordination logic between subsystems.
+
+## Implementation details
+
+### Cache key format
+
+Keys are path-only (no hostname) with no leading slash; `normalize_cache_key` strips it.
+
+```text
+{bucket}/{object_key}
 ```
 
-**Benefits**:
-- Eliminates timeout issues
-- Constant memory usage (64KB chunks)
-- Sub-100ms first byte latency
-- No cache performance regression
-
-**Trade-offs**:
-- Slightly more complex code
-- Background task overhead (minimal)
-- Partial cache hits still require buffering (for merging)
-
-### 2. Bucket-First Hash-Based Sharding
-
-**Problem**: Flat directory structure doesn't scale beyond 10K files per directory.
-
-**Solution**: Bucket-first hash-based sharding with BLAKE3
-```
-cache_dir/
-├── metadata/{bucket}/{XX}/{YYY}/
-└── ranges/{bucket}/{XX}/{YYY}/
-```
-
-**Why BLAKE3**:
-- Cryptographically secure (prevents collision attacks)
-- Excellent distribution properties
-- Native Rust implementation
-
-**Implementation** (`src/cache.rs`):
-```rust
-fn get_sharded_path(base_dir: &Path, cache_key: &str, suffix: &str) -> Result<PathBuf> {
-    let (bucket, object_key) = parse_cache_key(cache_key)?;
-    let hash = blake3::hash(object_key.as_bytes());
-    let hash_hex = hash.to_hex();
-    
-    let level1 = &hash_hex[0..2];   // 256 directories
-    let level2 = &hash_hex[2..5];   // 4,096 subdirectories
-    
-    Ok(base_dir.join(bucket).join(level1).join(level2).join(filename))
-}
-```
-
-**Capacity**:
-- 1,048,576 leaf directories per bucket (256 × 4,096)
-- 10.5B files per bucket maximum (10K files/directory)
-- 2.6B files per bucket optimal (40% safety margin)
-- Unlimited buckets
-
-**Benefits**:
-- O(1) file lookup regardless of cache size
-- Per-bucket cache management (`rm -rf cache_dir/metadata/{bucket}/`)
-- Uniform distribution across directories
-- Eliminates bucket name redundancy in filenames
-
-**Trade-offs**:
-- Breaking change (not backward compatible)
-- Directory overhead (~268MB inodes per bucket)
-- Hash computation overhead (~1μs per operation)
-
-### 3. Unified Range Storage
-
-**Problem**: Three different storage formats (write cache, GET cache, multipart) caused complexity and inefficiency.
-
-**Solution**: Store all cached data as ranges
-- PUT operations: Stored as range 0-N immediately (write caching enabled by default)
-- GET operations: Full objects or partial ranges
-- Multipart uploads: Parts assembled into ranges on completion
-
-**Implementation** (`src/cache.rs`):
-```rust
-// PUT request (write caching enabled by default)
-pub async fn store_write_cache_entry(&self, cache_key: &str, data: &[u8]) -> Result<()> {
-    // Store as range 0 to content_length-1
-    self.disk_cache.store_full_object_as_range(cache_key, data, metadata).await?;
-    // Mark upload_state = Complete
-    // Set PUT_TTL expiration
-}
-
-// Multipart completion
-pub async fn complete_multipart_upload(&self, path: &str) -> Result<()> {
-    // Sort parts by part number
-    // Calculate byte positions from part sizes
-    // Store each part as a range
-    // Mark upload_state = Complete
-}
-```
-
-**Benefits**:
-- Range requests work immediately (no S3 fetch)
-- No data copying on TTL transitions (metadata-only update)
-- Simplified code paths (single storage format)
-- Fast transitions (<10ms metadata update)
-
-**Trade-offs**:
-- Slightly larger metadata files (upload_state, parts list)
-- More complex multipart handling (position calculation)
-
-### 4. Frequency-Recency Hybrid Eviction Algorithm
-
-**Problem**: LRU evicts frequently-accessed items during scan patterns. LFU vulnerable to cache pollution. Need unified eviction across GET and HEAD entries.
-
-**Solution**: Simplified frequency-recency hybrid (labeled "TinyLFU" in config)
-- Combines access frequency and recency in eviction scoring
-- Sliding window tracks recent accesses
-- HashMap-based frequency counting (not a probabilistic sketch)
-
-**Note**: This is a simplified implementation, not the full TinyLFU algorithm from the research paper. It lacks:
-- Count-Min Sketch for O(1) memory frequency estimation
-- Doorkeeper bloom filter for admission control
-- Window/main cache segmentation (W-TinyLFU)
-
-**Implementation** (`src/ram_cache.rs`):
-```rust
-// Unified eviction across GET and HEAD entries.
-// Note: victim selection does NOT sort expired entries first — see
-// "TTL Expiration Prioritization" under Known Limitations.
-fn find_tinylfu_victim(&self) -> Option<String> {
-    // Score all entry types
-    let get_candidates = self.entries.iter().map(|(k, v)| (k, v.last_accessed, "GET"));
-    let head_candidates = self.head_entries.iter().map(|(k, v)| (k, v.last_accessed, "HEAD"));
-    
-    get_candidates.chain(head_candidates)
-        .min_by_key(|(key, last_accessed, _)| {
-            // Frequency decayed by idle time: halves per TINYLFU_HALF_LIFE_SECS.
-            // Do NOT divide frequency by recency — that inverts the ranking and
-            // evicts hot-but-idle entries ahead of fresh one-hit reads (fixed in 2.3.1).
-            let idle_secs = now.duration_since(*last_accessed)
-                .unwrap_or_default().as_secs();
-            decayed_frequency(self.access_count_for(*key), idle_secs)
-        })
-        .map(|(key, _, _)| key.clone())
-}
-
-// TTL-aware eviction prioritizes expired entries
-pub fn evict_expired_entries(&mut self) -> Result<u64> {
-    let now = SystemTime::now();
-    let mut evicted_count = 0;
-    
-    // Evict expired GET entries
-    self.entries.retain(|_, entry| {
-        if now > entry.expires_at {
-            evicted_count += 1;
-            false
-        } else {
-            true
-        }
-    });
-    
-    // Evict expired HEAD entries
-    self.head_entries.retain(|_, entry| {
-        if now > entry.expires_at {
-            evicted_count += 1;
-            false
-        } else {
-            true
-        }
-    });
-    
-    Ok(evicted_count)
-}
-```
-
-**Benefits**:
-- **Unified Competition**: GET and HEAD entries compete fairly for cache space
-- **TTL Priority**: Expired entries evicted first, regardless of frequency
-- **Optimal Utilization**: Most valuable entries (by frequency) retained
-- **Scan Resistance**: One-time scans don't pollute cache
-- **Low Overhead**: ~16-24 bytes per entry for frequency tracking
-
-**HEAD Cache Advantages**:
-- **Higher Density**: HEAD entries are 1-5KB vs GET entries that can be MB/GB
-- **Better Hit Rates**: More HEAD entries fit in same memory space
-- **Faster Eviction**: HEAD entries cheaper to evict than large GET entries
-
-**Performance Characteristics**:
-- **GET operations**: O(1) for hit/miss, O(N) for eviction
-- **HEAD operations**: O(1) for hit/miss, O(N) for eviction  
-- **Unified eviction**: O(N) scan across both entry types
-- **Memory overhead**: Minimal frequency tracking per entry
-
-**Trade-offs**:
-- Size-agnostic (doesn't consider object size differences between GET/HEAD)
-- Slower eviction than simple LRU (O(N) vs O(1))
-- May favor HEAD entries due to higher access frequency and smaller size
-
-**Alternative Considered**: GDSF (Greedy Dual Size Frequency)
-- Size-aware eviction considering GET vs HEAD entry sizes
-- Better byte hit rate optimization
-- More complex to implement and tune
-- Rejected: TinyLFU sufficient, HEAD entries naturally small
-
-### 5. Range Request Merging
-
-**Problem**: Partial cache hits fetched entire range from S3, wasting bandwidth.
-
-**Solution**: Intelligent range merging
-- Identify missing ranges
-- Consolidate small gaps (< 256KB threshold)
-- Fetch only missing portions from S3
-- Merge cached + fetched ranges
-
-**Implementation** (`src/http_proxy.rs`):
-```rust
-// Identify missing ranges
-let missing_ranges = identify_missing_ranges(&requested_range, &cached_ranges);
-
-// Consolidate small gaps
-let consolidated = consolidate_ranges(missing_ranges, gap_threshold);
-
-// Fetch missing ranges in parallel
-let fetched = fetch_ranges_from_s3(consolidated).await?;
-
-// Merge cached + fetched
-let merged = merge_ranges(&cached_ranges, &fetched, &requested_range)?;
-```
-
-**Benefits**:
-- 60-90% bandwidth savings for partial cache hits (based on internal testing with synthetic workloads)
-- Faster response times (less data from S3)
-- Reduced S3 costs (fewer bytes transferred)
-
-**Trade-offs**:
-- More complex code (range extraction, merging)
-- Requires buffering for merge (can't stream)
-- Gap threshold tuning needed for optimal performance
-
-### 6. Connection Keepalive
-
-**Problem**: Creating new TCP/TLS connection per request adds 150-300ms overhead.
-
-**Solution**: HTTP connection keepalive with Hyper 1.0
-- Reuse existing connections
-- Per-IP connection pools
-- Automatic lifecycle management
-
-**Implementation** (`src/connection_pool.rs`):
-```rust
-let client = Client::builder(TokioExecutor::new())
-    .pool_idle_timeout(Duration::from_secs(30))
-    .pool_max_idle_per_host(1)
-    .build(CustomHttpsConnector::new(pool_manager));
-```
-
-**Benefits**:
-- 150-200ms latency reduction per request (based on internal testing with synthetic workloads)
-- 50-100% throughput increase (based on internal testing with synthetic workloads)
-- Minimal memory overhead (~50KB per connection)
-
-**Trade-offs**:
-- Stale connections need handling
-- DNS changes require connection rotation
-- Memory usage for idle connections
-
-### 7. Part Number Request Caching
-
-**Problem**: GET requests with `partNumber` query parameters bypassed cache entirely, causing repeated S3 requests for the same parts.
-
-**Solution**: Treat parts as ranges using existing range storage architecture
-- Parse `partNumber` from query parameters to detect GetObjectPart requests
-- Extract multipart metadata from S3 response headers (`x-amz-mp-parts-count`, `Content-Range`)
-- Store parts as ranges using Content-Range byte offsets
-- Calculate part boundaries from stored metadata for cache lookups
-- Serve cached parts with consistent response headers
-
-**Implementation** (`src/cache.rs`, `src/http_proxy.rs`):
-```rust
-/// Part ranges stored per-part in ObjectMetadata
-/// Maps part number to (start_offset, end_offset) byte range
-pub part_ranges: HashMap<u32, (u64, u64)>,
-
-/// Look up byte range for a given part number
-fn lookup_part(cache_key: &str, part_number: u32) -> Result<Option<CachedPartResponse>> {
-    // Direct lookup: metadata.object_metadata.part_ranges.get(&part_number)
-    // Returns None on miss (no delay, no calculation)
-}
-
-/// Parse Content-Range header: "bytes 0-8388607/5368709120"
-fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
-    // Returns (start, end, total_size)
-}
-```
-
-**Benefits**:
-- Eliminates repeated S3 requests for same parts
-- Leverages existing range storage and compression
-- Maintains response header consistency
-- Supports all S3-compatible part operations
-
-**Trade-offs**:
-- Additional complexity in request parsing
-- Metadata overhead for multipart fields
-- Upload verification requests (partNumber + uploadId) still bypass cache
-
-### 8. RAM Metadata Cache Architecture
-
-**Problem**: Metadata lookups required disk I/O for every request, missing opportunity for sub-millisecond responses.
-
-**Solution**: RAM Metadata Cache with unified storage
-- `NewCacheMetadata` objects cached in RAM for both HEAD and GET requests
-- HEAD and GET share the same `.meta` file with independent TTLs
-- Simple LRU eviction (all entries similar size ~1-2KB)
-- Per-key locking prevents concurrent disk reads
-
-**Implementation** (`src/metadata_cache.rs`):
-```rust
-// MetadataCache entry structure
-pub struct MetadataCacheEntry {
-    pub metadata: NewCacheMetadata,  // Full metadata including HEAD and GET fields
-    pub loaded_at: Instant,          // When loaded from disk
-    pub disk_mtime: Option<SystemTime>, // Disk file modification time
-    pub last_accessed: Instant,      // For LRU eviction
-}
-
-// Get or load with per-key locking
-pub async fn get_or_load<F, Fut>(&self, cache_key: &str, loader: F) -> Result<NewCacheMetadata>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<NewCacheMetadata>>,
-{
-    // Check cache first
-    if let Some(entry) = self.get(cache_key).await {
-        if !self.is_stale(&entry) {
-            return Ok(entry.metadata);
-        }
-    }
-    
-    // Per-key locking prevents concurrent disk reads
-    let lock = self.get_or_create_key_lock(cache_key).await;
-    let _guard = lock.lock().await;
-    
-    // Double-check after acquiring lock
-    if let Some(entry) = self.get(cache_key).await {
-        if !self.is_stale(&entry) {
-            return Ok(entry.metadata);
-        }
-    }
-    
-    // Load from disk
-    let metadata = loader().await?;
-    self.put(cache_key, metadata.clone()).await;
-    Ok(metadata)
-}
-```
-
-**Key Design Decisions**:
-
-1. **Unified Storage**: HEAD and GET share same `.meta` file
-   - HEAD has `head_expires_at` field, GET ranges have `expires_at` field
-   - HEAD expiry doesn't delete file (ranges may still be valid)
-   - Range expiry doesn't affect HEAD validity
-
-2. **Simple LRU Eviction**: Not TinyLFU
-   - All metadata entries are similar size (~1-2KB)
-   - TinyLFU complexity not needed for uniform-size entries
-   - Simple LRU provides optimal performance
-
-3. **Per-Key Locking**: Prevents thundering herd
-   - Multiple concurrent requests for same key: only one disk read
-   - Other requests wait and get cached result
-   - Reduces disk I/O under high concurrency
-
-4. **Stale File Handle Recovery**: For NFS reliability
-   - Retry with exponential backoff on ESTALE errors
-   - Invalidate cache entry if retries exhausted
-   - Graceful degradation for shared storage
-
-**Benefits**:
-- **Performance**: Sub-millisecond metadata lookups for hot entries
-- **Efficiency**: Unified storage reduces disk space (no separate HEAD cache)
-- **Consistency**: Independent HEAD/GET TTLs in same file
-- **Reliability**: Stale file handle recovery for NFS
-
-**Trade-offs**:
-- Additional memory for metadata cache (~15-25MB for 10,000 entries; ~150-250MB at the default `max_entries` of 100,000)
-- Refresh interval adds slight staleness (default 5s)
-- Per-key locks add coordination overhead
-
-### 9. RAM-Disk Cache Coherency
-
-**Problem**: RAM cache hits don't update disk metadata, causing incorrect eviction decisions. On shared NFS storage, direct metadata writes cause race conditions.
-
-**Solution**: Journal-based metadata updates with RAM buffering
-- Cache-hit updates (TTL refresh, access count) buffered in RAM via `CacheHitUpdateBuffer`
-- Periodic flush to per-instance journal files (every 5 seconds)
-- Background consolidation applies journal entries to metadata files with locking
-- Lock acquisition with exponential backoff prevents contention
-
-**Implementation** (`src/disk_cache.rs`):
-```rust
-// Record cache hit (range access)
-self.record_range_access(cache_key, start, end).await?;
-
-// CacheHitUpdateBuffer accumulates updates in RAM
-// Periodic flush writes to journal file (per-instance)
-// JournalConsolidator applies entries to metadata with locking
-
-// Journal entry types for cache-hit updates:
-pub enum JournalOperation {
-    TtlRefresh { range_start: u64, range_end: u64, new_expires_at: SystemTime },
-    AccessUpdate { range_start: u64, range_end: u64, access_count_delta: u32 },
-    // ... other operations
-}
-```
-
-**Benefits**:
-- Accurate eviction decisions for GET data
-- Minimal disk I/O (batched updates via journal)
-- Prevents RAM-disk inconsistency
-- Race-condition-free on shared NFS storage
-- Lock contention handled with exponential backoff
-
-**Trade-offs**:
-- Slight delay in statistics propagation (5s buffer + consolidation interval)
-- Additional memory for pending updates (~10KB per 1000 entries)
-- Journal consolidation adds background I/O
-
-### 10. Coordinated Cache Initialization
-
-**Problem**: WriteCacheManager and CacheSizeTracker performed separate directory scans during startup, causing redundant I/O and unclear startup messages.
-
-**Solution**: Coordinated initialization with shared scanning
-- Single directory traversal provides data to all subsystems
-- Sequential phases with clear progress logging
-- Cross-validation between subsystems to detect inconsistencies
-- Shared validation utilities eliminate duplicate logic
-
-**Benefits**:
-- Faster startup (eliminates redundant directory scanning)
-- Clear visibility into initialization progress
-- Early detection of cache inconsistencies
-- Consistent validation behavior across subsystems
-
-**Trade-offs**:
-- Slightly more complex initialization flow
-- Additional coordination logic between subsystems
-
-## Implementation Details
-
-### Cache Key Format
-
-**Current Format**: Path-only (no hostname)
-```
-/{bucket}/{object_key}
-```
-
-**Examples**:
-- Full object: `/my-bucket/path/to/object.txt`
-- Range: `/my-bucket/path/to/object.txt:range:0-8388607`
-- Part: `/my-bucket/path/to/object.txt:part:1`
-
-**Rationale**:
-- Simplified from previous `{host}:{path}` format
-- Hostname not needed (S3 routing based on bucket)
-- Cleaner cache keys and filenames
-- Easier debugging and monitoring
-
-**Migration**: Old format detection with metrics tracking
-
-### Metadata Structure
-
-**ObjectMetadata** (`src/cache_types.rs`):
-```rust
-pub struct ObjectMetadata {
-    pub etag: String,
-    pub last_modified: String,
-    pub content_length: u64,
-    pub content_type: Option<String>,
-    pub ranges: Vec<RangeSpec>,
-    pub upload_state: UploadState,
-    pub cumulative_size: u64,
-    pub parts: Vec<PartInfo>,
-    pub expires_at: SystemTime,
-    pub created_at: SystemTime,
-}
-```
-
-**Key Fields**:
-- `ranges`: List of cached ranges (start, end, file path)
-- `upload_state`: Complete, InProgress, or Bypassed
-- `cumulative_size`: Running total for multipart uploads
-- `parts`: Temporary storage for multipart parts (cleared on completion)
-
-**File Size**: Typically <100KB even with hundreds of ranges
-
-### Compression Algorithm Selection
-
-**Content-Aware Detection** (`src/compression.rs`):
-```rust
-fn should_compress(path: &str) -> bool {
-    let ext = Path::new(path).extension()?.to_str()?;
-    
-    // Skip already-compressed formats
-    const SKIP_EXTENSIONS: &[&str] = &[
-        "jpg", "png", "gif", "mp4", "zip", "gz", // ...
-    ];
-    
-    !SKIP_EXTENSIONS.contains(&ext.to_lowercase().as_str())
-}
-```
-
-**Per-Entry Metadata**:
-- Each cache entry stores compression algorithm used
-- Changing algorithm doesn't invalidate existing cache
-- Gradual migration possible
-
-**Rationale**:
-- Avoids wasting CPU on already-compressed data
-- Saves 2-5x space for text/JSON
-- Maintains cache consistency across algorithm changes
-
-### Error Handling Strategy
-
-**Fail Gracefully** (`src/error.rs`):
-- Cache errors don't fail requests (serve from S3)
-- Corrupted metadata deleted automatically
-- Missing range files treated as cache miss
-- Disk full triggers emergency eviction
-
-**Error Recovery** (`src/cache.rs`):
-```rust
-match self.get_metadata(cache_key).await {
-    Ok(Some(metadata)) => { /* use metadata */ }
-    Ok(None) => { /* cache miss */ }
-    Err(e) => {
-        error!("Corrupted metadata: {}", e);
-        self.delete_metadata(cache_key).await?;
-        self.metrics.record_corrupted_metadata().await;
-        Ok(None) // Treat as cache miss
-    }
-}
-```
-
-**Metrics Tracking**:
-- `corruption_metadata_total`
-- `corruption_missing_range_total`
-- `inconsistency_fixed_total`
-- `disk_full_events_total`
-
-### Multipart Upload Handling
-
-**Capacity-Aware Caching** (`src/cache.rs`):
-```rust
-pub async fn store_multipart_part(&self, path: &str, part_number: u32, data: &[u8]) -> Result<()> {
-    let cache_key = Self::generate_cache_key(path);
-    
-    // Check if adding this part would exceed capacity
-    let current_size = self.disk_cache.get_object_size(&cache_key).await?;
-    let part_size = data.len() as u64;
-    
-    if current_size + part_size > self.write_cache_capacity {
-        // Mark upload as bypassed and clean up existing parts
-        self.disk_cache.invalidate(&cache_key).await?;
-        return Ok(());
-    }
-    
-    // Store part info (number, size, data)
-    // ...
-}
-```
-
-**Completion Assembly** (`src/signed_put_handler.rs`):
-```rust
-pub async fn finalize_multipart_upload(&self, cache_key: &str, ...) -> Result<()> {
-    // Validate all parts exist locally (multi-instance safety)
-    for part in &sorted_parts {
-        let part_file = get_sharded_path(&ranges_dir, cache_key, &part_suffix);
-        if !part_file.exists() {
-            // Skip caching and cleanup partial data to prevent corruption
-            self.cleanup_incomplete_multipart_cache(&multipart_dir, upload_id).await;
-            return Ok(()); // Don't fail S3 operation
-        }
-    }
-    
-    // Sort parts by part number
-    let sorted_parts = tracker.get_sorted_parts();
-    
-    // Calculate byte positions from part sizes
-    let mut current_position = 0u64;
-    for part in &sorted_parts {
-        let start = current_position;
-        let end = start + part.size - 1;
-        
-        // Create range spec using the actual compression algorithm from cache_upload_part
-        let range_spec = RangeSpec::new(
-            start,
-            end,
-            range_file_path,
-            part.compression_algorithm.clone(), // Use actual algorithm, not hardcoded
-            compressed_size,
-            part.size,
-        );
-        
-        current_position += part.size;
-    }
-    
-    // Mark upload complete
-    metadata.upload_state = UploadState::Complete;
-}
-```
-
-**Multi-Instance Safety**:
-- Each upload isolated in `mpus_in_progress/{upload_id}/` directory
-- CompleteMultipartUpload validates all parts exist before finalization
-- Missing parts trigger graceful cleanup without affecting other uploads
-- Prevents incomplete cache entries that could serve corrupted data
-
-**Content-Aware Compression** (`src/signed_put_handler.rs`):
-- Each part is compressed using content-aware rules based on file extension
-- The `CachedPartInfo` struct stores the actual compression algorithm used
-- On completion, each part's compression algorithm is preserved in the final range metadata
-- This ensures correct decompression when serving cached multipart uploads
-
-**Conflict Handling**:
-- New PutObject invalidates existing cached data
-- New CreateMultipartUpload invalidates existing cached data
-- Ensures cache consistency when uploads are overwritten
-
-### DNS Resolution
-
-**External DNS Servers** (`src/connection_pool.rs`):
-```rust
-let resolver = TokioAsyncResolver::tokio(
-    ResolverConfig::from_parts(
-        None,
-        vec![],
-        NameServerConfigGroup::from_ips_clear(
-            &[
-                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),      // Google DNS
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),      // Cloudflare DNS
-            ],
-            53,
-            true,
-        ),
-    ),
-    ResolverOpts::default(),
-);
-```
-
-**Rationale**:
-- Bypasses /etc/hosts entries
-- Resolves real S3 IP addresses
-- Enables IP load balancing
-- Prevents routing loops
-
-### Graceful Shutdown
-
-**Coordination** (`src/shutdown.rs`):
-```rust
-pub async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
-    };
-    
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-    
-    info!("Shutdown signal received, starting graceful shutdown");
-}
-```
-
-**Shutdown Sequence**:
-1. Stop accepting new connections
-2. Wait for in-flight requests to complete
-3. Flush pending cache writes
-4. Close connection pools
-5. Write final metrics
-6. Exit
-
-## Performance Optimizations
-
-### 1. Range Request Gap Consolidation
-
-**Problem**: Partial cache hits with small gaps between cached ranges caused excessive S3 requests.
-
-**Solution**: Intelligent gap consolidation with configurable threshold
-```rust
-// Consolidate missing ranges to minimize S3 requests
-let gap_threshold = config.cache.range_merge_gap_threshold; // Default: 1MB
-let consolidated_ranges = range_handler.consolidate_missing_ranges(
-    overlap.missing_ranges.clone(), 
-    gap_threshold
-);
-```
-
-**Algorithm** (`src/range_handler.rs`):
-```rust
-pub fn consolidate_missing_ranges(&self, missing_ranges: Vec<RangeSpec>, max_gap_size: u64) -> Vec<RangeSpec> {
-    // Sort ranges by start position
-    let mut sorted_ranges = missing_ranges;
-    sorted_ranges.sort_by_key(|r| r.start);
-    
-    let mut consolidated = Vec::new();
-    let mut current = sorted_ranges[0].clone();
-    
-    for range in sorted_ranges.iter().skip(1) {
-        let gap = if range.start > current.end {
-            range.start - current.end - 1
-        } else {
-            0 // Overlapping or adjacent
-        };
-        
-        // If gap is small enough, merge ranges
-        if gap <= max_gap_size {
-            current.end = std::cmp::max(current.end, range.end);
-        } else {
-            consolidated.push(current);
-            current = range.clone();
-        }
-    }
-    consolidated.push(current);
-    consolidated
-}
-```
-
-**Benefits**:
-- 60-90% reduction in S3 requests for partial cache hits
-- Configurable threshold (default 1MB, tunable per workload)
-- Significant bandwidth savings for sparse range access patterns
-- Reduced S3 API costs
-
-**Trade-offs**:
-- Fetches some unnecessary bytes within gaps
-- Requires buffering for merge operations (can't stream)
-- Gap threshold needs tuning for optimal performance
-
-### 2. Disk Cache Admission Window
-
-**Problem**: Newly cached ranges were immediately evicted due to zero access history in TinyLFU.
-
-**Solution**: 60-second admission window protection
-```rust
-// Admission window: skip ranges cached within the last 60 seconds
-let now = SystemTime::now();
-let admission_window = Duration::from_secs(60);
-if let Ok(age) = now.duration_since(range_spec.last_accessed) {
-    if age < admission_window {
-        // Skip this range as eviction candidate
-        continue;
-    }
-}
-```
-
-The window is unconditional — there is no bypass at any cache usage level.
-
-**Benefits**:
-- Prevents cache thrashing during large file downloads
-- Allows new ranges to accumulate access statistics
-- Protects investment in recently cached data
-
-**Rationale**:
-- New ranges have zero frequency in TinyLFU algorithm
-- Without protection, they'd be evicted immediately
-- 60 seconds allows ranges to build access history
-
-### 3. Eviction Buffer Strategy
-
-**Problem**: Frequent eviction at exact capacity limits caused performance degradation.
-
-**Solution**: Once over capacity, free down to a target *below* it, so eviction runs in
-batches rather than on every write at the boundary.
-
-The target is `eviction_target_percent`, default **80**:
+- Full object: `my-bucket/path/to/object.txt` (`CacheManager::generate_cache_key`)
+- Range, disk form: `my-bucket/path/to/object.txt:range:0-8388607` (`generate_range_cache_key`)
+- Range, RAM form: `my-bucket/path/to/object.txt:range:0:8388607` (`generate_ram_range_key`)
+- Part: `my-bucket/path/to/object.txt:part:1` (`generate_part_cache_key`)
+
+For a virtual-hosted or access-point request, `generate_cache_key` prefixes the bucket or
+access-point name taken from the `Host` header, so path-style and virtual-hosted requests for the
+same object share one entry. The hostname is left out because S3 routes on the bucket, which
+also keeps keys and file names short.
+
+### Metadata structure
+
+A `.meta` file holds one `NewCacheMetadata` (`src/cache_types.rs`): the `cache_key`, an
+`ObjectMetadata`, the cached `ranges` (each a `RangeSpec` with its offsets, `.bin` path,
+compression algorithm and sizes, and access statistics), the object-level `created_at` and
+`expires_at`, and the HEAD fields (`head_expires_at`, `head_access_count` and related).
+
+`ObjectMetadata` carries the S3 object facts (`etag`, `last_modified`, `content_length`,
+`content_type`, `response_headers`), the upload state (`upload_state`: Complete, InProgress or
+Bypassed; `cumulative_size`; `parts`), the multipart part map (`parts_count`, `part_ranges`,
+`upload_id`), and the write cache fields (`is_write_cached` and its timestamps). A `.meta` is
+typically under 100 KB, even with hundreds of ranges.
+
+### Compression algorithm selection
+
+`CacheManager::effective_compression` decides whether a write is compressed. A write below
+`compression.threshold` (default 1 KiB) is never compressed. Above it, a per-key cache rule that
+sets `compression_enabled` wins; otherwise the built-in extension denylist,
+`CompressionHandler::is_denylisted_extension`, decides. [Compression](COMPRESSION.md) has the
+denylist and the decision order.
+
+Each `RangeSpec` records the algorithm used and its compressed and uncompressed sizes, so
+changing the algorithm does not invalidate the existing cache. Already-compressed data is not
+compressed again, and compressible content such as text and JSON takes less space.
+
+### Error handling strategy
+
+A cache error does not fail the request: the proxy serves from S3 instead, and a missing range
+file is a cache miss. [Error handling](ERROR_HANDLING.md) says how each error category is
+detected, which ones delete or repair files, and which leave them for a retry. The counters are
+`corruption_metadata_total`, `corruption_missing_range_total` and `disk_full_events_total`.
+
+### Multipart upload handling
+
+While an upload is in progress, its parts are cached under `mpus_in_progress/{hash(uploadId)}/`
+(`SignedPutHandler`, `src/signed_put_handler.rs`). On `CompleteMultipartUpload`,
+`finalize_multipart_upload` keeps the requested parts, checks their ETags, computes cumulative
+byte offsets, and writes one `RangeSpec` per part with that part's own compression algorithm.
+[Multipart upload caching](MULTIPART_UPLOAD.md) lists the gates, and which failures clean up the
+staging directory and which leave it for the TTL sweep.
+
+Each upload has its own directory, and a failed gate skips caching without failing the S3
+operation; see [Multipart upload processing](ARCHITECTURE.md#multipart-upload-processing). A
+PutObject invalidates the key's cached object once S3 confirms it. A CompleteMultipartUpload
+replaces the cached object, and the old one keeps serving until then; see
+[Write-through ordering](CACHING.md#write-through-ordering).
+
+### DNS resolution
+
+`src/connection_pool.rs` builds a hickory resolver from `connection_pool.dns_servers`, or from
+the `GOOGLE` and `CLOUDFLARE` name-server sets when that list is empty, instead of the system
+resolver. It ignores `/etc/hosts`, which may point S3's hostnames at the proxy, so it resolves
+the real S3 addresses, avoids routing loops and lets the pool spread requests across S3's IPs.
+
+### Graceful shutdown
+
+`ShutdownCoordinator` (`src/shutdown.rs`) listens for SIGINT and SIGTERM in
+`listen_for_shutdown`, broadcasts a shutdown signal to subscribed components, and runs
+`perform_shutdown` within the configured shutdown timeout:
+
+1. Flush the access log buffer.
+2. Run a final journal consolidation and save the size state.
+3. Release cache locks.
+4. Close the connection pools.
+5. Final cleanup.
+
+## Optimizations
+
+### Range request gap consolidation
+
+Missing ranges separated by a gap no larger than `cache.range_merge_gap_threshold` (default
+1 MiB) are merged into one S3 request by `RangeHandler::consolidate_missing_ranges`, which sorts
+by start offset and extends the current range across each small gap. A sparse access pattern
+then makes fewer S3 requests, at the cost of fetching the bytes inside the gaps and of buffering
+the merge.
+
+### Disk cache admission window
+
+A range accessed within the last 60 seconds (`ADMISSION_WINDOW` in `src/cache.rs`) is not an
+eviction candidate unless its object has passed its stored expiry. New ranges start with zero
+frequency, so without the window a large download's own ranges would be evicted as they arrive;
+the window gives them time to gather access statistics. See
+[Admission window protection](EVICTION.md#admission-window-protection).
+
+### Eviction target below the limit
+
+Once over capacity, eviction frees space down to a target below the limit, so it runs in batches
+rather than on every write at the boundary. The target is `eviction_target_percent`, default 80:
 
 ```rust
 let target_size = (max_size as f64 * (self.eviction_target_percent as f64 / 100.0)) as u64;
 let bytes_to_free = current_size.saturating_sub(target_size);
 ```
 
-`cache.eviction_buffer_percent` is **deprecated and has no effect**. It still parses for
-backward compatibility, and the proxy logs a startup warning if it is set to a
-non-default value. Use `eviction_target_percent`.
+`cache.eviction_buffer_percent` has no effect; `eviction_target_percent` sets the target.
 
-**Benefits**:
-- Reduces eviction frequency (amortizes overhead)
-- Prevents cache thrashing at the capacity boundary
-- Better sustained performance under high load
+### Conditional requests answered from cache
 
-### 4. Conditional Header Injection Optimization
+`evaluate_conditions_from_cache`, default `true` and settable per key in `cache_rules.json`,
+decides who answers a conditional request:
 
-**Problem**: Client conditional headers (If-None-Match, If-Modified-Since) required careful handling to maintain HTTP compliance.
+- With local evaluation on, a GET, range GET or HEAD whose only conditional header is
+  `If-Match` is served from cache when `get_ttl` is non-zero and the cached entry is unexpired
+  with a matching ETag; a HEAD must also be within `head_ttl`. A request whose only conditional
+  header is `If-Range`, with a validator that strong-matches the cached ETag, is served from
+  cache the same way.
+- Any other conditional (`If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` or a mix of
+  headers), a mismatch or a miss is forwarded, and S3 decides. So is a request with a client
+  bypass header (`Cache-Control: no-cache` or `no-store`, `Pragma: no-cache`).
 
-**Solution**: Conditional handling is governed by `evaluate_conditions_from_cache`,
-which defaults to `true` (since 2.2.0) and is settable per key via `cache_rules.json`.
+The proxy never answers `If-None-Match` with a local 304 from cached metadata. That would answer
+the client without S3 seeing the request, which skips S3-side authorization for it and can serve
+a 304 against an ETag the caller is no longer entitled to. Do not add it.
 
-- **Local evaluation on**: `If-Match` is answered from cached metadata when the cached
-  ETag matches and the data is fully cached.
-- **Otherwise**: the request is forwarded and S3 decides.
+Requests answered locally do not revalidate credentials with S3. That is the documented trade-off
+of `evaluate_conditions_from_cache`, which is why it can be set per key and why the dashboard
+shows which rules enable it. Comma-separated ETag lists are parsed per RFC 7232, so
+`If-Match: "a", "b", W/"c"` matches on any entry.
+[Conditional headers handling](CACHE_FRESHNESS.md#conditional-headers-handling) has the full set
+of requests answered locally.
 
-Generating a local 304 for `If-None-Match` from cached metadata was removed in 2.2.0.
-It looked like a free optimization but it answered the client without S3 seeing the
-request, which skips S3-side authorization on that request and can serve a 304 against
-an ETag the caller is no longer entitled to. Do not reintroduce it.
+### Lazy directory creation
 
-**Consequences**:
-- Requests answered locally do not revalidate credentials with S3 — this is the
-  documented trade-off of `evaluate_conditions_from_cache`, which is why it is settable
-  per key and why the dashboard surfaces which rules enable it
-- Comma-separated ETag lists are parsed per RFC 7232, so `If-Match: "a", "b", W/"c"`
-  matches on any entry (fixed in 1.16.0)
+Directories are created when first needed, not at startup, so startup creates no shard
+directories:
 
-### 5. Lazy Directory Creation
-
-Directories created on-demand, not at startup:
 ```rust
 if let Some(parent) = path.parent() {
     tokio::fs::create_dir_all(parent).await?;
 }
 ```
 
-**Benefits**:
-- Fast startup (no directory scanning)
-- Minimal disk I/O
-- Only creates needed directories
+### Atomic file writes
 
-### 6. TinyLFU Unified Eviction with Frequency Tracking
+Metadata and range files are written to a temporary file and then renamed, so a crash or power
+failure leaves either the old file or the new one, never a partial write:
 
-**Problem**: LRU evicts frequently-accessed items during scan patterns. LFU vulnerable to cache pollution.
-
-**Solution**: TinyLFU algorithm with unified eviction across GET and HEAD entries
 ```rust
-// Unified eviction across GET and HEAD entries.
-// Note: victim selection does NOT sort expired entries first — see
-// "TTL Expiration Prioritization" under Known Limitations.
-fn find_tinylfu_victim(&self) -> Option<String> {
-    // Score all entry types
-    let get_candidates = self.entries.iter().map(|(k, v)| (k, v.last_accessed, "GET"));
-    let head_candidates = self.head_entries.iter().map(|(k, v)| (k, v.last_accessed, "HEAD"));
-    
-    get_candidates.chain(head_candidates)
-        .min_by_key(|(key, last_accessed, _)| {
-            // Frequency decayed by idle time: halves per TINYLFU_HALF_LIFE_SECS.
-            // Do NOT divide frequency by recency — that inverts the ranking and
-            // evicts hot-but-idle entries ahead of fresh one-hit reads (fixed in 2.3.1).
-            let idle_secs = now.duration_since(*last_accessed)
-                .unwrap_or_default().as_secs();
-            decayed_frequency(self.access_count_for(*key), idle_secs)
-        })
-        .map(|(key, _, _)| key.clone())
-}
-```
-
-**Frequency Sketch Implementation**:
-```rust
-// Lightweight frequency tracking
-tinylfu_frequencies: HashMap<String, u64>,
-
-// Update frequency on access
-fn record_access(&mut self, key: &str) {
-    let freq = self.tinylfu_frequencies.entry(key.to_string()).or_insert(0);
-    *freq = freq.saturating_add(1);
-}
-```
-
-**Benefits**:
-- **Scan Resistance**: One-time scans don't pollute cache
-- **Unified Competition**: GET and HEAD entries compete fairly for space
-- **TTL Priority**: Expired entries evicted first, regardless of frequency
-- **Low Overhead**: ~16-24 bytes per entry for frequency tracking
-- **Better Hit Rates**: Retains most valuable entries by access frequency
-
-### 7. Content-Aware Compression with Algorithm Selection
-
-**Problem**: Compressing already-compressed data wastes CPU and may increase size.
-
-**Solution**: Content-aware detection with per-entry algorithm storage
-```rust
-fn should_compress(path: &str) -> bool {
-    let ext = Path::new(path).extension()?.to_str()?;
-    
-    // Skip already-compressed formats
-    const SKIP_EXTENSIONS: &[&str] = &[
-        "jpg", "png", "gif", "mp4", "zip", "gz", "bz2", "xz", "7z",
-        "rar", "tar", "deb", "rpm", "dmg", "iso", "webp", "avif"
-    ];
-    
-    !SKIP_EXTENSIONS.contains(&ext.to_lowercase().as_str())
-}
-
-// Per-entry compression metadata
-pub struct RangeSpec {
-    pub compression_algorithm: CompressionAlgorithm,
-    pub compressed_size: u64,
-    pub uncompressed_size: u64,
-    // ... other fields
-}
-```
-
-**Compression Threshold**: Only compress objects > 4KB
-```rust
-if data.len() < self.compression_threshold {
-    return Ok(data.to_vec()); // Skip compression
-}
-```
-
-**Benefits**:
-- Avoids wasting CPU on already-compressed data
-- 2-5x space savings for compressible content (text, JSON, logs)
-- Per-entry algorithm storage enables gradual migration
-- Maintains cache consistency across algorithm changes
-
-### 8. RAM-Disk Cache Coherency with Journal System
-
-**Problem**: RAM cache hits don't update disk metadata, causing incorrect eviction decisions.
-
-**Solution**: Journal-based metadata updates with RAM buffering
-```rust
-// Cache-hit updates buffered in RAM
-pub struct CacheHitUpdateBuffer {
-    pending_updates: HashMap<String, Vec<JournalOperation>>,
-    flush_interval: Duration,
-    flush_threshold: usize,
-}
-
-// Journal entry types
-pub enum JournalOperation {
-    TtlRefresh { range_start: u64, range_end: u64, new_expires_at: SystemTime },
-    AccessUpdate { range_start: u64, range_end: u64, access_count_delta: u32 },
-}
-
-// Periodic flush to per-instance journal files
-async fn flush_to_journal(&self) -> Result<()> {
-    let journal_path = format!("{}/journals/{}.journal", cache_dir, instance_id);
-    // Write batched updates with atomic append
-}
-```
-
-**Background Consolidation**:
-```rust
-// JournalConsolidator applies entries to metadata with locking
-async fn consolidate_journal_entries(&self) -> Result<()> {
-    for entry in journal_entries {
-        let lock = self.acquire_metadata_lock(&cache_key).await?;
-        // Apply updates to .meta file atomically
-        self.update_metadata_from_journal(entry).await?;
-    }
-}
-```
-
-**Benefits**:
-- Accurate eviction decisions (considers RAM cache access patterns)
-- Minimal disk I/O (batched updates every 5 seconds)
-- Race-condition-free on shared NFS storage
-- Lock contention handled with exponential backoff
-
-### 9. Atomic File Operations with Crash Safety
-
-Write to `.tmp` file, then atomic rename:
-```rust
-let tmp_path = path.with_extension("tmp");
 tokio::fs::write(&tmp_path, data).await?;
 tokio::fs::rename(&tmp_path, &path).await?;
 ```
 
-**Benefits**:
-- Prevents partial writes during crashes
-- Ensures consistency across power failures
-- Crash-safe operations for metadata and range files
+### Parallel range fetching
 
-### 10. Parallel Range Fetching with Connection Reuse
+`RangeHandler::fetch_missing_ranges` issues the merged missing ranges concurrently and joins them
+with `futures::future::join_all`, over the reused connections described in
+[Connection keepalive](#connection-keepalive). A multi-range fill then waits for its slowest
+range rather than for the sum of all of them.
 
-Fetch multiple missing ranges concurrently:
-```rust
-let futures: Vec<_> = missing_ranges.iter()
-    .map(|range| fetch_range_from_s3(cache_key, range))
-    .collect();
+## Known limitations
 
-let results = futures::future::join_all(futures).await;
-```
+### Write cache
 
-**Connection Keepalive**:
-```rust
-let client = Client::builder(TokioExecutor::new())
-    .pool_idle_timeout(Duration::from_secs(30))
-    .pool_max_idle_per_host(1)
-    .build(CustomHttpsConnector::new(pool_manager));
-```
+The write cache is enabled by default (`cache.write_cache_enabled`). An object PUT through the
+proxy is cached on its way to S3, so it can be read from cache as soon as the upload succeeds.
 
-**Benefits**:
-- Faster partial cache hits (parallel S3 requests)
-- 150-200ms latency reduction per request (connection reuse, based on internal testing with synthetic workloads)
-- Better S3 throughput utilization
-- Reduced total latency for multi-range requests
+- **Capacity accounting is atomic.** A reservation goes through `try_reserve_write_cache()`,
+  which returns an RAII `WriteReservation` that is released on drop, so a cancelled or panicking
+  upload cannot leak capacity. Multipart uploads reserve against the declared content length on
+  the same path.
+- **The transition from write cache to read cache** runs before the freshness check, so the first
+  GET of a write-cached object honors `get_ttl`, including `get_ttl: 0`, which revalidates
+  against S3.
+- **Conflicts are checked at completion.** On any per-part ETag mismatch at
+  `CompleteMultipartUpload`, caching is skipped and the in-progress directory is removed, so the
+  cache never keeps an object it cannot show matches S3; see
+  [Multipart upload caching](MULTIPART_UPLOAD.md).
 
-### 11. Metadata Cache Performance Optimizations
+### Versioned requests
 
-**LRU Eviction**: Simple LRU for uniform-size metadata entries
-```rust
-// MetadataCache uses simple LRU (not TinyLFU)
-// All entries are similar size (~1-2KB), so TinyLFU complexity not needed
-fn evict_lru(&mut self) -> Option<String> {
-    self.lru_order.pop_front()
-}
-```
+A request with a `versionId` query parameter bypasses the cache and always goes to S3.
 
-**Simplified Cache Keys**: HEAD entries use simple keys without range suffixes
-```rust
-// GET cache key (with range)
-let get_key = format!("{}:range:{}:{}", path, start, end);
+### Part number requests
 
-// HEAD/Metadata cache key (simple)
-let cache_key = path.to_string();
-```
+A GET with `partNumber` (for example `GET /bucket/object?partNumber=5`) is cached when S3's
+response carries a `Content-Range` header; the part is stored as a range. An UploadPart (a PUT
+with `uploadId` and `partNumber`) is cached during the upload when the write cache is enabled and
+has capacity, and the parts become the object's ranges on `CompleteMultipartUpload`, readable at
+once.
 
-**Optimized Access Tracking**: HEAD access tracked in unified `.meta` file
-```rust
-// GET access tracking (with range details)
-pub fn record_access(&mut self, cache_key: &str, range: &Range, timestamp: SystemTime) {
-    // Complex range-aware tracking
-}
+Part requests that are not cached:
 
-// HEAD access tracked via MetadataCache
-// Updates head_access_count in the unified .meta file
-pub async fn update_head_access(&self, cache_key: &str, head_ttl: Duration) {
-    // Updates head_expires_at and head_access_count in NewCacheMetadata
-}
-```
+- Upload verification requests (`partNumber` with `uploadId`).
+- UploadPart requests beyond the write cache's capacity.
+- Responses without the S3 headers above.
 
-**Memory Efficiency**: Metadata entries have minimal overhead
-```rust
-// MetadataCache entry size calculation
-fn calculate_entry_size(entry: &MetadataCacheEntry) -> u64 {
-    // NewCacheMetadata: ~1-2KB per entry
-    // Entry overhead: ~100 bytes
-    // Total: ~1.5-2.5KB per entry
-    // 10,000 entries: ~15-25MB
-}
-```
+HEAD responses carry no multipart metadata (`x-amz-mp-parts-count`). For an object that was not
+write-cached, the first part request therefore goes to S3, which supplies the metadata, and later
+part requests can be served from cache:
 
-**Benefits**:
-- **Sub-millisecond access**: No disk I/O for hot entries
-- **High cache density**: 10,000+ entries in ~15-25MB
-- **Unified storage**: HEAD and GET share same `.meta` file
-- **Per-key locking**: Prevents thundering herd on cache miss
-
-## Known Limitations
-
-### 1. Write-Through Caching
-
-Write-through caching is enabled by default (`cache.write_cache_enabled`) and is
-complete. An object PUT through the proxy is cached on the way to S3, so it is
-readable from cache immediately after the upload succeeds — the read-after-write
-consistency property described in the project README.
-
-The three defects previously listed here have since been addressed and the notes are
-retained only to explain what changed:
-
-- **Capacity accounting** is atomic. Reservation goes through
-  `try_reserve_write_cache()`, which returns an RAII `WriteReservation` that releases
-  on drop, so a cancelled or panicking upload cannot leak capacity. This replaced a
-  racy check-then-reserve pair in 1.16.0. Multipart uploads reserve against the
-  declared content length on the same path.
-- **The write-cache-to-read-cache TTL transition** now runs before the freshness
-  check rather than asynchronously after it, so the first GET of a
-  write-through-cached object honours `get_ttl` — including `get_ttl: 0`, which
-  revalidates against S3. Fixed in 2.0.0.
-- **Conflict invalidation** is exercised by the multipart correctness gates described
-  in [MULTIPART_UPLOAD.md](MULTIPART_UPLOAD.md): on any per-part ETag mismatch at
-  `CompleteMultipartUpload`, cache finalization is skipped and the in-progress
-  directory is cleaned up, so the cache declines to retain an object it cannot prove
-  matches S3.
-
-### 2. Versioned Requests
-
-**Behavior**: Requests with `versionId` query parameter bypass cache entirely
-
-**Rationale**:
-- Versioned objects are immutable
-- Rare usage pattern
-- Complexity not justified
-
-**Impact**: Versioned requests always fetch from S3
-
-### 3. Part Number Request Caching
-
-Part caching is fully implemented for both read and write operations.
-
-**Read Operations (GET with partNumber)**:
-- GET requests with `partNumber` query parameter (e.g., `GET /bucket/object?partNumber=5`)
-- S3 response includes `Content-Range` header with byte offsets
-- Parts stored as ranges using existing range storage mechanism
-
-**Write Operations (UploadPart)**:
-- PUT requests with `uploadId` and `partNumber` parameters (multipart upload parts)
-- Parts cached immediately during upload (write-through caching)
-- On CompleteMultipartUpload, parts assembled into final object ranges
-
-**When Part Requests Are Cached**:
-- **Read**: GET with `partNumber` and S3 returns `Content-Range` header
-- **Write**: UploadPart requests when write caching is enabled and capacity allows
-
-**When Part Requests Are NOT Cached**:
-- Upload verification requests (`partNumber` + `uploadId` parameters)
-- UploadPart requests exceeding write cache capacity
-- Requests without proper S3 response headers
-
-**Important**: HEAD requests do not provide multipart metadata (`x-amz-mp-parts-count`). For objects not write-cached, the **first part request must be forwarded to S3** to extract multipart information before subsequent part requests can be served from cache.
-
-**How Part Caching Works**:
-
-**Read Path (GET with partNumber)**:
-1. **Detection**: Proxy identifies `partNumber` parameter in GET request
-2. **Cache Lookup**: Check if multipart metadata exists for object
-3. **First Request**: If no metadata, forward to S3 to extract `x-amz-mp-parts-count` and `Content-Range`
-4. **Metadata Population**: Store multipart info for future part requests
-5. **Subsequent Requests**: Calculate expected byte ranges and serve from cache
-
-**Write Path (UploadPart)**:
-1. **Detection**: Proxy identifies `uploadId` + `partNumber` in PUT request
-2. **Capacity Check**: Verify cumulative upload size fits in write cache
-3. **S3 Forward**: Part uploaded to S3 normally
-4. **Part Caching**: Part data cached in `mpus_in_progress/{uploadId}/` directory
-5. **Completion**: On CompleteMultipartUpload, parts assembled into final ranges
-6. **Immediate Access**: GET requests can access parts immediately after completion
-
-**Example Flows**:
 ```bash
-# Object not write-cached - first part request goes to S3
-aws s3api get-object --bucket my-bucket --key large-file.bin --part-number 1 part1.bin
-# → Cache miss, forwarded to S3, multipart metadata extracted and cached
-
-# Subsequent part requests served from cache (if ranges exist)
-aws s3api get-object --bucket my-bucket --key large-file.bin --part-number 1 part1-copy.bin
-# → Cache hit, served from cached range
-
-# Write-cached object - parts immediately available
-aws s3api upload-part --bucket my-bucket --key large-file.bin --part-number 1 --upload-id xyz --body part1.bin
-# → Part cached during upload
-aws s3api complete-multipart-upload --bucket my-bucket --key large-file.bin --upload-id xyz
-# → Parts assembled, immediately available for GET requests
+aws s3api get-object --bucket my-bucket --key large-file.bin --part-number 1 part1.bin  # Miss: forwarded to S3, metadata cached
+aws s3api get-object --bucket my-bucket --key large-file.bin --part-number 1 part1-copy.bin  # Hit: served from the cached range
 ```
 
-**Benefits**:
-- **Write-through**: Uploaded parts immediately available for range requests
-- **Read optimization**: Eliminates repeated S3 requests for same parts
-- **Unified storage**: Both read and write parts use same range storage mechanism
-- **Multi-instance safe**: Proper coordination for shared cache deployments
+### TTL expiry in the RAM cache
 
-**Key Implementation Details**:
-```rust
-// ObjectMetadata extended with part caching fields
-pub struct ObjectMetadata {
-    // ... existing fields ...
-    pub parts_count: Option<u32>,      // From x-amz-mp-parts-count header
-    pub part_ranges: HashMap<u32, (u64, u64)>,  // Per-part byte ranges
-    pub upload_id: Option<String>,
-}
+RAM range entries carry no expiry of their own: `shard_find_tinylfu_victim` scores entries by
+decayed frequency and recency only, so a live entry can be evicted before one whose object has
+expired. The disk cache does sort TTL-expired ranges first; see
+[Range-level granularity](EVICTION.md#range-level-granularity).
 
-// Part range lookup — direct HashMap access, no calculation
-fn lookup_part(part_number: u32, part_ranges: &HashMap<u32, (u64, u64)>) -> Option<(u64, u64)> {
-    part_ranges.get(&part_number).copied()
-}
-```
+### RAM cache eviction scan
 
-**Benefits**:
-- **Performance**: Eliminates repeated S3 requests for same parts
-- **Accuracy**: Stores exact byte ranges per part, supports variable-sized parts
-- **Efficiency**: Leverages existing range storage and compression infrastructure
-- **Consistency**: Cached responses match S3 responses exactly
+RAM victim selection scans every entry in the shard (O(entries in the shard)) on each eviction,
+so a very large number of entries per shard makes RAM eviction slower. Raising
+`ram_cache_shard_count` shortens each scan. Disk eviction reads a bounded prefix of a per-shard
+index instead; see [Eviction flow](EVICTION.md#eviction-flow).
 
-**Use Cases**:
-- **Large File Downloads**: Clients downloading specific parts of multi-GB files
-- **Parallel Processing**: Multiple workers accessing different parts of same object
-- **Resume Downloads**: Clients resuming downloads from specific part offsets
-- **Streaming Applications**: Video/audio streaming accessing non-sequential parts
-
-### 4. RAM Metadata Cache Implementation
-
-RAM Metadata Cache is fully implemented with unified storage.
-
-**Architecture**:
-- **Unified Storage**: HEAD and GET share same `.meta` file with independent TTLs
-- **LRU Eviction**: Simple LRU for uniform-size metadata entries (~1-2KB)
-- **Sub-millisecond Performance**: Metadata lookups served from RAM in <1ms
-
-**Key Implementation Details**:
-```rust
-// MetadataCache entry structure
-pub struct MetadataCacheEntry {
-    pub metadata: NewCacheMetadata,  // Full metadata including HEAD and GET fields
-    pub loaded_at: Instant,          // When loaded from disk
-    pub disk_mtime: Option<SystemTime>, // Disk file modification time
-    pub last_accessed: Instant,      // For LRU eviction
-}
-
-// Per-key locking prevents concurrent disk reads
-pub async fn get_or_load<F, Fut>(&self, cache_key: &str, loader: F) -> Result<NewCacheMetadata> {
-    // Check cache, acquire per-key lock if miss
-    // Only one disk read regardless of concurrent requests
-}
-```
-
-**Benefits**:
-- **Performance**: 99%+ latency reduction for metadata lookups (1ms vs 10-100ms from disk, based on internal testing with synthetic workloads)
-- **Efficiency**: Unified storage reduces disk space (no separate HEAD cache)
-- **Consistency**: Independent HEAD/GET TTLs in same file
-- **Reliability**: Stale file handle recovery for NFS
-
-**Use Cases**:
-- API Gateway health checks (99%+ reduction in disk I/O, based on internal testing with synthetic workloads)
-- High-concurrency workloads (per-key locking prevents thundering herd)
-- NFS shared cache (stale handle recovery)
-
-### 5. TTL Expiration Prioritization
-
-**Issue**: Eviction doesn't prioritize expired entries
-
-**Current Behavior**: Victim selection scores entries by decayed frequency and recency
-without consulting TTL expiry first. In the RAM tier, expired entries are dropped
-lazily as they are encountered on subsequent `put()` calls rather than being swept
-ahead of live data.
-
-**Impact**: Valid data may be evicted before expired data
-
-**Possible improvement**: Sort expired entries first during eviction
-
-### 6. Single-Threaded Eviction
-
-**Issue**: Eviction scans all entries sequentially (O(N))
-
-**Impact**: Large caches (millions of entries) have slow eviction
-
-**Future**: Parallel eviction scanning with rayon
-
-## Testing Strategy
+## Testing strategy
 
 ### Running the suite
 
 ```bash
-cargo test --release                          # everything; always use --release
-cargo test --release --lib                    # in-crate unit tests only (what CI runs)
-cargo test --release --test integration_test  # one integration binary
-cargo test --release -- --nocapture           # with test stdout
+cargo test --release  # everything; always use --release
+cargo test --release --lib  # in-crate unit tests only
+cargo test --release --test group_readpath -- integration_test:: --skip s3_integration_test:: --skip download_coordination_integration_test::  # one test file inside a group
+cargo test --release -- --nocapture  # with test output
 ```
 
-`--release` is not optional in practice: debug builds of this crate are slow and
-memory-hungry enough that the full suite becomes impractical.
+The integration tests build as a few dozen binaries, not one per file. `Cargo.toml` sets
+`autotests = false`, so a new `tests/*.rs` file is not built or run until it is registered, in
+one of two ways:
 
-Two constraints worth knowing before you rely on a green run:
+- Add a `#[path = "<file>.rs"]` line and a `mod <stem>;` line to the `tests/group_*.rs` file for
+  its subject. Its tests then run inside that group binary as `<stem>::<test>`.
+- Give it a `[[test]]` entry in `Cargo.toml`, with a comment giving the reason, when its verdict
+  depends on state shared by the whole process (a `#[global_allocator]`, a global `tracing`
+  subscriber, a process-global counter) or on a timing budget.
 
-- **CI does not run the integration suite.** The runner cannot link 130+ `--release`
-  test binaries within its memory budget, so the pipeline runs `cargo test --release --lib`
-  only. Integration and property tests are gated locally and by the fleet verification
-  suite. A green pipeline does not mean they passed.
-- **Never run two `cargo` invocations against the same `target/` concurrently.** Parallel
-  `--release` links sum their peak memory and OOM the linker, which presents as a hang
-  during linking rather than as an error.
+To run one file inside a group, filter on its stem:
+`cargo test --release --test group_<name> -- <stem>::`. A filter is a substring match, so a stem
+that ends another file's stem also selects that file's tests; add `--skip <other stem>::` for
+each.
 
-### Test Scenarios
+Use `--release`: debug builds of this crate are slow and use enough memory that the full suite
+becomes impractical.
+
+- **CI runs no tests.** The runner cannot link the test binaries within its memory, so the
+  pipeline type-checks the library, the binary and every integration test target (`cargo check --lib --bins --test '*'`) and runs
+  nothing. Unit, integration and property tests are run locally. A green pipeline does not mean
+  any test passed.
+- **Run one `cargo` command at a time against a `target/` directory.** Parallel `--release` links
+  add up their peak memory and can exhaust it, which shows as a hang while linking rather than as
+  an error.
+
+### Test scenarios
 
 The integration suite covers:
 
 | Area | Scenarios |
 |---|---|
-| Basic operations | GET (small/medium/large), HEAD metadata, PUT through the proxy |
-| Conditional requests | `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, each with matching and non-matching validators |
-| Range requests | Single ranges, mid-file ranges, byte-exactness of returned content |
-| Cache behaviour | Repeat requests for hit/miss timing, invalidation on object change |
+| Basic operations | GET (small, medium and large), HEAD metadata, PUT through the proxy |
+| Conditional requests | `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`, each with matching and non-matching validators |
+| Range requests | Single ranges, mid-file ranges, byte-exact returned content |
+| Cache behavior | Repeat requests for hit and miss timing, invalidation when the object changes |
 | AWS CLI integration | Standard CLI operations end to end |
-| Error handling | 404s, invalid conditional headers, network-error resilience |
+| Error handling | 404 responses, invalid conditional headers, recovery from network errors |
 
 ### Asserting on conditional requests
 
-Which side answers a conditional request depends on `evaluate_conditions_from_cache`,
-which has defaulted to `true` since 2.2.0. **A test must assert against the mode it
-configures**, not against a single fixed expectation:
+Which side answers a conditional request depends on `evaluate_conditions_from_cache`, default
+`true`. A test must assert against the mode it configures:
 
-- **Local evaluation (default `true`)**: an `If-Match` request is answered from cached
-  metadata when the cached ETag matches and the data is fully cached. No S3 round trip,
-  so no S3-side credential revalidation for those requests.
-- **Forward to S3** (`evaluate_conditions_from_cache: false`, or any request the local
-  path declines): S3 decides the condition.
+- **Local evaluation (the default):** a GET, range GET or HEAD whose only conditional header is
+  `If-Match` or `If-Range` is served from cache when the cached entry matches (see
+  [Conditional requests answered from cache](#conditional-requests-answered-from-cache)), with
+  no S3 round trip and so no S3-side credential revalidation.
+- **Forwarded to S3** (`evaluate_conditions_from_cache: false`, or any request the local path
+  declines): S3 decides the condition.
 
-When the request does reach S3, the cache action follows S3's response:
+When the request reaches S3, the cache action follows S3's response:
 
 | S3 response | Cache action |
 |---|---|
-| `200 OK` | Invalidate old cache, cache new data |
-| `304 Not Modified` | Refresh TTL, keep cache |
-| `412 Precondition Failed` | No cache change |
+| `200 OK` | Invalidate the old entry, cache the new data |
+| `304 Not Modified` | Refresh the TTL, keep the entry |
+| `412 Precondition Failed` | No change |
 
-See [CACHE_FRESHNESS.md](CACHE_FRESHNESS.md#conditional-headers-handling) for the full
+See [Conditional headers handling](CACHE_FRESHNESS.md#conditional-headers-handling) for the full
 dispatch matrix.
 
-### Unit Tests
+### Unit tests
 
-The suite spans inline `#[cfg(test)]` modules in 40+ of the `src/` modules plus
-130+ integration and property-test files under `tests/`. Get the current counts
-directly from the tree:
+Most `src/` modules carry inline `#[cfg(test)]` modules, and `tests/` holds the integration and
+property-test files. To count them in the current tree:
 
 ```bash
-cargo test --release 2>&1 | grep "test result"   # per-binary pass/fail totals
-ls tests/*.rs | wc -l                             # integration/property test files
+cargo test --release 2>&1 | grep "test result"  # per-binary pass and fail totals
+ls tests/*.rs | grep -vc '/group_'  # integration and property-test files
 ```
 
-**Key Test Suites**:
-- Cache operations (get, put, evict)
-- Range request handling
-- Compression/decompression
-- TTL expiration
-- Multipart uploads
-- Error handling
-- TCP passthrough SNI parsing (`tcp_proxy`)
-- Graceful shutdown signalling (`shutdown`)
-- Health status aggregation (`health`)
-
-**Property-Based Tests** (quickcheck):
-- Cache consistency
-- Range merging correctness
-- Compression round-trip
+The unit tests cover cache operations (get, put, evict), range handling, compression and
+decompression, TTL expiry, multipart uploads, error handling, SNI parsing for the HTTPS
+passthrough (`tcp_proxy`), shutdown signalling (`shutdown`) and health status aggregation
+(`health`). The property-based tests (quickcheck) cover cache consistency, range merging and the
+compression round trip.
 
 ### Coverage
 
-Coverage is measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
-(LLVM source-based instrumentation). The CI `coverage` job builds an instrumented
-binary, runs the full suite, and publishes a Cobertura report that GitLab renders
-as line-by-line annotations in the merge request diff; the MR-widget percentage is
-scraped from the job's text summary via the `coverage:` regex in `.gitlab-ci.yml`.
-
-Run it locally:
+Coverage is measured locally with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+(LLVM source-based instrumentation):
 
 ```bash
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov --locked
-cargo llvm-cov --release --workspace            # text summary in the terminal
-cargo llvm-cov --release --workspace --html     # browsable report under target/llvm-cov/html
+cargo llvm-cov --release --workspace  # text summary in the terminal
+cargo llvm-cov --release --workspace --html  # browsable report under target/llvm-cov/html
 ```
 
-Notes:
-- Coverage uses a distinct instrumented build profile, so it does not reuse the
-  `target/` artifacts from a normal `build`/`test` run.
-- The CI job is `allow_failure: true` until the `coverage:` regex is confirmed
-  against a real job log (the `llvm-cov` `TOTAL` line has several percentage
-  columns). Remove `allow_failure` once stable, and optionally gate with
-  `cargo llvm-cov --fail-under-lines <pct>`.
+Coverage uses its own instrumented build, so it does not reuse the `target/` artifacts of a
+normal build or test run.
 
-### Integration Tests
+### Integration tests
 
-**Test Files**:
-- `integration_test.rs` - End-to-end scenarios
-- `cache_statistics_test.rs` - Metrics validation
-- `multi_instance_integration_test.rs` - Shared cache coordination
-- `s3_integration_test.rs` - S3 API compatibility
+- `integration_test.rs`: end-to-end scenarios
+- `cache_statistics_test.rs`: metrics validation
+- `multi_instance_integration_test.rs`: coordination between proxies sharing a cache
+- `s3_integration_test.rs`: S3 API compatibility
 
 ### Benchmarks
 
-The project includes benchmark-style tests in the Rust test suite:
+`tests/connection_keepalive_benchmark.rs` holds benchmark-style tests of connection pooling:
 
-- `tests/connection_keepalive_benchmark.rs` - Connection pooling performance tests
-
-These tests measure:
-- HeadObject operations
-- GET operations (AWS CLI)
-- Multipart uploads
-- Get-after-Put scenarios
-- Cache hit vs miss latency
-
-**Metrics**:
-- Throughput (requests/second)
-- Latency (p50, p95, p99)
-- Cache hit rate
-- Bandwidth savings
-
-Run with:
 ```bash
 cargo test --release --test connection_keepalive_benchmark -- --nocapture
 ```
 
-## Debugging Tips
+## Debugging tips
 
-### Enable Debug Logging
+### Enable debug logging
 
 ```bash
 RUST_LOG=debug cargo run --release -- -c config.yaml
 ```
 
-### Monitor Cache Operations
+### Monitor cache operations
 
 ```bash
-# Watch cache hits/misses (including part cache)
-tail -f ./tmp/logs/app/*/s3-proxy.log.* | grep "cache HIT\|cache MISS\|Part cache"
-
-# Monitor metrics
-watch -n 1 'curl -s http://localhost:9090/metrics | jq .cache'
+tail -f ./tmp/logs/app/*/s3-proxy.log.* | grep "cache HIT\|cache MISS\|Part cache"  # cache hits and misses, part cache included
+watch -n 1 'curl -s http://localhost:9090/metrics | jq .cache'  # the cache section of /metrics
 ```
 
-### Inspect Cache Files
+### Inspect cache files
 
 ```bash
-# List metadata files
-find ./tmp/cache/metadata -name "*.meta" | head -10
-
-# View metadata content
-cat ./tmp/cache/metadata/my-bucket/a7/3f2/object.meta | jq .
-
-# Check range files
-ls -lh ./tmp/cache/ranges/my-bucket/a7/3f2/
+find ./tmp/cache/metadata -name "*.meta" | head -10  # list metadata files
+cat ./tmp/cache/metadata/my-bucket/a7/3f2/object.meta | jq .  # view one
+ls -lh ./tmp/cache/ranges/my-bucket/a7/3f2/  # its range files
 ```
 
-### Profile Performance
+### Profiling
 
 ```bash
-# CPU profiling
-cargo flamegraph --bin s3-proxy -- -c config.yaml
-
-# Memory profiling
-valgrind --tool=massif ./target/release/s3-proxy -c config.yaml
+cargo flamegraph --bin s3-proxy -- -c config.yaml  # CPU
+valgrind --tool=massif ./target/release/s3-proxy -c config.yaml  # memory
 ```
 
-### Test Specific Scenarios
+### Test specific scenarios
 
-These assume the proxy is running in proxy-only mode on port 3128 (the no-sudo local
-setup from [GETTING_STARTED.md](GETTING_STARTED.md#proxy-only-mode-no-sudo-required)).
-Adjust the port if you run the standard port-80 listener.
+These assume the proxy runs in proxy-only mode on port 3128 on the same host (the local setup in
+[Proxy-only mode](GETTING_STARTED.md#proxy-only-mode-no-sudo-required)). Adjust the port if you
+run the HTTP listener on port 80.
 
 ```bash
-# Test cache hit
-aws s3 cp s3://bucket/key ./test1.txt --endpoint-url "http://localhost:3128"
-aws s3 cp s3://bucket/key ./test2.txt --endpoint-url "http://localhost:3128"
-
-# Test range request
-curl -H "Range: bytes=0-1023" http://localhost:3128/bucket/key
-
-# Test part number request
-aws s3api get-object --bucket bucket --key large-file.bin --part-number 1 ./part1.bin --endpoint-url "http://localhost:3128"
-
-# Test multipart upload
-aws s3 cp large-file.zip s3://bucket/key --endpoint-url "http://localhost:3128"
+export HTTP_PROXY=http://127.0.0.1:3128
+export AWS_ENDPOINT_URL_S3=http://s3.us-east-1.amazonaws.com  # the bucket's Region
+aws s3 cp s3://bucket/key ./test1.txt  # first read: a cache miss
+aws s3 cp s3://bucket/key ./test2.txt  # second read: a cache hit
+aws s3api get-object --bucket bucket --key key --range bytes=0-1023 ./range.bin  # range request
+aws s3api get-object --bucket bucket --key large-file.bin --part-number 1 ./part1.bin  # part number request
+aws s3 cp large-file.zip s3://bucket/key  # multipart upload
 ```
 
-## Code Style Guidelines
+## Code style guidelines
 
-### Rust Conventions
+### Rust conventions
 
-- Use `rustfmt` for formatting
-- Use `clippy` for linting
-- Follow Rust API guidelines
-- Prefer `Result<T>` over panics
-- Use `?` operator for error propagation
+- Format with `rustfmt` and lint with `clippy`.
+- Follow the Rust API guidelines.
+- Return `Result<T>` rather than panicking, and propagate errors with `?`.
 
-### Error Handling
+### Error handling
 
 ```rust
 // Good
@@ -1589,7 +619,7 @@ error!(
 );
 ```
 
-### Async Patterns
+### Async patterns
 
 ```rust
 // Use tokio::spawn for concurrent tasks
@@ -1604,18 +634,18 @@ tokio::select! {
 }
 ```
 
-## Contributing Guidelines
+## Contributing guidelines
 
-### Before Submitting
+### Before submitting
 
-1. Run all tests: `cargo test`
-2. Run clippy: `cargo clippy`
-3. Format code: `cargo fmt`
-4. Update documentation
+1. Run all tests: `cargo test --release`
+2. Run clippy: `cargo clippy --all-targets --all-features -- -D warnings`
+3. Format the code: `cargo fmt`
+4. Update the documentation
 5. Add tests for new features
-6. Update CHANGELOG.md
+6. Update `CHANGELOG.md`
 
-### Pull Request Checklist
+### Pull request checklist
 
 - [ ] Tests pass
 - [ ] Documentation updated
@@ -1626,23 +656,23 @@ tokio::select! {
 
 ## References
 
-### External Documentation
+### External documentation
 
-- [Hyper 1.0 Guide](https://hyper.rs/guides/1/)
-- [Tokio Tutorial](https://tokio.rs/tokio/tutorial)
-- [Rust Async Book](https://rust-lang.github.io/async-book/)
-- [AWS S3 API Reference](https://docs.aws.amazon.com/AmazonS3/latest/API/)
+- [Hyper 1.0 guide](https://hyper.rs/guides/1/)
+- [Tokio tutorial](https://tokio.rs/tokio/tutorial)
+- [Rust async book](https://rust-lang.github.io/async-book/)
+- [Amazon S3 API reference](https://docs.aws.amazon.com/AmazonS3/latest/API/)
 
-### Internal Documentation
+### Related documentation
 
-- [CACHING.md](CACHING.md) - Cache architecture
-- [COMPRESSION.md](COMPRESSION.md) - Compression details
-- [CONNECTION_POOLING.md](CONNECTION_POOLING.md) - Connection management
-- [ERROR_HANDLING.md](ERROR_HANDLING.md) - Error recovery
-- [Configuration Guide](CONFIGURATION.md) - Configuration reference
+- [Caching](CACHING.md): what is cached and how to control it
+- [Compression](COMPRESSION.md): the compression decision and format
+- [Connection pooling](CONNECTION_POOLING.md): upstream connections and IP distribution
+- [Error handling](ERROR_HANDLING.md): errors and recovery
+- [Configuration reference](CONFIGURATION.md): every configuration field
 
-### Research Papers
+### Research papers
 
-- **TinyLFU**: "TinyLFU: A Highly Efficient Cache Admission Policy" (Gil Einziger, Roy Friedman, 2017)
-- **GDSF**: "GreedyDual-Size: A Cost-Aware WWW Proxy Caching Algorithm" (Pei Cao, Sandy Irani, 1997)
-- **BLAKE3**: "BLAKE3: One Function, Fast Everywhere" (Jack O'Connor, et al., 2020)
+- TinyLFU: "TinyLFU: A Highly Efficient Cache Admission Policy" (Gil Einziger, Roy Friedman, 2017)
+- GDSF: "GreedyDual-Size: A Cost-Aware WWW Proxy Caching Algorithm" (Pei Cao, Sandy Irani, 1997)
+- BLAKE3: "BLAKE3: One Function, Fast Everywhere" (Jack O'Connor et al., 2020)

@@ -24,7 +24,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         false, // RAM cache disabled for these tests
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),

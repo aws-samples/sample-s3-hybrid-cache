@@ -168,11 +168,14 @@ pub struct RangeIntegrityResult {
 }
 
 /// Result of consistency integrity validation
+///
+/// There is no orphan list here. See
+/// [`CacheValidator::validate_consistency_integrity`] for why the one that used to be
+/// reported — always empty, never computed — was removed rather than implemented.
 #[derive(Debug, Clone)]
 pub struct ConsistencyIntegrityResult {
     pub is_consistent: bool,
     pub missing_range_files: Vec<String>,
-    pub orphaned_range_files: Vec<String>,
     pub metadata_errors: Vec<MetadataIntegrityError>,
 }
 
@@ -1126,12 +1129,32 @@ impl CacheValidator {
         })
     }
 
-    /// Validate consistency between metadata and actual range files
+    /// Validate consistency between an entry's metadata and its range files
     ///
-    /// Checks that:
-    /// - All ranges in metadata have corresponding files
-    /// - No orphaned range files exist
-    /// - File sizes match metadata expectations
+    /// Checks that the `.meta` resolves and parses, and that every range it references
+    /// exists on disk. It reports; it deletes and repairs nothing.
+    ///
+    /// # It does NOT look for orphaned range files, deliberately
+    ///
+    /// It used to claim to. `orphaned_range_files` was bound with `let`, never pushed to,
+    /// returned in the result and logged with `.len()`, so the caller reported a count of
+    /// zero orphans for every entry whatever was on disk. The field is gone rather than
+    /// implemented, for three reasons:
+    ///
+    /// - **The job already exists.** `background_recovery::cleanup_orphan_bin_files`
+    ///   walks `ranges/{bucket}/{XX}/{YYY}` and unlinks any `.bin` whose sibling `.meta`
+    ///   is absent. A second orphan determination here would be a fourth reconstruction
+    ///   of the cache layout, which is the class of mistake this function was part of.
+    /// - **The cost is quadratic.** An orphan verdict for one entry needs a readdir of
+    ///   its shard leaf, so doing it per validated entry is O(entries in shard) per entry
+    ///   across a startup sweep that visits every entry. At this project's O(100M) range
+    ///   design point that is not a slower correct check, it is an unusable one. An
+    ///   orphan sweep has to be driven per shard, which is what the existing one does.
+    /// - **A local verdict about a shared volume is unsafe to hand onward.** `cache_dir`
+    ///   is shared storage. A `.bin` with no `.meta` from this instance's view may be a
+    ///   peer's in-progress write, and a consumer that saw a populated list would be one
+    ///   `remove_file` away from the deletion incidents already recorded in this
+    ///   workstream.
     ///
     /// **Validates: Requirements 7.1, 7.2, 7.3**
     pub async fn validate_consistency_integrity(
@@ -1139,11 +1162,24 @@ impl CacheValidator {
         cache_key: &str,
     ) -> Result<ConsistencyIntegrityResult> {
         let mut missing_range_files = Vec::new();
-        let orphaned_range_files = Vec::new();
         let mut metadata_errors = Vec::new();
 
-        // Try to load metadata
-        let metadata_path = self.get_metadata_path_integrity(cache_key);
+        // Resolve the metadata path through the production sharded helper. A cache key
+        // the helper will not parse is reported as such rather than as unreadable JSON.
+        let metadata_path = match self.get_metadata_path_integrity(cache_key) {
+            Ok(path) => path,
+            Err(e) => {
+                metadata_errors.push(MetadataIntegrityError::InvalidFieldValue {
+                    field: "cache_key".to_string(),
+                    reason: format!("cannot resolve a metadata path for this key: {}", e),
+                });
+                return Ok(ConsistencyIntegrityResult {
+                    is_consistent: false,
+                    missing_range_files,
+                    metadata_errors,
+                });
+            }
+        };
         let metadata = match self.load_metadata_integrity(&metadata_path).await {
             Ok(meta) => meta,
             Err(e) => {
@@ -1154,15 +1190,23 @@ impl CacheValidator {
                 return Ok(ConsistencyIntegrityResult {
                     is_consistent: false,
                     missing_range_files,
-                    orphaned_range_files,
                     metadata_errors,
                 });
             }
         };
 
-        // Check that all ranges have corresponding files
+        // Check that all ranges have corresponding files.
+        //
+        // `RangeSpec::file_path` is relative to `cache_dir/ranges`, not to `cache_dir`.
+        // Every read site in `src/cache.rs` joins it that way, and
+        // `cache_types::classify_new_range_as_staged`'s doc comment records that every
+        // live write path derives it from `strip_prefix(cache_dir/ranges)`. This joined
+        // `cache_dir` alone, so once the metadata path above was corrected the check
+        // reported every range of every entry as missing — a second, independent instance
+        // of the same mistake, hidden until then by the early return above it.
+        let ranges_dir = self.cache_dir.join("ranges");
         for (i, range) in metadata.ranges.iter().enumerate() {
-            let range_file_path = self.cache_dir.join(&range.file_path);
+            let range_file_path = ranges_dir.join(&range.file_path);
             if !range_file_path.exists() {
                 missing_range_files.push(range.file_path.clone());
                 metadata_errors.push(MetadataIntegrityError::RangeFileMissing {
@@ -1175,22 +1219,67 @@ impl CacheValidator {
         let is_consistent = metadata_errors.is_empty();
 
         debug!(
-            "Consistency integrity validation completed: key={}, consistent={}, missing_files={}, orphaned_files={}",
+            "Consistency integrity validation completed: key={}, consistent={}, missing_files={}",
             cache_key,
             is_consistent,
-            missing_range_files.len(),
-            orphaned_range_files.len()
+            missing_range_files.len()
         );
 
         Ok(ConsistencyIntegrityResult {
             is_consistent,
             missing_range_files,
-            orphaned_range_files,
             metadata_errors,
         })
     }
 
     /// Validate JSON structure and required fields for integrity
+    ///
+    /// # `etag` and `last_modified` are NOT required, and requiring them counted a healthy cache as corrupt
+    ///
+    /// This used to push `MissingRequiredField` for an empty `object_metadata.etag` and
+    /// for an empty `object_metadata.last_modified`. Neither is an invariant this codebase
+    /// holds, and three production writers refute them:
+    ///
+    /// - **Every write-through PUT and `CompleteMultipartUpload` entry** carries an empty
+    ///   `last_modified`. `S3Client::extract_object_metadata_from_response` reads the
+    ///   header with `.unwrap_or_default()` and S3 sends no `Last-Modified` on a write
+    ///   response, so the field is empty by construction and is learned later, from a
+    ///   `304`, by `CacheManager::backfill_write_cache_last_modified`. Nothing may
+    ///   synthesise a value (only one S3 actually returned is acceptable), so there is no
+    ///   producer fix available — the requirement was simply wrong. That made the entire
+    ///   write-cache population count one corruption per object.
+    /// - **Any origin that omits `ETag`** yields an empty stored etag through the same
+    ///   `.unwrap_or_default()`. `DiskCacheManager::check_object_expiration` records this
+    ///   as "an ordinary, correctly cached object" for such an origin, which is exactly
+    ///   why its own guard requires BOTH validators to be absent rather than testing the
+    ///   etag alone.
+    /// - **Every re-adopted orphaned range.**
+    ///   `OrphanedRangeRecovery::add_range_to_metadata` publishes with
+    ///   `object_metadata: None`, and `HybridMetadataWriter::load_or_create_metadata`'s
+    ///   create-new branch fills that with `ObjectMetadata::default()` — empty etag, empty
+    ///   `last_modified`, `content_length: 0` — while `add_or_update_range` attaches the
+    ///   adopted range.
+    ///
+    /// What detects a document that genuinely lost its validators is the read path, not
+    /// this sweep: `check_object_expiration`'s `no_validator_at_all` predicate refuses to
+    /// serve an entry carrying neither an etag nor an effective `Last-Modified`, warns
+    /// naming the key, and converges (the forwarded request re-caches under a real etag).
+    /// Its `missing_write_cache_last_modified` predicate forces revalidation of a
+    /// write-cached entry until the field is learned. A document that lost only one of the
+    /// two is indistinguishable from a legitimate terse-origin or write-through entry, so
+    /// no check here can separate them.
+    ///
+    /// # The length check is shape-aware on that same predicate
+    ///
+    /// `content_length == 0` beside a non-empty `ranges` is exactly what the re-adoption
+    /// producer publishes, where the length is unknown by construction rather than wrong.
+    /// The check now skips a document carrying no validator at all — the re-adoption
+    /// signature, and the same condition `check_object_expiration` uses to refuse the
+    /// serve — and stays live for every document an origin was actually observed to
+    /// produce. `validate_size_consistency_integrity` independently reports the same shape,
+    /// as over-coverage: a recorded length of 0 is exceeded by any range at all, and it
+    /// carries the same `no_validator_at_all` guard, so the two agree on which documents
+    /// are exempt.
     fn validate_json_structure_integrity(
         &self,
         metadata: &NewCacheMetadata,
@@ -1203,20 +1292,17 @@ impl CacheValidator {
             ));
         }
 
-        if metadata.object_metadata.etag.is_empty() {
-            errors.push(MetadataIntegrityError::MissingRequiredField(
-                "object_metadata.etag".to_string(),
-            ));
-        }
-
-        if metadata.object_metadata.last_modified.is_empty() {
-            errors.push(MetadataIntegrityError::MissingRequiredField(
-                "object_metadata.last_modified".to_string(),
-            ));
-        }
+        // The re-adoption signature: a document published with `ObjectMetadata::default()`
+        // because no observed object metadata was available. Same predicate as
+        // `DiskCacheManager::check_object_expiration`'s `no_validator_at_all`.
+        let no_validator_at_all = metadata.object_metadata.etag.trim().is_empty()
+            && metadata.object_metadata.effective_last_modified().is_none();
 
         // Validate field values
-        if metadata.object_metadata.content_length == 0 && !metadata.ranges.is_empty() {
+        if !no_validator_at_all
+            && metadata.object_metadata.content_length == 0
+            && !metadata.ranges.is_empty()
+        {
             errors.push(MetadataIntegrityError::InvalidFieldValue {
                 field: "object_metadata.content_length".to_string(),
                 reason: "Content length is 0 but ranges exist".to_string(),
@@ -1224,38 +1310,99 @@ impl CacheValidator {
         }
     }
 
-    /// Validate size consistency between object metadata and ranges for integrity
+    /// Report a cached entry whose ranges claim bytes the object does not have.
+    ///
+    /// That is the only size disagreement between `object_metadata` and `ranges` this
+    /// cache can decide. Two arms that tried to decide more have been retired, and both
+    /// fired on documents the tree's own writers publish deliberately.
+    ///
+    /// # Retired: empty `ranges` required a zero `content_length`
+    ///
+    /// It reported `SizeInconsistency { expected: 0, .. }` for every entry with no ranges
+    /// and a non-zero length. Empty `ranges` in this cache means "no body data cached",
+    /// **not** "the object is empty" — which is how `stale_head_only_entry` in
+    /// `cache_initialization_coordinator` defines the shape too — and
+    /// `CacheManager::create_head_only_metadata` publishes exactly that: `ranges:
+    /// Vec::new()` beside the object's real `content_length`, renamed into place itself.
+    /// So the arm fired once per HEAD-only entry on the volume.
+    ///
+    /// It was not made shape-aware, because there is no second shape to keep it for. The
+    /// only wrong version — an entry whose `ranges` array was emptied by a bad write while
+    /// a real length survived — is byte-identical to the legitimate one, so nothing here
+    /// can separate them. **What detects it instead**: nothing needs to.
+    /// `find_cached_ranges` reports no coverage for such an entry, so the request forwards
+    /// to S3 and the entry is re-cached — the condition is unobservable to this sweep and
+    /// self-correcting on the read path.
+    ///
+    /// # Retired: a 0-anchored entry required complete coverage
+    ///
+    /// It required `content_length == last_range.end + 1` whenever
+    /// `ranges.first().start == 0`. Partial caching is ordinary here:
+    /// `RangeHandler::store_range_new_storage` stores one fetched range while
+    /// `S3Client::extract_object_metadata_from_response` takes `content_length` from
+    /// `Content-Range`'s **total** — its call site in `http_proxy` carries a comment saying
+    /// that total must not be overridden — so a 4 KiB range cached out of a 1 MiB object
+    /// reported `expected: 4096, actual: 1048576`. Any client whose first read starts at
+    /// offset 0 produces it: a header read, or a transfer client's first chunk.
+    ///
+    /// **Under-coverage cannot be made correct, so it is gone rather than narrowed.** A
+    /// partially cached object and a complete object that lost a range record are the same
+    /// document: `NewCacheMetadata` carries no claim of completeness, so "1 MiB recorded,
+    /// 512 KiB covered" is both shapes at once. **What detects a truncated entry instead**:
+    /// per-range truncation is `validate_ranges_integrity`'s (`uncompressed_size` must
+    /// equal `end - start + 1`), a vanished range file is
+    /// `validate_consistency_integrity`'s, and a missing range is simply a miss on the read
+    /// path — `find_cached_ranges` reports the gap and the request fetches it.
+    ///
+    /// # What is kept
+    ///
+    /// Over-coverage, spelled the way the tree already spells it:
+    /// `RangeHandler::validate_range_request` rejects a request whose
+    /// `range.end >= content_length` as "Range end exceeds content length". No writer can
+    /// produce it — that check rejects it on the request path, and
+    /// `DiskCacheManager::store_range` additionally clamps `end` to the bytes actually
+    /// received — so it is real corruption. The retired arm's `first.start == 0` gate goes
+    /// with the equality, which makes this strictly wider at the condition that is
+    /// decidable: over-coverage is corruption wherever coverage begins.
+    ///
+    /// `no_validator_at_all` is the same guard, spelled the same way, that
+    /// `validate_json_structure_integrity` and `DiskCacheManager::check_object_expiration`
+    /// use. A document the orphan sweep re-adopted holds `ObjectMetadata::default()`, whose
+    /// `content_length: 0` is unknown rather than zero, and every range in it would
+    /// otherwise read as over-coverage.
+    ///
+    /// # `total_range_size` is diagnostic, NOT the comparison
+    ///
+    /// The retired code summed `uncompressed_size` across ranges and then logged the sum
+    /// without comparing it, and the arm's comment ("total range size should match content
+    /// length") reads as though the sum was meant to be the comparison. It was not usable
+    /// as one: the sum equals `content_length` only for coverage that is both complete
+    /// **and** gapless, so it would fire on every partially cached object regardless of
+    /// where coverage starts — a strictly larger false-positive population than the
+    /// equality it sits beside. It stays in the `debug!` because a gap is visible in the
+    /// difference between it and the covered span, which is worth having in a log and is
+    /// not a verdict.
     fn validate_size_consistency_integrity(
         &self,
         metadata: &NewCacheMetadata,
         errors: &mut Vec<MetadataIntegrityError>,
     ) {
-        if metadata.ranges.is_empty() {
-            // For empty objects, content_length should be 0
-            if metadata.object_metadata.content_length != 0 {
-                errors.push(MetadataIntegrityError::SizeInconsistency {
-                    expected: 0,
-                    actual: metadata.object_metadata.content_length,
-                });
-            }
-            return;
-        }
+        // Same predicate, same spelling, as `validate_json_structure_integrity` and
+        // `DiskCacheManager::check_object_expiration`: a document no origin metadata was
+        // ever observed for has an unknown length, not a length of zero.
+        let no_validator_at_all = metadata.object_metadata.etag.trim().is_empty()
+            && metadata.object_metadata.effective_last_modified().is_none();
 
-        // Calculate total size from ranges
         let total_range_size: u64 = metadata.ranges.iter().map(|r| r.uncompressed_size).sum();
 
-        // For full objects, total range size should match content length
-        if let Some(first_range) = metadata.ranges.first() {
-            if let Some(last_range) = metadata.ranges.last() {
-                if first_range.start == 0 {
-                    let expected_content_length = last_range.end + 1;
-                    if metadata.object_metadata.content_length != expected_content_length {
-                        errors.push(MetadataIntegrityError::SizeInconsistency {
-                            expected: expected_content_length,
-                            actual: metadata.object_metadata.content_length,
-                        });
-                    }
-                }
+        if let Some(last_range) = metadata.ranges.last() {
+            if !no_validator_at_all && last_range.end >= metadata.object_metadata.content_length {
+                errors.push(MetadataIntegrityError::SizeInconsistency {
+                    // Field convention unchanged: `expected` is the figure derived from
+                    // the ranges, `actual` the length recorded on the object.
+                    expected: last_range.end + 1,
+                    actual: metadata.object_metadata.content_length,
+                });
             }
         }
 
@@ -1363,13 +1510,35 @@ impl CacheValidator {
     }
 
     /// Get metadata file path for a cache key in integrity validation
-    fn get_metadata_path_integrity(&self, cache_key: &str) -> PathBuf {
-        // Use the same path resolution as disk cache
-        // This is a simplified version - in practice would use the same sharding logic
-        let sanitized_key = cache_key.replace(['/', ':', '\\'], "_");
-        self.cache_dir
-            .join("metadata")
-            .join(format!("{}.meta", sanitized_key))
+    ///
+    /// Delegates to `disk_cache::get_sharded_path`, the single production helper every
+    /// `.meta` producer uses (`HybridMetadataWriter::get_metadata_file_path`,
+    /// `JournalConsolidator::get_metadata_file_path`,
+    /// `WriteCacheManager::get_metadata_path`).
+    ///
+    /// # This used to build its own path, and so validated nothing
+    ///
+    /// It hand-rolled `metadata/{cache_key with / : \ replaced by _}.meta` — flat, and
+    /// with a sanitizer that is not the one production uses either (production
+    /// percent-encodes). Production writes
+    /// `metadata/{bucket}/{XX}/{YYY}/{percent-encoded key}.meta`, where `XX`/`YYY` come
+    /// from BLAKE3 over the **object key alone**. So `load_metadata_integrity` took its
+    /// `Err` arm for every entry, `validate_consistency_integrity` reported
+    /// `is_consistent: false` with an `InvalidJson` error for a file it had never
+    /// opened, and `CacheInitializationCoordinator::perform_metadata_consistency_validation`
+    /// counted a corruption per entry and logged two zero counts beside it.
+    ///
+    /// The flat layout it built was never correct. `get_sharded_path` landed before this
+    /// helper was written, and even the pre-sharding flat layout — `metadata/{key}.meta`
+    /// directly under the metadata root, whose builder has since been deleted —
+    /// percent-encodes the key rather than replacing separators with `_`.
+    ///
+    /// Returning `Result` rather than swallowing the parse failure is deliberate: a
+    /// malformed cache key is a different condition from a missing or corrupt file, and
+    /// reporting both as `InvalidJson` is what made the original failure mode
+    /// unreadable.
+    fn get_metadata_path_integrity(&self, cache_key: &str) -> Result<PathBuf> {
+        crate::disk_cache::get_sharded_path(&self.cache_dir.join("metadata"), cache_key, ".meta")
     }
 
     /// Load metadata from file for integrity validation
@@ -1548,6 +1717,8 @@ mod tests {
                 last_accessed: SystemTime::now(),
                 access_count: 1,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             },
             RangeSpec {
                 start: 1024,
@@ -1560,6 +1731,8 @@ mod tests {
                 last_accessed: SystemTime::now(),
                 access_count: 1,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             },
         ];
 

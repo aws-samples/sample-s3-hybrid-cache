@@ -88,18 +88,26 @@ impl EndpointOverrides {
     }
 
     /// Number of exact entries (for log messages).
-    pub fn exact_count(&self) -> usize {
+    pub(crate) fn exact_count(&self) -> usize {
         self.exact.len()
     }
 
     /// Number of suffix entries (for log messages).
-    pub fn suffix_count(&self) -> usize {
+    pub(crate) fn suffix_count(&self) -> usize {
         self.suffixes.len()
     }
 
     /// Iterate over all exact overrides (for distributor seeding / health reporting).
-    pub fn exact_iter(&self) -> impl Iterator<Item = (&String, &Vec<IpAddr>)> {
+    pub(crate) fn exact_iter(&self) -> impl Iterator<Item = (&String, &Vec<IpAddr>)> {
         self.exact.iter()
+    }
+
+    /// Whether `endpoint` has an exact (non-suffix) override entry.
+    ///
+    /// Exact entries get a distributor at startup; a host matched only by a
+    /// suffix entry gets one on first use through `register_endpoint`.
+    pub(crate) fn is_exact(&self, endpoint: &str) -> bool {
+        self.exact.contains_key(endpoint)
     }
 }
 
@@ -143,7 +151,7 @@ impl IpDistributor {
     ///
     /// Logs additions and removals at info level. Resets the round-robin
     /// counter to avoid modulo bias when the set size changes.
-    pub fn update_ips(&mut self, new_ips: Vec<IpAddr>, reason: &str) {
+    pub(crate) fn update_ips(&mut self, new_ips: Vec<IpAddr>, reason: &str) {
         let added: Vec<&IpAddr> = new_ips.iter().filter(|ip| !self.ips.contains(ip)).collect();
         let removed: Vec<&IpAddr> = self.ips.iter().filter(|ip| !new_ips.contains(ip)).collect();
 
@@ -163,7 +171,7 @@ impl IpDistributor {
     /// Only removes the IP from the distributor's selection Vec so new
     /// requests are no longer routed to it. Existing connections to the removed
     /// IP remain in hyper's internal pool and complete naturally.
-    pub fn remove_ip(&mut self, ip: IpAddr, reason: &str) {
+    pub(crate) fn remove_ip(&mut self, ip: IpAddr, reason: &str) {
         if let Some(pos) = self.ips.iter().position(|&x| x == ip) {
             self.ips.remove(pos);
             info!(ip = %ip, reason = %reason, "IP removed from distributor");
@@ -180,7 +188,7 @@ impl IpDistributor {
     /// Used by the recovery-probe path to restore an IP that was excluded by
     /// [`remove_ip`](Self::remove_ip) once a probe confirms it is reachable
     /// again, without waiting for the next DNS refresh.
-    pub fn add_ip(&mut self, ip: IpAddr, reason: &str) -> bool {
+    pub(crate) fn add_ip(&mut self, ip: IpAddr, reason: &str) -> bool {
         if self.ips.contains(&ip) {
             return false;
         }
@@ -196,7 +204,7 @@ impl IpDistributor {
     }
 
     /// Return a snapshot of the current IP set for health check reporting.
-    pub fn get_ips(&self) -> Vec<IpAddr> {
+    pub(crate) fn get_ips(&self) -> Vec<IpAddr> {
         self.ips.clone()
     }
 
@@ -205,7 +213,7 @@ impl IpDistributor {
     /// Returns `None` if the IP set is empty or every IP is in the exclusion list.
     /// Advances the internal counter by 1 regardless of how many IPs are skipped,
     /// so subsequent calls continue round-robin from a fresh position.
-    pub fn select_ip_excluding(&self, exclude: &[IpAddr]) -> Option<IpAddr> {
+    pub(crate) fn select_ip_excluding(&self, exclude: &[IpAddr]) -> Option<IpAddr> {
         if self.ips.is_empty() {
             return None;
         }
@@ -239,7 +247,9 @@ pub struct IpHealthEntry {
 ///
 /// Uses `DashMap` for lock-free concurrent access. When an IP's consecutive
 /// failure count reaches the threshold, the caller should remove it from the
-/// `IpDistributor`. Successes reset the counter. DNS refresh restores excluded IPs.
+/// `IpDistributor`. Successes reset the counter. DNS refresh does not restore an
+/// excluded IP that DNS still returns; it stays out of the distributor until a recovery
+/// probe succeeds. An IP that drops out of DNS has its health state forgotten.
 ///
 /// Recovery: once an IP has been marked unhealthy and its cooldown elapses,
 /// it becomes a "probe candidate". A successful probe clears the unhealthy state;
@@ -267,7 +277,7 @@ impl IpHealthTracker {
     }
 
     /// Create a new tracker with configurable cooldown parameters.
-    pub fn new_with_cooldown(
+    pub(crate) fn new_with_cooldown(
         threshold: u32,
         initial_cooldown: Duration,
         max_cooldown: Duration,
@@ -319,7 +329,7 @@ impl IpHealthTracker {
 
     /// Record a failed probe attempt on an unhealthy IP.
     /// Doubles the cooldown (capped at max_cooldown) and resets the unhealthy_at timestamp.
-    pub fn record_probe_failure(&self, ip: &IpAddr) {
+    pub(crate) fn record_probe_failure(&self, ip: &IpAddr) {
         self.record_probe_failure_at(ip, Instant::now())
     }
 
@@ -338,14 +348,14 @@ impl IpHealthTracker {
 
     /// Record a successful probe on a formerly unhealthy IP.
     /// Clears the unhealthy state and failure count.
-    pub fn record_probe_success(&self, ip: &IpAddr) {
+    pub(crate) fn record_probe_success(&self, ip: &IpAddr) {
         self.failures.remove(ip);
         self.unhealthy.remove(ip);
     }
 
     /// Returns IPs whose cooldown has elapsed and are eligible for probing.
     /// These IPs are still considered unhealthy until a probe succeeds.
-    pub fn get_probe_candidates(&self) -> Vec<IpAddr> {
+    pub(crate) fn get_probe_candidates(&self) -> Vec<IpAddr> {
         self.get_probe_candidates_at(Instant::now())
     }
 
@@ -364,23 +374,8 @@ impl IpHealthTracker {
             .collect()
     }
 
-    /// Check if a specific IP is a probe candidate (cooldown elapsed).
-    pub fn is_probe_candidate(&self, ip: &IpAddr) -> bool {
-        self.is_probe_candidate_at(ip, Instant::now())
-    }
-
-    /// [`is_probe_candidate`](Self::is_probe_candidate) with an explicit clock reading.
-    pub(crate) fn is_probe_candidate_at(&self, ip: &IpAddr, now: Instant) -> bool {
-        if let Some(entry) = self.unhealthy.get(ip) {
-            let elapsed = now.duration_since(entry.unhealthy_at);
-            elapsed >= entry.cooldown
-        } else {
-            false
-        }
-    }
-
     /// Check if an IP is currently marked as unhealthy.
-    pub fn is_unhealthy(&self, ip: &IpAddr) -> bool {
+    pub(crate) fn is_unhealthy(&self, ip: &IpAddr) -> bool {
         self.unhealthy.contains_key(ip)
     }
 
@@ -398,7 +393,7 @@ impl IpHealthTracker {
     ///
     /// Unlike [`get_probe_candidates`](Self::get_probe_candidates) this ignores
     /// cooldown state, so callers can reconcile the tracked set against DNS.
-    pub fn tracked_unhealthy_ips(&self) -> Vec<IpAddr> {
+    pub(crate) fn tracked_unhealthy_ips(&self) -> Vec<IpAddr> {
         self.unhealthy.iter().map(|e| *e.key()).collect()
     }
 
@@ -529,8 +524,10 @@ impl ConnectionPoolManager {
             );
             ip_distributors.insert(hostname.clone(), IpDistributor::new(ips.clone()));
         }
-        // Note: suffix overrides create distributors lazily on first match
-        // because the actual hostname isn't known until request time.
+        // A host matched only by a suffix (`*.`) entry gets its distributor on
+        // first use, because the concrete hostname is not known until request
+        // time: `register_endpoint` seeds it, keyed by that hostname, from the
+        // suffix entry's IPs (`resolve_endpoint` consults overrides first).
 
         Ok(Self {
             resolver,
@@ -550,17 +547,16 @@ impl ConnectionPoolManager {
         self.overrides.resolve(endpoint)
     }
 
-    /// Whether any endpoint overrides (exact or suffix) are configured.
-    pub fn has_overrides(&self) -> bool {
-        !self.overrides.is_empty()
-    }
-
     /// Resolve endpoint to IP addresses using the configured DNS resolver
     /// (bypasses /etc/hosts). Checks endpoint overrides first, then falls back to DNS.
     pub async fn resolve_endpoint(&self, endpoint: &str) -> Result<Vec<IpAddr>> {
         // Check overrides (exact then suffix)
         if let Some(ips) = self.overrides.resolve(endpoint) {
-            info!("Using endpoint override for {}: {:?}", endpoint, ips);
+            // `debug!`, not `info!`: every registered suffix-override host passes
+            // through here on each `dns_refresh_interval`, so at INFO this line
+            // repeated once per virtual-hosted bucket per refresh. The one INFO line
+            // per host is emitted by `register_endpoint` on first registration.
+            debug!("Using endpoint override for {}: {:?}", endpoint, ips);
             return Ok(ips.clone());
         }
 
@@ -592,13 +588,24 @@ impl ConnectionPoolManager {
     ///
     /// Performs an immediate DNS resolution and seeds the IP distributor.
     /// Subsequent calls to `refresh_dns` will keep the distributor up to date.
-    /// No-op if the endpoint is already registered or covered by `endpoint_overrides`.
+    /// No-op if the endpoint is already registered or has an exact
+    /// `endpoint_overrides` entry (those are seeded at startup).
+    ///
+    /// A host matched only by a suffix (`*.`) override IS registered: the
+    /// resolve goes through `resolve_endpoint`, which returns the suffix entry's
+    /// IPs, so the host gets a distributor of its own, keyed by the concrete
+    /// hostname. Its IPs then sit in `resolved_ips`, which is what lets the
+    /// recovery probe map an excluded IP back to this host, and what makes a DNS
+    /// refresh rebuild the distributor from the override list minus unhealthy IPs.
     pub async fn register_endpoint(&mut self, endpoint: &str) {
-        // Skip if already registered or covered by a static override (exact or suffix)
-        if self.resolved_ips.contains_key(endpoint) || self.resolve_override(endpoint).is_some() {
+        // Skip if already registered or seeded at startup from an exact override
+        if self.resolved_ips.contains_key(endpoint) || self.overrides.is_exact(endpoint) {
             return;
         }
-        // Cap: prevent unbounded growth of registered endpoints
+        // Cap: prevent unbounded growth of registered endpoints. Suffix-override
+        // hosts count against the same cap as DNS hosts, one slot per concrete
+        // hostname; a host refused here gets no distributor and its requests
+        // connect to the first IP `resolve_endpoint` returns.
         if self.resolved_ips.len() >= self.max_registered_endpoints {
             warn!(
                 endpoint = %endpoint,
@@ -607,10 +614,23 @@ impl ConnectionPoolManager {
             );
             return;
         }
-        info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
+        if let Some(ips) = self.overrides.resolve(endpoint) {
+            // Logged once per host at INFO; later refreshes log at debug in
+            // `resolve_endpoint`.
+            info!(
+                endpoint = %endpoint,
+                ips = ?ips,
+                "Using endpoint override for suffix-matched host; registering its IP distributor"
+            );
+        } else {
+            info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
+        }
         // `None`: this is a first-time registration (the early return above skips
-        // endpoints already known), so no IP of this endpoint can be under a
-        // health exclusion yet and there is nothing to hold back.
+        // endpoints already known), so no health tracker is consulted. For a
+        // suffix-override host an IP can already be marked unhealthy by a failure
+        // on the hostname path before this ran; it is seeded anyway, removed again
+        // by its next failure (`record_failure` returns true at or above the
+        // threshold), and held out by the next `refresh_dns`.
         if let Err(e) = self.refresh_endpoint_dns(endpoint, None).await {
             warn!(
                 "Initial DNS resolution failed for endpoint {}: {}",
@@ -662,7 +682,7 @@ impl ConnectionPoolManager {
     ///
     /// Tracker entries for IPs that have vanished from DNS entirely are dropped,
     /// so the unhealthy map cannot grow without bound as S3 rotates addresses.
-    pub async fn refresh_endpoint_dns(
+    pub(crate) async fn refresh_endpoint_dns(
         &mut self,
         endpoint: &str,
         health_tracker: Option<&IpHealthTracker>,
@@ -685,8 +705,19 @@ impl ConnectionPoolManager {
         // refresh of one endpoint cannot discard another endpoint's exclusions.
         let distributor_ips = match health_tracker {
             Some(tracker) => {
-                let all_resolved: std::collections::HashSet<IpAddr> =
-                    self.resolved_ips.values().flatten().copied().collect();
+                // Exact-override IPs never enter `resolved_ips`, but the probe
+                // re-admits them through `get_hostname_for_ip`, so their health
+                // state must survive a refresh too. Without them in the union, a
+                // refresh of any registered endpoint (including a suffix-override
+                // host) would forget an excluded exact-override IP, and nothing
+                // would ever probe it back into its distributor.
+                let all_resolved: std::collections::HashSet<IpAddr> = self
+                    .resolved_ips
+                    .values()
+                    .flatten()
+                    .chain(self.overrides.exact_iter().flat_map(|(_, ips)| ips.iter()))
+                    .copied()
+                    .collect();
                 for ip in tracker.tracked_unhealthy_ips() {
                     if !all_resolved.contains(&ip) {
                         debug!(ip = %ip, "Forgetting health state for IP no longer present in DNS");
@@ -749,7 +780,7 @@ impl ConnectionPoolManager {
     /// - 2 IPs → pin original and hedge to distinct IPs
     /// - 1 IP → pin both arms to the same IP (separate connections)
     /// - 0 IPs → run both arms unpinned
-    pub fn get_distinct_distributed_ips(&self, host: &str, n: usize) -> Vec<IpAddr> {
+    pub(crate) fn get_distinct_distributed_ips(&self, host: &str, n: usize) -> Vec<IpAddr> {
         let distributor = match self.ip_distributors.get(host) {
             Some(d) => d,
             None => return Vec::new(),
@@ -779,21 +810,98 @@ impl ConnectionPoolManager {
     /// Look up the endpoint hostname that owns a given IP address.
     ///
     /// Searches all IP distributors to find which endpoint the IP belongs to.
-    /// Used by `CustomHttpsConnector` to determine the original hostname for TLS SNI
-    /// when the URI authority has been rewritten to an IP address.
+    /// A request's TLS name and the distributor its failures exclude from come
+    /// from the host the request targeted, carried in the rewritten authority,
+    /// not from this lookup. It answers for callers with no request host:
+    /// `CustomHttpsConnector` when the authority carries no usable name (an
+    /// IP-literal `Host` or `upstream_overrides` target), and, through
+    /// `get_endpoint_for_ip`, the recovery probe that picks the distributor to
+    /// re-admit an IP to.
+    ///
+    /// Deterministic when more than one endpoint owns the IP:
+    ///
+    /// 1. An exact `endpoint_overrides` entry wins. An IP listed in both an exact
+    ///    and a suffix (`*.`) entry maps to the exact host, whether or not the IP
+    ///    is currently in that host's distributor.
+    /// 2. Otherwise the lexicographically smallest endpoint whose live
+    ///    distributor holds the IP. Every suffix-matched bucket hostname shares
+    ///    the suffix entry's IPs, so several distributors hold the same IP;
+    ///    `HashMap` iteration order would otherwise decide.
     pub fn get_hostname_for_ip(&self, ip: &IpAddr) -> Option<String> {
+        if let Some(endpoint) = self
+            .overrides
+            .exact_iter()
+            .filter(|(_, ips)| ips.contains(ip))
+            .map(|(endpoint, _)| endpoint)
+            .min()
+        {
+            return Some(endpoint.clone());
+        }
+        self.ip_distributors
+            .iter()
+            .filter(|(_, distributor)| distributor.get_ips().contains(ip))
+            .map(|(endpoint, _)| endpoint)
+            .min()
+            .cloned()
+    }
+
+    /// Look up the endpoint key to file a *metric* against for a given IP.
+    ///
+    /// This is deliberately NOT
+    /// [`get_hostname_for_ip`](Self::get_hostname_for_ip), which answers for an
+    /// exact `endpoint_overrides` entry or an IP still in a live distributor.
+    /// Two properties matter for
+    /// a metric key and for nothing else:
+    ///
+    /// 1. **It must resolve an IP that `remove_ip` has excluded.**
+    ///    `get_hostname_for_ip` searches the exact overrides and the live
+    ///    distributor sets, so it returns `None` for an excluded IP that no
+    ///    exact override lists, and its caller falls back to the
+    ///    dotted quad. A creation filed under a dotted quad can never match the
+    ///    request side's key, because the request side keys on the signed Host.
+    ///    This lookup also consults `resolved_ips`, which retains the full DNS
+    ///    result per endpoint and is not touched by `remove_ip`.
+    /// 2. **It must be deterministic.** Path-style and virtual-hosted authorities
+    ///    for one region resolve to overlapping IP sets, so more than one endpoint
+    ///    can own an IP, and `HashMap` iteration order is unspecified. This lookup
+    ///    returns the lexicographically smallest matching endpoint across live
+    ///    distributors, retained DNS results and exact overrides, so the same IP
+    ///    always yields the same key.
+    ///
+    /// Returns `None` when the IP belongs to no known endpoint at all. The caller
+    /// must then record nothing rather than invent a key — see
+    /// [`MetricsManager::record_connection_created`](crate::metrics::MetricsManager::record_connection_created).
+    pub(crate) fn get_metrics_endpoint_key(&self, ip: &IpAddr) -> Option<String> {
+        let mut candidates: Vec<&str> = Vec::new();
         for (endpoint, distributor) in &self.ip_distributors {
             if distributor.get_ips().contains(ip) {
-                return Some(endpoint.clone());
+                candidates.push(endpoint);
             }
         }
-        // Also check exact endpoint_overrides for IPs not yet in a distributor
+        for (endpoint, ips) in &self.resolved_ips {
+            if ips.contains(ip) {
+                candidates.push(endpoint);
+            }
+        }
         for (endpoint, ips) in self.overrides.exact_iter() {
             if ips.contains(ip) {
-                return Some(endpoint.clone());
+                candidates.push(endpoint);
             }
         }
-        None
+        candidates.into_iter().min().map(|s| s.to_string())
+    }
+
+    /// NAMED TEST SEAM. Seed the retained DNS result for an endpoint.
+    ///
+    /// `resolved_ips` is private and is only ever written by DNS resolution. The
+    /// key-coherence test for `connection_keepalive` has to construct an IP that
+    /// is excluded from the live distributor but still present in the retained DNS
+    /// result — the exact state route 1 of the key divergence needs — and that
+    /// state cannot be reached from outside this module without either running DNS
+    /// or widening the field's visibility. This seam is the narrower of the two.
+    #[cfg(test)]
+    pub(crate) fn seed_resolved_ips_for_test(&mut self, endpoint: &str, ips: Vec<IpAddr>) {
+        self.resolved_ips.insert(endpoint.to_string(), ips);
     }
 
     /// Look up the endpoint that owns an IP, including IPs currently excluded
@@ -807,7 +915,7 @@ impl ConnectionPoolManager {
     ///
     /// Returns `None` when the IP has disappeared from DNS entirely, which the
     /// probe path treats as "stop tracking this IP" rather than "probe it".
-    pub fn get_endpoint_for_ip(&self, ip: &IpAddr) -> Option<String> {
+    pub(crate) fn get_endpoint_for_ip(&self, ip: &IpAddr) -> Option<String> {
         if let Some(endpoint) = self.get_hostname_for_ip(ip) {
             return Some(endpoint);
         }
@@ -820,7 +928,7 @@ impl ConnectionPoolManager {
     }
 
     /// Get mutable reference to a distributor for IP exclusion.
-    pub fn get_distributor_mut(&mut self, endpoint: &str) -> Option<&mut IpDistributor> {
+    pub(crate) fn get_distributor_mut(&mut self, endpoint: &str) -> Option<&mut IpDistributor> {
         self.ip_distributors.get_mut(endpoint)
     }
 
@@ -850,7 +958,7 @@ impl ConnectionPoolManager {
     }
 
     /// Get DNS refresh count
-    pub fn get_dns_refresh_count(&self) -> u64 {
+    pub(crate) fn get_dns_refresh_count(&self) -> u64 {
         self.dns_refresh_count
     }
 }
@@ -1043,7 +1151,9 @@ mod tests {
 
         // Cooldown has elapsed
         let after_cooldown = t0 + Duration::from_secs(5);
-        assert!(tracker.is_probe_candidate_at(&ip, after_cooldown));
+        assert!(tracker
+            .get_probe_candidates_at(after_cooldown)
+            .contains(&ip));
         let candidates = tracker.get_probe_candidates_at(after_cooldown);
         assert!(candidates.contains(&ip));
     }
@@ -1062,7 +1172,7 @@ mod tests {
         tracker.record_failure(&ip);
         tracker.record_failure(&ip);
         assert!(tracker.is_unhealthy(&ip));
-        assert!(!tracker.is_probe_candidate(&ip));
+        assert!(!tracker.get_probe_candidates().contains(&ip));
         assert!(tracker.get_probe_candidates().is_empty());
     }
 
@@ -1084,13 +1194,13 @@ mod tests {
         // Probe success clears unhealthy state
         tracker.record_probe_success(&ip);
         assert!(!tracker.is_unhealthy(&ip));
-        assert!(!tracker.is_probe_candidate(&ip));
+        assert!(!tracker.get_probe_candidates().contains(&ip));
     }
 
     #[test]
     fn test_health_tracker_probe_failure_doubles_cooldown() {
         // Synthetic clock throughout. The previous sleep-based version budgeted
-        // 10ms/20ms windows and asserted `!is_probe_candidate` on the statement
+        // 10ms/20ms windows and asserted the IP was not a probe candidate on the statement
         // immediately after `record_probe_failure`, so a >=20ms scheduler stall
         // between two adjacent statements failed it on the shared CI runner.
         let tracker =
@@ -1105,7 +1215,7 @@ mod tests {
 
         // Initial cooldown elapsed — eligible for probing
         let t_probe = t0 + Duration::from_secs(5);
-        assert!(tracker.is_probe_candidate_at(&ip, t_probe));
+        assert!(tracker.get_probe_candidates_at(t_probe).contains(&ip));
 
         // Probe fails — cooldown doubles to 10s and unhealthy_at re-anchors to t_probe
         tracker.record_probe_failure_at(&ip, t_probe);
@@ -1116,13 +1226,17 @@ mod tests {
         );
 
         // Immediately after the failed probe: not a candidate, cooldown re-anchored
-        assert!(!tracker.is_probe_candidate_at(&ip, t_probe));
+        assert!(!tracker.get_probe_candidates_at(t_probe).contains(&ip));
 
         // Partway through the doubled cooldown: still not a candidate
-        assert!(!tracker.is_probe_candidate_at(&ip, t_probe + Duration::from_secs(9)));
+        assert!(!tracker
+            .get_probe_candidates_at(t_probe + Duration::from_secs(9))
+            .contains(&ip));
 
         // Full doubled cooldown elapsed: candidate again
-        assert!(tracker.is_probe_candidate_at(&ip, t_probe + Duration::from_secs(10)));
+        assert!(tracker
+            .get_probe_candidates_at(t_probe + Duration::from_secs(10))
+            .contains(&ip));
     }
 
     // -----------------------------------------------------------------------
@@ -1257,6 +1371,45 @@ mod tests {
         assert_eq!(
             manager.get_endpoint_for_ip(&unhealthy).as_deref(),
             Some("s3.us-west-2.amazonaws.com")
+        );
+    }
+
+    /// `connection_pool.dns_refresh_interval` reaches `refresh_dns`'s per-endpoint gate
+    /// through `new_with_config`, the constructor `S3Client::new` uses. The background task
+    /// ticks every `pool_check_interval`; on each tick an endpoint is re-resolved only once
+    /// `dns_refresh_interval` has elapsed since its last resolution. Both sides are asserted:
+    /// a zero interval re-resolves on the next tick, an hour-long one does not.
+    #[test]
+    fn dns_refresh_interval_from_config_gates_refresh_dns() {
+        let refreshes_after_one_tick = |interval: Duration| {
+            let mut overrides = std::collections::HashMap::new();
+            overrides.insert(
+                "s3.us-west-2.amazonaws.com".to_string(),
+                vec!["10.0.1.100".to_string()],
+            );
+            let config = crate::config::ConnectionPoolConfig {
+                endpoint_overrides: overrides,
+                dns_refresh_interval: interval,
+                ..Default::default()
+            };
+            let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+            futures::executor::block_on(
+                manager.refresh_endpoint_dns("s3.us-west-2.amazonaws.com", None),
+            )
+            .unwrap();
+            let before = manager.get_dns_refresh_count();
+            futures::executor::block_on(manager.refresh_dns(None)).unwrap();
+            manager.get_dns_refresh_count() - before
+        };
+        assert_eq!(
+            refreshes_after_one_tick(Duration::ZERO),
+            1,
+            "dns_refresh_interval 0s: the tick must re-resolve the endpoint"
+        );
+        assert_eq!(
+            refreshes_after_one_tick(Duration::from_secs(3600)),
+            0,
+            "dns_refresh_interval 1h: the tick must not re-resolve a just-resolved endpoint"
         );
     }
 
@@ -1867,5 +2020,255 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Suffix (`*.`) endpoint overrides: distributor on first use, failover,
+    // and recovery. A host matched only by a suffix entry used to get no
+    // distributor at all, so it dialled the entry's first IP forever.
+    // -----------------------------------------------------------------------
+
+    const SUFFIX_KEY: &str = "*.vpce-0abc.s3.us-west-2.vpce.amazonaws.com";
+    const SUFFIX_HOST: &str = "mybucket.bucket.vpce-0abc.s3.us-west-2.vpce.amazonaws.com";
+    const EXACT_HOST: &str = "bucket.vpce-0abc.s3.us-west-2.vpce.amazonaws.com";
+
+    fn suffix_ips() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, 100)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 3, 100)),
+        ]
+    }
+
+    fn exact_ips() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 9, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 9, 2)),
+        ]
+    }
+
+    /// A manager with one suffix entry and one exact entry on disjoint IPs, so a
+    /// lookup that returns an IP can only have come from one of them.
+    fn manager_with_suffix_and_exact_overrides() -> ConnectionPoolManager {
+        let mut endpoint_overrides = HashMap::new();
+        endpoint_overrides.insert(
+            SUFFIX_KEY.to_string(),
+            suffix_ips().iter().map(|ip| ip.to_string()).collect(),
+        );
+        endpoint_overrides.insert(
+            EXACT_HOST.to_string(),
+            exact_ips().iter().map(|ip| ip.to_string()).collect(),
+        );
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides,
+            ..crate::config::ConnectionPoolConfig::default()
+        };
+        ConnectionPoolManager::new_with_config(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_suffix_override_host_round_robins_after_registration() {
+        let mut manager = manager_with_suffix_and_exact_overrides();
+        assert!(
+            manager.get_distributed_ip(SUFFIX_HOST).is_none(),
+            "precondition: no distributor before first use"
+        );
+
+        // First use: `S3Client` spawns exactly this on a `None` distributor read.
+        manager.register_endpoint(SUFFIX_HOST).await;
+
+        let mut seen: Vec<IpAddr> = (0..6)
+            .map(|_| {
+                manager
+                    .get_distributed_ip(SUFFIX_HOST)
+                    .expect("a suffix-override host must get a distributor on first use")
+            })
+            .collect();
+        assert_eq!(
+            &seen[..3],
+            &seen[3..],
+            "selection must cycle in a fixed order"
+        );
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            suffix_ips(),
+            "round-robin must cover every IP of the suffix entry, not only the first"
+        );
+        // The rewritten-to-IP connection must map back to the concrete hostname,
+        // which is what the connector uses for SNI and for the exclusion lookup.
+        for ip in suffix_ips() {
+            assert_eq!(
+                manager.get_hostname_for_ip(&ip).as_deref(),
+                Some(SUFFIX_HOST)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_suffix_override_failing_ip_is_excluded_then_probe_readmits_it() {
+        let mut manager = manager_with_suffix_and_exact_overrides();
+        manager.register_endpoint(SUFFIX_HOST).await;
+        let tracker =
+            IpHealthTracker::new_with_cooldown(1, Duration::from_secs(5), Duration::from_secs(300));
+        let bad = suffix_ips()[0];
+        let t0 = Instant::now();
+
+        // The connector's failure path, verbatim in shape: record, then remove
+        // from the distributor owning the IP's hostname.
+        assert!(tracker.record_failure_at(&bad, t0));
+        let host = manager
+            .get_hostname_for_ip(&bad)
+            .expect("the failing IP must map to its suffix-override host");
+        manager
+            .get_distributor_mut(&host)
+            .expect("the suffix-override host must have a distributor to exclude from")
+            .remove_ip(bad, "TCP connect failure");
+        for _ in 0..6 {
+            assert_ne!(manager.get_distributed_ip(SUFFIX_HOST), Some(bad));
+        }
+
+        // A DNS refresh (override-first, so the suffix IPs) must hold it out.
+        manager
+            .refresh_endpoint_dns(SUFFIX_HOST, Some(&tracker))
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            assert_ne!(
+                manager.get_distributed_ip(SUFFIX_HOST),
+                Some(bad),
+                "a refresh must not re-admit an excluded suffix-override IP"
+            );
+        }
+        assert!(tracker.is_unhealthy(&bad), "refresh must not forget it");
+
+        // The recovery probe's own steps: candidate after cooldown, owning
+        // endpoint lookup, then re-admission on success.
+        let candidates = tracker.get_probe_candidates_at(t0 + Duration::from_secs(5));
+        assert_eq!(candidates, vec![bad]);
+        let endpoint = manager.get_endpoint_for_ip(&bad).expect(
+            "the probe must map an excluded suffix-override IP back to its host, \
+             or probe_unhealthy_ips forgets it instead of probing",
+        );
+        assert_eq!(endpoint, SUFFIX_HOST);
+        tracker.record_probe_success(&bad);
+        assert!(manager
+            .get_distributor_mut(&endpoint)
+            .unwrap()
+            .add_ip(bad, "recovery probe succeeded"));
+        let readmitted = (0..3).any(|_| manager.get_distributed_ip(SUFFIX_HOST) == Some(bad));
+        assert!(readmitted, "the probed IP must be back in round-robin");
+    }
+
+    #[tokio::test]
+    async fn test_exact_override_unchanged_by_suffix_registration() {
+        let mut manager = manager_with_suffix_and_exact_overrides();
+
+        // Exact entries are seeded at startup and registration leaves them alone.
+        manager.register_endpoint(EXACT_HOST).await;
+        assert!(
+            !manager.resolved_ips.contains_key(EXACT_HOST),
+            "an exact-override host must not be registered for DNS refresh"
+        );
+        let mut seen: Vec<IpAddr> = (0..4)
+            .map(|_| manager.get_distributed_ip(EXACT_HOST).unwrap())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen, exact_ips());
+        assert!(manager.get_hostname_for_ip(&exact_ips()[0]).as_deref() == Some(EXACT_HOST));
+
+        // An excluded exact-override IP must survive a refresh of another
+        // endpoint: a registered suffix host makes refreshes actually run in a
+        // PrivateLink-only deployment, and the prune must not forget this IP.
+        let tracker = IpHealthTracker::new(1);
+        let bad = exact_ips()[0];
+        assert!(tracker.record_failure(&bad));
+        manager
+            .get_distributor_mut(EXACT_HOST)
+            .unwrap()
+            .remove_ip(bad, "TCP connect failure");
+        manager.register_endpoint(SUFFIX_HOST).await;
+        manager
+            .refresh_endpoint_dns(SUFFIX_HOST, Some(&tracker))
+            .await
+            .unwrap();
+        assert!(
+            tracker.is_unhealthy(&bad),
+            "a refresh of a suffix-override host must not forget an exact-override IP's \
+             exclusion, or the probe never re-admits it"
+        );
+        assert_eq!(
+            manager.get_endpoint_for_ip(&bad).as_deref(),
+            Some(EXACT_HOST),
+            "the probe maps an excluded exact-override IP back through the exact entry"
+        );
+    }
+
+    /// An IP listed in BOTH an exact and a suffix entry, with two suffix-matched
+    /// bucket hosts registered, sits in three distributors at once. The lookup
+    /// that picks the SNI name, the exclusion target and the probe's re-admission
+    /// target must not depend on `HashMap` iteration order.
+    ///
+    /// `RandomState` reseeds per map, so each fresh manager is an independent
+    /// draw of iteration order. An order-dependent lookup returns a suffix host
+    /// for about two draws in three here, so 64 managers make a false pass
+    /// negligible.
+    #[tokio::test]
+    async fn test_ip_in_exact_and_suffix_entries_maps_to_exact_host_deterministically() {
+        const OTHER_SUFFIX_HOST: &str = "abucket.bucket.vpce-0abc.s3.us-west-2.vpce.amazonaws.com";
+        let shared = IpAddr::V4(Ipv4Addr::new(10, 0, 5, 5));
+        let suffix_only = suffix_ips()[0];
+        for draw in 0..64 {
+            let mut endpoint_overrides = HashMap::new();
+            let mut suffix_list: Vec<String> =
+                suffix_ips().iter().map(|ip| ip.to_string()).collect();
+            suffix_list.push(shared.to_string());
+            endpoint_overrides.insert(SUFFIX_KEY.to_string(), suffix_list);
+            endpoint_overrides.insert(
+                EXACT_HOST.to_string(),
+                vec![exact_ips()[0].to_string(), shared.to_string()],
+            );
+            let config = crate::config::ConnectionPoolConfig {
+                endpoint_overrides,
+                ..crate::config::ConnectionPoolConfig::default()
+            };
+            let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+            manager.register_endpoint(SUFFIX_HOST).await;
+            manager.register_endpoint(OTHER_SUFFIX_HOST).await;
+            assert_eq!(
+                manager.ip_distributors.len(),
+                3,
+                "fixture precondition: the shared IP must sit in three distributors"
+            );
+
+            assert_eq!(
+                manager.get_hostname_for_ip(&shared).as_deref(),
+                Some(EXACT_HOST),
+                "draw {draw}: an IP in an exact and a suffix entry must map to the exact host"
+            );
+            assert_eq!(
+                manager.get_endpoint_for_ip(&shared).as_deref(),
+                Some(EXACT_HOST),
+                "draw {draw}: the probe's lookup must agree"
+            );
+            // Excluded from the exact distributor: still the exact host.
+            manager
+                .get_distributor_mut(EXACT_HOST)
+                .unwrap()
+                .remove_ip(shared, "test: excluded from the exact distributor");
+            assert_eq!(
+                manager.get_hostname_for_ip(&shared).as_deref(),
+                Some(EXACT_HOST),
+                "draw {draw}: exclusion from the exact distributor must not hand the IP to a suffix host"
+            );
+            // An IP only the suffix entry lists: the smallest suffix host, always.
+            assert_eq!(
+                manager.get_hostname_for_ip(&suffix_only).as_deref(),
+                Some(OTHER_SUFFIX_HOST),
+                "draw {draw}: suffix-only IPs must map to the smallest registered host"
+            );
+        }
     }
 }

@@ -59,10 +59,11 @@ fn create_shared_cache_config(shared_dir: PathBuf, _instance_id: &str) -> CacheC
         max_cache_size: 100 * 1024 * 1024, // 100MB
         ram_cache_enabled: true,
         max_ram_cache_size: 50 * 1024 * 1024, // 50MB
-        eviction_algorithm: EvictionAlgorithm::LRU,
+        eviction_algorithm: EvictionAlgorithm::TinyLFU,
         write_cache_enabled: true,
         write_cache_percent: 10.0,
         write_cache_max_object_size: 256 * 1024 * 1024, // 256MB
+        disk_safety_free_space_floor: 1024 * 1024 * 1024, // 1 GiB
         put_ttl: Duration::from_secs(3600),
         get_ttl: Duration::from_secs(3600),
         head_ttl: Duration::from_secs(3600),
@@ -71,8 +72,6 @@ fn create_shared_cache_config(shared_dir: PathBuf, _instance_id: &str) -> CacheC
         shared_storage: SharedStorageConfig::default(),
         range_merge_gap_threshold: 256 * 1024, // 256KB
         ram_cache_flush_interval: Duration::from_secs(60),
-        ram_cache_flush_threshold: 100,
-        ram_cache_flush_on_eviction: false,
         ram_cache_verification_interval: Duration::from_secs(1),
         incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
         initialization: s3_proxy::config::InitializationConfig::default(),

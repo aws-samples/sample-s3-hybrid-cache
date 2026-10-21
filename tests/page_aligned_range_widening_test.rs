@@ -1,7 +1,7 @@
 //! Integration tests for page-aligned range caching (widening) in the range
 //! request path (`http_proxy.rs::handle_range_request`).
 //!
-//! Spec: `.kiro/specs/page-aligned-range-cache/` Task 4.
+//! Spec: the page aligned range cache feature Task 4.
 //!
 //! These tests drive `HttpProxy::handle_range_request` directly against the
 //! in-process `StubS3Client` harness (no real S3 connections), with
@@ -69,7 +69,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,
@@ -202,6 +202,382 @@ async fn small_read_widens_to_page_and_slices_exact_bytes() {
     let _ = captured; // silence unused if not needed further
 }
 
+/// A cold widened read, served before any `.meta` is visible to this instance, must still
+/// name the object's length in `Content-Range`. The Page's S3 response carried it
+/// (`bytes 0-1023/4096`); the client's 206 must say `/4096`, not the requested range's end.
+#[tokio::test]
+async fn cold_widened_read_carries_the_objects_total_in_content_range() {
+    let config = test_config();
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let cache_key = "bucket/widen-cold-total.bin".to_string();
+    let full_body = object_body();
+    let page_bytes = full_body[0..PAGE_SIZE as usize].to_vec();
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(page_bytes))
+            .with_header(
+                "content-range",
+                format!("bytes 0-{}/{}", PAGE_SIZE - 1, OBJECT_SIZE),
+            )
+            .with_header("etag", "\"cold-total-etag\""),
+    );
+    let response = HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.clone(),
+        "bytes=5-14",
+        HashMap::new(),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        stub.clone().into_trait_object(),
+        "s3.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().unwrap(),
+        Arc::clone(&config),
+        &widened_settings(),
+        None,
+        Arc::new(InFlightTracker::new()),
+        None,
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("handle_range_request should not error");
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let content_range = response
+        .headers()
+        .get("content-range")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(
+        content_range.as_deref(),
+        Some(format!("bytes 5-14/{}", OBJECT_SIZE).as_str()),
+        "the 206 must name the object's length, which the Page's S3 response carried"
+    );
+    let body = body_bytes(response).await;
+    assert_eq!(body, &full_body[5..=14]);
+}
+/// A Page loaded from the journal (no `.meta` yet) and promoted to RAM must record the
+/// object's length, not the Page's: the offset-0 Page of a 4096-byte object is 1024 bytes,
+/// and a RAM hit reporting 1024 would make every later serve of it name the wrong total.
+#[tokio::test(flavor = "multi_thread")]
+async fn journal_arm_page_promotion_records_the_objects_length() {
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 10;
+    config_inner.cache.ram_cache_enabled = true;
+    let config = Arc::new(config_inner);
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let inflight_tracker = Arc::new(InFlightTracker::new());
+    let cache_key = "bucket/widen-journal-arm-length.bin".to_string();
+    let full_body = object_body();
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(full_body[0..PAGE_SIZE as usize].to_vec()))
+            .with_header(
+                "content-range",
+                format!("bytes 0-{}/{}", PAGE_SIZE - 1, OBJECT_SIZE),
+            )
+            .with_header("etag", "\"journal-arm-etag\""),
+    );
+    let resolved = ResolvedSettings {
+        page_widening: true,
+        page_size: PAGE_SIZE,
+        ram_cache_eligible: true,
+        get_ttl: Duration::from_secs(3600),
+        ..ResolvedSettings::default()
+    };
+    // The first read fills the Page from S3; the second finds it through the journal arm
+    // (no `.meta` is written before consolidation) and promotes it to RAM.
+    for range in ["bytes=5-14", "bytes=20-29"] {
+        let response = HttpProxy::handle_range_request(
+            Method::GET,
+            cache_key.clone(),
+            range,
+            HashMap::new(),
+            Arc::clone(&cache_manager),
+            Arc::clone(&range_handler),
+            stub.clone().into_trait_object(),
+            "s3.amazonaws.com".to_string(),
+            format!("/{}", cache_key).parse().unwrap(),
+            Arc::clone(&config),
+            &resolved,
+            None,
+            Arc::clone(&inflight_tracker),
+            None,
+            &None,
+            false,
+            None,
+        )
+        .await
+        .expect("handle_range_request should not error");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let _ = body_bytes(response).await;
+    }
+    assert!(
+        cache_manager
+            .get_metadata_from_disk(&cache_key)
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "PRECONDITION MISSING: a .meta exists, so the journal arm was not exercised"
+    );
+    // The last Page's promotion may run detached: wait for it, bounded.
+    let mut hit = None;
+    for _ in 0..100 {
+        hit = cache_manager.get_range_from_ram_cache_hit(
+            &cache_key,
+            0,
+            PAGE_SIZE - 1,
+            Duration::from_secs(3600),
+        );
+        if hit.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let hit = hit.expect("PRECONDITION MISSING: the journal-arm Page was not promoted to RAM");
+    assert_eq!(
+        hit.content_length, OBJECT_SIZE,
+        "the promoted Page must record the object's length, not the Page's"
+    );
+}
+/// One widened range GET through `handle_range_request` with the stub as origin.
+async fn widened_get(
+    cache_manager: &Arc<CacheManager>,
+    range_handler: &Arc<s3_proxy::range_handler::RangeHandler>,
+    stub: &StubS3Client,
+    config: &Arc<Config>,
+    resolved: &ResolvedSettings,
+    cache_key: &str,
+    range: &str,
+) -> hyper::Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>> {
+    HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.to_string(),
+        range,
+        HashMap::new(),
+        Arc::clone(cache_manager),
+        Arc::clone(range_handler),
+        stub.clone().into_trait_object(),
+        "s3.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().unwrap(),
+        Arc::clone(config),
+        resolved,
+        None,
+        Arc::new(InFlightTracker::new()),
+        None,
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("handle_range_request should not error")
+}
+fn content_range_of(
+    response: &hyper::Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>>,
+) -> Option<String> {
+    response
+        .headers()
+        .get("content-range")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+/// The overlap arm: a second widened read finds the Page through the journal (no `.meta` yet)
+/// and must name the object's length from the document the Page was found under.
+#[tokio::test(flavor = "multi_thread")]
+async fn overlap_arm_widened_read_names_the_objects_total() {
+    let config = test_config();
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let cache_key = "bucket/widen-overlap-arm-total.bin".to_string();
+    let full_body = object_body();
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(full_body[0..PAGE_SIZE as usize].to_vec()))
+            .with_header(
+                "content-range",
+                format!("bytes 0-{}/{}", PAGE_SIZE - 1, OBJECT_SIZE),
+            )
+            .with_header("etag", "\"overlap-arm-etag\""),
+    );
+    let resolved = widened_settings();
+    let first = widened_get(
+        &cache_manager,
+        &range_handler,
+        &stub,
+        &config,
+        &resolved,
+        &cache_key,
+        "bytes=5-14",
+    )
+    .await;
+    let _ = body_bytes(first).await;
+    let second = widened_get(
+        &cache_manager,
+        &range_handler,
+        &stub,
+        &config,
+        &resolved,
+        &cache_key,
+        "bytes=20-29",
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        content_range_of(&second).as_deref(),
+        Some(format!("bytes 20-29/{}", OBJECT_SIZE).as_str()),
+        "the second read found the Page through the journal and must name the object's length"
+    );
+    assert_eq!(
+        stub.captured().len(),
+        1,
+        "PRECONDITION MISSING: the second read must not reach S3"
+    );
+    assert_eq!(body_bytes(second).await, &full_body[20..=29]);
+}
+/// The RAM-hit arm: a third widened read of a Page that the second read promoted to RAM is
+/// served from the RAM entry, and its `Content-Range` must name the object's length.
+#[tokio::test(flavor = "multi_thread")]
+async fn ram_hit_arm_widened_read_names_the_objects_total() {
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 10;
+    config_inner.cache.ram_cache_enabled = true;
+    let config = Arc::new(config_inner);
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let cache_key = "bucket/widen-ram-arm-total.bin".to_string();
+    let full_body = object_body();
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(full_body[0..PAGE_SIZE as usize].to_vec()))
+            .with_header(
+                "content-range",
+                format!("bytes 0-{}/{}", PAGE_SIZE - 1, OBJECT_SIZE),
+            )
+            .with_header("etag", "\"ram-arm-etag\""),
+    );
+    let resolved = ResolvedSettings {
+        page_widening: true,
+        page_size: PAGE_SIZE,
+        ram_cache_eligible: true,
+        get_ttl: Duration::from_secs(3600),
+        ..ResolvedSettings::default()
+    };
+    for range in ["bytes=5-14", "bytes=20-29"] {
+        let r = widened_get(
+            &cache_manager,
+            &range_handler,
+            &stub,
+            &config,
+            &resolved,
+            &cache_key,
+            range,
+        )
+        .await;
+        let _ = body_bytes(r).await;
+    }
+    let mut promoted = false;
+    for _ in 0..100 {
+        if cache_manager
+            .get_range_from_ram_cache_hit(&cache_key, 0, PAGE_SIZE - 1, Duration::from_secs(3600))
+            .is_some()
+        {
+            promoted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        promoted,
+        "PRECONDITION MISSING: the Page was not promoted to RAM"
+    );
+    let third = widened_get(
+        &cache_manager,
+        &range_handler,
+        &stub,
+        &config,
+        &resolved,
+        &cache_key,
+        "bytes=30-39",
+    )
+    .await;
+    assert_eq!(third.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        content_range_of(&third).as_deref(),
+        Some(format!("bytes 30-39/{}", OBJECT_SIZE).as_str()),
+        "the RAM-hit serve must name the object's length"
+    );
+    assert_eq!(
+        stub.captured().len(),
+        1,
+        "PRECONDITION MISSING: the third read must not reach S3"
+    );
+    assert_eq!(body_bytes(third).await, &full_body[30..=39]);
+}
+/// The no-length branch: when no source names the object's length, the read is served from S3
+/// under the client's own range, never under a total guessed from the requested end.
+#[tokio::test(flavor = "multi_thread")]
+async fn widened_read_with_no_known_length_is_served_from_s3() {
+    let config = test_config();
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let cache_key = "bucket/widen-no-length.bin".to_string();
+    let full_body = object_body();
+    // A 206 that names no total: no Content-Range, so no source gives the object's length.
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(full_body[0..PAGE_SIZE as usize].to_vec()))
+            .with_header("etag", "\"no-length-etag\""),
+    );
+    let response = widened_get(
+        &cache_manager,
+        &range_handler,
+        &stub,
+        &config,
+        &widened_settings(),
+        &cache_key,
+        "bytes=5-14",
+    )
+    .await;
+    let content_range = content_range_of(&response);
+    let _ = body_bytes(response).await;
+    let ranges: Vec<String> = stub
+        .captured()
+        .iter()
+        .filter_map(|r| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+                .map(|(_, v)| v.clone())
+        })
+        .collect();
+    assert!(
+        ranges.iter().any(|r| r == "bytes=5-14"),
+        "the read must reach S3 under the client's own range; requests carried {ranges:?}"
+    );
+    assert_ne!(
+        content_range.as_deref(),
+        Some("bytes 5-14/15"),
+        "the response must not name the requested end as the object's length"
+    );
+}
 /// A second small read into the SAME already-cached page must be served
 /// entirely from cache with no further S3 fetch (Requirement 6.1 page hit).
 #[tokio::test]
@@ -302,7 +678,9 @@ async fn second_small_read_into_cached_page_is_a_cache_hit() {
 
 /// A boundary-straddling small read must fetch both overlapping Pages
 /// (Requirement 3.5) and slice the client's exact requested bytes, which span
-/// the two Pages.
+/// the two Pages. R3.5's "concurrently" clause is superseded — the Pages are
+/// now filled one at a time (`buffered-serve-memory-bound` R1.3) — and this
+/// test never asserted the concurrency, only the two fetches and the slice.
 #[tokio::test]
 async fn straddling_read_fetches_both_pages_and_slices_correctly() {
     let config = test_config();
@@ -841,7 +1219,12 @@ async fn ram_cache_eligible_false_skips_page_promotion() {
 
     // The Page's cold-fetch fill must NOT have promoted it to RAM, because
     // `ram_cache_eligible` is false. A direct page-keyed RAM lookup must miss.
-    let ram_hit = cache_manager.get_range_from_ram_cache(&cache_key, page_start, page_end);
+    let ram_hit = cache_manager.get_range_from_ram_cache(
+        &cache_key,
+        page_start,
+        page_end,
+        std::time::Duration::from_secs(3600),
+    );
     assert!(
         ram_hit.is_none(),
         "page must not be promoted to RAM when ram_cache_eligible is false"
@@ -918,7 +1301,7 @@ async fn widening_disabled_leaves_small_read_unmodified() {
 /// `get_range_from_ram_cache` / `promote_range_to_ram_cache_frame` are
 /// untouched by the page-widening changes in `http_proxy.rs`.
 ///
-/// The range is pre-populated directly via `store_range_new_storage` (bypassing
+/// The range is pre-populated directly via `DiskCacheManager::store_range` (bypassing
 /// the S3 stub's cold-fetch caching, which is a pre-existing gap unrelated to
 /// page mode: `convert_s3_response_to_http_with_caching`'s `Buffered` branch
 /// returns the stub's bytes without caching them — only the `Streaming` body
@@ -966,8 +1349,10 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
         None,
         HashMap::new(),
     );
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             &cache_key,
             range_start,
             range_end,
@@ -979,7 +1364,7 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
         .await
         .expect("pre-populating the disk cache should succeed");
 
-    // `store_range_new_storage` writes journal-only (`WriteMode::JournalOnly`).
+    // `DiskCacheManager::store_range` writes journal-only (`WriteMode::JournalOnly`).
     // Unlike the page-widening path's `find_page_overlap` (which was written
     // with an explicit journal-fallback check for exactly this reason), the
     // shared, unchanged `RangeHandler::find_cached_ranges` does NOT consult
@@ -1000,8 +1385,12 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
         .await
         .expect("consolidation should succeed");
 
-    let ram_hit_before_any_read =
-        cache_manager.get_range_from_ram_cache(&cache_key, range_start, range_end);
+    let ram_hit_before_any_read = cache_manager.get_range_from_ram_cache(
+        &cache_key,
+        range_start,
+        range_end,
+        std::time::Duration::from_secs(3600),
+    );
     assert!(
         ram_hit_before_any_read.is_none(),
         "a freshly disk-stored range must not be in RAM before any read"
@@ -1061,8 +1450,12 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
     assert_eq!(response1.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(response1).await, body_data);
 
-    let ram_hit_after_first =
-        cache_manager.get_range_from_ram_cache(&cache_key, range_start, range_end);
+    let ram_hit_after_first = cache_manager.get_range_from_ram_cache(
+        &cache_key,
+        range_start,
+        range_end,
+        std::time::Duration::from_secs(3600),
+    );
     assert!(
         ram_hit_after_first.is_some(),
         "a disk hit must promote the range to RAM, exactly as the \
@@ -1282,6 +1675,186 @@ async fn signed_range_increments_skipped_signed_range_metric() {
     let metrics = metrics_manager.read().await.collect_metrics().await;
     assert_eq!(metrics.page_cache.skipped_signed_range, 1);
     assert_eq!(metrics.page_cache.widened_requests, 0);
+}
+
+/// A presigned URL lists its signed headers in `X-Amz-SignedHeaders`, not in an
+/// `Authorization` header. `signed_headers` is the value as it appears in the URL.
+fn presigned_uri(cache_key: &str, signed_headers: &str) -> hyper::Uri {
+    let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    format!(
+        "/{cache_key}?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+         &X-Amz-Credential=TESTACCESSKEY%2F20250101%2Fus-east-1%2Fs3%2Faws4_request\
+         &X-Amz-Date={date}&X-Amz-Expires=3600&X-Amz-SignedHeaders={signed_headers}\
+         &X-Amz-Signature=sig01"
+    )
+    .parse()
+    .unwrap()
+}
+
+/// A stub that answers only `raw_range` verbatim and rejects every other request as
+/// S3 rejects a rewritten signed header.
+fn presigned_verbatim_only_s3(raw_range: &str, start: u64, end: u64) -> StubS3Client {
+    StubS3Client::new()
+        .with_response_for_range(
+            raw_range,
+            StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+                .with_body(Bytes::from(vec![7u8; (end - start + 1) as usize]))
+                .with_header(
+                    "content-range",
+                    format!("bytes {}-{}/{}", start, end, OBJECT_SIZE),
+                )
+                .with_header("etag", "\"presigned-widen-etag\""),
+        )
+        .with_default(
+            StubResponse::with_status(StatusCode::FORBIDDEN)
+                .with_body(Bytes::from_static(
+                    b"<Error><Code>SignatureDoesNotMatch</Code></Error>",
+                ))
+                .with_header("content-type", "application/xml"),
+        )
+}
+
+fn assert_every_fetch_kept_range(stub: &StubS3Client, raw_range: &str) {
+    let captured = stub.captured();
+    assert!(!captured.is_empty(), "the request never reached S3");
+    for fetch in &captured {
+        let range = fetch
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            range,
+            Some(raw_range),
+            "a signed Range was rewritten on its way to S3: {fetch:?}"
+        );
+    }
+}
+
+async fn presigned_widening_get(
+    cache_key: &str,
+    raw_range: &str,
+    signed_headers: &str,
+    stub: &StubS3Client,
+) -> (StatusCode, usize, s3_proxy::metrics::PageCacheMetrics) {
+    let config = test_config();
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let metrics_manager = Arc::new(tokio::sync::RwLock::new(
+        s3_proxy::metrics::MetricsManager::new(),
+    ));
+    let mut headers = HashMap::new();
+    headers.insert("range".to_string(), raw_range.to_string());
+    let response = tokio::time::timeout(
+        Duration::from_secs(20),
+        HttpProxy::handle_range_request(
+            Method::GET,
+            cache_key.to_string(),
+            raw_range,
+            headers,
+            Arc::clone(&cache_manager),
+            Arc::clone(&range_handler),
+            stub.clone().into_trait_object(),
+            "s3.amazonaws.com".to_string(),
+            presigned_uri(cache_key, signed_headers),
+            Arc::clone(&config),
+            &widened_settings(),
+            None,
+            Arc::new(InFlightTracker::new()),
+            Some(Arc::clone(&metrics_manager)),
+            &None,
+            false,
+            // Test harness has no request-concurrency permit to thread.
+            None,
+        ),
+    )
+    .await
+    .expect("the range GET must not hang")
+    .expect("handle_range_request returns Infallible");
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let metrics = metrics_manager.read().await.collect_metrics().await;
+    (status, body.len(), metrics.page_cache)
+}
+
+/// A presigned suffix range below the page size, object size unknown: widening
+/// would send `bytes=-1024`, which S3 rejects for a URL that signed `range`.
+#[tokio::test]
+async fn presigned_signed_suffix_range_is_not_widened() {
+    let stub = presigned_verbatim_only_s3("bytes=-8", OBJECT_SIZE - 8, OBJECT_SIZE - 1);
+    let (status, len, page_cache) = presigned_widening_get(
+        "bucket/widen-presigned-suffix.bin",
+        "bytes=-8",
+        "host%3Brange",
+        &stub,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PARTIAL_CONTENT,
+        "S3 rejected a rewritten signed Range: {:?}",
+        stub.captured()
+    );
+    assert_eq!(len, 8);
+    assert_every_fetch_kept_range(&stub, "bytes=-8");
+    assert_eq!(page_cache.skipped_signed_range, 1);
+    assert_eq!(page_cache.widened_requests, 0);
+}
+
+/// A presigned absolute range: the page fetch rewrites `Range`, and the fallback
+/// to the client's range only hides it because `bytes=5-14` round-trips.
+#[tokio::test]
+async fn presigned_signed_absolute_range_is_not_widened() {
+    let stub = presigned_verbatim_only_s3("bytes=5-14", 5, 14);
+    let (status, len, page_cache) = presigned_widening_get(
+        "bucket/widen-presigned-absolute.bin",
+        "bytes=5-14",
+        "host%3Brange",
+        &stub,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{:?}", stub.captured());
+    assert_eq!(len, 10);
+    assert_every_fetch_kept_range(&stub, "bytes=5-14");
+    assert_eq!(page_cache.skipped_signed_range, 1);
+    assert_eq!(page_cache.widened_requests, 0);
+}
+
+/// Control: a presigned URL that does not sign `range` is still widened.
+#[tokio::test]
+async fn control_presigned_unsigned_range_is_widened() {
+    let page = object_body()[..PAGE_SIZE as usize].to_vec();
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(page))
+            .with_header(
+                "content-range",
+                format!("bytes 0-{}/{}", PAGE_SIZE - 1, OBJECT_SIZE),
+            )
+            .with_header("etag", "\"presigned-widen-etag\""),
+    );
+    let (status, len, page_cache) = presigned_widening_get(
+        "bucket/widen-presigned-unsigned.bin",
+        "bytes=5-14",
+        "host",
+        &stub,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{:?}", stub.captured());
+    assert_eq!(len, 10);
+    assert_eq!(page_cache.skipped_signed_range, 0);
+    assert_eq!(page_cache.widened_requests, 1);
+    assert!(
+        stub.captured().iter().any(|r| r
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("range") && v != "bytes=5-14")),
+        "widening must fetch a page with a rewritten Range: {:?}",
+        stub.captured()
+    );
 }
 
 /// A widened fetch failure that falls back to the client's original range
@@ -1584,10 +2157,21 @@ async fn suffix_read_size_known_widens_to_page_and_slices_exact_suffix() {
         head_last_accessed: None,
         head_access_count: 0,
         head_cached_at: None,
+        last_validated_at: None,
     };
     cache_manager
         .get_metadata_cache()
-        .put(&cache_key, seeded_metadata)
+        .put(
+            &cache_key,
+            seeded_metadata,
+            // Generous TTLs: this fixture's subject is page widening, not the
+            // `MetadataCache` admission gate added in 2.8.9, and a refused admission
+            // here would make the test fail for an unrelated reason.
+            s3_proxy::metadata_cache::MetadataTtls {
+                get_ttl: std::time::Duration::from_secs(3600),
+                head_ttl: std::time::Duration::from_secs(60),
+            },
+        )
         .await;
 
     let stub = StubS3Client::new().with_default(
@@ -1779,8 +2363,10 @@ async fn partial_page_only_fetches_missing_gap() {
         None,
         HashMap::new(),
     );
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             &cache_key,
             pre_start,
             pre_end,
@@ -2242,13 +2828,23 @@ async fn straddle_with_both_pages_in_ram_serves_with_no_s3_fetch() {
     // Confirm both Pages are actually RAM-resident before the straddling read.
     assert!(
         cache_manager
-            .get_range_from_ram_cache(&cache_key, page0_start, page0_end)
+            .get_range_from_ram_cache(
+                &cache_key,
+                page0_start,
+                page0_end,
+                std::time::Duration::from_secs(3600)
+            )
             .is_some(),
         "page 0 must be RAM-resident after warming"
     );
     assert!(
         cache_manager
-            .get_range_from_ram_cache(&cache_key, page1_start, page1_end)
+            .get_range_from_ram_cache(
+                &cache_key,
+                page1_start,
+                page1_end,
+                std::time::Duration::from_secs(3600)
+            )
             .is_some(),
         "page 1 must be RAM-resident after warming"
     );
@@ -2501,7 +3097,12 @@ async fn conditional_if_match_fail_passes_through_412() {
 
     // No caching should have happened for a 412 (no bytes to cache).
     assert!(cache_manager
-        .get_range_from_ram_cache(&cache_key, 0, PAGE_SIZE - 1)
+        .get_range_from_ram_cache(
+            &cache_key,
+            0,
+            PAGE_SIZE - 1,
+            std::time::Duration::from_secs(3600)
+        )
         .is_none());
 }
 
@@ -2842,11 +3443,11 @@ async fn property_served_bytes_equal_origin_for_any_small_read() {
 }
 
 // -----------------------------------------------------------------------
-// Warm-cache conditional range regression (T36j)
+// Warm-cache conditional range regression
 //
-// The fleet deployment-verification suite (T36j) sends a stale `If-Range`
+// The fleet deployment-verification suite sends a stale `If-Range`
 // plus a small `Range` against an object whose Page(s) are ALREADY warm in
-// the cache (T36i and the warm-up GET ran first). RFC 7233 §3.2: when the
+// the cache (the earlier requests and the warm-up GET ran first). RFC 7233 §3.2: when the
 // `If-Range` validator does not match, the server must ignore `Range` and
 // answer 200 with the full body. These two tests pin that behaviour for the
 // warm-cache case on BOTH the widened and the un-widened path — the existing
@@ -3019,7 +3620,7 @@ impl s3_proxy::S3ClientApi for IfRangeAwareStub {
 /// must still produce S3's 200-full response, passed through unchanged — the
 /// warm Page must not be sliced and returned as a 206.
 ///
-/// This is the fleet T36j scenario (`If-Range: "stale-etag-value"` +
+/// This is the fleet test scenario (`If-Range: "stale-etag-value"` +
 /// `-r 0-4095` after the object had already been read through the proxy).
 #[tokio::test]
 async fn warm_page_stale_if_range_passes_through_full_200() {
@@ -3129,7 +3730,7 @@ async fn non_widened_warm_cache_stale_if_range_passes_through_full_200() {
     let current_etag = "\"no-widen-if-range-etag\"";
 
     // Pre-populate the WHOLE object on disk, standing in for a prior full GET
-    // through the proxy (the fleet's T36 warm-up `aws s3 cp`).
+    // through the proxy (the fleet's warm-up `aws s3 cp`).
     let object_metadata = s3_proxy::cache_types::ObjectMetadata::new_with_headers(
         current_etag.to_string(),
         String::new(),
@@ -3137,8 +3738,10 @@ async fn non_widened_warm_cache_stale_if_range_passes_through_full_200() {
         None,
         HashMap::new(),
     );
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             &cache_key,
             0,
             OBJECT_SIZE - 1,
@@ -3254,8 +3857,10 @@ async fn mode_b_matching_if_range_serves_range_from_cache_without_s3() {
         None,
         HashMap::new(),
     );
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             &cache_key,
             0,
             OBJECT_SIZE - 1,
@@ -3376,57 +3981,63 @@ fn if_range_forms_that_cannot_be_compared_locally_all_forward() {
     ));
 }
 
-/// Once Mode B has committed to serving a matching `If-Range` from cache, the
-/// client's `If-Range` must be swapped for a proxy-injected `If-Match` pinning
-/// the matched ETag — but never when `If-Range` was signed, since removing a
-/// signed header would invalidate the client's SigV4 signature.
+/// A gap sub-fetch pinned by the proxy's own `If-Match` drops a client `If-Range` on
+/// the same tag, and changes nothing else: never when `If-Range` was signed (removing a
+/// signed header would invalidate the client's signature), never without the proxy's
+/// pin, and never by turning `If-Range` into `If-Match`.
 #[test]
-fn if_range_serve_swaps_to_injected_if_match_unless_signed() {
+fn gap_sub_fetch_drops_if_range_only_when_the_proxy_pin_names_the_same_tag() {
+    use s3_proxy::range_handler::RangeHandler;
     let etag = "\"pin-etag\"";
-
-    let mut headers = HashMap::new();
-    headers.insert("if-range".to_string(), etag.to_string());
-    assert!(HttpProxy::pin_if_range_serve_to_cached_etag(
-        &mut headers,
-        etag
-    ));
-    assert!(
-        !headers.contains_key("if-range"),
-        "the client If-Range must not travel on to the gap fetches"
-    );
+    let uri: hyper::Uri = "/bucket/key".parse().unwrap();
+    let pinned = |extra: &[(&str, &str)]| {
+        let mut h = HashMap::new();
+        h.insert("if-range".to_string(), etag.to_string());
+        h.insert("if-match".to_string(), etag.to_string());
+        h.insert("x-proxy-injected-if-match".to_string(), "1".to_string());
+        for (k, v) in extra {
+            h.insert(k.to_string(), v.to_string());
+        }
+        h
+    };
+    // Proxy pin on the same tag: If-Range is redundant and dropped; the pin stays.
+    let mut headers = pinned(&[]);
+    RangeHandler::drop_if_range_redundant_with_pin(&mut headers, &uri);
+    assert!(!headers.contains_key("if-range"));
     assert_eq!(headers.get("if-match").map(String::as_str), Some(etag));
-    assert_eq!(
-        headers.get("x-proxy-injected-if-match").map(String::as_str),
-        Some("1"),
-        "the sentinel is what lets the fetch path invalidate-and-retry on 412 \
-         instead of leaking it to the client"
-    );
-
     // Signed If-Range: untouched, signature must stay valid.
-    let mut signed = HashMap::new();
-    signed.insert("if-range".to_string(), etag.to_string());
-    signed.insert(
-        "authorization".to_string(),
+    let mut signed = pinned(&[(
+        "authorization",
         "AWS4-HMAC-SHA256 Credential=AKIA/20260101/us-west-2/s3/aws4_request, \
-         SignedHeaders=host;if-range;x-amz-date, Signature=sig01"
-            .to_string(),
-    );
-    assert!(!HttpProxy::pin_if_range_serve_to_cached_etag(
-        &mut signed,
-        etag
-    ));
+         SignedHeaders=host;if-range;x-amz-date, Signature=sig01",
+    )]);
+    RangeHandler::drop_if_range_redundant_with_pin(&mut signed, &uri);
     assert_eq!(signed.get("if-range").map(String::as_str), Some(etag));
-    assert!(!signed.contains_key("if-match"));
-
-    // No usable cached ETag — nothing to pin to.
-    let mut no_etag = HashMap::new();
-    no_etag.insert("if-range".to_string(), etag.to_string());
-    assert!(!HttpProxy::pin_if_range_serve_to_cached_etag(
-        &mut no_etag,
-        ""
-    ));
+    // Query-signed If-Range (presigned URL): untouched.
+    let presigned: hyper::Uri =
+        "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host%3Bif-range"
+            .parse()
+            .unwrap();
+    let mut query_signed = pinned(&[]);
+    RangeHandler::drop_if_range_redundant_with_pin(&mut query_signed, &presigned);
+    assert_eq!(query_signed.get("if-range").map(String::as_str), Some(etag));
+    // No proxy pin: the client's If-Range is left as sent, and no If-Match appears.
+    let mut bare = HashMap::new();
+    bare.insert("if-range".to_string(), etag.to_string());
+    RangeHandler::drop_if_range_redundant_with_pin(&mut bare, &uri);
+    assert_eq!(bare.get("if-range").map(String::as_str), Some(etag));
+    assert!(!bare.contains_key("if-match"));
+    // The client's own If-Match on the same tag (no sentinel): left exactly as sent.
+    let mut own = HashMap::new();
+    own.insert("if-range".to_string(), etag.to_string());
+    own.insert("if-match".to_string(), etag.to_string());
+    RangeHandler::drop_if_range_redundant_with_pin(&mut own, &uri);
+    assert_eq!(own.get("if-range").map(String::as_str), Some(etag));
+    // The pin names another tag: both stay, S3 decides.
+    let mut other = pinned(&[("if-match", "\"other\"")]);
+    RangeHandler::drop_if_range_redundant_with_pin(&mut other, &uri);
+    assert_eq!(other.get("if-range").map(String::as_str), Some(etag));
 }
-
 /// End-to-end effect of the swap: with the range only PARTIALLY cached, the gap
 /// fetch must carry the proxy's `If-Match` and NOT the client's `If-Range`.
 ///
@@ -3457,8 +4068,10 @@ async fn partial_cache_if_range_serve_sends_if_match_on_the_gap_fetch() {
         None,
         HashMap::new(),
     );
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             &cache_key,
             0,
             cached_end,
@@ -3487,13 +4100,10 @@ async fn partial_cache_if_range_serve_sends_if_match_on_the_gap_fetch() {
         ..ResolvedSettings::default()
     };
 
-    // Headers as `handle_request` hands them on: the swap has already been applied.
+    // Headers as `handle_request` hands them on: the client's `If-Range`, unchanged.
+    // The swap to `If-Match` happens on the gap sub-fetch's own headers.
     let mut headers = HashMap::new();
     headers.insert("if-range".to_string(), current_etag.to_string());
-    assert!(HttpProxy::pin_if_range_serve_to_cached_etag(
-        &mut headers,
-        current_etag
-    ));
 
     let response = HttpProxy::handle_range_request(
         Method::GET,
@@ -3547,4 +4157,636 @@ async fn partial_cache_if_range_serve_sends_if_match_on_the_gap_fetch() {
             "the internal sentinel must be stripped before the request leaves the proxy"
         );
     }
+}
+
+// =============================================================================
+// page-widening-freshness Requirements 1 & 2
+//
+// R1: the RAM page fast path is bounded and validated — a RAM-cached Page
+// whose etag no longer matches the object's current version must not be
+// served; it must be invalidated and the request must fall through to fetch
+// fresh data, exactly like the non-widened path's
+// `load_range_data_with_cache` fix (ram-tier-effectiveness Requirement 4).
+//
+// R2: the disk fast path uses LIVE TTL, not only stored expiry — tightening
+// `get_ttl` for an already-cached key must force revalidation on the next
+// widened request rather than waiting for the old, more generous stored
+// `expires_at` to elapse.
+// =============================================================================
+
+/// R1, criterion 1/3: a RAM-cached Page whose etag no longer matches the
+/// caller-supplied `current_etag` must NOT be served from RAM. It must be
+/// invalidated and the request must fall through to the S3 fetch/coordination
+/// path, which reports the up-to-date bytes.
+///
+/// Shown failing first: reverting `fill_page`'s RAM lookup back to an
+/// unconditional `get_range_from_ram_cache` call (no etag comparison) makes
+/// this test fail — the response would carry the stale RAM bytes for
+/// `"stale-etag"`'s version instead of the fresh bytes for `"fresh-etag"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn ram_page_etag_mismatch_invalidates_and_refetches() {
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 10;
+    config_inner.cache.ram_cache_enabled = true;
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let inflight_tracker = Arc::new(InFlightTracker::new());
+    let cache_key = "bucket/widen-ram-etag-mismatch.bin".to_string();
+
+    let page_start = 0u64;
+    let page_end = PAGE_SIZE - 1;
+    let stale_bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8).collect();
+    let fresh_bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| ((i % 251) as u8) ^ 0xFF).collect();
+    assert_ne!(
+        stale_bytes, fresh_bytes,
+        "fixture: the two versions must differ"
+    );
+
+    // Directly promote a Page into RAM under the STALE etag, bypassing any
+    // fetch — this is the state a prior widened read under an older object
+    // version would have left behind.
+    let promoted = cache_manager.promote_range_to_ram_cache_frame(
+        &cache_key,
+        (page_start, page_end),
+        stale_bytes.clone(),
+        s3_proxy::compression::CompressionAlgorithm::None,
+        "\"stale-etag\"".to_string(),
+        String::new(),
+        1u64 << 40,
+    );
+    assert!(promoted, "PRECONDITION FAILED: stale Page must be in RAM");
+    assert!(
+        cache_manager
+            .get_range_from_ram_cache(
+                &cache_key,
+                page_start,
+                page_end,
+                std::time::Duration::from_secs(3600)
+            )
+            .is_some(),
+        "PRECONDITION FAILED: RAM lookup must hit before the request"
+    );
+
+    // The S3 stub serves the FRESH page under the fresh etag — this is what a
+    // real fetch would return once the object has changed.
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(fresh_bytes.clone()))
+            .with_header(
+                "content-range",
+                format!("bytes {}-{}/{}", page_start, page_end, OBJECT_SIZE),
+            )
+            .with_header("etag", "\"fresh-etag\""),
+    );
+    let s3_client = stub.clone().into_trait_object();
+
+    let resolved = widened_settings();
+
+    // The request carries the CURRENT (fresh) etag, as a real caller would
+    // after a HEAD/GET establishes the object's current version.
+    let response = HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.clone(),
+        "bytes=5-14",
+        HashMap::new(),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        s3_client,
+        "s3.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().unwrap(),
+        Arc::clone(&config),
+        &resolved,
+        Some("\"fresh-etag\"".to_string()),
+        Arc::clone(&inflight_tracker),
+        None,
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("request should not error");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = body_bytes(response).await;
+    let expected = &fresh_bytes[5..=14];
+    assert_eq!(
+        body, expected,
+        "DEFECT if this fails: the response served the STALE RAM Page's bytes \
+         despite the caller supplying the current (fresh) etag. The RAM fast \
+         path must compare its own etag against the caller-supplied \
+         current_etag before trusting it, invalidating on mismatch."
+    );
+
+    // The stale RAM entry must have been invalidated as a side effect —
+    // a subsequent direct RAM lookup for the stale bytes must miss.
+    let ram_after = cache_manager.get_range_from_ram_cache(
+        &cache_key,
+        page_start,
+        page_end,
+        std::time::Duration::from_secs(3600),
+    );
+    if let Some(remaining) = ram_after {
+        assert_ne!(
+            remaining, stale_bytes,
+            "the stale RAM entry must have been invalidated, not left in place"
+        );
+    }
+}
+
+/// R1 control: when `current_etag` is unknown (`None`) — the common case for
+/// a cold widened request, since nothing upstream of `fill_page` performs a
+/// HEAD — a RAM hit is still trusted and served with no additional
+/// Shared_Storage read. This is what keeps the fix from silently disabling
+/// the RAM fast path's whole benefit whenever the caller has no prior ETag.
+#[tokio::test(flavor = "multi_thread")]
+async fn ram_page_hit_with_unknown_current_etag_is_still_served() {
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 10;
+    config_inner.cache.ram_cache_enabled = true;
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let inflight_tracker = Arc::new(InFlightTracker::new());
+    let cache_key = "bucket/widen-ram-unknown-etag.bin".to_string();
+
+    let page_start = 0u64;
+    let page_end = PAGE_SIZE - 1;
+    let page_bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8).collect();
+
+    let promoted = cache_manager.promote_range_to_ram_cache_frame(
+        &cache_key,
+        (page_start, page_end),
+        page_bytes.clone(),
+        s3_proxy::compression::CompressionAlgorithm::None,
+        "\"any-etag\"".to_string(),
+        String::new(),
+        1u64 << 40,
+    );
+    assert!(promoted);
+
+    // A stub that would fail loudly if hit — the RAM hit must serve this
+    // request with no S3 fetch at all.
+    let stub = StubS3Client::new();
+    let s3_client = stub.clone().into_trait_object();
+
+    let resolved = widened_settings();
+
+    let response = HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.clone(),
+        "bytes=5-14",
+        HashMap::new(),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        s3_client,
+        "s3.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().unwrap(),
+        Arc::clone(&config),
+        &resolved,
+        None, // current_etag unknown
+        Arc::clone(&inflight_tracker),
+        None,
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("request should not error");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], &page_bytes[5..=14]);
+    assert!(
+        stub.captured().is_empty(),
+        "CONTROL FAILED: a RAM hit with unknown current_etag must not cost an \
+         S3 fetch — this is the property that keeps the fix from disabling the \
+         RAM fast path's benefit whenever the caller has no prior ETag"
+    );
+}
+
+/// R2, criterion 1/2: tightening `get_ttl` on an already-cached widened key
+/// must take effect on the NEXT request via the disk fast path, not wait for
+/// the old, more generous stored `expires_at` to elapse. Per Requirement 5's
+/// criterion 2, a `get_ttl: 0` fixture set from the start would pass on
+/// current (pre-fix) code too — `bucket_settings.rs` already sets
+/// `ram_cache_eligible = false` and a near-immediate `expires_at` for a zero
+/// `get_ttl` at cache-write time. This test tightens an ALREADY-CACHED page's
+/// live `get_ttl`, which is the actual gap: stored expiry (generous, set at
+/// cache time) lagging a newly-tightened live TTL.
+///
+/// Because this spec's fix returns `None` from `try_widened_range_request` on
+/// live-TTL expiry (forwarding to the un-widened revalidation path) rather
+/// than duplicating a second conditional-request flow inside the widening
+/// path, the observable effect is: the widened S3 stub (which would answer
+/// with 206) is never hit, and the un-widened path's own revalidation runs
+/// instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn tightened_get_ttl_after_caching_forces_fallback_from_widened_disk_hit() {
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 10;
+    // Generous get_ttl at cache-write time.
+    config_inner.cache.get_ttl = Duration::from_secs(3600);
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let inflight_tracker = Arc::new(InFlightTracker::new());
+    let cache_key = "bucket/widen-tightened-get-ttl.bin".to_string();
+
+    let page_start = 0u64;
+    let page_end = PAGE_SIZE - 1;
+    let page_bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8).collect();
+
+    // Seed the Page directly on disk (as though a prior widened read had
+    // cached it under the generous get_ttl), with a far-future stored expiry
+    // so the STORED-expiry check alone would never trigger revalidation.
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
+            &cache_key,
+            page_start,
+            page_end,
+            &page_bytes,
+            s3_proxy::cache_types::ObjectMetadata::new_with_headers(
+                "\"tighten-etag\"".to_string(),
+                String::new(),
+                OBJECT_SIZE,
+                None,
+                HashMap::new(),
+            ),
+            Duration::from_secs(3600), // far-future stored expires_at
+            false,
+        )
+        .await
+        .expect("seed page on disk");
+
+    // `DiskCacheManager::store_range` writes journal-only. Force consolidation into
+    // a real `.meta` file, exactly as production's background
+    // `JournalConsolidator` would do — see the analogous comment in
+    // `widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit`.
+    let consolidator = cache_manager
+        .get_journal_consolidator()
+        .await
+        .expect("journal consolidator must be configured in shared-storage mode");
+    consolidator
+        .consolidate_object(&cache_key)
+        .await
+        .expect("consolidation should succeed");
+
+    let overlap_check = range_handler
+        .find_cached_ranges(
+            &cache_key,
+            &s3_proxy::range_handler::RangeSpec {
+                start: page_start,
+                end: page_end,
+            },
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
+        .await
+        .expect("find_cached_ranges should succeed");
+    assert!(
+        overlap_check.can_serve_from_cache,
+        "PRECONDITION FAILED: seeded page must be visible as fully cached: {:?}",
+        overlap_check
+    );
+
+    // Tighten get_ttl to 0 on THIS instance's resolved settings — as an
+    // operator editing cache_rules.json would, without touching the
+    // already-cached page's stored expires_at.
+    let mut resolved = widened_settings();
+    resolved.get_ttl = Duration::ZERO;
+
+    // A stub programmed to answer the WIDENED request with 206 if it is
+    // ever reached — proving the widened path was bypassed rather than
+    // merely failing to find a working stub.
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(page_bytes.clone()))
+            .with_header(
+                "content-range",
+                format!("bytes {}-{}/{}", page_start, page_end, OBJECT_SIZE),
+            )
+            .with_header("etag", "\"tighten-etag\""),
+    );
+    let s3_client = stub.clone().into_trait_object();
+
+    let response = HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.clone(),
+        "bytes=5-14",
+        HashMap::new(),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        s3_client,
+        "s3.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().unwrap(),
+        Arc::clone(&config),
+        &resolved,
+        Some("\"tighten-etag\"".to_string()),
+        Arc::clone(&inflight_tracker),
+        None,
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("request should not error");
+
+    // The discriminator, made non-vacuous. Without the fix, the widened
+    // path's own disk-hit fast path (`find_page_overlap`'s stored-expiry
+    // check alone) serves the already-cached, still-stored-fresh page
+    // directly with ZERO upstream requests — `get_ttl` is never consulted at
+    // all on that path. With the fix, `try_widened_range_request` returns
+    // `None` on live-TTL expiry, and the un-widened path's own
+    // `check_object_expiration`-gated revalidation (mainline GET,
+    // `http_proxy.rs` around the `check_object_expiration` call sites this
+    // spec's provenance note references) issues a conditional request to S3
+    // before serving. So the defect and the fix are distinguishable by
+    // whether a request went out at all, not only by its shape — asserting
+    // only "not exactly the widened page range" would pass vacuously against
+    // an empty capture list, which is exactly the trap
+    // `pre-push-checklist.md` step 8 warns about.
+    let captured = stub.captured();
+    assert!(
+        !captured.is_empty(),
+        "DEFECT if this fails: no upstream request was made at all, which means the \
+         already-cached page was served directly from the widened disk-hit fast path \
+         with get_ttl never consulted — `try_widened_range_request` did not detect the \
+         tightened get_ttl and fall through to the un-widened revalidation path"
+    );
+    let sent_range = captured[0]
+        .headers
+        .get("range")
+        .or_else(|| captured[0].headers.get("Range"))
+        .cloned();
+    assert_ne!(
+        sent_range,
+        Some(format!("bytes={}-{}", page_start, page_end)),
+        "DEFECT if this fails: the widened per-Page fetch went out — \
+         `try_widened_range_request` did not detect the tightened \
+         get_ttl and fell through to the un-widened path as required"
+    );
+    let _ = response;
+}
+
+/// R2 control: a widened request against a page whose live TTL is still
+/// fresh (get_ttl unchanged since caching) continues to serve from the disk
+/// fast path with NO additional S3 request — the fix must not turn every
+/// widened disk hit into an unconditional revalidation.
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_get_ttl_widened_disk_hit_serves_with_no_upstream_request() {
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 10;
+    config_inner.cache.get_ttl = Duration::from_secs(3600);
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let inflight_tracker = Arc::new(InFlightTracker::new());
+    let cache_key = "bucket/widen-fresh-get-ttl.bin".to_string();
+
+    let page_start = 0u64;
+    let page_end = PAGE_SIZE - 1;
+    let page_bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8).collect();
+
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
+            &cache_key,
+            page_start,
+            page_end,
+            &page_bytes,
+            s3_proxy::cache_types::ObjectMetadata::new_with_headers(
+                "\"fresh-ttl-etag\"".to_string(),
+                String::new(),
+                OBJECT_SIZE,
+                None,
+                HashMap::new(),
+            ),
+            Duration::from_secs(3600),
+            false,
+        )
+        .await
+        .expect("seed page on disk");
+
+    // `DiskCacheManager::store_range` writes journal-only. Force consolidation into
+    // a real `.meta` file — see the analogous comment above.
+    let consolidator = cache_manager
+        .get_journal_consolidator()
+        .await
+        .expect("journal consolidator must be configured in shared-storage mode");
+    consolidator
+        .consolidate_object(&cache_key)
+        .await
+        .expect("consolidation should succeed");
+
+    // get_ttl unchanged (still 3600s, matching config) — the object should
+    // remain fresh under the live-TTL check.
+    let resolved = widened_settings();
+
+    let stub = StubS3Client::new(); // would fail loudly if hit
+    let s3_client = stub.clone().into_trait_object();
+
+    let response = HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.clone(),
+        "bytes=5-14",
+        HashMap::new(),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        s3_client,
+        "s3.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().unwrap(),
+        Arc::clone(&config),
+        &resolved,
+        Some("\"fresh-ttl-etag\"".to_string()),
+        Arc::clone(&inflight_tracker),
+        None,
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("request should not error");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], &page_bytes[5..=14]);
+    assert!(
+        stub.captured().is_empty(),
+        "CONTROL FAILED: a widened disk hit that is still fresh under live TTL \
+         must not cost an S3 request — the fix must not revalidate \
+         unconditionally"
+    );
+}
+
+/// A Page cached as two extents, read once with a known ETag, is held in RAM ONCE: as the
+/// Page. The merge that assembles it must not also promote each extent under its own RAM key,
+/// which spent the RAM budget twice for the same bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_extent_page_read_holds_only_the_page_in_ram() {
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 10;
+    config_inner.cache.ram_cache_enabled = true;
+    config_inner.cache.get_ttl = Duration::from_secs(3600);
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let inflight_tracker = Arc::new(InFlightTracker::new());
+    let metrics_manager = Arc::new(tokio::sync::RwLock::new(
+        s3_proxy::metrics::MetricsManager::new(),
+    ));
+    let cache_key = "bucket/widen-two-extent-page-ram.bin".to_string();
+    let etag = "\"two-extent-etag\"".to_string();
+
+    let page_bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8).collect();
+    let half = PAGE_SIZE / 2;
+    for (start, end) in [(0u64, half - 1), (half, PAGE_SIZE - 1)] {
+        disk_cache_manager
+            .write()
+            .await
+            .store_range(
+                &cache_key,
+                start,
+                end,
+                &page_bytes[start as usize..=end as usize],
+                s3_proxy::cache_types::ObjectMetadata::new_with_headers(
+                    etag.clone(),
+                    "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                    OBJECT_SIZE,
+                    None,
+                    HashMap::new(),
+                ),
+                Duration::from_secs(3600),
+                false,
+            )
+            .await
+            .expect("seed extent on disk");
+    }
+    cache_manager
+        .get_journal_consolidator()
+        .await
+        .expect("journal consolidator must be configured in shared-storage mode")
+        .consolidate_object(&cache_key)
+        .await
+        .expect("consolidation should succeed");
+
+    let overlap = range_handler
+        .find_cached_ranges(
+            &cache_key,
+            &s3_proxy::range_handler::RangeSpec {
+                start: 0,
+                end: PAGE_SIZE - 1,
+            },
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
+        .await
+        .expect("find_cached_ranges should succeed");
+    assert!(
+        overlap.can_serve_from_cache && overlap.cached_ranges.len() == 2,
+        "PRECONDITION FAILED: the Page must be cached as exactly two extents: {:?}",
+        overlap
+    );
+    let before = cache_manager
+        .get_ram_cache_stats()
+        .expect("RAM tier enabled");
+    assert_eq!(
+        before.entries_count, 0,
+        "PRECONDITION FAILED: RAM starts empty"
+    );
+
+    let resolved = ResolvedSettings {
+        ram_cache_eligible: true,
+        ..widened_settings()
+    };
+    // The stub is never expected to be reached: the Page is fully cached.
+    let stub = StubS3Client::new().with_default(StubResponse::with_status(StatusCode::OK));
+    let response = HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.clone(),
+        "bytes=5-14",
+        HashMap::new(),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        stub.clone().into_trait_object(),
+        "s3.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().unwrap(),
+        Arc::clone(&config),
+        &resolved,
+        Some(etag.clone()),
+        Arc::clone(&inflight_tracker),
+        Some(Arc::clone(&metrics_manager)),
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("request should not error");
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], &page_bytes[5..=14], "served bytes must be exact");
+    assert!(
+        stub.captured().is_empty(),
+        "PRECONDITION FAILED: a fully cached Page must be served with no upstream request"
+    );
+
+    // The Page promotion is spawned off the response path; wait for it to land.
+    let mut promotions = 0u64;
+    for _ in 0..100 {
+        promotions = metrics_manager
+            .read()
+            .await
+            .collect_metrics()
+            .await
+            .page_cache
+            .ram_page_promotions;
+        if promotions >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        promotions, 1,
+        "PRECONDITION FAILED: the Page must be promoted once"
+    );
+
+    let after = cache_manager
+        .get_ram_cache_stats()
+        .expect("RAM tier enabled");
+    assert_eq!(
+        after.entries_count, 1,
+        "after one read of a two-extent Page RAM holds {} entries ({} bytes); only the \
+         Page itself should be there, not the extents it was assembled from as well",
+        after.entries_count, after.current_size
+    );
 }

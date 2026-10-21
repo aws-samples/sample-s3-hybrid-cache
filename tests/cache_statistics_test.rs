@@ -53,6 +53,8 @@ async fn test_calculate_disk_cache_size_with_new_architecture() {
         last_accessed: now,
         access_count: 1,
         staged: None,
+        unservable: false,
+        file_identity: None,
     };
 
     let now = SystemTime::now();
@@ -139,6 +141,8 @@ async fn test_get_cache_usage_breakdown_with_new_architecture() {
         last_accessed: now,
         access_count: 1,
         staged: None,
+        unservable: false,
+        file_identity: None,
     };
 
     let cache_metadata = NewCacheMetadata {

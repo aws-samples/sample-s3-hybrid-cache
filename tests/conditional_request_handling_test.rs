@@ -76,7 +76,7 @@ async fn test_cache_ttl_refresh() -> Result<(), Box<dyn std::error::Error>> {
         cache_dir,
         false,       // RAM cache disabled for simplicity
         1024 * 1024, // 1MB max size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,                                 // compression threshold
         true,                                 // compression enabled
         std::time::Duration::from_secs(3600), // 1 hour GET TTL
@@ -148,7 +148,7 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
         cache_dir,
         false,       // RAM cache disabled for simplicity
         1024 * 1024, // 1MB max size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,                                 // compression threshold
         true,                                 // compression enabled
         std::time::Duration::from_secs(3600), // 1 hour GET TTL

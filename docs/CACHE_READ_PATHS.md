@@ -1,556 +1,314 @@
-# Cache Read Paths
+# Cache read paths
 
-How a read is satisfied: which tier answers it, how partial coverage is merged, and the
-correctness checks applied before cached bytes reach a client.
+This page explains how Hybrid Cache for Amazon S3 answers a read from its cache: which cache serves it and how partly cached ranges are merged or refetched. It also covers signed ranges, part numbers and page widening, and the checks that run before cached bytes reach a client. It is for operators tuning range-heavy workloads and for developers changing a read path. The [range read-path map](ARCHITECTURE.md#3a-range-read-path-map) gives the short answer for each entry point; this page describes the mechanism.
 
-`docs/ARCHITECTURE.md` → Range Read-Path Map is the quick answer for a single entry point
-(RAM consulted? RAM promoted? under which key?). This document is the mechanism.
+## Cache types
 
-## Lookup purpose, and what authorises a cached serve
+### Full object cache
 
-Every cache-coverage lookup states **why** it is asking, because the answer changes what an
-expired entry looks like. `RangeLookupPurpose` is a required argument on both
-`DiskCacheManager::find_cached_ranges` and `RangeHandler::find_cached_ranges`; there is no
-default, so a new call site has to choose.
+Caches complete objects from GET requests, under the cache key `{bucket}/{object_key}`.
 
-| Purpose | Past stored expiry | For callers that |
-|---|---|---|
-| `FreshServe` | returns **no** coverage | may serve what they get with no further freshness check |
-| `RevalidationCandidate` | returns coverage, marked `StoredFreshness::Expired` | will evaluate freshness themselves before serving |
+### Range cache
 
-The question to ask at a call site is: **between this lookup and bytes reaching a client,
-what bounds the staleness?** A live-TTL verdict, a client validator, or a successful `304`
-means `RevalidationCandidate`. Nothing but the lookup itself means `FreshServe`. If the
-answer is "nothing at all", the call site is a defect whichever purpose it names.
+Caches byte ranges independently, in both the RAM cache and the disk cache. The disk cache key is `{bucket}/{object_key}:range:{start}-{end}` and the RAM cache key is `{cache_key}:range:{start}:{end}`.
 
-`RevalidationCandidate` grants **discovery, not permission**. `RangeOverlap` enforces that
-in its accessors rather than by convention:
+Caching ranges lets the proxy keep only the parts of a large file that clients read, and lets an interrupted download resume from cached bytes. Video seeking and columnar reads over large datasets are the typical workloads.
 
-- `is_serveable_unvalidated()` — complete coverage **and** stored-fresh. Safe on its own.
-- `has_complete_coverage()` — coverage only. Requires the caller to hold a separate
-  authority and say which one.
+All ranges of one object share one expiration time. When `get_ttl` expires for an object, all of its cached ranges expire together, even though they are stored separately.
 
-So serving expired bytes always involves reaching for the second accessor and writing down
-why it is allowed.
+#### RAM cache integration for ranges
 
-### Which authority each cached serve holds
+Both the streaming path (ranges at or above `cache.disk_streaming_threshold`, default 1 MiB) and the buffered path (ranges below it) use the RAM cache:
 
-| Read path | Purpose | What authorises the serve |
-|---|---|---|
-| Full-object mainline GET | `RevalidationCandidate` | Mode B matching `If-Match`, or a live-TTL `Fresh` verdict, or a `304` |
-| Range path, early full-object shortcut | `FreshServe` | Live-TTL `Fresh` verdict; when expired it falls through rather than serving |
-| Range path, range-specific lookup | `RevalidationCandidate` | Live-TTL `Fresh` verdict, or a `304` |
-| Page widening (`find_page_overlap`) | `FreshServe` | Stored expiry only — see the caveat below |
-| Part-scoped lookup (`?partNumber=N`) | `FreshServe` | Stored expiry only — see the caveat below |
-| Post-`304` validated-serve helpers | `RevalidationCandidate` | The `304` itself; coverage is re-checked because a `304` proves the version, not the coverage |
-| Degraded coalescing fallbacks | `FreshServe` | Stored expiry only; these run when S3 errored, so there is no validation to lean on |
+1. **Lookup**: before choosing between the streaming and buffered paths, the proxy checks the RAM cache under the range's key.
+2. **RAM hit**: the proxy serves the bytes from memory as a buffered `206` response, with no disk I/O.
+3. **RAM miss, disk hit**: after serving from disk, the proxy promotes the range to the RAM cache so later requests are served from memory. A range is promoted only when the object's ETag is known, so a later hit can check the RAM entry against the current version.
+4. **Streaming promotion**: while streaming from disk, the proxy collects the chunks and promotes them to the RAM cache when the stream completes.
+5. **Size guard**: promotion is bounded by the capacity of one RAM cache shard (`max_ram_cache_size / effective_shard_count`), not by `max_ram_cache_size` as a whole. At the defaults that is 64 MiB, not 512 MiB. A larger range skips promotion and no buffer is allocated. See [RAM sizing and the admission ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling).
 
-**Caveat on the two `FreshServe`-only rows.** Page widening and the part-scoped lookup are
-bounded by *stored* expiry rather than by the currently resolved `get_ttl`, so lowering
-`get_ttl` does not take effect on already-cached data on those paths until the old
-`expires_at` elapses. The widened path additionally consults the RAM tier before this
-lookup. Both are pre-existing, both are tracked separately, and neither is a consequence
-of candidate revalidation. The mainline GET paths are bounded by the resolved `get_ttl` and
-honour a `get_ttl` change without a restart or a cache wipe.
+### Intelligent range merging
 
-If you need `get_ttl` to take effect immediately on a key, keep it off page widening
-(`page_widening` defaults to off) and read whole objects or ordinary ranges rather than
-part-scoped (`?partNumber=N`) requests.
+When a GET needs bytes that are partly cached, the proxy serves the cached bytes, fetches only the missing bytes from S3, and merges them into one response. A merge is attempted only when the requested range and every cached extent it overlaps are each at most 8 MiB uncompressed. A larger, partly cached range is refetched from S3 instead (see [How much memory a cached serve may use](#how-much-memory-a-cached-serve-may-use)).
 
-## Cache Types
+A simple cache hit, where one cached range holds the whole requested range, skips the merge.
 
-### Full Object Cache
+#### Full-object GETs with partial cache coverage
 
-Caches complete objects from GET requests.
+A GET without a `Range` header can also use the merge when its object is partly cached. The proxy builds `Range: bytes=0-{total_size-1}` and routes the request through the same merge, subject to four fixed gates:
 
-**Cache Key**: `{bucket}/{object_key}`
+1. **Signature preservation**: `range` must not appear in the request's SigV4 `SignedHeaders`. The AWS SDKs sign only headers present at signing time, and this request had no `Range`, so the gate passes for the intended case.
+2. **Cached fraction at least 10%**: the cached bytes must add up to at least 10% of `total_size`.
+3. **Object size at most 128 MiB**: a larger object goes to an unconditional S3 fetch. Passing this gate only routes the request to the merge path. Because the built range is the whole object, the 8 MiB merge bound then decides. An object of at most 8 MiB, with every overlapped extent at most 8 MiB, is merged. A larger one is refetched whole from S3 through the streamed cache-miss path and stored as one range.
+4. **Object not empty**: a zero-length object has nothing to merge and no valid range.
 
-### Range Cache
+If any gate fails, the request goes to an unconditional S3 fetch. These thresholds are fixed in code, not configuration fields.
 
-Caches byte ranges independently across both RAM and disk tiers.
+This is the only place the proxy creates a `Range` header for a request that carried none, so internally a no-`Range` GET behaves like a ranged one. The response does not: a GET sent without a `Range` header is answered `200` with no `content-range`, whatever the object's size and however much of it is cached. Both routes keep to that, the one whose merge fits inside the memory bound and the one refetched from S3 because it does not. A client that receives `206` for a request with no `Range` is seeing a defect, not a documented mode. The bytes and `content-length` are still correct in that case; only the status and the `content-range` header are wrong.
 
-**Disk Cache Key**: `{bucket}/{object_key}:range:{start}-{end}`
-**RAM Cache Key**: `{cache_key}:range:{start}:{end}`
+The built range is carried to the refetch in an internal request header that is removed before the request leaves the proxy, so it never appears on the wire.
 
-Benefits:
-- Large files: cache only accessed ranges
-- Partial downloads: resume without re-downloading
-- Efficient for video streaming, large datasets
+#### How range merging works
 
-#### RAM Cache Integration for Ranges
+```text
+Cached ranges:   0-1 MiB, 2-3 MiB, 4-5 MiB
+Client requests: 0-5 MiB (inside the 8 MiB merge bound)
 
-Both the streaming path (ranges at or above `cache.disk_streaming_threshold`) and the buffered path (ranges below it) use RAM cache:
+1. Find the missing ranges: 1-2 MiB, 3-4 MiB
+2. Consolidate missing ranges separated by small gaps
+3. Fetch only the missing bytes from S3 (2 MiB)
+4. Merge cached and fetched bytes in order
+5. Return the complete 0-5 MiB response
+6. Cache the newly fetched ranges
 
-1. **RAM cache lookup**: Before deciding between streaming and buffered paths, the proxy checks RAM cache using the range-specific key
-2. **RAM hit**: Serves data directly from memory as a buffered 206 response, avoiding all disk I/O
-3. **RAM miss → disk hit**: After serving from disk, the proxy promotes the range data to RAM cache so subsequent requests are served from memory
-4. **Streaming path promotion**: During disk streaming, chunks are collected into a buffer and promoted to RAM cache after the stream completes
-5. **Size guard**: promotion is bounded by **per-shard** capacity (`max_ram_cache_size / effective_shard_count`), not by `max_ram_cache_size` as a whole. At defaults that is 64 MiB, not 512 MiB. Ranges above it skip RAM cache promotion with no buffer allocated. See [RAM Sizing and the Admission Ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling)
-
-**Important**: All ranges for the same object share the same expiration time. When GET_TTL expires for an object, ALL cached ranges for that object expire together, even though they're stored separately.
-
-### Intelligent Range Merging
-
-The proxy implements intelligent range merging to optimize partial cache hits. When a GET request requires bytes that are partially cached (some bytes in cache, some missing), the system serves cached portions and only fetches missing bytes from S3, then merges them into a complete response.
-
-**Range Merge Optimization**: Simple cache hits (where the requested range exactly matches or is fully contained within a single cached range) bypass merge operations entirely, eliminating unnecessary processing overhead.
-
-#### Full-Object GETs with Partial Cache Coverage
-
-A GET without a `Range` header whose cache has partial coverage can also benefit from the merge path. The proxy synthesizes `Range: bytes=0-{total_size-1}` and routes through the same merge machinery, subject to three hard-coded gates:
-
-1. **Signature preservation**: `range` must not appear in the request's SigV4 SignedHeaders. Since this path synthesizes a Range header on a request that had no Range, and AWS SDKs only sign headers present at signing time, this gate passes trivially for the intended use case (full-object GETs with partial cache coverage).
-2. **Cached fraction ≥ 10 %**: sum of cached range bytes must be at least 10 % of `total_size`.
-3. **Object size ≤ 128 MiB**: the merge path buffers the reconstructed response; a 128 MiB cap avoids memory pressure. Larger objects fall through to an unconditional S3 fetch as before.
-
-If any gate fails, the request falls through to an unconditional S3 fetch (pre-1.14.0 behavior). These thresholds are fixed in code, not exposed in configuration.
-
-#### How Range Merging Works
-
-**Scenario: Partial Cache Hit**
-
-```
-Cached ranges: 0-8MB, 16-24MB, 32-40MB
-Client requests: 0-40MB
-
-Traditional behavior: Fetch entire 0-40MB from S3 (wasteful)
-Range merging behavior:
-  1. Identify missing ranges: 8-16MB, 24-32MB
-  2. Consolidate missing ranges (if gaps are small)
-  3. Fetch only 8-16MB and 24-32MB from S3 (16MB total)
-  4. Merge cached + fetched ranges in correct order
-  5. Return complete 0-40MB response
-  6. Cache the newly fetched ranges for future requests
-
-Result: 60% cache efficiency (24MB from cache, 16MB from S3)
+Result: 3 MiB from the cache and 2 MiB from S3, a cache efficiency of 60%
 ```
 
-#### Range Consolidation
+The same layout under a request larger than 8 MiB is not merged: the whole requested range is refetched from S3 and stored as one range.
 
-When multiple missing ranges exist, the proxy consolidates them to minimize S3 requests:
+#### Range consolidation
 
-**Gap Threshold**: 1MiB (default, configurable)
+When several ranges are missing, the proxy joins those separated by less than `cache.range_merge_gap_threshold` (default 1 MiB) into one S3 request:
 
-```
-Missing ranges: 10-11MB, 11.1-12MB, 20-21MB
+```text
+Missing ranges: 10-11 MiB, 11.1-12 MiB, 20-21 MiB
 
-Without consolidation: 3 separate S3 requests
+Without consolidation: 3 S3 requests
 With consolidation:
-  - 10-11MB and 11.1-12MB have 100KB gap → Merge into 10-12MB (1 request)
-  - 20-21MB has large gap → Keep separate (1 request)
-  
+  10-11 MiB and 11.1-12 MiB are 0.1 MiB apart, so they become one request for 10-12 MiB
+  20-21 MiB is far from both, so it stays a separate request
+
 Result: 2 S3 requests instead of 3
 ```
 
-**Rationale**: If the gap between ranges is smaller than the threshold, fetching extra bytes is faster than making another S3 request (typical S3 request overhead: 50-100ms).
-
-#### Configuration
+When the gap is below the threshold, fetching the extra bytes costs less than another S3 request, each of which pays a round trip, and round trips are longest across Regions.
 
 ```yaml
 cache:
-  range_merge_gap_threshold: 1048576  # 1MiB (default)
+  range_merge_gap_threshold: 1048576  # 1 MiB (default)
 ```
 
-**Tuning Recommendations**:
+How to tune it:
 
-- **Low latency to S3** (< 10ms): Use smaller threshold (128KB)
-  - Multiple requests are cheap
-  - Minimize unnecessary data transfer
-  
-- **High latency to S3** (> 50ms): Use larger threshold (512KB-1MB)
-  - Request overhead is expensive
-  - Fetching extra bytes is cheaper than extra requests
-  
-- **Cost-optimized**: Use larger threshold (512KB-1MB)
-  - Minimize S3 request count (each request has a cost)
-  - Bandwidth is typically cheaper than request count
+- **Origin in the same Region**: a smaller threshold, such as 128 KiB, keeps unnecessary transfer down while extra requests stay cheap.
+- **Origin across Regions or outside AWS**: keep the 1 MiB default or raise it, since each extra request pays a long round trip.
+- **Request cost matters most**: keep the default or raise it. S3 charges per request, and bandwidth usually costs less than request count.
 
-#### Cache Efficiency Metrics
+#### Cache efficiency metrics
 
-Range merging operations log detailed efficiency metrics:
+A successful merge logs its efficiency at `debug` level:
 
-```
-INFO Range merge completed: cache_key=example.bin, requested=0-41943039, 
-     segments=5, cache_efficiency=60.00%, bytes_from_cache=25165824, 
-     bytes_from_s3=16777216, duration=45.23ms
+```text
+DEBUG Range merge succeeded: cache_key=example-bucket/example.bin, size=5242880 bytes, cache_efficiency=60.00%
 ```
 
-**Metrics Explained**:
+`size` is the number of bytes in the merged response, and `cache_efficiency` is the percentage of them served from the cache. A figure that stays low (under about 30%) on a busy prefix means the cached ranges line up poorly with the reads: consider the range boundaries clients use, or a larger cache.
 
-- **segments**: Number of range segments merged (cached + fetched)
-- **cache_efficiency**: Percentage of bytes served from cache
-- **bytes_from_cache**: Total bytes served from cached ranges
-- **bytes_from_s3**: Total bytes fetched from S3
-- **duration**: Time spent merging ranges (typically < 100ms)
+#### Fully cached across several ranges
 
-**Good cache efficiency**: 50-90%
-- Significant bandwidth savings
-- Faster response times than full S3 fetch
+When every requested byte is cached but split across several range files, the proxy serves the response from the cache alone:
 
-**Low cache efficiency**: < 30%
-- May indicate poor cache alignment with access patterns
-- Consider adjusting range boundaries or cache size
+```text
+Cached ranges:   0-8 MiB, 8-16 MiB, 16-24 MiB (three files)
+Client requests: 0-24 MiB
 
-#### Fully Cached Non-Contiguous Ranges
-
-When all requested bytes are cached but in non-contiguous ranges, the proxy serves the response entirely from cache without contacting S3:
-
-```
-Cached ranges: 0-8MB, 8-16MB, 16-24MB (non-contiguous storage)
-Client requests: 0-24MB
-
-Behavior:
-  1. Detect all bytes are cached (missing_ranges is empty)
-  2. Load and merge the 3 cached ranges
-  3. Return complete response
-  4. No S3 request needed
+1. Every byte is cached, so nothing is missing
+2. Serve the three ranges in order; above 8 MiB each extent is streamed in turn
+   rather than merged into one buffer
+3. Send no S3 request
 
 Result: 100% cache efficiency, 0 bytes from S3
 ```
 
-This is particularly efficient for:
-- **Multipart uploads**: Parts are cached as separate ranges, subsequent GET serves entirely from cache
-- **Sequential range requests**: Previous range requests populate cache, later full object request merges them
-- **Large files with partial access**: Only accessed portions are cached, but can be merged on demand
+This layout usually comes from a multipart upload, where each part is cached as its own range. It also comes from range requests that a later full-object request reads together, or from a large file whose parts were read on demand.
 
-#### Range Extraction
+#### Range extraction
 
-The proxy correctly extracts bytes from cached ranges that overlap with requested ranges:
+The proxy reads the overlapping bytes out of each cached range that a request touches:
 
-**Full Containment**:
-```
-Cached range: 0-10MB
-Requested: 2-5MB
+```text
+Full containment
+  Cached range: 0-10 MiB
+  Requested:    2-5 MiB
+  Read bytes 2097152-5242879 of the cached file: 3 MiB, no S3 fetch
 
-Extraction: Read bytes 2097152-5242880 from cached file
-Result: 3MB extracted, no S3 fetch needed
-```
-
-**Partial Overlap**:
-```
-Cached range: 0-8MB
-Requested: 6-10MB
-
-Extraction: Read bytes 6291456-8388608 from cached file (2MB)
-Missing: 8-10MB (fetch from S3)
-Result: Merge 2MB cached + 2MB fetched = 4MB response
+Partial overlap
+  Cached range: 0-8 MiB
+  Requested:    6-10 MiB
+  Read bytes 6291456-8388607 of the cached file (2 MiB) and fetch 8-10 MiB from S3
+  Merge 2 MiB cached and 2 MiB fetched into a 4 MiB response
 ```
 
-**Boundary Alignment**:
-- Cached ranges are typically aligned to 8MB boundaries (from multipart uploads)
-- Requests can cross boundaries (e.g., 1MB-10MB)
-- Proxy correctly extracts partial bytes from each cached range
-- No unnecessary S3 fetches for boundary-crossing requests
+Cached ranges from AWS CLI uploads usually sit on 8 MiB boundaries, the CLI's default part size. A request can cross those boundaries (for example 1-10 MiB); the proxy reads the partial bytes from each cached range it overlaps and fetches nothing it already holds.
 
-#### Error Handling and Fallback
+#### Error handling and fallback
 
-Range merging includes comprehensive error handling:
+| Scenario | What the proxy does | Result |
+|---|---|---|
+| Merged data size does not match the requested range | Logs an error and falls back to a complete S3 fetch | The client receives correct data, and the cache is updated |
+| Metadata lists a range whose file is missing or unreadable, unsigned `Range` | Marks the range missing, fetches it from S3 and caches it again | No client impact |
+| The same, signed `Range` | Invalidates the whole key and forwards the client's own request to S3 | No client impact |
+| A cached range file holds fewer bytes than its metadata records | Invalidates the whole key and forwards the client's own request to S3 | The client gets S3's response instead of a `500`, and that response is cached again |
+| A cached range file fails decompression | A read assembled in memory is answered from S3. A read streamed from the cache has already started its response, so it stops partway with a connection error | The damaged range is removed so the next read caches it again; until then, later reads of it on that proxy are fetched from S3 |
+| Some segments merge and others fail | Falls back to fetching the complete range from S3 | The response is S3's bytes, and the cache is refreshed |
 
-**Validation Failures**:
-```
-Scenario: Merged data size doesn't match requested range size
-Action: Log error, fall back to complete S3 fetch
-Result: Client receives correct data, cache is updated
-```
+Every scenario above except a streamed read that finds a damaged range file falls back to S3, so the client receives correct data even when the cache operation fails. A streamed read that finds a damaged file ends its response early with a connection error, and the bytes it sent before the check failed can be wrong. See [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3).
 
-**Cached File Missing**:
-```
-Scenario: Metadata indicates range is cached, but file is missing
-Action: Mark range as missing, fetch from S3, recache
-Result: Transparent recovery, no client impact
-```
+#### Signed `Range` requests
 
-**Decompression Failures**:
-```
-Scenario: Cached range file is corrupted
-Action: Invalidate corrupted cache entry, fetch from S3
-Result: Fresh data from S3, corrupted entry removed
-```
+A client whose SigV4 `SignedHeaders` lists `range` must reach S3 with that header byte for byte. That covers every AWS SDK ranged download, including the final open-ended chunk of an `aws s3 cp` download such as `bytes=16777216-`. Any rewrite is a different canonical request, and S3 answers `403 SignatureDoesNotMatch`. The proxy has no credentials and cannot sign again, so on every path that would otherwise send S3 a different `Range`, it forwards the client's own header instead:
 
-**Partial Merge Failures**:
-```
-Scenario: Some segments merge successfully, others fail
-Action: Fall back to fetching complete range from S3
-Result: Guaranteed correct response, cache is refreshed
-```
+| Situation | Unsigned `Range` | Signed `Range` |
+|---|---|---|
+| Partial coverage (cached bytes plus holes) | Fetch only the holes and merge them with the cached bytes | Stream the client's whole range from S3 and cache it; no hole fetches |
+| Cached range file missing or unreadable | Refetch that extent with a rewritten `Range` | Invalidate the whole key and forward the client's request |
+| A merge or fallback refetch would need a different `Range` | Fetch the needed extent | Forward the client's request unchanged; the cached entry is kept |
+| Complete-range fetch after a merge failure | Rewritten to the requested extent | The client's header is forwarded as sent, suffix and open-ended forms included |
 
-All error scenarios fall back to fetching the complete range from S3, ensuring clients always receive correct data even if cache operations fail.
+Invalidating the whole key drops its RAM ranges, its range files and its metadata through the same accounted path a version change takes, so the cache size stays correct. Every one of these cases answers the client from S3 rather than with a `500` or `502`. The hole fetcher itself refuses a signed `Range`, so a caller that missed one of the routes above still cannot send a rewritten header.
 
-#### Performance Characteristics
+The proxy checks range data from an upstream response before storing it. A body shorter than the requested range is stored as a shorter range when S3's `Content-Range`, or a `200` carrying the whole object from byte 0, shows that the object ends there. A streamed body cut short under a matching `Content-Range` is still stored as a shorter range when at least `cache.partial_range_commit_ratio` (default `0.5`) of the requested bytes arrived in order; see [Cache safety](CONNECTION_POOLING.md#cache-safety). Any other short body is not stored, and a range without an `ETag` is never stored over metadata that has one.
 
-**Parallel S3 Fetches**:
-- Multiple missing ranges are fetched from S3 in parallel
-- Reduces total fetch time compared to sequential requests
-- Example: 3 missing ranges fetched in ~100ms instead of ~300ms
+#### Fetching and memory
 
-**Memory-Efficient Merging**:
-- Ranges are loaded and merged incrementally
-- Avoids loading entire object into memory at once
-- Suitable for large objects (multi-GB files)
+- The proxy fetches several missing ranges from S3 in parallel.
+- The merged response is assembled in one buffer, so a merge is limited to 8 MiB uncompressed. A larger, partly cached range is refetched from S3 through the streamed path instead.
+- Fetched ranges are cached as soon as the merge completes, so later requests can use them.
 
-**Cache Warming**:
-- Fetched ranges are cached immediately after merge
-- Future requests benefit from newly cached ranges
-- Gradually improves cache coverage over time
+#### Use cases
 
-**Typical Performance**:
-- Range merge operation: 10-100ms (depending on number of segments)
-- S3 fetch for missing ranges: 50-200ms (depending on size and latency)
-- Total overhead vs full S3 fetch: Often 2-5x faster for partial cache hits (based on internal testing with synthetic workloads)
+```text
+Video seeking
+  Cached:      ranges from earlier seeks (0-2 MiB, 50-52 MiB, 100-102 MiB)
+  New request: 50-54 MiB
+  Result:      2 MiB from the cache and 2 MiB from S3 (50% cache efficiency).
+               A request larger than 8 MiB over the same layout is refetched whole
 
-#### Use Cases
+Parquet queries
+  First query:  the footer (the last 8 KiB of a 50 MiB file) and column A (5-7 MiB, 15-17 MiB)
+  Second query: the same file, column B (25-27 MiB, 35-37 MiB)
+  Result:       the footer is served from the cache; only column B's 4 MiB comes from S3
 
-**Video Streaming**:
-```
-Scenario: Client seeks to different positions in a video file
-Cached: Ranges from previous seeks (0-10MB, 50-60MB, 100-110MB)
-New request: 0-120MB (full video)
+Multipart upload followed by GET
+  Upload:  a 100 MiB file in 13 parts, cached as ranges 0-8 MiB, 8-16 MiB, ..., 96-100 MiB
+  GET:     0-100 MiB
+  Result:  the 13 ranges are streamed in order, 0 bytes from S3
 
-Benefit: Serve 30MB from cache, fetch 90MB from S3
-Result: 25% cache efficiency, faster startup than full fetch
+Many clients reading one file
+  First client:  downloads a 100 MiB artifact (cache miss, fetched from S3)
+  Other clients: the same request, served from the cache
+  Result:        1 S3 request instead of one per client
+
+Part number requests
+  GET /bucket/big.bin?partNumber=1 (cache miss)
+  S3 answers Content-Range: bytes 0-8388607/5368709120 and x-amz-mp-parts-count: 640
+  The proxy stores the part as range 0-8388607 and records parts_count=640, part_ranges[1]=(0, 8388607)
+  A later GET /bucket/big.bin?partNumber=1 is served from the cache with no S3 request
 ```
 
-**Parquet File Queries**:
-```
-Scenario: Analytics query reads specific columns from a 50MB Parquet file
-First query: Footer metadata (49.99-50MB, 8KB) + Column A chunks (5-7MB, 15-17MB)
-Cached: Footer (49.99-50MB) + Column A data (5-7MB, 15-17MB) = 4.008MB
+### Part number cache
 
-Second query: Same file, different column (Column B at 25-27MB, 35-37MB)
-Benefit: Serve footer from cache (8KB), fetch only Column B chunks (4MB)
-Result: Footer always cached, only new column data fetched from S3
-```
+The proxy caches GetObject requests that carry a `partNumber` query parameter, storing each part as a range of the object.
 
-**Multipart Upload Followed by GET**:
-```
-Scenario: Client uploads 100MB file via multipart (13 parts), then immediately GETs it
-Cached: All 13 parts as separate ranges (0-8MB, 8-16MB, ..., 96-100MB)
-GET request: 0-100MB (full file)
+1. **Detection**: a GET with `partNumber` is a GetObjectPart request.
+2. **Part range**: S3's `Content-Range` and `x-amz-mp-parts-count` headers give the part's exact byte range.
+3. **Storage**: the part is stored as a range, with the same storage and compression as any other range.
+4. **Lookup**: a later request for the same part number finds its byte range in the object's `part_ranges` map and is served from the cache when that range is cached.
 
-Benefit: Serve entire file from cache by merging 13 ranges
-Result: 100% cache efficiency, 0 bytes from S3, ~50ms merge time
-```
+Parts use the full object's cache key (`{bucket}/{object_key}`) and are stored as ranges at their byte offsets. Parts of different sizes are supported, and the cached response keeps S3's response headers. [Part caching](#part-caching) describes how part ranges are recorded.
 
-**Multiple Clients Accessing Same File**:
-```
-Scenario: Build system downloads 100MB artifact, multiple workers need same file
-First client: Downloads 0-100MB (cache miss, fetches from S3)
-Subsequent clients: Request 0-100MB (cache hit, served from proxy)
+Limits:
 
-Benefit: First client caches file, all other clients served from cache
-Result: 1 S3 request instead of N requests, significant cost savings
-```
+- An upload verification request, carrying both `partNumber` and `uploadId`, bypasses the cache.
+- An invalid part number, or one beyond the object's part count, is passed through to S3.
 
-**Part Number Requests**:
-```
-Scenario: Client downloads specific parts of a large multipart object
-First request: GET /bucket/5GB?partNumber=1 (cache miss)
-S3 response: Content-Range: bytes 0-8388607/5368709120, x-amz-mp-parts-count: 640
-Proxy: Store part as range 0-8388607, update metadata with parts_count=640, part_ranges[1]=(0, 8388607)
+#### Per-proxy part request deduplication
 
-Second request: GET /bucket/5GB?partNumber=2 (cache hit)
-Proxy: Lookup part_ranges[2] → (8388608, 16777215), serve from cache
-Result: Part served from cache without S3 request
-```
+Concurrent requests for the same part of the same object share one S3 fetch through download coordination: one request fetches while the others wait. See [Download coordination](#download-coordination).
 
-### Part Number Cache
+### Write-through cache
 
-Caches S3 GetObject requests with `partNumber` query parameters, treating parts as ranges within the existing range storage architecture.
+The write cache stores an object's bytes as a PUT passes through, in the same range format the read path uses. A GET straight after the upload is then served from the cache without fetching from S3.
 
-**How It Works:**
+#### How the write cache works
 
-1. **Part Request Detection**: GET requests with `partNumber` parameter are identified as GetObjectPart operations
-2. **Part Range Extraction**: S3 response headers (`x-amz-mp-parts-count`, `Content-Range`) provide exact byte ranges
-3. **Range Storage**: Parts are stored as ranges using the existing range storage mechanism
-4. **Direct Lookup**: Future part requests look up stored byte ranges from `part_ranges` map
-5. **Cache Lookup**: Parts are served from cache when the stored range is available
+For a single PUT:
 
-**Cache Key Strategy**: Parts use the same cache key as the full object (`{bucket}/{object_key}`) but are stored as ranges with specific byte offsets.
+1. The client sends `PutObject`.
+2. The proxy forwards it to S3 and streams the body to a temporary file.
+3. S3 returns `200 OK` with an ETag.
+4. The proxy commits the temporary file as the range `0-N`.
+5. It writes metadata with `is_write_cached=true` and the `put_ttl`.
+6. It returns S3's response to the client unchanged.
 
-**Example Flow:**
-```
-Client: GET /bucket/5GB?partNumber=1
-Proxy: Parse partNumber=1, check cache for /bucket/5GB
-S3: Returns Content-Range: bytes 0-8388607/5368709120, x-amz-mp-parts-count: 640
-Proxy: Store as range 0-8388607, update part_ranges[1]=(0, 8388607)
-Client: GET /bucket/5GB?partNumber=2 (later request)
-Proxy: Lookup part_ranges[2], serve from cache if available
-```
+Because the object is stored as the range `0-N` under `ranges/`, range requests are served from it at once.
 
-**Benefits:**
-- Eliminates repeated S3 requests for the same parts
-- Leverages existing range storage and compression
-- Supports variable-sized parts (no uniform size assumption)
-- Maintains response header consistency
+Headers for write-cached objects:
 
-**Limitations:**
-- Upload verification requests (with both `partNumber` and `uploadId`) bypass cache
-- Invalid part numbers are passed through to S3
-- Parts exceeding the object's part count are forwarded to S3
+- **ETag**: available at once from S3's PUT response.
+- **Last-Modified**: S3's `PutObject` and `CompleteMultipartUpload` responses carry no `Last-Modified`, so a write-cache entry starts without one. The first GET of such an entry sends a conditional request with `If-None-Match` alone, since there is no cached `Last-Modified` to send as `If-Modified-Since`. It takes the header from the `304` response and serves the learned value on that same request. The conditional is needed because a GET that resolves to a write-cache entry is otherwise a cache hit that never contacts S3, and the proxy has no AWS credentials to fetch the metadata separately.
+- **Last-Modified on HEAD**: a HEAD is never served from the cache while the field is unknown. It is forwarded to S3, and S3's response rewrites the entry. Two independent mechanisms cause that. A write-cache entry has no HEAD TTL set, so the HEAD lookup misses on it. The lookup also refuses any entry without the field, which covers an entry whose HEAD TTL was set by a previous revalidation that did not learn it.
+- **Content-Type**: cached when the PUT request (single part) or the CreateMultipartUpload request (multipart) provides it, and otherwise learned on the first HEAD or cache-miss GET. S3's CompleteMultipartUpload response carries `content-type: application/xml`, the type of its XML body rather than the object's, and the proxy filters it out.
 
-#### Per-Instance Part Request Deduplication
+#### TTL transition on first read
 
-Concurrent part requests for the same object are handled by the InFlightTracker (download coordination). When multiple requests arrive for the same part, only one fetches from S3 while others wait. See [Download Coordination](#download-coordination) for details.
+A write-cached object starts on its own TTL and moves to the read TTL the first time it is read. The move happens once:
 
-### Write-Through Cache
+- On the PUT, the TTL is `put_ttl` (default 1 hour).
+- On the first GET, the entry moves from `put_ttl` to `get_ttl`. The move runs before the freshness check, so with `get_ttl: 0` that first GET revalidates against S3.
+- The move needs a known `Last-Modified`. An entry whose `Last-Modified` is not yet known stays on `put_ttl`, in the write cache, until a revalidation learns it (see the `Last-Modified` header above), and then moves as part of that same operation. This keeps the revalidation trigger from clearing the flag it depends on before it fires.
+- An object not read within its TTL expires and is removed.
 
-Caches objects during PUT operations using the range storage format, enabling subsequent GET requests to be served from cache immediately without fetching from S3.
+Frequently read uploads therefore stay cached, and uploads nobody reads expire.
 
-**Use Case**: Upload once, download many times immediately after
+#### Capacity management
 
-#### How Write Caching Works
-
-**Full PUT Operations**:
-1. Client sends PutObject request
-2. Proxy forwards to S3 and streams body to temp file
-3. S3 returns 200 OK with ETag
-4. Proxy commits temp file as range 0-N
-5. Metadata created with `is_write_cached=true` and TTL
-6. S3 response returned to client unchanged
-
-**Storage Format**: PUT-cached objects are stored as range 0-N in the `ranges/` directory, enabling immediate range request support without fetching from S3.
-
-**Header Behavior for Write-Cached Objects**:
-- **ETag**: Available immediately from S3 PUT response
-- **Last-Modified**: S3 `PutObject` and `CompleteMultipartUpload` responses do not include a
-  `Last-Modified` header, so a write-through cache entry starts without one. The proxy learns it
-  actively: the first GET of such an entry issues a conditional request — `If-None-Match` alone,
-  since there is no cached `Last-Modified` to send an `If-Modified-Since` for — and backfills the
-  header from the `304` response, serving the learned value on that same request. A conditional is
-  necessary because a GET that resolves to a write-cache entry is otherwise a cache hit that never
-  contacts S3, and the proxy holds no AWS credentials with which to fetch the metadata separately.
-- **Last-Modified on HEAD**: a HEAD is never served from cache while the field is unknown. It
-  forwards to S3, and S3's response rewrites the entry. Two independent mechanisms produce that: a
-  write-through entry has no HEAD TTL set, so the HEAD lookup misses on it regardless; and the
-  lookup separately refuses any entry lacking the field, which covers an entry whose HEAD TTL was
-  set by an earlier revalidation that did not learn it.
-- **Content-Type**: If provided in the PUT request (single-part) or CreateMultipartUpload request (multipart), it is cached and used. If not provided, learned on first HEAD or cache-miss GET. Note: S3's CompleteMultipartUpload response has `content-type: application/xml` which is the XML response type, not the object's content-type - this is filtered out.
-
-#### TTL Transition on First Read
-
-Write-cached objects start on their own TTL and move to the read TTL the first time
-they are read. This is a one-time transition, not a refresh on every access:
-
-- Initial PUT: TTL set to `put_ttl` (default 1 hour)
-- First GET access: the entry transitions from `put_ttl` to `get_ttl`. This is a
-  one-time transition, not a repeating refresh, and it runs before the freshness check
-  so `get_ttl: 0` revalidates against S3 on that first GET
-- The transition requires a known `Last-Modified`. An entry whose `Last-Modified` is not
-  yet known stays on `put_ttl` and remains in the write tier until a revalidation learns
-  it (see the `Last-Modified` note above); the transition then happens as part of that
-  same operation. This is what keeps the revalidation trigger from clearing the flag it
-  depends on before it can fire.
-- No access within TTL: Object expires and is removed
-
-This keeps frequently accessed objects in cache while allowing rarely-read uploads to expire.
-
-#### Capacity Management
-
-The write cache is allocated a percentage of the total disk cache:
+The write cache is given a share of the disk cache:
 
 ```yaml
 cache:
   write_cache_percent: 10.0  # Default: 10% of max_cache_size
 ```
 
-**Eviction behavior**:
-- The allocation is a reclamation target, not an admission limit — an upload is cached even
-  when it is already full, and the excess is reclaimed in the background
-- Reclamation order is oldest-staged-first, with entries whose `put_ttl` elapsed unread
-  taken first. An object never read has no recency or frequency score to compute, so the
-  read cache's LRU/TinyLFU choice does not apply here
-- Reclamation runs from the background maintenance cycle, never on the request path
-- Staged bytes also leave the allocation without any reclamation, by being read for the
-  first time — the normal case for a read-after-write workload
-- S3 operation always succeeds regardless of caching outcome
+- The share is a reclamation target, not an admission limit: an upload is cached even when the share is already full, and the excess is reclaimed in the background.
+- Reclamation takes the oldest staged objects first, starting with those whose `put_ttl` elapsed unread. An object never read has no recency or frequency score, so the read cache's TinyLFU scoring does not apply.
+- Reclamation runs in the background maintenance cycle, never on the request path.
+- Staged bytes also leave the share without any reclamation when they are read for the first time, the normal case for a read-after-write workload.
+- The S3 operation succeeds whatever happens to the cached copy.
 
-#### Disk-Only Storage
+#### Disk-only storage
 
-Write-cached objects are stored only on disk, not in RAM cache:
-- Preserves RAM cache for hot read data
-- Write-cached objects can be promoted to RAM cache on subsequent GET access
-- Capacity tracking uses compressed size (actual disk usage)
+Write-cached objects are stored on disk only, which keeps the RAM cache for read traffic. A later GET can promote a write-cached object to the RAM cache. Capacity tracking counts the compressed size, which is what the object takes on disk.
 
 #### Limitations
 
-- Single PUT size limit: 256MB per object (configurable via `write_cache_max_object_size`)
-- Objects larger than that limit bypass caching automatically
-- Caching is also declined when it would take the cache past `max_cache_size`, or when the
-  cache volume has under 1 GiB free beyond the object's own size — reported as
-  `disk_safety` in `signed_put.skipped_puts_total`. This is the only capacity-shaped
-  refusal; `write_cache_percent` does not decline anything (see above)
-- POST object upload is not write-through cached — see below
+- A single PUT is cached only up to `write_cache_max_object_size` (default 256 MiB); a larger object bypasses the cache.
+- Caching is also declined when it would take the cache past `max_cache_size`, or when the cache volume has under 1 GiB free beyond the object's own size. Both are reported as `disk_safety` in `signed_put.skipped_puts_total`. This is the only capacity-shaped refusal; `write_cache_percent` declines nothing (see above).
+- A POST object upload is not cached; see the next section.
 
 #### POST object upload is not write-through cached
 
-A browser form upload (`POST /bucket` with a `multipart/form-data` body, the signature
-carried in form fields rather than an `Authorization` header) reaches S3 correctly and
-returns S3's own response, but the object is **not** placed in the cache.
+A browser form upload (`POST /bucket` with a `multipart/form-data` body, its signature carried in form fields rather than an `Authorization` header) reaches S3 correctly and returns S3's own response, but the object is not cached.
 
-The body is a MIME envelope, not the object bytes: the payload is one part (`file`)
-alongside form fields such as `key`, `policy`, and `x-amz-signature`. Caching the body
-as received would store the envelope and a later GET would serve corrupt data.
-Extracting the object part means parsing the envelope, which means buffering the whole
-upload in memory — the cost the streaming write path exists to remove. So the proxy
-streams the upload and skips caching.
+The body is a MIME envelope, not the object's bytes: the payload is one part (`file`) beside form fields such as `key`, `policy` and `x-amz-signature`. Caching the body as received would store the envelope, and a later GET would serve corrupt data. Extracting the object part means parsing the envelope, which means buffering the whole upload in memory, so the proxy streams the upload and skips caching.
 
-The practical effect is one extra S3 round-trip: a POST-uploaded object is absent from
-the cache until something reads it back through the proxy, at which point the read path
-caches it as a normal cache miss. Every later read is a cache hit. Presigned PUT,
-signed PUT, and multipart upload are all write-through cached as described above.
+The effect is one extra S3 round trip: a POST-uploaded object is not in the cache until something reads it through the proxy, and that read caches it as a normal cache miss. Every later read is a cache hit. Presigned PUT, signed PUT and multipart upload are all cached on write as described above.
 
-### Multipart Upload Cache
+### Multipart upload cache
 
-Caches multipart uploads with intelligent capacity management and shared cache coordination.
+#### How multipart caching works
 
-#### How Multipart Caching Works
+Parts are staged under `mpus_in_progress/{hash(uploadId)}/` as they arrive, each as a `part{N}.bin` with its own `part{N}.json` record, and `CompleteMultipartUpload` renames the requested parts into `ranges/` at their final byte offsets. Each part is compressed by the same content-aware rules as a single PUT, and its compression algorithm carries through to the final range metadata. The completed object is a write-cached entry stored without `Last-Modified`, which the first read learns by revalidating (see the write-cached headers above). `AbortMultipartUpload` deletes the staging directory whatever S3 answers.
 
-**1. Initiation** (`CreateMultipartUpload`):
-- Forward to S3, get uploadId from response XML
-- Create tracking metadata in `mpus_in_progress/{uploadId}/upload.meta`
-- Record start time and cache key
-- Return S3 response unchanged
+[Multipart upload caching](MULTIPART_UPLOAD.md) is the reference for the on-disk layout, the locks, the checks made at completion, fleet behavior and the incomplete-upload sweep.
 
-**2. Part Storage** (`UploadPart`):
-- Stream body to S3 and temp file simultaneously
-- S3 returns ETag for the part
-- Apply content-aware compression (see below)
-- Store part under the in-progress upload directory: `mpus_in_progress/{uploadId}/part{N}.bin` (see [MULTIPART_UPLOAD.md](MULTIPART_UPLOAD.md))
-- Update tracking metadata with part info and compression algorithm (acquire lock first)
-- Return S3 response unchanged
+#### Byte offset calculation
 
-**Content-Aware Compression for Parts**:
-- Each part is compressed using the same content-aware rules as single-part uploads
-- Already-compressed file types (`.zip`, `.jpg`, `.mp4`, etc.) are stored uncompressed
-- Compressible file types (`.txt`, `.json`, `.log`, etc.) are compressed with LZ4
-- The actual compression algorithm used is stored per-part in the tracking metadata
-- On completion, each part's compression algorithm is preserved in the final range metadata
+Parts are assembled in part-number order, not upload order. Every part except the last is at least 5 MiB:
 
-**3. Completion** (`CompleteMultipartUpload`):
-- Forward to S3, get final ETag from response XML
-- Acquire lock on tracking metadata
-- Read all parts, sort by part number
-- Calculate final byte offsets for each part
-- Rename part files with final offsets
-- Create object metadata with `is_write_cached=true`, ETag, and Content-Type (if provided in CreateMultipartUpload)
-- Note: `Last-Modified` is not available from the `CompleteMultipartUpload` response. The entry is stored without it, and the first read revalidates against S3 to learn it — see "Header Behavior for Write-Cached Objects" above
-- Delete tracking directory
-- Return S3 response unchanged
-
-**4. Abort** (`AbortMultipartUpload`):
-- Forward to S3
-- Delete all cached parts for uploadId
-- Delete tracking directory
-- Return S3 response unchanged
-
-#### Byte Offset Calculation
-
-Parts are assembled in part number order (not upload order):
-
-```
-Part 1: 5MB → bytes 0-5242879
-Part 2: 5MB → bytes 5242880-10485759
-Part 3: 3MB → bytes 10485760-13631487
+```text
+Part 1: 5 MiB  -> bytes 0-5242879
+Part 2: 5 MiB  -> bytes 5242880-10485759
+Part 3: 3 MiB  -> bytes 10485760-13631487
 
 Final ranges:
   {key}_0-5242879.bin
@@ -558,711 +316,397 @@ Final ranges:
   {key}_10485760-13631487.bin
 ```
 
-#### Incomplete Upload Cleanup
+#### Capacity-aware bypass
 
-Multipart uploads that are never completed are automatically cleaned up:
+Each `UploadPart` makes its own capacity decision, the same one a single PUT makes:
 
-```yaml
-cache:
-  incomplete_upload_ttl: "1d"  # Default: 1 day
-```
+- A part that does not fit is forwarded to S3 without being cached.
+- Parts already cached stay in place.
+- At completion, a part that was never cached counts as missing, so the object is not cached.
+- The upload continues to S3 normally either way.
 
-**Cleanup behavior**:
-- Runs at startup and periodically during operation
-- Uses file modification time (not creation time) to detect recent activity
-- Uploads with recent UploadPart activity are not evicted
-- Uses distributed eviction lock for shared cache coordination
-- Acquires per-upload lock before deletion
+#### Edge cases
 
-**Why file mtime**: The tracking file is updated after each UploadPart, so mtime reflects the most recent activity. An upload with recent activity should not be evicted even if it started long ago.
+- **A GET during an incomplete multipart upload**: the proxy checks the read cache first and forwards a miss to S3, the source of truth. In-progress parts are not served; they become readable after `CompleteMultipartUpload`.
+- **A new multipart upload over an existing object**: the cached object stays valid, and GETs keep serving it, until the new upload completes. On `CompleteMultipartUpload`, the new object's metadata replaces the old.
+- **`CompleteMultipartUpload` with missing parts**: a part is missing when it was not cached, because it was bypassed for capacity or went through a proxy that does not share this cache volume. If any part is missing, the object is not cached and S3's success response is returned unchanged.
 
-#### Capacity-Aware Bypass
+Once completed, a multipart object uses the cache key `{bucket}/{object_key}` and behaves like a PUT-cached object.
 
-If cumulative parts exceed write cache capacity:
-- Upload is marked as "Bypassed"
-- Already-cached parts are invalidated to free space
-- Subsequent parts are not cached
-- Upload continues to S3 normally (caching is transparent)
+### Write cache error handling
 
-#### Shared Cache Considerations
+The write cache commits data only after S3 returns success. An authentication or authorization failure (`403`, `401`), a `5xx` or a transport error never produces a cache entry, and S3's response reaches the client unchanged.
 
-When multiple proxy instances share a cache volume:
+- **PUT**: the body streams to S3 and, through a tee, to a staging file. The background cache task learns S3's status when the response arrives; on anything other than success it discards the staging file and commits nothing.
+- **UploadPart**: a failed part is not staged. Parts that succeeded stay staged, and the upload can continue.
+- **CompleteMultipartUpload**: on an S3 error no object metadata is written and the staged parts are kept, so a client retry can still succeed. The incomplete-upload sweep removes them if the upload is abandoned (`incomplete_upload_ttl`, default 1 day).
+- **AbortMultipartUpload**: removes the staged parts whatever S3 answers.
 
-**Part data storage (no lock needed)**:
-- Each part has a unique filename
-- Different part numbers → different files → no conflict
-- Write uses temp file + atomic rename → no partial reads
+Failed operations do not move the cache hit or miss metrics. Two log lines record them:
 
-**Tracking metadata updates (lock needed)**:
-- Lock acquired when updating `upload.meta`
-- Lock scope: only the specific uploadId, not global
-- Concurrent uploads to different uploadIds → no contention
-
-**CompleteMultipartUpload coordination**:
-- Acquire lock on tracking metadata
-- Read all parts from tracking file (regardless of which instance cached them)
-- Calculate offsets, rename files, create object metadata
-- Delete tracking directory
-- Release lock
-
-**Incomplete upload scanner coordination**:
-- Uses distributed eviction lock (same as read cache eviction)
-- Only one instance scans at a time
-- Prevents duplicate cleanup work
-
-#### Edge Cases
-
-**Instance crashes during CompleteMultipartUpload**:
-- Lock times out after configured timeout
-- Next instance can retry completion
-- Parts remain intact until completion or TTL expiration
-
-**GET request during incomplete multipart upload**:
-- Proxy checks existing read cache first
-- If cache miss, forward to S3 (S3 is source of truth)
-- In-progress upload parts are NOT served
-- Parts only become accessible after CompleteMultipartUpload
-
-**Object exists, then new multipart upload started**:
-- Existing cached object remains valid until new upload completes
-- GET requests continue to serve existing cached version
-- On CompleteMultipartUpload: new object metadata replaces old
-
-**CompleteMultipartUpload with missing parts (Multi-Instance)**:
-- Proxy validates all parts exist locally before finalization
-- If any parts missing (uploaded to other instances): skips caching entirely
-- Cleans up partial cache data to prevent corruption
-- Returns S3 success response unchanged to client
-- Prevents incomplete cache entries that could serve corrupted data
-
-**Benefits**:
-- Large multipart uploads can be cached if they fit within capacity
-- Completed multipart uploads support range requests immediately
-- Capacity limits are respected incrementally as parts arrive
-- Abandoned uploads don't consume cache space indefinitely
-- Any instance can handle any part of the upload
-- Multi-instance deployments maintain data integrity
-
-**Cache Key**: `{bucket}/{object_key}`
-
-**Important**: Multipart uploads use the same range storage as PUT and GET operations. Once completed, they behave identically to PUT-cached objects.
-
-### Write Cache Error Handling
-
-The write cache implements robust error handling to ensure that S3 operation failures (including authentication/authorization errors like 403 Forbidden) do not result in corrupted or invalid cache entries.
-
-#### Core Principle: Only Cache on S3 Success
-
-The write cache follows the fundamental principle of "only cache on S3 success." This ensures that:
-- Authentication failures (403 Forbidden) don't create cache entries
-- Authorization failures don't cache data the client shouldn't access
-- Network errors don't result in partial cache data
-- S3 service errors don't corrupt the cache
-
-#### Single PUT Request Error Handling
-
-When a PUT request receives an error response from S3 (including 403 Forbidden):
-
-**Process Flow:**
-1. **Request Processing**: Proxy reads the request body and spawns a background cache task
-2. **S3 Forward**: Request is forwarded to S3 immediately (doesn't wait for cache)
-3. **Error Detection**: Background cache task receives the error status via oneshot channel
-4. **Cache Prevention**: Cache task checks `if status.is_success()` and skips caching entirely
-
-**Code Behavior:**
-```rust
-if status.is_success() {
-    // S3 success - store as single range with write cache metadata
-    // ... caching logic here ...
-} else {
-    // S3 returned error - don't cache
-    debug!(
-        "S3 error response, not caching PUT: cache_key={}, status={}",
-        cache_key, status
-    );
-}
-```
-
-**Result for 403 Errors:**
-- No cache entry is created
-- No disk space is consumed
-- No partial or corrupted data is stored
-- 403 error is returned to client unchanged
-- No cleanup is needed (no cache data was created)
-
-#### Multipart Upload Error Handling
-
-**UploadPart 403 Errors:**
-- Individual part uploads that receive 403 are not cached
-- No partial cache data is stored for that failed part
-- Other successful parts remain cached (if any)
-- Upload can continue with remaining parts
-
-**CompleteMultipartUpload 403 Errors:**
-When CompleteMultipartUpload receives a 403 error:
-
-```rust
-if status.is_success() {
-    // ... finalize cache metadata linking all parts ...
-} else {
-    // Mark upload as incomplete but don't delete parts
-    error!(
-        "CompleteMultipartUpload S3 error: bucket={}, key={}, status={}",
-        bucket, key, status.as_u16()
-    );
-}
-```
-
-**Result for 403 Errors:**
-- Previously cached parts remain in cache (not deleted)
-- No final metadata linking parts together is created
-- Upload remains "incomplete" in cache terms
-- Parts will be cleaned up by incomplete upload TTL (default: 1 day)
-- 403 error is returned to client unchanged
-
-**AbortMultipartUpload:**
-This operation always cleans up cached parts regardless of S3 response status, so a 403 here would still result in proper cache cleanup.
-
-#### Error Types and Handling
-
-**Authentication/Authorization Errors (403, 401):**
-- No cache entries created
-- Existing cache entries remain unchanged
-- Client receives exact S3 error response
-
-**Network/Connection Errors:**
-- Background cache task receives error via channel
-- No cache entries created
-- S3 error propagated to client
-
-**S3 Service Errors (5xx):**
-- Treated same as authentication errors
-- No caching occurs on any S3 error status
-- Ensures cache consistency
-
-#### Resource Management
-
-**No Orphaned Cache Data:**
-- 403 errors prevent new cache entries but don't leave partial/corrupted data
-- Background tasks properly handle channel closure
-- Temporary files are cleaned up automatically
-
-**Memory Management:**
-- Request body is read once and shared between S3 forward and cache task
-- Failed operations don't consume additional memory
-- Background tasks exit cleanly on S3 errors
-
-**Disk Space Conservation:**
-- Failed operations don't consume cache space
-- No temporary files left behind
-- Incomplete multipart uploads cleaned up by TTL
-
-#### Transparency to Clients
-
-**Error Passthrough:**
-- All S3 errors (including 403) are passed through to client unchanged
-- No modification of error responses
-- Client sees exact same error as direct S3 access
-
-**No Cache Pollution:**
-- Failed operations don't create invalid cache entries
-- Subsequent requests don't serve stale/invalid data
-- Cache remains consistent with S3 state
-
-#### Monitoring and Logging
-
-**Error Logging:**
-```
-DEBUG S3 error response, not caching PUT: cache_key=bucket/object.txt, status=403
+```text
+DEBUG Streaming cache: S3 non-success status, not caching: cache_key=bucket/object.txt, status=403 Forbidden
 ERROR CompleteMultipartUpload S3 error: bucket=my-bucket, key=large-file.bin, status=403
 ```
 
-**Metrics:**
-- Failed PUT operations don't increment cache metrics
-- Error rates tracked separately from cache hit/miss rates
-- No false positive cache statistics
+## How much memory a cached serve may use
 
-#### Benefits
+A cached serve may assemble at most 8 MiB of uncompressed bytes in one buffer. The limit is part of how the read paths are built, not a setting. No configuration field controls it, it applies whether or not the in-flight memory ledger is enabled, and it is the same on every deployment. The memory a cached serve takes is bounded by this limit, not by the size of the object or of the extent its bytes are stored in.
 
-1. **Data Integrity**: Only valid, authorized data is cached
-2. **Security**: Authentication failures don't bypass security controls
-3. **Consistency**: Cache state always reflects successful S3 operations
-4. **Resource Efficiency**: Failed operations don't waste cache space
-5. **Transparency**: Clients see identical behavior to direct S3 access
-6. **Reliability**: No partial or corrupted cache entries
+Above the limit, a cached serve takes one of three forms, chosen after the lookup has established coverage and freshness:
 
-This error handling ensures that the write cache enhances performance without compromising security, consistency, or reliability.
+| Coverage of the requested bytes | How it is served |
+|---|---|
+| Inside one cached extent, or a whole object held as one extent | The requested slice is streamed out of that extent: `206` for a ranged request, `200` for a request with no `Range` |
+| Spanned by several adjacent cached extents with no gap | Each extent is streamed in turn, chained into one response body |
+| A gap, partial caching, or cached data that cannot be read | Not a cached serve. The whole requested interval is refetched from S3 through the streamed cache-miss path and stored as one new range, so the next identical request is a single-extent cache hit |
 
-## Page-Aligned Range Caching
+A HEAD never reaches any of this: it reads no range bytes, and its headers come from the cached metadata.
 
-Page-aligned range caching (also called *range read widening*) widens an eligible small ranged GET into a fixed-size, page-aligned fetch, caches the whole page (disk and RAM), and serves the client exactly the bytes it requested. Later small reads that fall in the same page — from the same reader, a re-run, or a different reader sharing the cache — are served with no S3 round trip, and concurrent small reads in the same page coalesce onto a single fetch.
+Two consequences to expect:
 
-The access shape it targets is a trailing footer read followed by clustered reads at scattered offsets, as produced by columnar readers (Parquet, ORC). Footer/tail caching is simply the special case where the read lands in the object's last page. The proxy never parses object content to detect any of this; it works purely from request byte offsets.
+- **The third row costs hit ratio once per range.** A partly cached range above the limit is fetched from S3 in full rather than merged with what is cached, so the cached part is fetched again. It heals: the refetch is stored, and the repeat is a hit. A degrade counter that keeps rising for the same range means the refetch is not being stored, which needs investigating, not tuning.
+- **Latency on a compressed extent grows with the offset.** A range deep inside an LZ4-compressed extent is decoded from the extent's start, discarding the bytes before it. Memory does not grow with the offset; time does.
+
+Each row, and each reason within the third, has its own counter under `inflight_memory` on `/metrics` and in the OTLP export: `buffered_serve_sliced_streams_total`, `buffered_serve_degraded_chained_stream_total`, and a `buffered_serve_degraded_*` counter per forward or heal reason. Serves that stayed inside the limit are counted by materialized size in `buffered_serve_size_{le_64kib,le_1mib,le_8mib,gt_8mib}_total`, with the largest single buffer in `buffered_serve_peak_materialised_bytes` and the no-`Range` whole-object share of those buckets in `buffered_serve_full_object_total`. A `buffered_serve_size_gt_8mib_total` above zero, or a peak above 8,388,608, means something materialized past the limit every serve is checked against; report it as a defect. See [`inflight_memory`](METRICS_REFERENCE.md#inflight_memory).
+
+Page widening is the one cached read this limit does not govern, because it holds a page rather than an extent. [Disk footprint](#disk-footprint) and [RAM cache uses the page as its unit](#ram-cache-uses-the-page-as-its-unit) give the figure that bounds it instead.
+
+## Page-aligned range caching
+
+Page-aligned range caching, also called range read widening, turns an eligible small ranged GET into a fetch of the fixed-size, aligned page that contains it. The proxy caches the whole page, on disk and in RAM, and serves the client exactly the bytes it asked for. Later small reads in the same page are served with no S3 round trip, whether they come from the same reader, a re-run or another reader of the same cache. Concurrent small reads in one page share one fetch.
+
+The access pattern it targets is a read of the file's trailing footer followed by clustered reads at scattered offsets, as columnar readers (Parquet, ORC) produce. Caching the footer is the special case where the read lands in the object's last page. The proxy never parses object content to detect this; it works only from the request's byte offsets.
 
 ### Eligibility: which clients can use this
 
-**Read this before enabling.** Widening requires that `range` is **absent** from the request's SigV4 `SignedHeaders`, because widening works by rewriting the upstream `Range` and rewriting a signed header invalidates the client's signature. The proxy has no credentials and cannot re-sign, so this is a hard constraint, not a tuning choice.
+Widening requires that `range` is absent from the request's SigV4 `SignedHeaders`. Widening works by rewriting the upstream `Range`, and rewriting a signed header breaks the client's signature. The proxy has no credentials and cannot sign again, so this is a hard constraint, not a tuning choice.
 
-The AWS CLI and every official AWS SDK (botocore/boto3, Java, JS v3, Rust, Go v2) sign `Range` — see [Which clients sign Range?](#which-clients-sign-range) for the full breakdown. **A workload made up exclusively of those clients gets no widening at all**, and gets no error saying so: every request falls through to the ordinary un-widened range path and increments `page_cache.skipped_signed_range`.
+The AWS CLI and every official AWS SDK (botocore and boto3, Java, JavaScript v3, Rust, Go v2) sign `Range`; [Which clients sign Range?](#which-clients-sign-range) has the full list. A workload made up only of those clients gets no widening at all, and no error says so: every request goes through the ordinary unwidened range path and increments `page_cache.skipped_signed_range`.
 
-Widening is therefore useful for:
+Widening is useful for:
 
-- **Presigned-URL access patterns** — video streaming with browser range-seeking, PDF viewers, columnar readers fetching via presigned URLs issued by a backend. A presigned URL signs via query-string parameters, so no `SignedHeaders` list containing `range` exists.
-- **rclone** — uses its own SigV4 implementation signing a minimal header set.
-- **Custom HTTP clients** that add `Range` after signing, or sign only the minimum required headers.
+- **Presigned-URL access**: video streaming with browser range-seeking, PDF viewers, and columnar readers fetching through presigned URLs issued by an application server. A presigned URL that lists `range` in `X-Amz-SignedHeaders` is not widened, and one that does not list it is.
+- **rclone**, which uses its own SigV4 implementation that signs a minimal header set.
+- **Custom HTTP clients** that add `Range` after signing, or sign only the required headers.
 
-Note what this excludes: Spark, Hadoop, Hive, Trino, Flink, `aws s3 cp`, `aws s3api get-object --range`, s5cmd, and Mountpoint. Columnar data read through any of those does not qualify, despite being the access shape the mechanism was designed around.
+It excludes Spark, Hadoop, Hive, Trino, Flink, `aws s3 cp`, `aws s3api get-object --range`, s5cmd and Mountpoint. Columnar data read through any of those does not qualify, although it is the access pattern the mechanism was designed around.
 
 ### Off by default, per-key opt-in
 
-Widening is **never enabled globally** and **off unless a `cache_rules.json` rule explicitly turns it on** for matching keys, via the `page_widening` and `page_size` rule fields (see [Cache Rules](CACHING.md#cache-rules) and [CONFIGURATION.md](CONFIGURATION.md#cache-rules)):
+Widening is never enabled globally. It is off unless a `cache_rules.json` rule turns it on for matching keys with the `page_widening` and `page_size` rule fields (see [Cache rules](CACHING.md#cache-rules) and the [rules file format](CONFIGURATION.md#cache-rules)):
 
 ```json
 { "pattern": "**/*.parquet", "page_widening": true, "page_size": 16777216 }
 ```
 
-- `page_widening` (bool, default `false`): enables widening for keys the rule matches.
-- `page_size` (bytes, default `16777216` = 16 MiB when the rule enables widening without specifying it): the fixed page size `P` for the grid, in bytes. Must be `> 0` and `<= 67108864` (64 MiB) — the RAM admission ceiling described below.
+- `page_widening` (bool, default `false`): turns widening on for the keys the rule matches.
+- `page_size` (bytes, default `16777216`, which is 16 MiB, when the rule enables widening without setting it): the page size `P` of the grid. It must be greater than 0 and at most `67108864` (64 MiB), the RAM admission ceiling described below. That check binds a rule that enables widening. A rule that sets only `page_size` is not rejected, so a widened key that matches both rules can inherit an out-of-range value. Such a value is clamped to 64 MiB, and an inherited `page_size: 0` resolves to the 16 MiB default. The rules file still loads, and each clamp logs a warning naming the rule's index; lower the value to silence it.
 
 ### Operator warning: amplification is workload-dependent
 
-Widening every small read to a full page is a large win when reads **cluster** within pages (columnar scans, footers) and a real **cost** when reads are **scattered** — a 4 KiB random read against a key with a 16 MiB page size becomes a 16 MiB fetch. Only enable `page_widening` for key patterns whose access pattern clusters reads within pages.
+Widening every small read to a full page pays off when reads cluster within pages, as in columnar scans and footer reads. It costs real transfer when reads are scattered: a 4 KiB random read against a key with a 16 MiB page size becomes a 16 MiB fetch. Enable `page_widening` only for key patterns whose reads cluster within pages.
 
 ### Mechanism
 
-A request is eligible for widening only when: the rule's `page_widening` is `true` for the key, the method is `GET` with a byte `Range` header, the requested length is smaller than `P`, the `Range` is not part of the request's SigV4 signed headers (a Signed_Range is forwarded unmodified — its bytes cannot be safely rewritten), and the request does not carry a `partNumber` query parameter (served by the separate part-caching path, unaffected by widening).
+A request is widened only when all of these hold:
+
+- the matching rule sets `page_widening: true` for the key;
+- the method is `GET` with a byte `Range` header, and the requested length is less than `P`;
+- `range` is not signed, either in the `Authorization` header's `SignedHeaders` or in a presigned URL's `X-Amz-SignedHeaders`. A signed `Range` is forwarded unmodified, because its bytes cannot be rewritten safely;
+- the request carries no `partNumber` query parameter. Part requests take the separate part path, which widening does not affect.
 
 For an eligible request:
 
-1. The requested byte range is mapped to the **Page(s)** it overlaps on a fixed grid anchored at offset 0: `page_index = floor(start / P)`, `page = [page_index * P, page_index * P + P - 1]`, clamped to the object's last byte on the final page. A request landing near a page boundary overlaps two Pages.
-2. A `Range: bytes=-N` suffix request is converted to its absolute range once the object size is known (from cached metadata) and then mapped to overlapping Page(s) the same way — never widened to a single fixed "last page", since that could be smaller than the requested suffix. When the size is not yet known, the proxy issues `bytes=-P` instead (a superset of the requested bytes, end-anchored but not grid-aligned); once the size is learned, later suffix reads take the grid-aligned path.
-3. Conditional range requests (`If-Range`, or `If-Match`/`If-None-Match` accompanying a `Range`) are widened the same way. A `206` response is sliced to the client's original sub-range and the Page is cached; a `304`, `412`, or `200`-full response (condition not met) is passed through to the client unchanged — it is never sliced or treated as a cacheable Page.
-4. **Only genuinely missing, not-in-flight bytes are fetched** — the proxy never re-requests bytes it already holds or bytes another in-flight fetch is already retrieving for the same Page (coalesced via the same in-flight tracker used for other cache misses). When a request overlaps two Pages, each Page is fetched independently and **concurrently**, never sequentially — parallelizing across S3 connections rather than merging into one larger request.
-5. If the widened/Page fetch fails (error status or network error), the proxy retries the client's original, un-widened range, serves it normally, and skips caching for that request — widening never turns a request that would otherwise succeed into a failure.
-6. The client always receives exactly the bytes it requested: a `206 Partial Content` response with `Content-Range`/`Content-Length` computed against its original request, sliced from the widened Page data.
+1. The requested range is mapped to the page or pages it overlaps on a fixed grid anchored at offset 0. The page index is `floor(start / P)`, and the page is `[page_index * P, page_index * P + P - 1]`, clamped to the object's last byte on the final page. A request near a page boundary overlaps two pages.
+2. A suffix request (`Range: bytes=-N`) is converted to its absolute range once the object size is known from cached metadata, then mapped to the pages it overlaps the same way. It is never widened to a single fixed "last page", which could be smaller than the requested suffix. When the size is not yet known, the proxy requests `bytes=-P` instead, which covers the requested bytes and ends at the object's end but is not aligned to the grid. Once the size is known, later suffix reads take the aligned path.
+3. A range request with a conditional that S3 must evaluate is not widened. By default that is every conditional; with `evaluate_conditions_from_cache`, it is anything other than an `If-Match` or `If-Range` naming the cached ETag. Such a request is forwarded with the client's own range, and S3's response is returned unchanged. In that mode, an `If-Match` or `If-Range` that matches the cached ETag is widened like an unconditional request. A `206` response is sliced to the client's original range and the page is cached. A `200` with the full object is passed through unchanged, and is never sliced or cached as a page.
+4. The proxy fetches only bytes it does not hold and that no in-flight fetch for the same page is already retrieving; such fetches share the in-flight tracker used for other cache misses. When a request overlaps two pages, each page is a separate fetch. The pages are filled one at a time, each released before the next is filled, so at most one page is held in memory. A page's RAM promotion finishes before the next page is loaded, and only the last page's promotion runs after the response is returned. A cold read that straddles two pages therefore pays two upstream round trips in sequence, where one merged request would pay one.
+5. If the page fetch fails, with an error status or a network error, the proxy retries the client's original range, serves it normally and skips caching for that request. Widening never turns a request that would otherwise succeed into a failure.
+6. The client always receives exactly the bytes it requested: a `206 Partial Content` response whose `Content-Range` and `Content-Length` match its original request, sliced from the page.
 
 ### Disk footprint
 
-A page is stored through the same range-store path as any other cached range — there is no new on-disk format, and it composes with the existing range-merge/consolidation logic. However, enabling `page_widening` for a key means a single small read caches an entire page rather than only the requested bytes, **increasing per-object disk footprint** for that key relative to unwidened range caching. Size the disk cache (`max_cache_size`) with this in mind for keys where widening is enabled.
+A page is stored through the same range-store path as any other cached range, with no separate on-disk format, and it works with the existing range merging and consolidation. A single small read on a widened key caches a whole page, though, not only the requested bytes, so widening increases the disk space each object takes. Size `max_cache_size` with that in mind for the keys where widening is on.
 
-### RAM cache uses the Page as its unit
+### RAM cache uses the page as its unit
 
-When widening is enabled for a key, the RAM cache stores and looks up data by the containing Page's bounds, not the client's requested sub-range — a sub-page read is served by looking up the deterministic containing Page and slicing the requested bytes from it. Promotion to RAM (whether from a disk hit or, for the Page path, only on a subsequent disk-hit read rather than the initial cold fetch) promotes the whole Page. RAM cache heat (access recency/frequency) is recorded against the whole Page, so any sub-page hit keeps the entire Page resident. When widening is **not** enabled for a key, RAM caching remains per-range exactly as before.
+When widening is on for a key, the RAM cache stores and looks up data by the containing page's bounds, not by the client's requested range. A read inside a page looks up that page and slices the requested bytes from it. Promotion to the RAM cache promotes the whole page. On the page path, a page is promoted on a later disk hit, not on the cold fetch that first cached it. Each page is written to the RAM cache once per read, including a page stored as one extent, and only when its ETag is known. A page assembled from several cached extents is held in RAM as the page alone; the extents it was read from are not promoted under their own keys. RAM cache recency and frequency are recorded against the whole page, so any hit inside the page keeps the entire page resident. When widening is off for a key, the RAM cache works per range.
 
-**64 MiB RAM admission ceiling.** The proxy unconditionally guarantees that any single RAM cache entry up to a hardcoded 64 MiB (`RAM_CACHE_ADMISSION_CEILING = 67108864` bytes, a compile-time constant, not a config field) is admitted rather than silently dropped — regardless of whether page-aligned range caching is used for any key. It does this by clamping the effective number of RAM cache shards so `max_ram_cache_size / effective_shard_count >= 64 MiB`, logging a warning when the clamp reduces concurrency below the configured `ram_cache_shard_count`. See [CONFIGURATION.md — RAM Sizing and the Admission Ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling) for the sizing guidance and shard-clamp formula, and [`config/config.example.yaml`](../config/config.example.yaml) for a worked example.
+The RAM cache admits any single entry up to 64 MiB (67,108,864 bytes, a compile-time constant rather than a configuration field), whether or not any key uses page widening. It does so by clamping the effective number of RAM cache shards so that `max_ram_cache_size / effective_shard_count` is at least 64 MiB, and logs a warning when the clamp reduces concurrency below the configured `ram_cache_shard_count`. See [RAM sizing and the admission ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling) for the sizing guidance and the clamp formula, and the [example configuration](../config/config.example.yaml) for a worked example.
 
 ### Coalescing and coherency
 
-Concurrent small reads that overlap the same Page on the same instance are coalesced onto a single upstream fetch — the in-flight fetch is keyed on the Page's bounds, not the client's requested sub-range — and served from the resulting cached Page. Cached Pages use the object's normal, object-level `get_ttl`; there is no separate per-Page TTL, so all Pages of an object expire together and an ETag/version mismatch purges the whole object, cached Pages included, exactly like any other cached range.
+Concurrent small reads that overlap the same page on one proxy share one upstream fetch, keyed on the page's bounds rather than the client's requested range, and are served from the resulting cached page. Cached pages use the object's normal `get_ttl`; there is no separate TTL per page. All the pages of an object therefore expire together, and an ETag or version mismatch removes the whole object, cached pages included, like any other cached range.
 
-### Metrics
+### Page cache metrics
 
-Widening exposes the following counters (see [Monitoring](#observing-range-merge-efficiency) and the dashboard):
+These counters are under `page_cache` in `/metrics` and on the [dashboard](DASHBOARD.md); [`page_cache`](METRICS_REFERENCE.md#page_cache) is the field reference.
 
 | Metric | Meaning |
 |---|---|
-| `page_cache.widened_requests` | Small reads widened to a Page fetch |
-| `page_cache.bytes_prefetched` | Bytes fetched beyond what the client requested (plus a derived amplification ratio) |
-| `page_cache.page_hits` | Small reads served from an already-cached Page with no S3 fetch |
-| `page_cache.skipped_signed_range` | Requests that would otherwise be eligible but were left unmodified because the Range was signed (expected for AWS CLI/SDK traffic; see [Eligibility](#eligibility-which-clients-can-use-this)) |
-| `page_cache.fallbacks` | Widened/Page fetches that failed and fell back to the client's original range |
-| `page_cache.ram_page_promotions` | Pages successfully promoted to the RAM cache |
-| `page_cache.ram_page_promotion_skipped` | Pages not promoted to RAM (e.g. exceeded the applicable RAM budget) |
+| `page_cache.widened_requests` | Small reads widened to a page fetch |
+| `page_cache.bytes_prefetched` | Bytes fetched beyond what clients requested, with a derived amplification ratio |
+| `page_cache.page_hits` | Small reads served from an already cached page, with no S3 fetch |
+| `page_cache.skipped_signed_range` | Requests that were otherwise eligible but left unmodified because their `Range` was signed. Expected for AWS CLI and SDK traffic; see [Eligibility](#eligibility-which-clients-can-use-this) |
+| `page_cache.fallbacks` | Widened requests served with the client's original range from S3 instead: the page fetch failed or did not cover the requested bytes, the pages could not be shown to belong to one version of the object, or the object's length was not yet known |
+| `page_cache.ram_page_promotions` | Pages promoted to the RAM cache |
+| `page_cache.ram_page_promotion_skipped` | Pages not promoted to the RAM cache, for example because they exceeded the RAM budget |
 
-A widened request is also logged at `DEBUG` with the cache key, the original requested range, and the widened Page range.
+A widened request is also logged at `DEBUG` with the cache key, the requested range and the page range.
 
 ### Non-goals
 
-The proxy never parses object content (no Parquet/ORC footer, Thrift metadata, or magic-byte parsing) — every decision is based on request metadata only (the key's glob match and byte offsets/lengths). There is no chunk prediction, no widening of reads already `>= P`, and no cross-instance coordination of Page fetches.
+The proxy never parses object content: no Parquet or ORC footer, Thrift metadata or magic-byte parsing. Every decision uses request metadata only, meaning the key's pattern match and the byte offsets and lengths. There is no prediction of which chunks come next, no widening of reads already at least `P` long, and no coordination of page fetches between proxies.
 
-## Cache Coherency on the Read Path
+## Cache coherency on the read path
 
-Two checks run before cached bytes are served, both of which can invalidate cache rather
-than serve stale data.
+Two checks run before cached bytes are served. Either can invalidate the cache rather than serve stale data.
 
-## Full Object Range Replacement
+### Full object range replacement
 
-When a full object is successfully cached, the proxy automatically invalidates all existing partial ranges for that object to prevent serving stale data.
+When the proxy caches a full object, it removes every existing partial range of that object, so a range from a previous version cannot be served beside the new object:
 
-**How It Works:**
+1. It removes all existing range files for the cache key.
+2. It updates the object's metadata to list only the full object.
+3. It does both under the key's metadata lock.
 
-1. **Range Invalidation**: When caching a full object, all existing range files for that cache key are removed
-2. **Metadata Cleanup**: Object metadata is updated to reflect only the full object, removing references to deleted ranges
-3. **Atomic Operations**: Range cleanup and metadata updates use proper locking to ensure consistency
-4. **Logging**: All range invalidation events are logged with details of affected ranges
-
-**Example Scenario:**
-```
-Existing cache: object.bin ranges 0-8MB, 16-24MB, 32-40MB (partial coverage)
-Client uploads new version via PUT → Full object cached as range 0-50MB
-Action: Invalidate all existing ranges (0-8MB, 16-24MB, 32-40MB)
-Result: Only full object 0-50MB remains in cache
+```text
+Existing cache: object.bin ranges 0-8 MiB, 16-24 MiB, 32-40 MiB
+A PUT of a new version caches the full object as range 0-50 MiB
+The proxy removes ranges 0-8 MiB, 16-24 MiB and 32-40 MiB
+Only the full object, 0-50 MiB, remains
 ```
 
-**Benefits:**
-- Prevents serving stale partial ranges from previous object versions
-- Ensures range requests are served from current full object data
-- Maintains cache consistency across concurrent operations
+### ETag validation for range requests
 
-## ETag Validation for Range Requests
+Ranges carry no ETag of their own: the object's ETag in its `.meta` covers every cached range. When the caller of the range lookup already knows the object's current ETag, from S3 or from a fresher metadata read, the lookup compares it with the cached ETag before returning coverage:
 
-Range requests validate cached range ETags against cached object metadata ETags before serving from cache.
+1. **Comparison**: the current ETag is compared with the cached object ETag, ignoring one balanced pair of quotes on either side.
+2. **Mismatch**: every cached range for the key is invalidated, on disk and in RAM, and the range is reported missing so it is fetched from S3.
+3. **No current ETag**: when the caller has none, no comparison is made, and the TTL checks decide freshness.
+4. **No metadata**: there is nothing to compare, and the range is treated as missing.
 
-**How It Works:**
-
-1. **ETag Comparison**: Before serving cached ranges, compare range ETag with object metadata ETag
-2. **Mismatch Handling**: If ETags don't match, invalidate all cached ranges and forward request to S3
-3. **Orphaned Range Cleanup**: If no object metadata exists for ranges, invalidate orphaned ranges
-4. **Logging**: All ETag validation results and actions are logged for monitoring
-
-**Validation Flow:**
-```
-Range Request → Check cached ranges exist
-             → Get object metadata ETag
-             → Compare range ETag with object ETag
-             → Match: Serve from cache
-             → Mismatch: Invalidate ranges, forward to S3
-             → No metadata: Cleanup orphaned ranges, forward to S3
+```text
+Range request -> read the cached .meta (or use the caller's preloaded copy)
+              -> current ETag known?
+                   match:    continue with the cached coverage
+                   mismatch: invalidate all ranges, fetch from S3
+              -> no .meta:   the range is missing, fetch from S3
 ```
 
-**Example Scenarios:**
+A mismatch logs, for example:
 
-**ETag Match (Serve from Cache):**
-```
-Cached range: 0-8MB, ETag="abc123"
-Object metadata: ETag="abc123"
-Action: Serve range from cache (ETags match)
+```text
+INFO ETag validation failed: invalidated 3 stale ranges for cache_key=bucket/object.txt, cached_etag="abc123", current_etag="def456"
 ```
 
-**ETag Mismatch (Invalidate and Forward):**
-```
-Cached range: 0-8MB, ETag="abc123" (from old version)
-Object metadata: ETag="def456" (from new version)
-Action: Invalidate cached range, forward request to S3
-Log: "ETag validation failed: range_etag=abc123, object_etag=def456, range is stale"
-```
+### Metadata consistency
 
-**Orphaned Ranges (Cleanup):**
-```
-Cached range: 0-8MB, ETag="abc123"
-Object metadata: Not found
-Action: Remove orphaned range, forward request to S3
-Log: "Cleaning up orphaned ranges for cache_key: /bucket/object.txt"
-```
+The proxy keeps range files and object metadata consistent:
 
-## Metadata Consistency
+- Metadata updates write a temporary file and rename it into place.
+- An exclusive lock on the key prevents concurrent changes during an update.
+- Removing range files and updating the metadata happen together: invalidating ranges removes them from the metadata, a new version updates the object's metadata, and removed ranges are tracked so the two stay consistent.
+- Failed operations are logged and retried in the background.
 
-The proxy maintains consistency between range files and object metadata through atomic operations and proper locking.
+### Coherency error handling
 
-**Consistency Mechanisms:**
+- **Corrupt metadata**: detected, and the affected entries are invalidated.
+- **Missing range file**: handled as described in [Error handling and fallback](#error-handling-and-fallback).
+- **Lock contention**: a contended metadata lock is retried a bounded number of times, and the request then falls back instead of waiting indefinitely. There is no elapsed-time limit on the retries.
+- **Cleanup failures**: logged, and requests keep being served.
 
-1. **Atomic Updates**: Metadata updates use temporary files and atomic renames
-2. **File Locking**: Exclusive locks prevent concurrent modifications during updates
-3. **Cleanup Coordination**: Range file removal and metadata updates are coordinated
-4. **Error Recovery**: Failed operations are logged and retried in background
-
-**Metadata Operations:**
-- **Range Invalidation**: Update metadata to remove references to deleted ranges
-- **ETag Updates**: Update object metadata when new versions are cached
-- **Cleanup Tracking**: Track which ranges have been removed for consistency
-
-## Error Handling and Fallback
-
-Cache coherency operations include comprehensive error handling to ensure clients always receive correct data.
-
-**Error Scenarios and Responses:**
-
-1. **Metadata Corruption**: Detect corrupted metadata files and invalidate affected entries
-2. **Range File Missing**: Handle cases where metadata references non-existent range files
-3. **Lock Timeout**: Gracefully handle lock acquisition failures with fallback behavior
-4. **Cleanup Failures**: Log cleanup errors and continue serving requests
-
-**Fallback Behavior:**
-- When cache coherency operations fail, requests are forwarded directly to S3
-- Clients always receive correct data even if cache operations fail
-- Failed operations are retried in background where possible
+When a coherency operation fails, the request is forwarded to S3, so the client still receives correct data, and the failed operation is retried in the background where possible.
 
 ### Coherency log lines
 
-```
-INFO Range invalidation for full object: cache_key=bucket/object.txt, 
-     ranges_removed=3, size_freed=25165824
-
-INFO ETag validation failed: cache_key=bucket/object.txt, 
-     range_etag=abc123, object_etag=def456, range is stale
-
-INFO Cleaning up orphaned ranges for cache_key: /bucket/object.txt, 
-     ranges_removed=2, size_freed=16777216
-
-WARN Metadata corruption detected: cache_key=bucket/object.txt, 
-     error="Invalid JSON", action="invalidated entry"
+```text
+WARN ETag mismatch detected for cache_key: bucket/object.txt, cached_etag: "abc123",
+     current_etag: "def456", action: invalidating stale ranges
+INFO ETag validation failed: invalidated 3 stale ranges for cache_key=bucket/object.txt,
+     cached_etag="abc123", current_etag="def456"
 ```
 
-### Coherency performance
+### Coherency cost and metrics
 
-### Performance Impact
+ETag validation sends no S3 request of its own. Range cleanup is batched and runs in the background without blocking requests.
 
-Cache coherency operations are designed to have minimal performance impact:
+Two counters observe these operations: `cache.cache_etag_mismatches_total` and `cache.cache_range_invalidations_total` (see [`cache`](METRICS_REFERENCE.md#cache)). `cache.cache_etag_validations_total` and `cache.cache_orphaned_ranges_cleaned_total` are published but always zero: nothing outside the metrics module's own tests writes them, so neither says anything about this path.
 
-**Operation Performance:**
-- ETag validation: < 1ms (metadata-only comparison)
-- Range invalidation: 10-50ms (depending on number of ranges)
-- Metadata updates: < 10ms (atomic file operations)
-- Lock operations: < 5ms (filesystem-based locks)
+## Signed range request handling
 
-**Optimization Features:**
-- ETag validation uses only cached metadata (no S3 requests)
-- Range cleanup is batched for efficiency
-- Background cleanup doesn't block request serving
-- Lock timeouts prevent indefinite blocking
+When a client signs a GET with AWS Signature Version 4 (SigV4), the `Range` header is in the `SignedHeaders` list if it was present at signing time. The proxy then cannot change it: rewriting `Range` to fetch only the missing bytes would invalidate the signature, and S3 would return `403 Forbidden`.
 
-The counters for these operations are `cache.cache_etag_validations_total`,
-`cache.cache_etag_mismatches_total`, `cache.cache_range_invalidations_total`, and
-`cache.cache_orphaned_ranges_cleaned_total` — see
-[METRICS_REFERENCE.md](METRICS_REFERENCE.md#cache).
+### Which clients sign Range?
 
-## Signed Range Request Handling
+The AWS CLI and all official AWS SDKs (botocore and boto3, Java, JavaScript v3, Rust, Go v2) sign every header that is not on botocore's internal blocklist. `Range` is not on it, so any request made through an official AWS SDK or the CLI with a `Range` header has `Range` signed. That includes:
 
-### Overview
+- `aws s3api get-object --range`;
+- `aws s3 cp`, whose CRT parallel downloads sign `Range` and `If-Match` on each ranged part;
+- s5cmd, which uses the AWS SDK for Go v2;
+- Mountpoint for Amazon S3, which uses the CRT's `auto_ranged_get` and signs `Range` internally.
 
-When clients sign GET requests with AWS Signature Version 4 (SigV4), the Range header is included in the SignedHeaders list if it was present at signing time. This creates a challenge for the proxy: modifying the Range header to fetch only missing cache portions would invalidate the signature, causing S3 to return 403 Forbidden errors.
+Clients that usually do not sign `Range`:
 
-#### Which clients sign Range?
+- **Presigned URLs with `Range` added at request time**: the signature was computed before the header existed, so `range` is not in `X-Amz-SignedHeaders`. A presigned URL generated with a `Range` parameter, as aws-sdk-js v2's `getSignedUrl` can, does sign it.
+- **curl, wget and other HTTP clients** using presigned URLs.
+- **rclone**, which uses its own SigV4 implementation and signs only `host` and the `x-amz-*` headers.
+- **Older MinIO Go clients**, with a similarly minimal `SignedHeaders` set.
 
-The AWS CLI and all official AWS SDKs (botocore/boto3, Java SDK, JS SDK v3, Rust SDK, Go SDK v2) sign every header not on botocore's internal blocklist. Range is not on that blocklist, so **any request made through an official AWS SDK or CLI with a Range header will have Range signed**. This includes:
+The proxy checks every request, parsing the `SignedHeaders` field of the `Authorization` header or the `X-Amz-SignedHeaders` query parameter of a presigned URL, so it handles signed and unsigned `Range` without configuration.
 
-- `aws s3api get-object --range`
-- `aws s3 cp` (CRT parallel downloads sign Range + If-Match on each ranged part)
-- s5cmd (uses Go AWS SDK v2)
-- Mountpoint for Amazon S3 (uses CRT `auto_ranged_get`, which signs Range internally)
+### How signed ranges are served
 
-Clients that typically do **not** sign Range:
+A request is treated as a signed range request when:
 
-- **Presigned URLs with Range added at request time** — the signature was computed before the Range header was added, so Range is not in SignedHeaders
-- **curl / wget / custom HTTP clients** using presigned URLs
-- **rclone** — uses its own SigV4 implementation that signs a minimal header set (host + x-amz-* headers)
-- **Older MinIO Go client** — similar minimal SignedHeaders set
+- it has an `Authorization` header using `AWS4-HMAC-SHA256` (SigV4) or `AWS4-ECDSA-P256-SHA256` (SigV4A), or is a presigned URL;
+- its `SignedHeaders` (the `Authorization` header's, or a presigned URL's `X-Amz-SignedHeaders`) includes `range`;
+- the requested range has cache gaps: it is partly cached or not cached at all.
 
-The proxy detects which case applies on every request by parsing the `SignedHeaders` field in the Authorization header, so it handles both signed and unsigned Range transparently.
+A fully cached range is served from the cache whether or not `Range` is signed. Otherwise:
 
-### How It Works
+1. The proxy checks whether `range` is among the signed headers. The check runs only when the range has cache gaps.
+2. If it is, the proxy forwards the original request to S3 as received, plus one `Via` entry. Every signed header is forwarded exactly as received; the proxy adds only unsigned headers (`Via`, and `Referer` when enabled).
+3. The response streams to the client at once, with no buffering, and is cached in the background without delaying the client. A cache failure does not affect the response.
+4. Later requests for the same range are served from the cache with no S3 request.
 
-The proxy detects signed range requests and handles them specially:
+The first request fetches the full range from S3, the same as an unsigned cache miss.
 
-1. **Detection**: When a range request has cache gaps, the proxy checks if the Range header is included in the AWS SigV4 signature's SignedHeaders list
-2. **Forwarding**: If the range is signed, the entire original request is forwarded to S3 unchanged (preserving signature validity)
-3. **Caching**: The response is cached while streaming to the client
-4. **Subsequent Requests**: Future requests for the same range are served from cache
+## Part caching
 
-### Request Flow
+The request-level behavior is described under [Part number cache](#part-number-cache). This section covers how part ranges are recorded.
 
-```
-Client Request (Signed Range)
-    ↓
-Check Cache Coverage
-    ↓
-┌─────────────────────────────┐
-│ Fully Cached?               │
-│ Yes → Serve from cache      │──→ Response to Client
-│ No  → Continue              │
-└─────────────────────────────┘
-    ↓
-Parse Authorization Header
-    ↓
-┌─────────────────────────────┐
-│ Range in SignedHeaders?     │
-│ No  → Standard logic        │──→ Fetch missing ranges only
-│ Yes → Signed range handling │
-└─────────────────────────────┘
-    ↓
-Forward Entire Range to S3
-    ↓
-Stream Response to Client
-    ↓
-Cache Response for Future Requests
+### Part range storage
+
+When a GET with a `partNumber` parameter returns from S3, the proxy:
+
+1. parses the `Content-Range` header (for example `bytes 0-8388607/5368709120`);
+2. stores the exact `(start, end)` byte range in `part_ranges` for that part number;
+3. updates `parts_count` from the `x-amz-mp-parts-count` header when present;
+4. saves the updated metadata to disk.
+
+Later requests for the same part number use the stored range to look it up in the cache.
+
+### CompleteMultipartUpload handling
+
+At multipart completion, the proxy:
+
+1. parses the `CompleteMultipartUpload` XML request body;
+2. reads the list of requested parts and their ETags;
+3. checks each cached part's ETag against the request's, with quotes removed from both;
+4. builds `part_ranges` from the requested parts, with cumulative byte offsets;
+5. deletes cached parts that the completion request does not list.
+
+An ETag mismatch skips cache finalization; the request is still forwarded to S3. Part caching is automatic and needs no configuration.
+
+## Download coordination
+
+Download coordination, or coalescing, prevents redundant S3 fetches when several concurrent requests arrive for the same uncached object. One request fetches from S3 while the others wait, and then they are all served from the cache.
+
+```text
+Request 1 (cache miss) -> registers as the fetcher -> fetches from S3 -> caches -> completes
+Request 2 (cache miss) -> registers as a waiter   -> waits for the fetcher -> served from the cache
+Request 3 (cache miss) -> registers as a waiter   -> waits for the fetcher -> served from the cache
 ```
 
-### Key Behaviors
-
-- **Signature Preservation**: All request headers are forwarded exactly as received
-- **Streaming**: Responses are streamed to clients immediately (no buffering)
-- **Background Caching**: Cache writes happen asynchronously without blocking the client
-- **Error Resilience**: Cache failures don't affect client responses
-
-### When This Applies
-
-Signed range requests are detected when:
-- The request has an `Authorization` header with `AWS4-HMAC-SHA256`
-- The `SignedHeaders` parameter includes `range`
-- There are cache gaps (partial or complete cache miss)
-
-### Performance Considerations
-
-- **First Request**: Full range is fetched from S3 (same as unsigned request with cache miss)
-- **Subsequent Requests**: Served entirely from cache (no S3 request)
-- **Overhead**: Minimal - signature detection only happens when cache gaps exist
-
-## Part Caching
-
-### Overview
-
-The proxy caches multipart object parts with exact byte range tracking. Each part's byte range is stored in `ObjectMetadata.part_ranges`, enabling accurate cache lookups for objects with variable-sized parts.
-
-### Part Range Storage
-
-When a GET request with `partNumber` parameter returns from S3, the proxy:
-
-1. Parses the `Content-Range` header (e.g., `bytes 0-8388607/5368709120`)
-2. Stores the exact `(start, end)` byte range in `part_ranges` for that part number
-3. Updates `parts_count` from the `x-amz-mp-parts-count` header if present
-4. Saves the updated metadata to disk
-
-Subsequent requests for the same part number use the stored range for cache lookup.
-
-### CompleteMultipartUpload Handling
-
-During multipart upload completion:
-
-1. The proxy parses the `CompleteMultipartUpload` XML request body
-2. Extracts the list of requested parts with their ETags
-3. Validates cached part ETags against request ETags (normalized, quotes removed)
-4. Builds `part_ranges` from filtered parts with cumulative byte offsets
-5. Deletes unreferenced cached parts (parts not in the completion request)
-
-ETag mismatches cause cache finalization to be skipped (request still forwarded to S3).
-
-### Configuration
-
-Part caching is automatic and requires no configuration. Part ranges are stored in the standard metadata format.
-
-## Download Coordination
-
-### Overview
-
-Download coordination (coalescing) prevents redundant S3 fetches when multiple concurrent requests arrive for the same uncached resource. Only one request fetches from S3 while others wait, then all serve from cache.
-
-### How It Works
-
-```
-Request 1 (cache miss) → Registers as Fetcher → Fetches from S3 → Caches → Completes
-Request 2 (cache miss) → Registers as Waiter → Waits for Fetcher → Serves from cache
-Request 3 (cache miss) → Registers as Waiter → Waits for Fetcher → Serves from cache
-```
-
-The `InFlightTracker` uses a `DashMap` to track in-flight fetches by key. The first request for a key becomes the Fetcher; subsequent requests become Waiters.
+The proxy tracks in-flight fetches by key: the first request for a key becomes the fetcher, and later requests become waiters. Coordination is per proxy.
 
 ### Scope
 
-Coalescing covers three request types, each with independent flight keys:
+Coalescing covers three request types, each with its own key:
 
-| Request Type | Flight Key Format | Example |
+| Request type | Key format | Example |
 |---|---|---|
 | Full object GET | `"{cache_key}"` | `"my-bucket/path/to/file.txt"` |
 | Range request | `"{cache_key}:{start}-{end}"` | `"my-bucket/path/to/file.txt:0-8388607"` |
 | Part number request | `"{cache_key}:part{N}"` | `"my-bucket/path/to/file.txt:part2"` |
 
-Different request types for the same object proceed independently — a full-object GET does not block a range request for the same object.
+Different request types for the same object proceed independently: a full-object GET does not block a range request for the same object.
 
-### Waiter Behavior
+### Waiter behavior
 
-Waiters wait up to `wait_timeout_secs` for the Fetcher to complete:
+A waiter waits up to `wait_timeout_secs` for the fetcher to finish:
 
-- **Fetcher succeeds**: Waiters try the cache first (the fetcher should have cached the data). If the cache hit succeeds, the response is served directly from disk or RAM — no S3 request. If the cache lookup misses (e.g., metadata not yet consolidated), the waiter falls back to its own S3 fetch.
-- **Fetcher fails**: Waiters fall back to their own S3 fetch
-- **Timeout**: Waiters fall back to their own S3 fetch
-
-In testing with 100 concurrent clients, the cache-first waiter path reduced S3 data transfer by 88% compared to the naive approach of always re-fetching from S3 (6.3 GB from S3 vs 53.8 GB without the optimization, serving 137 GB to clients).
-
-### Configuration
+- **The fetcher succeeds**: the waiter tries the cache first, since the fetcher should have cached the data. On a hit, it serves the response from disk or RAM with no S3 request. If the lookup misses, for example because the metadata is not yet consolidated, it makes its own S3 fetch.
+- **The fetcher fails**: the waiter makes its own S3 fetch.
+- **The wait times out**: the waiter makes its own S3 fetch.
 
 ```yaml
 cache:
   download_coordination:
-    enabled: true           # Enable/disable coalescing (default: true)
-    wait_timeout_secs: 30   # Waiter timeout in seconds (default: 30, range: 5-120)
+    enabled: true           # Turn coalescing on or off (default: true)
+    wait_timeout_secs: 30   # Waiter timeout in seconds (default: 30, clamped to 5-120)
 ```
 
-### Metrics
+### Coalescing metrics
 
-Download coordination exposes metrics via `/metrics`:
+`/metrics` reports download coordination under `coalescing` (see [`coalescing`](METRICS_REFERENCE.md#coalescing)):
 
 | Metric | Description |
 |--------|-------------|
-| `waits_total` | Total waiter registrations |
-| `cache_hits_after_wait_total` | Waiters that served from cache |
+| `waits_total` | Waiter registrations |
+| `cache_hits_after_wait_total` | Waiters served from the cache |
 | `timeouts_total` | Waiters that timed out |
 | `s3_fetches_saved_total` | S3 fetches avoided by coalescing |
-| `average_wait_duration_ms` | Average waiter wait time |
+| `average_wait_duration_ms` | Average time a waiter waited |
 
-### When to Disable
+### When to disable it
 
-Disable download coordination if:
-- Single-instance deployment with no concurrent duplicate requests
-- Workload has unique requests (no duplicates)
-- Debugging cache behavior
+Consider turning download coordination off for a single proxy whose clients never send concurrent duplicate requests, for a workload with no repeated requests, or while debugging cache behavior.
 
-## Observing Range Merge Efficiency
+## Observing range merge efficiency
 
-**Range-merge efficiency is log-only.** There is no `range_merge.*` metric namespace in
-`/metrics`; the figures below come from application log lines.
-
-- May need longer TTLs
-- Check if workload is cache-friendly
-
-**Range Merge Efficiency**:
-
-With intelligent range merging, even partial cache hits provide significant benefits:
-
-- **100% efficiency**: All bytes served from cache (no S3 fetch)
-  - Common after multipart uploads
-  - Indicates excellent cache coverage
-  
-- **50-90% efficiency**: Majority of bytes from cache
-  - Significant bandwidth savings
-  - Faster than full S3 fetch
-  - Indicates good cache alignment
-  
-- **30-50% efficiency**: Moderate cache benefit
-  - Still reduces S3 bandwidth
-  - May indicate fragmented cache coverage
-  - Consider increasing cache size or adjusting access patterns
-  
-- **<30% efficiency**: Limited cache benefit
-  - Most bytes fetched from S3
-  - May indicate poor cache alignment with access patterns
-  - Consider adjusting `range_merge_gap_threshold`
-
-**Monitoring Range Merge Efficiency**:
+Range-merge efficiency is reported only in the logs: there is no `range_merge.*` section in `/metrics`, and the figures come from `debug`-level application log lines. See [Cache efficiency metrics](#cache-efficiency-metrics) for how to read the percentage.
 
 ```bash
-# View range merge operations in logs
-grep "Range merge completed" /logs/app/*/app.log
-
-
-
-**Monitoring:**
-```bash
-# Check cache efficiency in logs
-grep "Range merge completed" /logs/app/*/app.log | grep "cache_efficiency"
-
-# Expected output:
-# cache_efficiency=75.50%, bytes_from_cache=31457280, bytes_from_s3=10485760
-# cache_efficiency=100.00%, bytes_from_cache=104857600, bytes_from_s3=0
-
-# Check part caching operations
-grep "Part cache" /logs/app/*/app.log
-
-# Expected output:
-# Part cache HIT - serving from cache: cache_key=bucket/large-file.bin part_number=1
-# Part cache MISS - fetching from S3: cache_key=bucket/large-file.bin part_number=2
-# Part cached - stored as range: cache_key=bucket/large-file.bin part_number=2
+grep -h "Range merge succeeded" /logs/app/*/s3-proxy.log*  # Range merges and their efficiency (debug level)
+grep -hE "Part cache|Part cached|cache_type=\"?part_cache" /logs/app/*/s3-proxy.log*  # Part caching operations
 ```
 
-## See Also
+A merge line reads, for example, `Range merge succeeded: cache_key=bucket/large-file.bin, size=5242880 bytes, cache_efficiency=75.50%`. A part-cache miss logs `Part cache MISS: cache_key=…, part_number=…` and `Part cache MISS - fetching from S3`, both at `debug`. Storing a part logs `Part cached - stored as range` at `info`, and a hit logs `Cache operation completed` with `cache_result=HIT` and `cache_type=part_cache` at `debug`.
 
-- [CACHING.md](CACHING.md) — what gets cached, and what bypasses the cache
-- [CACHE_INTERNALS.md](CACHE_INTERNALS.md) — the on-disk and in-memory structures these paths read
-- [CACHE_FRESHNESS.md](CACHE_FRESHNESS.md) — TTL and conditional-request handling
-- [HEDGING.md](HEDGING.md) — racing a duplicate upstream fetch to cut tail latency
-- [MULTIPART_UPLOAD.md](MULTIPART_UPLOAD.md) — multipart cache internals
-- [METRICS_REFERENCE.md](METRICS_REFERENCE.md) — the `cache` and `page_cache` counters
+## Internals: lookup purpose and what authorizes a cached serve
+
+This section is for developers changing a read path.
+
+Every cache-coverage lookup states why it is asking, because the answer changes what an expired entry looks like. `RangeLookupPurpose` is a required argument of both `DiskCacheManager::find_cached_ranges` and `RangeHandler::find_cached_ranges`. It has no default, so a new call site has to choose.
+
+| Purpose | Past stored expiry | For callers that |
+|---|---|---|
+| `FreshServe` | returns no coverage | may serve what they get with no further freshness check |
+| `RevalidationCandidate` | returns coverage, marked `StoredFreshness::Expired` | evaluate freshness themselves before serving |
+
+At a call site, ask what bounds the staleness between this lookup and bytes reaching a client. A live-TTL verdict, a client validator or a successful `304` means `RevalidationCandidate`. Nothing but the lookup itself means `FreshServe`. If the answer is "nothing at all", the call site is a defect whichever purpose it names.
+
+`RevalidationCandidate` grants discovery, not permission, and `RangeOverlap` enforces that in its accessors rather than by convention:
+
+- `is_serveable_unvalidated()`: complete coverage and stored-fresh. Safe on its own.
+- `has_complete_coverage()`: coverage only. The caller must hold a separate authority and say which one.
+
+Serving expired bytes therefore always means reaching for the second accessor and writing down why it is allowed.
+
+### Which authority each cached serve holds
+
+| Read path | Purpose | What authorizes the serve |
+|---|---|---|
+| Full-object mainline GET | `RevalidationCandidate` | Mode B matching `If-Match`, a live-TTL `Fresh` verdict, or a `304` |
+| Range path, early full-object shortcut | `FreshServe` | A live-TTL `Fresh` verdict; when expired it falls through rather than serving |
+| Range path, range-specific lookup | `RevalidationCandidate` | A live-TTL `Fresh` verdict, or a `304` |
+| Page widening (`find_page_overlap`) | `FreshServe` | Stored expiry only, plus a live-TTL check once per request ahead of it; see below |
+| Part-scoped lookup (`?partNumber=N`) | `FreshServe` | A live-TTL `Fresh` verdict and stored expiry; an expired part revalidates with one conditional request (`304`) |
+| Post-`304` validated-serve helpers | `RevalidationCandidate` | The `304` itself; coverage is checked again, because a `304` proves the version, not the coverage |
+| Degraded coalescing fallbacks | `FreshServe` | Stored expiry and the live `get_ttl` verdict; never for `get_ttl: "0s"`. These run when S3 returned an error, so there is no validation to rely on |
+
+For page widening, `find_page_overlap` passes `FreshServe` and is bounded only by stored expiry. Its caller, `try_widened_range_request`, checks the currently resolved `get_ttl` against the object's live age (since it was cached or last confirmed by a `304`) once per request, before either widening branch runs. Checking once per page instead would multiply cache-volume reads by the page count and undo the point of widening. On expiry it returns `None` and hands the request to the unwidened path's own revalidation, rather than running a second conditional-request flow. An already cached widened key therefore honors a tightened or zeroed `get_ttl` on its next request, the same guarantee the mainline GET paths give.
+
+The RAM cache check in `fill_page`, made before `find_page_overlap`, is gated on `resolved.ram_cache_eligible`. When the caller supplies a known `current_etag`, it is compared with the RAM entry's own ETag before serving, and a mismatch invalidates the entry and falls through to disk. When `current_etag` is unknown, the common case for a cold request, the RAM entry is trusted for `cache.ram_cache_verification_interval` (default `1s`) and then checked again against the shared `.meta`. A key whose `get_ttl` is `"0s"` is never widened.
+
+## See also
+
+- [Caching](CACHING.md): what is cached, and what bypasses the cache
+- [Cache internals](CACHE_INTERNALS.md): the on-disk and in-memory structures these paths read
+- [Cache freshness](CACHE_FRESHNESS.md): TTLs and conditional requests
+- [Hedged upstream requests](HEDGING.md): racing a second upstream fetch to cut tail latency
+- [Multipart upload caching](MULTIPART_UPLOAD.md): the multipart write path
+- [`/metrics` reference](METRICS_REFERENCE.md): the `cache`, `page_cache`, `inflight_memory` and `coalescing` counters

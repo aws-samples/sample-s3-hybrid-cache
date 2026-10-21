@@ -118,7 +118,7 @@ async fn make_test_cache(config: &Config) -> (TempDir, Arc<CacheManager>, Arc<Ra
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,
@@ -152,6 +152,22 @@ async fn make_test_cache(config: &Config) -> (TempDir, Arc<CacheManager>, Arc<Ra
     (temp_dir, cache_manager, range_handler)
 }
 
+/// `cache.upstream_idle_retry_total` and `cache.upstream_idle_abort_total_pre_stream`, read
+/// the way `/metrics` reads them.
+async fn published_first_byte_counters(cache_manager: &Arc<CacheManager>) -> (u64, u64) {
+    let mut metrics = s3_proxy::metrics::MetricsManager::new();
+    metrics.set_cache_manager(Arc::clone(cache_manager));
+    let cache = metrics
+        .collect_metrics()
+        .await
+        .cache
+        .expect("the cache section must be present when a cache manager is attached");
+    (
+        cache.upstream_idle_retry_total,
+        cache.upstream_idle_abort_total_pre_stream,
+    )
+}
+
 /// Test: stalled upstream → proxy aborts at first_byte_timeout, retries, then errors.
 /// Asserts:
 /// - Total time < (retries + 1) * timeout + small buffer (not 60s hang)
@@ -168,16 +184,15 @@ async fn test_stalled_upstream_aborts_at_timeout_and_retries() {
 
     let (_temp_dir, cache_manager, range_handler) = make_test_cache(&config).await;
     let resolved = ResolvedSettings::default();
-
+    let (retries_before, aborts_before) = published_first_byte_counters(&cache_manager).await;
     let start = Instant::now();
-
     let response = HttpProxy::forward_get_head_to_s3_and_cache(
         Method::GET,
         "/test-bucket/stalled-object.bin".parse().unwrap(),
         "s3.amazonaws.com".to_string(),
         HashMap::new(),
         "test-bucket/stalled-object.bin".to_string(),
-        cache_manager,
+        Arc::clone(&cache_manager),
         s3_client,
         range_handler,
         config.clone(),
@@ -189,9 +204,26 @@ async fn test_stalled_upstream_aborts_at_timeout_and_retries() {
     )
     .await
     .unwrap();
-
     let elapsed = start.elapsed();
-
+    // The counters are process-global and the other tests in this binary move them too,
+    // so both are lower bounds on this request's contribution: `retries` retries, then one
+    // pre-stream abort.
+    let (retries_after, aborts_after) = published_first_byte_counters(&cache_manager).await;
+    assert!(
+        retries_after >= retries_before + retries as u64,
+        "{} first-byte timeouts were retried but cache.upstream_idle_retry_total moved \
+         {} -> {}",
+        retries,
+        retries_before,
+        retries_after
+    );
+    assert!(
+        aborts_after > aborts_before,
+        "the request was answered after its last first-byte timeout but \
+         cache.upstream_idle_abort_total_pre_stream moved {} -> {}",
+        aborts_before,
+        aborts_after
+    );
     // Verify: all retries were attempted
     assert_eq!(
         stalled_client.attempts(),

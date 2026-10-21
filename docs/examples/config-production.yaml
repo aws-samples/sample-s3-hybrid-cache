@@ -1,5 +1,10 @@
-# Production configuration — standard ports, TLS-terminating listener, shared
-# cache volume, OTLP export, loopback dashboard reached over an SSH tunnel.
+# Production configuration: standard ports, the TLS proxy listener (port 3129),
+# a cache volume shared by the fleet, OTLP export, and a loopback dashboard
+# reached over an SSH tunnel.
+#
+# Two shared mounts, kept separate on purpose (see the cache_dir comment):
+#   /mnt/cache  the cache volume, on its own file system, dataset or export
+#   /mnt/nfs    configuration, TLS material and logs
 #
 # Ports 80 and 443 require either root or CAP_NET_BIND_SERVICE. See
 # docs/GETTING_STARTED.md for proxy-only mode if you cannot grant that.
@@ -17,8 +22,19 @@ server:
     key_path: "/mnt/nfs/config/tls/key.pem"
 
 cache:
-  cache_dir: "/var/cache/s3-proxy"
-  max_cache_size: 107374182400      # 100 GiB — keep at or below 90% of the volume
+  # Recommended, not required: make this the root of its own storage unit (its
+  # own file system, dataset, volume, or quota-scoped share that nothing else
+  # writes to). The consumed-bytes reading (the exhaustion guard and the
+  # cache.consumed_bytes gauge) covers the whole file system rather than walking
+  # this tree, so anything else on that file system is charged to the cache and
+  # the guard may be more conservative than necessary. The cache-capacity budget
+  # is unaffected. This is why the example avoids `/var/cache` on a stock
+  # install, where the root file system also holds the OS and the logs, and why
+  # the logs below go on a separate mount. A sibling directory on the same file
+  # system does not count. See docs/SHARED_STORAGE.md for the mount; AWS
+  # deployments name these volumes differently (docs/AWS_DEPLOYMENT.md).
+  cache_dir: "/mnt/cache"
+  max_cache_size: 107374182400      # 100 GiB; keep at or below 90% of the volume
   ram_cache_enabled: true
   max_ram_cache_size: 1073741824    # 1 GiB
   eviction_algorithm: "tinylfu"
@@ -27,8 +43,14 @@ cache:
     eviction_lock_timeout: "300s"
 
 logging:
-  access_log_dir: "/var/log/s3-proxy/access"
-  app_log_dir: "/var/log/s3-proxy/app"
+  # On the shared config volume rather than the cache volume; see the cache_dir
+  # comment. The logs are shared rather than local to each proxy, so one `cat`
+  # reads every proxy's access log for a date, and retention removes files that
+  # a departed proxy left behind. Both depend on the directory being shared.
+  # Logging to a local directory works, but loses both and needs a log shipper
+  # for fleet-wide analysis. See docs/ACCESS_LOG_FORMAT.md.
+  access_log_dir: "/mnt/nfs/logs/access"
+  app_log_dir: "/mnt/nfs/logs/app"
   log_level: "info"
 
 dashboard:
@@ -36,10 +58,8 @@ dashboard:
   port: 8081
   bind_address: "127.0.0.1"         # Unauthenticated; tunnel in rather than exposing
 
-# NOTE: metrics, metrics.otlp, health, and compression sections require ALL of
-# their fields once the section is present at all -- a partial section fails to
-# parse. Omit the whole section to accept every default, or write it in full as
-# below. See docs/CONFIGURATION.md -> Metrics Configuration.
+# Omitted fields in any section take their defaults. See docs/CONFIGURATION.md
+# -> Metrics Configuration.
 metrics:
   enabled: true
   endpoint: "/metrics"

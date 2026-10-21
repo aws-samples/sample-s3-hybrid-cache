@@ -21,7 +21,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         false, // RAM cache disabled for data
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600), // GET TTL: 1 hour
@@ -139,7 +139,7 @@ async fn test_independent_head_get_ttls() {
         false,
         0,
         1024 * 1024 * 1024,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600), // GET TTL: 1 hour
@@ -281,7 +281,7 @@ async fn test_metadata_cache_integration() {
         false,
         0,
         1024 * 1024 * 1024,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -296,7 +296,6 @@ async fn test_metadata_cache_integration() {
             enabled: true,
             refresh_interval: Duration::from_secs(5),
             max_entries: 100,
-            stale_handle_max_retries: 3,
         },
         95,                                 // eviction_trigger_percent
         80,                                 // eviction_target_percent

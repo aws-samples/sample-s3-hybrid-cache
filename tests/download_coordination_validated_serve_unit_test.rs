@@ -1,6 +1,6 @@
 //! Unit tests for validated-serve dispatch correctness.
 //!
-//! Spec: `.kiro/specs/download-coordination-ttl-correctness/`
+//! Spec: the download coordination ttl correctness feature
 //! Task: 9
 //!
 //! These tests exercise the three validated-serve helpers introduced by
@@ -78,6 +78,17 @@ fn zero_ttl_config() -> Arc<Config> {
     Arc::new(config)
 }
 
+/// As [`zero_ttl_config`], but with `get_ttl` equal to the `ResolvedSettings::default()`
+/// these tests pass. Since the change a key's fills, its part lookup and the stale-if-error
+/// fallback all follow the key's resolved `get_ttl`, and a zero one never falls back to cached
+/// bytes, so a test of the non-zero fallback or the part serve needs a config that agrees with
+/// the settings it passes. The zero-TTL side is pinned in `ttl_authority_serve_paths_test`.
+fn non_zero_ttl_config() -> Arc<Config> {
+    let mut config = (*zero_ttl_config()).clone();
+    config.cache.get_ttl = ResolvedSettings::default().get_ttl;
+    Arc::new(config)
+}
+
 fn coordination_disabled_config() -> Arc<Config> {
     let mut config = Config::default();
     config.cache.get_ttl = Duration::from_secs(0);
@@ -103,7 +114,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,
@@ -363,7 +374,7 @@ async fn full_get_validated_serve_403_returns_s3_response_cache_preserved() {
 
 #[tokio::test]
 async fn full_get_validated_serve_500_falls_back_to_cache() {
-    let config = zero_ttl_config();
+    let config = non_zero_ttl_config();
     let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
     let range_handler = Arc::new(RangeHandler::new(
         Arc::clone(&cache_manager),
@@ -593,8 +604,10 @@ async fn range_validated_serve_304_serves_cached_range() {
         end: CACHED_BODY.len() as u64 - 1,
     };
 
-    let stub =
-        StubS3Client::new().with_response_for_etag(CACHED_ETAG, StubResponse::not_modified());
+    let stub = StubS3Client::new().with_response_for_etag(
+        CACHED_ETAG,
+        StubResponse::not_modified_with_etag(CACHED_ETAG),
+    );
     let s3_client = stub.clone().into_trait_object();
     let mm = make_metrics();
 
@@ -758,7 +771,7 @@ async fn range_validated_serve_403_returns_s3_response() {
 
 #[tokio::test]
 async fn range_validated_serve_500_falls_back_to_cache() {
-    let config = zero_ttl_config();
+    let config = non_zero_ttl_config();
     let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
     let range_handler = Arc::new(RangeHandler::new(
         Arc::clone(&cache_manager),
@@ -873,7 +886,7 @@ async fn range_validated_serve_metadata_missing_delegates_to_forward() {
 
 #[tokio::test]
 async fn part_validated_serve_304_serves_cached_part() {
-    let config = zero_ttl_config();
+    let config = non_zero_ttl_config();
     let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
     let range_handler = Arc::new(RangeHandler::new(
         Arc::clone(&cache_manager),
@@ -903,8 +916,10 @@ async fn part_validated_serve_304_serves_cached_part() {
         .store_part_as_range(&cache_key, 1, &content_range, &part_headers, part_body)
         .await;
 
-    let stub =
-        StubS3Client::new().with_response_for_etag(CACHED_ETAG, StubResponse::not_modified());
+    let stub = StubS3Client::new().with_response_for_etag(
+        CACHED_ETAG,
+        StubResponse::not_modified_with_etag(CACHED_ETAG),
+    );
     let s3_client = stub.clone().into_trait_object();
     let mm = make_metrics();
 
@@ -945,7 +960,7 @@ async fn part_validated_serve_304_serves_cached_part() {
 
 #[tokio::test]
 async fn part_validated_serve_200_serves_s3_body() {
-    let config = zero_ttl_config();
+    let config = non_zero_ttl_config();
     let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
     let range_handler = Arc::new(RangeHandler::new(
         Arc::clone(&cache_manager),
@@ -1015,7 +1030,7 @@ async fn part_validated_serve_200_serves_s3_body() {
 
 #[tokio::test]
 async fn part_validated_serve_403_returns_s3_response() {
-    let config = zero_ttl_config();
+    let config = non_zero_ttl_config();
     let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
     let range_handler = Arc::new(RangeHandler::new(
         Arc::clone(&cache_manager),
@@ -1083,7 +1098,7 @@ async fn part_validated_serve_403_returns_s3_response() {
 
 #[tokio::test]
 async fn part_validated_serve_500_falls_back_to_cache() {
-    let config = zero_ttl_config();
+    let config = non_zero_ttl_config();
     let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
     let range_handler = Arc::new(RangeHandler::new(
         Arc::clone(&cache_manager),
@@ -1643,4 +1658,299 @@ async fn coordination_disabled_bypasses_inflight_tracker_range() {
         0,
         "InFlightTracker should not be used when coordination is disabled (range)"
     );
+}
+
+// =========================================================================
+// The full-object waiter streams a 200 and drops a superseded entry
+// =========================================================================
+
+mod full_object_waiter_followups {
+    use super::*;
+
+    use std::net::SocketAddr;
+
+    use async_trait::async_trait;
+    use http_body_util::Full;
+    use hyper_util::rt::TokioExecutor;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use s3_proxy::cache_types::ObjectMetadata;
+    use s3_proxy::connection_pool::ConnectionPoolManager;
+    use s3_proxy::{Result, S3ClientApi, S3RequestContext, S3Response, S3ResponseBody};
+
+    /// Bytes the stalling body server sends before it stops writing.
+    const FIRST_CHUNK: usize = 4096;
+    /// The `content-length` it declares: far more than it will ever send.
+    const DECLARED: u64 = 1 << 30;
+
+    /// Answer every connection with a `200` declaring `DECLARED` bytes, write
+    /// `FIRST_CHUNK` of them, then hold the socket open without writing more: an
+    /// object far larger than memory, or an origin that is slow to finish one.
+    async fn spawn_stalling_body_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {DECLARED}\r\n\r\n");
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&vec![b'N'; FIRST_CHUNK]).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// An origin whose object has changed: every request gets a `200` with a new
+    /// ETag and a streamed body from the stalling server.
+    #[derive(Clone)]
+    struct ChangedObjectOrigin {
+        body_server: SocketAddr,
+        delegate: StubS3Client,
+    }
+
+    #[async_trait]
+    impl S3ClientApi for ChangedObjectOrigin {
+        async fn forward_request(&self, context: S3RequestContext) -> Result<S3Response> {
+            let mut headers = HashMap::new();
+            headers.insert("etag".to_string(), "\"changed-etag\"".to_string());
+            headers.insert("content-length".to_string(), DECLARED.to_string());
+            headers.insert(
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            );
+            let body = if context.allow_streaming {
+                let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+                    .build_http::<Full<Bytes>>();
+                let response = client
+                    .get(
+                        format!("http://{}/", self.body_server)
+                            .parse()
+                            .expect("uri"),
+                    )
+                    .await
+                    .expect("body server");
+                Some(S3ResponseBody::Streaming(response.into_body()))
+            } else {
+                // A buffered context would collect the whole declared body in the
+                // client; that is the defect, so stand in with what arrived first.
+                Some(S3ResponseBody::Buffered(Bytes::from(vec![
+                    b'N';
+                    FIRST_CHUNK
+                ])))
+            };
+            Ok(S3Response {
+                status: StatusCode::OK,
+                headers,
+                body,
+                request_duration: Duration::ZERO,
+            })
+        }
+
+        fn extract_metadata_from_response(
+            &self,
+            headers: &HashMap<String, String>,
+        ) -> CacheMetadata {
+            self.delegate.extract_metadata_from_response(headers)
+        }
+
+        fn extract_object_metadata_from_response(
+            &self,
+            headers: &HashMap<String, String>,
+        ) -> ObjectMetadata {
+            self.delegate.extract_object_metadata_from_response(headers)
+        }
+
+        fn get_connection_pool(&self) -> Arc<tokio::sync::RwLock<ConnectionPoolManager>> {
+            self.delegate.get_connection_pool()
+        }
+
+        fn has_endpoint_overrides(&self) -> bool {
+            false
+        }
+
+        async fn set_metrics_manager(
+            &self,
+            _metrics_manager: Arc<tokio::sync::RwLock<MetricsManager>>,
+        ) {
+        }
+
+        async fn register_endpoint(&self, _endpoint: &str) {}
+
+        async fn refresh_dns(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_inflight_ledger(&self) -> Arc<s3_proxy::inflight_ledger::InflightLedger> {
+            self.delegate.get_inflight_ledger()
+        }
+    }
+
+    /// A waiter whose revalidation finds the object changed gets S3's `200` streamed:
+    /// its response is returned, and its first bytes readable, while the origin is still
+    /// sending. Collecting the body first held the whole object in memory with no
+    /// in-flight ledger reservation, and returned nothing until the origin finished.
+    #[tokio::test]
+    async fn full_get_waiter_200_is_streamed_not_collected() {
+        let config = zero_ttl_config();
+        let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+        let range_handler = Arc::new(RangeHandler::new(
+            Arc::clone(&cache_manager),
+            Arc::clone(&disk_cache_manager),
+        ));
+        let cache_key = "bucket/scn1-full-200-stream.bin".to_string();
+        prime_cache(&cache_manager, &cache_key).await;
+        let origin = ChangedObjectOrigin {
+            body_server: spawn_stalling_body_server().await,
+            delegate: StubS3Client::new(),
+        };
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(origin);
+
+        let resolved = ResolvedSettings::default();
+        let serve = HttpProxy::serve_from_cache_validated(
+            Method::GET,
+            "/bucket/scn1-full-200-stream.bin".parse().unwrap(),
+            "s3.amazonaws.com".to_string(),
+            signed_headers(&waiter_auth()),
+            cache_key.clone(),
+            Arc::clone(&cache_manager),
+            Arc::clone(&range_handler),
+            s3_client,
+            Arc::clone(&config),
+            Some(make_metrics()),
+            &resolved,
+            &None,
+            None,
+        );
+        let response = tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect(
+                "the waiter's 200 was not returned while the origin was still sending: \
+                 its body is being collected before the response",
+            )
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("first frame within 5s")
+            .expect("a frame")
+            .expect("frame ok");
+        let data = frame.into_data().expect("a data frame");
+        assert!(
+            !data.is_empty() && data.iter().all(|b| *b == b'N'),
+            "the first bytes are S3's: {} bytes",
+            data.len()
+        );
+    }
+
+    /// When the client's own `If-None-Match: *` gets a `304` naming another ETag than the
+    /// cached one, the object was overwritten: the client gets S3's `304` and the
+    /// superseded entry is invalidated, as the range waiter does in the same case.
+    #[tokio::test]
+    async fn full_get_waiter_304_naming_another_etag_invalidates_the_entry() {
+        let config = zero_ttl_config();
+        let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+        let range_handler = Arc::new(RangeHandler::new(
+            Arc::clone(&cache_manager),
+            Arc::clone(&disk_cache_manager),
+        ));
+        let cache_key = "bucket/scn1-full-304-other.bin".to_string();
+        prime_cache(&cache_manager, &cache_key).await;
+        assert!(
+            cache_manager
+                .get_metadata_from_disk(&cache_key)
+                .await
+                .ok()
+                .flatten()
+                .is_some(),
+            "fixture: the primed entry is visible"
+        );
+
+        let stub = StubS3Client::new()
+            .with_default(StubResponse::not_modified_with_etag("\"overwritten-etag\""));
+        let s3_client = stub.clone().into_trait_object();
+        let mut headers = signed_headers(&waiter_auth());
+        headers.insert("if-none-match".to_string(), "*".to_string());
+
+        let response = HttpProxy::serve_from_cache_validated(
+            Method::GET,
+            "/bucket/scn1-full-304-other.bin".parse().unwrap(),
+            "s3.amazonaws.com".to_string(),
+            headers,
+            cache_key.clone(),
+            Arc::clone(&cache_manager),
+            Arc::clone(&range_handler),
+            s3_client,
+            Arc::clone(&config),
+            Some(make_metrics()),
+            &ResolvedSettings::default(),
+            &None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(
+            cache_manager
+                .get_metadata_from_disk(&cache_key)
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "a 304 naming another ETag left the superseded entry in place"
+        );
+    }
+
+    /// Control: a `304` to the client's own conditional naming the cached ETag leaves
+    /// the entry in place.
+    #[tokio::test]
+    async fn control_full_get_waiter_304_naming_the_cached_etag_keeps_the_entry() {
+        let config = zero_ttl_config();
+        let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+        let range_handler = Arc::new(RangeHandler::new(
+            Arc::clone(&cache_manager),
+            Arc::clone(&disk_cache_manager),
+        ));
+        let cache_key = "bucket/scn1-full-304-same.bin".to_string();
+        prime_cache(&cache_manager, &cache_key).await;
+
+        let stub =
+            StubS3Client::new().with_default(StubResponse::not_modified_with_etag(CACHED_ETAG));
+        let s3_client = stub.clone().into_trait_object();
+        let mut headers = signed_headers(&waiter_auth());
+        headers.insert("if-none-match".to_string(), CACHED_ETAG.to_string());
+
+        let response = HttpProxy::serve_from_cache_validated(
+            Method::GET,
+            "/bucket/scn1-full-304-same.bin".parse().unwrap(),
+            "s3.amazonaws.com".to_string(),
+            headers,
+            cache_key.clone(),
+            Arc::clone(&cache_manager),
+            Arc::clone(&range_handler),
+            s3_client,
+            Arc::clone(&config),
+            Some(make_metrics()),
+            &ResolvedSettings::default(),
+            &None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(cache_manager
+            .get_metadata_from_disk(&cache_key)
+            .await
+            .ok()
+            .flatten()
+            .is_some());
+    }
 }

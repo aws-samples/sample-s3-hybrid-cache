@@ -62,7 +62,7 @@ async fn make_cache_infra(
         false,
         0,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false,
         config.cache.get_ttl,
@@ -150,6 +150,46 @@ async fn cache_ranges(
             .await
             .expect("cache range");
     }
+}
+
+/// Partial eviction of one range: delete its range file AND drop its `RangeSpec`
+/// from the `.meta`, leaving a metadata gap between the surviving extents.
+///
+/// This is the end state `DiskCacheManager::delete_ranges` produced before it was
+/// removed as production-unreachable, and nothing more: no journal entry, no size
+/// accounting. Contrast `cache_ranges_then_orphan_metadata` below, which removes
+/// only the file and keeps the metadata claiming coverage — a different arm.
+async fn evict_one_range(
+    disk_cache: &Arc<tokio::sync::RwLock<DiskCacheManager>>,
+    cache_dir: &std::path::Path,
+    cache_key: &str,
+    range: (u64, u64),
+) {
+    let disk = disk_cache.read().await;
+    let mut metadata = disk
+        .get_metadata(cache_key)
+        .await
+        .expect("read metadata")
+        .expect("metadata present");
+    let before = metadata.ranges.len();
+    let mut removed_files = 0;
+    metadata.ranges.retain(|spec| {
+        if (spec.start, spec.end) != range {
+            return true;
+        }
+        std::fs::remove_file(cache_dir.join("ranges").join(&spec.file_path))
+            .expect("remove range file");
+        removed_files += 1;
+        false
+    });
+    assert_eq!(
+        (removed_files, metadata.ranges.len()),
+        (1, before - 1),
+        "the fixture must evict exactly one range, file and metadata entry both"
+    );
+    disk.update_metadata(&metadata)
+        .await
+        .expect("write metadata without the evicted range");
 }
 
 struct ProxyServer {
@@ -449,12 +489,7 @@ async fn partial_eviction_hole_returns_exact_bytes() {
     let path = "/bucket/evicted-middle.bin";
     let cache_key = CacheManager::generate_cache_key(path, None);
     cache_ranges(&disk_cache, &cache_key, &[(0, 9), (10, 19), (20, 29)]).await;
-    disk_cache
-        .read()
-        .await
-        .delete_ranges(&cache_key, &[(10, 19)])
-        .await
-        .expect("partial eviction");
+    evict_one_range(&disk_cache, temp_dir.path(), &cache_key, (10, 19)).await;
     let stub = range_stub();
     let server = spawn_proxy_server(
         config,
@@ -542,8 +577,8 @@ const LEDGER_CEILING: u64 = 30;
 /// Cache three adjacent extents, then delete one range file directly from disk
 /// while leaving metadata claiming full coverage.
 ///
-/// This detail is load-bearing. `DiskCacheManager::delete_ranges` also updates
-/// metadata, which drops `can_serve_from_cache` to false and routes the request
+/// This detail is load-bearing. A partial eviction (`evict_one_range` above) also
+/// updates metadata, which drops `can_serve_from_cache` to false and routes the request
 /// down the plain S3-fetch path instead — a path whose ledger rejection was
 /// already mapped correctly, so the case would pass without touching the code
 /// under test. Removing only the file keeps the request classified as a cache
@@ -659,7 +694,7 @@ async fn repair_fetch_reuses_serve_reservation_instead_of_double_counting() {
 ///
 /// The occupied capacity is an explicit reservation held outside the request
 /// rather than a second concurrent request, so the contention is deterministic
-/// and needs no timing. It is the same shape as the fleet suite's T40g (leg A
+/// and needs no timing. It is the same shape as the fleet test (leg A
 /// holds, leg B sheds, leg A releases, leg B retries byte-exact).
 ///
 /// Before the fix the retry failed with a second 503: with capacity free, the
@@ -812,4 +847,181 @@ async fn ledger_refused_repair_fetch_surfaces_ceiling_exceeded() {
     );
     assert_eq!(ledger.rejected_total(), 1);
     assert_eq!(ledger.reserved_bytes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The merge fallback's complete refetch is pinned to the cached version.
+//
+// Every caller of `merge_ranges_with_fallback` serves the merged bytes under the
+// cached object's headers, so a refetch that lands on another version must not be
+// served. The refetch carries `If-Match: <cached ETag>` when the client sent none
+// and `if-match` is outside its signature (the single-extent recovery arm's rule),
+// and a `412` on it, or a success with another ETag, is refused with the
+// version-change error. The proxy-level caller then invalidates the key and
+// forwards the client's request, so the client gets one consistent version.
+//
+// RED SIDE: with the pin removed, the refetch carries no `If-Match` (the direct
+// test fails on the captured request) and the stub answers the unpinned range
+// with the new version's bytes, which the proxy served under the cached ETag.
+// ---------------------------------------------------------------------------
+
+const NEW_ETAG: &str = "\"cached-range-gap-etag-v2\"";
+const NEW_BODY: &[u8] = b"ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210";
+const SIGNED_AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIA-TEST/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=sig";
+
+/// S3 after the object was overwritten: the cached ETag fails `If-Match`, and an
+/// unconditional range read returns the new version.
+fn changed_object_stub(cached_etag: &str) -> StubS3Client {
+    StubS3Client::new()
+        .with_response_for_if_match(
+            cached_etag.to_string(),
+            StubResponse::with_status(StatusCode::PRECONDITION_FAILED)
+                .with_header("etag", NEW_ETAG),
+        )
+        .with_response_for_range(
+            "bytes=0-29",
+            StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+                .with_body(Bytes::copy_from_slice(&NEW_BODY[..30]))
+                .with_header("etag", NEW_ETAG)
+                .with_header("content-range", format!("bytes 0-29/{}", NEW_BODY.len())),
+        )
+}
+
+#[tokio::test]
+async fn merge_fallback_refetch_is_pinned_to_the_cached_etag() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let config = test_config(temp_dir.path().to_path_buf());
+    let (_cache_manager, disk_cache, range_handler) = make_cache_infra(&config).await;
+    let cache_key = "bucket/merge-pin-direct.bin";
+    cache_ranges(&disk_cache, cache_key, &[(0, 9), (20, 29)]).await;
+    let request = RangeSpec { start: 0, end: 29 };
+    let overlap = range_handler
+        .find_cached_ranges(
+            cache_key,
+            &request,
+            Some(ETAG),
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
+        .await
+        .expect("overlap");
+    let cached_etag = overlap.cached_ranges[0].etag.clone();
+    assert!(!cached_etag.is_empty(), "PRECONDITION: cached ETag");
+    let stub = changed_object_stub(&cached_etag);
+    let client: Arc<dyn S3ClientApi + Send + Sync> = stub.clone().into_trait_object();
+    let headers = HashMap::from([("authorization".to_string(), SIGNED_AUTH.to_string())]);
+
+    let error = range_handler
+        .merge_ranges_with_fallback(
+            cache_key,
+            &request,
+            &overlap.cached_ranges,
+            &[],
+            &client,
+            "bucket.s3.amazonaws.com",
+            &"https://bucket.s3.amazonaws.com/object"
+                .parse()
+                .expect("uri"),
+            &headers,
+            None,
+        )
+        .await
+        .expect_err("a refetch of another version must not be returned for serving");
+
+    let refetch = stub
+        .captured()
+        .into_iter()
+        .find(|r| r.headers.get("range").map(String::as_str) == Some("bytes=0-29"))
+        .expect("the fallback refetch must have been sent");
+    assert_eq!(
+        refetch.headers.get("if-match").map(String::as_str),
+        Some(cached_etag.as_str()),
+        "UNPINNED REFETCH: the merge fallback sent no If-Match for the cached ETag, so a \
+         changed object's bytes would come back under the cached headers"
+    );
+    assert!(
+        s3_proxy::range_handler::is_merge_refetch_version_change(&error),
+        "a 412 on the pin must be the version-change refusal, got: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn merge_fallback_does_not_serve_a_changed_object_under_cached_headers() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let config = ledger_test_config(temp_dir.path().to_path_buf());
+    let (cache_manager, disk_cache, range_handler) = make_cache_infra(&config).await;
+    let path = "/bucket/merge-pin-changed.bin";
+    let cache_key = CacheManager::generate_cache_key(path, None);
+    cache_ranges_then_orphan_metadata(&disk_cache, temp_dir.path(), &cache_key).await;
+    let cached_etag = disk_cache
+        .read()
+        .await
+        .get_metadata(&cache_key)
+        .await
+        .expect("read metadata")
+        .expect("metadata present")
+        .object_metadata
+        .etag;
+    let stub = changed_object_stub(&cached_etag);
+    let server = spawn_proxy_server(
+        config,
+        Arc::clone(&cache_manager),
+        range_handler,
+        stub.clone().into_trait_object(),
+    )
+    .await;
+
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        .build_http::<Full<Bytes>>();
+    let response = client
+        .request(
+            Request::builder()
+                .method("GET")
+                .uri(format!("http://{}{}", server.addr, path))
+                .header("range", "bytes=0-29")
+                .header("authorization", SIGNED_AUTH)
+                .body(Full::new(Bytes::new()))
+                .expect("request"),
+        )
+        .await
+        .expect("proxy request");
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let _ = server.shutdown_tx.send(());
+
+    assert!(
+        stub.captured()
+            .iter()
+            .any(|r| r.headers.get("if-match").map(String::as_str) == Some(cached_etag.as_str())),
+        "PRECONDITION: the request must have reached the merge fallback's pinned refetch; \
+         captured: {:?}",
+        stub.captured()
+    );
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT, "body: {body:?}");
+    assert_eq!(
+        (body.clone(), etag.as_str()),
+        (Bytes::copy_from_slice(&NEW_BODY[..30]), NEW_ETAG),
+        "MIXED VERSION: the response must be the current version's bytes under its own ETag"
+    );
+    assert!(
+        disk_cache
+            .read()
+            .await
+            .get_metadata(&cache_key)
+            .await
+            .expect("read metadata")
+            .is_none_or(|m| m.ranges.is_empty()),
+        "the changed object's cached ranges must be invalidated"
+    );
 }

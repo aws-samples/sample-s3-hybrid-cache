@@ -12,6 +12,78 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
+/// Derive a full object's `content_length` from its single range, but ONLY when the
+/// document carries no published length of its own.
+///
+/// Returns `true` when the length was derived, `false` when the shape did not match or
+/// when the derivation was refused.
+///
+/// # Why this exists
+///
+/// Both metadata writers can be handed a range for a document they have no
+/// `ObjectMetadata` for. `HybridMetadataWriter::write_immediate_only` takes no
+/// `object_metadata` argument at all, and
+/// `JournalConsolidator::load_or_create_metadata_with_journal_entries` falls back to
+/// `ObjectMetadata::default()` when no journal entry carries one. Such a document has
+/// `content_length: 0` because the length is UNKNOWN, and a single range starting at 0 is
+/// the best available statement of it. Deriving it there is correct and is the case this
+/// helper was written for.
+///
+/// # Why the `etag` check is the predicate, and what it refuses
+///
+/// `content_length == 0` is ambiguous: it means "unknown" on a defaulted document and
+/// "this object is zero bytes" on a published one. Nothing distinguishes them by length,
+/// so the discriminator is PROVENANCE — whether anything that knew the object wrote this
+/// document. A defaulted `ObjectMetadata` has an empty `etag`; every publisher stores the
+/// origin's `ETag` beside the length it is asserting, including a zero-byte object's. So a
+/// non-empty `etag` makes `content_length: 0` a published fact, and overwriting it is not a
+/// heal.
+///
+/// Without this check, a stale range attached to a correctly-published zero-byte object
+/// produced a document that was internally CONSISTENT and described the SUPERSEDED object,
+/// under the new empty object's `ETag`. Every freshness and authorisation gate then admits
+/// it, which is why the length derivation is the step that made the corruption serveable
+/// rather than obviously broken. `CacheManager::is_empty_object_etag_entry` detects that
+/// shape on the read path; this refuses to create it.
+///
+/// # Why refusing leaves the range in place
+///
+/// The refusal skips only the derivation. The document keeps `content_length: 0` beside a
+/// range, which `CacheManager::has_cached_ranges` rejects on its `content_length > 0` gate,
+/// so the read forwards to S3 and the client gets the origin's bytes. Dropping the range
+/// instead would discard a range that may be perfectly good whenever this predicate is
+/// wrong, and would do so silently; leaving it costs a refetch and never wrong bytes.
+/// `cache_validator`'s `MetadataIntegrityError::InvalidFieldValue` already reports the
+/// resulting shape, so a refusal is observable rather than mute.
+///
+/// # One copy, deliberately
+///
+/// This logic was duplicated byte-identically in `add_or_update_range` and
+/// `JournalConsolidator::apply_journal_entries`, which is how one of them came to be
+/// guarded while the other was not. Both now call this. Do not re-inline it.
+pub(crate) fn derive_full_object_content_length(metadata: &mut NewCacheMetadata) -> bool {
+    if metadata.ranges.len() != 1
+        || metadata.ranges[0].start != 0
+        || metadata.object_metadata.content_length != 0
+    {
+        return false;
+    }
+
+    if !metadata.object_metadata.etag.is_empty() {
+        warn!(
+            "Refusing to derive content_length for a document that already published one: \
+             cache_key={}, etag={}, range=0-{}. A published content_length of 0 describes a \
+             zero-byte object; deriving a length from an attached range would describe a \
+             different object under this object's ETag.",
+            metadata.cache_key, metadata.object_metadata.etag, metadata.ranges[0].end
+        );
+        return false;
+    }
+
+    metadata.object_metadata.content_length = metadata.ranges[0].end + 1;
+    true
+}
+
 /// Write modes for hybrid metadata writer
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WriteMode {
@@ -23,7 +95,11 @@ pub enum WriteMode {
     Hybrid,
 }
 
-/// Consolidation trigger for immediate consolidation
+/// Size/entry-count threshold check on a key's pending journal entries.
+///
+/// Informational only: crossing it logs at debug level and triggers nothing. Journal
+/// consolidation runs on `consolidation_interval` alone, which is why
+/// `cache.shared_storage.consolidation_size_threshold` is deprecated as having no effect.
 pub struct ConsolidationTrigger {
     size_threshold: u64,
     entry_count_threshold: usize,
@@ -37,8 +113,12 @@ impl ConsolidationTrigger {
         }
     }
 
-    /// Check if immediate consolidation should be triggered
-    pub fn should_trigger(&self, journal_size: u64, entry_count: usize) -> bool {
+    /// Whether the pending entries cross either threshold. No production caller since
+    /// the per-fill journal re-parse that fed it was removed; consolidation is
+    /// interval-driven. Kept, with its unit test, because removing the type means
+    /// changing its construction in `cache.rs`, outside this change's scope.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn should_trigger(&self, journal_size: u64, entry_count: usize) -> bool {
         journal_size >= self.size_threshold || entry_count >= self.entry_count_threshold
     }
 }
@@ -48,6 +128,9 @@ pub struct HybridMetadataWriter {
     cache_dir: PathBuf,
     lock_manager: Arc<MetadataLockManager>,
     journal_manager: Arc<JournalManager>,
+    // Unread since the per-fill threshold check was removed; kept so the constructor
+    // signature `cache.rs` calls stays unchanged (see `ConsolidationTrigger::should_trigger`).
+    #[allow(dead_code)]
     consolidation_trigger: Arc<ConsolidationTrigger>,
 }
 
@@ -82,6 +165,29 @@ impl HybridMetadataWriter {
         object_metadata: Option<crate::cache_types::ObjectMetadata>,
         ttl: std::time::Duration,
     ) -> Result<()> {
+        self.write_range_metadata_witnessed(
+            cache_key,
+            range_spec,
+            write_mode,
+            object_metadata,
+            ttl,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_range_metadata`] for a GET-miss range fill carrying its version witness
+    /// A journal-only `Add` records it, and the consolidator folds the `Add` only while
+    /// the key's write-order marker still holds it. `None` journals no witness, as before.
+    pub async fn write_range_metadata_witnessed(
+        &mut self,
+        cache_key: &str,
+        range_spec: RangeSpec,
+        write_mode: WriteMode,
+        object_metadata: Option<crate::cache_types::ObjectMetadata>,
+        ttl: std::time::Duration,
+        fill_witness: Option<String>,
+    ) -> Result<()> {
         debug!(
             "Writing range metadata: cache_key={}, range={}-{}, mode={:?}",
             cache_key, range_spec.start, range_spec.end, write_mode
@@ -90,102 +196,11 @@ impl HybridMetadataWriter {
         match write_mode {
             WriteMode::Immediate => self.write_immediate_only(cache_key, range_spec, ttl).await,
             WriteMode::JournalOnly => {
-                self.write_journal_only(cache_key, range_spec, object_metadata, ttl)
+                self.write_journal_only(cache_key, range_spec, object_metadata, ttl, fill_witness)
                     .await
             }
             WriteMode::Hybrid => self.write_hybrid(cache_key, range_spec, ttl).await,
         }
-    }
-
-    /// Write full object metadata with optimized write mode
-    pub async fn write_full_object_metadata(
-        &mut self,
-        cache_key: &str,
-        object_metadata: ObjectMetadata,
-        ttl: std::time::Duration,
-    ) -> Result<()> {
-        debug!(
-            "Writing full object metadata: cache_key={}, content_length={}",
-            cache_key, object_metadata.content_length
-        );
-
-        // Optimization: Full objects rarely need journaling since they don't have
-        // the concurrent partial write issues that journals are designed to solve
-        let write_mode = if self.is_high_contention(cache_key) {
-            WriteMode::Hybrid // Fall back to journaling under extreme contention
-        } else {
-            WriteMode::Immediate // Default: immediate-only for better performance
-        };
-
-        // Create range spec for full object
-        let range_spec = if object_metadata.content_length == 0 {
-            // Empty objects have no ranges
-            return self
-                .write_empty_object_metadata(cache_key, object_metadata, ttl)
-                .await;
-        } else {
-            let file_path = format!(
-                "{}_{}-{}.bin",
-                sanitize_cache_key_for_filename(cache_key),
-                0,
-                object_metadata.content_length.saturating_sub(1)
-            );
-            // Live write path, so membership is recorded explicitly (R12.2).
-            // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
-            let counts_as_staged = crate::cache_types::classify_new_range_as_staged(
-                &file_path,
-                object_metadata.is_write_cached,
-            );
-            RangeSpec::new_staged(
-                0,
-                object_metadata.content_length.saturating_sub(1),
-                file_path,
-                crate::compression::CompressionAlgorithm::Lz4,
-                object_metadata.content_length,
-                object_metadata.content_length,
-                counts_as_staged,
-            )
-        };
-
-        self.write_range_metadata(
-            cache_key,
-            range_spec,
-            write_mode,
-            Some(object_metadata),
-            ttl,
-        )
-        .await
-    }
-
-    /// Write empty object metadata (no ranges)
-    async fn write_empty_object_metadata(
-        &mut self,
-        cache_key: &str,
-        object_metadata: ObjectMetadata,
-        ttl: std::time::Duration,
-    ) -> Result<()> {
-        debug!("Writing empty object metadata: cache_key={}", cache_key);
-
-        let lock = self.lock_manager.acquire_lock(cache_key).await?;
-
-        let metadata = NewCacheMetadata {
-            cache_key: cache_key.to_string(),
-            object_metadata,
-            ranges: Vec::new(), // Empty objects have no ranges
-            created_at: SystemTime::now(),
-            expires_at: SystemTime::now() + ttl,
-            compression_info: crate::cache_types::CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        self.write_metadata_to_disk(&metadata, &lock).await?;
-
-        info!(
-            "Successfully wrote empty object metadata: cache_key={}",
-            cache_key
-        );
-
-        Ok(())
     }
 
     /// Write metadata immediately only (no journal)
@@ -260,6 +275,7 @@ impl HybridMetadataWriter {
         range_spec: RangeSpec,
         object_metadata: Option<crate::cache_types::ObjectMetadata>,
         ttl: std::time::Duration,
+        fill_witness: Option<String>,
     ) -> Result<()> {
         let journal_entry = JournalEntry {
             timestamp: SystemTime::now(),
@@ -273,6 +289,7 @@ impl HybridMetadataWriter {
             object_ttl_secs: Some(ttl.as_secs()),
             access_increment: None,
             object_metadata, // Include object metadata for journal consolidation
+            fill_witness,
         };
 
         match self
@@ -299,30 +316,8 @@ impl HybridMetadataWriter {
             }
         }
 
-        // Check if immediate consolidation should be triggered
-        let pending_entries = match self.journal_manager.get_pending_entries(cache_key).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(
-                    "Failed to get pending entries for consolidation check: cache_key={}, error={}",
-                    cache_key, e
-                );
-                // Don't fail the operation if we can't check for consolidation
-                return Ok(());
-            }
-        };
-
-        if self.consolidation_trigger.should_trigger(
-            self.estimate_journal_size(&pending_entries),
-            pending_entries.len(),
-        ) {
-            debug!(
-                "Journal entries accumulated for large object, consolidation will merge: cache_key={}, entries={}",
-                cache_key, pending_entries.len()
-            );
-            // JournalConsolidator handles consolidation on its periodic schedule
-        }
-
+        // No post-append threshold check: it re-read and parsed the whole journal per
+        // fill only to emit a debug line, and consolidation runs on its interval alone.
         Ok(())
     }
 
@@ -352,6 +347,7 @@ impl HybridMetadataWriter {
                     object_ttl_secs: Some(ttl.as_secs()),
                     access_increment: None,
                     object_metadata: None, // Not needed in hybrid mode - immediate write already created .meta
+                    fill_witness: None,
                 };
 
                 // Journal write failure is not critical in hybrid mode since immediate write succeeded
@@ -383,7 +379,7 @@ impl HybridMetadataWriter {
                 // Fall back to journal-only with proper error handling
                 // Note: In hybrid fallback, we don't have object_metadata since immediate write failed
                 match self
-                    .write_journal_only(cache_key, range_spec, None, ttl)
+                    .write_journal_only(cache_key, range_spec, None, ttl, None)
                     .await
                 {
                     Ok(()) => {
@@ -408,12 +404,6 @@ impl HybridMetadataWriter {
                 }
             }
         }
-    }
-
-    /// Check if cache key is experiencing high contention
-    fn is_high_contention(&self, _cache_key: &str) -> bool {
-        // Returns false (no contention) - full objects use immediate writes for performance
-        false
     }
 
     /// Load existing metadata or create new metadata structure
@@ -474,14 +464,14 @@ impl HybridMetadataWriter {
             metadata.ranges.push(range_spec);
         }
 
-        // Update object metadata if this is a full object
-        if metadata.ranges.len() == 1
-            && metadata.ranges[0].start == 0
-            && metadata.object_metadata.content_length == 0
-        {
-            // This looks like a full object, update content_length
-            metadata.object_metadata.content_length = metadata.ranges[0].end + 1;
-        }
+        // Update object metadata if this is a full object.
+        //
+        // Guarded rather than unconditional: see `derive_full_object_content_length`. The
+        // only production route to this function is the orphan sweep's
+        // `add_range_to_metadata` (via `WriteMode::Hybrid`), which already declines a range
+        // a published `content_length` cannot contain — so this is defence in depth here,
+        // and load-bearing at the consolidator's copy.
+        derive_full_object_content_length(metadata);
     }
 
     /// Write metadata to disk atomically with enhanced error handling
@@ -518,16 +508,17 @@ impl HybridMetadataWriter {
         // Atomic write: write to temp file then rename
         // Use instance-specific tmp file to avoid race conditions on shared storage
         // Format: {key}.meta.tmp.{hostname}.{pid}
-        let instance_suffix = format!(
-            "{}.{}",
-            gethostname::gethostname().to_string_lossy(),
-            std::process::id()
-        );
-        let tmp_extension = format!("meta.tmp.{}", instance_suffix);
-        let temp_path = metadata_path.with_extension(&tmp_extension);
+        //
+        // Built through the shared constructor rather than inline, because
+        // `cleanup_temp_files_for_cache_key` now removes exactly this path and nothing
+        // else. Two independent copies of the format string would let the cleanup miss
+        // its own leftover — the failure this shape exists to avoid — so the writer and
+        // its reaper share one definition.
+        let temp_path = crate::cache::instance_scoped_meta_tmp_path(&metadata_path);
 
         // Write to temporary file
-        if let Err(e) = tokio::fs::write(&temp_path, &json_content).await {
+        // Synced before the rename publishes it; see `disk_cache::write_synced`.
+        if let Err(e) = crate::disk_cache::write_synced(&temp_path, &json_content) {
             error!(
                 "Failed to write metadata temp file: cache_key={}, temp_path={:?}, error={}",
                 metadata.cache_key, temp_path, e
@@ -562,7 +553,58 @@ impl HybridMetadataWriter {
         Ok(())
     }
 
-    /// Clean up temporary files for a specific cache key
+    /// Remove **this instance's own** leftover metadata temp file for `cache_key`.
+    ///
+    /// Called only from this module's own write-failure arms, for the key whose write
+    /// just failed. The single file that can legitimately be removed is therefore the
+    /// one `write_metadata_to_disk` wrote moments earlier, at
+    /// `cache::instance_scoped_meta_tmp_path` — `{key}.meta.tmp.{host}.{pid}` for *this*
+    /// host and *this* pid. That path is constructed, not matched, so no other file in
+    /// the shard directory is a candidate.
+    ///
+    /// # What this used to do, and why a local write failure must not reach any of it
+    ///
+    /// It removed three populations, two of which belong to other instances. On shared
+    /// storage the deletion is invisible to whoever loses the file, which is the
+    /// corollary in the cache coherency invariants: a local decision
+    /// taken from local state can delete another instance's data because the disk is
+    /// shared, and the deleting instance never learns it did.
+    ///
+    /// - It scanned the shard directory and deleted every entry matching
+    ///   `starts_with(file_stem) && contains(".meta.tmp.")`. Requires a peer publishing
+    ///   the same key concurrently, and then unlinks that peer's in-flight
+    ///   `{key}.meta.tmp.{their_host}.{their_pid}` — after which the peer's `rename`
+    ///   fails, or, if its write had completed, its publish is lost. The instance-scoped
+    ///   name carries the host and pid precisely so this is avoidable.
+    /// - It deleted the fixed-name `{key}.meta.tmp`. This writer never produces that
+    ///   shape, so the deletion could only ever hit somebody else's: live producers
+    ///   remain in `cache.rs` and `disk_cache.rs`. The fixed name identifies neither
+    ///   host nor process, so it carries no liveness input at all and is
+    ///   indistinguishable from a peer's publish in flight right now. No instance can
+    ///   soundly reap it, and this one has no reason to try.
+    /// - It scanned `cache_dir/ranges` **flat** for `{sanitized_key}*.tmp`. Range files
+    ///   live at `ranges/{bucket}/{XX}/{YYY}/`, so the loop matched nothing in any
+    ///   production layout — its own comment said "simplified - in production this would
+    ///   use proper sharding". It is deleted rather than repointed at the sharded layout:
+    ///   this writer creates no range temp files, and `{key}_{start}-{end}.bin.tmp`
+    ///   carries no host or pid either, so correcting the path would convert a loop that
+    ///   matches nothing into a live cross-instance deletion of a shape nobody can judge.
+    ///   `{key}_{start}-{end}.bin.tmp` accordingly still has no reaper; that gap is
+    ///   `META-TMP-ORPHANS-UNREAPED`'s, and an acknowledged gap is better than a reaper
+    ///   that deletes live data.
+    ///
+    /// # Own host, own pid — and why not own host, any pid
+    ///
+    /// `ORPHAN-RECLAIM-DESIGN` recommends that a *sweep* may reap its own host's files
+    /// whose pid is not the current pid, since a pid from a previous boot of the same
+    /// host is dead. That rule is sound for a sweep and is not needed here, and it is
+    /// not free: it assumes one proxy process per host per cache volume, which nothing
+    /// in the code enforces. This call site needs no liveness inference whatsoever,
+    /// because it is cleaning up after its own write rather than sweeping, so it takes
+    /// the strictly narrower rule. A previous boot's leftover for this key is left to
+    /// whatever sweep is eventually wired.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.
     async fn cleanup_temp_files_for_cache_key(&self, cache_key: &str) -> Result<()> {
         debug!(
             "Starting temp file cleanup for cache key: cache_key={}",
@@ -572,94 +614,27 @@ impl HybridMetadataWriter {
         let mut cleanup_count = 0;
         let mut cleanup_errors = Vec::new();
 
-        // Clean up metadata temp files (both old .meta.tmp and new instance-specific patterns)
         let metadata_path = self.get_metadata_file_path(cache_key)?;
 
-        // Clean up old-style .meta.tmp
-        let metadata_temp_path = metadata_path.with_extension("meta.tmp");
-        if metadata_temp_path.exists() {
-            match tokio::fs::remove_file(&metadata_temp_path).await {
+        // The one file this instance wrote and may remove. Same constructor
+        // `write_metadata_to_disk` publishes through, so the two cannot drift apart.
+        let own_temp_path = crate::cache::instance_scoped_meta_tmp_path(&metadata_path);
+        if own_temp_path.exists() {
+            match tokio::fs::remove_file(&own_temp_path).await {
                 Ok(()) => {
                     cleanup_count += 1;
                     debug!(
-                        "Cleaned up metadata temp file: cache_key={}, path={:?}",
-                        cache_key, metadata_temp_path
+                        "Cleaned up this instance's metadata temp file: cache_key={}, path={:?}",
+                        cache_key, own_temp_path
                     );
                 }
                 Err(e) => {
                     let error_msg = format!(
-                        "Failed to remove metadata temp file: path={:?}, error={}",
-                        metadata_temp_path, e
+                        "Failed to remove this instance's metadata temp file: path={:?}, error={}",
+                        own_temp_path, e
                     );
                     warn!("{}", error_msg);
                     cleanup_errors.push(error_msg);
-                }
-            }
-        }
-
-        // Clean up instance-specific .meta.tmp.{instance} files in the same directory
-        if let Some(parent_dir) = metadata_path.parent() {
-            if let Some(file_stem) = metadata_path.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(mut entries) = tokio::fs::read_dir(parent_dir).await {
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        if let Some(name) = entry.file_name().to_str() {
-                            // Match pattern: {file_stem}.meta.tmp.{instance}
-                            if name.starts_with(file_stem) && name.contains(".meta.tmp.") {
-                                let path = entry.path();
-                                match tokio::fs::remove_file(&path).await {
-                                    Ok(()) => {
-                                        cleanup_count += 1;
-                                        debug!(
-                                            "Cleaned up instance-specific metadata temp file: cache_key={}, path={:?}",
-                                            cache_key, path
-                                        );
-                                    }
-                                    Err(e) => {
-                                        let error_msg = format!(
-                                            "Failed to remove instance-specific metadata temp file: path={:?}, error={}",
-                                            path, e
-                                        );
-                                        warn!("{}", error_msg);
-                                        cleanup_errors.push(error_msg);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Clean up range temp files (simplified - in production this would use proper sharding)
-        let ranges_dir = self.cache_dir.join("ranges");
-        if ranges_dir.exists() {
-            if let Ok(entries) = tokio::fs::read_dir(&ranges_dir).await {
-                let mut entries = entries;
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        // Check if this is a temp file for our cache key
-                        let sanitized_key = sanitize_cache_key_for_filename(cache_key);
-                        if file_name.starts_with(&sanitized_key) && file_name.ends_with(".tmp") {
-                            match tokio::fs::remove_file(&path).await {
-                                Ok(()) => {
-                                    cleanup_count += 1;
-                                    debug!(
-                                        "Cleaned up range temp file: cache_key={}, path={:?}",
-                                        cache_key, path
-                                    );
-                                }
-                                Err(e) => {
-                                    let error_msg = format!(
-                                        "Failed to remove range temp file: path={:?}, error={}",
-                                        path, e
-                                    );
-                                    warn!("{}", error_msg);
-                                    cleanup_errors.push(error_msg);
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -693,7 +668,10 @@ impl HybridMetadataWriter {
     fn get_metadata_file_path(&self, cache_key: &str) -> Result<PathBuf> {
         let base_dir = self.cache_dir.join("metadata");
 
-        // Use the same sharding logic as DiskCacheManager for consistency
+        // The sharded construction, same as `DiskCacheManager::get_new_metadata_file_path`.
+        // Name that method, not its type: `DiskCacheManager` also carries
+        // `get_legacy_flat_metadata_file_path`, which is the pre-sharding FLAT path and the
+        // only non-sharded `.meta` construction left in the tree.
         crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta")
     }
 
@@ -704,49 +682,6 @@ impl HybridMetadataWriter {
             hostname::get().unwrap_or_default().to_string_lossy(),
             std::process::id()
         )
-    }
-
-    /// Estimate journal size for consolidation triggering
-    fn estimate_journal_size(&self, entries: &[JournalEntry]) -> u64 {
-        entries
-            .iter()
-            .map(|entry| {
-                // Rough estimate: JSON serialization size
-                serde_json::to_string(entry)
-                    .map(|s| s.len() as u64)
-                    .unwrap_or(1024) // Default estimate
-            })
-            .sum()
-    }
-}
-
-/// Sanitize cache key for safe filesystem usage
-fn sanitize_cache_key_for_filename(cache_key: &str) -> String {
-    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-
-    // Define filesystem-unsafe ASCII characters that need encoding
-    const FRAGMENT: &AsciiSet = &CONTROLS
-        .add(b' ') // Space
-        .add(b'/') // Path separator (Unix)
-        .add(b'\\') // Path separator (Windows)
-        .add(b':') // Drive letter separator (Windows), problematic on macOS
-        .add(b'*') // Wildcard (Windows)
-        .add(b'?') // Wildcard (Windows)
-        .add(b'"') // Quote (Windows)
-        .add(b'<') // Redirect (Windows)
-        .add(b'>') // Redirect (Windows)
-        .add(b'|') // Pipe (Windows)
-        .add(b'%'); // Percent (to avoid double-encoding issues)
-
-    let sanitized = utf8_percent_encode(cache_key, FRAGMENT).to_string();
-
-    // Filesystem filename limit is typically 255 bytes
-    // Use 200 as threshold to leave room for extensions
-    if sanitized.len() > 200 {
-        let hash = blake3::hash(cache_key.as_bytes());
-        format!("long_key_{}", hash.to_hex())
-    } else {
-        sanitized
     }
 }
 
@@ -805,9 +740,8 @@ mod tests {
         assert_eq!(writer.cache_dir, temp_dir.path());
     }
 
-    #[tokio::test]
-    async fn test_write_empty_object_metadata() {
-        let temp_dir = TempDir::new().unwrap();
+    /// Fixture for the three `cleanup_temp_files_for_cache_key` assertions below.
+    fn cleanup_fixture(temp_dir: &TempDir) -> HybridMetadataWriter {
         let lock_manager = Arc::new(MetadataLockManager::new(
             temp_dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -817,64 +751,189 @@ mod tests {
             temp_dir.path().to_path_buf(),
             "test-instance".to_string(),
         ));
-        let consolidation_trigger = Arc::new(ConsolidationTrigger::new(1024, 10));
-
-        let mut writer = HybridMetadataWriter::new(
+        HybridMetadataWriter::new(
             temp_dir.path().to_path_buf(),
             lock_manager,
             journal_manager,
-            consolidation_trigger,
-        );
+            Arc::new(ConsolidationTrigger::new(1024, 10)),
+        )
+    }
 
-        let cache_key = "test-bucket/empty-object";
-        let object_metadata = ObjectMetadata {
-            etag: "empty-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: 0,
-            content_type: Some("text/plain".to_string()),
-            ..Default::default()
-        };
+    /// A peer's temp path for the same key: same shard directory, same file stem, a
+    /// different host and pid. Built by hand rather than through
+    /// `instance_scoped_meta_tmp_path`, because that helper can only ever name *this*
+    /// instance and the point is that another one exists.
+    fn peer_temp_path(metadata_path: &std::path::Path) -> PathBuf {
+        metadata_path.with_extension("meta.tmp.peer-host-172-31-37-46.4242")
+    }
 
-        // Write empty object metadata
+    /// Assertion 1 (the defect, red before the fix): a peer's IN-FLIGHT temp file for
+    /// the same key survives a local cleanup.
+    ///
+    /// The pre-fix loop matched `starts_with(file_stem) && contains(".meta.tmp.")` and
+    /// deleted every match, so a write failure on this instance unlinked a peer's
+    /// in-flight `{key}.meta.tmp.{their_host}.{their_pid}`, after which the peer's
+    /// `rename` fails or its completed publish is lost. The instance-scoped name carries
+    /// the host and the pid precisely so this is avoidable.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.
+    #[tokio::test]
+    async fn cleanup_leaves_a_peers_in_flight_temp_file_alone() {
+        let temp_dir = TempDir::new().unwrap();
+        let writer = cleanup_fixture(&temp_dir);
+        let cache_key = "test-bucket/contended-object";
+
+        let metadata_path = writer.get_metadata_file_path(cache_key).unwrap();
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        let peers = peer_temp_path(&metadata_path);
+        std::fs::write(&peers, b"{\"peer\":\"mid-publish\"}").unwrap();
+
         writer
-            .write_full_object_metadata(
-                cache_key,
-                object_metadata,
-                std::time::Duration::from_secs(3600),
-            )
+            .cleanup_temp_files_for_cache_key(cache_key)
             .await
             .unwrap();
 
-        // Verify metadata file was created
-        let metadata_path = writer.get_metadata_file_path(cache_key).unwrap();
-        assert!(metadata_path.exists());
-
-        // Verify metadata content
-        let content = tokio::fs::read_to_string(&metadata_path).await.unwrap();
-        let metadata: NewCacheMetadata = serde_json::from_str(&content).unwrap();
-
-        assert_eq!(metadata.cache_key, cache_key);
-        assert_eq!(metadata.object_metadata.content_length, 0);
-        assert_eq!(metadata.ranges.len(), 0); // Empty objects have no ranges
+        assert!(
+            peers.exists(),
+            "a local write failure deleted a PEER's in-flight metadata temp file \
+             ({:?}). The peer's rename then fails, or its publish is lost, and it never \
+             learns — the local-decision / shared-effect corollary in \
+             cache-coherency-invariants.md. Only this instance's own \
+             {{key}}.meta.tmp.{{host}}.{{pid}} may be removed here.",
+            peers
+        );
     }
 
-    #[test]
-    fn test_sanitize_cache_key_for_filename() {
-        // Test normal key
-        let sanitized = sanitize_cache_key_for_filename("normal-key");
-        assert_eq!(sanitized, "normal-key");
+    /// Assertion 2 (the positive control): this instance's own leftover temp file is
+    /// still cleaned up.
+    ///
+    /// The narrowing must not turn the cleanup off. If this reds while assertion 1 stays
+    /// green the constructed path no longer matches what the writer publishes through,
+    /// which is a distinct signature from the defect itself — and is exactly why
+    /// `write_metadata_to_disk` was moved onto the same constructor.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.
+    #[tokio::test]
+    async fn cleanup_still_removes_this_instances_own_temp_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let writer = cleanup_fixture(&temp_dir);
+        let cache_key = "test-bucket/own-leftover";
 
-        // Test key with unsafe characters
-        let sanitized = sanitize_cache_key_for_filename("path/with:unsafe*chars");
-        assert!(!sanitized.contains('/'));
-        assert!(!sanitized.contains(':'));
-        assert!(!sanitized.contains('*'));
+        let metadata_path = writer.get_metadata_file_path(cache_key).unwrap();
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        let own = crate::cache::instance_scoped_meta_tmp_path(&metadata_path);
+        std::fs::write(&own, b"{\"ours\":\"failed mid-write\"}").unwrap();
 
-        // Test long key (should be hashed)
-        let long_key = "a".repeat(250);
-        let sanitized = sanitize_cache_key_for_filename(&long_key);
-        assert!(sanitized.starts_with("long_key_"));
-        assert!(sanitized.len() < 200);
+        writer
+            .cleanup_temp_files_for_cache_key(cache_key)
+            .await
+            .unwrap();
+
+        assert!(
+            !own.exists(),
+            "POSITIVE CONTROL FAILED: this instance's own leftover temp file ({:?}) \
+             survived its own cleanup, so the write-failure arms now leak a file per \
+             failure. The path is constructed rather than matched, so this fails when \
+             the cleanup and `write_metadata_to_disk` stop agreeing on the shape.",
+            own
+        );
+    }
+
+    /// Assertion 3 (the cross-instance case), constructed so local hygiene cannot pass
+    /// it: this instance and a peer both have a publish in flight for the SAME key at
+    /// the same moment, and this instance's write is the one that failed.
+    ///
+    /// Both peer artefacts are planted by direct mutation of the shared tree — the way
+    /// another instance's write appears — with no local code path driven for either.
+    /// The fixed-name `{key}.meta.tmp` is included because this writer never produces
+    /// that shape, so any deletion of it is necessarily somebody else's file; it names
+    /// neither host nor process, carries no liveness input at all, and is therefore
+    /// indistinguishable from a peer's publish in flight right now.
+    ///
+    /// Anti-vacuity: this instance's own file must be gone in the same run. Without
+    /// that, a cleanup that returned early — or one whose constructed path stopped
+    /// matching — would pass on the two survival assertions while doing nothing.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.
+    #[tokio::test]
+    async fn a_local_write_failure_deletes_only_its_own_file_while_a_peer_publishes() {
+        let temp_dir = TempDir::new().unwrap();
+        let writer = cleanup_fixture(&temp_dir);
+        let cache_key = "test-bucket/simultaneous-publish";
+
+        let metadata_path = writer.get_metadata_file_path(cache_key).unwrap();
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+
+        let own = crate::cache::instance_scoped_meta_tmp_path(&metadata_path);
+        let peers = peer_temp_path(&metadata_path);
+        let fixed = metadata_path.with_extension("meta.tmp");
+        std::fs::write(&own, b"{\"ours\":\"failed mid-write\"}").unwrap();
+        std::fs::write(&peers, b"{\"peer\":\"mid-publish\"}").unwrap();
+        std::fs::write(&fixed, b"{\"someone\":\"mid-publish\"}").unwrap();
+
+        writer
+            .cleanup_temp_files_for_cache_key(cache_key)
+            .await
+            .unwrap();
+
+        assert!(
+            !own.exists(),
+            "ANTI-VACUITY: this instance's own temp file ({:?}) survived, so the \
+             cleanup did nothing and the two survival assertions below prove nothing",
+            own
+        );
+        assert!(
+            peers.exists(),
+            "a peer's in-flight temp file ({:?}) was deleted by this instance's \
+             write-failure cleanup, while both were publishing the same key",
+            peers
+        );
+        assert!(
+            fixed.exists(),
+            "the fixed-name {{key}}.meta.tmp ({:?}) was deleted. This writer never \
+             produces that shape, so the file can only be another writer's; it names \
+             neither host nor pid, so no instance can tell it apart from a publish in \
+             flight, and none may reap it",
+            fixed
+        );
+    }
+
+    /// The reaper and the writer must build the same string, and this asserts it from
+    /// the writer's real output rather than from two copies of a format literal.
+    ///
+    /// `write_metadata_to_disk` renames its temp file away on success, so the shape is
+    /// not observable after a successful write. What is observable, and is what the
+    /// cleanup depends on, is that the path the cleanup constructs is the
+    /// instance-scoped one for this host and pid.
+    #[tokio::test]
+    async fn the_cleanup_path_is_this_hosts_and_this_pids_temp_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let writer = cleanup_fixture(&temp_dir);
+        let metadata_path = writer
+            .get_metadata_file_path("test-bucket/shape-check")
+            .unwrap();
+
+        let own = crate::cache::instance_scoped_meta_tmp_path(&metadata_path);
+        let name = own.file_name().unwrap().to_str().unwrap();
+        let expected_suffix = format!(
+            ".meta.tmp.{}.{}",
+            gethostname::gethostname().to_string_lossy(),
+            std::process::id()
+        );
+
+        assert!(
+            name.ends_with(&expected_suffix),
+            "the temp path the cleanup targets ({}) does not end in this instance's own \
+             suffix ({}), so it neither removes this instance's leftover nor stays clear \
+             of a peer's",
+            name,
+            expected_suffix
+        );
+        assert_eq!(
+            own.parent(),
+            metadata_path.parent(),
+            "the temp file must sit beside its .meta, or the rename crosses directories"
+        );
     }
 
     #[tokio::test]

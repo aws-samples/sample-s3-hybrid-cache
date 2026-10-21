@@ -1,41 +1,46 @@
 # Compression
 
-The S3 proxy compresses cacheable data with LZ4, using per-entry algorithm
-metadata so that reads never depend on the current compression
-configuration. The compression *decision* — whether to run the LZ4 block
-compressor for a given write — is a denylist with compress-by-default
-fallback, not an allowlist: any file extension not explicitly recognized as
-"already compressed" is compressed by default.
+Hybrid Cache for Amazon S3 stores every cached range as an LZ4 frame with a checksum, and
+compresses the payload inside the frame unless the content is already compressed. Compression is
+on by default and needs no configuration. Reads decode each entry by the algorithm recorded with
+it, so a changed setting affects new writes only.
 
-## The Compression Decision
+## Turn it on or off
 
-For every cache write, the proxy computes:
+These are the defaults:
 
+```yaml
+compression:
+  enabled: true      # false stores every payload uncompressed, still framed and checksummed
+  threshold: 1024    # Payloads smaller than this many bytes are stored uncompressed
+  preferred_algorithm: "lz4"  # LZ4 is the only algorithm; the field selects nothing
 ```
-enabled AND size >= threshold AND (rule_explicitly_set_it OR NOT denylisted(extension))
-```
 
-- **`enabled`** — the global `compression.enabled` setting.
-- **`threshold`** — the global `compression.threshold` (bytes). A size floor
-  guarding against compressing tiny payloads; it applies regardless of the
-  extension or any rule override.
-- **The built-in denylist** — a hardcoded set of extensions
-  (`CompressionHandler::is_denylisted_extension`, see below) that are
-  already compressed and gain little to nothing from LZ4. This is the
-  *default* layer, consulted only when no `cache_rules.json` rule explicitly
-  sets `compression_enabled` for the key.
-- **Cache rules win.** If a `cache_rules.json` glob rule (see
-  `docs/CONFIGURATION.md`) explicitly sets `compression_enabled: true` or
-  `false` for a matching key, that value is honored verbatim — including
-  forcing compression of a normally-denylisted extension (e.g. `.jpg`), or
-  skipping compression of a normally-compressible one. This is the intended
-  operator-facing override mechanism; there is no separate extension-list
-  configuration field.
+[Compression configuration](CONFIGURATION.md#compression-configuration) lists the field types and
+defaults. To change the decision for some keys, set `compression_enabled` in a
+[cache rule](CONFIGURATION.md#cache-rules). There is no field for the extension list.
 
-## Built-In Denylist
+## How it works
 
-Extensions in this list skip the LZ4 block compressor under the *default*
-layer (no cache-rule override):
+### The compression decision
+
+For each cache write, the proxy decides whether to run the LZ4 block compressor:
+
+1. A payload smaller than `compression.threshold` (default `1024` bytes) is stored uncompressed,
+   whatever any rule says.
+2. If a cache rule sets `compression_enabled` for the key, the rule decides: `true` compresses the
+   payload whatever its extension, and `false` stores it uncompressed. The rule's value replaces
+   `compression.enabled` for the keys it matches.
+3. Otherwise the payload is compressed when `compression.enabled` is `true` and the key's extension
+   is not on the built-in denylist.
+
+An uncompressed payload is still written as a checksummed frame, described under
+[Integrity](#integrity-every-write-is-a-checksummed-lz4-frame).
+
+### Built-in denylist
+
+Extensions on this list skip the block compressor unless a cache rule sets `compression_enabled`
+for the key:
 
 - **Images**: `jpg`, `jpeg`, `png`, `gif`, `webp`, `avif`, `heic`, `heif`
 - **Video**: `mp4`, `avi`, `mkv`, `mov`, `wmv`, `flv`, `webm`, `m4v`
@@ -47,153 +52,96 @@ layer (no cache-rule override):
 - **Database**: `sqlite`, `db`
 - **Executables**: `exe`, `msi`, `dmg`, `pkg`
 
-Everything else (`.txt`, `.json`, `.xml`, `.html`, `.css`, `.js`, `.log`,
-`.md`, `.yaml`, `.py`, `.rs`, `.sql`, and any extension not listed above)
-compresses by default, subject to the size threshold.
+Every other extension, including `.txt`, `.json`, `.csv`, `.log` and `.parquet`, and a key with no
+extension, is compressed by default, subject to the threshold.
 
-**Extension matching caveat**: extraction takes only the final dot-suffix of
-the object key's last path segment, lowercased. `archive.tar.gz` matches via
-the `gz` arm, not a distinguished `tar.gz` entry — `tar.gz` is not, and
-cannot be, a member of this list. Operators needing exact multi-part-suffix
-precision (distinguishing `.tar.gz` from `.gz`) should use a
-`cache_rules.json` glob rule instead, e.g. `{"pattern": "**/*.tar.gz", "compression_enabled": false}`
-— glob rules match the full cache key and have no extraction step.
+The extension is the text after the last dot in the key's last path segment, lowercased. So
+`archive.tar.gz` matches `gz`, and the list cannot hold a multi-dot suffix such as `tar.gz`. To
+treat `.tar.gz` differently from `.gz`, use a cache rule, which matches the whole cache key:
+`{"pattern": "**/*.tar.gz", "compression_enabled": false}`.
 
-## Integrity: Every Write Is a Checksummed LZ4 Frame
+### Integrity: every write is a checksummed LZ4 frame
 
-Every write — compressed or not — produces a valid LZ4 frame carrying an
-**xxhash32 content checksum** (`FrameInfo::content_checksum = true`). When
-the compression decision above is `false`, the proxy does not fall back to
-writing raw, unprotected bytes: it encodes a **store-mode frame** — a
-standard LZ4 frame whose data blocks are stored uncompressed (the LZ4 frame
-format's native mechanism for incompressible data), still carrying the same
-content checksum. Store-mode encoding never invokes the LZ4 block
-compressor, so skipping compression for a denylisted or rule-disabled
-extension still avoids the CPU cost — it just does so via a stored block
-instead of raw bytes.
+Every write, compressed or not, is a standard LZ4 frame with an xxHash32 content checksum. When the
+decision above is not to compress, the proxy writes a store-mode frame: the LZ4 frame format's
+stored-block form, with the same checksum. Writing a store-mode frame never runs the block
+compressor, so a denylisted or rule-disabled key costs no compression CPU.
 
-On every read, `lz4_flex::frame::FrameDecoder` verifies the checksum as it
-decodes, transparently handling compressed and store-mode frames identically
-(both are standard LZ4 frames — `FrameDecoder` requires no special-casing).
-Any disk bit-flip, truncation, or silent corruption of a range file surfaces
-as a decode error, which callers treat as a cache miss and refetch from S3.
-No separate hash-at-rest or read-time re-hashing is required.
+Every read verifies the checksum as it decodes, and decodes compressed and store-mode frames the
+same way. A bit flip, a truncation or other damage to a range file shows up as a decode error:
 
-Both paths are implemented in `CompressionHandler`: `compress_with_algorithm`
-for the compressed path, `encode_store_mode_frame` for the store-mode path.
-`compress_with_metadata` picks between them based on the caller's
-already-computed decision. Tests `test_store_mode_round_trip`,
-`test_store_mode_corruption_detected`, `test_corrupted_frame_data_returns_error`,
-and `test_corrupt_cache_entry_decompression_error` cover the round-trip and
-corruption paths.
+- A read the proxy assembles in memory treats the range as a cache miss and fetches the bytes from
+  S3.
+- A read streamed from the cache has already sent part of its response, so it ends early with a
+  connection error. The proxy marks the file, and later reads of the range on that proxy are
+  fetched from S3 until the range is removed or cached again, or two minutes pass with no read turned away by the mark.
+  [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3)
+  gives the full bound.
 
-**Legacy entries**: cache entries written by proxy versions prior to 2.3.0 may be tagged `CompressionAlgorithm::None` — raw bytes with no
-frame or checksum. These remain readable (the read path dispatches on the
-stored per-entry algorithm tag, never on current configuration), but carry
-no integrity protection. No write path in this version produces `None`
-entries; they age out naturally via TTL/eviction and get re-cached as
-checksummed frames on next fetch.
+A checksum shows that a file is intact, not that it is the file its metadata describes. The proxy
+records each range file's size and modification time when it writes the range. Where a range's
+metadata carries that record, a read that opens a file with another size or time treats the range
+as not cached.
 
-## Algorithm Support & Cache Consistency
+A cache entry whose metadata names the algorithm `None` holds raw bytes with no frame and no
+checksum. The proxy still reads it, because reads follow each entry's recorded algorithm, but
+nothing checks its integrity. No write produces such an entry. Once eviction, invalidation or
+expiry removes it, the next fetch caches the object as a checksummed frame.
 
-- **Current**: LZ4 (compressed or store-mode blocks — both tagged `Lz4`)
-- **Legacy**: `None` (raw bytes, no checksum) — read-only, no longer written
-- **Future**: Zstd, Brotli, LZ4HC (easily extensible; `preferred_algorithm`
-  in config is parsed but not yet wired to a second algorithm)
-- **Per-Entry Metadata**: Each cache entry stores which algorithm was used,
-  so reads never depend on the current compression configuration —
-  changing the denylist, threshold, or cache rules only affects new writes
+### Block size
 
-## RAM Cache Compression Optimization
+Every frame the proxy writes, compressed or store-mode, declares 64 KiB blocks (block-size code 4
+in the frame descriptor). The decoder sizes its buffers from the block size in the frame header,
+not from the amount of data: one compressed-block buffer and one decompressed-block buffer per
+stream. With 64 KiB blocks, each disk read or streamed serve of a range holds about 128 KiB of
+decoder state; with 4 MiB blocks it would hold about 8 MiB, whatever the range length.
 
-When promoting data from disk cache to RAM cache, the proxy stores the
-on-disk frame verbatim — whichever form it's in (LZ4-compressed blocks or a
-store-mode/uncompressed-but-framed block) is exactly what's cached in RAM.
-There is no separate "always compress for RAM" step and no decompress-then-
-recompress round trip. Size checks use the on-disk (framed) size, so large
-compressible files are accepted into RAM cache based on their compressed
-footprint rather than their uncompressed size.
+The proxy reads a range file through a buffer as large as the file, up to 256 KiB, so each read
+call covers several blocks. In all, a read of a file with 64 KiB blocks holds about 384 KiB. A
+range file with 4 MiB blocks, which the proxy reads but does not write, holds about 8.25 MiB per
+read. These figures are per concurrent stream, so the total grows with
+`server.max_concurrent_requests`.
 
-This holds across every promotion path — full-object, write-cache, and
-range promotion all pass the disk frame through unchanged
-(`compressed: true` + the entry's real `compression_algorithm`). Range
-promotion previously decompressed the frame and stored the raw bytes with
-`compressed: false`, which meant range-promoted entries consumed their full
-uncompressed size in RAM instead of the compact on-disk footprint. That was
-a bug, not intended behavior, and has since been fixed.
+Smaller blocks compress slightly worse, because an LZ4 match cannot cross a block boundary. Highly
+repetitive content can take up to twice the disk space it would take with 4 MiB blocks, which is
+still a small fraction of its uncompressed size. Content that does not compress grows by a few
+bytes per block.
 
-**Algorithm handling**:
+The reader takes the block size from each frame's header, on both the buffered and the streamed
+read paths. It therefore decodes frames of either block size, and one range file can hold both.
 
-| Disk Cache | RAM Cache | Behavior | CPU Cost |
-|------------|-----------|----------|----------|
-| LZ4 (compressed or store-mode) | LZ4 | Pass data directly | None |
+### RAM cache compression optimization
 
-**Example**: A 500MB text file compressed to 1MB on disk is stored in RAM
-cache as 1MB. The size check compares 1MB against the RAM cache limit, not
-500MB.
+When the proxy promotes a range from the disk cache to the RAM cache, it stores the disk frame
+unchanged, compressed or store-mode, and never decompresses and recompresses it. Every promotion
+path does this: full objects, write-cached objects and ranges. The RAM cache's size checks use the
+frame's size, so a compressible object takes its compressed size in RAM. For example, a 100 MiB log
+file that compresses to 25 MiB on disk counts as 25 MiB against `cache.max_ram_cache_size`.
 
-No configuration is required. The behavior is automatic based on compression
-metadata stored with each cache entry.
+### Multipart uploads
 
-**Debug log indicators**:
-- `"Using pre-compressed data for RAM cache entry"` — direct pass-through path
-- `"Compressed data for RAM cache entry"` — first-time compression path
+Each part of a multipart upload takes the same decision as a single PUT. Each part's metadata
+records its algorithm (`Lz4`, for compressed and store-mode frames alike), and
+CompleteMultipartUpload carries those records into the completed object's ranges, so a GET decodes
+every part correctly. For example, the parts of `data.zip` are written as store-mode frames
+because `zip` is on the denylist, and the parts of `logs.json` are compressed.
 
-## Multipart Upload Compression
+## Limits
 
-Multipart uploads use the same compression decision as single-part uploads:
+- LZ4 is the only algorithm. `preferred_algorithm` is parsed and selects nothing.
+- The extension denylist is built in. A cache rule's `compression_enabled` is the only per-key
+  change.
+- A changed setting or rule applies to new writes only. Entries already cached keep the algorithm
+  recorded with them.
 
-- Each part's effective compression decision is computed the same way
-  (enabled + threshold + rules-win-over-denylist)
-- The resulting algorithm tag (always `Lz4` — compressed or store-mode) is
-  stored per-part in the tracking metadata
-- On `CompleteMultipartUpload`, each part's compression algorithm is
-  preserved in the final range metadata
-- This ensures correct decompression when serving cached multipart uploads
+## Observe it
 
-**Example**: Uploading `data.zip` via multipart:
-- Each part is written as a store-mode LZ4 frame (`.zip` is in the built-in
-  denylist; no `cache_rules.json` override present)
-- Metadata records `compression_algorithm: Lz4` for each part
-- GET requests decode the frame via `FrameDecoder` before serving —
-  identically whether the frame is compressed or store-mode
+- [`range_file_corruption_detected`](METRICS_REFERENCE.md#atomic_metadata) on `/metrics` counts
+  damaged range files that reads found.
+- `cache.total_cache_size` reports the bytes the cache holds on disk, after compression.
 
-**Example**: Uploading `logs.json` via multipart:
-- Each part is compressed with LZ4 (`.json` is not in the built-in denylist)
-- Metadata records `compression_algorithm: Lz4` for each part
-- GET requests decompress each part via the same frame decoder
+## See also
 
-## Configuration
-
-```yaml
-compression:
-  enabled: true      # master on/off switch
-  threshold: 1024    # size floor in bytes; smaller writes always skip compression
-  preferred_algorithm: "lz4"  # only "lz4" is implemented; parsed but otherwise inert
-```
-
-Field types, defaults, and the removed `content_aware` alias are documented in
-[CONFIGURATION.md — Compression Configuration](CONFIGURATION.md#compression-configuration).
-
-There is no extension-list configuration field. The built-in denylist above is the
-default, and per-key overrides go through the `compression_enabled` field on a
-`cache_rules.json` glob rule (see
-[CONFIGURATION.md — Cache Rules](CONFIGURATION.md#cache-rules)), which overrides the
-denylist in either direction.
-
-## Benefits
-
-1. **Content-Aware Compression**: Saves CPU cycles and storage space by
-   avoiding redundant compression of already-compressed formats
-2. **Operator Override**: `cache_rules.json` lets any key's compression be
-   forced on or off, overriding the built-in denylist in either direction
-3. **Algorithm Consistency**: Per-entry metadata means denylist, threshold,
-   or rule changes only affect new writes — existing cache entries decode
-   unchanged
-4. **Universal Integrity**: Every entry, compressed or not, is a
-   checksummed LZ4 frame — corruption is detected on read regardless of
-   whether the LZ4 compressor ran
-5. **Multi-Tier Optimization**: Eliminates unnecessary compression cycles
-   between disk and RAM cache tiers
-6. **Multipart Support**: Correct compression handling for multipart
-   uploads with per-part algorithm tracking
+- [Caching](CACHING.md): what the proxy caches and how cache rules apply
+- [Compression configuration](CONFIGURATION.md#compression-configuration): the field reference
+- [Multipart uploads](MULTIPART_UPLOAD.md): how parts are staged and completed

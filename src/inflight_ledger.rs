@@ -57,6 +57,12 @@ pub struct InflightLedger {
     /// Cumulative count of Unknown_Size_Site accumulations aborted because a
     /// `try_grow` call was rejected mid-accumulation.
     aborted_total: AtomicU64,
+    /// Cumulative count of grants: every `try_reserve` that admitted bytes and every
+    /// `try_grow` that grew a reservation. Monotonic, so a reservation too brief to catch in a
+    /// sample of `reserved` still moves it. Not counted while Ledger_Disabled.
+    granted_total: AtomicU64,
+    /// Cumulative bytes granted by those calls.
+    granted_bytes_total: AtomicU64,
     /// Unix timestamp (seconds) of the last rate-limited rejection log line.
     /// Mirrors the `LAST_503_LOG`/`CONCURRENCY_LAST_LOG` discipline in
     /// `http_proxy.rs::shed_request` (Requirement 2.6): at most one `warn!`
@@ -74,6 +80,8 @@ impl InflightLedger {
             peak: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
             aborted_total: AtomicU64::new(0),
+            granted_total: AtomicU64::new(0),
+            granted_bytes_total: AtomicU64::new(0),
             last_rejection_log_secs: AtomicU64::new(0),
         }
     }
@@ -119,7 +127,7 @@ impl InflightLedger {
     /// Configured ceiling in bytes (0 when disabled). Reported by the metrics
     /// endpoint even while disabled (Requirement 8.6).
     #[inline]
-    pub fn ceiling_bytes(&self) -> u64 {
+    pub(crate) fn ceiling_bytes(&self) -> u64 {
         self.ceiling.load(Ordering::Relaxed)
     }
 
@@ -143,8 +151,27 @@ impl InflightLedger {
 
     /// Cumulative aborted Unknown_Size_Site accumulations (Requirement 8.5).
     #[inline]
-    pub fn aborted_total(&self) -> u64 {
+    pub(crate) fn aborted_total(&self) -> u64 {
         self.aborted_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative grants (`try_reserve` admissions plus `try_grow` growths) since construction.
+    #[inline]
+    pub fn granted_total(&self) -> u64 {
+        self.granted_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative bytes granted since construction.
+    #[inline]
+    pub fn granted_bytes_total(&self) -> u64 {
+        self.granted_bytes_total.load(Ordering::Relaxed)
+    }
+
+    /// Count one grant of `bytes`.
+    #[inline]
+    fn record_grant(&self, bytes: u64) {
+        self.granted_total.fetch_add(1, Ordering::Relaxed);
+        self.granted_bytes_total.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Attempt to reserve `bytes` against the ceiling.
@@ -187,6 +214,7 @@ impl InflightLedger {
             ) {
                 Ok(_) => {
                     self.peak.fetch_max(new_total, Ordering::Relaxed);
+                    self.record_grant(bytes);
                     return Some(Reservation {
                         ledger: Some(Arc::clone(self)),
                         bytes,
@@ -240,6 +268,7 @@ impl InflightLedger {
             ) {
                 Ok(_) => {
                     self.peak.fetch_max(new_total, Ordering::Relaxed);
+                    self.record_grant(additional);
                     return true;
                 }
                 Err(actual) => current = actual,
@@ -249,7 +278,7 @@ impl InflightLedger {
 
     /// Record an aborted Unknown_Size_Site accumulation (Requirement 8.5).
     /// Call sites abort when `Reservation::try_grow` returns `false`.
-    pub fn record_aborted_accumulation(&self) {
+    pub(crate) fn record_aborted_accumulation(&self) {
         self.aborted_total.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -279,7 +308,7 @@ impl InflightLedger {
     ///
     /// Returns `None` when the claim (or the grow) would breach the ceiling,
     /// having already counted the rejection, matching `try_reserve`.
-    pub fn claim_overlapping(
+    pub(crate) fn claim_overlapping(
         self: &Arc<Self>,
         bytes: u64,
         caller_reservation: Option<&mut Reservation>,
@@ -337,7 +366,7 @@ impl Reservation {
     }
 
     /// Bytes currently held by this reservation.
-    pub fn held_bytes(&self) -> u64 {
+    pub(crate) fn held_bytes(&self) -> u64 {
         self.bytes
     }
 
@@ -383,6 +412,45 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `granted_total` / `granted_bytes_total` count every grant, including a growth, and
+    /// nothing else: a rejection, a release and a disabled ledger leave them unmoved.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `self.record_grant(bytes)` deleted from `try_reserve`, the first assertion fails
+    /// with `left: (0, 0), right: (1, 300)`.
+    #[test]
+    fn grants_are_counted_monotonically_and_rejections_are_not() {
+        let ledger = Arc::new(InflightLedger::new(1000));
+        let mut r1 = ledger.try_reserve(300).expect("should admit");
+        assert_eq!(
+            (ledger.granted_total(), ledger.granted_bytes_total()),
+            (1, 300),
+            "an admitted reservation is one grant of its bytes"
+        );
+        assert!(r1.try_grow(50));
+        assert_eq!(
+            (ledger.granted_total(), ledger.granted_bytes_total()),
+            (2, 350),
+            "a successful growth is a grant of the additional bytes"
+        );
+        assert!(ledger.try_reserve(900).is_none());
+        assert!(!r1.try_grow(900));
+        drop(r1);
+        assert_eq!(ledger.reserved_bytes(), 0);
+        assert_eq!(
+            (ledger.granted_total(), ledger.granted_bytes_total()),
+            (2, 350),
+            "rejections and releases must not move the grant counters"
+        );
+        let disabled = Arc::new(InflightLedger::disabled());
+        let _d = disabled.try_reserve(4096).expect("disabled always admits");
+        assert_eq!(
+            (disabled.granted_total(), disabled.granted_bytes_total()),
+            (0, 0),
+            "Ledger_Disabled accounts nothing"
+        );
+    }
 
     /// Concurrent reservations totalling less than the ceiling are all
     /// admitted. Requirement 10.1.

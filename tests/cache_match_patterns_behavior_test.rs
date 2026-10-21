@@ -1,6 +1,6 @@
 //! End-to-end behavioral test for glob cache-rule matching.
 //!
-//! Spec: `.kiro/specs/cache-match-patterns/`
+//! Spec: the cache match patterns feature
 //!
 //! The unit tests in `src/bucket_settings.rs` already cover the glob→regex
 //! translator and first-match-per-field resolution *in isolation*. What those
@@ -105,7 +105,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false, // compression disabled — keeps stored bytes 1:1 with the body
         config.cache.get_ttl,
@@ -147,10 +147,41 @@ async fn make_cache_infra(
     (cache_manager, disk_cache_manager, range_handler)
 }
 
-/// Write `cache_rules.json` into the cache dir. MUST be called before
-/// `make_cache_infra` so the file is present when the rules first load.
+/// Write `cache_rules.json` into the cache dir. Call it before `make_cache_infra` so the
+/// file is present when the rules first load. A write made after the proxy has started
+/// needs `wait_for_rules_reload` before the request that depends on it.
 fn write_cache_rules(cache_dir: &std::path::Path, json: &str) {
     std::fs::write(cache_dir.join("cache_rules.json"), json).expect("write cache_rules.json");
+}
+/// Poll the resolver until `wanted` holds for `path`, every 20 ms for up to 5 s.
+///
+/// A rule written after `make_cache_infra` reaches the next request only once the proxy
+/// has re-read it: a request that finds the rules stale waits at most
+/// `RULES_RELOAD_WAIT_BOUND` for the reload, and one that joins a read already in flight
+/// does not wait. Call this after a mid-test `write_cache_rules` and before the request
+/// that depends on the new rule. It waits on the positive condition only; the behaviour
+/// under test is still asserted after the request.
+async fn wait_for_rules_reload<F>(
+    cache_manager: &Arc<CacheManager>,
+    path: &str,
+    wanted: &str,
+    applied: F,
+) where
+    F: Fn(&s3_proxy::bucket_settings::ResolvedSettings) -> bool,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let resolved = cache_manager.resolve_settings(path).await;
+        if applied(&resolved) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rules reload did not apply within 5s: apparatus, not the behaviour under test \
+             (resolve_settings for {path} never reported {wanted}; last resolved: {resolved:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// A running loopback proxy: its address plus a shutdown trigger that, when
@@ -364,7 +395,7 @@ fn s3_get_fetches_for(stub: &StubS3Client, path_fragment: &str) -> usize {
 async fn class_a_get_ttl_zero_forces_revalidation_after_rule_change() {
     let temp_dir = TempDir::new().expect("tempdir");
 
-    // Start with NO rules file → global defaults apply (get_ttl = ~10 years).
+    // Start with NO rules file → global defaults apply (get_ttl = 1 day).
     // Objects cached under these defaults have `expires_at` far in the future.
     let config = behavior_config(temp_dir.path().to_path_buf());
     let (cache_manager, _disk, range_handler) = make_cache_infra(&config).await;
@@ -397,6 +428,10 @@ async fn class_a_get_ttl_zero_forces_revalidation_after_rule_change() {
         temp_dir.path(),
         r#"{ "rules": [ { "pattern": "**", "get_ttl": "0s" } ] }"#,
     );
+    wait_for_rules_reload(&cache_manager, path, "get_ttl = 0s", |r| {
+        r.get_ttl == Duration::ZERO
+    })
+    .await;
 
     // --- Step 3: GET again — expect S3 revalidation (a new round-trip) ---
     let s2 = proxy_get(server.addr, path).await;
@@ -474,6 +509,10 @@ async fn class_a_head_ttl_zero_forces_revalidation_after_rule_change() {
         temp_dir.path(),
         r#"{ "rules": [ { "pattern": "**", "head_ttl": "0s" } ] }"#,
     );
+    wait_for_rules_reload(&cache_manager, path, "head_ttl = 0s", |r| {
+        r.head_ttl == Duration::ZERO
+    })
+    .await;
 
     // --- Step 4: HEAD again — expect S3 revalidation (a new round-trip) ---
     let total_before_rule = stub.captured().len();
@@ -495,14 +534,14 @@ async fn class_a_head_ttl_zero_forces_revalidation_after_rule_change() {
 // ---------------------------------------------------------------------------
 // (class-a-3) Reduced TTL case: cache with the default long TTL, then tighten
 // get_ttl to 1ms (effectively expired for any object older than 1ms). The next
-// GET should revalidate. On unfixed code the stored `expires_at` (~10 years out)
+// GET should revalidate. On unfixed code the stored `expires_at` (1 day out)
 // keeps the object fresh → served from cache → FAIL.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread")]
 async fn class_a_reduced_get_ttl_expires_cached_object() {
     let temp_dir = TempDir::new().expect("tempdir");
 
-    // No rules file → global defaults (get_ttl = ~10 years).
+    // No rules file → global defaults (get_ttl = 1 day).
     let config = behavior_config(temp_dir.path().to_path_buf());
     let (cache_manager, _disk, range_handler) = make_cache_infra(&config).await;
     let stub = get_ok_stub_with_304();
@@ -532,6 +571,10 @@ async fn class_a_reduced_get_ttl_expires_cached_object() {
         temp_dir.path(),
         r#"{ "rules": [ { "pattern": "**", "get_ttl": "0.001s" } ] }"#,
     );
+    wait_for_rules_reload(&cache_manager, path, "get_ttl of about 1ms", |r| {
+        r.get_ttl < Duration::from_secs(1)
+    })
+    .await;
 
     // --- Step 3: GET again — expect revalidation ---
     let s2 = proxy_get(server.addr, path).await;
@@ -541,7 +584,7 @@ async fn class_a_reduced_get_ttl_expires_cached_object() {
         2,
         "BUG CLASS A (reduced get_ttl): after tightening get_ttl to 1ms and waiting, \
          the next GET must revalidate against S3 (2 total fetches). On unfixed code the \
-         stored expires_at (~10 years out) keeps serving from cache — COUNTEREXAMPLE: \
+         stored expires_at (1 day out) keeps serving from cache — COUNTEREXAMPLE: \
          GET with current get_ttl=1ms (object age > 1ms) served from cache, 1 S3 \
          round-trip, expected 2"
     );
@@ -749,6 +792,14 @@ async fn class_b_default_path_eager_delete_on_read_cache_disabled() {
         r#"{ "rules": [ { "pattern": "**/nocache/**", "read_cache_enabled": false } ] }"#,
     );
 
+    wait_for_rules_reload(
+        &cache_manager,
+        nocache_path,
+        "read_cache_enabled = false",
+        |r| !r.read_cache_enabled,
+    )
+    .await;
+
     // --- Step 3: GET the nocache key again — expect forwarded to S3 AND files deleted ---
     let s3 = proxy_get(server.addr, nocache_path).await;
     assert!(s3.is_success(), "GET after rule change should succeed");
@@ -839,7 +890,17 @@ async fn class_b_mode_b_conditional_get_not_served_from_cache() {
         r#"{ "rules": [ { "pattern": "**/nocache/**", "read_cache_enabled": false } ] }"#,
     );
 
-    // --- Step 3: Send conditional GET with If-None-Match matching cached ETag ---
+    // --- Step 3: Wait until the new rule has resolved, then send the conditional GET ---
+    // A request that finds the rules stale waits at most RULES_RELOAD_WAIT_BOUND for the
+    // reload, and one that joins a read already in flight does not wait, so under load
+    // the conditional GET below could resolve against the old rules and take the caching
+    // path. Poll the resolver until it reports the new rule. This waits on the positive
+    // condition only; the eager delete itself is still asserted after the request.
+    wait_for_rules_reload(&cache_manager, path, "read_cache_enabled = false", |r| {
+        !r.read_cache_enabled
+    })
+    .await;
+
     // On unfixed code, Mode B evaluates conditions from cache BEFORE the
     // read_cache_enabled gate, answers 304, and never contacts S3.
     let total_before = stub.captured().len();
@@ -935,6 +996,11 @@ async fn class_b_mode_b_conditional_head_not_served_from_cache() {
         temp_dir.path(),
         r#"{ "rules": [ { "pattern": "**/nocache/**", "read_cache_enabled": false } ] }"#,
     );
+
+    wait_for_rules_reload(&cache_manager, path, "read_cache_enabled = false", |r| {
+        !r.read_cache_enabled
+    })
+    .await;
 
     // --- Step 3: Send conditional HEAD with If-None-Match matching cached ETag ---
     let total_before = stub.captured().len();
@@ -1313,7 +1379,7 @@ async fn full_key_matching_is_case_sensitive_on_request_path() {
 async fn preservation_unchanged_rules_get_in_window_served_from_cache() {
     let temp_dir = TempDir::new().expect("tempdir");
 
-    // No rules file → global defaults (get_ttl ~10 years). The object will be
+    // No rules file → global defaults (get_ttl 1 day). The object will be
     // well within its TTL window for the entire duration of this test.
     let config = behavior_config(temp_dir.path().to_path_buf());
     let (cache_manager, _disk, range_handler) = make_cache_infra(&config).await;

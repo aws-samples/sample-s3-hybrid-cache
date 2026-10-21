@@ -1,7 +1,7 @@
 //! Permit-lifetime integration tests.
 //!
-//! Spec: `.kiro/specs/transfer-concurrency-admission/` (Requirement 9), combined
-//! into `.kiro/specs/combined-2.5.0/tasks.md` Phase C, tasks 14 and 16.
+//! Spec: the transfer concurrency admission feature (Requirement 9), combined
+//! into the combined 2.5.0 feature Phase C, tasks 14 and 16.
 //!
 //! `PermitBody` itself is already exhaustively unit-tested in
 //! `src/permit_body.rs` (frames unchanged, released on completion, released on
@@ -144,7 +144,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false, // compression disabled — keeps stored bytes 1:1 with the body
         config.cache.get_ttl,

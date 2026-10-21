@@ -13,9 +13,9 @@
 //!   when it is present and skip caching on mismatch.
 //! - [`decode_aws_chunked`] — decode a complete chunked body to plain bytes
 //!   and parse any trailers after the zero-size chunk.
-//! - [`encode_aws_chunked`] — encode plain bytes as chunked (for tests only).
-//! - [`encode_aws_chunked_with_trailers`] — encode plain bytes as chunked
-//!   with trailer key-value pairs (for tests only).
+//! - `encode_aws_chunked` — encode plain bytes as chunked. `#[cfg(test)]` only.
+//! - `encode_aws_chunked_with_trailers` — encode plain bytes as chunked
+//!   with trailer key-value pairs. `#[cfg(test)]` only.
 //!
 //! # When to use this module
 //!
@@ -157,7 +157,7 @@ pub struct AwsChunkedDecodeResult {
 ///
 /// # Returns
 /// `true` if aws-chunked encoding is detected, `false` otherwise
-pub fn is_aws_chunked(headers: &HashMap<String, String>) -> bool {
+pub(crate) fn is_aws_chunked(headers: &HashMap<String, String>) -> bool {
     // Check content-encoding header for aws-chunked
     if let Some(content_encoding) = headers.get("content-encoding") {
         if content_encoding.to_lowercase().contains("aws-chunked") {
@@ -192,7 +192,7 @@ pub fn is_aws_chunked(headers: &HashMap<String, String>) -> bool {
 ///
 /// # Returns
 /// `Some(u64)` if the header is present and valid, `None` otherwise
-pub fn get_decoded_content_length(headers: &HashMap<String, String>) -> Option<u64> {
+pub(crate) fn get_decoded_content_length(headers: &HashMap<String, String>) -> Option<u64> {
     headers
         .get("x-amz-decoded-content-length")
         .and_then(|v| v.parse::<u64>().ok())
@@ -375,7 +375,10 @@ fn parse_chunk_size(header: &str) -> Result<usize, AwsChunkedError> {
 ///
 /// # Panics
 /// Panics if `chunk_size` is 0
-pub fn encode_aws_chunked(data: &[u8], chunk_size: usize) -> Vec<u8> {
+///
+/// Test seam: only this module's own tests encode bodies, so it is not compiled into the library.
+#[cfg(test)]
+pub(crate) fn encode_aws_chunked(data: &[u8], chunk_size: usize) -> Vec<u8> {
     encode_aws_chunked_with_trailers(data, chunk_size, &[])
 }
 
@@ -394,7 +397,8 @@ pub fn encode_aws_chunked(data: &[u8], chunk_size: usize) -> Vec<u8> {
 ///
 /// # Panics
 /// Panics if `chunk_size` is 0
-pub fn encode_aws_chunked_with_trailers(
+#[cfg(test)]
+pub(crate) fn encode_aws_chunked_with_trailers(
     data: &[u8],
     chunk_size: usize,
     trailers: &[(&str, &str)],
@@ -500,7 +504,7 @@ enum DecoderState {
 /// the way in, and `forward_signed_request_streaming`
 /// (`src/signed_request_proxy.rs`) re-establishes it on the way out rather than
 /// relaying raw frames — see that function's doc comment and
-/// `.kiro/specs/chunked-request-framing/` (GitHub issue #19) for why a raw
+/// the chunked request framing feature (GitHub issue #19) for why a raw
 /// relay of an unwrapped chunked body is not equivalent to what the client
 /// originally sent on the wire, even though every byte of the signed content
 /// is unchanged. This decoder's inner-layer scope is unaffected either way: it
@@ -640,8 +644,10 @@ impl IncrementalAwsChunkedDecoder {
         }
     }
 
-    /// Total number of decoded object bytes emitted so far.
-    pub fn decoded_len(&self) -> u64 {
+    /// Total number of decoded object bytes emitted so far. Test seam: production code
+    /// reads the final figure from `AwsChunkedTrailers::decoded_len` after `finish`.
+    #[cfg(test)]
+    pub(crate) fn decoded_len(&self) -> u64 {
         self.decoded_len
     }
 

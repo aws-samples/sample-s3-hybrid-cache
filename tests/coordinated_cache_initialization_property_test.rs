@@ -82,10 +82,11 @@ fn create_test_cache_config() -> CacheConfig {
         max_cache_size: 1024 * 1024 * 1024, // 1GB
         ram_cache_enabled: false,
         max_ram_cache_size: 0,
-        eviction_algorithm: EvictionAlgorithm::LRU,
+        eviction_algorithm: EvictionAlgorithm::TinyLFU,
         write_cache_enabled: true,
         write_cache_percent: 0.5,
         write_cache_max_object_size: 1024 * 1024 * 100, // 100MB
+        disk_safety_free_space_floor: 1024 * 1024 * 1024, // 1 GiB
         put_ttl: Duration::from_secs(86400),            // 1 day
         get_ttl: Duration::from_secs(3600),             // 1 hour
         head_ttl: Duration::from_secs(300),             // 5 minutes
@@ -94,8 +95,6 @@ fn create_test_cache_config() -> CacheConfig {
         range_merge_gap_threshold: 1024 * 1024, // 1MB
         eviction_buffer_percent: 5,
         ram_cache_flush_interval: Duration::from_secs(60),
-        ram_cache_flush_threshold: 100,
-        ram_cache_flush_on_eviction: false,
         ram_cache_verification_interval: Duration::from_secs(1),
         incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
         initialization: InitializationConfig::default(),
@@ -146,6 +145,8 @@ fn create_test_metadata(
             last_accessed: SystemTime::now(),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         }],
         created_at: SystemTime::now(),
         expires_at: SystemTime::now() + Duration::from_secs(3600),
@@ -349,7 +350,7 @@ fn prop_inflight_and_resident_are_never_cross_validated(
             50.0,
             config.put_ttl,
             config.incomplete_upload_ttl,
-            s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+            s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
             config.write_cache_max_object_size,
         );
 
@@ -642,7 +643,7 @@ mod edge_case_properties {
                 50.0,
                 config.put_ttl,
                 config.incomplete_upload_ttl,
-                s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+                s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
                 config.write_cache_max_object_size,
             );
 

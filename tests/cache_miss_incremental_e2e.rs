@@ -34,7 +34,7 @@ use bytes::Bytes;
 use s3_proxy::cache_types::{ObjectMetadata, RangeSpec, UploadState};
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::{DiskCacheManager, IncrementalRangeWriter};
-use s3_proxy::{ProxyError, Result};
+use s3_proxy::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -96,7 +96,8 @@ async fn simulate_incremental_miss_write(
     let writer = disk_cache
         .begin_incremental_range_write(cache_key, start, end, compression_enabled)
         .await
-        .expect("begin_incremental_range_write failed");
+        .expect("begin_incremental_range_write failed")
+        .expect("the capacity guard admits with an unconfigured floor");
 
     // Same shape as http_proxy.rs: closure returns (writer, Result<()>) so
     // the writer is always recovered (even on per-chunk error) and can be
@@ -220,10 +221,6 @@ async fn setup_disk_cache() -> (Arc<DiskCacheManager>, tempfile::TempDir) {
 // construct inside the blocking task. This keeps the unused-import guard
 // from flagging the top-level `ProxyError` re-export we rely on via the
 // closure return type.
-#[allow(dead_code)]
-fn _proxy_error_import_guard() -> Result<()> {
-    Err::<(), ProxyError>(ProxyError::CacheError("unused".into()))
-}
 
 // ---------------------------------------------------------------------------
 // Partial-range cache-miss path

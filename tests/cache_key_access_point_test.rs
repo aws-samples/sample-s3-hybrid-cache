@@ -315,7 +315,7 @@ fn test_path_style_cache_key_preservation() {
 // any path is `{bucket}/{normalize_cache_key(path)}` — the bucket from the
 // Host header is prepended so cache entries are shared with path-style
 // requests for the same bucket+key. Updated in the s3-transfer-acceleration-
-// support spec (see .kiro/specs/s3-transfer-acceleration-support/) to reflect
+// support spec (see the s3 transfer acceleration support feature) to reflect
 // the new virtual-hosted bucket extraction behaviour.
 //
 // **Validates: Requirement 4.1 (s3-transfer-acceleration-support spec)**

@@ -1,36 +1,32 @@
 //! `ShardedRamCache` shard-count contention microbenchmark.
 //!
-//! Purpose: characterize how RAM-cache throughput scales with `ram_cache_shard_count`
-//! under high concurrent access, to inform the `page-aligned-range-cache` decision to
-//! keep the default `max_ram_cache_size` at 256 MiB (which, with the unconditional
-//! 64 MiB admission-ceiling shard clamp, yields 4 effective shards instead of 8).
+//! Measures how RAM cache `get()` throughput scales with `ram_cache_shard_count` under high
+//! concurrent access. The effective shard count is
+//! `min(ram_cache_shard_count, max(1, max_ram_cache_size / 64 MiB))`, so the default 512 MiB
+//! RAM cache gets all of the default 8 shards, and a smaller RAM cache gets fewer.
 //!
-//! This is the CORRECT instrument for that question — the per-shard `RwLock` is the only
-//! thing that differs across shard counts, and it is exercised only under high concurrent
-//! request rate across many distinct keys. The single-client S3Proxy-Bench rig cannot
-//! surface it (one stream, one/few keys), and the network fleet buries it (the lock is
-//! held for a hashmap lookup + `Arc<Bytes>` clone, nanoseconds, dwarfed by S3 latency).
-//! So we measure it in isolation, in-process, with zero network noise.
+//! The per-shard `RwLock` is the only thing that differs across shard counts, and only a high
+//! request rate across many distinct keys exercises it. A single client with one or a few keys
+//! cannot show it, and over a network it is lost in S3 latency (the lock is held for a hash map
+//! lookup and an `Arc<Bytes>` clone, nanoseconds). So this measures it in isolation, in
+//! process, with no network. It uses only `std::time::Instant` and `tokio`, with no
+//! benchmarking crate.
 //!
-//! Consistent with the repo's no-new-dependency posture (`nonpublic/LICENSE_COMPLIANCE.md`),
-//! this uses ONLY `std::time::Instant` + `tokio` (already a dependency) — no `criterion`.
+//! Workload: pre-populate `KEYS` distinct entries (every later read is a hit, so this measures
+//! the `get()` lock path, not eviction or S3), then run `CONCURRENCY` tasks, each issuing
+//! `OPS_PER_TASK` `get()` calls over pseudo-random keys, for each shard count in `SHARDS`.
+//! Total capacity is held constant and large enough that nothing is evicted.
 //!
-//! Workload: pre-populate `KEYS` distinct entries (all subsequent reads are HITS, so we
-//! measure the get() lock path, not eviction or S3), then run `CONCURRENCY` tasks each
-//! issuing `OPS_PER_TASK` `get()`s over pseudo-random keys, for each shard count in
-//! `SHARDS`. Total capacity is held constant and large enough that nothing is evicted.
-//!
-//! Run in RELEASE (microbenchmarks are meaningless in debug):
+//! Run in release mode; microbenchmarks are meaningless in debug:
 //!
 //! ```text
 //! cargo run --release --example ram_cache_shard_contention_bench
 //! # tunables (env): SHARDS=1,4,8,16,32 KEYS=20000 OPS_PER_TASK=500000 CONCURRENCY=<cpus>
 //! ```
 //!
-//! Reading the result: if ops/sec is ~flat from 4→8→16 shards, shard contention is
-//! negligible and keeping the 256 MiB / 4-shard default is safe. If throughput climbs
-//! materially with more shards, the clamp's 8→4 reduction is a real regression and the
-//! default should be bumped to 512 MiB to preserve 8 shards.
+//! Reading the result: if ops/sec stays roughly flat from 4 to 8 to 16 shards, shard
+//! contention is negligible at that concurrency; if it climbs with more shards, a RAM cache too
+//! small for 8 shards pays for it.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -78,6 +74,7 @@ fn make_entry(key: &str) -> RamCacheEntry {
         access_count: AtomicU64::new(0),
         compressed: false,
         compression_algorithm: CompressionAlgorithm::Lz4,
+        verified_at: AtomicU64::new(now_ms),
     }
 }
 

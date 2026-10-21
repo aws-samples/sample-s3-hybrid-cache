@@ -24,7 +24,7 @@ fn create_cache_manager(
         false,
         0,
         1024 * 1024 * 1024,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         get_ttl,

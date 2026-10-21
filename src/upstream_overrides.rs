@@ -51,7 +51,7 @@ impl TransportMode {
     /// Whether this mode waives a security protection — `Plaintext` (cleartext
     /// egress) or `TlsUnvalidated` (no MITM protection on the proxy→origin leg).
     /// `TlsValidated` waives nothing.
-    pub fn is_protection_waiving(self) -> bool {
+    pub(crate) fn is_protection_waiving(self) -> bool {
         matches!(
             self,
             TransportMode::Plaintext | TransportMode::TlsUnvalidated

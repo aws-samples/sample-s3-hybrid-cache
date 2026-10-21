@@ -2,7 +2,8 @@
 //!
 //! This file consolidates all property tests for the range-based eviction feature:
 //! - Property 1: Range Independence (Requirements 1.1, 1.5)
-//! - Property 2: LRU Ordering by Range (Requirements 1.2)
+//! - Property 2: Equal-frequency ranges sort oldest first under TinyLFU (was LRU ordering,
+//!   Requirements 1.2; retargeted when LRU was deleted, cache-eviction-at-scale R10.1)
 //! - Property 3: TinyLFU Scoring by Range (Requirements 1.3)
 //! - Property 4: Single Range Deletion Isolation (Requirements 2.1)
 //! - Property 5: Metadata Update After Range Eviction (Requirements 2.2)
@@ -458,11 +459,19 @@ fn test_property_range_independence_separate_candidates() {
 }
 
 // ============================================================================
-// Property 2: LRU Ordering by Range
-// **Validates: Requirements 1.2**
+// Property 2: equal-frequency ranges sort oldest first under TinyLFU
+//
+// Every range in this fixture has the same access_count and an idle time of 1-2 hours,
+// so decayed_frequency is equal across all of them and TinyLFU's key reduces to its
+// last_accessed tiebreak. That is the R10.1 subsumption case: recency order within a
+// decay band. The property asserts last_accessed is non-decreasing after the sort, and
+// refuses a fixture whose ranges do not share one access_count, so a fixture change
+// cannot turn this into a frequency test by accident. (A range idle past an extra
+// half-life has a LOWER decayed frequency and so still sorts first: older-first holds
+// across bands too.)
+// **Validates: Requirements 1.2 (retargeted from LRU to TinyLFU, R10.1)**
 // ============================================================================
-
-fn prop_lru_sorts_oldest_first(config: LruOrderingConfig) -> TestResult {
+fn prop_equal_frequency_sorts_oldest_first(config: LruOrderingConfig) -> TestResult {
     let rt = Runtime::new().expect("Failed to create runtime");
     rt.block_on(async {
         let (_temp_dir, cache_dir) = create_test_cache_dir();
@@ -470,7 +479,7 @@ fn prop_lru_sorts_oldest_first(config: LruOrderingConfig) -> TestResult {
             cache_dir.clone(),
             false,
             0,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
         );
 
         let mut time_offset_idx = 0usize;
@@ -501,22 +510,29 @@ fn prop_lru_sorts_oldest_first(config: LruOrderingConfig) -> TestResult {
             return TestResult::discard();
         }
 
+        let first_count = candidates[0].access_count;
+        if candidates.iter().any(|c| c.access_count != first_count) {
+            return TestResult::error("fixture must give every range the same access_count");
+        }
         cache_manager.sort_range_candidates(&mut candidates);
-
         for i in 1..candidates.len() {
             if candidates[i - 1].last_accessed > candidates[i].last_accessed {
-                return TestResult::failed();
+                return TestResult::error(format!(
+                    "equal-frequency candidates out of recency order at {}: {:?} before {:?}",
+                    i,
+                    candidates[i - 1].last_accessed,
+                    candidates[i].last_accessed
+                ));
             }
         }
         TestResult::passed()
     })
 }
-
 #[test]
-fn test_property_lru_ordering_oldest_first() {
+fn test_property_equal_frequency_sorts_oldest_first() {
     QuickCheck::new()
         .tests(20)
-        .quickcheck(prop_lru_sorts_oldest_first as fn(LruOrderingConfig) -> TestResult);
+        .quickcheck(prop_equal_frequency_sorts_oldest_first as fn(LruOrderingConfig) -> TestResult);
 }
 
 // ============================================================================
@@ -704,14 +720,17 @@ mod unit_tests {
         assert_eq!(candidates[0].cache_key, cache_key);
     }
 
+    /// Equal TinyLFU keys keep their collection order: the sort is stable. The test asserts
+    /// the order itself, because five candidates sharing one `last_accessed` satisfy any
+    /// timestamp check in every permutation.
     #[tokio::test]
-    async fn test_lru_stable_for_equal_times() {
+    async fn test_tinylfu_stable_for_equal_keys() {
         let (_temp_dir, cache_dir) = create_test_cache_dir();
         let cache_manager = CacheManager::new_with_eviction_algorithm(
             cache_dir.clone(),
             false,
             0,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
         );
 
         let cache_key = "test-bucket/same-time-object";
@@ -723,22 +742,12 @@ mod unit_tests {
             .await
             .unwrap();
         assert_eq!(candidates.len(), 5);
-
+        let before: Vec<u64> = candidates.iter().map(|c| c.range_start).collect();
         cache_manager.sort_range_candidates(&mut candidates);
-
-        let first_time = candidates[0].last_accessed;
-        for candidate in &candidates {
-            let diff = if candidate.last_accessed >= first_time {
-                candidate
-                    .last_accessed
-                    .duration_since(first_time)
-                    .unwrap_or_default()
-            } else {
-                first_time
-                    .duration_since(candidate.last_accessed)
-                    .unwrap_or_default()
-            };
-            assert!(diff <= Duration::from_secs(1));
-        }
+        let after: Vec<u64> = candidates.iter().map(|c| c.range_start).collect();
+        assert_eq!(
+            after, before,
+            "candidates with equal (decayed_frequency, last_accessed) must keep their order"
+        );
     }
 }

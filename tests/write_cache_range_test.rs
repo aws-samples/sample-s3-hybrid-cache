@@ -29,7 +29,7 @@ async fn test_range_request_from_write_cache() {
         false, // RAM cache disabled for simplicity
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         get_ttl,
@@ -285,7 +285,7 @@ async fn test_full_object_range_from_write_cache() {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),

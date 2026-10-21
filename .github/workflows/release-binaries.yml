@@ -1,0 +1,214 @@
+name: release-binaries
+
+# Builds the prebuilt s3-proxy release binaries and publishes them as GitHub
+# release assets when a version tag (v<version>, e.g. v3.0.0) is pushed.
+#
+# Two native builds, one per architecture, each inside amazonlinux:2023 so the
+# binary's glibc floor is 2.34 (ubuntu-24.04 ships 2.39, and a binary built on
+# the bare runner cannot start on Amazon Linux 2023). The floor is asserted by
+# reading the highest GLIBC_ symbol version the binary requires, never by
+# running the binary or reading ldd on the machine that built it.
+#
+# Every action used is first-party (actions/*), so the workflow passes under
+# any organization Actions policy. Do not add a third-party action.
+#
+# A workflow_dispatch run from a branch builds, attests and verifies but does
+# not publish: the publish step only runs for a v* tag ref.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            container: amazonlinux:2023
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            container: amazonlinux:2023
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # Echo the runner's own facts so a change of runner class or base image
+      # shows up in the log, then refuse to continue if the machine is not the
+      # architecture this matrix entry names. Without that check an x86_64
+      # binary could ship under the aarch64 file name.
+      - name: Runner and container facts
+        shell: bash
+        run: |
+          echo "uname -m : $(uname -m)"
+          if [ "$(uname -m)" != "${{ matrix.arch }}" ]; then
+            echo "::error::runner machine $(uname -m) does not match matrix arch ${{ matrix.arch }}"
+            exit 1
+          fi
+          echo "nproc    : $(nproc)"
+          grep -E '^Mem(Total|Available)' /proc/meminfo
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "no cgroup memory limit readable"
+          ldd --version 2>&1 | sed -n 1p
+          grep -E '^(NAME|VERSION)=' /etc/os-release
+
+      - name: Install toolchain
+        shell: bash
+        run: |
+          dnf install -y -q gcc git tar gzip which findutils binutils procps-ng time file
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v7
+
+      # rustup was installed with --default-toolchain none, so this is the first
+      # thing that resolves rust-toolchain.toml. If the pin does not install, the
+      # build fails here rather than silently using some other compiler.
+      - name: Resolve pinned toolchain
+        shell: bash
+        run: |
+          cat rust-toolchain.toml
+          rustc --version
+          cargo --version
+
+      - name: Build
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          /usr/bin/time -v cargo build --release --bin s3-proxy 2>&1 | tee build-time.txt
+
+      - name: Binary facts
+        shell: bash
+        run: |
+          BIN=target/release/s3-proxy
+          ls -l "$BIN"
+          file "$BIN" || true
+          echo "--- dynamic dependencies (recorded, not asserted) ---"
+          ldd "$BIN"
+          echo "--- peak build RSS / wall clock ---"
+          grep -E 'Maximum resident set size|Elapsed \(wall clock\)' build-time.txt || true
+          sha256sum "$BIN"
+
+      # The predicate an operator's host evaluates: the highest GLIBC_ symbol
+      # version the binary requires, compared against the published floor.
+      - name: Assert glibc floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_ALLOWED=GLIBC_2.34
+          FLOOR=$(objdump -T target/release/s3-proxy | { grep -o 'GLIBC_[0-9.]*' || true; } | sort -uV | tail -1)
+          echo "highest GLIBC_ symbol version required: ${FLOOR:-<none found>}"
+          if [ -z "$FLOOR" ]; then
+            echo "::error::no GLIBC_ symbol versions found; the floor cannot be read"
+            exit 1
+          fi
+          HIGHER=$(printf '%s\n%s\n' "$FLOOR" "$MAX_ALLOWED" | sort -V | tail -1)
+          if [ "$HIGHER" != "$MAX_ALLOWED" ]; then
+            echo "::error::glibc floor $FLOOR is above $MAX_ALLOWED"
+            exit 1
+          fi
+          echo "glibc floor $FLOOR is at or below $MAX_ALLOWED"
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/s3-proxy "dist/s3-proxy-${{ matrix.arch }}-linux"
+          cd dist && sha256sum "s3-proxy-${{ matrix.arch }}-linux" > "SHA256SUMS-${{ matrix.arch }}"
+          cat "SHA256SUMS-${{ matrix.arch }}"
+
+      # A failure here fails the build job, so the release job (needs: build)
+      # never runs and nothing is published without its provenance.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/s3-proxy-${{ matrix.arch }}-linux
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: s3-proxy-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Refuse to assemble anything but exactly two binaries and two per-arch
+      # checksum files. merge-multiple would otherwise build a one-architecture
+      # release without complaint.
+      - name: Assert asset count
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          EXPECTED=$(printf '%s\n' SHA256SUMS-aarch64 SHA256SUMS-x86_64 s3-proxy-aarch64-linux s3-proxy-x86_64-linux | sort)
+          ACTUAL=$(ls -1 dist | sort)
+          BINS=$(ls -1 dist | grep -c '^s3-proxy-.*-linux$' || true)
+          SUMS=$(ls -1 dist | grep -c '^SHA256SUMS-' || true)
+          echo "binaries: $BINS, per-arch checksum files: $SUMS"
+          if [ "$BINS" -ne 2 ] || [ "$SUMS" -ne 2 ] || [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::expected exactly two binaries and two per-arch checksum files; refusing to publish"
+            exit 1
+          fi
+
+      - name: Verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS-x86_64 SHA256SUMS-aarch64
+
+      - name: Assemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat SHA256SUMS-x86_64 SHA256SUMS-aarch64 > SHA256SUMS
+          rm -f SHA256SUMS-*
+          cp ../LICENSE ../THIRD_PARTY_LICENSES .
+          cat SHA256SUMS
+          ls -l
+
+      # Publishes only for a v* tag ref. The tag must already exist
+      # (--verify-tag), so GitHub never auto-creates an untagged-* tag.
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          PRERELEASE=()
+          case "$TAG" in *-*) PRERELEASE=(--prerelease) ;; esac
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --verify-tag \
+            "${PRERELEASE[@]}" \
+            --title "$TAG" \
+            --notes "Prebuilt s3-proxy $TAG for Linux, x86_64 and aarch64. Requires glibc 2.34 or newer (Amazon Linux 2023 and newer; not Amazon Linux 2). Dynamically linked against glibc; no musl, macOS or Windows builds. Verify with sha256sum -c SHA256SUMS, or gh attestation verify <binary> --repo ${{ github.repository }}." \
+            dist/s3-proxy-x86_64-linux dist/s3-proxy-aarch64-linux dist/SHA256SUMS dist/LICENSE dist/THIRD_PARTY_LICENSES
+          gh release view "$TAG" --repo "${{ github.repository }}"

@@ -12,7 +12,7 @@ async fn test_get_write_cache_capacity_default() -> Result<()> {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -51,7 +51,7 @@ async fn test_get_write_cache_capacity_with_total_size() -> Result<()> {
         false,
         0,
         10 * 1024 * 1024 * 1024, // 10GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -93,7 +93,7 @@ async fn test_get_write_cache_capacity_different_percentages() -> Result<()> {
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -135,7 +135,7 @@ async fn test_get_write_cache_capacity_consistency() -> Result<()> {
         false,
         0,
         5 * 1024 * 1024 * 1024, // 5GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),

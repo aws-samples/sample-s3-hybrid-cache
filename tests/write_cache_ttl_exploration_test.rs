@@ -36,7 +36,7 @@ fn create_cache_manager_get_ttl_zero(
         false,
         0,
         1024 * 1024 * 1024,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::ZERO, // get_ttl = 0 (the bug condition)

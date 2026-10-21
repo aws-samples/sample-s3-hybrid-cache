@@ -1,213 +1,205 @@
-# Web Dashboard
+# Dashboard
 
-Real-time web-based monitoring interface for S3 proxy cache performance and application logs.
+The dashboard is a read-only web page that shows a proxy's cache statistics, per-bucket traffic,
+active cache rules and recent application log entries. It is one of the three monitoring
+listeners, with health and metrics. It requires no authentication, so it binds to `127.0.0.1` by
+default; read [Security considerations](#security-considerations) before binding it to any other
+address.
 
-## Overview
+## Turn it on
 
-The dashboard provides a lightweight, browser-based interface for monitoring proxy status without requiring authentication. It serves static HTML/CSS/JavaScript and provides JSON APIs for real-time data updates.
-
-## Features
-
-### Cache Statistics
-- **Real-time metrics**: RAM and disk cache hit rates, miss rates, current sizes
-- **Auto-refresh**: Updates every 5 seconds (configurable)
-- **Human-readable formatting**: Displays sizes in KB, MB, GB units
-- **Eviction tracking**: Shows eviction counts and recently evicted items
-- **Requests tile**: `Requests: N / M` shows concurrency permits held against the configured `server.max_concurrent_requests`, with the TCP connection count displayed alongside. Before 2.5.0 the numerator was the connection count, which does not track what the limit bounds — with HTTP/1 keep-alive one connection serves many sequential requests. See [Metrics](METRICS.md) for the underlying `permits_held` and `permits_held_peak` fields.
-- **Effectiveness metrics**: Overall Statistics card shows total requests served (GET + HEAD + PUT), GET hits, GET misses, and cache hit rate. The hit-rate denominator counts every GET/HEAD that flows through the proxy — including list-object GETs, conditional requests, and non-cacheable or error responses (e.g. 404/403) — so the displayed rate is the fraction of all GET/HEAD traffic served from cache, not of cacheable object reads alone. Per-bucket traffic table shows GET/PUT request counts, bytes downloaded to clients, bytes saved (S3 transfers avoided via cache), and bytes uploaded.
-
-### Cache Rules
-- **Rules-only table**: Lists the active cache rules from `cache_rules.json` in evaluation order, each with its configured settings and HEAD/GET hit rate. Only appears when at least one rule is configured.
-- **Rule rows**: One row per rule, shown in first-match-per-field order. The "Rule / Pattern" column holds the glob pattern; HEAD and GET columns show per-rule hit summaries (e.g. `72.3% of 4 102`)
-- **Pattern filter**: Client-side text filter that matches rule patterns
-- **Top 20 display**: Shows the top 20 rows by default with a "Show all" toggle
-- **Expandable settings**: Click "Settings" on a rule row to view the fields that rule sets (GET/HEAD/PUT TTL, read/write/compression/RAM, "Local conditions" for `evaluate_conditions_from_cache`, and page widening + page size for [page-aligned range caching](CACHE_READ_PATHS.md#page-aligned-range-caching)). Only fields the rule actually sets are shown; unset fields fall through to the global defaults and are omitted. "Local conditions: On" means the proxy answers conditional requests for matching keys from cached metadata rather than forwarding them to S3 — worth noting when auditing which prefixes skip S3-side credential revalidation.
-
-### Page-Aligned Range Caching Statistics
-
-The `page_cache` counters (widened requests, bytes prefetched, page hits, signed-range
-skips, fallbacks, and RAM page promotions) are returned in the `/api/cache-stats` JSON
-payload. There is no dedicated dashboard card for them yet — read them from that
-endpoint or from `/metrics`. Per-rule page settings *are* visible in the Cache Rules
-table via the Settings expander, described above.
-
-### Application Log Viewer
-- **Recent entries**: Shows the most recent 100 log entries by default
-- **Auto-refresh**: Updates every 10 seconds (`logs_refresh_interval`)
-- **Structured display**: Timestamp, log level, and message content
-- **Log level filtering**: Filter by ERROR, WARN, INFO, DEBUG levels
-- **Adjustable limit**: An in-page dropdown selects 50, 100, 200, or 500 entries and is passed to `/api/logs?limit=`. This is a **browser-side control**, which is why the `dashboard.max_log_entries` config field is inert — the viewer's cap comes from the dropdown, not from configuration.
-- **Structured data formatting**: Key-value pairs displayed in readable format
-
-### System Information
-- **Instance details**: Hostname, version, uptime
-- **Navigation**: Menu with Cache Stats and Application Logs sections
-- **Error handling**: User-friendly error messages with retry options
-- **Responsive design**: Works on desktop and mobile browsers
-
-## Configuration
-
-### Basic Settings
-
-```yaml
-dashboard:
-  enabled: true                        # Enable dashboard server
-  port: 8081                          # Dashboard server port
-  bind_address: "127.0.0.1"           # Default: loopback only
-  cache_stats_refresh_interval: "5s"   # Cache stats refresh rate
-  logs_refresh_interval: "10s"         # Log refresh rate
-  max_log_entries: 100                 # DEPRECATED: parsed but has no effect
-```
-
-### Access Control
-
-**No Authentication**: The dashboard is unauthenticated and read-only — it exposes cache statistics and log excerpts, not credentials or control operations. Access control is network-level.
-
-**Network Access**:
-- `bind_address: "127.0.0.1"` - Localhost only (code default; safest)
-- `bind_address: "0.0.0.0"` - All interfaces (requires network-layer restriction)
-- Use firewall rules or security groups to restrict access when non-loopback
-- SSH tunnel provides secure remote access without exposing the port
-
-### Performance Settings
-
-**Refresh Intervals**:
-- `cache_stats_refresh_interval`: 1-300 seconds (default: 5s)
-- `logs_refresh_interval`: 1-300 seconds (default: 10s)
-- Lower values = more frequent updates, higher CPU usage
-
-**Log Display**:
-- `max_log_entries` is **deprecated**. It is parsed and range-validated (10-10000) and logged at startup, but the log viewer does not use it to cap output. It will be removed in a future release.
-
-## Architecture
-
-### Server Component
-- **Dedicated HTTP server**: Runs on separate port from proxy traffic
-- **Static file handler**: Serves HTML, CSS, JavaScript assets
-- **JSON API handler**: Provides real-time data endpoints
-- **Connection management**: Handles up to 50 concurrent users
-
-### Integration Points
-- **CacheManager**: Real-time cache statistics
-- **LoggerManager**: Application log access
-- **MetricsManager**: System metrics and counters
-- **ShutdownSignal**: Graceful shutdown coordination
-
-### API Endpoints
-
-**Static Assets**:
-- `GET /` - Dashboard HTML interface
-- `GET /style.css` - Stylesheet
-- `GET /script.js` - JavaScript
-
-**JSON APIs** (six endpoints):
-- `GET /api/cache-stats` - Cache statistics, including the global hit/miss counters and the `page_cache` counters. Returns `overall` with `total_requests` (GET + HEAD + PUT), `get_hits`, `get_misses`, `get_total`, `head_hits`, `head_misses`, `head_total`, `put_total`, `cache_hit_rate`, `s3_requests_saved`, and `bytes_served_from_cache`, plus the per-tier size and eviction figures the statistics cards render.
-- `GET /api/bucket-stats` - Cache rules and per-rule hit/miss stats. Returns `rules` (the ordered rule list, each with the fields it sets plus HEAD/GET hit and miss counts). Only populated when `cache_rules.json` has at least one rule.
-- `GET /api/bucket-traffic` - Per-bucket traffic counters. Returns `bucket_traffic` map keyed by `bucket` or `bucket/prefix`, each entry with `get_requests`, `put_requests`, `bytes_served` (all GET bytes to clients), `bytes_saved` (GET bytes served from cache, i.e. S3 transfers avoided), and `bytes_uploaded` (PUT/UploadPart bytes from clients). See [METRICS.md](METRICS.md).
-- `GET /api/bandwidth` - Download bandwidth QoS state. Returns `instance_ceiling_bps`, `class_bytes`, `residual_bytes`, and `failopen_total`. See [BANDWIDTH_QOS.md](BANDWIDTH_QOS.md).
-- `GET /api/logs` - Recent application log entries. Accepts `?limit=` (50/100/200/500) and `?level=` (ERROR/WARN/INFO/DEBUG).
-- `GET /api/system-info` - Hostname, version, and uptime
-
-## Performance Impact
-
-### Resource Usage
-- **Memory overhead**: <10MB additional memory
-- **CPU impact**: Minimal when no users connected
-- **Network**: Efficient polling, no persistent connections
-- **Disk I/O**: Read-only access to logs and cache metadata
-
-### Scalability
-- **Concurrent users**: Up to 50 simultaneous connections
-- **Auto-refresh**: Staggered updates to prevent thundering herd
-- **Graceful degradation**: Continues serving under proxy load
-- **Non-blocking**: Does not impact main proxy operations
-
-## Deployment
-
-### Development
 ```yaml
 dashboard:
   enabled: true
   port: 8081
-  bind_address: "127.0.0.1"  # Localhost only
-  cache_stats_refresh_interval: "2s"   # Faster updates
-  logs_refresh_interval: "5s"
+  bind_address: "127.0.0.1"            # the default: loopback only
+  cache_stats_refresh_interval: "5s"   # how often an open page polls cache statistics
+  logs_refresh_interval: "10s"         # how often an open page polls the log viewer
 ```
 
-### Production
-```yaml
-dashboard:
-  enabled: true
-  port: 8081
-  bind_address: "127.0.0.1"  # Loopback; reach it over an SSH tunnel
-  cache_stats_refresh_interval: "10s"  # Reduced frequency
-  logs_refresh_interval: "30s"
-```
+Both refresh intervals accept 1 to 300 seconds; the defaults are `5s` and `10s`. An open page
+polls the proxy at these intervals, so longer intervals send it fewer requests. `max_log_entries`
+is accepted and validated (10 to 10000) but has no effect, and a value other than `100` logs a startup warning to delete it: the selector on the page sets how many
+log entries the viewer shows. Every dashboard field is in
+[Dashboard configuration](CONFIGURATION.md#dashboard-configuration).
 
-The dashboard is unauthenticated and exposes cache statistics and application log
-content, so the recommended production posture is to leave it on loopback and reach
-it through an SSH tunnel (see [Security Considerations](#security-considerations)).
-Binding `0.0.0.0` is supported, but then the port needs a firewall or a reverse proxy
-in front of it.
+Open `http://localhost:8081` on the proxy host, or through an SSH tunnel (see
+[Security considerations](#security-considerations)).
+
+## What it shows
+
+### Cache statistics
+
+- **Hit and miss rates and sizes** for the RAM cache and the disk cache, refreshed every
+  `cache_stats_refresh_interval` and shown in human-readable units.
+- **Eviction counts** for the RAM range cache, the metadata cache and the disk cache.
+- **Write Cache:** the space used by multipart uploads in progress and PUT objects not yet read,
+  against its limit. The limit is `cache.write_cache_percent` of `cache.max_cache_size`, the
+  bound the proxy enforces. See
+  [Write cache configuration](CONFIGURATION.md#write-cache-configuration).
+- **Requests tile:** `Requests: N / M` shows concurrency permits held against
+  `server.max_concurrent_requests`, with the TCP connection count beside it. The numerator is
+  permits because with HTTP/1 keep-alive one connection serves many sequential requests, so a
+  connection count does not track what the limit bounds. See
+  [Request completion metrics](METRICS.md#request-completion-metrics) for `permits_held` and
+  `permits_held_peak`.
+- **Overall statistics card:** total requests served (GET, HEAD and PUT), GET hits, GET misses
+  and the cache hit rate. The hit-rate denominator counts every GET and HEAD through the proxy,
+  including list requests, conditional requests and error responses such as 404 and 403, so the
+  rate is the share of all GET and HEAD traffic served from cache, not of cacheable object reads
+  alone.
+- **Per-bucket traffic table:** GET and PUT request counts, bytes downloaded by clients, bytes
+  saved (S3 transfers the cache avoided) and bytes uploaded. See
+  [Per-bucket traffic metrics](METRICS.md).
+
+### Staged write tier
+
+A card on the Cache Statistics tab, shown whenever the metrics manager is available. It reports
+on staged objects, the write-cache objects not yet read, and every figure on it is fleet-wide
+because it comes from the cache volume.
+
+- **Staged Ranges:** write-cached ranges against the staged range limit, with the percentage.
+  The write cache declines new objects once the limit is reached, so this row is a capacity signal; it
+  turns to a warning at 75%. The limit is read from the running proxy (`staged_tier.range_budget`
+  in the API payload), so the card always shows the limit in force.
+- **Figure State:** `CURRENT`, `STALE` or `UNKNOWN`. `STALE` is a complete figure for an older
+  state, shown with the count of shards past the age bound. `UNKNOWN` means a staged input could
+  not be read, so the occupancy above is the last complete figure, labelled as retained.
+- **Authority Age:** the age of the stalest shard behind the figure, against its bound, measured
+  from the last successful install, never from a pass start or a failed attempt.
+
+The card also shows staged bytes, in-progress multipart bytes, budget declines, fold shard counts
+and mean visit duration, whether the per-pass shard budget is being clipped, the staged-authority
+epoch in the card heading, and the state of the repair rotation. `Repair Rotation: UNREACHABLE`
+is the one permanent condition on the card: every other signal resolves by waiting, while this
+one means the staged-authority epoch cannot advance at this shard population.
+
+The last row, **Authority Memo**, shows read cost rather than correctness. The staged figure is
+cached for a few seconds, so a dashboard refresh, a `/metrics` scrape and a write do not each
+re-read the same state from the cache volume. A low hit count against a high recompute count
+means those reads are still being paid for.
+
+Every field is in the `/api/cache-stats` payload under `staged_tier`, and the same figures are on
+`/metrics` under `write_cache`; see the [Metrics reference](METRICS_REFERENCE.md#write_cache).
+
+### Cache rules
+
+- **Rules table:** the active rules from `cache_rules.json` in evaluation order, each with its
+  settings and its HEAD and GET hit rates (for example `72.3% of 4 102`). The table appears only
+  when at least one rule is configured.
+- **Pattern filter:** a text filter on rule patterns, applied in the browser.
+- **Top 20:** the first 20 rows are shown, with a "Show all" toggle.
+- **Settings:** expands a rule to the fields it sets: GET, HEAD and PUT TTLs; read, write,
+  compression and RAM settings; "Local conditions" for `evaluate_conditions_from_cache`; and page
+  widening and page size for
+  [page-aligned range caching](CACHE_READ_PATHS.md#page-aligned-range-caching). Fields the rule
+  does not set take the global defaults and are not shown. "Local conditions: On" means the proxy
+  answers conditional requests for matching keys from cached metadata instead of forwarding them
+  to S3. Check this setting when auditing which prefixes skip S3-side credential revalidation.
+
+### Page-aligned range caching statistics
+
+The `page_cache` counters (widened requests, bytes prefetched, page hits, signed-range skips,
+fallbacks and RAM page promotions) are in the `/api/cache-stats` payload and on `/metrics`; the
+dashboard has no card for them. Per-rule page settings are in the cache rules table's Settings
+expander.
+
+### Application log viewer
+
+- **Recent entries:** the most recent 100 entries by default, refreshed every
+  `logs_refresh_interval`.
+- **Entry limit:** a selector on the page chooses 50, 100, 200 or 500 entries and passes the
+  choice to `/api/logs?limit=`.
+- **Level filter:** ERROR, WARN, INFO or DEBUG.
+- **Layout:** timestamp, level and message, with structured key-value fields formatted for
+  reading.
+
+### System information
+
+The hostname, version and uptime, and a menu for the Cache Stats and Application Logs sections.
+A failed API call shows an error in place of its card, and the next refresh retries it. The page
+works in desktop and mobile browsers.
+
+## API endpoints
+
+The dashboard runs its own HTTP server on `dashboard.port`, separate from proxy traffic. It serves
+three static assets (`GET /` for the page, `GET /style.css` and `GET /script.js`) and six JSON
+endpoints:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/cache-stats` | Cache statistics: the global hit and miss counters, the `page_cache` counters, and `overall` with `total_requests` (GET, HEAD and PUT), `get_hits`, `get_misses`, `get_total`, `head_hits`, `head_misses`, `head_total`, `put_total`, `cache_hit_rate`, `s3_requests_saved` and `bytes_served_from_cache`, plus the per-tier size and eviction figures the cards render |
+| `GET /api/bucket-stats` | `rules`: the ordered rule list, each rule with the fields it sets and its HEAD and GET hit and miss counts. Populated only when `cache_rules.json` has at least one rule |
+| `GET /api/bucket-traffic` | `bucket_traffic`, keyed by `bucket` or `bucket/prefix`, each entry with `get_requests`, `put_requests`, `bytes_served` (all GET bytes to clients), `bytes_saved` (GET bytes served from cache) and `bytes_uploaded` (PUT and UploadPart bytes from clients). See [Per-bucket traffic metrics](METRICS.md) |
+| `GET /api/bandwidth` | Download bandwidth QoS state: `instance_ceiling_bps`, `class_bytes`, `residual_bytes` and `failopen_total`. See [Bandwidth QoS](BANDWIDTH_QOS.md) |
+| `GET /api/logs` | Recent application log entries. Accepts `?limit=` (50, 100, 200 or 500) and `?level=` (ERROR, WARN, INFO or DEBUG) |
+| `GET /api/system-info` | Hostname, version and uptime |
+
+## Limits
+
+The server accepts at most 50 concurrent connections. It rejects further connections and logs
+each rejection at WARN with the peer address.
+
+## Performance impact
+
+An open page polls the proxy at the two refresh intervals, and each poll reads cache statistics
+or recent log entries. The dashboard's disk access is read-only: application log files and cache
+metadata. It writes nothing.
 
 ## Troubleshooting
 
-### Dashboard Not Accessible
-1. Verify `dashboard.enabled: true` in configuration
-2. Check port conflicts with `dashboard.port`
-3. Verify `bind_address` allows connections from your network
-4. Check firewall rules for configured port
-5. Ensure proxy is running and dashboard started successfully
+### Dashboard not accessible
 
-### Performance Issues
-1. Increase refresh intervals to reduce update frequency
-3. Monitor concurrent connection count (50 concurrent connections are accepted; beyond
-   that, new connections are rejected and the rejection is logged)
-4. Check proxy logs for dashboard-related errors
+1. Check that `dashboard.enabled` is `true`.
+2. Check that no other process uses `dashboard.port`.
+3. Check that `bind_address` accepts connections from your network.
+4. Check the firewall rules for the port.
+5. Check the application log for the dashboard starting.
 
-### Connection Limits
-- Dashboard supports maximum 50 concurrent connections
-- Additional connections are rejected once the limit is reached, and each rejection is logged at WARN with the peer address
-- Use browser refresh if connection limit reached
-- Consider increasing refresh intervals to reduce connection frequency
+### Slow or rejected connections
 
-## Security Considerations
+1. Raise the refresh intervals so open pages poll less often.
+2. Check the application log for connection-limit rejections (WARN, with the peer address). A
+   browser refresh retries a rejected connection.
+3. Check the application log for other dashboard errors.
 
-### Unauthenticated, Read-Only Interface
+## Security considerations
 
-The dashboard is unauthenticated and read-only. It provides cache statistics, application log excerpts, and system information (hostname, version, uptime). It exposes no write operations, no credentials, and no control-plane actions. Presigned URL parameters are masked before they reach the log viewer, so signatures, credentials, and session tokens are redacted rather than displayed.
+### Unauthenticated, read-only interface
 
-The security posture depends entirely on who can reach the port:
+The dashboard requires no authentication and is read-only. It shows cache statistics,
+application log excerpts and system information (hostname, version and uptime). It has no write
+operations, no credentials and no control actions. Presigned URL parameters are masked before
+they reach the log viewer, so signatures, credentials and session tokens are redacted.
+
+Access control is at the network level, so who can reach the port decides who can read the page:
 
 | `bind_address` | Who can reach it | When to use |
 |---|---|---|
-| `127.0.0.1` (code default) | Only the local host | Production — access via SSH tunnel |
-| `0.0.0.0` | Any host with network access | Only when security groups / firewall rules restrict the port to administrators |
+| `127.0.0.1` (default) | The local host only | Production: reach it through an SSH tunnel |
+| `0.0.0.0` | Any host with network access | Only when security groups or firewall rules restrict the port to administrators |
 
-**Production recommendation**: bind to `127.0.0.1` and use an SSH tunnel for remote access:
+In production, bind to `127.0.0.1` and reach the dashboard through an SSH tunnel:
 
 ```bash
-ssh -L 8081:127.0.0.1:8081 proxy-host
+ssh -L 8081:127.0.0.1:8081 <proxy-host>
 ```
 
 Then open `http://localhost:8081` in your browser.
 
-If you bind to `0.0.0.0`, you **must** restrict access at the network layer (security groups, NACLs, firewall rules) to prevent unauthorized monitoring.
+If you bind to `0.0.0.0`, restrict access at the network layer (security groups, network ACLs,
+firewall rules) so that only administrators can reach the port.
 
-### Internal Use Only
-- Dashboard provides full access to cache statistics and logs
-- No authentication or authorization mechanisms
-- Designed for internal monitoring by administrators
-- Should not be exposed to public networks
+### Data exposure
 
-### Network Security
-- Use `bind_address: "127.0.0.1"` for localhost-only access (code default)
-- Configure firewall rules to restrict network access when using `0.0.0.0`
-- Consider VPN or SSH tunneling for remote access
-- Monitor access logs for unexpected connections
+- Cache statistics can reveal usage patterns.
+- Application logs can contain sensitive information; presigned URL parameters are masked.
+- The log level filter narrows what a viewer sees.
+- Consider sanitizing logs in sensitive environments.
 
-### Data Exposure
-- Cache statistics may reveal usage patterns
-- Application logs may contain sensitive information (presigned params are masked)
-- Log filtering helps reduce information exposure
-- Consider log sanitization for sensitive environments
+## See also
+
+- [Metrics reference](METRICS_REFERENCE.md): every `/metrics` field, including those the cards
+  show
+- [Per-bucket traffic metrics](METRICS.md): the traffic table's counters and how to read them
+- [Dashboard configuration](CONFIGURATION.md#dashboard-configuration): every `dashboard.*` field

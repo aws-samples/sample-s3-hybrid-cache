@@ -1,6 +1,6 @@
 //! Property-based tests for `ShardedRamCache`.
 //!
-//! Spec: `.kiro/specs/performance-enhancements/`
+//! Spec: the performance enhancements feature
 //! Task: 3.12
 //!
 //! Tests four correctness properties of the sharded RAM cache:
@@ -50,6 +50,7 @@ fn make_entry(key: &str, data: &[u8]) -> RamCacheEntry {
         access_count: AtomicU64::new(0),
         compressed: false,
         compression_algorithm: s3_proxy::compression::CompressionAlgorithm::Lz4,
+        verified_at: AtomicU64::new(now_ms),
     }
 }
 
@@ -88,7 +89,7 @@ fn prop_shard_isolation_concurrent_gets(k1: String, k2: String) -> TestResult {
         let cache = Arc::new(ShardedRamCache::new(
             capacity,
             SHARD_COUNT,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
         ));
 
         let data1 = b"value-for-k1";
@@ -162,7 +163,7 @@ fn prop_arc_clone_outlives_eviction(key: String, data: Vec<u8>) -> TestResult {
         let entry_bytes = overhead + data.len();
         let capacity = entry_bytes + entry_bytes / 2 + 1;
 
-        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::TinyLFU);
 
         // Step 1: store K → D.
         cache.put(make_entry(&key, &data)).await.unwrap();
@@ -224,7 +225,8 @@ fn prop_capacity_invariant(entries: Vec<(String, Vec<u8>)>) -> TestResult {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async move {
-        let cache = ShardedRamCache::new(TOTAL_CAPACITY, SHARD_COUNT, CacheEvictionAlgorithm::LRU);
+        let cache =
+            ShardedRamCache::new(TOTAL_CAPACITY, SHARD_COUNT, CacheEvictionAlgorithm::TinyLFU);
 
         for (key, data) in &valid {
             cache.put(make_entry(key, data)).await.unwrap();
@@ -281,7 +283,7 @@ fn prop_concurrent_same_key_reads_byte_identical(key: String, data: Vec<u8>) -> 
         let cache = Arc::new(ShardedRamCache::new(
             capacity,
             4,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
         ));
 
         // Store the entry once.

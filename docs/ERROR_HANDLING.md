@@ -1,355 +1,136 @@
-# Error Handling and Recovery
+# Error handling and recovery
 
-This document describes the error handling and recovery mechanisms in the S3 proxy cache
-system, for the range storage architecture.
-
-> **The Rust snippets here illustrate internal `DiskCache` methods**, not a public or
-> stable API. They exist to show what the proxy does on each failure class and what it
-> logs. Operators do not call these — every recovery path described here runs
-> automatically. Method names and signatures may change between releases.
-
-## Table of Contents
-- [Overview](#overview)
-- [Error Categories](#error-categories)
-  - [Corrupted Metadata Files](#1-corrupted-metadata-files)
-  - [Missing Range Binary Files](#2-missing-range-binary-files)
-  - [Disk Space Exhaustion](#3-disk-space-exhaustion)
-  - [Inconsistent Metadata](#4-inconsistent-metadata)
-  - [Partial Write Failures](#5-partial-write-failures)
-  - [Orphaned Files](#6-orphaned-files)
-- [Error Metrics](#error-metrics)
-- [Maintenance Operations](#maintenance-operations)
-- [Error Handling Best Practices](#error-handling-best-practices)
-- [Monitoring and Alerting](#monitoring-and-alerting)
-- [Testing Error Handling](#testing-error-handling)
-- [Troubleshooting](#troubleshooting)
+This page describes what Hybrid Cache for Amazon S3 does when something on the cache path fails: a damaged or missing cache file, a full or slow cache volume, a stalled upstream response, or a request loop. It is for operators deciding what to alert on and what to do when a counter moves. Each section names the detection, what the proxy does, and the metrics and log lines that show it.
 
 ## Overview
 
-The cache system implements robust error handling to ensure that cache corruption, missing files, disk space issues, and other errors don't cause proxy failures. The system follows a "fail gracefully" approach where errors are logged, metrics are recorded, and the system continues serving requests.
+Cache corruption, missing files and disk space errors do not stop the proxy. The proxy logs the error, records a metric where one exists, and serves the request from S3. Two cases reach the client:
 
-### Design Principles
+- A stall mid-stream closes the client connection; see [Stalled upstream responses](#7-stalled-upstream-responses-mid-stream-idle-watchdog).
+- A read streamed from the cache that finds a damaged range file ends early with a connection error; see [Damaged range files](#damaged-range-files).
 
-1. **Graceful Degradation**: When cache errors occur, the system falls back to direct S3 access without interruption
-2. **Self-Healing**: Many errors are automatically detected and repaired without manual intervention
-3. **Transparency**: End users experience no disruption during cache errors
-4. **Observability**: All errors are logged and metrics are recorded for monitoring
-5. **Resilience**: The system continues operating even when parts of the cache are corrupted or unavailable
+Damaged state is cleared without operator action. Confidently corrupt metadata is overwritten by the next full-object fetch (see [Self-healing via overwrite-in-place](#self-healing-via-overwrite-in-place)), and range files that no metadata lists are deleted by the orphan reclamation rotation (see [Orphaned files](#6-orphaned-files)). A single damaged cache entry never stops the process.
 
-### Error Recovery Flow
+## Failure classes
 
-When an error occurs in the cache system, the following flow is typically followed:
+### 1. Corrupted metadata files
 
-1. **Detection**: Error is detected during cache operation
-2. **Logging**: Error is logged with detailed context
-3. **Metric Recording**: Error is recorded in metrics for monitoring
-4. **Recovery Attempt**: System attempts automatic recovery if possible
-5. **Fallback**: Request is served from S3 if cache is unavailable
-6. **Cleanup**: Orphaned or corrupted files are cleaned up in background
+**Detection**: a `.meta` file fails to parse when it is read.
 
-## Error Categories
+**What the proxy does**: it logs the error with the file path, treats the read as a cache miss and leaves the file in place, and counts it in `corruption_metadata_total`. The request is served from S3. A confidently corrupt file is then replaced as described below, with no manual step.
 
-The S3 proxy cache system handles several categories of errors, each with specific detection and recovery strategies.
+#### Self-healing via overwrite-in-place
 
-### 1. Corrupted Metadata Files
+When a `.meta` file is confidently corrupt, rather than caught mid-write, the proxy heals it. Three signals classify a file as confidently corrupt, checked in this order:
 
-**Detection**: JSON parse failure when reading metadata files
+1. **Oversize**: the file is larger than `max_metadata_file_bytes` (default 4 MiB). It is rejected without reading the body. This check runs on the capped metadata reads; the lookup that serves a GET or HEAD on a RAM metadata-cache miss has no size check.
+2. **Legacy**: the document uses the old layout, with an inline `body` and no `object_metadata`.
+3. **Parse failure**: the file still fails to parse after bounded retries, and its size did not change during the retry window, so it is not being written.
 
-**Recovery Strategy**:
-- Log error with details including file path and error message
-- Treat as cache miss (return None)
-- Delete corrupted metadata file to prevent future issues
-- Record metric: `corruption_metadata_total`
+A file that meets none of these stays on the "treat as a miss, do not delete" path. That keeps reads tolerant of a document another proxy is writing at that moment on the cache volume (NFS or EFS).
 
-**Example**:
-```rust
-// When metadata file is corrupted
-let result = disk_cache.get_metadata(cache_key).await?;
-// Returns Ok(None) and deletes corrupted file
-```
+The heal happens on a later fetch:
 
-**Behavior**:
-- System continues operating normally
-- Request is served from S3 (cache miss)
-- Corrupted file is automatically cleaned up
-- No manual intervention required
+- **GET**: the normal cache-miss handling fetches the object from S3 and writes a fresh `.meta` at the same sharded path, over the corrupt file. A full-object fill does this during the request. It publishes the range file first. It then holds the key's metadata lock while it reads whatever `.meta` is there, releases the ranges the new copy supersedes, and renames the new document into place. A document that cannot be parsed is not read, and the fresh one replaces it whole. A range fill instead records the range in this proxy's journal for consolidation to fold in, and folding reads the existing document, so a range fill does not replace an unparseable one. A corrupt `.meta` is therefore cleared by the next full-object fetch of that key, and until then every request for the key is served from S3 as a miss.
+- **HEAD**: a HEAD response does not write a fresh `.meta`, since it caches only in the HEAD cache, and it does not remove the corrupt file either. The file stays until a GET's fill replaces it.
 
-**Prevention Tips**:
-- Ensure proper shutdown procedures to prevent incomplete writes
-- Monitor disk health to prevent I/O errors
-- Regular backups of critical cache metadata (for disaster recovery)
-
-#### Self-Healing via Overwrite-in-Place
-
-When a `.meta` file is classified as **confidently corrupt** (not a transient
-mid-write condition), the proxy heals it automatically:
-
-**Classification — three signals, in order:**
-
-1. **Oversize**: file exceeds `max_metadata_file_bytes` (default 4 MiB) — rejected
-   without reading the body.
-2. **Legacy schema**: the content matches the old `CacheEntry` format (inline
-   `body`, no `object_metadata`) from a pre-upgrade proxy version.
-3. **Stable parse failure**: parse fails after bounded retries AND the file size
-   is unchanged across the retry window (not actively being written).
-
-Files that don't meet any of these criteria remain on the "treat as miss, do not
-delete" path, preserving tolerance for concurrent mid-write reads on shared storage
-(NFS/EFS).
-
-**Heal mechanism:**
-
-- **GET path**: the normal cache-miss handling fetches the object from S3 and calls
-  `store_range`, which writes a fresh `.meta` via atomic tmp+rename — overwriting
-  the corrupt file at the same sharded path. No special action needed beyond
-  detecting corruption.
-- **HEAD-only path**: HEAD responses don't persist a fresh `.meta` (they only cache
-  in the HEAD cache). For these paths, the corrupt `.meta` is explicitly removed so
-  subsequent requests don't re-read it.
-
-**Invariant**: the heal overwrite is always backed by a real S3 fetch. The proxy
-never fabricates metadata from internal state alone.
-
-**Metrics:**
+The overwrite is always backed by a real S3 fetch: the proxy never builds metadata from internal state alone.
 
 | Metric | Description |
 |--------|-------------|
-| `corruption_metadata_total` | Total corrupt metadata detections (all reasons) |
-| `corruption_metadata_by_reason{reason}` | Per-reason breakdown: `Oversize`, `Legacy`, `ParseFailure` |
-| `metadata_heal_overwrite_total` | Successful heal overwrites (GET path store or HEAD path removal) |
+| `corruption_metadata_total` | Corrupt metadata detections, all reasons |
+| `metadata_heal_overwrite_total` | Unparseable `.meta` documents replaced by a fresh one, from a full-object fill, a zero-length fill or a range store. Counted once the replacement is renamed into place, per proxy, and exported over OTLP. A rising `corruption_metadata_total` with a flat heal count means the damaged keys are not being fetched as full objects, so they stay unhealed and keep going to S3 |
 
-**Concurrency safety**: the atomic tmp+rename write cannot race against the
-consolidator because both paths acquire the per-key metadata lock before writing.
-Transient (mid-write) files are never healed — only confident corruption triggers
-the destructive overwrite.
+A heal cannot interleave with a consolidation. Every writer of a `.meta`, the fill paths and the consolidator alike, holds the key's metadata lock across the whole read-modify-write and releases it only after the rename. The lock is never taken from its holder. A fill retries a contended lock a bounded number of times, then abandons the write and leaves the corrupt file for a later request to heal. Consolidation skips a contended key and retries on its next cycle. A file caught mid-write is never healed; only confident corruption triggers the overwrite.
 
-### 2. Missing Range Binary Files
+### 2. Missing range binary files
 
-**Detection**: File not found when loading range data
+**Detection**: a range file that the metadata lists is not found when the proxy loads it.
 
-**Recovery Strategy**:
-- Log error with range details (start, end, cache key)
-- Return error to caller (cache miss)
-- Caller fetches range from S3
-- Caller attempts to recache the range
-- Remove missing range reference from metadata
-- Record metric: `corruption_missing_range_total`
+**What the proxy does**: it logs the error with the range's start, end and cache key, treats the range as a cache miss, fetches it from S3 and caches it again. It removes the missing range from the metadata and counts it in `corruption_missing_range_total`. Other ranges of the same object keep serving, and the client sees no error.
 
-**Example**:
-```rust
-// When range file is missing
-let result = disk_cache.load_range_data(&range_spec).await;
-// Returns Err(ProxyError::CacheError("Range file not found..."))
-// Caller handles by fetching from S3
-```
+Common causes are manual deletion of cache files, disk corruption or I/O errors, an unclean shutdown during a write, and file system faults. Leave the cache files alone, and watch disk health and I/O errors.
 
-**Behavior**:
-- Cache miss is transparent to end user
-- Range is fetched from S3 and served
-- System attempts to recache for future requests
-- Other ranges in the same object remain accessible
-- Metadata is automatically updated to remove reference to missing range
+#### Damaged range files
 
-**Common Causes**:
-- Manual deletion of cache files
-- Disk corruption or I/O errors
-- Improper shutdown during write operations
-- File system issues
+The proxy handles three kinds of range-file damage as a miss:
 
-**Prevention Tips**:
-- Avoid manual manipulation of cache files
-- Use proper shutdown procedures
-- Monitor disk health and I/O errors
-- Implement regular cache validation
+- a frame that fails its checksum;
+- a file whose size or modification time differs from what was recorded when the range was cached;
+- a file that cannot be checked when it is opened.
 
-### 3. Disk Space Exhaustion
+The read is answered from S3, and the proxy removes the range so the next read caches it again. A read already streaming from the cache cannot switch to S3 once its response has started. It ends early with a connection error, and the bytes it sent before the check failed can be wrong. Until the range is removed, later reads of it on that proxy are fetched from S3. The counters are `range_file_corruption_detected` and `range_file_identity_mismatch_detected`; see [`atomic_metadata`](METRICS_REFERENCE.md#atomic_metadata) and [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3).
 
-**Detection**: Write operation fails with "No space left on device"
+### 3. Disk space exhaustion
 
-**Recovery Strategy**:
-- Log error with severity warning including available space
-- Return error to caller
-- Trigger emergency cache eviction (if configured)
-- Retry write operation after eviction
-- Record metric: `disk_full_events_total`
+**Detection**: a cache write fails with `ENOSPC`. These writes detect and count it:
 
-**Example**:
-```rust
-// When disk is full
-let result = disk_cache.store_range(cache_key, start, end, data, metadata).await;
-// Returns Err(ProxyError::CacheError("Disk space exhausted..."))
-```
+- range data files, whether written whole or streamed from a GET response, including multipart parts assembled into the cache;
+- `.meta` files written on the request path: range stores, TTL refreshes, HEAD metadata and range removals;
+- journal appends.
 
-**Behavior**:
-- Write operation fails gracefully
-- No partial writes or corrupted files
-- Cache eviction frees up space
-- System continues serving from S3
-- Caching resumes when space is available
+Not counted: `.meta` writes made by the journal consolidator, cache-hit journal flushes, and the accounting state files under `metadata/_shard_state/` and `metadata/_write_ledger/`.
 
-**Prevention and Mitigation**:
-- Monitor disk space usage regularly
-- Configure appropriate cache size limits
-- Implement alerts for low disk space
-- Use cache eviction policies effectively
-- Consider expanding storage capacity proactively
+**What the proxy does**: it logs a WARN naming the write that failed, with the running total, removes the write's temporary file where it has one, and counts the event in `disk_full_events_total`. The request is still served from S3, and no range file is published for the failed write. Caching resumes once eviction or the operator frees space.
 
-**Best Practices**:
-- Set cache size limits to 80-90% of available disk space
-- Monitor `disk_full_events_total` metric for trends
-- Implement automated scaling for cloud deployments
-- Use separate disks/partitions for cache and logs
+Nothing on the write path triggers eviction: eviction runs on the consolidation cycle's own schedule (see [Triggers](EVICTION.md#triggers)).
 
-### 4. Inconsistent Metadata
+To prevent it:
 
-**Detection**: Metadata references range files that don't exist
+- set `cache.max_cache_size` to 80 to 90% of the cache volume's capacity;
+- alert on low free space on the cache volume and on increases in `disk_full_events_total`;
+- put the cache and the logs on separate disks or partitions.
 
-**Recovery Strategy**:
-- Detect during metadata verification
-- Remove missing range specs from metadata
-- Update metadata atomically
-- Continue serving other valid ranges
-- Delete entire entry if no valid ranges remain
-- Record metric: `inconsistency_fixed_total`
+### 4. Inconsistent metadata
 
-**Example**:
-```rust
-// Verify and fix inconsistent metadata
-let fixed_count = disk_cache.verify_and_fix_metadata(cache_key).await?;
-// Returns number of inconsistencies fixed
-```
+**Detection**: metadata lists range files that do not exist.
 
-**Behavior**:
-- System automatically repairs inconsistencies
-- Valid ranges remain accessible
-- Missing ranges are treated as cache misses
-- No data loss for valid ranges
-- Metadata stays consistent with actual files
+The proxy does not scan for this. No pass walks the cache checking each `.meta` against its range files. A request that reads a missing range file handles it as described in [Missing range binary files](#2-missing-range-binary-files): the affected bytes are fetched from S3 and the other cached ranges keep serving.
 
-**Common Scenarios**:
-- Crash during range deletion
-- Manual file manipulation
-- Partial write failures
-- Disk corruption affecting specific files
+Typical causes are a crash during a range deletion, manual changes to cache files, a failed partial write, and disk corruption affecting specific files.
 
-**Validation Process**:
-1. Read metadata file
-2. Check existence of all referenced range files
-3. Identify missing ranges
-4. Remove references to missing ranges
-5. Update metadata atomically
-6. Log and record metrics
+### 5. Partial write failures
 
-**Prevention Tips**:
-- Use atomic operations for metadata updates
-- Implement proper shutdown procedures
-- Avoid manual cache file manipulation
-- Regular cache validation and cleanup
+**Detection**: `.tmp` files exist with no matching final file.
 
-### 5. Partial Write Failures
+A cache writer removes its own temporary file when its write or rename fails. No automatic cleanup runs for a temporary file left behind by a crash: it stays until it is removed by hand, and [Metadata cleanup](EVICTION.md#metadata-cleanup) lists the three shapes and when removing them is safe. No `/metrics` field counts these files or their removal.
 
-**Detection**: `.tmp` files exist without corresponding final files
+Partial writes come from a crash, a full disk, an I/O error or the process being killed during a write. A temporary file is never served; only a renamed, complete range file is, and valid cache entries are unaffected.
 
-**Recovery Strategy**:
-- Detect during cleanup operations
-- Delete orphaned `.tmp` files
-- Prevent accumulation of temporary files
-- Record metric: `partial_write_cleanup_total`
+### 6. Orphaned files
 
-**Example**:
-```rust
-// Clean up temporary files
-disk_cache.cleanup_temp_files(cache_key).await?;
-// Removes all .tmp files for the cache key
-```
+**Detection**: range files exist with no metadata listing them.
 
-**Behavior**:
-- Temporary files are automatically cleaned up
-- No disk space wasted on partial writes
-- System maintains clean cache directory
-- Cleanup runs during maintenance operations
+**What the proxy does**: the orphan reclamation rotation deletes the file. The rotation runs on every proxy. It deletes a file only when, under the object's metadata lock, no `.meta` lists it and no proxy's journal holds a pending write for it. Orphans are never added back to metadata. A pass is skipped, and counted in `orphan_reclaim.passes_gated`, while the rotation waits for proxies on an older release to leave the fleet or for traffic; see [During a rolling upgrade](UPGRADING.md#during-a-rolling-upgrade) and [Orphan recovery](SHARED_STORAGE.md#orphan-recovery).
 
-**When Partial Writes Occur**:
-- System crash during file write
-- Disk space exhaustion during write
-- I/O errors during write operations
-- Process termination during write
+The rotation finds orphans on its own schedule, not on the next read of the object. Their bytes were never in `cache.total_cache_size`, so deleting one does not change it, and valid cache entries are unaffected.
 
-**Prevention Strategies**:
-- Use write-ahead logging for critical operations
-- Implement proper error handling for write operations
-- Monitor system stability and uptime
-- Use UPS or other power protection for critical systems
+Typical causes are a crash during a metadata deletion, manual deletion of metadata files, and disk corruption that hit metadata but not range files. An invalidation or overwrite that removed metadata and left the range files leaves orphans too.
 
-**Recovery Guarantees**:
-- No data corruption from partial writes
-- Automatic cleanup of temporary files
-- No impact on valid cache entries
-- System continues operating normally
+To monitor it:
 
-### 6. Orphaned Files
+- the `orphan_reclaim` section of `/metrics`: `found`, `reclaimed`, `bytes_reclaimed`, `skipped_unconfirmed` and the rotation-progress gauges (see [`orphan_reclaim`](METRICS_REFERENCE.md#orphan_reclaim));
+- while passes are skipped, disk usage against `cache.total_cache_size` (see [Error metrics](#error-metrics)): orphan bytes show as the gap between the two.
 
-**Detection**: Range files exist without corresponding metadata
+### 7. Stalled upstream responses (mid-stream idle watchdog)
 
-**Recovery Strategy**:
-- Detect during comprehensive cleanup
-- Delete orphaned range files
-- Prevent disk space waste
-- Record metric: `orphaned_files_cleaned_total`
+**Detection**: no bytes arrive from the upstream within `upstream_idle_timeout` (default `5s`) while the proxy is trying to read. Backpressure from a slow client does not count as an idle upstream.
 
-**Example**:
-```rust
-// Perform comprehensive cleanup
-let stats = disk_cache.perform_cache_cleanup().await?;
-// Returns CacheCleanupStats with counts
-```
+**What the proxy does**:
 
-**Behavior**:
-- Orphaned files are automatically detected
-- Files are safely deleted
-- Disk space is reclaimed
-- No impact on valid cache entries
+- **Before the first byte**: it retries up to `upstream_idle_retries` times (default 2), failing over through the connection pool. When the retries run out, it answers `504 Gateway Timeout`.
+- **Mid-stream**: it closes the client connection, ending the body early, and the client's own retry logic takes over. The requested range is never cached as if it had arrived whole.
 
-**Common Causes of Orphaned Files**:
-- Crash during metadata deletion
-- Manual deletion of metadata files
-- Disk corruption affecting metadata but not range files
-- Bugs in cache cleanup logic
+The idle timer measures a gap with no bytes, not the total transfer time, so a slow transfer that keeps making progress is never aborted. While the cache writer cannot keep up, the proxy stops asking the upstream for data and the timer pauses. An aborted fetch never publishes a truncated `.bin` under the requested bounds. If at least `cache.partial_range_commit_ratio` (default `0.5`) of the requested bytes arrived in order, the proxy caches them as a smaller valid range; otherwise it deletes the temporary file. See [Cache safety](CONNECTION_POOLING.md#cache-safety). The watchdog does not apply while a request waits for another request's fetch of the same object, which has its own coordination timeout.
 
-**Detection Process**:
-1. Scan all range files in cache directory
-2. Extract cache keys from filenames
-3. Verify corresponding metadata exists
-4. Identify files without metadata
-5. Safely delete orphaned files
-6. Record metrics and log results
+The counters, per proxy since the process started, on `/metrics` and over OTLP:
 
-**Prevention Measures**:
-- Atomic operations for file creation and deletion
-- Proper shutdown procedures
-- Regular cache validation
-- Monitoring of orphaned file metrics
+- `cache.upstream_idle_abort_total_mid_stream`: responses cut off mid-body by the watchdog;
+- `cache.upstream_idle_abort_total_pre_stream`: requests answered `504` after every first-byte attempt timed out;
+- `cache.upstream_idle_retry_total`: first-byte timeouts that were retried.
 
-### 7. Stalled Upstream Responses (Mid-Stream Idle Watchdog)
+Each abort also logs a WARN: `[UPSTREAM_IDLE_ABORT]` mid-stream and `[UPSTREAM_FIRST_BYTE]` before the first byte.
 
-**Detection**: No bytes received from the upstream within `upstream_idle_timeout` (default 5s) while the proxy is actively trying to read. Backpressure from a slow client does not count as upstream idle.
-
-**Recovery Strategy**:
-- **Pre-first-byte**: Retry up to `upstream_idle_retries` (default 2) using connection pool failover. After exhausting retries, return 504 Gateway Timeout.
-- **Mid-stream**: Terminate the client connection (abort the body stream). The client's own retry logic engages. No partial body is ever committed to cache.
-
-**Key Behaviors**:
-- The idle timer is "no bytes for T", not "total transfer > T". A slow-but-progressing transfer is never aborted.
-- During backpressure (cache writer can't keep up), the idle timer is paused — the proxy isn't asking the upstream for more data, so the upstream isn't stalling.
-- An aborted mid-stream fetch never finalizes a partial `.bin` or `.meta`. The incremental writer detects the size mismatch and cleans up the temporary file.
-- The watchdog does NOT apply to download-coordinator wait time (coalesced waiters have their own coordination timeout).
-
-**Metrics**:
-- `upstream_idle_abort_total{phase=mid_stream}`: Mid-stream idle aborts
-- `upstream_idle_abort_total{phase=pre_stream}`: Pre-stream timeout exhaustions
-- `upstream_idle_retry_total`: Pre-stream retry attempts
-
-**Configuration**:
 ```yaml
 connection_pool:
   upstream_first_byte_timeout: "5s"
@@ -357,202 +138,113 @@ connection_pool:
   upstream_idle_retries: 2
 ```
 
-## Error Metrics
+### 8. A slow cache volume on the write path (bounded waits)
 
-All error events are tracked via metrics for monitoring and alerting:
+Every write-path step that touches the cache volume is bounded, and every bound expires the same way: the upload continues to S3, uncached. A slow volume costs hit rate, not uploads, and none of these bounds returns an error to the client.
 
-```rust
-pub struct CacheMetrics {
-    // ... other metrics ...
-    pub corruption_metadata_total: u64,
-    pub corruption_missing_range_total: u64,
-    pub inconsistency_fixed_total: u64,
-    pub partial_write_cleanup_total: u64,
-    pub disk_full_events_total: u64,
-    pub orphaned_files_cleaned_total: u64,
-    pub metadata_heal_overwrite_total: u64,
-    /// Corruption counts broken down by detected reason
-    pub corruption_metadata_by_reason: HashMap<String, u64>,
-}
+The bounds are internal constants with no configuration field:
+
+| Step | Bound | What happens when it expires |
+|---|---|---|
+| Cache setup, which runs beside the upload: sink open, capacity reservation, `.tmp` creation, TTL lookup | 5s | Upload forwarded uncached |
+| Cache setup, when a streaming PUT's buffer fills while setup is still running | 500ms | Upload forwarded uncached |
+| Each body frame handed to the cache writer, after setup | 5s, and at most what remains of the write's 1s in total | Caching abandoned mid-upload; bytes already written are discarded, not published |
+| Origin-marker read or claim for the bucket, for a PUT, UploadPart, multipart request, DELETE, DeleteObjects or form POST | 250ms | A PUT, UploadPart or multipart request is forwarded uncached and the key's cached copy is invalidated on success; a DELETE, DeleteObjects or form POST still invalidates the cached copy of each key it deletes or writes |
+| Origin-marker read or claim for the bucket, for a read such as GET or HEAD | 5s | That request forwarded uncached |
+| The first cache-size read a PUT's capacity check needs | 250ms | Write forwarded uncached; the key's cached copy is invalidated on success |
+| The first `cache_rules.json` load, for a write | 250ms | Write forwarded uncached; the key's cached copy is invalidated on success |
+| Cache-rule reload, for the request that triggers it | 100ms | That request uses the rules it already has; the reload completes in the background |
+| `CreateMultipartUpload`: the disk-safety check and the `upload.meta` write | 500ms | The upload is not cached, and a tracker written later is removed |
+| `CompleteMultipartUpload`: the client's wait for cache finalization | 250ms | The response returns; finalization continues in the background |
+
+#### One budget per write
+
+Cache work on a write has one budget of 1,000 ms, which every wait in the table draws on except the 5 s cache setup, since that runs beside the upload and delays nothing. The budget covers the per-frame waits during the upload, the 500 ms wait after the buffer fills, and the origin-marker and cache-size reads. It also covers the cache-rule reload, the `CreateMultipartUpload` checks, the `CompleteMultipartUpload` wait, and the invalidation after a PUT, DELETE or form POST. Each wait takes the smaller of its own bound and what remains, so the 5 s per-frame figure is a ceiling the budget cuts short. Cache work therefore delays a write by at most 1,000 ms in total, however many steps it takes. When the budget is spent, a cache read that has not finished forwards the write uncached, caching an upload is abandoned, and an invalidation finishes in the background.
+
+DeleteObjects is the exception. Its origin-marker read (at most 250 ms) and the invalidation of its whole batch share one flat 3 s budget that starts when S3 answers. A key still being invalidated at the deadline, or not yet started, is handed with the other unfinished keys to the background stamp retry. Until the retry lands, this proxy forwards that key's GET and HEAD to S3. That holds even when every retry worker is busy and the record on the proxy's local disk cannot be written; [Write ordering](CACHING.md#write-through-ordering) gives the memory limit and what happens past it. Handing keys over writes records to the proxy's local disk and syncs them after the deadline, and so does a key whose lock retries ran out just before it. The response can therefore run past 3 s by a few local disk writes.
+
+Serial stalled DeleteObjects still open the breaker described next. Each counts once, when its batch ends. The breaker therefore trips when the time each request spends beyond its 3 s is under about 2 s, made up of the client's turnaround, S3's own DeleteObjects time and the local disk writes. While the breaker is open, a DeleteObjects hands every key over at once with no cache delay. One that started while the breaker was closed keeps its 3 s even if the breaker opens during it.
+
+#### The volume stall breaker
+
+If three writes each have a bounded cache wait time out within 10 seconds, and those writes did not all start waiting on the cache together, the proxy treats the cache volume as stalled. Any bounded cache wait counts: the 250 ms origin-marker, cache-size and cache-rules reads, the 1 s budget, and a DeleteObjects' 3 s. The breaker stays open until three probes of the volume succeed in a row, spanning at least one second. Until then, writes skip the cache with no added delay, their invalidations go to the background retry, and GET and HEAD are forwarded to S3 uncached. The exception is a plain HEAD whose metadata this proxy loaded into memory within `metadata_cache.refresh_interval`, which is answered from memory.
+
+Each proxy decides for itself. `cache.volume_stall_breaker_open` is `1` while the breaker is open, and `cache.volume_stall_breaker_trips_total` counts the times it opened. The `volume_stalled` reason in `skipped_puts_total` and `cache_bypasses_by_reason` counts what was skipped.
+
+An `UploadPart` response is also held until its part sink has opened, for at most 500 ms, so that a `CompleteMultipartUpload` sent right after a small part finds the upload's staging directory.
+
+#### What it looks like
+
+Each bound logs a rate-limited WARN that names the step that gave up and says the upload was unaffected:
+
+```text
+Streaming write cache: cache setup did not finish within 5s, forwarding uncached (upload unaffected; ...)
+Streaming write cache: cache writer did not accept a frame within <bound>, abandoning caching for this object (upload unaffected): cache_key=...
+Streaming write cache: cache setup had not finished within 500ms of the tee's buffer filling, forwarding uncached (upload unaffected; ...)
+Origin marker: read/claim for bucket B did not finish within 5s; forwarding uncached ...
+Origin marker: read/claim for bucket B did not finish within 250ms; forwarding the write uncached ...
+PUT capacity check: the first cache-size read did not finish within 250ms; forwarding writes uncached until it does ...
 ```
 
-### Recording Metrics
+Two counters per proxy on `/metrics` separate the two places caching can give up:
 
-Metrics are recorded through the MetricsManager:
+- `write_cache.setup_abandoned_total_put`: cache setups, which run beside the upload, that did not finish;
+- `cache.tee_abandoned_total_put`: caching abandoned once the body was already streaming.
 
-```rust
-// Record corrupted metadata
-metrics_manager.record_corrupted_metadata().await;
+A steady non-zero reading on either means the write cache is being skipped, so PUT-heavy traffic pays S3 latency on the reads that follow. Read them against the volume's own latency: there is no proxy setting to tune, and the fix is the volume's metadata-operation latency. On FSx, check `nconnect` first; see [Mount requirements](SHARED_STORAGE.md#mount-requirements).
 
-// Record missing range file
-metrics_manager.record_missing_range_file().await;
+#### How stale the capacity figure can be
 
-// Record inconsistency fixed
-metrics_manager.record_inconsistency_fixed().await;
+The capacity figure a PUT checks is refreshed by a background task every 5 seconds, not read per request. It can be up to one refresh interval stale on a healthy volume, and as stale as the stall on an unhealthy one. The `max_cache_size` check each upload passes adds what this proxy has written since a consolidation cycle last folded its own additions into the shared total. One proxy's burst is therefore measured against a figure that includes it. GET-miss fills take the same soft stop and count the same way.
 
-// Record partial write cleanup
-metrics_manager.record_partial_write_cleanup().await;
+What a proxy adds is what it has admitted, not the net of what it has also evicted since the total was folded. A cache sitting at `max_cache_size` with eviction keeping pace can therefore decline some uploads and fills it has room for, until the next consolidation cycle. A record the proxy renamed aside as corrupt, or retired at its 256-record cap, can keep that over-decline going for longer. An upload's check reads this proxy's additions before the shared total, and does not pair the two reads the way a fill's check does. Around a consolidation cycle it can therefore decline an upload that a fill would have passed.
 
-// Record disk full event
-metrics_manager.record_disk_full_event().await;
+A fleet stays within a bound made of three terms. They are `max_cache_size`, the uploads and fills in flight on each proxy, and what each other proxy admits at its own offered (attempted) rate over the age of the figure it reads. That age is the 5-second refresh plus the time one consolidation cycle takes: close to `cache.shared_storage.consolidation_interval` on a healthy volume, and several times longer when admission alone saturates a small file system. Eviction reclaims the overshoot.
 
-// Record orphaned files cleaned
-metrics_manager.record_orphaned_files_cleaned(count).await;
-```
+### 9. Request loops (Via and 508 Loop Detected)
 
-### Accessing Metrics
+**Detection**: a request arrives carrying a `Via` entry that names this proxy process.
 
-Metrics are available via the `/metrics` endpoint:
+The proxy connects to the `Host` a client names. If that name resolves back to the fleet, for example to a load balancer in front of the proxies, the request would visit proxies in a cycle. Each visit holds a `max_concurrent_requests` permit, until the fleet sheds traffic.
 
-```bash
-curl http://localhost:9090/metrics
-```
+Every request the proxy forwards over the HTTP listener or the TLS proxy listener carries a `Via: 1.1 s3-proxy-<token>` entry. The token is 16 random hex digits chosen when the process starts, so each proxy process has its own and a restart changes it. A request that arrives with this process's own entry is answered `508 Loop Detected` with an S3-style `LoopDetected` XML error and is not forwarded. The proxy logs a WARN at most once per 60 seconds, with the number of refusals in that window.
 
-Example response:
-```json
-{
-  "cache": {
-    "corruption_metadata_total": 5,
-    "corruption_missing_range_total": 12,
-    "inconsistency_fixed_total": 8,
-    "partial_write_cleanup_total": 3,
-    "disk_full_events_total": 1,
-    "orphaned_files_cleaned_total": 15
-  }
-}
-```
+**What to do**: fix the DNS record or load balancer so the `Host` names S3, not the proxy. The proxy does not retry a looped request.
 
-## Maintenance Operations
+- A `Via` entry from another proxy, as in [chaining to another proxy](CONFIGURATION.md), is kept, and this proxy's entry is appended after it.
+- A request that signs `via`, in its `Authorization` header's `SignedHeaders` or in a presigned URL's `X-Amz-SignedHeaders`, is forwarded with its `Via` unchanged. It carries no entry from this proxy, so a loop through it is not detected. This is the only exception: every other forwarded request carries the entry, including cache revalidation and refetch requests.
+- The entry is added whatever `add_referer_header` is set to; no setting turns it off.
+- The HTTPS passthrough (port 443) never reads request headers, so it neither adds the entry nor detects loops.
 
-### Comprehensive Cache Cleanup
+## Error metrics
 
-The system provides a comprehensive cleanup operation that:
-1. Cleans up orphaned range files
-2. Cleans up temporary files
-3. Verifies and fixes inconsistent metadata
-4. Returns statistics about cleanup operations
+The error counters sit in the `cache` section of `/metrics` (`curl http://localhost:9090/metrics`); [`cache`](METRICS_REFERENCE.md#cache) is the field reference.
 
-```rust
-let stats = disk_cache.perform_cache_cleanup().await?;
-println!("Cleaned up {} temp files", stats.temp_files_cleaned);
-println!("Cleaned up {} orphaned files", stats.orphaned_files_cleaned);
-println!("Fixed {} inconsistencies", stats.inconsistencies_fixed);
-```
+| Field | Meaning |
+|---|---|
+| `corruption_metadata_total` | Corrupt `.meta` files detected, all reasons |
+| `metadata_heal_overwrite_total` | Corrupt `.meta` files replaced by a fresh document |
+| `corruption_missing_range_total` | Range files the metadata listed that were missing |
+| `disk_full_events_total` | Counted cache writes that failed with `ENOSPC` |
 
-### Scheduled Cleanup
+For orphan range files, read the `orphan_reclaim` section, and compare disk usage with `cache.total_cache_size` while the rotation is waiting (`orphan_reclaim.passes_gated` rising).
 
-**The proxy already runs this on a schedule; operators do not need to arrange it.** The
-orphan recovery sweep (`background_recovery.rs`, `orphaned_range_recovery.rs`) fires
-every `cache.shared_storage.orphan_recovery_interval` (default `300s`) while
-`orphan_recovery_enabled` is `true`, which is the default. Each cycle is bounded by
-`orphan_scan_timeout` (default `30s`) and `orphan_max_per_cycle` (default `100`) so a
-large cache cannot let one scan block other operations.
+## Scheduled cleanup
 
-A second, startup-only sweep for orphan `.bin` files is **disabled** and removes nothing —
-on a shared cache volume it could not tell an orphan from a range file another instance had
-just written, so orphan `.bin` files left by a crashed writer now persist. See
-[SHARED_STORAGE.md — Orphan recovery](SHARED_STORAGE.md#orphan-recovery).
+The proxy has no whole-cache cleanup pass that removes temporary files, deletes orphaned range files or repairs metadata, and nothing outside the process can start one. Two mechanisms run on their own:
 
-To make cleanup less or more aggressive, tune those fields rather than driving cleanup
-externally. See [Configuration — Cache Size Tracking](CONFIGURATION.md#cache-size-tracking)
-and [SHARED_STORAGE.md — Orphan recovery](SHARED_STORAGE.md#orphan-recovery).
+- the [orphan reclamation rotation](SHARED_STORAGE.md#orphan-recovery), which deletes range files no metadata lists. Each proxy runs one bounded pass every 300 seconds while passes are not skipped; the interval and the per-pass budget are not configurable;
+- the daily validation scan, which deletes unparseable `.meta` files only.
 
-## Error Handling Best Practices
+## Monitoring and alerting
 
-### 1. Always Check Return Values
+Recommended alerts:
 
-All internal helpers that can fail return `Result` rather than panicking. For example, `WriteCacheManager::get_metadata_path` returns `Result<PathBuf>` — callers propagate the error through a `match` (log a warning, skip the eviction candidate). This ensures a single corrupted cache key in the eviction queue cannot crash the process.
+1. **High corruption rate**: `corruption_metadata_total` increasing quickly. It can mean disk faults or a software defect.
+2. **Disk full events**: any increase in `disk_full_events_total`. The cache size limit or the disk may need changing.
+3. **Orphaned files accumulating**: free space on the cache volume, and the gap between disk usage and `cache.total_cache_size`. Also alert on a sustained rise in `peer_unavailable` or `indeterminate` in `orphan_reclaim.journal_evidence_total`, or in `orphan_reclaim.passes_gated` while the fleet serves traffic and no proxy on an older release remains. `orphan_reclaim.reclaimed` and `orphan_reclaim.bytes_reclaimed` count the orphaned range files the reclaim rotation has removed.
 
-```rust
-// Good
-match disk_cache.get_metadata(cache_key).await {
-    Ok(Some(metadata)) => {
-        // Use metadata
-    }
-    Ok(None) => {
-        // Cache miss - fetch from S3
-    }
-    Err(e) => {
-        // Handle error
-        error!("Failed to get metadata: {}", e);
-    }
-}
-
-// Bad
-let metadata = disk_cache.get_metadata(cache_key).await.unwrap();
-```
-
-### 2. Handle Cache Misses Gracefully
-
-```rust
-// Try to load from cache
-let data = match disk_cache.load_range_data(&range_spec).await {
-    Ok(data) => data,
-    Err(e) => {
-        // Cache miss - fetch from S3
-        warn!("Cache miss for range {}-{}: {}", range_spec.start, range_spec.end, e);
-        fetch_from_s3(cache_key, range_spec.start, range_spec.end).await?
-    }
-};
-```
-
-### 3. Log Errors with Context
-
-```rust
-// Good
-error!(
-    "Failed to store range {}-{} for key {}: {}",
-    start, end, cache_key, e
-);
-
-// Bad
-error!("Store failed: {}", e);
-```
-
-### 4. Record Metrics for Monitoring
-
-```rust
-// Always record metrics for error events
-if let Err(e) = disk_cache.get_metadata(cache_key).await {
-    metrics_manager.record_corrupted_metadata().await;
-    error!("Corrupted metadata for key {}: {}", cache_key, e);
-}
-```
-
-### 5. Clean Up on Failure
-
-```rust
-// Always clean up temporary files on failure
-if let Err(e) = disk_cache.store_range(cache_key, start, end, data, metadata).await {
-    // Cleanup is automatic in store_range, but for custom operations:
-    let _ = disk_cache.cleanup_temp_files(cache_key).await;
-    return Err(e);
-}
-```
-
-## Monitoring and Alerting
-
-### Recommended Alerts
-
-1. **High Corruption Rate**
-   - Alert when `corruption_metadata_total` increases rapidly
-   - May indicate disk issues or software bugs
-
-2. **Frequent Disk Full Events**
-   - Alert when `disk_full_events_total` increases
-   - May need to increase cache size limits or disk space
-
-3. **Many Inconsistencies**
-   - Alert when `inconsistency_fixed_total` is high
-   - May indicate crashes or improper shutdowns
-
-4. **Orphaned Files Accumulating**
-   - Alert when `orphaned_files_cleaned_total` grows without cleanup
-   - May need to run cleanup more frequently
-
-### Monitoring Dashboard
-
-Example Prometheus queries:
+Example Prometheus queries over the OTLP export, where `cache.corruption_metadata_total` and `cache.disk_full_events_total` arrive with dots converted to underscores (see [OTLP metrics](OTLP_METRICS.md)):
 
 ```promql
 # Corruption rate (per minute)
@@ -560,166 +252,81 @@ rate(cache_corruption_metadata_total[1m])
 
 # Disk full events (last hour)
 increase(cache_disk_full_events_total[1h])
-
-# Inconsistencies fixed (last day)
-increase(cache_inconsistency_fixed_total[1d])
-
-# Orphaned files cleaned (last hour)
-increase(cache_orphaned_files_cleaned_total[1h])
 ```
 
-## Testing Error Handling
-
-The error handling system is thoroughly tested in `tests/error_handling_test.rs`:
-
-```bash
-# Run error handling tests
-cargo test --release --test error_handling_test
-
-# Run specific test
-cargo test --release --test error_handling_test test_corrupted_metadata_handling
-```
-
-### Test Coverage
-
-- Corrupted metadata handling
-- Empty metadata files
-- Missing range binary files
-- Disk space exhaustion
-- Inconsistent metadata (partial)
-- Inconsistent metadata (all ranges missing)
-- Temporary file cleanup
-- Comprehensive cache cleanup
-- Valid entries preservation
-- Error recovery without crashes
-- Partial write cleanup
+No query is useful for orphaned files, inconsistencies or partial-write cleanup: OTLP exports none of them and the `/metrics` fields never move. Alert on the cache volume's free space instead.
 
 ## Troubleshooting
 
-### Problem: High corruption rate
+### High corruption rate
 
-**Symptoms**: `corruption_metadata_total` increasing rapidly
+**Symptoms**: `corruption_metadata_total` increasing quickly.
 
-**Possible Causes**:
-- Disk errors or failing hardware
-- Improper shutdowns or crashes
-- Software bugs in serialization
+**Possible causes**: disk errors or failing hardware, unclean shutdowns or crashes, or a serialization defect.
 
-**Solutions**:
-1. Check disk health: `smartctl -a /dev/sdX`
-2. Review system logs for crashes
-3. Run comprehensive cleanup
-4. Consider clearing cache and starting fresh
+**What to do**:
 
-### Problem: Disk full events
+1. Check disk health, for example `smartctl -a /dev/sdX` on a local disk.
+2. Look in the system logs for crashes.
+3. Consider clearing the cache and starting fresh.
 
-**Symptoms**: `disk_full_events_total` increasing, cache writes failing
+### Disk full events
 
-**Possible Causes**:
-- Cache size limits too high for available disk space
-- Other processes consuming disk space
-- Eviction not working properly
+**Symptoms**: `disk_full_events_total` increasing, and cache writes failing.
 
-**Solutions**:
-1. Check disk usage: `df -h`
-2. Reduce cache size limits in config
-3. Verify eviction is enabled
-4. Clear old cache entries manually if needed
+**Possible causes**: a cache size limit too high for the disk, other processes using the disk, or eviction not keeping up.
 
-### Problem: Many inconsistencies
+**What to do**:
 
-**Symptoms**: `inconsistency_fixed_total` high, frequent metadata repairs
+1. Check disk usage with `df -h`.
+2. Lower `cache.max_cache_size`.
+3. Check the `[DISK_CACHE_EVICTION]` log lines and `cache.eviction_unlink_failures_total` (see [When a range file cannot be deleted](EVICTION.md#when-a-range-file-cannot-be-deleted)).
+4. Remove old cache entries by hand if needed.
 
-**Possible Causes**:
-- Improper shutdowns
-- Manual file deletions
-- Bugs in deletion logic
+### Orphaned files accumulating
 
-**Solutions**:
-1. Ensure graceful shutdowns
-2. Don't manually delete cache files
-3. Run comprehensive cleanup regularly
-4. Review deletion logic for bugs
+**Symptoms**: disk usage on the cache volume exceeds `cache.total_cache_size` and the gap grows, while `orphan_reclaim.found` rises.
 
-### Problem: Orphaned files accumulating
+**Possible causes**: crashes during writes, or invalidations that removed metadata and left range files. Candidates are also kept when a journal could not be read (`peer_unavailable` or `indeterminate` in `orphan_reclaim.journal_evidence_total`) or the cache key could not be recovered from the file name.
 
-**Symptoms**: `orphaned_files_cleaned_total` growing, disk space wasted
+**What to do**:
 
-**Possible Causes**:
-- Cleanup not running frequently enough
-- Bugs in deletion logic
-- Crashes during deletion
+1. `orphan_reclaim.skipped_unconfirmed` rises normally on a busy cache, because new files and uploads in progress are kept by design. If `peer_unavailable` or `indeterminate` keeps rising in `journal_evidence_total`, check that every proxy's journal under `metadata/_journals/` is readable (see [Orphan recovery](SHARED_STORAGE.md#orphan-recovery)).
+2. Size the cache volume with headroom above `cache.max_cache_size` for orphans not yet reclaimed.
+3. Check for crashes during cache operations.
 
-**Solutions**:
-1. Increase cleanup frequency
-2. Run manual cleanup: `disk_cache.perform_cache_cleanup().await`
-3. Review deletion logic
-4. Check for crashes during cache operations
+## Prevention
 
-## Error Prevention Strategies
-
-While the S3 proxy has robust error handling, preventing errors is always preferable to recovering from them. Here are key strategies to minimize cache errors:
-
-### 1. Proper Shutdown Procedures
-
-Always allow the proxy to shut down gracefully to prevent file corruption:
+Let the proxy shut down gracefully, so no write is cut off mid-file:
 
 ```bash
-# Use SIGTERM for graceful shutdown
-kill -TERM <proxy_pid>
-
-# Or use systemctl for systemd-managed services
-systemctl stop s3-proxy
+kill -TERM <proxy_pid>  # Graceful shutdown
+systemctl stop s3-proxy  # The same, for the systemd service
 ```
 
-Avoid force-killing the process with SIGKILL (`kill -9`) unless absolutely necessary.
+Avoid `kill -9` (SIGKILL) unless nothing else works.
 
-### 2. Disk Health Monitoring
-
-Regularly monitor disk health to prevent I/O errors:
+On a local disk, watch disk health and I/O errors:
 
 ```bash
-# Check disk health
-smartctl -a /dev/sdX
-
-# Monitor disk I/O
-iostat -x 5
-
-# Check for filesystem errors
-fsck /dev/sdX
+smartctl -a /dev/sdX  # Disk health
+iostat -x 5  # Disk I/O
+fsck /dev/sdX  # File system check, on an unmounted file system only
 ```
 
-### 3. Adequate Disk Space Management
+Size `cache.max_cache_size` against the volume as described under [Disk space exhaustion](#3-disk-space-exhaustion), and watch free space with `df -h`. Orphan recovery and the validation scan run inside the proxy with nothing to schedule; see [Scheduled cleanup](#scheduled-cleanup).
 
-Ensure sufficient disk space is always available:
+## Testing
+
+The error-handling paths are covered by `tests/error_handling_test.rs`, which builds inside the `group_other` test target:
 
 ```bash
-# Monitor disk usage
-df -h
-
-# Set up alerts for disk space
-# Configure cache size limits appropriately (typically 80-90% of available space)
+cargo test --release --test group_other -- error_handling_test::  # Run the error-handling tests
 ```
 
-### 4. Regular Cache Maintenance
+## See also
 
-Nothing to schedule. Cleanup runs inside the proxy on `orphan_recovery_interval`
-(default `300s`), and the daily validation scan reconciles tracked size against disk.
-See [Scheduled Cleanup](#scheduled-cleanup) for the fields that tune both.
-
-### 5. Backup and Recovery Planning
-
-For critical deployments, implement backup strategies:
-
-- Regular snapshots of cache directories (when proxy is stopped)
-- Off-site backup of critical metadata
-- Disaster recovery procedures documentation
-
-### 6. Monitoring and Alerting
-
-Implement comprehensive monitoring:
-
-- Set up alerts for error metrics
-- Monitor disk health and space
-- Track cache performance metrics
-- Implement log aggregation and analysis
+- [Connection pooling](CONNECTION_POOLING.md): retries, IP health tracking and the upstream idle watchdog
+- [Eviction](EVICTION.md): capacity limits and what frees space
+- [Orphan recovery](SHARED_STORAGE.md#orphan-recovery): how orphaned range files are reclaimed on a cache volume
+- [`/metrics` reference](METRICS_REFERENCE.md): every counter named on this page

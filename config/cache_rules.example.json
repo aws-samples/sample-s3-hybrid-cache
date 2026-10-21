@@ -2,8 +2,10 @@
   "$schema": "../docs/cache-rules-schema.json",
   "rules": [
     { "pattern": "**/credit-cards/**", "read_cache_enabled": false },
+    { "pattern": "**/restricted/**", "get_ttl": "0s", "head_ttl": "0s", "evaluate_conditions_from_cache": false },
     { "pattern": "**/logs/**", "get_ttl": "0s" },
     { "pattern": "prod-*/static/**", "get_ttl": "7d", "compression_enabled": true },
+    { "pattern": "prod-*/manifests/**", "get_ttl": "7d", "head_ttl": "10s" },
     { "pattern": "analytics-bucket/hot-prefix/**", "hedging_enabled": true, "hedge_trigger_after": "250ms" },
     { "pattern": "my-bucket/temp/**", "get_ttl": "0s" },
     { "pattern": "**", "get_ttl": "5m" }

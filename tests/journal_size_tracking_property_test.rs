@@ -50,6 +50,7 @@ async fn create_test_consolidator(
         stale_entry_timeout_secs: 300,
         consolidation_cycle_timeout: Duration::from_secs(30),
         max_keys_per_cycle: 5000,
+        ..ConsolidationConfig::default()
     };
     let consolidator = Arc::new(JournalConsolidator::new(
         cache_dir,
@@ -96,6 +97,7 @@ fn prop_multi_instance_shared_state_persistence(
             last_consolidation: SystemTime::now(),
             consolidation_count: consolidation_count as u64,
             last_updated_by: "instance-1:12345".to_string(),
+            ..Default::default()
         };
 
         let size_state_path = cache_dir.join("size_tracking").join("size_state.json");
@@ -106,7 +108,7 @@ fn prop_multi_instance_shared_state_persistence(
         let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
         // Property: instance 2 should see the same values as instance 1 wrote
-        let loaded_state = consolidator.get_size_state().await;
+        let loaded_state = consolidator.get_size_state().await.unwrap();
 
         if loaded_state.total_size != original_state.total_size {
             return TestResult::error(format!(
@@ -175,6 +177,7 @@ fn prop_crash_recovery_size_state(
             last_consolidation: SystemTime::now() - Duration::from_secs(60),
             consolidation_count: consolidation_count as u64,
             last_updated_by: "previous-instance:12345".to_string(),
+            ..Default::default()
         };
 
         let size_state_path = cache_dir.join("size_tracking").join("size_state.json");
@@ -185,7 +188,7 @@ fn prop_crash_recovery_size_state(
         let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
         // Property: size state should be recovered from disk
-        let recovered_state = consolidator.get_size_state().await;
+        let recovered_state = consolidator.get_size_state().await.unwrap();
 
         if recovered_state.total_size != previous_state.total_size {
             return TestResult::error(format!(
@@ -209,10 +212,10 @@ fn prop_crash_recovery_size_state(
         }
 
         // Verify get_current_size() returns recovered value
-        if consolidator.get_current_size().await != previous_state.total_size {
+        if consolidator.get_current_size().await.unwrap() != previous_state.total_size {
             return TestResult::error(format!(
                 "get_current_size() mismatch: actual={}, expected={}",
-                consolidator.get_current_size().await,
+                consolidator.get_current_size().await.unwrap(),
                 previous_state.total_size
             ));
         }
@@ -238,7 +241,7 @@ fn prop_crash_recovery_fresh_start(_seed: u8) -> TestResult {
         let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
         // Property: size state should start at default values
-        let size_state = consolidator.get_size_state().await;
+        let size_state = consolidator.get_size_state().await.unwrap();
 
         if size_state.total_size != 0 {
             return TestResult::error(format!(
@@ -307,7 +310,7 @@ fn prop_crash_recovery_validation_correction(
             .await;
 
         // Property: size should be corrected by validation
-        let size_state = consolidator.get_size_state().await;
+        let size_state = consolidator.get_size_state().await.unwrap();
 
         if size_state.total_size != correct_size {
             return TestResult::error(format!(

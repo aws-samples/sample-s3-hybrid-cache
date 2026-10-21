@@ -1,324 +1,727 @@
-//! Enhanced Metadata Lock Manager
+//! Metadata Lock Manager
 //!
-//! Provides robust metadata locking with stale lock detection, process existence validation,
-//! and atomic lock breaking for the S3 proxy's shared cache system.
+//! Mutual exclusion for `.meta` read-modify-write on shared storage, over a fixed set of lock
+//! slots that are created on first use and never unlinked.
+//!
+//! The protocol is a payload-free `flock` and nothing else: no lock-file contents, no fsync, no
+//! read-back, no fence epoch, no heartbeat, no staleness inference, and no lock breaking.
+//! Liveness comes from the kernel releasing a `flock` on process death and from the NFSv4.1
+//! server releasing it on lease expiry. There is no such thing as a stale `flock`, so a lock
+//! that is still held is held by someone live, and breaking it would remove exclusion rather
+//! than restore it.
+//!
+//! # Lease expiry is a safety boundary as well as a liveness mechanism
+//!
+//! Everything above is a statement about the lock. None of it is a statement about the
+//! publish, and that gap is the protocol's one unfenced edge.
+//!
+//! The `flock` is held on the slot file. The publish it protects writes
+//! `{key}.meta.tmp.{host}.{pid}` and then renames it onto `{key}.meta`, which are path
+//! operations on other files. Nothing ties the rename's validity to the lock still being held,
+//! so a rename issued after the server has released the lock still lands.
+//!
+//! Reaching that state requires a partition longer than the NFSv4.1 lease AND a peer publish
+//! inside it. Instance A acquires the slot lock and reads the `.meta`. A's connection to the
+//! shared volume is cut for longer than the lease, and the server releases A's lock. Instance B
+//! acquires the same slot, publishes, releases. A reconnects and renames the document it read
+//! before the partition, discarding B's publish. A believed throughout that it held the lock,
+//! nothing refused its rename, and neither side logs an error.
+//!
+//! Five callers do not publish by tmp-and-rename. `CacheManager::evict_range` and
+//! `DiskCacheManager::{update_range_access_direct, refresh_object_ttl_direct,
+//! remove_invalidated_range, delete_stale_range}` rewrite `{key}.meta` in place under the slot
+//! lock, with no temp file. The clobber above applies to them unchanged. They also carry a
+//! failure mode the rename shape cannot: `std::fs::write` truncates before it writes, so a
+//! write that fails partway leaves a zero-length `.meta` where a failed rename would have left
+//! the previous document intact. That needs no partition and no peer, only a failed write.
+//! The read path absorbs both. `disk_cache::read_and_parse_metadata_blocking` classifies an
+//! empty or size-changing document `TransientMiss`, which is an ordinary miss, and
+//! `CacheManager::remove_corrupt_metadata` re-parses under the lock before deleting. Of the
+//! five, only `remove_invalidated_range` is reachable in production.
+//!
+//! Nothing detects this, and the reason is structural rather than an oversight. Once `flock`
+//! returns, no code performs any further operation on the locked descriptor: the slot file
+//! carries no payload, `MetadataLock` exposes no handle to the `File`, and no caller
+//! re-validates the lock before publishing. There is therefore no operation left on which a
+//! lost lock could surface an error. Only a fence applied at publish time would catch it, and
+//! the protocol has none; the fence epoch that once existed was removed because no writer read
+//! it before publishing.
+//!
+//! This is a property of the protocol, not of any one caller. Every slot-locked
+//! read-modify-write on the volume is exposed, including
+//! `JournalConsolidator::consolidate_object_with_files`.
+//!
+//! Both statements are true at once, and a reader who takes either alone reaches the wrong
+//! conclusion: a `flock` never goes stale, and a lock that never goes stale is still not a
+//! fence over the publish it protects — whether that publish is a `rename` or an in-place
+//! `write`.
+//!
+//! # Bounding a wait, without inferring liveness from it
+//!
+//! Two bounds exist, and they bound different disciplines rather than duplicating one:
+//!
+//! - **A wait budget**, `cache.shared_storage.lock_acquire_wait_budget`, bounds the *budgeted*
+//!   acquisition — `acquire_slot_lock_within_budget`, which polls `try_lock` with an async
+//!   sleep between attempts. On expiry the caller gives up having touched nothing.
+//! - **A retry count**, `cache.shared_storage.lock_max_retries`, bounds the *retrying*
+//!   acquisition — `MetadataLockManager::acquire_lock`, which reattempts a non-blocking
+//!   acquisition with backoff.
+//!
+//! Neither is a lock expiry. Giving up after waiting is not a statement about the holder;
+//! taking the lock after waiting would be, and that is what the retired `locks/{key}.lock`
+//! sentinel did. A budget that stole the lock on expiry would reintroduce exactly the lost
+//! update this protocol replaced, so the word "timeout" is avoided throughout: the value is
+//! how long a caller is willing to wait, not how long a holder is allowed to hold.
+//!
+//! Slots are shared, so two distinct keys can hash to one. See `slot_for_cache_key`.
+//!
+//! # What one acquisition costs on the volume
+//!
+//! Three filesystem operations: an `open(2)` of the slot file (`O_CREAT`, no truncate), the
+//! `flock(2)`, and the `close(2)` that releases it. The slot directory's `create_dir_all` — a
+//! `mkdir(2)` that fails `EEXIST` plus a `stat(2)` — runs once per directory per process, and
+//! again only when an open finds the directory gone. Until it ran on every acquisition, so
+//! an acquisition was five operations, not three.
+//!
+//! # Lock ordering
+//!
+//! Three file-lock namespaces can be held together by a single writer, and a writer that
+//! needs more than one takes them in this order and releases them in reverse.
+//!
+//! **This is not an enumeration of the volume's lock namespaces.** There are at least
+//! eleven, and an earlier version of this note said "three ... exist on the cache volume",
+//! which a reader takes as complete. The others — `locks/global_eviction.lock`,
+//! `locks/initialization.lock`, `size_tracking/{validation,size_state,global_consolidation}.lock`,
+//! `{journal}.journal.lock`, `capacity_guard`'s `_reservations.lock`, and the retired legacy
+//! `{key}.meta.lock` that `disk_cache` still sweeps — are not per-key, which is why an
+//! ordering note aimed at per-key deadlock leaves them out. Only the completeness claim was
+//! wrong; the order below is sound and is obeyed.
+//!
+//! Note also that the journal-append lock is taken *inside* a slot-lock section in places
+//! (`CacheManager::debit_removed_ranges` reaches the consolidator's journal append), so it
+//! is ordered after the slot lock without appearing in the list:
+//!
+//! 1. `mpus_in_progress/{upload_id}/upload.lock` — the multipart upload's own lock, held
+//!    by the signed-write path for the life of a **completion**. It has not guarded a part
+//!    write since 2.6.0: a part's finalize-and-record critical section takes the per-part
+//!    `mpus_in_progress/{upload_id}/part{N}.lock` instead
+//!    (`SignedPutHandler::record_part_blocking` records why), which is a fourth namespace
+//!    and is likewise not per-key.
+//! 2. the metadata slot lock in this module — innermost, and the only one that guards a
+//!    `.meta` read-modify-write.
+//!
+//! A third namespace sat between the two until it was retired: `locks/{key}.lock`, a
+//! per-key write sentinel written as a `create_new(true)` JSON file rather than a `flock`.
+//! It excluded nothing — no `.meta` writer observed it — and its only real effect was to
+//! make `CacheManager::is_cache_entry_active` report a key busy while a publication held
+//! it. Nothing creates or reads one now.
+//!
+//! **Never hold two metadata slot locks at once**, even for two different keys: two keys
+//! can share a slot, and `flock` conflicts between two descriptors of the same file even
+//! within one process, so the second acquisition deadlocks against the first roughly once
+//! in `META_LOCK_SLOTS` requests. A function that mutates two keys' metadata acquires for
+//! the first, releases, then acquires for the second — see
+//! `CacheManager::invalidate_cache_hierarchy` for the shape, and
+//! `nested_meta_lock_acquisition_is_refused` for the assertion that a nested acquisition
+//! is refused rather than granted.
 
 use crate::{ProxyError, Result};
-use fs2::FileExt;
-use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
-/// Configuration for lock acquisition with retry
+/// Slot-lock acquisitions granted, process-wide since start.
 ///
-/// Used by `acquire_lock_with_retry` to control exponential backoff behavior.
-#[derive(Debug, Clone)]
-pub struct LockConfig {
-    /// Maximum number of retry attempts (default: 5)
-    pub max_retries: u32,
-    /// Initial backoff duration (default: 50ms)
-    pub initial_backoff: Duration,
-    /// Maximum backoff duration (default: 2s)
-    pub max_backoff: Duration,
-    /// Jitter factor (0.0 to 1.0, default: 0.25 for ±25%)
-    pub jitter_factor: f64,
-}
+/// Counts acquisitions that produced a `MetadataLock` guard, which is every acquisition
+/// made through this module. The counters live here rather than on `MetricsManager`
+/// because the acquisition primitives are synchronous free functions with no metrics
+/// handle to reach — some of them run inside blocking-pool closures — and this module
+/// holds no `MetricsManager` reference at all. Same channel as
+/// `crate::tee_stream::backpressure_events_total_get`.
+static SLOT_ACQUISITIONS_SUCCESSFUL: AtomicU64 = AtomicU64::new(0);
 
-impl Default for LockConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 5,
-            initial_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_secs(2),
-            jitter_factor: 0.25,
-        }
-    }
-}
+/// Slot-lock acquisition ATTEMPTS refused, process-wide since start.
+///
+/// One per refused attempt, not one per giving-up caller: `MetadataLockManager::
+/// acquire_lock` retries, so a contended acquisition that succeeds on its third
+/// attempt adds two here and one to `SLOT_ACQUISITIONS_SUCCESSFUL`. That makes this
+/// the contention signal and `SLOT_RETRY_EXHAUSTED` the failure signal, and it is why
+/// this counter is always greater than or equal to that one.
+static SLOT_ACQUISITIONS_FAILED: AtomicU64 = AtomicU64::new(0);
 
-impl LockConfig {
-    /// Create a new LockConfig with custom settings
-    pub fn new(
-        max_retries: u32,
-        initial_backoff: Duration,
-        max_backoff: Duration,
-        jitter_factor: f64,
-    ) -> Self {
-        Self {
-            max_retries,
-            initial_backoff,
-            max_backoff,
-            jitter_factor: jitter_factor.clamp(0.0, 1.0),
-        }
+/// Callers that exhausted `lock_max_retries` and gave up, process-wide since start.
+///
+/// This is the retry-exhaustion event, and it is **not** a timeout: the protocol has no
+/// timeout and never infers liveness from elapsed time, so what bounds a caller's wait
+/// is the retry count. See `MetadataLockManager::acquire_lock`.
+static SLOT_RETRY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Test seam: make the next `n` `run_locked_blocking` calls for a key return the
+/// retry-exhaustion error without trying the lock, as a slot held through every retry would.
+#[cfg(test)]
+pub(crate) mod forced_retry_exhaustion {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn registry() -> &'static Mutex<HashMap<String, u32>> {
+        static R: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+        R.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Calculate backoff duration for a given attempt
-    ///
-    /// Returns the backoff duration with exponential growth and jitter applied.
-    pub fn calculate_backoff(&self, attempt: u32) -> Duration {
-        // Exponential backoff: initial_backoff * 2^attempt
-        let base_backoff_ms = self.initial_backoff.as_millis() as u64;
-        let exponential_factor = 1u64 << attempt.min(10); // Cap at 2^10 to prevent overflow
-        let exponential_backoff_ms = base_backoff_ms.saturating_mul(exponential_factor);
-
-        // Cap at max_backoff
-        let capped_backoff_ms = exponential_backoff_ms.min(self.max_backoff.as_millis() as u64);
-
-        // Add jitter (±jitter_factor of the backoff time)
-        let jitter_range = (capped_backoff_ms as f64 * self.jitter_factor) as u64;
-        let jitter = if jitter_range > 0 {
-            let random_jitter = fastrand::u64(0..=jitter_range * 2);
-            random_jitter as i64 - jitter_range as i64
-        } else {
-            0
-        };
-
-        let final_backoff_ms = (capped_backoff_ms as i64 + jitter).max(1) as u64;
-        Duration::from_millis(final_backoff_ms)
-    }
-}
-
-/// Acquire an exclusive file lock with exponential backoff and jitter
-///
-/// This function attempts to acquire an exclusive lock on the specified file,
-/// retrying with exponential backoff if the lock is held by another process.
-///
-/// # Arguments
-/// * `lock_path` - Path to the lock file
-/// * `config` - Lock configuration controlling retry behavior
-///
-/// # Returns
-/// * `Ok(File)` - The locked file handle (lock is held while file is open)
-/// * `Err(ProxyError)` - If lock acquisition fails after all retries
-///
-/// # Example
-/// ```ignore
-/// let config = LockConfig::default();
-/// let lock_file = acquire_lock_with_retry(&lock_path, &config).await?;
-/// // Lock is held while lock_file is in scope
-/// // Do work with the locked resource...
-/// drop(lock_file); // Lock is released
-/// ```
-pub async fn acquire_lock_with_retry(lock_path: &Path, config: &LockConfig) -> Result<File> {
-    let mut attempt = 0;
-
-    // Ensure parent directory exists
-    if let Some(parent) = lock_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to create lock directory: path={:?}, error={}",
-                    parent, e
-                ))
-            })?;
-        }
+    pub(crate) fn arm(cache_key: &str, n: u32) {
+        registry().lock().unwrap().insert(cache_key.to_string(), n);
     }
 
-    loop {
-        // Try to open/create lock file
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)
-            .map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to open lock file: path={:?}, error={}",
-                    lock_path, e
-                ))
-            })?;
-
-        // Try to acquire exclusive lock (non-blocking)
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => {
-                debug!(
-                    "Acquired lock with retry: path={:?}, attempt={}",
-                    lock_path,
-                    attempt + 1
-                );
-                return Ok(lock_file);
+    pub(crate) fn take(cache_key: &str) -> bool {
+        let mut r = registry().lock().unwrap();
+        match r.get_mut(cache_key) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                if *n == 0 {
+                    r.remove(cache_key);
+                }
+                true
             }
-            Err(_) if attempt < config.max_retries => {
-                // Lock is held - calculate backoff and retry
-                let backoff = config.calculate_backoff(attempt);
-                debug!(
-                    "Lock held, retrying: path={:?}, attempt={}, backoff={:.2}ms",
-                    lock_path,
-                    attempt + 1,
-                    backoff.as_secs_f64() * 1000.0
-                );
-                tokio::time::sleep(backoff).await;
-                attempt += 1;
-            }
-            Err(e) => {
-                // Max retries exceeded
-                warn!(
-                    "Failed to acquire lock after {} attempts: path={:?}, error={}",
-                    attempt + 1,
-                    lock_path,
-                    e
-                );
-                return Err(ProxyError::LockContention(format!(
-                    "Lock acquisition failed after {} retries: path={:?}",
-                    attempt + 1,
-                    lock_path
-                )));
-            }
+            _ => false,
         }
     }
 }
 
-/// Try to acquire an exclusive file lock without retrying
+/// Cumulative microseconds that slot locks were held, process-wide since start.
 ///
-/// This is a simpler version that attempts to acquire the lock once.
+/// Accumulated in microseconds and published in milliseconds so that a critical
+/// section shorter than a millisecond still contributes rather than truncating to
+/// zero — most `.meta` read-modify-write sections are a few milliseconds on shared
+/// storage, but not all of them are.
+static SLOT_HOLD_TIME_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Blocking acquisitions that gave up because the wait budget expired, process-wide.
 ///
-/// # Arguments
-/// * `lock_path` - Path to the lock file
+/// The failure signal for `acquire_slot_lock_within_budget`. Distinct from
+/// `SLOT_RETRY_EXHAUSTED`, which is the same event on the *retrying* path: this one
+/// counts a caller bounded by elapsed time, that one a caller bounded by attempt
+/// count, and a deployment normally produces both.
 ///
-/// # Returns
-/// * `Ok(File)` - The locked file handle
-/// * `Err(ProxyError)` - If lock acquisition fails
-pub fn try_acquire_exclusive_lock(lock_path: &Path) -> Result<File> {
-    // Ensure parent directory exists
-    if let Some(parent) = lock_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to create lock directory: path={:?}, error={}",
-                    parent, e
-                ))
-            })?;
+/// Expiry is a give-up, never a steal. The lock stays with whoever holds it.
+static SLOT_WAIT_BUDGET_EXPIRED: AtomicU64 = AtomicU64::new(0);
+
+/// Wait budget for a blocking slot-lock acquisition, in milliseconds.
+///
+/// Seeded once from `cache.shared_storage.lock_acquire_wait_budget` by
+/// `set_slot_acquire_wait_budget`, and read by `acquire_slot_lock_within_budget`. It lives
+/// here as a process-wide value rather than on `MetadataLockManager` for the same reason the
+/// counters above do: the acquisition primitives are synchronous free functions, some of them
+/// running inside blocking-pool closures, with no handle to reach a config through.
+///
+/// The initial value is the shipped default rather than zero, so a process that never calls
+/// the setter — every unit test, and any future caller that forgets — gets the documented
+/// budget instead of an instantly-expiring one.
+static SLOT_ACQUIRE_WAIT_BUDGET_MS: AtomicU64 = AtomicU64::new(5_000);
+
+/// Slot-lock acquisitions granted since process start.
+pub fn metadata_lock_acquisitions_successful() -> u64 {
+    SLOT_ACQUISITIONS_SUCCESSFUL.load(Ordering::Relaxed)
+}
+
+/// Slot-lock acquisition attempts refused since process start.
+///
+/// Attempts, not callers — see `SLOT_ACQUISITIONS_FAILED`.
+pub fn metadata_lock_acquisitions_failed() -> u64 {
+    SLOT_ACQUISITIONS_FAILED.load(Ordering::Relaxed)
+}
+
+/// Callers that exhausted their retries and gave up since process start.
+pub fn metadata_lock_retry_exhausted_total() -> u64 {
+    SLOT_RETRY_EXHAUSTED.load(Ordering::Relaxed)
+}
+
+/// Cumulative milliseconds slot locks were held since process start.
+///
+/// A cumulative **sum**, not a mean. Divide by
+/// `metadata_lock_acquisitions_successful` for a mean hold time, accepting that the
+/// divisor also counts any lock still held at the moment of the read.
+pub fn metadata_lock_hold_time_ms_total() -> u64 {
+    SLOT_HOLD_TIME_US_TOTAL.load(Ordering::Relaxed) / 1_000
+}
+
+/// Blocking acquisitions that gave up because the wait budget expired, since process start.
+pub fn metadata_lock_wait_budget_expired_total() -> u64 {
+    SLOT_WAIT_BUDGET_EXPIRED.load(Ordering::Relaxed)
+}
+
+/// Set the process-wide wait budget for blocking slot-lock acquisitions.
+///
+/// Called once during configuration load. Later calls simply replace the value; nothing
+/// caches it, so a change takes effect on the next acquisition.
+pub fn set_slot_acquire_wait_budget(budget: Duration) {
+    SLOT_ACQUIRE_WAIT_BUDGET_MS.store(budget.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// The process-wide wait budget for blocking slot-lock acquisitions.
+pub fn slot_acquire_wait_budget() -> Duration {
+    Duration::from_millis(SLOT_ACQUIRE_WAIT_BUDGET_MS.load(Ordering::Relaxed))
+}
+
+/// Number of metadata lock slots.
+///
+/// The lock namespace is a fixed set of files, created on first use and **never unlinked
+/// by anyone**. A cache key maps to a slot by hash, so two distinct keys can share one —
+/// see `slot_for_cache_key` for the collision arithmetic and its consequence.
+pub const META_LOCK_SLOTS: u64 = 4096;
+
+/// Directory holding the fixed slot set, relative to `metadata/`.
+pub const META_LOCK_DIR: &str = "_meta_locks";
+
+/// Map a cache key to its lock slot.
+///
+/// BLAKE3 over the key, first 8 bytes read little-endian, modulo `META_LOCK_SLOTS`.
+/// BLAKE3 is already this crate's sharding hash (`disk_cache::get_sharded_path`), so the
+/// distribution is uniform for the same reason that one is.
+///
+/// # Slot collisions are latency, never corruption
+///
+/// Two keys sharing a slot serialise against each other. Each holder still gets genuine
+/// mutual exclusion — it simply excludes one more key than it strictly needs to. The
+/// critical section is a single `.meta` read-modify-write, so the cost of a collision is
+/// one such section's duration, and the protocol's correctness does not depend on `N`.
+pub fn slot_for_cache_key(cache_key: &str) -> u64 {
+    let digest = blake3::hash(cache_key.as_bytes());
+    let bytes = digest.as_bytes();
+    let mut first_eight = [0u8; 8];
+    first_eight.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(first_eight) % META_LOCK_SLOTS
+}
+
+// `open_slot_file_for` used to live here: it handed a caller the slot path and an open
+// descriptor so the caller could `flock` and unlock it itself, without ever constructing a
+// `MetadataLock`. Its eight callers were the whole reason the published lock figures covered 25
+// of 33 acquisitions, and they now hold guards, so it has no callers and is gone.
+//
+// It is deliberately not kept "in case someone needs it". `open_slot_file` below is private and
+// `MetadataLock::new` is private, so with the public helper removed there is no way to lock a
+// slot from outside this module except through an acquisition function that counts it. That is
+// what keeps the funnel complete — a property of the module's surface rather than of anyone
+// remembering.
+
+/// Absolute path of the slot file for a cache key.
+pub fn slot_lock_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
+    cache_dir
+        .join("metadata")
+        .join(META_LOCK_DIR)
+        .join(format!("{:04}.lock", slot_for_cache_key(cache_key)))
+}
+
+/// Test seam: `create_dir_all` calls made for each slot directory.
+#[cfg(test)]
+static SLOT_DIR_CREATE_CALLS_FOR_TESTS: std::sync::Mutex<
+    Option<std::collections::HashMap<PathBuf, u64>>,
+> = std::sync::Mutex::new(None);
+
+/// `create_dir_all` for a slot directory, counted under test.
+fn create_slot_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        *SLOT_DIR_CREATE_CALLS_FOR_TESTS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .entry(dir.to_path_buf())
+            .or_insert(0) += 1;
+    }
+    std::fs::create_dir_all(dir)
+}
+
+/// Slot directories this process has already created or found present.
+///
+/// The directory is created once per volume and never removed by this crate, so re-running
+/// `create_dir_all` on every acquisition bought nothing but a `mkdir(2)` that fails `EEXIST` and
+/// the `stat(2)` that follows it. Cached per directory rather than as one flag, because a process
+/// can hold more than one `cache_dir` (every test does).
+static KNOWN_SLOT_DIRS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn known_slot_dirs() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    KNOWN_SLOT_DIRS.get_or_init(Default::default)
+}
+
+/// Create `dir` if this process has not already, tolerating a peer that created it first.
+fn ensure_slot_dir(dir: &Path, force: bool) -> Result<()> {
+    if !force && known_slot_dirs().lock().unwrap().contains(dir) {
+        return Ok(());
+    }
+    if let Err(e) = create_slot_dir(dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(ProxyError::CacheError(format!(
+                "Failed to create metadata lock slot directory: path={:?}, error={}",
+                dir, e
+            )));
         }
     }
+    known_slot_dirs().lock().unwrap().insert(dir.to_path_buf());
+    Ok(())
+}
 
-    let lock_file = OpenOptions::new()
+fn open_slot_file_once(lock_file_path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(lock_path)
-        .map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to open lock file: path={:?}, error={}",
-                lock_path, e
-            ))
-        })?;
+        .open(lock_file_path)
+}
 
-    lock_file.try_lock_exclusive().map_err(|e| {
-        ProxyError::LockContention(format!(
-            "Lock is held by another process: path={:?}, error={}",
-            lock_path, e
+/// Open (creating if absent) the slot file for a lock acquisition.
+///
+/// Three properties are load-bearing on shared storage:
+///
+/// - The slot directory is created once per directory per process, tolerating
+///   `AlreadyExists` because a peer may create it between our check and our call, and then
+///   remembered, so an acquisition does not pay a `mkdir(2)` + `stat(2)` every time.
+/// - An `ENOENT` at open means the directory was removed after we created it (an operator
+///   wiping the volume, a test tearing down). The directory is recreated and the open retried
+///   once, so a deleted directory costs one extra `mkdir` rather than an error.
+/// - `create(true).truncate(false)`, so both instances converge on ONE inode instead of one
+///   truncating the file the other is locking. Truncation would also be pointless: the slot
+///   carries no payload.
+fn open_slot_file(lock_file_path: &Path, cache_key: &str) -> Result<File> {
+    let parent = lock_file_path.parent();
+    if let Some(parent) = parent {
+        ensure_slot_dir(parent, false)?;
+    }
+
+    let opened = match open_slot_file_once(lock_file_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && parent.is_some() => {
+            let parent = parent.expect("checked above");
+            debug!(
+                "Metadata lock slot directory vanished, recreating: path={:?}",
+                parent
+            );
+            ensure_slot_dir(parent, true)?;
+            open_slot_file_once(lock_file_path)
+        }
+        other => other,
+    };
+
+    opened.map_err(|e| {
+        error!(
+            "Failed to open metadata lock slot: cache_key={}, path={:?}, error={}",
+            cache_key, lock_file_path, e
+        );
+        ProxyError::CacheError(format!(
+            "Failed to open metadata lock slot: path={:?}, error={}",
+            lock_file_path, e
+        ))
+    })
+}
+
+/// Acquire the slot lock for `cache_key` with a single non-blocking attempt.
+///
+/// This is the one acquisition primitive. `MetadataLockManager` wraps it for retries, and
+/// `disk_cache` calls it directly, so both share one namespace and one protocol.
+///
+/// The slot directory is created on this process's first use of it, tolerating a peer that
+/// created it first, and recreated if an open finds it gone; the slot file is opened `create(true).truncate(false)` so two instances racing to create
+/// it converge on one inode rather than one truncating the other's.
+///
+/// No payload is written, nothing is fsynced, nothing is read back, and the file is never
+/// unlinked. A held lock is released by closing the descriptor; the kernel does that on
+/// process death and the NFSv4.1 server does it on lease expiry, which is the whole of the
+/// liveness story and not the whole story. Server-side release on lease expiry is also a safety
+/// boundary, because the `rename` a caller publishes with is not fenced by this lock: see the
+/// module's "Lease expiry is a safety boundary as well as a liveness mechanism".
+///
+/// # Nesting is forbidden
+///
+/// Holding two metadata locks at once can self-deadlock, because two keys may share a slot
+/// and `flock` conflicts between two descriptors of the same file even within one process.
+/// Acquire sequentially, never nested. `nested_meta_lock_acquisition_is_refused` asserts the
+/// refusal so a nested acquisition fails loudly instead of hanging.
+pub fn try_acquire_slot_lock(cache_dir: &Path, cache_key: &str) -> Result<MetadataLock> {
+    let lock_file_path = slot_lock_path(cache_dir, cache_key);
+    let lock_file = open_slot_file(&lock_file_path, cache_key)?;
+
+    match fs4::FileExt::try_lock(&lock_file) {
+        Ok(()) => {
+            SLOT_ACQUISITIONS_SUCCESSFUL.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "Acquired metadata slot lock: cache_key={}, path={:?}",
+                cache_key, lock_file_path
+            );
+            Ok(MetadataLock::new(
+                lock_file_path,
+                lock_file,
+                cache_key.to_string(),
+            ))
+        }
+        Err(fs4::TryLockError::WouldBlock) => {
+            SLOT_ACQUISITIONS_FAILED.fetch_add(1, Ordering::Relaxed);
+            Err(ProxyError::LockContention(format!(
+                "Metadata slot lock is held: cache_key={}, path={:?}",
+                cache_key, lock_file_path
+            )))
+        }
+        Err(fs4::TryLockError::Error(e)) => {
+            SLOT_ACQUISITIONS_FAILED.fetch_add(1, Ordering::Relaxed);
+            Err(ProxyError::CacheError(format!(
+                "Failed to lock metadata slot: cache_key={}, path={:?}, error={}",
+                cache_key, lock_file_path, e
+            )))
+        }
+    }
+}
+
+/// Acquire the slot lock for `cache_key`, blocking until it is granted.
+///
+/// The blocking counterpart of `try_acquire_slot_lock`, for synchronous call sites that
+/// previously took their own inline blocking `flock`. Same namespace, same slot file, same
+/// absence of ceremony.
+///
+/// # This function is UNBOUNDED
+///
+/// It waits in the kernel for as long as the holder holds, parking its thread. No production
+/// path uses it: async callers use `acquire_slot_lock_within_budget`, which polls with
+/// non-blocking attempts so a waiter holds no thread, at one shared-storage round trip per
+/// attempt.
+///
+/// Test-only: `acquire_slot_lock_within` was its last production caller and now
+/// polls instead. Tests still use it to hold a slot as a peer would.
+#[cfg(test)]
+pub(crate) fn acquire_slot_lock_blocking(
+    cache_dir: &Path,
+    cache_key: &str,
+) -> Result<MetadataLock> {
+    let lock_file_path = slot_lock_path(cache_dir, cache_key);
+    let lock_file = open_slot_file(&lock_file_path, cache_key)?;
+
+    fs4::FileExt::lock(&lock_file).map_err(|e| {
+        SLOT_ACQUISITIONS_FAILED.fetch_add(1, Ordering::Relaxed);
+        ProxyError::CacheError(format!(
+            "Failed to lock metadata slot: cache_key={}, path={:?}, error={}",
+            cache_key, lock_file_path, e
         ))
     })?;
 
-    Ok(lock_file)
+    SLOT_ACQUISITIONS_SUCCESSFUL.fetch_add(1, Ordering::Relaxed);
+    debug!(
+        "Acquired metadata slot lock (blocking): cache_key={}, path={:?}",
+        cache_key, lock_file_path
+    );
+    Ok(MetadataLock::new(
+        lock_file_path,
+        lock_file,
+        cache_key.to_string(),
+    ))
 }
 
-/// Lock file content structure for cross-host metadata locking.
+/// Acquire the slot lock for `cache_key` from an async context, bounded by the configured
+/// wait budget.
 ///
-/// Written atomically as JSON when a lock is acquired. Contains enough
-/// information for any host to determine whether the lock is stale:
-/// - Same host: PID check (fast, authoritative)
-/// - Different host: wall-clock timeout only (no remote PID visibility)
+/// This is the acquisition every async caller should use. It does two things the raw blocking
+/// primitive cannot: it waits without holding a runtime worker or a blocking-pool thread
+/// (see [`acquire_slot_lock_within`]), so a contended slot stalls neither unrelated requests
+/// nor its own holder; and it bounds the wait, so a wedged peer cannot hang a request path
+/// indefinitely.
 ///
-/// Requirements: 3.1, 3.2, 3.3, 3.5
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LockFileContent {
-    /// Unique identifier: "hostname:pid"
-    pub instance_id: String,
-    /// Hostname of the lock holder (used for same-host vs cross-host decision)
-    pub hostname: String,
-    /// Process ID of the lock holder
-    pub pid: u32,
-    /// Acquisition timestamp in milliseconds since UNIX epoch
-    pub acquired_at_ms: u64,
-    /// Monotonic fence epoch — incremented on each takeover to detect races
-    pub fence_epoch: u64,
+/// # A budget, not a timeout
+///
+/// Expiry returns `ProxyError::LockContention` and the caller has touched nothing. It does
+/// **not** conclude the holder is dead, and it does not take the lock. That distinction is the
+/// whole protocol: the retired per-key sentinel inferred death from elapsed time and broke the
+/// lock, which produced two holders and the lost update the lock exists to prevent.
+///
+/// Retryable, and worth retrying: the condition is transient by construction, because the
+/// holder is live and will release.
+pub(crate) async fn acquire_slot_lock_within_budget(
+    cache_dir: &Path,
+    cache_key: &str,
+) -> Result<MetadataLock> {
+    acquire_slot_lock_within(cache_dir, cache_key, slot_acquire_wait_budget()).await
 }
 
-impl LockFileContent {
-    /// Create new lock file content for the current process
-    pub fn new(fence_epoch: u64) -> Self {
-        let hostname = hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let pid = std::process::id();
-        let instance_id = format!("{}:{}", hostname, pid);
-        let acquired_at_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+/// First pause between two `try_lock` attempts in [`acquire_slot_lock_within`]. Slot holds
+/// are a few milliseconds on shared storage, so the first retry comes soon.
+const SLOT_POLL_RETRY_MIN: Duration = Duration::from_millis(2);
+/// Longest pause between two attempts: at most 20 shared-storage round trips per second per
+/// waiter, and a grant noticed within 50 ms of the release.
+const SLOT_POLL_RETRY_MAX: Duration = Duration::from_millis(50);
 
-        Self {
-            instance_id,
-            hostname,
-            pid,
-            acquired_at_ms,
-            fence_epoch,
+/// One non-blocking attempt for [`acquire_slot_lock_within`]: `Ok(None)` while the slot is
+/// held. Unlike [`try_acquire_slot_lock`] it does not count a refusal, so a budgeted wait
+/// moves the counters exactly as the queued `flock` it replaced did: one success when granted,
+/// one budget expiry when not.
+fn try_slot_lock_uncounted(cache_dir: &Path, cache_key: &str) -> Result<Option<MetadataLock>> {
+    let lock_file_path = slot_lock_path(cache_dir, cache_key);
+    let lock_file = open_slot_file(&lock_file_path, cache_key)?;
+    match fs4::FileExt::try_lock(&lock_file) {
+        Ok(()) => {
+            SLOT_ACQUISITIONS_SUCCESSFUL.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "Acquired metadata slot lock (budgeted): cache_key={}, path={:?}",
+                cache_key, lock_file_path
+            );
+            Ok(Some(MetadataLock::new(
+                lock_file_path,
+                lock_file,
+                cache_key.to_string(),
+            )))
+        }
+        Err(fs4::TryLockError::WouldBlock) => Ok(None),
+        Err(fs4::TryLockError::Error(e)) => {
+            SLOT_ACQUISITIONS_FAILED.fetch_add(1, Ordering::Relaxed);
+            Err(ProxyError::CacheError(format!(
+                "Failed to lock metadata slot: cache_key={}, path={:?}, error={}",
+                cache_key, lock_file_path, e
+            )))
         }
     }
+}
 
-    /// Create a LockFileContent with a specific hostname (for testing)
-    #[cfg(test)]
-    pub fn with_hostname(hostname: String, pid: u32, fence_epoch: u64) -> Self {
-        let instance_id = format!("{}:{}", hostname, pid);
-        let acquired_at_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        Self {
-            instance_id,
-            hostname,
-            pid,
-            acquired_at_ms,
-            fence_epoch,
+/// `acquire_slot_lock_within_budget` with the budget supplied explicitly.
+///
+/// Exists so a test can drive an acquisition to expiry deterministically rather than depending
+/// on process-wide state that another test in the same binary may have changed.
+///
+/// # No waiter ever parks a blocking thread
+///
+/// Each attempt is a non-blocking `try_lock` on a blocking thread that returns at once;
+/// between attempts the task sleeps asynchronously (2 ms doubling to 50 ms), and the budget
+/// bounds the whole wait. A queued kernel `flock` here would park one blocking-pool thread
+/// per waiter, and `tokio::time::timeout` abandons a `spawn_blocking` task without cancelling
+/// the kernel wait, so every expiry left a thread parked until the holder released. Several
+/// holders await `tokio::fs` while they hold a slot (the multipart completion, the
+/// `disk_cache` and `cache` publish paths, orphan reclamation). With enough waiters across
+/// the 4096 slots to fill the blocking pool, a holder's next `tokio::fs` call queued behind
+/// threads parked on its own slot, and nothing could release. Polling holds a pool thread
+/// for one `open` plus one `try_lock` only.
+///
+/// The cost is the queued `flock`'s FIFO handoff: a waiter notices a release on its next
+/// attempt rather than at once, and a busy slot is won by whichever waiter polls first.
+///
+/// An attempt in flight when the budget expires may still win; its guard is returned into a
+/// dropped `JoinHandle` and `Drop` releases it at once, so the slot is held for a moment by a
+/// caller that has already given up. That costs no correctness: the guard cannot outlive the
+/// dropped handle.
+pub async fn acquire_slot_lock_within(
+    cache_dir: &Path,
+    cache_key: &str,
+    budget: Duration,
+) -> Result<MetadataLock> {
+    let poll = async {
+        let mut backoff = SLOT_POLL_RETRY_MIN;
+        loop {
+            let owned_dir = cache_dir.to_path_buf();
+            let owned_key = cache_key.to_string();
+            let attempt = tokio::task::spawn_blocking(move || {
+                try_slot_lock_uncounted(&owned_dir, &owned_key)
+            })
+            .await
+            .map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Metadata slot lock task failed: cache_key={}, error={}",
+                    cache_key, e
+                ))
+            })??;
+            if let Some(lock) = attempt {
+                return Ok(lock);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(SLOT_POLL_RETRY_MAX);
         }
-    }
+    };
 
-    /// Get the hostname component of the lock owner
-    pub fn hostname_component(&self) -> &str {
-        &self.hostname
-    }
-
-    /// Serialize to JSON for storage
-    pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to serialize lock content: {}", e)))
-    }
-
-    /// Deserialize from JSON
-    pub fn from_json(json: &str) -> Result<Self> {
-        serde_json::from_str(json).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to deserialize lock content: {}", e))
-        })
+    match tokio::time::timeout(budget, poll).await {
+        Ok(result) => result,
+        Err(_) => {
+            SLOT_WAIT_BUDGET_EXPIRED.fetch_add(1, Ordering::Relaxed);
+            Err(ProxyError::LockContention(format!(
+                "Metadata slot lock not acquired within the {}ms wait budget: cache_key={}",
+                budget.as_millis(),
+                cache_key
+            )))
+        }
     }
 }
 
-/// Represents an acquired metadata lock
+/// Blocking-pool threads the request-path commit tails may occupy at once, per process.
+///
+/// The runtime keeps tokio's default `max_blocking_threads` of 512, and that pool also carries
+/// every `tokio::fs` call, the streamed-PUT drain and finalize threads, the size-state and
+/// ledger writers and the consolidator. A commit tail holds its thread for roughly ten
+/// shared-storage round trips, tens of milliseconds on EFS, so 64 threads carry several
+/// hundred commits a second, well above the 62 per second per proxy design point, and leave 448
+/// threads for everything else. Without the bound, a burst of concurrent PUTs could take the
+/// whole pool and queue every other `tokio::fs` call behind it.
+pub(crate) const BLOCKING_COMMIT_SLOTS: usize = 64;
+
+fn blocking_commit_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(BLOCKING_COMMIT_SLOTS)))
+}
+
+/// Run synchronous shared-storage work `f` on the blocking pool, holding one of the
+/// [`BLOCKING_COMMIT_SLOTS`] permits for as long as `f` runs.
+///
+/// The permit moves into the blocking task, so a caller that stops waiting (a cancelled
+/// request) cannot free it while `f` is still running: the bound counts threads, not waiters.
+/// `f` must not wait on anything that a permit holder could be waiting for; the callers are
+/// leaf transactions that take at most one non-blocking slot lock.
+pub(crate) async fn run_blocking_io<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = blocking_commit_slots()
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ProxyError::CacheError(format!("Blocking commit slots closed: {}", e)))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| ProxyError::CacheError(format!("Blocking commit task failed: {}", e)))
+}
+
+/// Release `lock` on the blocking pool: its `close` is a shared-storage round trip, and dropping
+/// the guard on a runtime worker holds that worker for it. If the blocking task cannot run, the
+/// guard is dropped with the failed task, so the lock is released either way.
+///
+/// Plain `spawn_blocking`, not [`run_blocking_io`]: one `close` holds its thread for one round
+/// trip, so it needs no share of the [`BLOCKING_COMMIT_SLOTS`] bound, and taking one would make
+/// every release wait behind up to 64 full commit tails while the slot stays held.
+pub(crate) async fn release_off_worker(lock: MetadataLock) {
+    let _ = tokio::task::spawn_blocking(move || drop(lock)).await;
+}
+
+/// Represents an acquired metadata lock.
+///
+/// The lock is held for as long as this value lives: `Drop` closes the descriptor and does
+/// nothing else. It does **not** unlink the slot file — the slot set is fixed and shared, so
+/// unlinking it would remove a file other holders are locking, which is the defect this
+/// protocol replaced.
+#[derive(Debug)]
 pub struct MetadataLock {
-    /// Path to the lock file
+    /// Path to the slot file
     lock_file_path: PathBuf,
-    /// Open file handle (keeps lock active)
+    /// Open file handle (keeps lock active; closing it releases the lock)
     _lock_file: File,
     /// Cache key being locked
     cache_key: String,
     /// When the lock was acquired
     acquired_at: SystemTime,
-    /// Fence epoch written at acquisition time (for verification)
-    fence_epoch: u64,
 }
 
 impl MetadataLock {
     /// Create a new metadata lock
-    fn new(lock_file_path: PathBuf, lock_file: File, cache_key: String, fence_epoch: u64) -> Self {
+    fn new(lock_file_path: PathBuf, lock_file: File, cache_key: String) -> Self {
         Self {
             lock_file_path,
             _lock_file: lock_file,
             cache_key,
             acquired_at: SystemTime::now(),
-            fence_epoch,
         }
     }
 
@@ -336,194 +739,118 @@ impl MetadataLock {
     pub fn acquired_at(&self) -> SystemTime {
         self.acquired_at
     }
-
-    /// Get the fence epoch for this lock
-    pub fn fence_epoch(&self) -> u64 {
-        self.fence_epoch
-    }
-
-    /// Refresh the heartbeat by updating `acquired_at_ms` in the lockfile.
-    ///
-    /// Call this periodically during long operations (every `metadata_lock_timeout_ms / 2`)
-    /// to prevent other hosts from treating this lock as stale and attempting takeover.
-    ///
-    /// Requirements: 3.4, 3.5
-    pub fn refresh_heartbeat(&self) -> Result<()> {
-        use std::io::Write;
-
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // Read current content to preserve fields
-        let content = std::fs::read_to_string(&self.lock_file_path).map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to read lock file for heartbeat refresh: path={:?}, error={}",
-                self.lock_file_path, e
-            ))
-        })?;
-
-        let mut lock_info = LockFileContent::from_json(&content)?;
-
-        // Verify our epoch is still current before refreshing
-        if lock_info.fence_epoch != self.fence_epoch {
-            return Err(ProxyError::CacheError(format!(
-                "Fence epoch mismatch during heartbeat refresh: path={:?}, expected={}, found={}",
-                self.lock_file_path, self.fence_epoch, lock_info.fence_epoch
-            )));
-        }
-
-        // Update the timestamp
-        lock_info.acquired_at_ms = now_ms;
-
-        // Write back with fsync
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.lock_file_path)
-            .map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to open lock file for heartbeat refresh: path={:?}, error={}",
-                    self.lock_file_path, e
-                ))
-            })?;
-
-        let json = lock_info.to_json()?;
-        file.write_all(json.as_bytes()).map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to write heartbeat refresh: path={:?}, error={}",
-                self.lock_file_path, e
-            ))
-        })?;
-        file.sync_all().map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to fsync heartbeat refresh: path={:?}, error={}",
-                self.lock_file_path, e
-            ))
-        })?;
-
-        debug!(
-            "Refreshed lock heartbeat: cache_key={}, path={:?}, acquired_at_ms={}",
-            self.cache_key, self.lock_file_path, now_ms
-        );
-
-        Ok(())
-    }
 }
 
 impl Drop for MetadataLock {
     fn drop(&mut self) {
-        // Clean up lock file when lock is dropped
-        if let Err(e) = std::fs::remove_file(&self.lock_file_path) {
-            // NotFound is expected on shared storage — another instance may have cleaned it up
-            if e.kind() == std::io::ErrorKind::NotFound {
-                debug!(
-                    "Lock file already removed on drop: path={:?}",
-                    self.lock_file_path
-                );
-            } else {
-                warn!(
-                    "Failed to remove lock file on drop: path={:?}, error={}",
-                    self.lock_file_path, e
-                );
-            }
-        } else {
-            debug!(
-                "Cleaned up lock file on drop: cache_key={}, path={:?}",
-                self.cache_key, self.lock_file_path
-            );
-        }
+        // The guard's lifetime IS the hold, because `Drop` is what releases the lock —
+        // so this is the critical section's duration and not an approximation of it.
+        // `elapsed()` fails only if the wall clock stepped backwards during the hold,
+        // in which case the hold contributes zero rather than a wrapped value.
+        SLOT_HOLD_TIME_US_TOTAL.fetch_add(
+            self.acquired_at().elapsed().unwrap_or_default().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+
+        // Unlock explicitly, then close `_lock_file`: a child forked while the slot file was
+        // open keeps the flock alive after the close otherwise. The slot file itself is
+        // permanent.
+        crate::journal_consolidator::unlock_lock_file(&self._lock_file, "metadata slot lock");
+        debug!(
+            "Released metadata slot lock: cache_key={}, path={:?}",
+            self.cache_key, self.lock_file_path
+        );
     }
 }
 
-/// Enhanced metadata lock manager with stale lock detection and process validation
+/// How [`MetadataLockManager::run_locked_blocking_logged`] logs giving up after
+/// `lock_max_retries`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockExhaustionLog {
+    /// ERROR, the default: the caller gives up on the operation.
+    Error,
+    /// debug: the caller retries the operation and logs its own failures at a bounded rate.
+    Debug,
+}
+
+/// Metadata lock manager over the fixed slot set.
+///
+/// Adds a retry loop with exponential backoff on top of `try_acquire_slot_lock`. It holds no
+/// lock state of its own — acquisition depends on `cache_dir` and the cache key only — which
+/// is why `disk_cache` can call the free function directly and share this namespace without
+/// being handed a manager.
 pub struct MetadataLockManager {
     /// Cache directory path
     cache_dir: PathBuf,
-    /// Lock timeout duration (used for lock acquisition retries)
-    /// Retained for API compatibility; cross-host staleness uses metadata_lock_timeout_ms.
-    #[allow(dead_code)]
-    lock_timeout: Duration,
     /// Maximum retry attempts
     max_retries: u32,
     /// Base backoff duration for exponential backoff
     base_backoff: Duration,
     /// Maximum backoff duration
     max_backoff: Duration,
-    /// Hostname of this instance (cached at construction for cross-host comparison)
-    hostname: String,
-    /// Cross-host metadata lock timeout in milliseconds (Req 3.3)
-    metadata_lock_timeout_ms: u64,
 }
 
 impl MetadataLockManager {
-    /// Create a new metadata lock manager
-    pub fn new(cache_dir: PathBuf, lock_timeout: Duration, max_retries: u32) -> Self {
-        let hostname = hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+    /// Create a new metadata lock manager.
+    ///
+    /// The second parameter is accepted for call-site compatibility and unused. This manager's
+    /// bound is `max_retries`; the wait budget belongs to the blocking path and is a
+    /// process-wide value set by `set_slot_acquire_wait_budget`, because the blocking
+    /// primitive is a free function with no manager to reach.
+    pub fn new(cache_dir: PathBuf, _lock_acquire_wait_budget: Duration, max_retries: u32) -> Self {
         Self {
             cache_dir,
-            lock_timeout,
             max_retries,
             base_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
-            hostname,
-            metadata_lock_timeout_ms: 30_000, // default 30s
         }
     }
 
-    /// Create a new metadata lock manager with explicit cross-host timeout
-    pub fn with_metadata_lock_timeout(
-        cache_dir: PathBuf,
-        lock_timeout: Duration,
-        max_retries: u32,
-        metadata_lock_timeout_ms: u64,
-    ) -> Self {
-        let hostname = hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        Self {
-            cache_dir,
-            lock_timeout,
-            max_retries,
-            base_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(5),
-            hostname,
-            metadata_lock_timeout_ms,
-        }
-    }
-    /// Acquire an exclusive metadata lock with stale lock detection and exponential backoff
+    /// Acquire the key's metadata slot lock, retrying with exponential backoff.
+    ///
+    /// A contended slot is retried; there is no stale-lock branch, because a `flock` cannot go
+    /// stale — the kernel releases it on process death and the NFSv4.1 server releases it on
+    /// lease expiry. A lock that stays held is held by someone live, and breaking it would
+    /// remove exclusion rather than restore it.
+    ///
+    /// Holding the lock is not the same as being fenced while publishing. A caller that renames
+    /// a `.meta` under this lock can still have lost the lock to a lease expiry it has no way to
+    /// observe: see the module's "Lease expiry is a safety boundary as well as a liveness
+    /// mechanism".
+    ///
+    /// What bounds the wait is `lock_max_retries`, not elapsed time, so giving up here is
+    /// **retry exhaustion** and is counted by `metadata_lock_retry_exhausted_total`. There is
+    /// no timeout to count.
+    ///
+    /// Each attempt (one `open` plus one non-blocking `try_lock`) runs on the blocking pool, so
+    /// a slow shared-storage `open` does not hold a runtime worker. The guard is returned to the
+    /// caller, which releases it wherever it drops it.
     pub async fn acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
-        let lock_file_path = self.get_lock_file_path(cache_key)?;
         let mut attempt = 0;
 
-        // Ensure parent directory exists
-        if let Some(parent) = lock_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to create lock directory: path={:?}, error={}",
-                    parent, e
-                ))
-            })?;
-        }
-
         while attempt <= self.max_retries {
-            match self.try_acquire_lock_once(cache_key, &lock_file_path).await {
+            let dir = self.cache_dir.clone();
+            let key = cache_key.to_string();
+            let outcome = tokio::task::spawn_blocking(move || try_acquire_slot_lock(&dir, &key))
+                .await
+                .map_err(|e| {
+                    ProxyError::CacheError(format!(
+                        "Metadata slot lock task failed: cache_key={}, error={}",
+                        cache_key, e
+                    ))
+                })?;
+            match outcome {
                 Ok(lock) => {
                     debug!(
-                        "Successfully acquired metadata lock: cache_key={}, attempt={}, path={:?}",
+                        "Successfully acquired metadata lock: cache_key={}, attempt={}",
                         cache_key,
-                        attempt + 1,
-                        lock_file_path
+                        attempt + 1
                     );
                     return Ok(lock);
                 }
                 Err(e) => {
                     if attempt == self.max_retries {
+                        SLOT_RETRY_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                         error!(
                             "Failed to acquire metadata lock after {} attempts: cache_key={}, error={}",
                             self.max_retries + 1, cache_key, e
@@ -531,7 +858,6 @@ impl MetadataLockManager {
                         return Err(e);
                     }
 
-                    // Calculate exponential backoff with jitter
                     let backoff = self.calculate_backoff(attempt);
                     debug!(
                         "Lock acquisition failed, retrying: cache_key={}, attempt={}, backoff={:.2}ms, error={}",
@@ -547,487 +873,152 @@ impl MetadataLockManager {
         unreachable!("Loop should have returned or errored")
     }
 
-    /// Try to acquire a metadata lock with a single attempt (no retries).
+    /// Try to acquire the key's metadata slot lock with a single attempt (no retries).
     ///
-    /// Returns `Ok(lock)` if acquired, `Err` if the lock is held by another process.
-    /// Still checks for stale locks and breaks them if found, but does not retry
-    /// with exponential backoff. Used by journal consolidation where skipping a
-    /// contended key and retrying next cycle is cheaper than waiting.
+    /// Returns `Ok(lock)` if acquired, `Err` if the slot is held. Used by journal
+    /// consolidation, where skipping a contended key and retrying next cycle is cheaper than
+    /// waiting.
     pub async fn try_acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
-        let lock_file_path = self.get_lock_file_path(cache_key)?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = lock_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to create lock directory: path={:?}, error={}",
-                    parent, e
-                ))
-            })?;
-        }
-
-        self.try_acquire_lock_once(cache_key, &lock_file_path).await
+        try_acquire_slot_lock(&self.cache_dir, cache_key)
     }
 
-    /// Try to acquire lock once (internal method)
-    async fn try_acquire_lock_once(
-        &self,
-        cache_key: &str,
-        lock_file_path: &Path,
-    ) -> Result<MetadataLock> {
-        // Try to open/create lock file
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_file_path)
-            .map_err(|e| {
-                error!(
-                    "Failed to open lock file: cache_key={}, path={:?}, error={}",
-                    cache_key, lock_file_path, e
-                );
-                ProxyError::CacheError(format!(
-                    "Failed to open lock file: path={:?}, error={}",
-                    lock_file_path, e
-                ))
-            })?;
-
-        // Try to acquire exclusive lock (non-blocking)
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => {
-                // Successfully acquired lock — write content, fsync, verify epoch
-                let lock_content = LockFileContent::new(0);
-                let epoch = lock_content.fence_epoch;
-
-                self.write_and_verify_lock_content(lock_file_path, &lock_content, cache_key)?;
-
-                debug!(
-                    "Acquired fresh metadata lock: cache_key={}, path={:?}, epoch={}",
-                    cache_key, lock_file_path, epoch
-                );
-
-                Ok(MetadataLock::new(
-                    lock_file_path.to_path_buf(),
-                    lock_file,
-                    cache_key.to_string(),
-                    epoch,
-                ))
-            }
-            Err(_lock_err) => {
-                debug!(
-                    "Lock file is held: cache_key={}, path={:?}, checking if stale",
-                    cache_key, lock_file_path
-                );
-
-                // Lock is held - check if it's stale
-                match self.is_lock_stale(lock_file_path) {
-                    Ok(true) => {
-                        // Break stale lock and retry
-                        match self.break_stale_lock(lock_file_path).await {
-                            Ok(true) => {
-                                info!(
-                                    "Successfully broke stale lock: cache_key={}, path={:?}",
-                                    cache_key, lock_file_path
-                                );
-                            }
-                            Ok(false) => {
-                                warn!(
-                                    "Failed to break stale lock: cache_key={}, path={:?}",
-                                    cache_key, lock_file_path
-                                );
-                                return Err(ProxyError::CacheError(format!(
-                                    "Failed to break stale lock: cache_key={}, path={:?}",
-                                    cache_key, lock_file_path
-                                )));
-                            }
-                            Err(e) => {
-                                info!(
-                                    "Error breaking stale lock (likely already removed): cache_key={}, path={:?}, error={}",
-                                    cache_key, lock_file_path, e
-                                );
-                                return Err(e);
-                            }
-                        }
-
-                        // Read the epoch that break_stale_lock wrote (for cross-host takeover)
-                        // or default to 0 if the file was deleted (same-host stale)
-                        let takeover_epoch = std::fs::read_to_string(lock_file_path)
-                            .ok()
-                            .and_then(|c| LockFileContent::from_json(&c).ok())
-                            .map(|info| info.fence_epoch)
-                            .unwrap_or(0);
-
-                        // Try to acquire lock again after breaking stale lock
-                        let new_lock_file = OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .truncate(true)
-                            .open(lock_file_path)
-                            .map_err(|e| {
-                                error!(
-                                    "Failed to reopen lock file after breaking stale lock: cache_key={}, path={:?}, error={}",
-                                    cache_key, lock_file_path, e
-                                );
-                                ProxyError::CacheError(format!(
-                                    "Failed to reopen lock file after breaking stale lock: path={:?}, error={}",
-                                    lock_file_path, e
-                                ))
-                            })?;
-
-                        new_lock_file.lock_exclusive().map_err(|e| {
-                            error!(
-                                "Failed to acquire lock after breaking stale lock: cache_key={}, path={:?}, error={}",
-                                cache_key, lock_file_path, e
-                            );
-                            ProxyError::CacheError(format!(
-                                "Failed to acquire lock after breaking stale lock: path={:?}, error={}",
-                                lock_file_path, e
-                            ))
-                        })?;
-
-                        // Write new lock content with the takeover epoch, fsync, verify
-                        let lock_content = LockFileContent::new(takeover_epoch);
-                        let epoch = lock_content.fence_epoch;
-
-                        self.write_and_verify_lock_content(
-                            lock_file_path,
-                            &lock_content,
-                            cache_key,
-                        )?;
-
-                        info!(
-                            "Acquired metadata lock after breaking stale lock: cache_key={}, path={:?}, epoch={}",
-                            cache_key, lock_file_path, epoch
-                        );
-
-                        Ok(MetadataLock::new(
-                            lock_file_path.to_path_buf(),
-                            new_lock_file,
-                            cache_key.to_string(),
-                            epoch,
-                        ))
-                    }
-                    Ok(false) => {
-                        // Lock is active - return error to trigger retry
-                        debug!(
-                            "Metadata lock is held by active process: cache_key={}, path={:?}",
-                            cache_key, lock_file_path
-                        );
-                        Err(ProxyError::CacheError(format!(
-                            "Metadata lock is held by active process: cache_key={}, path={:?}",
-                            cache_key, lock_file_path
-                        )))
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to check if lock is stale: cache_key={}, path={:?}, error={}",
-                            cache_key, lock_file_path, e
-                        );
-                        Err(e)
-                    }
-                }
-            }
-        }
+    /// Acquire the key's slot lock, run `critical` under it and release it, all on ONE
+    /// blocking-pool thread behind a [`run_blocking_io`] permit.
+    ///
+    /// For a synchronous shared-storage transaction on the request path (the streamed PUT's
+    /// commit tail): the `open` and `try_lock`, every `std::fs` call `critical` makes, and the
+    /// `close` that releases the lock all run off the runtime workers, so a slow volume stalls
+    /// the PUT and not `/health`.
+    ///
+    /// `critical` receives the guard by value and must drop it before it returns; the guard
+    /// cannot leave the closure unless `critical` returns it, and no caller does.
+    ///
+    /// The wait has `acquire_lock`'s shape and bound: each attempt is one non-blocking
+    /// `try_lock`; a refused attempt hands `critical` back to the async side, which sleeps the
+    /// same backoff without holding a thread or a permit and retries, and `lock_max_retries`
+    /// bounds the whole wait. A queued `flock` inside the closure would park a pool thread and a
+    /// permit for as long as a peer held the slot, which is the wedge in a new place.
+    ///
+    /// Never call this while holding another metadata lock: see the never-hold-two rule.
+    pub(crate) async fn run_locked_blocking<T, F>(&self, cache_key: &str, critical: F) -> Result<T>
+    where
+        F: FnOnce(MetadataLock) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_locked_blocking_logged(cache_key, LockExhaustionLog::Error, critical)
+            .await
     }
 
-    /// Write lock content to the lockfile, fsync, and re-read to verify the fence epoch.
-    ///
-    /// This ensures durability and detects races where another host overwrites the
-    /// lockfile between our write and our verification read.
-    ///
-    /// Requirements: 3.4, 3.5
-    fn write_and_verify_lock_content(
+    /// [`Self::run_locked_blocking`], with the log level of retry exhaustion chosen by the
+    /// caller. A caller that retries the whole transaction itself and rate-limits its
+    /// own failure log (the background write-stamp retry) passes [`LockExhaustionLog::Debug`],
+    /// so a volume that refuses every lock does not produce one ERROR per attempt. Exhaustion
+    /// is counted in `metadata_lock_retry_exhausted_total` either way.
+    pub(crate) async fn run_locked_blocking_logged<T, F>(
         &self,
-        lock_file_path: &Path,
-        lock_content: &LockFileContent,
         cache_key: &str,
-    ) -> Result<()> {
-        use std::io::Write;
-
-        let json = lock_content.to_json()?;
-
-        // Write lock content with truncate + write + fsync
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(lock_file_path)
-            .map_err(|e| {
-                error!(
-                    "Failed to open lock file for write: cache_key={}, path={:?}, error={}",
-                    cache_key, lock_file_path, e
-                );
-                ProxyError::CacheError(format!(
-                    "Failed to open lock file for write: path={:?}, error={}",
-                    lock_file_path, e
-                ))
-            })?;
-
-        file.write_all(json.as_bytes()).map_err(|e| {
-            error!(
-                "Failed to write lock content: cache_key={}, path={:?}, error={}",
-                cache_key, lock_file_path, e
-            );
-            let _ = std::fs::remove_file(lock_file_path);
-            ProxyError::CacheError(format!(
-                "Failed to write lock content: path={:?}, error={}",
-                lock_file_path, e
-            ))
-        })?;
-
-        file.sync_all().map_err(|e| {
-            error!(
-                "Failed to fsync lock file: cache_key={}, path={:?}, error={}",
-                cache_key, lock_file_path, e
-            );
-            let _ = std::fs::remove_file(lock_file_path);
-            ProxyError::CacheError(format!(
-                "Failed to fsync lock file: path={:?}, error={}",
-                lock_file_path, e
-            ))
-        })?;
-
-        drop(file);
-
-        // Re-read and verify the fence epoch matches what we wrote
-        let verify_content = std::fs::read_to_string(lock_file_path).map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to re-read lock file for epoch verification: path={:?}, error={}",
-                lock_file_path, e
-            ))
-        })?;
-
-        let verified = LockFileContent::from_json(&verify_content)?;
-        if verified.fence_epoch != lock_content.fence_epoch {
-            warn!(
-                "Fence epoch mismatch after lock acquisition: cache_key={}, path={:?}, expected={}, got={}",
-                cache_key, lock_file_path, lock_content.fence_epoch, verified.fence_epoch
-            );
-            return Err(ProxyError::CacheError(format!(
-                "Fence epoch mismatch: expected={}, got={} — another host overwrote the lock",
-                lock_content.fence_epoch, verified.fence_epoch
+        exhaustion_log: LockExhaustionLog,
+        critical: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(MetadataLock) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        #[cfg(test)]
+        if forced_retry_exhaustion::take(cache_key) {
+            return Err(ProxyError::LockContention(format!(
+                "test seam: forced slot-lock retry exhaustion: cache_key={}",
+                cache_key
             )));
         }
-
-        Ok(())
-    }
-
-    /// Check if a lock file represents a stale lock.
-    ///
-    /// Cross-host staleness logic (Requirements 3.1, 3.2, 3.3):
-    /// - Same host: use PID check (authoritative, fast)
-    /// - Different host: wall-clock timeout only (no remote PID visibility)
-    /// - Unparseable/empty lockfiles: treated as remote-owned, use wall-clock timeout
-    fn is_lock_stale(&self, lock_file_path: &Path) -> Result<bool> {
-        // Read lock file content
-        let content = match std::fs::read_to_string(lock_file_path) {
-            Ok(content) => content,
-            Err(_) => {
-                // Unreadable lock file — treat as stale (cannot determine owner)
-                debug!(
-                    "Lock file is unreadable, considering stale: path={:?}",
-                    lock_file_path
-                );
-                return Ok(true);
-            }
-        };
-
-        if content.trim().is_empty() {
-            // Empty lock file is stale
-            debug!(
-                "Lock file is empty, considering stale: path={:?}",
-                lock_file_path
-            );
-            return Ok(true);
-        }
-
-        // Parse lock content — unparseable files are treated as remote-owned
-        // and use wall-clock timeout (Req 3.3: never assume local ownership)
-        let lock_info = match LockFileContent::from_json(&content) {
-            Ok(info) => info,
-            Err(_) => {
-                // Corrupted/unparseable: treat as remote-owned, use wall-clock timeout.
-                // We use the file's mtime as a proxy for acquired_at_ms since we can't
-                // parse the content.
-                debug!(
-                    "Lock file is unparseable, using wall-clock timeout: path={:?}",
-                    lock_file_path
-                );
-                let file_age_ms = match std::fs::metadata(lock_file_path) {
-                    Ok(meta) => meta
-                        .modified()
-                        .ok()
-                        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(u64::MAX),
-                    Err(_) => u64::MAX, // Can't stat → assume very old → stale
-                };
-                return Ok(file_age_ms > self.metadata_lock_timeout_ms);
-            }
-        };
-
-        let my_hostname = self.hostname.as_str();
-        let lock_hostname = lock_info.hostname_component();
-
-        if lock_hostname == my_hostname {
-            // Same host: use PID check (Req 3.2)
-            let stale = !is_process_alive(lock_info.pid);
-            if stale {
-                debug!(
-                    "Lock is stale (same-host, PID dead): path={:?}, pid={}, hostname={}",
-                    lock_file_path, lock_info.pid, lock_hostname
-                );
-            } else {
-                debug!(
-                    "Lock is active (same-host, PID alive): path={:?}, pid={}, hostname={}",
-                    lock_file_path, lock_info.pid, lock_hostname
-                );
-            }
-            Ok(stale)
-        } else {
-            // Different host: wall-clock timeout only (Req 3.3)
-            let now_ms = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let age_ms = now_ms.saturating_sub(lock_info.acquired_at_ms);
-            let stale = age_ms > self.metadata_lock_timeout_ms;
-
-            if stale {
-                debug!(
-                    "Lock is stale (cross-host, timeout): path={:?}, lock_hostname={}, age_ms={}, timeout_ms={}",
-                    lock_file_path, lock_hostname, age_ms, self.metadata_lock_timeout_ms
-                );
-            } else {
-                debug!(
-                    "Lock is active (cross-host, within timeout): path={:?}, lock_hostname={}, age_ms={}, timeout_ms={}",
-                    lock_file_path, lock_hostname, age_ms, self.metadata_lock_timeout_ms
-                );
-            }
-            Ok(stale)
-        }
-    }
-
-    /// Break a stale lock with cross-host ownership awareness.
-    ///
-    /// Requirement 3.1: Never delete/recreate a lockfile owned by another host.
-    /// - Same-host stale lock (dead PID): delete and recreate as before.
-    /// - Different-host stale lock (timeout): overwrite content in-place with new
-    ///   fence epoch, fsync, then re-read to verify epoch matches.
-    pub async fn break_stale_lock(&self, lock_file_path: &Path) -> Result<bool> {
-        debug!("Breaking stale lock: path={:?}", lock_file_path);
-
-        // Read lock content to determine ownership
-        let lock_info = match std::fs::read_to_string(lock_file_path) {
-            Ok(content) => LockFileContent::from_json(&content).ok(),
-            Err(_) => None,
-        };
-
-        let is_same_host = lock_info
-            .as_ref()
-            .map(|info| info.hostname_component() == self.hostname.as_str())
-            .unwrap_or(true); // If we can't parse, treat as local (safe to delete)
-
-        if is_same_host {
-            // Same-host stale lock (dead PID): safe to delete and recreate
-            match std::fs::remove_file(lock_file_path) {
-                Ok(()) => {
-                    info!(
-                        "Broke stale same-host lock (deleted): path={:?}, lock_info={:?}",
-                        lock_file_path,
-                        lock_info
-                            .as_ref()
-                            .map(|i| format!("instance_id={}, pid={}", i.instance_id, i.pid))
+        let mut pending = critical;
+        let mut attempt = 0;
+        loop {
+            let dir = self.cache_dir.clone();
+            let key = cache_key.to_string();
+            let outcome = run_blocking_io(move || match try_acquire_slot_lock(&dir, &key) {
+                Ok(lock) => Ok(pending(lock)),
+                Err(e) => Err((pending, e)),
+            })
+            .await?;
+            match outcome {
+                Ok(value) => {
+                    debug!(
+                        "Ran locked blocking section: cache_key={}, attempt={}",
+                        cache_key,
+                        attempt + 1
                     );
-                    Ok(true)
+                    return Ok(value);
                 }
-                Err(e) => {
-                    info!(
-                        "Failed to break stale same-host lock (likely already removed): path={:?}, error={}",
-                        lock_file_path, e
+                Err((back, e)) => {
+                    if attempt == self.max_retries {
+                        SLOT_RETRY_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                        match exhaustion_log {
+                            LockExhaustionLog::Error => error!(
+                                "Failed to acquire metadata lock after {} attempts: cache_key={}, error={}",
+                                self.max_retries + 1, cache_key, e
+                            ),
+                            LockExhaustionLog::Debug => debug!(
+                                "Failed to acquire metadata lock after {} attempts: cache_key={}, error={}",
+                                self.max_retries + 1, cache_key, e
+                            ),
+                        }
+                        return Err(e);
+                    }
+                    let backoff = self.calculate_backoff(attempt);
+                    debug!(
+                        "Lock acquisition failed, retrying: cache_key={}, attempt={}, backoff={:.2}ms, error={}",
+                        cache_key, attempt + 1, backoff.as_secs_f64() * 1000.0, e
                     );
-                    Err(ProxyError::CacheError(format!(
-                        "Failed to remove stale lock file: {}",
-                        e
-                    )))
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    pending = back;
                 }
             }
-        } else {
-            // Different-host stale lock (Req 3.1): do NOT delete/recreate.
-            // Instead, overwrite content in-place with a new fence epoch.
-            let prev_epoch = lock_info.as_ref().map(|i| i.fence_epoch).unwrap_or(0);
-            let new_epoch = prev_epoch + 1;
-            let new_content = LockFileContent::new(new_epoch);
-
-            // Overwrite the lockfile content (atomic write via truncate+write+fsync)
-            use std::io::Write;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(lock_file_path)
-                .map_err(|e| {
-                    ProxyError::CacheError(format!(
-                        "Failed to open cross-host lock for overwrite: path={:?}, error={}",
-                        lock_file_path, e
-                    ))
-                })?;
-
-            let json = new_content.to_json()?;
-            file.write_all(json.as_bytes()).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to write new epoch to cross-host lock: path={:?}, error={}",
-                    lock_file_path, e
-                ))
-            })?;
-            file.sync_all().map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to fsync cross-host lock: path={:?}, error={}",
-                    lock_file_path, e
-                ))
-            })?;
-            drop(file);
-
-            // Re-read to verify the epoch matches (fence verification)
-            let verify_content = std::fs::read_to_string(lock_file_path).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to re-read cross-host lock for verification: path={:?}, error={}",
-                    lock_file_path, e
-                ))
-            })?;
-            let verified = LockFileContent::from_json(&verify_content)?;
-            if verified.fence_epoch != new_epoch {
-                warn!(
-                    "Fence epoch mismatch after cross-host lock takeover: path={:?}, expected={}, got={}",
-                    lock_file_path, new_epoch, verified.fence_epoch
-                );
-                return Ok(false);
-            }
-
-            info!(
-                "Broke stale cross-host lock (overwritten with new epoch): path={:?}, prev_host={}, new_epoch={}",
-                lock_file_path,
-                lock_info.as_ref().map(|i| i.hostname.as_str()).unwrap_or("unknown"),
-                new_epoch
-            );
-            Ok(true)
         }
     }
-    /// Get lock file path for a cache key
+
+    /// [`Self::run_locked_blocking`] with a single attempt and no retry: the slot lock's `open`
+    /// and `try_lock`, `critical` and the release all run on ONE blocking-pool thread behind a
+    /// [`run_blocking_io`] permit. A held slot returns `Err(ProxyError::LockContention)` without
+    /// running `critical`.
     ///
-    /// Returns `ProxyError::CacheError` if `cache_key` is malformed (missing
-    /// `bucket/object` separator or containing a rejected bucket segment).
-    fn get_lock_file_path(&self, cache_key: &str) -> Result<PathBuf> {
-        // Use the same path structure as metadata files
-        let metadata_path = self.get_metadata_file_path(cache_key)?;
-        Ok(metadata_path.with_extension("meta.lock"))
+    /// For request-path side effects that are cheaper to skip than to wait for (the HEAD
+    /// metadata store), where `try_acquire_lock` would otherwise do the `open` and `flock` on a
+    /// runtime worker. Once the permit is held the blocking task exists, so a caller that stops
+    /// waiting does not stop `critical`.
+    pub(crate) async fn try_run_locked_blocking<T, F>(
+        &self,
+        cache_key: &str,
+        critical: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(MetadataLock) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let dir = self.cache_dir.clone();
+        let key = cache_key.to_string();
+        run_blocking_io(move || try_acquire_slot_lock(&dir, &key).map(critical)).await?
+    }
+
+    /// Path of the slot lock file for a cache key.
+    ///
+    /// Test-only: production callers go through `slot_lock_path` or the acquisition functions
+    /// directly. Kept because the one-namespace test asserts the manager and the free function
+    /// resolve to the same path.
+    #[cfg(test)]
+    fn get_lock_file_path(&self, cache_key: &str) -> PathBuf {
+        slot_lock_path(&self.cache_dir, cache_key)
     }
 
     /// Get metadata file path for a cache key
     ///
+    /// Test-only: the slot protocol never needs the `.meta` path, but the malformed-key
+    /// rejection it inherits from `get_sharded_path` is worth keeping asserted.
+    ///
     /// Returns `ProxyError::CacheError` if `cache_key` is malformed (missing
     /// `bucket/object` separator or containing a rejected bucket segment).
-    /// Callers in request-handling paths should propagate via `?`; callers in
-    /// background loops should log at WARN level and skip the entry.
+    #[cfg(test)]
     fn get_metadata_file_path(&self, cache_key: &str) -> Result<PathBuf> {
         let base_dir = self.cache_dir.join("metadata");
         crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta")
@@ -1056,112 +1047,56 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Check if a process is alive (cross-platform)
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // On Unix systems, use kill(pid, 0) to check if process exists
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-
-    #[cfg(windows)]
-    {
-        // On Windows, try to open the process handle
-        use std::ptr;
-        use winapi::um::handleapi::CloseHandle;
-        use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
-
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
-            if handle != ptr::null_mut() {
-                CloseHandle(handle);
-                true
-            } else {
-                false
-            }
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        // Fallback: assume process is alive (conservative approach)
-        warn!(
-            "Process existence check not implemented for this platform, assuming process is alive"
-        );
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_lock_file_content_creation() {
-        let content = LockFileContent::new(0);
-
-        assert_eq!(content.pid, std::process::id());
-        assert!(!content.instance_id.is_empty());
-        assert!(!content.hostname.is_empty());
-        assert_eq!(content.fence_epoch, 0);
-        assert!(content.acquired_at_ms > 0);
+    fn slot_dir_create_calls(dir: &Path) -> u64 {
+        SLOT_DIR_CREATE_CALLS_FOR_TESTS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(dir).copied())
+            .unwrap_or(0)
     }
 
+    /// `SLOT-LOCK-CREATE-DIR-ALL-HOIST`: the slot directory is created once, not on every
+    /// acquisition. Counted per directory, so parallel tests in other temp dirs cannot move it.
     #[test]
-    fn test_lock_file_content_serialization() {
-        let content = LockFileContent::new(42);
-
-        let json = content.to_json().unwrap();
-        let deserialized = LockFileContent::from_json(&json).unwrap();
-
-        assert_eq!(deserialized.pid, content.pid);
-        assert_eq!(deserialized.instance_id, content.instance_id);
-        assert_eq!(deserialized.hostname, content.hostname);
-        assert_eq!(deserialized.acquired_at_ms, content.acquired_at_ms);
-        assert_eq!(deserialized.fence_epoch, content.fence_epoch);
-    }
-
-    #[test]
-    fn test_lock_file_content_stale_detection_same_host() {
+    fn slot_directory_is_created_once_not_per_acquisition() {
         let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let lock_path = temp_dir.path().join("test.lock");
-
-        // Write a lock owned by current host with current PID — should NOT be stale
-        let content = LockFileContent::new(0);
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(!manager.is_lock_stale(&lock_path).unwrap());
-
-        // Write a lock owned by current host with non-existent PID — should be stale
-        let mut content = LockFileContent::new(0);
-        content.pid = 999999; // Unlikely to exist
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(manager.is_lock_stale(&lock_path).unwrap());
+        let slot_dir = temp_dir.path().join("metadata").join(META_LOCK_DIR);
+        let acquisitions = 50;
+        for i in 0..acquisitions {
+            let lock = try_acquire_slot_lock(temp_dir.path(), &format!("scn1-bucket/key-{i}"))
+                .expect("uncontended acquisition");
+            drop(lock);
+        }
+        assert_eq!(
+            slot_dir_create_calls(&slot_dir),
+            1,
+            "create_dir_all ran {} times for {} acquisitions of one slot directory",
+            slot_dir_create_calls(&slot_dir),
+            acquisitions
+        );
     }
 
+    /// The hoist must not make a deleted slot directory fatal: an acquisition after the
+    /// directory is removed recreates it and succeeds.
     #[test]
-    fn test_lock_file_content_stale_detection_cross_host() {
+    fn a_deleted_slot_directory_is_recreated_on_the_next_acquisition() {
         let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let lock_path = temp_dir.path().join("test.lock");
-
-        // Write a lock owned by a different host, recently acquired — should NOT be stale
-        let mut content = LockFileContent::with_hostname("other-host".to_string(), 12345, 0);
-        content.acquired_at_ms = now_ms(); // just acquired
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(!manager.is_lock_stale(&lock_path).unwrap());
-
-        // Write a lock owned by a different host, acquired long ago — should be stale
-        let mut content = LockFileContent::with_hostname("other-host".to_string(), 12345, 0);
-        content.acquired_at_ms = now_ms().saturating_sub(60_000); // 60s ago, timeout is 30s
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(manager.is_lock_stale(&lock_path).unwrap());
+        let slot_dir = temp_dir.path().join("metadata").join(META_LOCK_DIR);
+        drop(try_acquire_slot_lock(temp_dir.path(), "scn1-bucket/a").unwrap());
+        std::fs::remove_dir_all(&slot_dir).unwrap();
+        let lock = try_acquire_slot_lock(temp_dir.path(), "scn1-bucket/a")
+            .expect("acquisition after the slot directory was deleted");
+        assert!(lock.lock_file_path().exists());
+        drop(lock);
+        let blocking = acquire_slot_lock_blocking(temp_dir.path(), "scn1-bucket/b")
+            .expect("blocking acquisition after recreation");
+        drop(blocking);
     }
 
     #[test]
@@ -1171,7 +1106,6 @@ mod tests {
             MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
 
         assert_eq!(manager.cache_dir, temp_dir.path());
-        assert_eq!(manager.lock_timeout, Duration::from_secs(30));
         assert_eq!(manager.max_retries, 3);
     }
 
@@ -1187,387 +1121,14 @@ mod tests {
         assert_eq!(lock.cache_key(), cache_key);
         assert!(lock.lock_file_path().exists());
 
-        // Lock file should contain valid JSON with new format
+        // The slot file carries NO payload. Asserted, because a payload is exactly what the
+        // retired protocol mistook for a liveness record — and an empty file is what its
+        // stale-detection branch then judged stale.
         let content = std::fs::read_to_string(lock.lock_file_path()).unwrap();
-        let lock_content = LockFileContent::from_json(&content).unwrap();
-        assert_eq!(lock_content.pid, std::process::id());
-        assert!(!lock_content.hostname.is_empty());
-        assert!(!lock_content.instance_id.is_empty());
-        assert!(lock_content.acquired_at_ms > 0);
-    }
-
-    #[tokio::test]
-    async fn test_lock_cleanup_on_drop() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let cache_key = "test-bucket/test-object";
-        let lock_file_path = {
-            let lock = manager.acquire_lock(cache_key).await.unwrap();
-            let path = lock.lock_file_path().to_path_buf();
-            assert!(path.exists());
-            path
-        }; // Lock is dropped here
-
-        // Lock file should be cleaned up
-        assert!(!lock_file_path.exists());
-    }
-
-    // Tests for LockConfig and acquire_lock_with_retry
-
-    #[test]
-    fn test_lock_config_default() {
-        let config = LockConfig::default();
-        assert_eq!(config.max_retries, 5);
-        assert_eq!(config.initial_backoff, Duration::from_millis(50));
-        assert_eq!(config.max_backoff, Duration::from_secs(2));
-        assert!((config.jitter_factor - 0.25).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_lock_config_custom() {
-        let config = LockConfig::new(10, Duration::from_millis(100), Duration::from_secs(5), 0.5);
-        assert_eq!(config.max_retries, 10);
-        assert_eq!(config.initial_backoff, Duration::from_millis(100));
-        assert_eq!(config.max_backoff, Duration::from_secs(5));
-        assert!((config.jitter_factor - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_lock_config_jitter_clamping() {
-        // Jitter factor should be clamped to [0.0, 1.0]
-        let config = LockConfig::new(
-            5,
-            Duration::from_millis(50),
-            Duration::from_secs(2),
-            1.5, // Should be clamped to 1.0
+        assert!(
+            content.is_empty(),
+            "the slot file must stay empty. content={content:?}"
         );
-        assert!((config.jitter_factor - 1.0).abs() < f64::EPSILON);
-
-        let config2 = LockConfig::new(
-            5,
-            Duration::from_millis(50),
-            Duration::from_secs(2),
-            -0.5, // Should be clamped to 0.0
-        );
-        assert!(config2.jitter_factor.abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_lock_config_calculate_backoff_exponential_growth() {
-        let config = LockConfig::new(
-            5,
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            0.0, // No jitter for predictable testing
-        );
-
-        // Attempt 0: 100ms * 2^0 = 100ms
-        let backoff0 = config.calculate_backoff(0);
-        assert_eq!(backoff0.as_millis(), 100);
-
-        // Attempt 1: 100ms * 2^1 = 200ms
-        let backoff1 = config.calculate_backoff(1);
-        assert_eq!(backoff1.as_millis(), 200);
-
-        // Attempt 2: 100ms * 2^2 = 400ms
-        let backoff2 = config.calculate_backoff(2);
-        assert_eq!(backoff2.as_millis(), 400);
-
-        // Attempt 3: 100ms * 2^3 = 800ms
-        let backoff3 = config.calculate_backoff(3);
-        assert_eq!(backoff3.as_millis(), 800);
-    }
-
-    #[test]
-    fn test_lock_config_calculate_backoff_cap() {
-        let config = LockConfig::new(
-            5,
-            Duration::from_millis(100),
-            Duration::from_millis(500), // Cap at 500ms
-            0.0,                        // No jitter
-        );
-
-        // Attempt 0: 100ms (under cap)
-        assert_eq!(config.calculate_backoff(0).as_millis(), 100);
-
-        // Attempt 1: 200ms (under cap)
-        assert_eq!(config.calculate_backoff(1).as_millis(), 200);
-
-        // Attempt 2: 400ms (under cap)
-        assert_eq!(config.calculate_backoff(2).as_millis(), 400);
-
-        // Attempt 3: 800ms -> capped to 500ms
-        assert_eq!(config.calculate_backoff(3).as_millis(), 500);
-
-        // Attempt 10: still capped at 500ms
-        assert_eq!(config.calculate_backoff(10).as_millis(), 500);
-    }
-
-    #[test]
-    fn test_lock_config_calculate_backoff_with_jitter() {
-        let config = LockConfig::new(
-            5,
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            0.25, // ±25% jitter
-        );
-
-        // Run multiple times to verify jitter is within bounds
-        for _ in 0..100 {
-            let backoff = config.calculate_backoff(0);
-            // Base is 100ms, jitter is ±25ms, so range is 75-125ms
-            assert!(
-                backoff.as_millis() >= 75,
-                "Backoff {} too low",
-                backoff.as_millis()
-            );
-            assert!(
-                backoff.as_millis() <= 125,
-                "Backoff {} too high",
-                backoff.as_millis()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_acquire_lock_with_retry_success() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("test.lock");
-        let config = LockConfig::default();
-
-        let lock_file = acquire_lock_with_retry(&lock_path, &config).await.unwrap();
-        assert!(lock_path.exists());
-
-        // Lock should be held
-        drop(lock_file);
-    }
-
-    #[tokio::test]
-    async fn test_acquire_lock_with_retry_creates_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir
-            .path()
-            .join("subdir")
-            .join("nested")
-            .join("test.lock");
-        let config = LockConfig::default();
-
-        // Directory doesn't exist yet
-        assert!(!lock_path.parent().unwrap().exists());
-
-        let lock_file = acquire_lock_with_retry(&lock_path, &config).await.unwrap();
-
-        // Directory should be created
-        assert!(lock_path.parent().unwrap().exists());
-        assert!(lock_path.exists());
-
-        drop(lock_file);
-    }
-
-    #[tokio::test]
-    async fn test_try_acquire_exclusive_lock_success() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("test.lock");
-
-        let lock_file = try_acquire_exclusive_lock(&lock_path).unwrap();
-        assert!(lock_path.exists());
-
-        drop(lock_file);
-    }
-
-    #[tokio::test]
-    async fn test_try_acquire_exclusive_lock_contention() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("test.lock");
-
-        // Acquire first lock
-        let _lock1 = try_acquire_exclusive_lock(&lock_path).unwrap();
-
-        // Second attempt should fail with LockContention
-        let result = try_acquire_exclusive_lock(&lock_path);
-        assert!(result.is_err());
-
-        match result {
-            Err(ProxyError::LockContention(_)) => {} // Expected
-            Err(e) => panic!("Expected LockContention error, got: {:?}", e),
-            Ok(_) => panic!("Expected error, got success"),
-        }
-    }
-
-    // Property-based tests using quickcheck
-    use quickcheck::TestResult;
-    use quickcheck_macros::quickcheck;
-
-    /// **Feature: journal-based-metadata-updates, Property 3: Exponential Backoff with Jitter**
-    /// *For any* lock acquisition attempt that fails, the retry delay shall be:
-    /// - At least `initial_backoff * 2^(attempt-1)` (exponential growth)
-    /// - At most `max_backoff` (capped)
-    /// - Include jitter within ±`jitter_factor` of the base delay
-    /// - Stop after `max_retries` attempts
-    /// **Validates: Requirements 3.2, 3.5, 3.7**
-    #[quickcheck]
-    fn prop_exponential_backoff_with_jitter(
-        initial_backoff_ms: u16,
-        max_backoff_ms: u16,
-        jitter_factor_percent: u8,
-        attempt: u8,
-    ) -> TestResult {
-        // Filter invalid inputs
-        if initial_backoff_ms == 0 || max_backoff_ms == 0 {
-            return TestResult::discard();
-        }
-        if initial_backoff_ms > max_backoff_ms {
-            return TestResult::discard();
-        }
-        if attempt > 15 {
-            // Limit attempts to prevent overflow
-            return TestResult::discard();
-        }
-
-        let initial_backoff = Duration::from_millis(initial_backoff_ms as u64);
-        let max_backoff = Duration::from_millis(max_backoff_ms as u64);
-        let jitter_factor = (jitter_factor_percent % 100) as f64 / 100.0; // 0.0 to 0.99
-
-        let config = LockConfig::new(5, initial_backoff, max_backoff, jitter_factor);
-
-        let backoff = config.calculate_backoff(attempt as u32);
-
-        // Calculate expected base backoff (without jitter)
-        let exponential_factor = 1u64 << (attempt as u32).min(10);
-        let expected_base_ms = (initial_backoff_ms as u64)
-            .saturating_mul(exponential_factor)
-            .min(max_backoff_ms as u64);
-
-        // Calculate jitter bounds
-        let jitter_range = (expected_base_ms as f64 * jitter_factor) as u64;
-        let min_expected = expected_base_ms.saturating_sub(jitter_range).max(1);
-        let max_expected = expected_base_ms.saturating_add(jitter_range);
-
-        let actual_ms = backoff.as_millis() as u64;
-
-        // Property 1: Backoff should be within jitter bounds of expected base
-        if actual_ms < min_expected || actual_ms > max_expected {
-            return TestResult::error(format!(
-                "Backoff {} not in expected range [{}, {}] for attempt {} (base={}, jitter_factor={})",
-                actual_ms, min_expected, max_expected, attempt, expected_base_ms, jitter_factor
-            ));
-        }
-
-        // Property 2: Backoff should never exceed max_backoff + jitter
-        let absolute_max = max_backoff_ms as u64 + (max_backoff_ms as f64 * jitter_factor) as u64;
-        if actual_ms > absolute_max {
-            return TestResult::error(format!(
-                "Backoff {} exceeds absolute max {} for attempt {}",
-                actual_ms, absolute_max, attempt
-            ));
-        }
-
-        // Property 3: Backoff should be at least 1ms
-        if actual_ms < 1 {
-            return TestResult::error(format!(
-                "Backoff {} is less than 1ms for attempt {}",
-                actual_ms, attempt
-            ));
-        }
-
-        TestResult::passed()
-    }
-
-    /// Property test: Exponential growth without jitter
-    /// Verifies that backoff grows exponentially when jitter is disabled.
-    #[quickcheck]
-    fn prop_exponential_growth_no_jitter(
-        initial_backoff_ms: u16,
-        max_backoff_ms: u16,
-    ) -> TestResult {
-        // Filter invalid inputs
-        if initial_backoff_ms == 0 || max_backoff_ms == 0 {
-            return TestResult::discard();
-        }
-        if initial_backoff_ms > max_backoff_ms {
-            return TestResult::discard();
-        }
-
-        let initial_backoff = Duration::from_millis(initial_backoff_ms as u64);
-        let max_backoff = Duration::from_millis(max_backoff_ms as u64);
-
-        let config = LockConfig::new(
-            5,
-            initial_backoff,
-            max_backoff,
-            0.0, // No jitter
-        );
-
-        // Verify exponential growth for first few attempts
-        let mut prev_backoff = 0u64;
-        for attempt in 0..5 {
-            let backoff = config.calculate_backoff(attempt);
-            let backoff_ms = backoff.as_millis() as u64;
-
-            // Each backoff should be >= previous (exponential growth)
-            if backoff_ms < prev_backoff {
-                return TestResult::error(format!(
-                    "Backoff decreased: attempt {} has {}ms, previous was {}ms",
-                    attempt, backoff_ms, prev_backoff
-                ));
-            }
-
-            // Backoff should be exactly initial * 2^attempt (capped at max)
-            let expected =
-                (initial_backoff_ms as u64 * (1u64 << attempt)).min(max_backoff_ms as u64);
-            if backoff_ms != expected {
-                return TestResult::error(format!(
-                    "Backoff mismatch: attempt {} has {}ms, expected {}ms",
-                    attempt, backoff_ms, expected
-                ));
-            }
-
-            prev_backoff = backoff_ms;
-        }
-
-        TestResult::passed()
-    }
-
-    /// Property test: Max backoff cap is respected
-    #[quickcheck]
-    fn prop_max_backoff_cap_respected(
-        initial_backoff_ms: u16,
-        max_backoff_ms: u16,
-        jitter_factor_percent: u8,
-    ) -> TestResult {
-        // Filter invalid inputs
-        if initial_backoff_ms == 0 || max_backoff_ms == 0 {
-            return TestResult::discard();
-        }
-        if initial_backoff_ms > max_backoff_ms {
-            return TestResult::discard();
-        }
-
-        let initial_backoff = Duration::from_millis(initial_backoff_ms as u64);
-        let max_backoff = Duration::from_millis(max_backoff_ms as u64);
-        let jitter_factor = (jitter_factor_percent % 100) as f64 / 100.0;
-
-        let config = LockConfig::new(5, initial_backoff, max_backoff, jitter_factor);
-
-        // Test with high attempt numbers that would exceed max without cap
-        for attempt in 10..15 {
-            let backoff = config.calculate_backoff(attempt);
-            let backoff_ms = backoff.as_millis() as u64;
-
-            // Backoff should never exceed max + jitter
-            let absolute_max =
-                max_backoff_ms as u64 + (max_backoff_ms as f64 * jitter_factor) as u64;
-            if backoff_ms > absolute_max {
-                return TestResult::error(format!(
-                    "Backoff {} exceeds max {} + jitter for attempt {}",
-                    backoff_ms, max_backoff_ms, attempt
-                ));
-            }
-        }
-
-        TestResult::passed()
     }
 
     #[tokio::test]
@@ -1585,469 +1146,303 @@ mod tests {
     }
 
     // =========================================================================
-    // Cross-host metadata lock behavior tests (Task 4.5)
-    // Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5
+    // Slot protocol: exclusion, permanence, and the nesting rule
     // =========================================================================
 
-    /// Requirement 3.2: Same-host staleness uses PID check — dead PID = stale
+    /// Find a second cache key that hashes to the same slot as `first`.
+    ///
+    /// Used by the collision and nesting tests. With 4096 slots a match turns up within a
+    /// few thousand candidates, so the search is bounded and fast.
+    fn colliding_key(first: &str) -> String {
+        let target = slot_for_cache_key(first);
+        for i in 0..1_000_000u64 {
+            let candidate = format!("test-bucket/collide-{i}");
+            if candidate != first && slot_for_cache_key(&candidate) == target {
+                return candidate;
+            }
+        }
+        panic!("no colliding key found for {first} — is the slot function degenerate?");
+    }
+
     #[test]
-    fn test_same_host_staleness_uses_pid_check() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let lock_path = temp_dir.path().join("same_host.lock");
-
-        // Current PID is alive — lock should NOT be stale
-        let content = LockFileContent::new(0);
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(
-            !manager.is_lock_stale(&lock_path).unwrap(),
-            "Lock with current PID should not be stale"
-        );
-
-        // Non-existent PID on same host — lock SHOULD be stale
-        let hostname = hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let dead_pid = 4_000_000; // PID unlikely to exist
-        let content = LockFileContent::with_hostname(hostname, dead_pid, 5);
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(
-            manager.is_lock_stale(&lock_path).unwrap(),
-            "Lock with dead PID on same host should be stale"
-        );
-    }
-
-    /// Requirement 3.3: Different-host staleness uses wall-clock timeout only
-    #[test]
-    fn test_cross_host_staleness_uses_wall_clock_timeout_only() {
-        let temp_dir = TempDir::new().unwrap();
-        // Use a short timeout (1 second) for testing
-        let manager = MetadataLockManager::with_metadata_lock_timeout(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(30),
-            3,
-            1_000, // 1 second timeout
-        );
-
-        let lock_path = temp_dir.path().join("cross_host.lock");
-
-        // Lock from another host, acquired just now — should NOT be stale
-        // (even though the PID doesn't exist locally, we don't check PID for remote hosts)
-        let mut content = LockFileContent::with_hostname("remote-host-alpha".to_string(), 99999, 0);
-        content.acquired_at_ms = now_ms();
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(
-            !manager.is_lock_stale(&lock_path).unwrap(),
-            "Recent cross-host lock should not be stale regardless of PID"
-        );
-
-        // Lock from another host, acquired 5 seconds ago (exceeds 1s timeout) — SHOULD be stale
-        let mut content = LockFileContent::with_hostname("remote-host-beta".to_string(), 12345, 0);
-        content.acquired_at_ms = now_ms().saturating_sub(5_000);
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(
-            manager.is_lock_stale(&lock_path).unwrap(),
-            "Cross-host lock exceeding timeout should be stale"
-        );
-    }
-
-    /// Requirement 3.3: Cross-host staleness does NOT consult local PID
-    /// Even if the PID happens to be alive locally, a cross-host lock's staleness
-    /// is determined solely by wall-clock age.
-    #[test]
-    fn test_cross_host_ignores_local_pid_existence() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = MetadataLockManager::with_metadata_lock_timeout(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(30),
-            3,
-            1_000, // 1 second timeout
-        );
-
-        let lock_path = temp_dir.path().join("cross_host_pid.lock");
-
-        // Use current process PID but from a different hostname.
-        // Even though this PID is alive locally, the lock is from another host
-        // so staleness should be determined by wall-clock only.
-        let current_pid = std::process::id();
-        let mut content =
-            LockFileContent::with_hostname("different-host".to_string(), current_pid, 0);
-        content.acquired_at_ms = now_ms().saturating_sub(5_000); // 5s ago, exceeds 1s timeout
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(
-            manager.is_lock_stale(&lock_path).unwrap(),
-            "Cross-host lock should be stale based on timeout even if PID is alive locally"
-        );
-
-        // Same scenario but within timeout — should NOT be stale
-        let mut content =
-            LockFileContent::with_hostname("different-host".to_string(), current_pid, 0);
-        content.acquired_at_ms = now_ms(); // just now
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-        assert!(
-            !manager.is_lock_stale(&lock_path).unwrap(),
-            "Cross-host lock within timeout should not be stale even if PID is alive locally"
-        );
-    }
-
-    /// Requirement 3.1: Never delete/recreate lockfile owned by another host.
-    /// break_stale_lock overwrites in-place for cross-host locks.
-    #[tokio::test]
-    async fn test_break_stale_lock_overwrites_cross_host_instead_of_delete() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = MetadataLockManager::with_metadata_lock_timeout(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(30),
-            3,
-            1_000,
-        );
-
-        let lock_path = temp_dir.path().join("cross_host_break.lock");
-
-        // Create a lock from a different host with epoch 5
-        let mut content = LockFileContent::with_hostname("remote-host-gamma".to_string(), 54321, 5);
-        content.acquired_at_ms = now_ms().saturating_sub(60_000); // stale
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-
-        // Break the stale lock — should overwrite, NOT delete
-        let result = manager.break_stale_lock(&lock_path).await.unwrap();
-        assert!(result, "break_stale_lock should succeed");
-
-        // File should still exist (overwritten, not deleted)
-        assert!(
-            lock_path.exists(),
-            "Cross-host lock file should still exist after break (overwritten, not deleted)"
-        );
-
-        // Content should have incremented epoch
-        let new_content = std::fs::read_to_string(&lock_path).unwrap();
-        let new_info = LockFileContent::from_json(&new_content).unwrap();
-        assert_eq!(
-            new_info.fence_epoch, 6,
-            "Epoch should be incremented from 5 to 6 on cross-host takeover"
-        );
-    }
-
-    /// Requirement 3.1: Same-host stale lock (dead PID) IS deleted
-    #[tokio::test]
-    async fn test_break_stale_lock_deletes_same_host() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let lock_path = temp_dir.path().join("same_host_break.lock");
-
-        // Create a lock from the current host with a dead PID
-        let hostname = hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let content = LockFileContent::with_hostname(hostname, 4_000_000, 3);
-        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-
-        // Break the stale lock — should delete for same-host
-        let result = manager.break_stale_lock(&lock_path).await.unwrap();
-        assert!(result, "break_stale_lock should succeed for same-host");
-
-        // File should be deleted
-        assert!(
-            !lock_path.exists(),
-            "Same-host stale lock file should be deleted"
-        );
-    }
-
-    /// Requirement 3.4: Fence-epoch verification — acquisition rejected on epoch mismatch.
-    /// Tests that the fence-epoch mechanism detects when another host has modified the
-    /// lockfile. The heartbeat refresh path checks epoch before updating, and rejects
-    /// if the epoch has changed (indicating another host took over).
-    #[tokio::test]
-    async fn test_fence_epoch_verification_rejects_mismatch() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let cache_key = "test-bucket/epoch-mismatch-object";
-        let lock = manager.acquire_lock(cache_key).await.unwrap();
-
-        // Read the lock's epoch
-        let original_epoch = lock.fence_epoch();
-
-        // Simulate another host taking over by writing a different epoch to the lockfile
-        let hijacker =
-            LockFileContent::with_hostname("hijacker-host".to_string(), 7777, original_epoch + 5);
-        std::fs::write(lock.lock_file_path(), hijacker.to_json().unwrap()).unwrap();
-
-        // Now any operation that verifies the epoch should fail
-        let result = lock.refresh_heartbeat();
-        assert!(
-            result.is_err(),
-            "Operations should be rejected when fence epoch has been changed by another host"
-        );
-
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("Fence epoch mismatch"),
-            "Error should mention fence epoch mismatch, got: {}",
-            err_msg
-        );
-    }
-
-    /// Requirement 3.4: Fence-epoch verification succeeds when epoch matches
-    #[test]
-    fn test_fence_epoch_verification_succeeds_on_match() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let lock_path = temp_dir.path().join("epoch_ok.lock");
-
-        let content = LockFileContent::with_hostname("host-a".to_string(), 1000, 42);
-
-        // write_and_verify should succeed when no race occurs
-        let result = manager.write_and_verify_lock_content(&lock_path, &content, "test/key");
-        assert!(
-            result.is_ok(),
-            "write_and_verify should succeed when epoch matches: {:?}",
-            result.err()
-        );
-
-        // Verify the file contains the expected epoch
-        let stored = std::fs::read_to_string(&lock_path).unwrap();
-        let stored_info = LockFileContent::from_json(&stored).unwrap();
-        assert_eq!(stored_info.fence_epoch, 42);
-    }
-
-    /// Requirement 3.5: LockFileContent serialization/deserialization round-trip
-    #[test]
-    fn test_lock_file_content_round_trip() {
-        let content = LockFileContent::with_hostname("test-host-xyz".to_string(), 12345, 99);
-
-        let json = content.to_json().unwrap();
-        let deserialized = LockFileContent::from_json(&json).unwrap();
-
-        assert_eq!(deserialized.instance_id, "test-host-xyz:12345");
-        assert_eq!(deserialized.hostname, "test-host-xyz");
-        assert_eq!(deserialized.pid, 12345);
-        assert_eq!(deserialized.fence_epoch, 99);
-        assert_eq!(deserialized.acquired_at_ms, content.acquired_at_ms);
-    }
-
-    /// Requirement 3.5: LockFileContent round-trip with various hostnames
-    #[test]
-    fn test_lock_file_content_round_trip_various_hostnames() {
-        let test_cases = vec![
-            ("simple-host", 1, 0),
-            ("host.with.dots.example.com", 65535, u64::MAX),
-            ("UPPERCASE-HOST", 1, 1),
-            ("host-with-dashes-123", 99999, 42),
-        ];
-
-        for (hostname, pid, epoch) in test_cases {
-            let content = LockFileContent::with_hostname(hostname.to_string(), pid, epoch);
-            let json = content.to_json().unwrap();
-            let deserialized = LockFileContent::from_json(&json).unwrap();
-
-            assert_eq!(deserialized.hostname, hostname);
-            assert_eq!(deserialized.pid, pid);
-            assert_eq!(deserialized.fence_epoch, epoch);
+    fn slot_function_is_in_range_and_stable() {
+        for i in 0..2_000u64 {
+            let key = format!("bucket/object-{i}");
+            let slot = slot_for_cache_key(&key);
+            assert!(slot < META_LOCK_SLOTS, "slot {slot} out of range");
             assert_eq!(
-                deserialized.hostname_component(),
-                hostname,
-                "hostname_component() should return the hostname"
+                slot,
+                slot_for_cache_key(&key),
+                "the slot function must be deterministic"
             );
         }
     }
 
-    /// Requirement 3.5: Heartbeat refresh updates acquired_at_ms without changing epoch
-    #[tokio::test]
-    async fn test_heartbeat_refresh_updates_timestamp_preserves_epoch() {
+    /// R1, the defect this protocol replaced.
+    ///
+    /// # The branch this targets
+    ///
+    /// The retired protocol's contended path was: `try_lock` returns `WouldBlock`, then
+    /// `is_lock_stale` reads an EMPTY payload and returns `Ok(true)`, then `break_stale_lock`
+    /// unlinks the live holder's file and a fresh `create(true).truncate(true)` open takes an
+    /// independent lock on a new inode. Two holders, neither able to tell.
+    ///
+    /// The empty payload was not an edge case: `disk_cache::batch_delete_ranges` flocked the
+    /// same path and never wrote one, so it was the steady state of every eviction rewrite.
+    ///
+    /// This asserts the OPPOSITE outcome — the contender is REFUSED — and asserts the
+    /// precondition (an empty lock file) rather than assuming it, because a fixture whose
+    /// holder writes a payload cannot reach the arm that carried the defect.
+    #[test]
+    fn a_contended_slot_with_an_empty_lock_file_refuses_the_contender() {
         let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+        let cache_key = "test-bucket/contended-object";
 
-        let cache_key = "test-bucket/heartbeat-test-object";
-        let lock = manager.acquire_lock(cache_key).await.unwrap();
+        let holder = try_acquire_slot_lock(temp_dir.path(), cache_key)
+            .expect("fixture: the first acquisition must succeed");
 
-        // Read initial state
-        let initial_content = std::fs::read_to_string(lock.lock_file_path()).unwrap();
-        let initial_info = LockFileContent::from_json(&initial_content).unwrap();
-        let initial_epoch = initial_info.fence_epoch;
-        let initial_timestamp = initial_info.acquired_at_ms;
+        // The precondition, ASSERTED: an empty payload is what the retired stale-detection
+        // branch judged stale, and it is the state a payload-writing fixture cannot reach.
+        let content = std::fs::read_to_string(holder.lock_file_path()).unwrap();
+        assert!(
+            content.is_empty(),
+            "fixture: the lock file must be EMPTY. content={content:?}"
+        );
 
-        // Small sleep to ensure timestamp advances
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let contender = try_acquire_slot_lock(temp_dir.path(), cache_key);
+        assert!(
+            matches!(contender, Err(ProxyError::LockContention(_))),
+            "a live holder must exclude the contender. Under the retired protocol the \
+             contender read the empty payload, judged it stale, unlinked the live holder's \
+             file and acquired a second independent lock. got={contender:?}"
+        );
 
-        // Refresh heartbeat
-        lock.refresh_heartbeat().unwrap();
+        assert!(
+            holder.lock_file_path().exists(),
+            "the refused contender must not have unlinked the holder's slot file"
+        );
+    }
 
-        // Read updated state
-        let updated_content = std::fs::read_to_string(lock.lock_file_path()).unwrap();
-        let updated_info = LockFileContent::from_json(&updated_content).unwrap();
+    /// R3's runtime half: the slot file OUTLIVES its holder.
+    ///
+    /// `Drop` closes the descriptor and nothing else. The retired `Drop` unlinked in its body,
+    /// and because Rust drops fields after the body, the unlink preceded the flock release.
+    #[test]
+    fn dropping_a_lock_releases_it_without_unlinking_the_slot() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/dropped-object";
 
-        // Epoch should be unchanged
+        let path = {
+            let lock = try_acquire_slot_lock(temp_dir.path(), cache_key).unwrap();
+            lock.lock_file_path().to_path_buf()
+        };
+
+        assert!(
+            path.exists(),
+            "the slot file must persist after its holder is dropped: the slot set is fixed \
+             and shared, so unlinking it would remove a file other holders lock"
+        );
+
+        let again = try_acquire_slot_lock(temp_dir.path(), cache_key);
+        assert!(
+            again.is_ok(),
+            "closing the descriptor must release the lock, got={again:?}"
+        );
+    }
+
+    /// A slot collision serialises two DISTINCT keys. That is the cost of the design, and it
+    /// is latency rather than corruption — asserted here so the trade-off is executable.
+    #[test]
+    fn two_keys_sharing_a_slot_exclude_each_other() {
+        let temp_dir = TempDir::new().unwrap();
+        let first = "test-bucket/collision-anchor";
+        let second = colliding_key(first);
         assert_eq!(
-            updated_info.fence_epoch, initial_epoch,
-            "Heartbeat refresh must not change fence_epoch"
+            slot_for_cache_key(first),
+            slot_for_cache_key(&second),
+            "fixture: the two keys must share a slot"
         );
 
-        // Timestamp should be updated (>= initial)
+        let _held = try_acquire_slot_lock(temp_dir.path(), first).unwrap();
+        let other = try_acquire_slot_lock(temp_dir.path(), &second);
         assert!(
-            updated_info.acquired_at_ms >= initial_timestamp,
-            "Heartbeat refresh should update acquired_at_ms: initial={}, updated={}",
-            initial_timestamp,
-            updated_info.acquired_at_ms
+            matches!(other, Err(ProxyError::LockContention(_))),
+            "a colliding key must WAIT rather than proceed — exclusion is over-broad by \
+             design, never absent. got={other:?}"
         );
-
-        // Other fields should be preserved
-        assert_eq!(updated_info.pid, initial_info.pid);
-        assert_eq!(updated_info.hostname, initial_info.hostname);
-        assert_eq!(updated_info.instance_id, initial_info.instance_id);
     }
 
-    /// Requirement 3.4: Heartbeat refresh fails on epoch mismatch (another host took over)
+    /// R4, the nesting rule.
+    ///
+    /// Two keys can share a slot, so holding two metadata locks at once can self-deadlock.
+    /// `flock` conflicts between two descriptors of the same file even within one process, so
+    /// a nested acquisition is REFUSED rather than granted — which makes the failure loud and
+    /// bounded instead of a hang. This fires if a nested acquisition is introduced.
+    #[test]
+    fn nested_meta_lock_acquisition_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let outer_key = "test-bucket/nesting-outer";
+        let inner_key = colliding_key(outer_key);
+
+        let _outer = try_acquire_slot_lock(temp_dir.path(), outer_key).unwrap();
+
+        // The deliberate nesting: a second acquisition while the first is still held.
+        let inner = try_acquire_slot_lock(temp_dir.path(), &inner_key);
+        assert!(
+            matches!(inner, Err(ProxyError::LockContention(_))),
+            "a nested acquisition on a colliding slot must be refused, not granted. Granting \
+             it would mean two holders of one slot inside one process. got={inner:?}"
+        );
+    }
+
     #[tokio::test]
-    async fn test_heartbeat_refresh_fails_on_epoch_mismatch() {
+    async fn the_manager_and_the_free_function_share_one_namespace() {
         let temp_dir = TempDir::new().unwrap();
         let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 0);
+        let cache_key = "test-bucket/one-namespace";
 
-        let cache_key = "test-bucket/heartbeat-mismatch-object";
-        let lock = manager.acquire_lock(cache_key).await.unwrap();
-
-        // Simulate another host overwriting the lock file with a different epoch
-        let hijacked_content =
-            LockFileContent::with_hostname("hijacker-host".to_string(), 9999, 999);
-        std::fs::write(lock.lock_file_path(), hijacked_content.to_json().unwrap()).unwrap();
-
-        // Heartbeat refresh should fail because epoch doesn't match
-        let result = lock.refresh_heartbeat();
-        assert!(
-            result.is_err(),
-            "Heartbeat refresh should fail when epoch has been changed by another host"
+        let inline = try_acquire_slot_lock(temp_dir.path(), cache_key).unwrap();
+        assert_eq!(
+            inline.lock_file_path(),
+            manager.get_lock_file_path(cache_key),
+            "disk_cache's direct acquisition and the manager's must resolve to ONE path, or \
+             they are two protocols in two namespaces excluding nobody"
         );
 
-        let err_msg = format!("{}", result.unwrap_err());
+        let via_manager = manager.try_acquire_lock(cache_key).await;
         assert!(
-            err_msg.contains("Fence epoch mismatch"),
-            "Error should mention fence epoch mismatch, got: {}",
-            err_msg
+            via_manager.is_err(),
+            "an inline holder must exclude a manager acquirer: this is the exclusion the \
+             retired protocol did not provide. got={:?}",
+            via_manager.err()
         );
     }
 
-    /// Requirement 3.1, 3.3: Multi-host contention simulation
-    /// Simulates two hosts with different instance_ids contending for the same lock.
     #[test]
-    fn test_multi_host_contention_staleness_decisions() {
+    fn slots_are_distinct_paths_under_one_fixed_directory() {
         let temp_dir = TempDir::new().unwrap();
-
-        // Create two managers simulating different hosts
-        // Manager A: represents the local host
-        let manager_a =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        // Manager B: we simulate by checking how manager_a evaluates locks from "host-b"
-        let lock_path = temp_dir.path().join("contention.lock");
-
-        // Scenario 1: host-b holds a fresh lock — manager_a should see it as NOT stale
-        let mut content_b = LockFileContent::with_hostname("host-b".to_string(), 5000, 1);
-        content_b.acquired_at_ms = now_ms();
-        std::fs::write(&lock_path, content_b.to_json().unwrap()).unwrap();
-        assert!(
-            !manager_a.is_lock_stale(&lock_path).unwrap(),
-            "Fresh cross-host lock should not be stale"
+        let a = slot_lock_path(temp_dir.path(), "bucket/a");
+        let expected_dir = temp_dir.path().join("metadata").join(META_LOCK_DIR);
+        assert_eq!(a.parent().unwrap(), expected_dir);
+        assert_eq!(
+            a.extension().and_then(|e| e.to_str()),
+            Some("lock"),
+            "slot files must keep the .lock suffix"
         );
 
-        // Scenario 2: host-b's lock has timed out — manager_a should see it as stale
-        let mut content_b = LockFileContent::with_hostname("host-b".to_string(), 5000, 1);
-        content_b.acquired_at_ms = now_ms().saturating_sub(60_000); // 60s ago, default timeout 30s
-        std::fs::write(&lock_path, content_b.to_json().unwrap()).unwrap();
-        assert!(
-            manager_a.is_lock_stale(&lock_path).unwrap(),
-            "Timed-out cross-host lock should be stale"
-        );
-
-        // Scenario 3: host-b's lock is just barely within timeout — should NOT be stale
-        let mut content_b = LockFileContent::with_hostname("host-b".to_string(), 5000, 1);
-        content_b.acquired_at_ms = now_ms().saturating_sub(29_000); // 29s ago, timeout is 30s
-        std::fs::write(&lock_path, content_b.to_json().unwrap()).unwrap();
-        assert!(
-            !manager_a.is_lock_stale(&lock_path).unwrap(),
-            "Lock within timeout should not be stale"
-        );
-    }
-
-    /// Requirement 3.5: Unparseable lock file content treated as remote-owned
-    #[test]
-    fn test_unparseable_lock_treated_as_remote_with_wall_clock() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = MetadataLockManager::with_metadata_lock_timeout(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(30),
-            3,
-            1_000, // 1 second timeout
-        );
-
-        let lock_path = temp_dir.path().join("corrupt.lock");
-
-        // Write garbage content — should be treated as remote-owned
-        // and use file mtime for wall-clock check
-        std::fs::write(&lock_path, "this is not valid json {{{").unwrap();
-
-        // File was just written so mtime is recent — should NOT be stale
-        // (within 1 second timeout)
-        assert!(
-            !manager.is_lock_stale(&lock_path).unwrap(),
-            "Recently-written unparseable lock should not be stale"
-        );
-    }
-
-    /// Requirement 3.5: Empty lock file is always stale
-    #[test]
-    fn test_empty_lock_file_is_stale() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let lock_path = temp_dir.path().join("empty.lock");
-        std::fs::write(&lock_path, "").unwrap();
-
-        assert!(
-            manager.is_lock_stale(&lock_path).unwrap(),
-            "Empty lock file should always be stale"
-        );
-    }
-
-    /// Requirement 3.4: Cross-host break_stale_lock increments fence epoch correctly
-    #[tokio::test]
-    async fn test_cross_host_break_increments_epoch_from_existing() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager =
-            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
-
-        let lock_path = temp_dir.path().join("epoch_increment.lock");
-
-        // Test epoch increment from various starting values
-        for start_epoch in [0u64, 1, 42, 100, u64::MAX - 1] {
-            let mut content =
-                LockFileContent::with_hostname("remote-host".to_string(), 11111, start_epoch);
-            content.acquired_at_ms = now_ms().saturating_sub(60_000); // stale
-            std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
-
-            let result = manager.break_stale_lock(&lock_path).await.unwrap();
-            assert!(result);
-
-            let new_content = std::fs::read_to_string(&lock_path).unwrap();
-            let new_info = LockFileContent::from_json(&new_content).unwrap();
-            assert_eq!(
-                new_info.fence_epoch,
-                start_epoch + 1,
-                "Epoch should increment from {} to {}",
-                start_epoch,
-                start_epoch + 1
-            );
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..500u64 {
+            seen.insert(slot_lock_path(temp_dir.path(), &format!("bucket/k{i}")));
         }
+        assert!(
+            seen.len() > 1,
+            "all keys collapsed to one slot — the hash is not distributing"
+        );
+    }
+
+    /// `n` cache keys that all hash to distinct slots.
+    fn keys_on_distinct_slots(n: usize) -> Vec<String> {
+        let mut slots = std::collections::BTreeSet::new();
+        let mut keys = Vec::with_capacity(n);
+        for i in 0..1_000_000u64 {
+            let key = format!("case62-bucket/k{i}");
+            if slots.insert(slot_for_cache_key(&key)) {
+                keys.push(key);
+                if keys.len() == n {
+                    return keys;
+                }
+            }
+        }
+        panic!("could not find {n} keys on distinct slots");
+    }
+
+    /// a slot holder that awaits `tokio::fs` completes while more contended slots
+    /// than blocking-pool threads have waiters.
+    ///
+    /// Eight peers hold eight other slots and eight budgeted waiters queue on them, on a
+    /// runtime whose blocking pool has 4 threads. The holder of a ninth slot then needs one
+    /// pool thread for a `tokio::fs` read. A per-slot gate would still park one thread per
+    /// contended slot, which is why the bound has to be "no waiter parks a thread" rather
+    /// than "one waiter per slot".
+    ///
+    /// # RED SIDE
+    ///
+    /// With `acquire_slot_lock_within` restored to a blocking `flock` on the pool, the eight
+    /// waiters park all 4 threads and the holder's read never runs.
+    #[test]
+    fn a_slot_holder_awaiting_tokio_fs_completes_while_waiters_outnumber_the_blocking_pool() {
+        let temp_dir = TempDir::new().unwrap();
+        let keys = keys_on_distinct_slots(9);
+        let peers: Vec<MetadataLock> = keys[1..]
+            .iter()
+            .map(|k| try_acquire_slot_lock(temp_dir.path(), k).unwrap())
+            .collect();
+        let probe_file = temp_dir.path().join("probe.txt");
+        std::fs::write(&probe_file, b"probe").unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        let outcome = rt.block_on(async move {
+            let holder_lock = acquire_slot_lock_within(&dir, &keys[0], Duration::from_secs(10))
+                .await
+                .expect("FIXTURE: the holder's slot is uncontended");
+            for k in &keys[1..] {
+                let d = dir.clone();
+                let k = k.clone();
+                tokio::spawn(async move {
+                    let _ = acquire_slot_lock_within(&d, &k, Duration::from_secs(10)).await;
+                });
+            }
+            // Let the waiters reach their slots before the holder needs the pool.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::timeout(Duration::from_secs(3), async move {
+                let body = tokio::fs::read(&probe_file).await;
+                drop(holder_lock);
+                body
+            })
+            .await
+        });
+        drop(peers);
+        rt.shutdown_background();
+        assert!(
+            matches!(&outcome, Ok(Ok(body)) if body.as_slice() == b"probe"),
+            "STALLED: a slot holder's tokio::fs read did not finish within 3 s while 8 slot \
+             waiters faced a 4-thread blocking pool: {:?}",
+            outcome
+        );
+    }
+}
+#[cfg(test)]
+mod explicit_unlock_tests {
+    use super::*;
+    use crate::journal_consolidator::explicit_unlock_tests::{child_holding, peer_can_lock};
+    use tempfile::TempDir;
+    /// dropping a `MetadataLock` frees the slot flock while a child holds the descriptor.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the `unlock_lock_file` call in `Drop for MetadataLock` removed, the final assertion
+    /// fails.
+    #[test]
+    fn a_dropped_metadata_lock_frees_the_flock_while_a_child_holds_the_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let key = "test-bucket/case63-key";
+        let lock = try_acquire_slot_lock(tmp.path(), key).unwrap();
+        let path = lock.lock_file_path().to_path_buf();
+        let mut child = child_holding(&lock._lock_file);
+        assert!(!peer_can_lock(&path), "fixture: the slot lock must be held");
+        drop(lock);
+        let freed = peer_can_lock(&path);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            freed,
+            "dropping a MetadataLock must unlock despite the child's copy of the descriptor"
+        );
     }
 }

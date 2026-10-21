@@ -1,4 +1,4 @@
-//! Cache fixtures for `.kiro/specs/expired-entry-revalidation/`.
+//! Cache fixtures for the expired entry revalidation feature.
 //!
 //! Builds the three states the spec's requirements are written against, and
 //! drives the real mainline handlers against them:
@@ -121,9 +121,10 @@ impl SeedSpec {
     }
 
     /// Stored-fresh but live-expired: the state an operator produces by
-    /// tightening `get_ttl` on an already-cached key, and the state any prior
-    /// `304` leaves behind (`refresh_object_ttl` moves `expires_at` to
-    /// `now + ttl` and leaves `created_at` alone).
+    /// tightening `get_ttl` on an already-cached key. A Mode B `If-Match` serve
+    /// used to produce it too, by moving `expires_at` forward on every serve; it
+    /// no longer touches stored expiry. An origin `304` does not leave this
+    /// state: it re-anchors the live age as well.
     pub fn stored_fresh_live_expired(
         extents: Vec<(u64, u64)>,
         content_length: u64,
@@ -219,13 +220,13 @@ pub fn test_config_coordinated(object_size: u64) -> Arc<Config> {
 /// `ResolvedSettings` from config and `cache_rules.json`, so any value a test
 /// constructs is ignored entirely.
 ///
-/// The default `cache.get_ttl` is ~10 years, so a loopback test that relies on a
+/// The default `cache.get_ttl` is 1 day, so a loopback test that relies on a
 /// `ResolvedSettings` it cannot inject gets a `Fresh` verdict no matter how old
 /// its fixture is, serves from cache, issues no conditional — and reads exactly
 /// like the defect it was written to detect. That happened: the first run of
 /// `expired_full_object_mainline_test` reported "no conditional upstream request"
-/// with `status=200 body_len=4096`, which is a correct cache serve under a 10-year
-/// TTL, not a missing revalidation. The status and length in that message are what
+/// with `status=200 body_len=4096`, which is a correct cache serve under the
+/// default TTL (then 10 years), not a missing revalidation. The status and length in that message are what
 /// distinguished the two.
 ///
 /// So: for loopback tests, set the TTL **here**. `Duration::ZERO` means every GET
@@ -242,6 +243,35 @@ pub fn test_config_full_object_checks_with_get_ttl(
     Arc::new(config)
 }
 
+/// As [`test_config_full_object_checks_with_get_ttl`], but sets `head_ttl` too.
+///
+/// # Why both fields have to be settable independently
+///
+/// `get_ttl` and `head_ttl` are orthogonal by design and nothing derives one from
+/// the other (`get-ttl-zero-enforcement` R1.5). A helper that set only `get_ttl`
+/// therefore cannot express the configuration R2.3 is about — a generous `get_ttl`
+/// with `head_ttl: "0s"` — and a test written against it would be asserting under
+/// the default 60s `head_ttl`, i.e. measuring nothing about the operator control.
+///
+/// The RAM **metadata** tier is left ENABLED here (`metadata_cache.enabled`
+/// defaults true, and it is a separate structure from the RAM range cache that
+/// `ram_cache_enabled` gates). That is deliberate: the metadata tier is the one
+/// consumer that is *not* opted out for `get_ttl: 0` keys, so disabling it would
+/// remove the very tier R2.3 exists to pin.
+pub fn test_config_full_object_checks_with_ttls(
+    object_size: u64,
+    get_ttl: Duration,
+    head_ttl: Duration,
+) -> Arc<Config> {
+    let mut config = Config::default();
+    config.cache.download_coordination.enabled = false;
+    config.cache.ram_cache_enabled = false;
+    config.cache.full_object_check_threshold = object_size * 16;
+    config.cache.get_ttl = get_ttl;
+    config.cache.head_ttl = head_ttl;
+    Arc::new(config)
+}
+
 impl Fixture {
     pub async fn new(config: Arc<Config>) -> Self {
         let temp_dir = TempDir::new().expect("tempdir");
@@ -252,7 +282,7 @@ impl Fixture {
             config.cache.ram_cache_enabled,
             config.cache.max_ram_cache_size,
             config.cache.max_cache_size,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             1024,
             config.compression.enabled,
             config.cache.get_ttl,
@@ -375,6 +405,11 @@ impl Fixture {
                 last_accessed: created_at,
                 access_count: 1,
                 staged: None,
+                unservable: false,
+                // As a 3.0.0 writer records it (`RangeSpec::is_unverified_prefix`).
+                file_identity: s3_proxy::cache_types::RangeFileIdentity::of(
+                    &std::fs::metadata(&path).expect("fixture: stat the planted .bin"),
+                ),
             });
         }
 
@@ -425,6 +460,7 @@ impl Fixture {
             head_last_accessed: None,
             head_access_count: 0,
             head_cached_at: None,
+            last_validated_at: None,
         };
 
         let meta_path = self.meta_path(cache_key);
@@ -526,6 +562,31 @@ impl Fixture {
         current_etag: Option<String>,
         s3_client: Arc<dyn s3_proxy::s3_client::S3ClientApi + Send + Sync>,
     ) -> hyper::Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>> {
+        self.range_get_with_uri(
+            cache_key,
+            raw_range,
+            format!("/{}", cache_key).parse().expect("uri"),
+            client_headers,
+            resolved,
+            current_etag,
+            s3_client,
+        )
+        .await
+    }
+
+    /// As [`Self::range_get`], with the request target given explicitly, so a
+    /// presigned URL's query string reaches the handler.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_get_with_uri(
+        &self,
+        cache_key: &str,
+        raw_range: &str,
+        uri: hyper::Uri,
+        client_headers: HashMap<String, String>,
+        resolved: &ResolvedSettings,
+        current_etag: Option<String>,
+        s3_client: Arc<dyn s3_proxy::s3_client::S3ClientApi + Send + Sync>,
+    ) -> hyper::Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>> {
         HttpProxy::handle_range_request(
             Method::GET,
             cache_key.to_string(),
@@ -535,7 +596,7 @@ impl Fixture {
             Arc::clone(&self.range_handler),
             s3_client,
             "s3.us-west-2.amazonaws.com".to_string(),
-            format!("/{}", cache_key).parse().expect("uri"),
+            uri,
             Arc::clone(&self.config),
             resolved,
             current_etag,
@@ -606,6 +667,33 @@ pub fn signed_range_authorization() -> String {
      SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
      Signature=0000000000000000000000000000000000000000000000000000000000000000"
         .to_string()
+}
+
+/// Query string of a presigned SigV4 GET whose `X-Amz-SignedHeaders` value is
+/// `signed_headers`, given exactly as it appears in the URL (for example
+/// `host%3Brange`). A presigned URL carries no `Authorization` header, so this list
+/// is the only record of what the client signed. Credential and signature are
+/// filler, as in [`signed_range_authorization`]; `X-Amz-Date` is the current time
+/// so the proxy's expiry check passes.
+pub fn presigned_query(signed_headers: &str) -> String {
+    let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+         &X-Amz-Credential=TESTACCESSKEY%2F20260830%2Fus-west-2%2Fs3%2Faws4_request\
+         &X-Amz-Date={date}&X-Amz-Expires=3600&X-Amz-SignedHeaders={signed_headers}\
+         &X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    )
+}
+
+/// A presigned URL query that signs `range`, as aws-sdk-js v2 emits for a ranged
+/// `getSignedUrl`.
+pub fn presigned_range_query() -> String {
+    presigned_query("host%3Brange")
+}
+
+/// A presigned URL query that does not sign `range`.
+pub fn presigned_query_without_range() -> String {
+    presigned_query("host")
 }
 
 /// Response a stub returns for a `304 Not Modified`, which carries no body.
@@ -790,13 +878,56 @@ pub async fn proxy_get_with_auth(
     authorization: &str,
     extra_headers: &[(&str, &str)],
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
+    proxy_request(addr, "GET", path, authorization, extra_headers).await
+}
+
+/// Send a HEAD through the loopback proxy.
+///
+/// HEAD is a genuinely different consumer from GET, not a variant of it: it is
+/// governed solely by `head_ttl` (`is_head_fresh`, `cache.rs`, requires
+/// `!current_head_ttl.is_zero()`), and `get_head_cache_entry_unified` never reads
+/// `get_ttl` at all. The two fields are deliberately orthogonal
+/// (`get-ttl-zero-enforcement` R1.5), so a GET-only harness cannot say anything
+/// about the HEAD half of the always-revalidate contract — which is why this
+/// helper had to exist before R2.3 could be pinned.
+///
+/// A HEAD carries no body, so the returned `Vec<u8>` is expected to be empty; it
+/// is returned anyway rather than dropped, so a body that unexpectedly arrives is
+/// visible to the caller instead of silently discarded.
+pub async fn proxy_head(
+    addr: SocketAddr,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    proxy_request(
+        addr,
+        "HEAD",
+        path,
+        &signed_authorization_without_range(),
+        extra_headers,
+    )
+    .await
+}
+
+/// Shared core for [`proxy_get_with_auth`] and [`proxy_head`].
+///
+/// One implementation rather than two, so a change to how the loopback client is
+/// built cannot apply to GET and not to HEAD — the kind of drift that makes a
+/// method-specific test look like a method-specific behaviour.
+async fn proxy_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: &str,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     use http_body_util::Full;
     use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
 
     let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
     let mut builder = Request::builder()
-        .method("GET")
+        .method(method)
         .uri(format!("http://{}{}", addr, path))
         .header("authorization", authorization);
     for (k, v) in extra_headers {
@@ -804,9 +935,9 @@ pub async fn proxy_get_with_auth(
     }
     let req = builder
         .body(Full::new(Bytes::new()))
-        .expect("build GET request");
+        .expect("build request");
 
-    let resp = client.request(req).await.expect("proxy GET failed");
+    let resp = client.request(req).await.expect("proxy request failed");
     let status = resp.status();
     let headers = resp.headers().clone();
     let body = resp

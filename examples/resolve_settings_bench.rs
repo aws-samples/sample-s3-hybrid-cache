@@ -1,32 +1,25 @@
-//! `resolve_settings` benchmark — Task 9.1 merge gate (Requirements 8.1, 8.3, 8.4).
+//! `resolve_settings` benchmark.
 //!
-//! Characterizes the per-request cost of the glob cache-rules resolver and
-//! confirms it stays within the ≤ 1 ms request-latency budget at the rule cap.
+//! Measures the per-request cost of the glob cache-rules resolver and checks that it stays
+//! within a 1 ms request-latency budget at the rule cap (1,024 rules). It uses only
+//! `std::time::Instant`, with no benchmarking crate. The 1 ms bar is coarse; this is a one-off
+//! characterization and a check on the cap, not a regression database.
 //!
-//! Deliberately uses ONLY `std::time::Instant` — no `criterion`/`divan`. This
-//! repo has a documented anti-dependency posture (`nonpublic/LICENSE_COMPLIANCE.md`
-//! requires a THIRD_PARTY + compliance review for any new crate; the design reused
-//! `regex` rather than adding `globset`). The ≤ 1 ms bar is coarse and expected to
-//! be cleared by ~100x, and this is a one-time characterization for the docs
-//! (task 10.2) and cap confirmation — not a CI regression database.
+//! What it measures, through the public path a request takes
+//! (`BucketSettingsManager::resolve`, including the per-call `RwLock` read):
 //!
-//! What it measures, driving the REAL public path
-//! (`BucketSettingsManager::resolve`, including the per-call `RwLock` read a
-//! request actually pays):
+//! - Resolution latency at 1, 16, 64, 256 and 1024 rules over representative keys
+//!   (bucket-prefix, deep, access-point form, Multi-Region Access Point form, and a key no rule
+//!   matches).
+//! - An empty rule set (no `cache_rules.json`) as the resolver's floor, so the cost at each rule
+//!   count is reported both absolutely and as a delta over that floor, the marginal cost the
+//!   latency budget governs.
+//! - A high fan-out worst case: N broad `**` rules that all match one key and set no field, so
+//!   the first-match-per-field walk visits every matched rule for every field. Match fan-out per
+//!   key, not the total rule count, drives the cost, so this case bounds the cost at the cap.
 //!
-//! - Resolution latency at 1 / 16 / 64 / 256 / 1024 rules over representative
-//!   keys (bucket-prefix, deep, access-point form, MRAP form, and a no-match key).
-//! - A "baseline" empty rule set (no `cache_rules.json`) as the resolver floor,
-//!   so each N's cost is reported both absolutely and as a delta over baseline —
-//!   the marginal "feature cost" the latency budget governs.
-//! - A high-fan-out worst case: N broad `**` rules that ALL match one key and set
-//!   no field, forcing the first-match-per-field walk to traverse every matched
-//!   index for all 8 fields. Per the design, match fan-out per key (not total
-//!   rule count) is the real cost driver, so this case bounds the 1024 cap.
-//!
-//! It asserts the measured per-resolve cost is ≤ 1 ms (panics, non-zero exit, on
-//! breach — this is a merge gate). Run in RELEASE (microbenchmarks are meaningless
-//! in debug):
+//! It asserts that the measured cost per resolve is at most 1 ms, and panics with a non-zero
+//! exit on a breach. Run in release mode; microbenchmarks are meaningless in debug:
 //!
 //! ```text
 //! cargo run --release --example resolve_settings_bench

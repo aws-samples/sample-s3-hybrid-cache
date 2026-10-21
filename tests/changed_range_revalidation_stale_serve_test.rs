@@ -1,7 +1,7 @@
 //! A changed-object response to a *range* revalidation must never re-serve the
 //! superseded cached bytes.
 //!
-//! Spec: `.kiro/specs/expired-entry-revalidation/` Requirement 3.5, verified per
+//! Spec: the expired entry revalidation feature Requirement 3.5, verified per
 //! Requirement 7.4 (both `200` and `206`).
 //!
 //! # Why this file exists separately from the rest of the spec's tests
@@ -20,7 +20,7 @@
 //! needs the entry to be stored-FRESH while `check_object_expiration` reports
 //! **live**-expired — `created_at` age against the *currently resolved*
 //! `get_ttl`. That is not a contrived combination; it is precisely what live TTL
-//! exists to produce (see `.kiro/steering/cache-coherency-invariants.md` § "The
+//! exists to produce (see the cache coherency invariants § "The
 //! two freshness mechanisms"). Two routine ways in:
 //!
 //! 1. An operator tightens or zeroes `get_ttl` in `cache_rules.json` for a key
@@ -77,7 +77,7 @@
 //!
 //! # Why the assertions are built the way they are
 //!
-//! Per `.kiro/steering/pre-push-checklist.md` § "Assert the predicate the code
+//! Per the pre-push checklist § "Assert the predicate the code
 //! evaluates": a rejection or a wrong body can have more than one cause, and
 //! asserting the outcome asserts none of them.
 //!
@@ -90,7 +90,7 @@
 //!   the old bytes is the stale cache serve.
 //! - **The conditional request is asserted to have happened.** Without it, a
 //!   plain miss that forwarded and returned fresh bytes would pass while never
-//!   reaching the branch under test — the vacuous-pass failure mode T15 had.
+//!   reaching the branch under test — the vacuous-pass failure mode the fleet test had.
 //! - **The validator is read from the `.meta`, not hardcoded.** The code
 //!   branches on `metadata.object_metadata.etag`, so the stub is keyed on
 //!   whatever was actually stored rather than on what the stub was told to send.
@@ -193,7 +193,7 @@ async fn make_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,
@@ -388,6 +388,11 @@ async fn seed_cached_extents(
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            // As a 3.0.0 writer records it (`RangeSpec::is_unverified_prefix`).
+            file_identity: s3_proxy::cache_types::RangeFileIdentity::of(
+                &std::fs::metadata(&bin_path).expect("fixture: stat the planted .bin"),
+            ),
         });
     }
 
@@ -423,6 +428,7 @@ async fn seed_cached_extents(
         head_last_accessed: None,
         head_access_count: 0,
         head_cached_at: None,
+        last_validated_at: None,
     };
 
     let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);

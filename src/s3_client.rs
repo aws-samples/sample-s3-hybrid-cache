@@ -6,7 +6,7 @@
 use crate::cache_types::CacheMetadata;
 use crate::config::ConnectionPoolConfig;
 use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
-use crate::https_connector::CustomHttpsConnector;
+use crate::https_connector::{retire_if_over_max_lifetime, CustomHttpsConnector};
 use crate::tls_trust_store;
 use crate::upstream_overrides::UpstreamOverrides;
 use crate::{ProxyError, Result, UpstreamSendFailureKind};
@@ -15,6 +15,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, StatusCode, Uri};
+use hyper_util::client::legacy::connect::{capture_connection, CaptureConnection};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::collections::HashMap;
@@ -58,6 +59,10 @@ pub struct S3Client {
     probe_connector: CustomHttpsConnector,
     /// Timeout applied to a single recovery probe (connect + TLS handshake).
     probe_timeout: Duration,
+    /// Maximum age a pooled upstream connection may reach before it is retired
+    /// (`connection_pool.max_lifetime`). Enforced at checkout, never mid-request
+    /// — see `https_connector::retire_if_over_max_lifetime`.
+    max_lifetime: Duration,
 }
 
 /// S3 request context for forwarding
@@ -404,6 +409,7 @@ impl S3Client {
             inflight_ledger: Arc::new(crate::inflight_ledger::InflightLedger::disabled()),
             probe_connector,
             probe_timeout: config.connection_timeout,
+            max_lifetime: config.max_lifetime,
         })
     }
 
@@ -417,6 +423,26 @@ impl S3Client {
     ) -> Self {
         self.inflight_ledger = ledger;
         self
+    }
+
+    /// Retire the connection this request used if it has reached
+    /// `connection_pool.max_lifetime`, and count the retirement.
+    ///
+    /// The connection is taken out of the pool, so it is not handed to another
+    /// request; the request that has just run on it, and any response body still
+    /// streaming from it, are unaffected. Skipped when keepalive is disabled,
+    /// where the pool holds nothing to retire.
+    async fn enforce_max_lifetime(&self, capture: &CaptureConnection) {
+        if !self.keepalive_enabled {
+            return;
+        }
+
+        if retire_if_over_max_lifetime(capture, self.max_lifetime, Instant::now()) {
+            let mm = self.metrics_manager.read().await;
+            if let Some(ref metrics) = *mm {
+                metrics.read().await.record_max_lifetime_closure().await;
+            }
+        }
     }
 
     /// Set metrics manager for tracking connection metrics
@@ -617,10 +643,89 @@ impl S3Client {
             }
         };
 
+        // A bodiless GET or HEAD whose established connection was lost after the request
+        // went out is retried once, at once, on a pool-less connection to the SAME pinned IP,
+        // the same rule `forward_request` applies. The hedge arms call this path, and a lost
+        // pooled connection there otherwise fails the arm and, at the default failure
+        // threshold, three of them exclude a healthy IP.
+        let (response, lifetime_capture) = match self
+            .send_pinned(
+                &context,
+                pinned_ip,
+                &effective_uri,
+                &self.client,
+                Attempt::First,
+            )
+            .await
+        {
+            Ok(sent) => sent,
+            Err(e) if Self::is_retryable_lost_connection(&e, &context) => {
+                let retry_start = Instant::now();
+                let retried = self
+                    .send_pinned(
+                        &context,
+                        pinned_ip,
+                        &effective_uri,
+                        &self.fresh_client,
+                        Attempt::Retry,
+                    )
+                    .await;
+                let retry_ms = retry_start.elapsed().as_millis() as u64;
+                match &retried {
+                    Ok(_) => info!(
+                        method = %context.method,
+                        host = %context.host,
+                        pinned_ip = %pinned_ip,
+                        outcome = "recovered",
+                        retry_ms,
+                        "Retried a request on a fresh connection after its connection was lost: {}",
+                        e
+                    ),
+                    Err(retry_error) => warn!(
+                        method = %context.method,
+                        host = %context.host,
+                        pinned_ip = %pinned_ip,
+                        outcome = "failed",
+                        retry_ms,
+                        "Retried a request on a fresh connection after its connection was lost, and the retry failed: {} (first attempt: {})",
+                        retry_error,
+                        e
+                    ),
+                }
+                retried?
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.enforce_max_lifetime(&lifetime_capture).await;
+
+        // Record success for the pinned IP
+        self.health_tracker.record_success(&pinned_ip);
+
+        // Read response
+        let (parts, body) = response.into_parts();
+        self.finish_pinned_response(&context, pinned_ip, parts, body, start_time)
+            .await
+    }
+
+    /// Build and send one pinned attempt on `client`: the pooled client for the first
+    /// attempt, the pool-less one for the lost-connection retry. A send failure counts
+    /// against `pinned_ip` unless `counts_against_ip` exempts it.
+    async fn send_pinned(
+        &self,
+        context: &S3RequestContext,
+        pinned_ip: IpAddr,
+        effective_uri: &Uri,
+        client: &Client<CustomHttpsConnector, Full<Bytes>>,
+        attempt: Attempt,
+    ) -> Result<(
+        hyper::Response<hyper::body::Incoming>,
+        hyper_util::client::legacy::connect::CaptureConnection,
+    )> {
         // Build HTTP request
         let mut request_builder = Request::builder()
             .method(&context.method)
-            .uri(&effective_uri);
+            .uri(effective_uri);
 
         // Add headers, ensuring Host header is set to the original hostname for SigV4
         let has_body = context.body.is_some();
@@ -646,9 +751,15 @@ impl S3Client {
             None => Full::new(Bytes::new()),
         };
 
-        let request = request_builder
+        let mut request = request_builder
             .body(body)
             .map_err(|e| ProxyError::HttpError(format!("Failed to build request: {}", e)))?;
+
+        // Capture which connection this request is checked out onto, so the
+        // max_lifetime cap can read that connection's age. hyper fills this in
+        // after checkout and before the request is written, for a reused
+        // connection as well as a fresh one.
+        let lifetime_capture = capture_connection(&mut request);
 
         debug!(
             method = %context.method,
@@ -659,12 +770,17 @@ impl S3Client {
         );
 
         // Send request through Hyper client
-        let response = tokio::time::timeout(self.request_timeout, self.client.request(request))
+        let response = tokio::time::timeout(self.request_timeout, client.request(request))
             .await
             .map_err(|_| ProxyError::TimeoutError("Request timeout".to_string()))?
             .map_err(|e| {
-                // Record failure for health tracking on the pinned IP
-                if self.health_tracker.record_failure(&pinned_ip) {
+                let failure = send_failure(&e);
+                // Record failure for health tracking on the pinned IP, except for a lost
+                // connection on a first attempt that the caller retries (see
+                // `counts_against_ip`).
+                if Self::counts_against_ip(&failure, context, attempt)
+                    && self.health_tracker.record_failure(&pinned_ip)
+                {
                     warn!(
                         ip = %pinned_ip,
                         host = %context.host,
@@ -683,15 +799,21 @@ impl S3Client {
                 if let Some(tls_err) = Self::recover_upstream_tls_validation_error(&e) {
                     return tls_err;
                 }
-                send_failure(&e)
+                failure
             })?;
 
-        // Record success for the pinned IP
-        self.health_tracker.record_success(&pinned_ip);
+        Ok((response, lifetime_capture))
+    }
 
-        // Read response
-        let (parts, body) = response.into_parts();
-
+    /// Read a pinned response's head and body into an [`S3Response`].
+    async fn finish_pinned_response(
+        &self,
+        context: &S3RequestContext,
+        pinned_ip: IpAddr,
+        parts: hyper::http::response::Parts,
+        body: hyper::body::Incoming,
+        start_time: Instant,
+    ) -> Result<S3Response> {
         let mut headers = HashMap::new();
         for (key, value) in parts.headers.iter() {
             if let Ok(value_str) = value.to_str() {
@@ -882,9 +1004,15 @@ impl S3Client {
             None => Full::new(Bytes::new()),
         };
 
-        let request = request_builder
+        let mut request = request_builder
             .body(body)
             .map_err(|e| ProxyError::HttpError(format!("Failed to build request: {}", e)))?;
+
+        // Capture which connection this request is checked out onto, so the
+        // max_lifetime cap can read that connection's age. hyper fills this in
+        // after checkout and before the request is written, for a reused
+        // connection as well as a fresh one.
+        let lifetime_capture = capture_connection(&mut request);
 
         if self.keepalive_enabled {
             debug!(
@@ -935,6 +1063,8 @@ impl S3Client {
                 }
                 failure
             })?;
+
+        self.enforce_max_lifetime(&lifetime_capture).await;
 
         // Record success for IP health tracking
         if let Some(ip) = selected_ip {
@@ -1376,7 +1506,7 @@ pub struct S3UrlParams {
 
 impl S3UrlParams {
     /// Parse S3-specific parameters from query string
-    pub fn parse_from_query(query: &str) -> Self {
+    pub(crate) fn parse_from_query(query: &str) -> Self {
         let mut part_number = None;
         let mut upload_id = None;
         let mut uploads = false;
@@ -1425,6 +1555,78 @@ impl S3UrlParams {
     }
 }
 
+/// The proxy's internal sentinel headers. Each marks a precondition, or a synthesized
+/// `Range`, that the proxy added, so the fetch paths can tell the proxy's own `412` from
+/// the client's. They are not S3 headers: `handle_get_head_request` removes any a client
+/// sends, and both request-context builders below remove them, so none reaches S3.
+pub(crate) const PROXY_INTERNAL_HEADERS: [&str; 3] = [
+    "x-proxy-injected-if-match",
+    "x-proxy-injected-if-unmodified-since",
+    "x-proxy-synthesized-full-object-range",
+];
+
+/// What [`header_map_to_string_map`] does with a header value that is not visible text.
+///
+/// The forwarding sites differed before this helper existed and each keeps its own
+/// treatment: some left such a value out, others mapped it to an empty string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NonTextHeaderValue {
+    /// Leave the value out. A name whose every value is non-text is absent from the map.
+    Drop,
+    /// A name whose every value is non-text maps to `""`.
+    Empty,
+}
+
+/// Convert a request's [`hyper::HeaderMap`] to the lowercase-name map the forwarding paths
+/// take, keeping every value of a header the client sent on more than one line.
+///
+/// The values of a repeated name are joined with `,` and no space, in arrival order. SigV4
+/// canonicalises a multi-value header to exactly that join (each value trimmed, values
+/// separated by commas), so S3 computes the same canonical header from the one joined line
+/// as the client did from its separate lines. Collecting the `(name, value)` pairs straight
+/// into a map kept only the last line, which changed a signed header's value and drew
+/// `403 SignatureDoesNotMatch` for a valid request.
+pub(crate) fn header_map_to_string_map(
+    headers: &hyper::HeaderMap,
+    non_text: NonTextHeaderValue,
+) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(headers.keys_len());
+    for name in headers.keys() {
+        let mut joined: Option<String> = None;
+        for value in headers.get_all(name) {
+            let Ok(text) = value.to_str() else {
+                continue;
+            };
+            match joined.as_mut() {
+                Some(j) => {
+                    j.push(',');
+                    j.push_str(text);
+                }
+                None => joined = Some(text.to_string()),
+            }
+        }
+        match (joined, non_text) {
+            (Some(j), _) => {
+                out.insert(name.as_str().to_string(), j);
+            }
+            (None, NonTextHeaderValue::Empty) => {
+                out.insert(name.as_str().to_string(), String::new());
+            }
+            (None, NonTextHeaderValue::Drop) => {}
+        }
+    }
+    out
+}
+
+/// Remove [`PROXY_INTERNAL_HEADERS`] from an outbound header map, case-insensitively.
+fn strip_proxy_internal_headers(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| {
+        !PROXY_INTERNAL_HEADERS
+            .iter()
+            .any(|internal| name.eq_ignore_ascii_case(internal))
+    });
+}
+
 /// Helper function to build S3 request context from HTTP request
 pub fn build_s3_request_context(
     method: Method,
@@ -1433,6 +1635,9 @@ pub fn build_s3_request_context(
     body: Option<Bytes>,
     host: String,
 ) -> S3RequestContext {
+    let mut headers = headers;
+    strip_proxy_internal_headers(&mut headers);
+    crate::signed_request_proxy::add_via_for_egress(&mut headers, &uri);
     let request_size = body.as_ref().map(|b| b.len() as u64);
 
     // Build absolute URI for S3 request if the URI is relative
@@ -1469,7 +1674,7 @@ pub fn build_s3_request_context(
 }
 
 /// Helper function to build S3 request context with operation type
-pub fn build_s3_request_context_with_operation(
+pub(crate) fn build_s3_request_context_with_operation(
     method: Method,
     uri: Uri,
     headers: HashMap<String, String>,
@@ -1477,6 +1682,9 @@ pub fn build_s3_request_context_with_operation(
     host: String,
     operation_type: Option<String>,
 ) -> S3RequestContext {
+    let mut headers = headers;
+    strip_proxy_internal_headers(&mut headers);
+    crate::signed_request_proxy::add_via_for_egress(&mut headers, &uri);
     let request_size = body.as_ref().map(|b| b.len() as u64);
 
     // Build absolute URI for S3 request if the URI is relative
@@ -1514,6 +1722,30 @@ pub fn build_s3_request_context_with_operation(
 
 /// Rewrite a URI's authority (host) from a hostname to an IP address while preserving
 /// scheme, path, and query. Used by IP distribution to make hyper create per-IP pools.
+///
+/// The host the request targeted is carried into the rewritten authority's userinfo
+/// (`{host}@{ip}[:port]`), so the TLS layer uses the name this request asked for.
+/// Without it the connector sees only an address and has to recover a name by
+/// searching the registered endpoints, which answers with the lexicographically
+/// smallest endpoint holding that address. Every virtual-hosted bucket hostname in a
+/// region resolves to one shared address set, so that answer is routinely a different
+/// request's name, and a name the upstream certificate does not cover fails
+/// verification.
+///
+/// Three properties make the carrier safe, each pinned by a test below:
+///
+/// 1. `Uri::host()` and `Uri::port_u16()` ignore userinfo (`http::uri::Authority`
+///    splits the host off after the last `@`), so the connector still dials the
+///    address IP distribution chose.
+/// 2. Nothing of the userinfo reaches the wire. hyper sends an origin-form request
+///    target on HTTP/1, and the `Host` header is set here from the signed request.
+/// 3. hyper's connection-pool key is the whole authority, so the pool holds one entry
+///    per host-and-address pair rather than one per address.
+///
+/// An IP-literal host is not carried: it names no certificate to verify, and an IPv6
+/// literal's brackets are not valid in userinfo. A host that will not parse inside an
+/// authority leaves the rewrite returning `Err`, and both callers then forward on the
+/// original hostname.
 fn rewrite_uri_authority(original: &Uri, ip: &IpAddr) -> std::result::Result<Uri, String> {
     let scheme = original.scheme_str().unwrap_or("https");
     let port_suffix = match original.port_u16() {
@@ -1530,7 +1762,19 @@ fn rewrite_uri_authority(original: &Uri, ip: &IpAddr) -> std::result::Result<Uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let new_uri_str = format!("{}://{}{}", scheme, ip_authority, path_and_query);
+    // Carry the request's own host to the connector (see the doc comment). A host
+    // that is already an IP literal is left out: `[` is not valid in userinfo, and an
+    // address names no certificate for the connector to prefer it over.
+    let userinfo = match original.host() {
+        Some(host) if !host.starts_with('[') && host.parse::<IpAddr>().is_err() => {
+            format!("{}@", host)
+        }
+        _ => String::new(),
+    };
+    let new_uri_str = format!(
+        "{}://{}{}{}",
+        scheme, userinfo, ip_authority, path_and_query
+    );
     new_uri_str
         .parse::<Uri>()
         .map_err(|e| format!("Failed to parse rewritten URI '{}': {}", new_uri_str, e))
@@ -1680,6 +1924,52 @@ mod tests {
     use super::*;
     use crate::config::ConnectionPoolConfig;
 
+    #[test]
+    fn header_map_to_string_map_joins_repeated_values_in_arrival_order() {
+        let mut h = hyper::HeaderMap::new();
+        h.append("x-amz-object-attributes", "ETag".parse().unwrap());
+        h.append("x-amz-date", "20261017T000000Z".parse().unwrap());
+        h.append("x-amz-object-attributes", "ObjectSize".parse().unwrap());
+        h.append("x-amz-object-attributes", "Checksum".parse().unwrap());
+        h.append(
+            "x-non-text",
+            hyper::header::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        h.append("x-mixed", "kept".parse().unwrap());
+        h.append(
+            "x-mixed",
+            hyper::header::HeaderValue::from_bytes(b"\xfe").unwrap(),
+        );
+        for mode in [NonTextHeaderValue::Drop, NonTextHeaderValue::Empty] {
+            let m = header_map_to_string_map(&h, mode);
+            // Comma, no space: the SigV4 canonical join of a multi-value header.
+            assert_eq!(
+                m.get("x-amz-object-attributes").map(String::as_str),
+                Some("ETag,ObjectSize,Checksum"),
+                "{mode:?}"
+            );
+            // A header sent once is unchanged.
+            assert_eq!(
+                m.get("x-amz-date").map(String::as_str),
+                Some("20261017T000000Z")
+            );
+            // A non-text value among text values is left out of the join.
+            assert_eq!(m.get("x-mixed").map(String::as_str), Some("kept"));
+        }
+        // A name whose only value is non-text: absent under Drop, "" under Empty.
+        assert!(!header_map_to_string_map(&h, NonTextHeaderValue::Drop).contains_key("x-non-text"));
+        assert_eq!(
+            header_map_to_string_map(&h, NonTextHeaderValue::Empty)
+                .get("x-non-text")
+                .map(String::as_str),
+            Some("")
+        );
+        // Names arrive lowercase from hyper and stay lowercase.
+        assert!(header_map_to_string_map(&h, NonTextHeaderValue::Drop)
+            .keys()
+            .all(|k| k.chars().all(|c| !c.is_ascii_uppercase())));
+    }
+
     fn create_test_config() -> ConnectionPoolConfig {
         ConnectionPoolConfig {
             max_connections_per_ip: 10,
@@ -1792,7 +2082,13 @@ mod tests {
 
         assert_eq!(context.method, method);
         assert_eq!(context.uri, uri);
-        assert_eq!(context.headers, headers);
+        // The input headers are kept and this process's `Via` is the one addition.
+        let mut expected = headers.clone();
+        expected.insert(
+            "Via".to_string(),
+            crate::signed_request_proxy::append_via(None),
+        );
+        assert_eq!(context.headers, expected);
         assert_eq!(context.body, body);
         assert_eq!(context.host, host);
         assert_eq!(context.request_size, Some(9)); // "test data" is 9 bytes
@@ -1926,7 +2222,7 @@ mod tests {
         use crate::upstream_overrides::{TransportMode, UpstreamOverrides};
 
         let raw = override_map(&[
-            // Hostname entry the fleet verification (T22) depends on: real S3 over
+            // Hostname entry the fleet verification depends on: real S3 over
             // plaintext HTTP on port 80.
             ("s3.us-east-1.amazonaws.com:80", UpstreamScheme::Http, true),
             // IP-literal entry (local plaintext store).
@@ -1937,7 +2233,7 @@ mod tests {
         // Matched hostname authority resolves to Some(Plaintext): because the lookup
         // matches, `try_forward_request` skips the IP-distribution rewrite, so the
         // authority is NOT rewritten to an S3 IP and the override keeps matching — the
-        // exact path the fleet T22 group relies on.
+        // exact path the fleet test relies on.
         assert_eq!(
             overrides.resolve("s3.us-east-1.amazonaws.com", 80),
             Some(TransportMode::Plaintext),
@@ -2211,6 +2507,62 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_uri_authority_carries_the_original_host_as_userinfo() {
+        // The carrier proof, properties 1 and 3 (property 2, nothing on the wire,
+        // is pinned by `https_connector`'s loopback-origin test, which reads the
+        // bytes an origin receives).
+        let uri: Uri = "https://my.dotted.bucket.s3.us-west-2.amazonaws.com/bucket/key"
+            .parse()
+            .unwrap();
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+        // 1. The connector still dials the address IP distribution chose: `host()`
+        //    and `port_u16()` read past the userinfo.
+        assert_eq!(result.host(), Some("52.92.17.224"));
+        assert_eq!(result.port_u16(), None);
+        assert_eq!(result.scheme_str(), Some("https"));
+        assert_eq!(result.path(), "/bucket/key");
+        // 3. hyper's pool key is `(scheme, authority)`, and the authority carries the
+        //    host, so the pool holds one entry per host-and-address pair.
+        assert_eq!(
+            result.authority().map(|a| a.as_str()),
+            Some("my.dotted.bucket.s3.us-west-2.amazonaws.com@52.92.17.224"),
+            "the targeted host must survive in the authority for the connector to read"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_carrier_survives_a_non_default_port() {
+        let uri: Uri = "http://bucket.s3.eu-west-2.amazonaws.com:8080/key"
+            .parse()
+            .unwrap();
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+        assert_eq!(result.host(), Some("52.92.17.224"));
+        assert_eq!(result.port_u16(), Some(8080));
+        assert_eq!(
+            result.authority().map(|a| a.as_str()),
+            Some("bucket.s3.eu-west-2.amazonaws.com@52.92.17.224:8080")
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_does_not_carry_an_ip_literal_host() {
+        // An address names no certificate, and an IPv6 literal's brackets are not
+        // valid in userinfo, so neither is carried and the rewrite is unchanged.
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+        for host in ["http://10.1.2.3/key", "http://[2600:1f18::1]/key"] {
+            let uri: Uri = host.parse().unwrap();
+            let result = rewrite_uri_authority(&uri, &ip).unwrap();
+            assert_eq!(
+                result.authority().map(|a| a.as_str()),
+                Some("52.92.17.224"),
+                "{host} must rewrite to the bare address"
+            );
+        }
+    }
+
+    #[test]
     fn test_pool_max_idle_per_host_ip_distribution_enabled() {
         // Validates: Requirement 5.2 - max_idle_per_ip (10) used when IP distribution enabled
         let mut config = create_test_config();
@@ -2315,14 +2667,14 @@ mod tests {
         use crate::upstream_overrides::UpstreamOverrides;
 
         let raw = override_map(&[
-            ("172.31.41.100:9000", UpstreamScheme::Http, true),
+            ("10.0.41.100:9000", UpstreamScheme::Http, true),
             ("s3.us-west-2.amazonaws.com:80", UpstreamScheme::Http, true),
         ]);
         let overrides = UpstreamOverrides::from_config(&raw);
 
         // A request to an override-matched IP literal: forward_request_pinned
         // should detect the match and ignore any pinned_ip.
-        let uri: Uri = "http://172.31.41.100:9000/bucket/key".parse().unwrap();
+        let uri: Uri = "http://10.0.41.100:9000/bucket/key".parse().unwrap();
         let target_host = uri.host().unwrap();
         let target_port = uri.port_u16().unwrap_or(80);
         assert!(
@@ -2405,8 +2757,7 @@ mod lost_connection_tests {
     struct Upstream {
         port: u16,
         accepts: Arc<AtomicUsize>,
-        // Read only by the Linux-only `a_recovered_lost_connection_leaves_its_ip_healthy`
-        // (it needs 127.0.0.2 to answer), so they are unread on other targets.
+        // Read only by the Linux-only tests below, so `dead_code` fires elsewhere.
         #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         arrived_on: Arc<std::sync::Mutex<Vec<std::net::IpAddr>>>,
         #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -2839,6 +3190,89 @@ mod lost_connection_tests {
         assert!(
             !client.health_tracker.is_unhealthy(&ip1),
             "a recovered loss counted against ip1"
+        );
+    }
+
+    /// The hedge arms send through `forward_request_pinned`. A bodiless GET whose pooled
+    /// connection to the pinned IP is lost is retried once, on a new connection to the
+    /// same IP, and that loss is not held against the IP (the failure threshold is 1, so
+    /// one counted failure would mark it unhealthy). Mutations that must break this: drop
+    /// the retry in `forward_request_pinned`, or count every pinned send failure.
+    #[tokio::test]
+    async fn a_pinned_get_on_a_lost_pooled_connection_is_retried_on_the_same_ip() {
+        let upstream = start_upstream_on("127.0.0.1:0", Duration::ZERO).await;
+        let port = upstream.port;
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut config = ConnectionPoolConfig {
+            ip_distribution_enabled: true,
+            keepalive_enabled: true,
+            idle_timeout: Duration::from_secs(55),
+            ip_failure_threshold: 1,
+            ..Default::default()
+        };
+        // Keyed on the pinned address, so the hostname has no override (the pinned
+        // branch is taken) and the rewritten authority dials plain HTTP.
+        config.upstream_overrides.insert(
+            format!("{ip}:{port}"),
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: false,
+            },
+        );
+        let client = S3Client::new(&config, None).expect("client builds");
+        // A distributor holding the pinned IP, so a counted failure is observable: at
+        // threshold 1 it removes the IP, and the retry's later success on the same IP
+        // resets the health counter but does not restore the distributor entry.
+        client.pool_manager.write().await.ip_distributors.insert(
+            "fake-s3.test".into(),
+            crate::connection_pool::IpDistributor::new(vec![ip]),
+        );
+        let get = || S3RequestContext {
+            method: Method::GET,
+            uri: format!("http://fake-s3.test:{port}/bucket/key")
+                .parse()
+                .unwrap(),
+            headers: HashMap::new(),
+            body: None,
+            host: "fake-s3.test".into(),
+            request_size: None,
+            operation_type: None,
+            allow_streaming: false,
+        };
+        client
+            .forward_request_pinned(get(), Some(ip))
+            .await
+            .expect("fixture: the first pinned GET primes one pooled connection");
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1, "fixture");
+
+        let response = client.forward_request_pinned(get(), Some(ip)).await;
+
+        assert_eq!(
+            response
+                .expect("the pinned GET must be retried on a fresh connection")
+                .status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            upstream.dropped.load(Ordering::SeqCst),
+            1,
+            "the second GET really went out on the reused connection and lost it"
+        );
+        assert_eq!(
+            upstream.accepts.load(Ordering::SeqCst),
+            2,
+            "exactly one new connection, for the retry"
+        );
+        // The removal a counted failure triggers runs on a spawned task.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            client
+                .pool_manager
+                .read()
+                .await
+                .get_distinct_distributed_ips("fake-s3.test", 2),
+            vec![ip],
+            "a recovered pinned loss counted against its IP and took it out of rotation"
         );
     }
 

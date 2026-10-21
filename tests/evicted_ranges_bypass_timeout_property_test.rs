@@ -132,7 +132,7 @@ impl EvictedRangesTracker {
 /// JournalConsolidator::validate_journal_entries_with_staleness() as a pure function for
 /// property testing. It does NOT model the object-level exemption for `TtlRefresh`,
 /// `AccessUpdate`, and `Graduation` entries (which validate against the `.meta`, not a
-/// range file) — task 45 in `.kiro/specs/write-cache-accounting-and-eviction/` found
+/// range file) — task 45 in the write cache accounting and eviction feature found
 /// that gap the hard way when `Graduation` was missing from that exemption in
 /// production. This model covers only the staleness-timeout and bypass arithmetic
 /// below; it makes no claim about operation-type dispatch.

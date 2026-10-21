@@ -46,7 +46,7 @@ pub fn init_global_hedging() -> Arc<HedgeMetrics> {
 }
 
 /// Get the process-global hedge governor (returns `None` before `init_global_hedging`).
-pub fn get_global_governor() -> Option<&'static Arc<HedgeGovernor>> {
+pub(crate) fn get_global_governor() -> Option<&'static Arc<HedgeGovernor>> {
     GLOBAL_GOVERNOR.get()
 }
 
@@ -86,7 +86,7 @@ impl HedgeGovernor {
     }
 
     /// Begin a fetch and return a guard that tracks it.
-    pub fn start_fetch(&self) -> FetchGuard<'_> {
+    pub(crate) fn start_fetch(&self) -> FetchGuard<'_> {
         self.inflight_fetches.fetch_add(1, Ordering::Relaxed);
         FetchGuard { governor: self }
     }
@@ -101,7 +101,7 @@ impl HedgeGovernor {
     /// to bound cost amplification", which only applies when there is meaningful
     /// traffic to amplify). At steady state with many in-flight fetches the
     /// fraction cap governs normally.
-    pub fn try_admit_hedge(&self, max_inflight_fraction: f64) -> Option<HedgeGuard<'_>> {
+    pub(crate) fn try_admit_hedge(&self, max_inflight_fraction: f64) -> Option<HedgeGuard<'_>> {
         let fetches = self.inflight_fetches.load(Ordering::Relaxed);
         let hedges = self.inflight_hedges.load(Ordering::Relaxed);
 
@@ -123,13 +123,15 @@ impl HedgeGovernor {
         Some(HedgeGuard { governor: self })
     }
 
-    /// Current number of in-flight fetches (for testing/metrics).
-    pub fn inflight_fetches(&self) -> u64 {
+    /// Current number of in-flight fetches. Test seam: no metric publishes it.
+    #[cfg(test)]
+    pub(crate) fn inflight_fetches(&self) -> u64 {
         self.inflight_fetches.load(Ordering::Relaxed)
     }
 
-    /// Current number of in-flight hedges (for testing/metrics).
-    pub fn inflight_hedges(&self) -> u64 {
+    /// Current number of in-flight hedges. Test seam: no metric publishes it.
+    #[cfg(test)]
+    pub(crate) fn inflight_hedges(&self) -> u64 {
         self.inflight_hedges.load(Ordering::Relaxed)
     }
 }
@@ -187,15 +189,15 @@ impl HedgeMetrics {
         }
     }
 
-    pub fn record_issued(&self) {
+    pub(crate) fn record_issued(&self) {
         self.issued.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_won(&self) {
+    pub(crate) fn record_won(&self) {
         self.won.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_suppressed(&self) {
+    pub(crate) fn record_suppressed(&self) {
         self.suppressed.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -231,7 +233,7 @@ enum ArmResult {
 /// "finished" flags. A flat `select!` would drop the losing branch on first
 /// completion, breaking the no-status fallback (Req 5.4).
 #[allow(clippy::too_many_arguments)]
-pub async fn race_first_byte(
+pub(crate) async fn race_first_byte(
     s3_client: &(dyn S3ClientApi + Send + Sync),
     ctx: S3RequestContext,
     first_byte_timeout: Option<Duration>,
@@ -421,7 +423,7 @@ pub async fn race_first_byte(
 /// - 2 IPs → the arms are pinned to distinct IPs
 /// - 1 IP  → both arms pin to it (still separate connections)
 /// - 0 IPs → both arms run unpinned (no distributor yet, e.g. DNS not resolved)
-pub async fn select_ip_pair(
+pub(crate) async fn select_ip_pair(
     s3_client: &(dyn S3ClientApi + Send + Sync),
     host: &str,
 ) -> [Option<IpAddr>; 2] {
@@ -449,7 +451,7 @@ pub async fn select_ip_pair(
 /// (Requirement 1.3).
 ///
 /// Spec: hedged-upstream-requests Requirements 1.3, 2.3, 6.1, 6.5.
-pub async fn fetch_maybe_hedged(
+pub(crate) async fn fetch_maybe_hedged(
     s3_client: &(dyn S3ClientApi + Send + Sync),
     ctx: S3RequestContext,
     host: &str,

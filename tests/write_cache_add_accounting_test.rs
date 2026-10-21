@@ -10,7 +10,7 @@
 //!
 //! * `finalize_incremental_range` documents that it performs no size tracking;
 //! * `store_new_metadata` writes no journal entry;
-//! * `consolidate_key` hardcodes its own `size_delta` to 0, contributing only
+//! * `apply_journal_entries` hardcodes its own `size_delta` to 0, contributing only
 //!   graduation's negative `write_cache_delta`.
 //!
 //! So a write-through PUT credited neither `total_size` nor `write_cache_size`.
@@ -66,7 +66,7 @@ fn setup(cache_dir: &std::path::Path) -> CacheManager {
         cache_dir.to_path_buf(),
         false, // ram_cache_enabled — irrelevant here, and off keeps the test cheap
         0,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
     );
 
     // Wires the journal consolidator into the manager as a side effect.

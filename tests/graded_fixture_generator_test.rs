@@ -10,7 +10,7 @@
 //! bearing assertion here is not any of the shape checks — it is
 //! [`fixture_tree_is_discoverable_by_the_real_eviction_candidate_collector`], which
 //! drives `CacheManager::collect_range_candidates_for_eviction` (`src/cache.rs`,
-//! `collect_range_candidates_recursive` → `collect_candidates_from_metadata_file`)
+//! `MetaFileWalk` → `collect_candidates_from_metadata_file`)
 //! over a generated tree and compares what **eviction** discovered against what was
 //! written. If the product cannot discover what the generator produced, the fixture
 //! is invalid however well-formed it looks.

@@ -1,6 +1,6 @@
 //! RAM Cache Module
 //!
-//! Provides in-memory caching with configurable eviction algorithms (LRU, TinyLFU).
+//! Provides in-memory caching with TinyLFU (decayed-frequency) eviction.
 //! Integrates with compression system for memory efficiency and serves as first-tier cache.
 //!
 //! Note: Access tracking for disk metadata updates is now handled by the journal system
@@ -9,7 +9,7 @@
 use crate::cache::{CacheEvictionAlgorithm, RamCacheEntry, RamCacheRead};
 use crate::cache_types::CacheMetadata;
 use crate::Result;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -39,31 +39,6 @@ pub fn shard_index(cache_key: &str, shard_count: usize) -> usize {
     (h % shard_count as u64) as usize
 }
 
-/// Per-shard eviction state: holds all LRU/TinyLFU counters for one shard.
-///
-/// Each `RamCacheShard` owns an independent copy of the eviction bookkeeping
-/// with no sharing between shards.
-pub(crate) struct EvictionState {
-    /// Which algorithm this shard uses.
-    pub eviction_algorithm: CacheEvictionAlgorithm,
-    /// LRU recency queue (front = least-recently used).
-    pub lru_order: VecDeque<String>,
-}
-
-impl EvictionState {
-    /// Create a new eviction state for the given algorithm.
-    ///
-    /// TinyLFU no longer needs any window/frequency state here: victim scoring
-    /// (`shard_find_tinylfu_victim`) reads `access_count`/`last_accessed`
-    /// directly from each entry's atomics at eviction time.
-    pub fn new(eviction_algorithm: CacheEvictionAlgorithm) -> Self {
-        Self {
-            eviction_algorithm,
-            lru_order: VecDeque::new(),
-        }
-    }
-}
-
 /// One shard of the sharded RAM cache.
 ///
 /// `ShardedRamCache` owns a `Vec<tokio::sync::RwLock<RamCacheShard>>`.  Each
@@ -72,23 +47,15 @@ impl EvictionState {
 ///
 /// Fields:
 /// - `data` — the cache entries stored in this shard.
-/// - `eviction` — per-shard LRU/TinyLFU counters.
 /// - `current_size` — sum of entry sizes currently stored (bytes).
 /// - `capacity` — maximum bytes this shard may hold (= total_capacity / shard_count).
-/// - `pending_accesses` — deferred-reorder buffer: keys pushed here by `get()`
-///   under a shared read lock; drained and applied to `eviction` by the next
-///   `put()` call that holds the write lock.
 pub(crate) struct RamCacheShard {
     /// Cache entries for this shard.
     pub data: HashMap<String, RamCacheEntry>,
-    /// Eviction algorithm state (LRU order / TinyLFU counters) for this shard.
-    pub eviction: EvictionState,
     /// Total byte size of all entries currently in `data`.
     pub current_size: usize,
     /// Maximum byte capacity for this shard (total_capacity / shard_count).
     pub capacity: usize,
-    /// Deferred access-reorder buffer drained by the next `put()` write lock.
-    pub pending_accesses: Vec<String>,
     /// Number of entries evicted from this shard under capacity pressure.
     /// Incremented under the write lock in `put()`; read under the read lock
     /// in `stats()`. Spec: compression-followup-fixes Requirement 3.
@@ -98,14 +65,14 @@ pub(crate) struct RamCacheShard {
 }
 
 impl RamCacheShard {
-    /// Create a new, empty shard with the given capacity and eviction algorithm.
-    pub fn new(capacity: usize, eviction_algorithm: CacheEvictionAlgorithm) -> Self {
+    /// Create a new, empty shard with the given capacity. TinyLFU victim scoring reads each
+    /// entry's atomics, so a shard keeps no eviction-ordering state; the algorithm is held
+    /// once on [`ShardedRamCache`].
+    pub fn new(capacity: usize) -> Self {
         Self {
             data: HashMap::new(),
-            eviction: EvictionState::new(eviction_algorithm),
             current_size: 0,
             capacity,
-            pending_accesses: Vec::new(),
             eviction_count: 0,
             last_eviction_ms: 0,
         }
@@ -129,7 +96,25 @@ pub struct ShardedRamCache {
     hit_count: AtomicU64,
     /// Total cache misses across all shards (updated atomically under a read lock).
     miss_count: AtomicU64,
+    /// Lock-free mirrors of the per-shard figures `stats()` publishes, so a `/health` or
+    /// `/metrics` scrape never waits on a shard lock (a PUT's `invalidate_by_prefix` holds
+    /// every shard's write lock in turn). Each is updated inside the same write-lock
+    /// critical section that changes the shard field it mirrors, so at quiescence each
+    /// equals the sum over shards exactly.
+    total_size: AtomicU64,
+    total_entries: AtomicU64,
+    total_evictions: AtomicU64,
+    last_eviction_ms: AtomicU64,
+    /// Per-shard capacity, fixed at construction (read by `max_size` without a lock).
+    per_shard_capacity: usize,
+    /// The eviction algorithm every shard uses, fixed at construction.
+    eviction_algorithm: CacheEvictionAlgorithm,
 }
+
+/// Red-side lever for the lock-free stats read: `true` sums the shards under their read
+/// locks, as `stats` did before the fix.
+#[cfg(test)]
+const STATS_UNDER_SHARD_LOCKS: bool = false;
 
 impl ShardedRamCache {
     /// Create a new sharded RAM cache.
@@ -149,8 +134,7 @@ impl ShardedRamCache {
     /// suggesting a larger `max_ram_cache_size`, since concurrency (shard
     /// count) was reduced to honour the admission guarantee.
     ///
-    /// All shards use `eviction_algorithm` for their independent LRU/TinyLFU
-    /// bookkeeping.
+    /// All shards use `eviction_algorithm` (TinyLFU, the only variant).
     ///
     /// Spec: page-aligned-range-cache Requirements 7.7, 7.8.
     pub fn new(
@@ -174,19 +158,34 @@ impl ShardedRamCache {
         let per_shard_capacity = (total_capacity / effective_shard_count).max(1);
 
         let shards = (0..effective_shard_count)
-            .map(|_| {
-                RwLock::new(RamCacheShard::new(
-                    per_shard_capacity,
-                    eviction_algorithm.clone(),
-                ))
-            })
+            .map(|_| RwLock::new(RamCacheShard::new(per_shard_capacity)))
             .collect();
 
+        Self::from_shards(
+            shards,
+            effective_shard_count,
+            per_shard_capacity,
+            eviction_algorithm,
+        )
+    }
+
+    fn from_shards(
+        shards: Vec<RwLock<RamCacheShard>>,
+        shard_count: usize,
+        per_shard_capacity: usize,
+        eviction_algorithm: CacheEvictionAlgorithm,
+    ) -> Self {
         Self {
             shards,
-            shard_count: effective_shard_count,
+            shard_count,
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
+            total_size: AtomicU64::new(0),
+            total_entries: AtomicU64::new(0),
+            total_evictions: AtomicU64::new(0),
+            last_eviction_ms: AtomicU64::new(0),
+            per_shard_capacity,
+            eviction_algorithm,
         }
     }
 
@@ -212,20 +211,10 @@ impl ShardedRamCache {
         let per_shard_capacity = (total_capacity / shard_count).max(1);
 
         let shards = (0..shard_count)
-            .map(|_| {
-                RwLock::new(RamCacheShard::new(
-                    per_shard_capacity,
-                    eviction_algorithm.clone(),
-                ))
-            })
+            .map(|_| RwLock::new(RamCacheShard::new(per_shard_capacity)))
             .collect();
 
-        Self {
-            shards,
-            shard_count,
-            hit_count: AtomicU64::new(0),
-            miss_count: AtomicU64::new(0),
-        }
+        Self::from_shards(shards, shard_count, per_shard_capacity, eviction_algorithm)
     }
 
     /// Return the total byte capacity across all shards.
@@ -240,15 +229,25 @@ impl ShardedRamCache {
         if self.shard_count == 0 {
             return 0;
         }
-        // Read capacity from the first shard without holding the lock for long.
-        // SAFETY: shard_count ≥ 1 is guaranteed by the constructor.
-        //
-        // We use try_read() which succeeds immediately when no writer holds the
-        // lock.  If a writer is active (extremely unlikely at stats time) we fall
-        // back to the shard_count * (total / shard_count) approximation — which
-        // is exactly what the constructor computed anyway.
-        let first_capacity = self.shards[0].try_read().map(|g| g.capacity).unwrap_or(0);
-        first_capacity * self.shard_count
+        // Capacity is fixed at construction, so this takes no lock. It used to `try_read`
+        // shard 0 and report 0 whenever a writer held it.
+        self.per_shard_capacity * self.shard_count
+    }
+
+    /// Mirror a shard-size change in the lock-free totals. Call under the shard's write lock.
+    fn note_size_change(&self, added: usize, removed: usize) {
+        if added > 0 {
+            self.total_size.fetch_add(added as u64, Ordering::Relaxed);
+        }
+        if removed > 0 {
+            self.total_size.fetch_sub(removed as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Mirror one entry removal (size and count). Call under the shard's write lock.
+    fn note_entry_removed(&self, size: usize) {
+        self.note_size_change(0, size);
+        self.total_entries.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Look up a key in the cache.
@@ -264,10 +263,8 @@ impl ShardedRamCache {
     /// - Drops the read lock before returning (the `Arc` keeps the data alive
     ///   independently of the lock).
     /// - Increments the aggregate `hit_count` atomic.
-    /// - On a sampled fraction of reads (`access_count % 8 == 0`) attempts a
-    ///   non-blocking `try_write()` on the shard to push the key onto
-    ///   `pending_accesses` for deferred LRU/TinyLFU reordering.  If the
-    ///   write lock is contended the push is skipped — this is best-effort.
+    /// - Never takes the shard's write lock: TinyLFU victim scoring reads the
+    ///   two atomics above directly, so a hit maintains no ordering structure.
     ///
     /// On miss:
     /// - Drops the read lock immediately.
@@ -300,7 +297,7 @@ impl ShardedRamCache {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 entry.last_accessed.store(now_ms, Ordering::Relaxed);
-                let new_count = entry.access_count.fetch_add(1, Ordering::Relaxed) + 1;
+                entry.access_count.fetch_add(1, Ordering::Relaxed);
 
                 // Clone Arc<Bytes> — O(1) reference-count increment, no data copy.
                 let read = RamCacheRead {
@@ -308,35 +305,41 @@ impl ShardedRamCache {
                     metadata: entry.metadata.clone(),
                     compressed: entry.compressed,
                     compression_algorithm: entry.compression_algorithm.clone(),
+                    verified_at_ms: entry.verified_at.load(Ordering::Relaxed),
                 };
 
-                // Read the eviction algorithm before dropping the read guard —
-                // needed below to gate the deferred-reorder block to LRU only.
-                let eviction_algorithm = guard.eviction.eviction_algorithm.clone();
-
-                // Release the read lock before any write-lock attempt.
-                // The Arc clone keeps the data alive independently.
+                // Release the read lock. The Arc clone keeps the data alive
+                // independently.
                 drop(guard);
 
                 self.hit_count.fetch_add(1, Ordering::Relaxed);
                 debug!("ShardedRamCache hit for key: {}", key);
 
-                // Sampled deferred reorder: on every ~8th access attempt a
-                // non-blocking write lock to push the key onto pending_accesses.
-                // If the lock is already held (contended write), skip silently —
-                // best-effort; the next put() will drain whatever was recorded.
-                //
-                // Only meaningful for LRU: TinyLFU victim scoring reads
-                // `access_count`/`last_accessed` atomics directly at eviction
-                // time and needs no per-access ordering structure.
-                if new_count % 8 == 0 && eviction_algorithm == CacheEvictionAlgorithm::LRU {
-                    if let Ok(mut write_guard) = shard.try_write() {
-                        write_guard.pending_accesses.push(key.to_string());
-                    }
-                }
-
                 Some(read)
             }
+        }
+    }
+
+    /// Update an entry's `verified_at` timestamp to now, in place, under a
+    /// shared read lock — mirrors `get()`'s atomic `last_accessed` update, no
+    /// write lock needed. Called after a successful verification against the
+    /// shared `.meta` confirms the RAM entry's etag still matches.
+    ///
+    /// No-op if the key is no longer resident (e.g. evicted between the
+    /// verification read and this call) — the next lookup will simply verify
+    /// again.
+    ///
+    /// Spec: ram-tier-effectiveness Requirement 4, criterion 2a.
+    pub(crate) async fn touch_verified_at(&self, key: &str) {
+        let idx = shard_index(key, self.shard_count);
+        let shard = &self.shards[idx];
+        let guard = shard.read().await;
+        if let Some(entry) = guard.data.get(key) {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            entry.verified_at.store(now_ms, Ordering::Relaxed);
         }
     }
 
@@ -345,19 +348,13 @@ impl ShardedRamCache {
     /// Acquires an **exclusive write lock** on the shard that owns `entry.cache_key`.
     /// While holding the write lock the method:
     ///
-    /// 1. **Drains `pending_accesses`** — applies deferred LRU/TinyLFU reordering for
-    ///    all keys that were recorded by recent `get()` calls under a read lock.  This
-    ///    keeps eviction ordering approximately up-to-date without requiring every `get()`
-    ///    to take the write lock.
-    /// 2. **Evicts** entries until the shard has room for the new entry
-    ///    (`current_size + entry_size ≤ capacity`).  Eviction uses the same LRU or
-    ///    TinyLFU victim-selection logic as `RamCache::evict_entry`.
-    /// 3. **Inserts** the new entry, updates `current_size`, and adds the key to the
-    ///    eviction tracking structures.
+    /// 1. **Evicts** entries until the shard has room for the new entry
+    ///    (`current_size + entry_size ≤ capacity`), choosing each victim by TinyLFU
+    ///    score (`shard_find_tinylfu_victim`).
+    /// 2. **Inserts** the new entry and updates `current_size`.
     ///
     /// If an entry with the same key already exists it is replaced: its old size is
-    /// subtracted from `current_size` and it is removed from tracking before the new
-    /// entry is inserted.
+    /// subtracted from `current_size` before the new entry is inserted.
     ///
     /// If the entry alone exceeds the shard capacity it is silently dropped (same
     /// behaviour as `RamCache::put`).
@@ -368,18 +365,7 @@ impl ShardedRamCache {
         let idx = shard_index(&cache_key, self.shard_count);
         let mut guard = self.shards[idx].write().await;
 
-        // Step 1: drain pending_accesses and apply deferred LRU/TinyLFU reordering.
-        // We collect first to avoid a borrow-split issue while calling
-        // shard_update_access_tracking(&mut guard, ...).
-        let pending: Vec<String> = std::mem::take(&mut guard.pending_accesses);
-        for key in pending {
-            // Only update ordering for keys that still exist in the shard.
-            if guard.data.contains_key(&key) {
-                shard_update_access_tracking(&mut guard, &key);
-            }
-        }
-
-        // Step 2: calculate the size of the new entry.
+        // Calculate the size of the new entry.
         let entry_size = shard_calculate_entry_size(&entry);
 
         // If the entry alone is larger than the full shard capacity, drop it silently
@@ -392,18 +378,15 @@ impl ShardedRamCache {
             return Ok(());
         }
 
-        // Step 3: evict until there is room for the new entry.
+        // Evict until there is room for the new entry.
         while guard.current_size + entry_size > guard.capacity && !guard.data.is_empty() {
-            let victim = match guard.eviction.eviction_algorithm {
-                CacheEvictionAlgorithm::LRU => shard_find_lru_victim(&guard),
-                CacheEvictionAlgorithm::TinyLFU => shard_find_tinylfu_victim(&guard),
-            };
+            let victim = shard_find_tinylfu_victim(&guard);
 
             if let Some(victim_key) = victim {
                 if let Some(evicted) = guard.data.remove(&victim_key) {
                     let evicted_size = shard_calculate_entry_size(&evicted);
                     guard.current_size = guard.current_size.saturating_sub(evicted_size);
-                    shard_remove_from_tracking(&mut guard, &victim_key);
+                    self.note_entry_removed(evicted_size);
                     // Track eviction for observability (Spec:
                     // compression-followup-fixes Requirement 3). Under the
                     // write lock, so plain-field updates are race-free.
@@ -412,14 +395,16 @@ impl ShardedRamCache {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+                    self.total_evictions.fetch_add(1, Ordering::Relaxed);
+                    self.last_eviction_ms
+                        .fetch_max(guard.last_eviction_ms, Ordering::Relaxed);
                     debug!(
                         "ShardedRamCache evicted key {} ({} bytes) from shard {}",
                         victim_key, evicted_size, idx
                     );
                 } else {
-                    // Victim key was in tracking but not in data — remove from tracking
-                    // and break to avoid an infinite loop.
-                    shard_remove_from_tracking(&mut guard, &victim_key);
+                    // The victim is chosen from `data` itself, so this is unreachable;
+                    // break rather than loop if it ever happens.
                     break;
                 }
             } else {
@@ -428,17 +413,18 @@ impl ShardedRamCache {
             }
         }
 
-        // Step 4: remove any existing entry for this key before inserting.
+        // Remove any existing entry for this key before inserting.
         if let Some(existing) = guard.data.remove(&cache_key) {
             let existing_size = shard_calculate_entry_size(&existing);
             guard.current_size = guard.current_size.saturating_sub(existing_size);
-            shard_remove_from_tracking(&mut guard, &cache_key);
+            self.note_entry_removed(existing_size);
         }
 
-        // Step 5: insert the new entry.
+        // Insert the new entry.
         guard.current_size += entry_size;
         guard.data.insert(cache_key.clone(), entry);
-        shard_add_to_tracking(&mut guard, &cache_key);
+        self.note_size_change(entry_size, 0);
+        self.total_entries.fetch_add(1, Ordering::Relaxed);
 
         debug!(
             "ShardedRamCache stored key {} ({} bytes) in shard {} (shard utilization: {}/{})",
@@ -451,9 +437,8 @@ impl ShardedRamCache {
     /// Invalidate a single key from the cache.
     ///
     /// Acquires a write lock on the one shard that owns `key`, removes the
-    /// entry from `shard.data`, updates `current_size`, and removes the key
-    /// from LRU/TinyLFU tracking.  If the key is not present the call is a
-    /// no-op and returns `Ok(())`.
+    /// entry from `shard.data` and updates `current_size`.  If the key is not
+    /// present the call is a no-op and returns `Ok(())`.
     ///
     /// _Requirements: 1.4_
     pub async fn invalidate(&self, key: &str) -> Result<()> {
@@ -463,7 +448,7 @@ impl ShardedRamCache {
         if let Some(entry) = guard.data.remove(key) {
             let entry_size = shard_calculate_entry_size(&entry);
             guard.current_size = guard.current_size.saturating_sub(entry_size);
-            shard_remove_from_tracking(&mut guard, key);
+            self.note_entry_removed(entry_size);
             debug!("ShardedRamCache invalidated key: {}", key);
         } else {
             debug!("ShardedRamCache invalidate: key not found: {}", key);
@@ -475,14 +460,13 @@ impl ShardedRamCache {
     /// Invalidate all entries whose cache key starts with `prefix`.
     ///
     /// Iterates **all** shards under exclusive write locks (one at a time),
-    /// removing matching entries and updating `current_size` and eviction
-    /// tracking for each.  Returns the total number of entries removed.
+    /// removing matching entries and updating `current_size` for each.  Returns the total number of entries removed.
     ///
     /// Used on the object overwrite path (`cache.rs`) to purge all range
     /// entries for an object in one call.
     ///
     /// _Requirements: 1.4_
-    pub async fn invalidate_by_prefix(&self, prefix: &str) -> Result<usize> {
+    pub(crate) async fn invalidate_by_prefix(&self, prefix: &str) -> Result<usize> {
         let mut total_removed = 0usize;
 
         for shard_lock in &self.shards {
@@ -499,7 +483,7 @@ impl ShardedRamCache {
                 if let Some(entry) = guard.data.remove(key) {
                     let entry_size = shard_calculate_entry_size(&entry);
                     guard.current_size = guard.current_size.saturating_sub(entry_size);
-                    shard_remove_from_tracking(&mut guard, key);
+                    self.note_entry_removed(entry_size);
                 }
             }
 
@@ -518,12 +502,11 @@ impl ShardedRamCache {
 
     /// Return aggregate statistics for the whole sharded cache.
     ///
-    /// Hit/miss counts are read from atomics (no lock needed).  Entry count,
-    /// `current_size`, `eviction_count`, and `last_eviction` are aggregated by
-    /// iterating all shards under shared read locks: eviction counts are summed
-    /// and the most recent per-shard eviction timestamp is returned (`None` if
-    /// nothing has been evicted).  The `eviction_algorithm` is read from the
-    /// first shard.
+    /// Takes no shard lock. Hit/miss counts, entry count, `current_size`, `eviction_count`
+    /// and `last_eviction` are read from aggregate atomics that every mutation updates under
+    /// the shard write lock it already holds, so each figure is exact once no mutation is in
+    /// flight (fields read during a mutation may come from either side of it).
+    /// `last_eviction` is `None` if nothing has been evicted.
     ///
     /// _Requirements: 1.1; compression-followup-fixes Req 3_
     pub async fn stats(&self) -> RamCacheStats {
@@ -539,22 +522,31 @@ impl ShardedRamCache {
 
         let max_size = self.max_size() as u64;
 
-        let mut current_size: u64 = 0;
-        let mut entries_count: u64 = 0;
-        let mut eviction_count: u64 = 0;
-        let mut last_eviction_ms: u64 = 0;
-        let mut eviction_algorithm = CacheEvictionAlgorithm::LRU;
-
-        for (i, shard_lock) in self.shards.iter().enumerate() {
-            let guard = shard_lock.read().await;
-            current_size += guard.current_size as u64;
-            entries_count += guard.data.len() as u64;
-            eviction_count += guard.eviction_count;
-            last_eviction_ms = last_eviction_ms.max(guard.last_eviction_ms);
-            if i == 0 {
-                eviction_algorithm = guard.eviction.eviction_algorithm.clone();
+        // Lock-free: the totals are maintained under each shard's write lock by every
+        // mutation, so this read never queues behind a writer.
+        #[cfg(test)]
+        let locked = STATS_UNDER_SHARD_LOCKS;
+        #[cfg(not(test))]
+        let locked = false;
+        let (current_size, entries_count, eviction_count, last_eviction_ms) = if locked {
+            let mut sums = (0u64, 0u64, 0u64, 0u64);
+            for shard_lock in self.shards.iter() {
+                let guard = shard_lock.read().await;
+                sums.0 += guard.current_size as u64;
+                sums.1 += guard.data.len() as u64;
+                sums.2 += guard.eviction_count;
+                sums.3 = sums.3.max(guard.last_eviction_ms);
             }
-        }
+            sums
+        } else {
+            (
+                self.total_size.load(Ordering::Relaxed),
+                self.total_entries.load(Ordering::Relaxed),
+                self.total_evictions.load(Ordering::Relaxed),
+                self.last_eviction_ms.load(Ordering::Relaxed),
+            )
+        };
+        let eviction_algorithm = self.eviction_algorithm.clone();
 
         let last_eviction = if last_eviction_ms == 0 {
             None
@@ -589,59 +581,6 @@ fn shard_calculate_entry_size(entry: &RamCacheEntry) -> usize {
     let data_size = entry.data.len();
     let metadata_size = std::mem::size_of::<CacheMetadata>();
     base_size + key_size + data_size + metadata_size
-}
-
-/// Add `key` to the shard's LRU eviction tracking.
-///
-/// TinyLFU is a no-op here: victim scoring (`shard_find_tinylfu_victim`) reads
-/// `access_count`/`last_accessed` directly from each entry's atomics at
-/// eviction time, so no separate window/frequency bookkeeping is needed.
-/// Equivalent to `RamCache::add_to_tracking`.
-fn shard_add_to_tracking(shard: &mut RamCacheShard, key: &str) {
-    match shard.eviction.eviction_algorithm {
-        CacheEvictionAlgorithm::LRU => {
-            shard.eviction.lru_order.push_back(key.to_string());
-        }
-        CacheEvictionAlgorithm::TinyLFU => {}
-    }
-}
-
-/// Remove `key` from the shard's LRU eviction tracking.
-///
-/// TinyLFU is a no-op (see `shard_add_to_tracking`).
-/// Equivalent to `RamCache::remove_from_tracking`.
-fn shard_remove_from_tracking(shard: &mut RamCacheShard, key: &str) {
-    match shard.eviction.eviction_algorithm {
-        CacheEvictionAlgorithm::LRU => {
-            if let Some(pos) = shard.eviction.lru_order.iter().position(|k| k == key) {
-                shard.eviction.lru_order.remove(pos);
-            }
-        }
-        CacheEvictionAlgorithm::TinyLFU => {}
-    }
-}
-
-/// Update LRU ordering for `key` on an access.
-///
-/// TinyLFU is a no-op (see `shard_add_to_tracking`).
-/// Equivalent to `RamCache::update_access_tracking`.
-fn shard_update_access_tracking(shard: &mut RamCacheShard, key: &str) {
-    match shard.eviction.eviction_algorithm {
-        CacheEvictionAlgorithm::LRU => {
-            // Move to back of LRU queue (most-recently used)
-            if let Some(pos) = shard.eviction.lru_order.iter().position(|k| k == key) {
-                shard.eviction.lru_order.remove(pos);
-            }
-            shard.eviction.lru_order.push_back(key.to_string());
-        }
-        CacheEvictionAlgorithm::TinyLFU => {}
-    }
-}
-
-/// Find the LRU victim key in a shard.
-/// Equivalent to `RamCache::find_lru_victim`.
-fn shard_find_lru_victim(shard: &RamCacheShard) -> Option<String> {
-    shard.eviction.lru_order.front().cloned()
 }
 
 /// Find the TinyLFU victim key in a shard.
@@ -717,6 +656,7 @@ mod sharded_tests {
             access_count: AtomicU64::new(0),
             compressed: false,
             compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+            verified_at: AtomicU64::new(now_ms),
         }
     }
 
@@ -766,7 +706,7 @@ mod sharded_tests {
     // -----------------------------------------------------------------
     #[tokio::test]
     async fn test_get_put_basic() {
-        let cache = ShardedRamCache::new(64 * 1024, 4, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(64 * 1024, 4, CacheEvictionAlgorithm::TinyLFU);
 
         let data = b"hello world";
         let entry = make_entry("test:basic:key", data);
@@ -810,7 +750,7 @@ mod sharded_tests {
         // capacity = 1 entry + a small margin (not enough for two).
         let capacity = one_entry_size + 16;
 
-        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::TinyLFU);
         cache.put(entry_a).await.unwrap();
 
         // Grab an Arc clone while key A is still live.
@@ -823,12 +763,12 @@ mod sharded_tests {
         // Now put a second entry that is large enough to force eviction of A.
         let _big_data = vec![0u8; capacity + 1];
         // This entry is too large for the shard — it will be silently dropped.
-        // So use an entry exactly as large as "A" to trigger LRU eviction of A.
+        // So use an entry exactly as large as "A" to trigger eviction of A.
         let entry_b = make_entry("evict:key:B", small_data);
         cache.put(entry_b).await.unwrap();
 
-        // A should now be evicted (LRU: A was added first, B was added second,
-        // the shard can hold at most one entry).
+        // A should now be evicted: the shard holds at most one entry, and A is the
+        // only resident entry when B's admission needs room.
         assert!(
             cache.get("evict:key:A").await.is_none(),
             "A must be evicted after B was inserted into the full shard"
@@ -856,7 +796,7 @@ mod sharded_tests {
             + small_data.len()
             + std::mem::size_of::<crate::cache_types::CacheMetadata>();
         // Capacity for exactly one entry (plus a small margin), one shard.
-        let cache = ShardedRamCache::new(one_entry_size + 16, 1, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(one_entry_size + 16, 1, CacheEvictionAlgorithm::TinyLFU);
 
         // Before any eviction: metric is zero / never.
         let before = cache.stats().await;
@@ -934,7 +874,7 @@ mod sharded_tests {
         let cache = ShardedRamCache::new_unclamped_for_test(
             total_capacity,
             shard_count,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
         );
 
         // Insert 3 entries into shard 0.
@@ -970,14 +910,14 @@ mod sharded_tests {
         const MIB: usize = 1024 * 1024;
 
         // 512 MiB / 8 configured shards -> 8 effective shards (512/64 = 8, no clamp).
-        let cache = ShardedRamCache::new(512 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(512 * MIB, 8, CacheEvictionAlgorithm::TinyLFU);
         assert_eq!(
             cache.shard_count, 8,
             "512 MiB / 8 shards must yield 8 effective shards"
         );
 
         // 256 MiB / 8 configured shards -> clamps to 4 effective shards (256/64 = 4).
-        let cache = ShardedRamCache::new(256 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(256 * MIB, 8, CacheEvictionAlgorithm::TinyLFU);
         assert_eq!(
             cache.shard_count, 4,
             "256 MiB / 8 shards must clamp to 4 effective shards"
@@ -985,14 +925,14 @@ mod sharded_tests {
 
         // 1 GiB / 8 configured shards -> capped AT the configured count (min() never
         // raises above what was configured, even though 1024/64 = 16 > 8).
-        let cache = ShardedRamCache::new(1024 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(1024 * MIB, 8, CacheEvictionAlgorithm::TinyLFU);
         assert_eq!(
             cache.shard_count, 8,
             "1 GiB / 8 configured shards must stay at the configured 8 (never increased)"
         );
 
         // 64 MiB / 8 configured shards -> clamps all the way down to 1 effective shard.
-        let cache = ShardedRamCache::new(64 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(64 * MIB, 8, CacheEvictionAlgorithm::TinyLFU);
         assert_eq!(
             cache.shard_count, 1,
             "64 MiB / 8 shards must clamp to 1 effective shard"
@@ -1024,7 +964,7 @@ mod sharded_tests {
         let payload = vec![0xABu8; payload_len];
 
         for total_capacity in [256 * MIB, 512 * MIB] {
-            let cache = ShardedRamCache::new(total_capacity, 8, CacheEvictionAlgorithm::LRU);
+            let cache = ShardedRamCache::new(total_capacity, 8, CacheEvictionAlgorithm::TinyLFU);
             cache.put(make_entry(key, &payload)).await.unwrap();
 
             let read = cache.get(key).await;
@@ -1055,7 +995,7 @@ mod sharded_tests {
         // 128 MiB / 8 configured -> clamps to 2 effective shards (128/64=2),
         // which is strictly less than the configured 8, so the warning path
         // in `new()` fires.
-        let cache = ShardedRamCache::new(128 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(128 * MIB, 8, CacheEvictionAlgorithm::TinyLFU);
         assert_eq!(cache.shard_count, 2, "128 MiB / 8 shards must clamp to 2");
 
         // The clamped cache must still be fully functional.
@@ -1094,7 +1034,7 @@ mod sharded_tests {
     // -----------------------------------------------------------------
     #[tokio::test]
     async fn test_shard_count_1_behaves_as_single_shard() {
-        let cache = ShardedRamCache::new(64 * 1024, 1, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(64 * 1024, 1, CacheEvictionAlgorithm::TinyLFU);
         assert_eq!(cache.shard_count, 1);
 
         let keys = ["single:a", "single:b", "single:c"];
@@ -1134,8 +1074,11 @@ mod sharded_tests {
     // -----------------------------------------------------------------
     #[tokio::test]
     async fn test_sub_page_hit_updates_page_access_count() {
-        let cache =
-            ShardedRamCache::new_unclamped_for_test(1024 * 1024, 4, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new_unclamped_for_test(
+            1024 * 1024,
+            4,
+            CacheEvictionAlgorithm::TinyLFU,
+        );
 
         let page_key = "bucket/object:range:0:4095";
         let page_data: Vec<u8> = (0u32..4096).map(|b| (b % 251) as u8).collect();
@@ -1196,7 +1139,7 @@ mod sharded_tests {
         let cache = Arc::new(ShardedRamCache::new_unclamped_for_test(
             64 * 1024,
             4,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
         ));
 
         cache
@@ -1252,71 +1195,58 @@ mod sharded_tests {
     }
 
     // -----------------------------------------------------------------
-    // Test 7: test_deferred_reorder_evicts_cold_first
-    // A hot key (accessed many times, triggering sampled pending_accesses
-    // recording) survives while a cold key (never re-accessed) is evicted
-    // when a new entry is inserted.
+    // Test 7: test_frequency_protects_older_hot_key
+    // A hot key inserted FIRST (so it is the least recently inserted) and then read
+    // many times survives, while a cold key inserted after it (more recent, never
+    // read) is evicted when a new entry needs room.
     //
-    // The deferred-reorder mechanism: every ~8th access (access_count % 8 == 0)
-    // the get() method tries a non-blocking try_write() to push the key onto
-    // pending_accesses.  The *next* put() drains pending_accesses to move the
-    // key to the back of the LRU queue.  So after ≥8 accesses and one put(),
-    // the hot key is at the back of LRU; cold keys remain at the front and are
-    // evicted first.
+    // Recency alone would evict the hot key, because it is the older of the two;
+    // only TinyLFU's frequency term keeps it. The keys are inserted in the order
+    // in which recency and frequency disagree, so a recency-only victim selection
+    // fails this test.
     // Validates: Requirement 4.4, 4.6, Property 6
     // -----------------------------------------------------------------
     #[tokio::test]
-    async fn test_deferred_reorder_evicts_cold_first() {
+    async fn test_frequency_protects_older_hot_key() {
         // One shard, capacity for exactly 2 entries of this size.
         let payload = vec![b'X'; 20];
         let one_entry_size = std::mem::size_of::<RamCacheEntry>()
-            + "deferred:hot".len()
+            + "frequency:hot".len()
             + payload.len()
             + std::mem::size_of::<crate::cache_types::CacheMetadata>();
-
-        // Capacity holds 2 entries; inserting a 3rd forces eviction of the LRU entry.
         let capacity = one_entry_size * 2 + 16;
-        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::LRU);
-
-        // Insert "cold" first (oldest in LRU queue) then "hot".
+        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::TinyLFU);
+        // "hot" first, so it is the older entry.
         cache
-            .put(make_entry("deferred:cold", &payload))
+            .put(make_entry("frequency:hot", &payload))
             .await
             .unwrap();
-        cache
-            .put(make_entry("deferred:hot", &payload))
-            .await
-            .unwrap();
-
-        // Access "hot" at least 8 times so that on access_count == 8 the sampled
-        // deferred-reorder path fires and records "deferred:hot" in pending_accesses.
         for _ in 0..9 {
-            cache.get("deferred:hot").await;
+            assert!(cache.get("frequency:hot").await.is_some());
         }
-
-        // Now insert a new entry.  put() drains pending_accesses first (moving
-        // "deferred:hot" to the back of the LRU queue), then evicts the entry at the
-        // front — which must be "deferred:cold".
         cache
-            .put(make_entry("deferred:new", &payload))
+            .put(make_entry("frequency:cold", &payload))
             .await
             .unwrap();
-
-        let hot_present = cache.get("deferred:hot").await.is_some();
-        let cold_present = cache.get("deferred:cold").await.is_some();
-        let new_present = cache.get("deferred:new").await.is_some();
-
+        // The third entry forces one eviction from the two-entry shard.
+        cache
+            .put(make_entry("frequency:new", &payload))
+            .await
+            .unwrap();
+        let hot_present = cache.get("frequency:hot").await.is_some();
+        let cold_present = cache.get("frequency:cold").await.is_some();
+        let new_present = cache.get("frequency:new").await.is_some();
         assert!(
             hot_present,
-            "hot key must survive — deferred LRU reorder should keep it at the back"
+            "hot key must survive: 9 reads give it a higher decayed frequency than the cold key, \
+             although it is the older entry"
         );
         assert!(new_present, "newly inserted key must be present");
         assert!(
             !cold_present,
-            "cold key must be evicted first (it was at the front of LRU queue)"
+            "cold key must be evicted: it was never read, so its decayed frequency is the lowest"
         );
     }
-
     /// Back-date `entry`'s `last_accessed` atomic to `idle_secs` ago, so eviction
     /// scoring sees it as idle without needing to actually sleep in the test.
     fn backdate(entry: &RamCacheEntry, idle_secs: u64) {
@@ -1589,7 +1519,7 @@ mod sharded_tests {
 
         // At the default 512 MiB / 8 shards, each shard is exactly the 64 MiB
         // admission ceiling — the worst case a full Page must still fit in.
-        let cache = ShardedRamCache::new(512 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        let cache = ShardedRamCache::new(512 * MIB, 8, CacheEvictionAlgorithm::TinyLFU);
         cache
             .put(make_entry(page_key, &page_data))
             .await
@@ -1617,5 +1547,173 @@ mod sharded_tests {
         let sub2_start = payload_len - 100;
         let sliced2 = &read.data[sub2_start..payload_len];
         assert_eq!(sliced2, &page_data[sub2_start..payload_len]);
+    }
+
+    /// RAM-hit latency measurement for cache-eviction-at-scale R10.1's hot-path claim.
+    /// Not an assertion: it prints nanoseconds per `get()` hit, single-task and with
+    /// eight tasks contending on one shard. Run with
+    /// `cargo test --release --lib ram_hit_latency_measurement -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn ram_hit_latency_measurement() {
+        const KEYS: usize = 256;
+        const GETS_PER_TASK: usize = 400_000;
+        const RUNS: usize = 7;
+        for algo in [CacheEvictionAlgorithm::TinyLFU] {
+            let cache = Arc::new(ShardedRamCache::new(64 * 1024 * 1024, 1, algo.clone()));
+            let keys: Arc<Vec<String>> =
+                Arc::new((0..KEYS).map(|i| format!("bench:key:{i}")).collect());
+            for k in keys.iter() {
+                cache.put(make_entry(k, &[7u8; 64])).await.unwrap();
+            }
+            for tasks in [1usize, 8] {
+                let mut samples = Vec::with_capacity(RUNS);
+                for _ in 0..RUNS {
+                    let start = std::time::Instant::now();
+                    let mut handles = Vec::with_capacity(tasks);
+                    for t in 0..tasks {
+                        let cache = cache.clone();
+                        let keys = keys.clone();
+                        handles.push(tokio::spawn(async move {
+                            let mut hits = 0usize;
+                            for i in 0..GETS_PER_TASK {
+                                if cache.get(&keys[(i + t) % KEYS]).await.is_some() {
+                                    hits += 1;
+                                }
+                            }
+                            hits
+                        }));
+                    }
+                    let mut hits = 0usize;
+                    for h in handles {
+                        hits += h.await.unwrap();
+                    }
+                    assert_eq!(hits, tasks * GETS_PER_TASK);
+                    let ns = start.elapsed().as_nanos() as f64 / (tasks * GETS_PER_TASK) as f64;
+                    samples.push(ns);
+                }
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!(
+                    "RAM_HIT_LATENCY algo={:?} tasks={} ns_per_get median={:.1} min={:.1} max={:.1}",
+                    algo,
+                    tasks,
+                    samples[RUNS / 2],
+                    samples[0],
+                    samples[RUNS - 1]
+                );
+            }
+        }
+    }
+}
+
+/// the stats read takes no shard lock and its figures stay exact.
+#[cfg(test)]
+mod lock_free_stats_tests {
+    use super::*;
+    use crate::cache::CacheEvictionAlgorithm;
+    use std::sync::Arc;
+
+    fn entry(key: &str, len: usize) -> RamCacheEntry {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        RamCacheEntry {
+            cache_key: key.to_string(),
+            data: Arc::new(bytes::Bytes::from(vec![1u8; len])),
+            metadata: crate::cache_types::CacheMetadata {
+                etag: "e".to_string(),
+                last_modified: "m".to_string(),
+                content_length: len as u64,
+                part_number: None,
+                cache_control: None,
+                access_count: 0,
+                last_accessed: SystemTime::now(),
+            },
+            created_at: SystemTime::now(),
+            last_accessed: AtomicU64::new(now_ms),
+            access_count: AtomicU64::new(0),
+            compressed: false,
+            compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+            verified_at: AtomicU64::new(now_ms),
+        }
+    }
+
+    /// The sums over shards, under their read locks: the figures the atomics must equal.
+    async fn locked_sums(cache: &ShardedRamCache) -> (u64, u64, u64) {
+        let mut sums = (0u64, 0u64, 0u64);
+        for shard in &cache.shards {
+            let g = shard.read().await;
+            sums.0 += g.current_size as u64;
+            sums.1 += g.data.len() as u64;
+            sums.2 += g.eviction_count;
+        }
+        sums
+    }
+
+    /// A scrape completes while a writer holds every shard's write lock.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `STATS_UNDER_SHARD_LOCKS` set, `stats()` waits for the write locks and the
+    /// timeout fires.
+    #[tokio::test]
+    async fn a_scrape_completes_while_a_writer_holds_every_shard_lock() {
+        let cache =
+            ShardedRamCache::new_unclamped_for_test(1 << 20, 4, CacheEvictionAlgorithm::TinyLFU);
+        cache.put(entry("a", 100)).await.unwrap();
+        cache.put(entry("b", 200)).await.unwrap();
+        let expected = locked_sums(&cache).await;
+        let mut guards = Vec::new();
+        for shard in &cache.shards {
+            guards.push(shard.write().await);
+        }
+        let stats =
+            tokio::time::timeout(std::time::Duration::from_millis(500), cache.stats()).await;
+        drop(guards);
+        let stats = stats.expect(
+            "BLOCKED: stats() did not complete within 500 ms while every shard's write lock was held",
+        );
+        assert_eq!(
+            (
+                stats.current_size,
+                stats.entries_count,
+                stats.eviction_count
+            ),
+            expected
+        );
+    }
+
+    /// The atomics equal the shard sums after puts, replacements, capacity evictions,
+    /// single-key and prefix invalidations.
+    #[tokio::test]
+    async fn the_lock_free_totals_equal_the_shard_sums_after_every_mutation() {
+        let cache =
+            ShardedRamCache::new_unclamped_for_test(4096, 2, CacheEvictionAlgorithm::TinyLFU);
+        for i in 0..40 {
+            cache.put(entry(&format!("k/{i}"), 100 + i)).await.unwrap();
+            let s = cache.stats().await;
+            assert_eq!(
+                (s.current_size, s.entries_count, s.eviction_count),
+                locked_sums(&cache).await,
+                "after put {i}"
+            );
+        }
+        assert!(
+            cache.stats().await.eviction_count > 0,
+            "FIXTURE: must evict"
+        );
+        cache.put(entry("k/39", 10)).await.unwrap();
+        cache.invalidate("k/38").await.unwrap();
+        cache.invalidate("absent").await.unwrap();
+        cache.invalidate_by_prefix("k/3").await.unwrap();
+        let s = cache.stats().await;
+        assert_eq!(
+            (s.current_size, s.entries_count, s.eviction_count),
+            locked_sums(&cache).await
+        );
+        cache.invalidate_by_prefix("k/").await.unwrap();
+        let s = cache.stats().await;
+        assert_eq!((s.current_size, s.entries_count), (0, 0));
     }
 }

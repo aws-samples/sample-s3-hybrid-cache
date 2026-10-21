@@ -8,7 +8,7 @@
 //! [`suffix_page_target`]. Spec: `page-aligned-range-cache`.
 
 use crate::cache::{CacheManager, Range};
-use crate::cache_types::{ObjectMetadata, StoredFreshness};
+use crate::cache_types::StoredFreshness;
 use crate::disk_cache::DiskCacheManager;
 use crate::{ProxyError, Result};
 use bytes::Bytes;
@@ -187,8 +187,12 @@ pub enum SuffixPageTarget {
 /// here indicates a caller bug, not a runtime/user-input condition).
 ///
 /// # Example
-/// ```
-/// # use s3_proxy::range_handler::page_bounds;
+/// Not a doctest: this function is `pub(crate)`, and a doctest compiles as a
+/// separate crate, so it could only reach this name by widening the visibility
+/// back to `pub`. The executable equivalent is `page_bounds_second_page` in this
+/// file's test module, alongside five siblings and the property test
+/// `prop_page_bounds_contains_start_and_never_exceeds_size`.
+/// ```text
 /// // A 100 MiB object, 16 MiB pages: offset 20 MiB falls in the second page.
 /// let p = 16 * 1024 * 1024;
 /// let size = 100 * 1024 * 1024;
@@ -196,7 +200,7 @@ pub enum SuffixPageTarget {
 /// ```
 ///
 /// Spec: page-aligned-range-cache Requirement 3.1, Page model (design.md).
-pub fn page_bounds(start: u64, page_size: u64, size: u64) -> (u64, u64) {
+pub(crate) fn page_bounds(start: u64, page_size: u64, size: u64) -> (u64, u64) {
     assert!(page_size > 0, "page_size must be > 0");
     assert!(size > 0, "size must be > 0");
 
@@ -218,8 +222,12 @@ pub fn page_bounds(start: u64, page_size: u64, size: u64) -> (u64, u64) {
 /// is 0 — see [`page_bounds`].
 ///
 /// # Example
-/// ```
-/// # use s3_proxy::range_handler::overlapping_pages;
+/// Not a doctest: this function is `pub(crate)`, and a doctest compiles as a
+/// separate crate, so it could only reach this name by widening the visibility
+/// back to `pub`. The executable equivalent is
+/// `overlapping_pages_straddle_returns_two_pages_in_order` in this file's test
+/// module, alongside four siblings and two property tests.
+/// ```text
 /// let p = 16 * 1024 * 1024;
 /// let size = 100 * 1024 * 1024;
 /// // A read that straddles the boundary between page 0 and page 1.
@@ -230,7 +238,7 @@ pub fn page_bounds(start: u64, page_size: u64, size: u64) -> (u64, u64) {
 /// ```
 ///
 /// Spec: page-aligned-range-cache Requirement 3.1, 3.5.
-pub fn overlapping_pages(
+pub(crate) fn overlapping_pages(
     start: u64,
     end: u64,
     page_size: u64,
@@ -269,8 +277,13 @@ pub fn overlapping_pages(
 /// Panics if `n` is 0, or if `page_size` is 0 when `size` is `Some`.
 ///
 /// # Example
-/// ```
-/// # use s3_proxy::range_handler::{suffix_page_target, SuffixPageTarget};
+/// Not a doctest: this function is `pub(crate)`, and a doctest compiles as a
+/// separate crate, so it could only reach this name by widening the visibility
+/// back to `pub`. The executable equivalents are
+/// `suffix_page_target_size_unknown_returns_sentinel` and
+/// `suffix_page_target_size_known_cold_maps_to_last_page` in this file's test
+/// module, alongside three siblings and three property tests.
+/// ```text
 /// let p = 16 * 1024 * 1024;
 /// // Size unknown: caller must fall back to bytes=-P.
 /// assert_eq!(suffix_page_target(1024, p, None), SuffixPageTarget::SizeUnknown);
@@ -283,7 +296,7 @@ pub fn overlapping_pages(
 /// ```
 ///
 /// Spec: page-aligned-range-cache Requirement 3.2, 3.3.
-pub fn suffix_page_target(n: u64, page_size: u64, size: Option<u64>) -> SuffixPageTarget {
+pub(crate) fn suffix_page_target(n: u64, page_size: u64, size: Option<u64>) -> SuffixPageTarget {
     assert!(n > 0, "suffix length must be > 0");
 
     let Some(size) = size else {
@@ -323,7 +336,7 @@ pub struct RangeOverlap {
     /// deliberately: it is read at a dozen sites and its meaning has not changed.
     pub can_serve_from_cache: bool,
     /// Stored-expiry state of the entry this coverage came from
-    /// (`.kiro/specs/expired-entry-revalidation/` R1.2).
+    /// (the expired entry revalidation feature R1.2).
     ///
     /// Only ever [`crate::cache_types::StoredFreshness::Expired`] when the lookup was made with
     /// [`crate::cache_types::RangeLookupPurpose::RevalidationCandidate`]; a `FreshServe` lookup
@@ -406,6 +419,60 @@ pub enum RangeMergeSource {
     },
 }
 
+/// Message prefix of the `ProxyError::S3Error` that
+/// [`RangeHandler::merge_ranges_with_fallback`] returns when its complete refetch
+/// shows the object changed (a `412` on the proxy-added `If-Match`, or a different
+/// ETag). Recognise it with [`is_merge_refetch_version_change`].
+pub const MERGE_REFETCH_VERSION_CHANGED: &str =
+    "merge fallback refetch returned another version of the object";
+
+/// Whether `error` is the merge fallback's version-change refusal. A caller must
+/// not serve anything under the cached headers on it; the cached version is gone
+/// from S3, so the key is invalidated and the client's request forwarded.
+pub fn is_merge_refetch_version_change(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::S3Error(msg) if msg.starts_with(MERGE_REFETCH_VERSION_CHANGED))
+}
+
+/// Prefix of the error the disk loaders return when the `.meta` they re-read lists the
+/// extent under another version than the lookup labelled it with, or does not list it while
+/// pending journal `Add`s for it record only other versions. An extent nothing lists is the
+/// missing-file error instead, so the caller's recovery refetches it. Recognise it with
+/// [`is_listed_under_another_version`].
+pub(crate) const LISTED_UNDER_ANOTHER_VERSION: &str =
+    "cached extent is listed under another version than the lookup's";
+
+/// Whether two documents of an object, neither recording an ETag, name different versions by
+/// the `Last-Modified` each records. The ETag identifies a version; an origin that sends
+/// none is judged by the `Last-Modified` it does send, compared as an instant so that two
+/// spellings of one date are one version. A side with no value is no evidence either way, and
+/// two versions with the same `Last-Modified` second cannot be told apart. False whenever
+/// either side records an ETag: the ETag comparison decides then.
+pub(crate) fn etagless_versions_differ(
+    etag_a: &str,
+    last_modified_a: &str,
+    etag_b: &str,
+    last_modified_b: &str,
+) -> bool {
+    if !etag_a.is_empty() || !etag_b.is_empty() {
+        return false;
+    }
+    let (a, b) = (last_modified_a.trim(), last_modified_b.trim());
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    match (httpdate::parse_http_date(a), httpdate::parse_http_date(b)) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => a != b,
+    }
+}
+
+/// Whether `error` is the loaders' refusal of a listing of another version. The cached copy is
+/// not shown stale (a newer version may be what is listed), so a caller forwards the client's
+/// request uncached rather than refetching under the old version's `If-Match` and invalidating.
+pub(crate) fn is_listed_under_another_version(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::CacheError(msg) if msg.starts_with(LISTED_UNDER_ANOTHER_VERSION))
+}
+
 /// Result of range merging operation with metrics
 #[derive(Debug)]
 pub struct RangeMergeResult {
@@ -447,7 +514,7 @@ impl RangeHandler {
     }
 
     /// Get reference to disk cache manager for TTL operations
-    pub fn get_disk_cache_manager(&self) -> &Arc<tokio::sync::RwLock<DiskCacheManager>> {
+    pub(crate) fn get_disk_cache_manager(&self) -> &Arc<tokio::sync::RwLock<DiskCacheManager>> {
         &self.disk_cache_manager
     }
 
@@ -457,7 +524,7 @@ impl RangeHandler {
     }
 
     /// Parse HTTP Range header and validate byte ranges - Requirements 3.1, 3.5
-    pub fn parse_range_header(
+    pub(crate) fn parse_range_header(
         &self,
         range_header: &str,
         content_length: Option<u64>,
@@ -637,15 +704,15 @@ impl RangeHandler {
         Ok(())
     }
     /// Convert range specification to HTTP Content-Range header value
-    pub fn build_content_range_header(&self, range: &RangeSpec, content_length: u64) -> String {
+    pub(crate) fn build_content_range_header(
+        &self,
+        range: &RangeSpec,
+        content_length: u64,
+    ) -> String {
         format!("bytes {}-{}/{}", range.start, range.end, content_length)
     }
-    /// Check if two ranges overlap
-    pub fn ranges_overlap(&self, range1: &RangeSpec, range2: &RangeSpec) -> bool {
-        !(range1.end < range2.start || range2.end < range1.start)
-    }
     /// Merge overlapping or adjacent ranges
-    pub fn merge_ranges(&self, ranges: &[RangeSpec]) -> Vec<RangeSpec> {
+    pub(crate) fn merge_ranges(&self, ranges: &[RangeSpec]) -> Vec<RangeSpec> {
         if ranges.is_empty() {
             return Vec::new();
         }
@@ -673,6 +740,23 @@ impl RangeHandler {
     }
 }
 
+/// Whether a client's raw `Range` header names exactly `requested`.
+///
+/// `Some(true)`/`Some(false)` for the absolute `bytes=a-b` form. `None` for the suffix
+/// (`bytes=-n`) and open-ended (`bytes=a-`) forms, which cannot be compared without the
+/// object length; a caller then forwards the header verbatim and relies on the
+/// response-size validation that follows every fallback fetch.
+pub(crate) fn signed_client_range_covers(raw: &str, requested: &RangeSpec) -> Option<bool> {
+    let spec = raw.trim().strip_prefix("bytes=")?.trim();
+    let (start, end) = spec.split_once('-')?;
+    if start.trim().is_empty() || end.trim().is_empty() {
+        return None;
+    }
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    Some(start == requested.start && end == requested.end)
+}
+
 impl RangeHandler {
     /// Find cached ranges that overlap with requested range - Requirements 3.2, 3.3
     ///
@@ -692,7 +776,7 @@ impl RangeHandler {
     /// - Logs ETag mismatch warning
     /// - Treats all cached ranges as missing (returns empty cached_ranges)
     /// - Caller should invalidate stale ranges and fetch fresh data from S3
-    /// # `purpose` (`.kiro/specs/expired-entry-revalidation/`, R1.1-R1.5)
+    /// # `purpose` (the expired entry revalidation feature, R1.1-R1.5)
     ///
     /// Passed straight through to [`crate::disk_cache::DiskCacheManager::find_cached_ranges`], which
     /// owns the stored-expiry decision. The resulting
@@ -736,6 +820,46 @@ impl RangeHandler {
             disk_cache.get_metadata(cache_key).await?
         };
 
+        // The preloaded document may be this instance's RAM metadata snapshot, which can lag
+        // the shared `.meta` by up to `metadata_cache.refresh_interval`, while `current_etag`
+        // is read from the shared `.meta`. When they disagree, re-read the shared `.meta`
+        // before treating it as a version change: if it agrees with `current_etag`, the RAM
+        // snapshot is the stale side (typically a peer's overwrite), so drop it and its RAM
+        // ranges and continue with the shared document. Invalidating on the snapshot's word
+        // would delete the NEW version's range files from shared storage.
+        let mut lookup_preloaded = preloaded_metadata;
+        let mut metadata_opt = metadata_opt;
+        if let (Some(current), Some(preloaded)) = (current_etag, preloaded_metadata) {
+            if !crate::revalidation::etags_equal_ignoring_quotes(
+                current,
+                &preloaded.object_metadata.etag,
+            ) {
+                let shared = disk_cache.get_metadata(cache_key).await?;
+                if let Some(shared) = shared.filter(|m| {
+                    crate::revalidation::etags_equal_ignoring_quotes(
+                        current,
+                        &m.object_metadata.etag,
+                    )
+                }) {
+                    info!(
+                        "Preloaded metadata is stale against the shared .meta; dropping the RAM snapshot and using the shared document: cache_key={}, snapshot_etag={}, shared_etag={}",
+                        cache_key, preloaded.object_metadata.etag, shared.object_metadata.etag
+                    );
+                    self.cache_manager
+                        .invalidate_metadata_cache(cache_key)
+                        .await;
+                    if let Err(e) = self.cache_manager.invalidate_ram_ranges(cache_key).await {
+                        warn!(
+                            "Failed to drop RAM ranges of a stale metadata snapshot: cache_key={}, error={}",
+                            cache_key, e
+                        );
+                    }
+                    metadata_opt = Some(shared);
+                    lookup_preloaded = None;
+                }
+            }
+        }
+
         if let Some(metadata) = metadata_opt {
             debug!(
                 "[CACHE_LOOKUP] Found new-format metadata: cache_key={}, ranges_count={}, etag={}",
@@ -747,7 +871,11 @@ impl RangeHandler {
             // Requirement 3.3: ETag mismatch detection and invalidation
             // If current_etag is provided, compare with cached metadata ETag
             if let Some(current_etag) = current_etag {
-                if current_etag != metadata.object_metadata.etag {
+                // Quote-tolerant: older multipart entries were stored unquoted.
+                if !crate::revalidation::etags_equal_ignoring_quotes(
+                    current_etag,
+                    &metadata.object_metadata.etag,
+                ) {
                     warn!(
                         "ETag mismatch detected for cache_key: {}, cached_etag: {}, current_etag: {}, action: invalidating stale ranges",
                         cache_key, metadata.object_metadata.etag, current_etag
@@ -778,6 +906,10 @@ impl RangeHandler {
                             cache_key, e
                         );
                     }
+                    // And the RAM metadata snapshot of the document just invalidated.
+                    self.cache_manager
+                        .invalidate_metadata_cache(cache_key)
+                        .await;
 
                     // Return empty cached ranges, forcing a fetch from S3
                     return Ok(RangeOverlap::all_missing(requested_range));
@@ -802,88 +934,67 @@ impl RangeHandler {
                 "[CACHE_LOOKUP] Calling disk_cache.find_cached_ranges: cache_key={}, requested_range={}-{}",
                 cache_key, requested_range.start, requested_range.end
             );
+            // Coverage from the document the lookup is labelled from (`metadata`): the shared
+            // `.meta` when the snapshot was dropped above, else the caller's preload. Passing
+            // the caller's preload there took one document's extents under the other's ETag
+            // No preload stays `None`, so the callee's own `.meta` read is unchanged.
             let lookup = disk_cache
                 .find_cached_ranges(
                     cache_key,
                     requested_range.start,
                     requested_range.end,
-                    preloaded_metadata,
+                    preloaded_metadata.map(|_| &metadata),
                     purpose,
                 )
                 .await?;
-            let stored_freshness = lookup.stored_freshness;
-            let overlapping_range_specs = lookup.ranges;
-
             debug!(
                 "[CACHE_LOOKUP] disk_cache.find_cached_ranges returned: cache_key={}, overlapping_ranges_count={}, purpose={:?}, stored_freshness={:?}",
                 cache_key,
-                overlapping_range_specs.len(),
+                lookup.ranges.len(),
                 purpose,
-                stored_freshness
+                lookup.stored_freshness
             );
 
-            if !overlapping_range_specs.is_empty() {
-                debug!(
-                    "[CACHE_LOOKUP] Found overlapping ranges in new storage: cache_key={}, count={}",
-                    cache_key, overlapping_range_specs.len()
-                );
+            let overlap = self.overlap_from_lookup(cache_key, requested_range, &metadata, lookup);
 
-                // Requirement 1.4: Log each overlapping range for debugging
-                for (i, range_spec) in overlapping_range_specs.iter().enumerate() {
-                    debug!(
-                        "[CACHE_LOOKUP] Overlapping range {}: cache_key={}, start={}, end={}, compression={:?}",
-                        i, cache_key, range_spec.start, range_spec.end, range_spec.compression_algorithm
-                    );
+            // `ram-tier-effectiveness:R1.2`. A Metadata_Cache entry is NOT
+            // authoritative for the ABSENCE of cached ranges, so a verdict of
+            // "not covered" taken from a possibly-resident document has to be
+            // confirmed against Shared_Storage before it becomes a miss. The
+            // resident copy is a snapshot bounded by
+            // `metadata_cache.refresh_interval`, and inside that window another
+            // instance's consolidation can have extended the shared `.meta` with
+            // ranges whose `.bin` files are already on this volume. Without the
+            // confirmation the GET refetches from S3 bytes that are cached
+            // locally — a cost defect, never a correctness one.
+            //
+            // THE COVERED BRANCH IS UNTOUCHED, AND THAT IS THE POINT.
+            // The v1.9.4 fix rejected re-reading the shared `.meta` on every
+            // GET for exactly this class of entry, and re-introducing that would
+            // be a regression dressed as a fix. The guard below is structurally
+            // inside `!overlap.can_serve_from_cache`: nothing was added before
+            // the lookup or before the coverage computation, so a covered
+            // request executes the same statements and performs the same reads as
+            // it did before this change. The branch it does sit on is the one
+            // that proceeds to a full S3 fetch today, so one `.meta` read there
+            // is strictly cheaper than the status quo.
+            if !overlap.can_serve_from_cache && lookup_preloaded.is_some() {
+                if let Some(confirmed) = self
+                    .confirm_absence_against_shared_storage(
+                        &disk_cache,
+                        cache_key,
+                        requested_range,
+                        current_etag,
+                        &metadata,
+                        purpose,
+                    )
+                    .await
+                {
+                    return Ok(confirmed);
                 }
-
-                // Convert NewRangeSpec to old Range format for compatibility
-                // Note: We don't load the data yet - that happens when serving
-                let mut overlapping_ranges = Vec::new();
-                let mut covered_ranges = Vec::new();
-
-                for range_spec in &overlapping_range_specs {
-                    // Create a Range struct without data (will be loaded on demand)
-                    overlapping_ranges.push(Range {
-                        start: range_spec.start,
-                        end: range_spec.end,
-                        data: Vec::new(), // Data will be loaded when needed
-                        etag: metadata.object_metadata.etag.clone(),
-                        last_modified: metadata.object_metadata.last_modified.clone(),
-                        compression_algorithm: range_spec.compression_algorithm.clone(),
-                    });
-
-                    // Calculate the intersection with requested range
-                    let intersection_start = std::cmp::max(requested_range.start, range_spec.start);
-                    let intersection_end = std::cmp::min(requested_range.end, range_spec.end);
-
-                    covered_ranges.push(RangeSpec {
-                        start: intersection_start,
-                        end: intersection_end,
-                    });
-                }
-
-                // Calculate missing ranges
-                let missing_ranges =
-                    self.calculate_missing_ranges(requested_range, &covered_ranges);
-                let can_serve_from_cache = missing_ranges.is_empty();
-
-                debug!(
-                    "[CACHE_LOOKUP] Cache lookup result: cache_key={}, overlapping_ranges={}, missing_ranges={}, requested_range={}-{}, can_serve_from_cache={}, stored_freshness={:?}",
-                    cache_key, overlapping_ranges.len(), missing_ranges.len(), requested_range.start, requested_range.end, can_serve_from_cache, stored_freshness
-                );
-
-                return Ok(RangeOverlap {
-                    cached_ranges: overlapping_ranges,
-                    missing_ranges,
-                    can_serve_from_cache,
-                    stored_freshness,
-                });
-            } else {
-                debug!(
-                    "[CACHE_LOOKUP] No overlapping ranges found in new storage: cache_key={}",
-                    cache_key
-                );
             }
+
+            return Ok(overlap);
         } else {
             debug!(
                 "[CACHE_LOOKUP] No new-format metadata found: cache_key={}",
@@ -900,6 +1011,238 @@ impl RangeHandler {
             cache_key
         );
         Ok(RangeOverlap::all_missing(requested_range))
+    }
+
+    /// Turn a completed range lookup into the coverage verdict callers branch on.
+    ///
+    /// Split out of [`RangeHandler::find_cached_ranges`] so the same computation can be
+    /// run twice against two metadata sources — the possibly-resident document the
+    /// caller preloaded, and the shared `.meta` — without the second run being a
+    /// paraphrase of the first. Two copies of this arithmetic would be two chances for
+    /// the confirmation in `R1.2` to disagree with the verdict it is confirming.
+    fn overlap_from_lookup(
+        &self,
+        cache_key: &str,
+        requested_range: &RangeSpec,
+        metadata: &crate::cache_types::NewCacheMetadata,
+        lookup: crate::cache_types::RangeLookupResult,
+    ) -> RangeOverlap {
+        let stored_freshness = lookup.stored_freshness;
+        let overlapping_range_specs = lookup.ranges;
+
+        if overlapping_range_specs.is_empty() {
+            debug!(
+                "[CACHE_LOOKUP] No overlapping ranges found in new storage: cache_key={}",
+                cache_key
+            );
+            return RangeOverlap::all_missing(requested_range);
+        }
+
+        debug!(
+            "[CACHE_LOOKUP] Found overlapping ranges in new storage: cache_key={}, count={}",
+            cache_key,
+            overlapping_range_specs.len()
+        );
+
+        // Requirement 1.4: Log each overlapping range for debugging
+        for (i, range_spec) in overlapping_range_specs.iter().enumerate() {
+            debug!(
+                        "[CACHE_LOOKUP] Overlapping range {}: cache_key={}, start={}, end={}, compression={:?}",
+                        i, cache_key, range_spec.start, range_spec.end, range_spec.compression_algorithm
+                    );
+        }
+
+        // Convert NewRangeSpec to old Range format for compatibility
+        // Note: We don't load the data yet - that happens when serving
+        let mut overlapping_ranges = Vec::new();
+        let mut covered_ranges = Vec::new();
+
+        for range_spec in &overlapping_range_specs {
+            // Create a Range struct without data (will be loaded on demand)
+            overlapping_ranges.push(Range {
+                start: range_spec.start,
+                end: range_spec.end,
+                data: Vec::new(), // Data will be loaded when needed
+                etag: metadata.object_metadata.etag.clone(),
+                last_modified: metadata.object_metadata.last_modified.clone(),
+                compression_algorithm: range_spec.compression_algorithm.clone(),
+            });
+
+            // Calculate the intersection with requested range
+            let intersection_start = std::cmp::max(requested_range.start, range_spec.start);
+            let intersection_end = std::cmp::min(requested_range.end, range_spec.end);
+
+            covered_ranges.push(RangeSpec {
+                start: intersection_start,
+                end: intersection_end,
+            });
+        }
+
+        // Calculate missing ranges
+        let missing_ranges = self.calculate_missing_ranges(requested_range, &covered_ranges);
+        let can_serve_from_cache = missing_ranges.is_empty();
+
+        debug!(
+                    "[CACHE_LOOKUP] Cache lookup result: cache_key={}, overlapping_ranges={}, missing_ranges={}, requested_range={}-{}, can_serve_from_cache={}, stored_freshness={:?}",
+                    cache_key, overlapping_ranges.len(), missing_ranges.len(), requested_range.start, requested_range.end, can_serve_from_cache, stored_freshness
+                );
+
+        RangeOverlap {
+            cached_ranges: overlapping_ranges,
+            missing_ranges,
+            can_serve_from_cache,
+            stored_freshness,
+        }
+    }
+
+    /// `ram-tier-effectiveness:R1.2`: confirm a not-covered verdict against Shared_Storage
+    /// before it becomes a miss.
+    ///
+    /// Returns `Some(overlap)` only when the shared `.meta` covers the request in full —
+    /// i.e. only when the verdict the caller was about to take is demonstrably wrong.
+    /// `None` means "nothing learned, keep the verdict you have", which is every other
+    /// outcome: the shared document is the one already evaluated, the object is gone, the
+    /// read failed, or the disk document does not cover either.
+    ///
+    /// # Why a full-coverage test and not "whatever disk covers"
+    ///
+    /// Taking disk's *partial* coverage instead would also shrink the S3 fetch, and it is
+    /// deliberately not done here. `missing_ranges` is consumed by the merge, gap-repair
+    /// and page-widening paths, so changing its shape on a branch that stays a miss either
+    /// way widens this change from "a miss becomes a hit" to "every partial miss is
+    /// reshaped". The requirement is about the miss *classification*; the classification is
+    /// what this returns.
+    ///
+    /// # Exactly one extra Shared_Storage read, and only on this branch
+    ///
+    /// `get_metadata` reads the `.meta`; the second `find_cached_ranges` is then handed
+    /// that document as `preloaded`, so it does no I/O of its own beyond the journal
+    /// fallback the first lookup would have taken anyway. The `ranges`-equality early
+    /// return below skips even that when the shared document is the one already evaluated.
+    async fn confirm_absence_against_shared_storage(
+        &self,
+        disk_cache: &DiskCacheManager,
+        cache_key: &str,
+        requested_range: &RangeSpec,
+        current_etag: Option<&str>,
+        evaluated: &crate::cache_types::NewCacheMetadata,
+        purpose: crate::cache_types::RangeLookupPurpose,
+    ) -> Option<RangeOverlap> {
+        // A preloaded document cannot have come from a tier that is switched off, so
+        // there is nothing for this instance to be behind. Config-static, so this cannot
+        // silently disable the guard on a running proxy the way an eviction-sensitive
+        // residency test could.
+        if !self.cache_manager.get_metadata_cache().is_enabled() {
+            return None;
+        }
+
+        let shared = match disk_cache.get_metadata(cache_key).await {
+            Ok(Some(shared)) => shared,
+            Ok(None) => {
+                // The shared `.meta` is gone. Disk is authoritative for presence, so the
+                // caller's miss stands.
+                debug!(
+                    "[R1.2] Shared .meta absent, not-covered verdict confirmed: cache_key={}",
+                    cache_key
+                );
+                return None;
+            }
+            Err(e) => {
+                // A transient read failure must not manufacture coverage. Keep the
+                // caller's verdict, which is the pre-change behaviour.
+                warn!(
+                    "[R1.2] Could not read shared .meta to confirm a not-covered verdict, \
+                     keeping it: cache_key={}, error={}",
+                    cache_key, e
+                );
+                return None;
+            }
+        };
+
+        if shared.ranges == evaluated.ranges {
+            debug!(
+                "[R1.2] Shared .meta carries the same {} range(s) already evaluated, \
+                 not-covered verdict confirmed: cache_key={}",
+                shared.ranges.len(),
+                cache_key
+            );
+            return None;
+        }
+
+        // The caller's own ETag check ran against the document it preloaded. Re-apply it
+        // to the shared document rather than inheriting that result: this is a different
+        // document, and coverage from a superseded version must not be served.
+        if let Some(current_etag) = current_etag {
+            if !crate::revalidation::etags_equal_ignoring_quotes(
+                current_etag,
+                &shared.object_metadata.etag,
+            ) {
+                debug!(
+                    "[R1.2] Shared .meta carries a different ETag than the request \
+                     validator, not-covered verdict confirmed: cache_key={}, \
+                     shared_etag={}, current_etag={}",
+                    cache_key, shared.object_metadata.etag, current_etag
+                );
+                return None;
+            }
+        }
+
+        let lookup = match disk_cache
+            .find_cached_ranges(
+                cache_key,
+                requested_range.start,
+                requested_range.end,
+                Some(&shared),
+                purpose,
+            )
+            .await
+        {
+            Ok(lookup) => lookup,
+            Err(e) => {
+                warn!(
+                    "[R1.2] Range lookup against the shared .meta failed, keeping the \
+                     not-covered verdict: cache_key={}, error={}",
+                    cache_key, e
+                );
+                return None;
+            }
+        };
+
+        let confirmed = self.overlap_from_lookup(cache_key, requested_range, &shared, lookup);
+        if !confirmed.can_serve_from_cache {
+            debug!(
+                "[R1.2] Shared .meta does not cover the request either, not-covered \
+                 verdict confirmed: cache_key={}, shared_ranges={}, requested_range={}-{}",
+                cache_key,
+                shared.ranges.len(),
+                requested_range.start,
+                requested_range.end
+            );
+            return None;
+        }
+
+        // The resident copy is behind the shared `.meta` for this key, and it is the only
+        // reason the request was about to be classified a miss. Dropping it is the same
+        // convergence argument the two `has_cached_ranges` guards make: without it every
+        // request inside the remaining `refresh_interval` re-reads the same superseded
+        // document and pays this confirmation again.
+        self.cache_manager
+            .invalidate_metadata_cache(cache_key)
+            .await;
+
+        info!(
+            "[R1.2] Shared .meta covers a request a preloaded metadata document reported as \
+             missing: cache_key={}, requested_range={}-{}, evaluated_ranges={}, \
+             shared_ranges={}. Serving from cache instead of refetching from S3; the stale \
+             resident metadata entry has been dropped",
+            cache_key,
+            requested_range.start,
+            requested_range.end,
+            evaluated.ranges.len(),
+            shared.ranges.len()
+        );
+
+        Some(confirmed)
     }
 
     /// Calculate missing ranges that are not covered by cached ranges
@@ -940,6 +1283,91 @@ impl RangeHandler {
 
         missing
     }
+
+    /// Resolve the on-disk spec for an extent a lookup chose, by re-reading its `.meta` and
+    /// falling back to the pending journals.
+    ///
+    /// A consolidation can mark the extent `unservable` between the lookup and this re-read;
+    /// its file may then hold another version's bytes. That case is an `Err`, never a
+    /// journal lookup (a journal line for the same offsets names the same file), so both
+    /// loaders below refuse it before touching the file. Their callers route the `Err` to an
+    /// S3 refetch: `get_cached_range_data`'s `If-Match`-pinned arm for a single extent, and
+    /// `merge_ranges_with_fallback`'s complete fetch for a merge.
+    ///
+    /// The bytes are answered under the head of the document the lookup used, whose ETag is
+    /// `range.etag`. So the re-read is bound to that version: a `.meta` naming another
+    /// version (an overwrite landed since the lookup's document was read, possibly a RAM copy
+    /// up to `metadata_cache.refresh_interval` old) and a pending `Add` recording another are
+    /// both refused, with [`LISTED_UNDER_ANOTHER_VERSION`]. An empty label matches only a
+    /// `.meta` or `Add` that records no ETag, and a `.meta` only when its `Last-Modified` does
+    /// not differ from the label's. The cost is a hit lost to an overwrite.
+    async fn resolve_extent_spec_for_read(
+        disk_cache: &DiskCacheManager,
+        cache_key: &str,
+        range: &Range,
+    ) -> Result<crate::cache_types::RangeSpec> {
+        let metadata = disk_cache.get_metadata(cache_key).await?;
+        let listed_under_another = || {
+            #[cfg(test)]
+            crate::disk_cache::serve_refusal_log::note(cache_key, "listed_under_another_version");
+            debug!(
+                "Cached extent {}-{} is not listed under the lookup's version {}, refusing the \
+                 disk read: cache_key={}",
+                range.start, range.end, range.etag, cache_key
+            );
+            ProxyError::CacheError(format!(
+                "{} ({}): extent {}-{} of key {}",
+                LISTED_UNDER_ANOTHER_VERSION, range.etag, range.start, range.end, cache_key
+            ))
+        };
+        match crate::http_proxy::reread_extent_spec(metadata.as_ref(), range.start, range.end) {
+            crate::http_proxy::ExtentSpecReread::Listed(spec) => {
+                let listed = metadata.as_ref().map(|m| &m.object_metadata);
+                let listed_etag = listed.map(|o| o.etag.as_str()).unwrap_or_default();
+                let listed_last_modified =
+                    listed.map(|o| o.last_modified.as_str()).unwrap_or_default();
+                if crate::revalidation::etags_equal_ignoring_quotes(listed_etag, &range.etag)
+                    && !etagless_versions_differ(
+                        listed_etag,
+                        listed_last_modified,
+                        &range.etag,
+                        &range.last_modified,
+                    )
+                {
+                    Ok(spec)
+                } else {
+                    Err(listed_under_another())
+                }
+            }
+            crate::http_proxy::ExtentSpecReread::Unservable => {
+                debug!(
+                    "Cached extent {}-{} was marked unservable after the lookup, refusing the disk read: cache_key={}",
+                    range.start, range.end, cache_key
+                );
+                Err(ProxyError::CacheError(format!(
+                    "Cached extent {}-{} for key {} was marked unservable after the lookup",
+                    range.start, range.end, cache_key
+                )))
+            }
+            // Not in the document: find_cached_ranges may have returned it from a journal that
+            // has not been consolidated yet (shared storage mode). Only an `Add` of the label's
+            // version, as the streaming arms take. When nothing lists the extent at all
+            // (its `.meta` was dropped since the lookup), the missing-file error, so the caller's
+            // recovery refetches the extent under the label's `If-Match` and re-caches it.
+            crate::http_proxy::ExtentSpecReread::NotListed => match disk_cache
+                .pending_journal_range_for_label(cache_key, range.start, range.end, &range.etag)
+                .await
+            {
+                crate::disk_cache::PendingForLabel::Found(spec) => Ok(spec),
+                crate::disk_cache::PendingForLabel::OtherVersion => Err(listed_under_another()),
+                crate::disk_cache::PendingForLabel::Absent => Err(ProxyError::CacheError(format!(
+                    "Range spec not found for range {}-{} in key: {} (checked metadata and journals)",
+                    range.start, range.end, cache_key
+                ))),
+            },
+        }
+    }
+
     /// Load range data from new storage architecture
     ///
     /// This method loads the actual range data from the separate binary files
@@ -952,7 +1380,7 @@ impl RangeHandler {
     ///
     /// # Returns
     /// The actual range data loaded from disk
-    pub async fn load_range_data_from_new_storage(
+    pub(crate) async fn load_range_data_from_new_storage(
         &self,
         cache_key: &str,
         range: &Range,
@@ -964,41 +1392,7 @@ impl RangeHandler {
 
         let disk_cache = self.disk_cache_manager.read().await;
 
-        // Get metadata to find the range spec
-        let metadata = disk_cache.get_metadata(cache_key).await?;
-
-        // Find the matching range spec in metadata
-        let range_spec = if let Some(ref meta) = metadata {
-            meta.ranges
-                .iter()
-                .find(|r| r.start == range.start && r.end == range.end)
-                .cloned()
-        } else {
-            None
-        };
-
-        // If not found in metadata, check journals (shared storage mode)
-        // This handles the case where find_cached_ranges returned a range from the journal
-        // but the journal hasn't been consolidated into the .meta file yet
-        let range_spec = match range_spec {
-            Some(spec) => spec,
-            None => {
-                // Check journals for pending ranges
-                let journal_ranges = disk_cache
-                    .find_pending_journal_ranges(cache_key, range.start, range.end)
-                    .await?;
-
-                journal_ranges
-                    .into_iter()
-                    .find(|r| r.start == range.start && r.end == range.end)
-                    .ok_or_else(|| {
-                        ProxyError::CacheError(format!(
-                            "Range spec not found for range {}-{} in key: {} (checked metadata and journals)",
-                            range.start, range.end, cache_key
-                        ))
-                    })?
-            }
-        };
+        let range_spec = Self::resolve_extent_spec_for_read(&disk_cache, cache_key, range).await?;
 
         // Load the range data
         let data = disk_cache.load_range_data(&range_spec).await?;
@@ -1055,7 +1449,7 @@ impl RangeHandler {
     ///
     /// # Returns
     /// The raw frame bytes and the range's compression algorithm.
-    pub async fn load_range_frame_from_new_storage(
+    pub(crate) async fn load_range_frame_from_new_storage(
         &self,
         cache_key: &str,
         range: &Range,
@@ -1067,38 +1461,7 @@ impl RangeHandler {
 
         let disk_cache = self.disk_cache_manager.read().await;
 
-        // Get metadata to find the range spec
-        let metadata = disk_cache.get_metadata(cache_key).await?;
-
-        // Find the matching range spec in metadata
-        let range_spec = if let Some(ref meta) = metadata {
-            meta.ranges
-                .iter()
-                .find(|r| r.start == range.start && r.end == range.end)
-                .cloned()
-        } else {
-            None
-        };
-
-        // If not found in metadata, check journals (shared storage mode)
-        let range_spec = match range_spec {
-            Some(spec) => spec,
-            None => {
-                let journal_ranges = disk_cache
-                    .find_pending_journal_ranges(cache_key, range.start, range.end)
-                    .await?;
-
-                journal_ranges
-                    .into_iter()
-                    .find(|r| r.start == range.start && r.end == range.end)
-                    .ok_or_else(|| {
-                        ProxyError::CacheError(format!(
-                            "Range spec not found for range {}-{} in key: {} (checked metadata and journals)",
-                            range.start, range.end, cache_key
-                        ))
-                    })?
-            }
-        };
+        let range_spec = Self::resolve_extent_spec_for_read(&disk_cache, cache_key, range).await?;
 
         // Load the raw frame bytes (no decompression)
         let (frame_data, algorithm) = disk_cache.load_range_frame(&range_spec).await?;
@@ -1112,69 +1475,6 @@ impl RangeHandler {
         Ok((frame_data, algorithm))
     }
 
-    /// Store range data using new storage architecture
-    ///
-    /// This method stores a range using the new separated storage architecture.
-    /// It should be used when caching new range data.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key for the object
-    /// * `start` - Start offset of the range
-    /// * `end` - End offset of the range
-    /// * `data` - The range data to store
-    /// * `object_metadata` - Metadata about the S3 object
-    /// * `ttl` - Time-to-live for the cached range
-    /// * `compression_enabled` - Resolved compression setting for this key
-    ///   (resolved once per logical request; Requirement 8.2)
-    // The extra `compression_enabled` arg is the once-per-request resolved
-    // setting threaded in (Requirement 8.2) instead of re-resolving per range.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_range_new_storage(
-        &self,
-        cache_key: &str,
-        start: u64,
-        end: u64,
-        data: &[u8],
-        object_metadata: ObjectMetadata,
-        ttl: std::time::Duration,
-        compression_enabled: bool,
-    ) -> Result<()> {
-        debug!(
-            "Storing range using new storage: key={}, range={}-{}, size={}",
-            cache_key,
-            start,
-            end,
-            data.len()
-        );
-
-        // Check capacity and evict if needed before caching new data (Requirement 1.6)
-        let required_space = data.len() as u64;
-        if let Err(e) = self.cache_manager.evict_if_needed(required_space).await {
-            warn!("Eviction failed before caching range: {}", e);
-            // Continue anyway - store_range will handle capacity issues
-        }
-
-        let mut disk_cache = self.disk_cache_manager.write().await;
-        // Compression setting is resolved once per request and threaded in
-        // (Requirement 8.2: resolve once, reuse for all per-range cache writes).
-        disk_cache
-            .store_range(
-                cache_key,
-                start,
-                end,
-                data,
-                object_metadata,
-                ttl,
-                compression_enabled,
-            )
-            .await?;
-
-        debug!(
-            "Successfully stored range {}-{} for key: {}",
-            start, end, cache_key
-        );
-        Ok(())
-    }
     /// Build conditional headers for uncached range portions - Requirements 3.6, 3.8
     pub fn build_conditional_headers_for_range(
         &self,
@@ -1202,8 +1502,10 @@ impl RangeHandler {
         // Preserve client-specified conditional headers exactly - Requirement 3.8
         if let Some(if_match) = client_if_match {
             conditional_headers.insert("if-match".to_string(), if_match.clone());
-        } else if let Some(etag) = &cache_etag {
-            // Add cache validation header only if client didn't specify one
+        } else if let Some(etag) = cache_etag.as_ref().filter(|etag| !etag.is_empty()) {
+            // Add cache validation header only if client didn't specify one. Never an
+            // empty one: S3 answers `If-Match:` with no value with `412`, which would
+            // turn every gap fetch of an entry with no recorded ETag into a retry.
             conditional_headers.insert("if-match".to_string(), etag.clone());
         }
 
@@ -1220,8 +1522,10 @@ impl RangeHandler {
                 "if-unmodified-since".to_string(),
                 if_unmodified_since.clone(),
             );
-        } else if let Some(last_modified) = &cache_last_modified {
-            // Add cache validation header only if client didn't specify one
+        } else if let Some(last_modified) = cache_last_modified.as_ref().filter(|lm| !lm.is_empty())
+        {
+            // Add cache validation header only if client didn't specify one, and never
+            // an empty one (S3 ignores it, so it would carry a sentinel for nothing).
             conditional_headers.insert("if-unmodified-since".to_string(), last_modified.clone());
         }
 
@@ -1279,7 +1583,28 @@ impl RangeHandler {
         cached_range: &Range,
         requested_start: u64,
         requested_end: u64,
-    ) -> Result<(Vec<u8>, bool)> {
+    ) -> Result<(Bytes, bool)> {
+        self.extract_bytes_from_cached_range_tiered(
+            cache_key,
+            cached_range,
+            requested_start,
+            requested_end,
+            true,
+        )
+        .await
+    }
+
+    /// `extract_bytes_from_cached_range`, with the disk-hit RAM promotion chosen by
+    /// `promote`. `false` still consults RAM; it only declines to store the extent under
+    /// its own RAM key, for a caller that stores the assembled bytes itself.
+    async fn extract_bytes_from_cached_range_tiered(
+        &self,
+        cache_key: &str,
+        cached_range: &Range,
+        requested_start: u64,
+        requested_end: u64,
+        promote: bool,
+    ) -> Result<(Bytes, bool)> {
         debug!(
             "Extracting bytes from cached range: cached_range={}-{}, requested={}-{}, cache_key={}",
             cached_range.start, cached_range.end, requested_start, requested_end, cache_key
@@ -1325,11 +1650,19 @@ impl RangeHandler {
         // Load the cached range data with RAM cache support. This is the RAM
         // tier access described in the doc comment above: RAM hit, disk hit
         // + promote, or disk miss, per segment.
-        debug!("Loading range data with RAM cache support");
-        let (range_data, ram_hit) = self
-            .cache_manager
-            .load_range_data_with_cache(cache_key, cached_range, self)
-            .await?;
+        debug!(
+            "Loading range data with RAM cache support (promote={})",
+            promote
+        );
+        let (range_data, ram_hit) = if promote {
+            self.cache_manager
+                .load_range_data_with_cache(cache_key, cached_range, self)
+                .await?
+        } else {
+            self.cache_manager
+                .load_range_data_without_promotion(cache_key, cached_range, self)
+                .await?
+        };
 
         // Validate that we have enough data
         if range_data.len() as u64 != cached_range_size {
@@ -1353,7 +1686,10 @@ impl RangeHandler {
             )));
         }
 
-        let extracted_bytes = range_data[start_idx..end_idx].to_vec();
+        // A view of the loaded extent, not a copy: the caller appends it to
+        // its output and drops it, which drops the extent, so a merge holds its output
+        // plus one extent rather than an extent and a copy of its slice as well.
+        let extracted_bytes = range_data.slice(start_idx..end_idx);
 
         debug!(
             "Successfully extracted {} bytes from cached range {}-{} (RAM hit: {})",
@@ -1368,7 +1704,7 @@ impl RangeHandler {
 
     /// Calculate the overlap between two ranges
     /// Returns None if ranges don't overlap, otherwise returns (overlap_start, overlap_end)
-    pub fn calculate_overlap(
+    pub(crate) fn calculate_overlap(
         range1_start: u64,
         range1_end: u64,
         range2_start: u64,
@@ -1582,7 +1918,9 @@ impl RangeHandler {
     /// that segment's stored-range bounds (not the overall requested range).
     /// `RangeMergeResult::ram_hit` (threaded from each segment's `ram_hit`
     /// into `all_ram_hits` below) is the only signal of this at this call
-    /// site — nothing else here mentions RAM.
+    /// site — nothing else here mentions RAM. Page widening uses
+    /// `merge_range_segments_without_promotion` instead, which consults RAM
+    /// per segment but does not promote.
     ///
     /// Requirements: 1.5, 2.1, 2.4, 3.5, 8.1, 8.2, 8.3, 8.4
     pub async fn merge_range_segments(
@@ -1591,6 +1929,48 @@ impl RangeHandler {
         requested_range: &RangeSpec,
         cached_ranges: &[Range],
         fetched_ranges: &[(RangeSpec, Bytes, HashMap<String, String>)],
+    ) -> Result<RangeMergeResult> {
+        self.merge_range_segments_tiered(
+            cache_key,
+            requested_range,
+            cached_ranges,
+            fetched_ranges,
+            true,
+        )
+        .await
+    }
+
+    /// As [`Self::merge_range_segments`], except that a cached segment read from disk is
+    /// NOT promoted to RAM under its own extent key. Each segment still consults RAM.
+    ///
+    /// For page widening, which assembles a Page from several extents and then stores the
+    /// Page itself (`promote_page_to_ram`) or, on a cold fill, deliberately stores
+    /// nothing. Promoting each extent as well held the same bytes in RAM twice, and on the
+    /// journal-fallback arm stored extents with an empty etag.
+    pub(crate) async fn merge_range_segments_without_promotion(
+        &self,
+        cache_key: &str,
+        requested_range: &RangeSpec,
+        cached_ranges: &[Range],
+        fetched_ranges: &[(RangeSpec, Bytes, HashMap<String, String>)],
+    ) -> Result<RangeMergeResult> {
+        self.merge_range_segments_tiered(
+            cache_key,
+            requested_range,
+            cached_ranges,
+            fetched_ranges,
+            false,
+        )
+        .await
+    }
+
+    async fn merge_range_segments_tiered(
+        &self,
+        cache_key: &str,
+        requested_range: &RangeSpec,
+        cached_ranges: &[Range],
+        fetched_ranges: &[(RangeSpec, Bytes, HashMap<String, String>)],
+        promote: bool,
     ) -> Result<RangeMergeResult> {
         let merge_start = std::time::Instant::now();
 
@@ -1782,11 +2162,12 @@ impl RangeHandler {
                         );
 
                         let (bytes, ram_hit) = self
-                            .extract_bytes_from_cached_range(
+                            .extract_bytes_from_cached_range_tiered(
                                 cache_key,
                                 range,
                                 adjusted_start,
                                 segment.output_end,
+                                promote,
                             )
                             .await?;
 
@@ -1850,11 +2231,12 @@ impl RangeHandler {
                         );
 
                         let (bytes, ram_hit) = self
-                            .extract_bytes_from_cached_range(
+                            .extract_bytes_from_cached_range_tiered(
                                 cache_key,
                                 range,
                                 segment.output_start,
                                 segment.output_end,
+                                promote,
                             )
                             .await?;
 
@@ -1985,6 +2367,49 @@ impl RangeHandler {
         })
     }
 
+    /// Drop a client `If-Range` from a gap sub-fetch that the proxy has pinned to the
+    /// same entity tag.
+    ///
+    /// Each sub-fetch is buffered (`allow_streaming = false`) and only a `206` is used. A
+    /// stale `If-Range` makes S3 ignore `Range` and answer `200` with the whole object,
+    /// which would be read into memory and then discarded. When the sub-fetch also
+    /// carries the proxy's own `If-Match` (marked by its sentinel) on the same strong
+    /// tag, the `If-Range` decides nothing: S3 evaluates `If-Match` first, a failing one
+    /// is a bodyless `412` that [`Self::fetch_missing_ranges`] reports as
+    /// `MERGE_REFETCH_VERSION_CHANGED`, and a passing one means the object is that
+    /// version, so the `If-Range` would match too. The caller then forwards the client's
+    /// own request, `If-Range` intact, and S3 answers it.
+    ///
+    /// Applied to the sub-fetch copy only, never to the client's header map. Nothing is
+    /// changed when `If-Range` is signed (header or query form), when the request has no
+    /// proxy pin, or when the pin names another tag. A client `If-Range` is never turned
+    /// into an `If-Match`.
+    ///
+    /// `pub` so the decision is asserted directly by tests.
+    pub fn drop_if_range_redundant_with_pin(
+        headers: &mut HashMap<String, String>,
+        uri: &hyper::Uri,
+    ) {
+        if !headers.contains_key("x-proxy-injected-if-match") {
+            return;
+        }
+        let (Some(if_range), Some(if_match)) = (headers.get("if-range"), headers.get("if-match"))
+        else {
+            return;
+        };
+        let if_range = if_range.trim();
+        if !if_range.starts_with('"') || if_range != if_match.trim() {
+            return;
+        }
+        let uri = uri.to_string();
+        if crate::signed_request_proxy::is_header_signed(headers, "if-range")
+            || crate::signed_request_proxy::is_header_signed_in_query(&uri, "if-range")
+        {
+            return;
+        }
+        headers.remove("if-range");
+    }
+
     /// Fetch multiple missing ranges from S3 in parallel
     /// Returns fetched data with their corresponding range specs and response headers
     ///
@@ -2019,11 +2444,40 @@ impl RangeHandler {
             return Ok(Vec::new());
         }
 
+        // Every sub-fetch below replaces the `Range` header. When the client signed
+        // `range`, that rewrite invalidates its signature and S3 answers `403
+        // SignatureDoesNotMatch`. Refused here whichever caller forgot to route the
+        // request elsewhere, so the caller can fail open with the client's own request.
+        if crate::signed_request_proxy::is_range_signed(
+            headers,
+            crate::signed_request_proxy::request_target(uri),
+        ) {
+            warn!(
+                "Refusing to fetch {} missing range(s) with a rewritten Range header: the client signed 'range' (cache_key={})",
+                missing_ranges.len(),
+                cache_key
+            );
+            return Err(ProxyError::SignedHeaderRewriteRefused {
+                header: "range".to_string(),
+                cache_key: cache_key.to_string(),
+            });
+        }
+
         debug!(
             "Fetching {} missing ranges from S3 in parallel: cache_key={}",
             missing_ranges.len(),
             cache_key
         );
+
+        // A client `If-Range` the proxy's pin makes redundant is left off these
+        // sub-fetches only; the caller's map keeps it.
+        let mut sub_fetch_headers = headers.clone();
+        Self::drop_if_range_redundant_with_pin(&mut sub_fetch_headers, uri);
+        let headers = &sub_fetch_headers;
+
+        // A `412` on a proxy-injected `If-Match` (marked by its sentinel) means the
+        // cached version these bytes would be merged with is gone from S3.
+        let proxy_pinned = headers.contains_key("x-proxy-injected-if-match");
 
         // Create fetch tasks for each missing range
         let fetch_futures: Vec<_> = missing_ranges
@@ -2114,6 +2568,17 @@ impl RangeHandler {
                                         "S3 response has no body".to_string()
                                     ))
                                 }
+                            } else if s3_response.status == hyper::StatusCode::PRECONDITION_FAILED
+                                && proxy_pinned
+                            {
+                                warn!(
+                                    "S3 refused the proxy's If-Match pin on a missing-range fetch: cache_key={}, range={}-{}",
+                                    cache_key, range_spec.start, range_spec.end
+                                );
+                                Err(crate::ProxyError::S3Error(format!(
+                                    "{}: cache_key={}",
+                                    MERGE_REFETCH_VERSION_CHANGED, cache_key
+                                )))
                             } else {
                                 warn!(
                                     "S3 returned unexpected status: cache_key={}, range={}-{}, status={}",
@@ -2145,6 +2610,7 @@ impl RangeHandler {
         // Collect successful fetches
         let mut fetched_ranges = Vec::new();
         let mut failed_count = 0;
+        let mut version_change: Option<ProxyError> = None;
 
         for result in results {
             match result {
@@ -2154,11 +2620,19 @@ impl RangeHandler {
                 Err(e) => {
                     failed_count += 1;
                     warn!("Range fetch failed: {}", e);
+                    if is_merge_refetch_version_change(&e) {
+                        version_change = Some(e);
+                    }
                 }
             }
         }
 
         if fetched_ranges.is_empty() && !missing_ranges.is_empty() {
+            // Every sub-fetch failed. When one of them was a refused pin, say so, so
+            // a caller can tell "the cached version is gone" from an S3 failure.
+            if let Some(e) = version_change {
+                return Err(e);
+            }
             return Err(crate::ProxyError::S3Error(
                 "Failed to fetch any missing ranges from S3".to_string(),
             ));
@@ -2236,6 +2710,30 @@ impl RangeHandler {
         headers: &HashMap<String, String>,
         mut caller_reservation: Option<&mut crate::inflight_ledger::Reservation>,
     ) -> Result<RangeMergeResult> {
+        // Backstop (buffered-serve-memory-bound R1.2): refuse to materialise a range, or a
+        // cached extent, above the buffered-operation bound. Checked here rather than in
+        // `merge_range_segments` because page widening calls that directly with a
+        // Page-sized range (16 MiB by default) and has its own bound; and checked BEFORE
+        // the merge so the complete-refetch fallback below cannot buffer it either.
+        let requested_bytes = requested_range.end - requested_range.start + 1;
+        let largest_extent_bytes = cached_ranges
+            .iter()
+            .map(|r| r.end - r.start + 1)
+            .max()
+            .unwrap_or(0);
+        if !crate::http_proxy::may_materialise(requested_bytes, cached_ranges) {
+            warn!(
+                "Range merge refused over the buffered-operation bound: cache_key={}, requested={} bytes, largest extent={} bytes",
+                cache_key, requested_bytes, largest_extent_bytes
+            );
+            return Err(ProxyError::BufferedOperationBoundExceeded {
+                requested_bytes,
+                largest_extent_bytes,
+            });
+        }
+        // The ETag every caller serves the merged bytes under (`cached_ranges[0]`),
+        // which the fallback refetch is pinned to.
+        let cached_etag = cached_ranges.first().map(|r| r.etag.as_str()).unwrap_or("");
         // Attempt to merge ranges
         match self
             .merge_range_segments(cache_key, requested_range, cached_ranges, fetched_ranges)
@@ -2260,6 +2758,7 @@ impl RangeHandler {
                             uri,
                             headers,
                             "size validation failed",
+                            cached_etag,
                             caller_reservation.as_deref_mut(),
                         )
                         .await;
@@ -2324,6 +2823,7 @@ impl RangeHandler {
                     uri,
                     headers,
                     error_context,
+                    cached_etag,
                     caller_reservation,
                 )
                 .await
@@ -2360,6 +2860,7 @@ impl RangeHandler {
         uri: &hyper::Uri,
         headers: &HashMap<String, String>,
         reason: &str,
+        cached_etag: &str,
         caller_reservation: Option<&mut crate::inflight_ledger::Reservation>,
     ) -> Result<RangeMergeResult> {
         info!(
@@ -2369,15 +2870,71 @@ impl RangeHandler {
 
         let fallback_start = std::time::Instant::now();
 
-        // Build S3 request with Range header
+        // Build S3 request with Range header.
+        //
+        // A client that signed `range` gets its own header value forwarded
+        // byte-for-byte: a normalised `bytes=a-b` for a suffix, open-ended or
+        // past-the-end request is a different string and so a different signature.
+        // That is valid only when `requested_range` is the client's range; a caller
+        // asking for some other extent under a signed `range` is refused, and the
+        // caller fails open with the client's own request.
         let mut s3_headers = headers.clone();
-        s3_headers.insert(
-            "range".to_string(),
-            format!("bytes={}-{}", requested_range.start, requested_range.end),
-        );
-        // Strip the proxy's internal sentinels before sending to S3.
-        s3_headers.remove("x-proxy-injected-if-match");
+        if crate::signed_request_proxy::is_range_signed(
+            &s3_headers,
+            crate::signed_request_proxy::request_target(uri),
+        ) {
+            let client_range = s3_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+                .map(|(_, v)| v.clone());
+            let covers = client_range
+                .as_deref()
+                .map(|raw| signed_client_range_covers(raw, requested_range).unwrap_or(true));
+            if covers != Some(true) {
+                warn!(
+                    "Refusing fallback fetch of range {}-{}: the client signed a different Range header {:?} (cache_key={})",
+                    requested_range.start, requested_range.end, client_range, cache_key
+                );
+                return Err(ProxyError::SignedHeaderRewriteRefused {
+                    header: "range".to_string(),
+                    cache_key: cache_key.to_string(),
+                });
+            }
+            debug!(
+                "Fallback fetch keeps the client's signed Range header verbatim: range={}-{} cache_key={}",
+                requested_range.start, requested_range.end, cache_key
+            );
+        } else {
+            s3_headers.retain(|k, _| !k.eq_ignore_ascii_case("range"));
+            s3_headers.insert(
+                "range".to_string(),
+                format!("bytes={}-{}", requested_range.start, requested_range.end),
+            );
+        }
+        // An `If-Match` already present was put there by the proxy (the Mode B
+        // `If-Range` swap) when this sentinel accompanies it, so a `412` on it is
+        // evidence the cached version is gone, exactly like the pin below.
+        let sentinel_if_match = s3_headers.remove("x-proxy-injected-if-match").is_some();
+        // Strip the proxy's other internal sentinel before sending to S3.
         s3_headers.remove("x-proxy-injected-if-unmodified-since");
+
+        // Every caller assembles the response under the cached object's headers,
+        // so the refetched bytes must be that version. Pin the refetch with
+        // `If-Match: <cached ETag>` on the same terms as the single-extent recovery
+        // refetch in `HttpProxy::get_cached_range_data`: only when the request has
+        // no `If-Match` of its own and `if-match` is outside its SigV4 signature.
+        // A request that cannot be pinned is still checked by the ETag comparison
+        // on the response below.
+        let pinned_if_match = !cached_etag.is_empty()
+            && crate::http_proxy::HttpProxy::recovery_refetch_may_pin_if_match(
+                &s3_headers,
+                &uri.to_string(),
+                cached_etag,
+            );
+        if pinned_if_match {
+            s3_headers.insert("if-match".to_string(), cached_etag.to_string());
+        }
+        let proxy_if_match = pinned_if_match || sentinel_if_match;
 
         let mut context = crate::s3_client::build_s3_request_context(
             hyper::Method::GET,
@@ -2430,6 +2987,35 @@ impl RangeHandler {
 
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
+                // A version change is refused before any body is collected: a `412`
+                // on a proxy-added `If-Match`, or a success carrying an ETag other
+                // than the cached one. A response with no ETag is not evidence of a
+                // change and keeps the status and length checks below.
+                if !cached_etag.is_empty() {
+                    let response_etag = s3_response
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                        .map(|(_, v)| v.as_str())
+                        .filter(|v| !v.is_empty());
+                    let changed = (s3_response.status == hyper::StatusCode::PRECONDITION_FAILED
+                        && proxy_if_match)
+                        || matches!(
+                            (s3_response.status, response_etag),
+                            (hyper::StatusCode::PARTIAL_CONTENT | hyper::StatusCode::OK, Some(etag))
+                                if !crate::revalidation::etags_equal_ignoring_quotes(etag, cached_etag)
+                        );
+                    if changed {
+                        warn!(
+                            "Fallback S3 fetch returned another version of the object: cache_key={}, status={}, cached_etag={}, response_etag={:?}",
+                            cache_key, s3_response.status, cached_etag, response_etag
+                        );
+                        return Err(ProxyError::S3Error(format!(
+                            "{}: cache_key={}",
+                            MERGE_REFETCH_VERSION_CHANGED, cache_key
+                        )));
+                    }
+                }
                 if s3_response.status == hyper::StatusCode::PARTIAL_CONTENT {
                     if let Some(body) = s3_response.body {
                         // Keep the collected Bytes and move it into the result. This
@@ -2566,23 +3152,6 @@ mod tests {
 
         // Invalid range - exceeds content length
         assert!(handler.validate_range_request(&range, 400).is_err());
-    }
-
-    #[test]
-    fn test_range_overlap_detection() {
-        let handler = create_test_range_handler();
-        let range1 = RangeSpec { start: 0, end: 100 };
-        let range2 = RangeSpec {
-            start: 50,
-            end: 150,
-        };
-        let range3 = RangeSpec {
-            start: 200,
-            end: 300,
-        };
-
-        assert!(handler.ranges_overlap(&range1, &range2));
-        assert!(!handler.ranges_overlap(&range1, &range3));
     }
 
     #[test]

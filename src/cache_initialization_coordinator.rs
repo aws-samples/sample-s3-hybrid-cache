@@ -4,20 +4,30 @@
 //! directory scanning, provide clear startup messaging, and ensure consistency
 //! between cache subsystems while preserving architectural separation.
 
-use crate::cache_size_tracker::CacheSizeTracker;
+use crate::cache_size_tracker::{CacheSizeTracker, ValidationRequestKind};
 use crate::cache_types::NewCacheMetadata;
-use crate::cache_validator::CacheValidator;
 use crate::config::CacheConfig;
 use crate::error::{ProxyError, Result};
 use crate::journal_consolidator::SizeState;
 use crate::write_cache_manager::WriteCacheManager;
-use fs2::FileExt;
 use serde_json;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+/// What startup asks of the validation scheduler. See
+/// [`CacheInitializationCoordinator::startup_validation_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupValidation {
+    /// The figure is validated and recent: nothing to ask.
+    None,
+    /// An empty cache with a zero figure: record its validation, which is exact without a scan.
+    RecordEmpty,
+    /// Ask the scheduler for a pass under `validation.lock`.
+    Request(ValidationRequestKind),
+}
 
 /// Coordinates cache initialization across multiple subsystems
 pub struct CacheInitializationCoordinator {
@@ -44,11 +54,6 @@ impl CacheInitializationCoordinator {
         &self.cache_dir
     }
 
-    /// Check if write cache is enabled
-    pub fn is_write_cache_enabled(&self) -> bool {
-        self.write_cache_enabled
-    }
-
     /// Get the cache configuration
     pub fn config(&self) -> &CacheConfig {
         &self.config
@@ -61,7 +66,6 @@ impl CacheInitializationCoordinator {
         size_tracker: &mut Option<Arc<CacheSizeTracker>>,
     ) -> Result<InitializationSummary> {
         let start_time = Instant::now();
-        let mut phase_results = Vec::new();
         let mut total_errors = 0u32;
         let mut total_warnings = 0u32;
 
@@ -95,20 +99,26 @@ impl CacheInitializationCoordinator {
                 total_errors += 1;
             }
         }
-        phase_results.push(PhaseResult {
-            phase_name: "Directory Setup".to_string(),
-            duration: phase1_duration,
-            success: phase1_result.is_ok(),
-            error_message: phase1_result.err().map(|e| e.to_string()),
-        });
 
-        // Phase 2: Metadata Scan with Consistency Validation (enhanced for Requirements 10.1, 10.2, 10.3, 10.4, 10.5)
+        // Phase 2: load size_state.json. No `.meta` file is walked at startup.
         let phase2_start = Instant::now();
-        info!("Cache initialization: Phase 2/4 - Metadata scan with consistency validation");
+        info!("Cache initialization: Phase 2/4 - Load size state (no startup scan)");
         let scan_result = self
-            .scan_cache_metadata_with_consistency_validation(&mut performance_metrics)
+            .load_size_state_at_startup(&mut performance_metrics)
             .await;
         let phase2_duration = phase2_start.elapsed();
+
+        // Phases 1 and 2 are the only two whose durations have no home on
+        // `PerformanceMetrics` — phase 3 sets `subsystem_init_duration` and phase 4
+        // sets `cross_validation_duration`, and phase 2's scan separately sets
+        // `scan_duration`, which `detailed_report` prints. Until the retired
+        // `PhaseResult` list was removed these two were collected into a field of
+        // `InitializationSummary` that nothing ever read, so they were measured and
+        // then discarded. Log them instead of dropping the measurement.
+        debug!(
+            "Cache initialization: phase 1 (directory setup) took {:?}, phase 2 (metadata scan) took {:?}",
+            phase1_duration, phase2_duration
+        );
 
         // Update peak memory usage
         let current_memory = get_current_memory_usage();
@@ -136,13 +146,6 @@ impl CacheInitializationCoordinator {
                 ObjectsScanResults::empty()
             }
         };
-
-        phase_results.push(PhaseResult {
-            phase_name: "Metadata Scan".to_string(),
-            duration: phase2_duration,
-            success: scan_result.is_ok(),
-            error_message: scan_result.err().map(|e| e.to_string()),
-        });
 
         // Phase 3: Subsystem Initialization
         let phase3_start = Instant::now();
@@ -178,24 +181,15 @@ impl CacheInitializationCoordinator {
             }
         };
 
-        phase_results.push(PhaseResult {
-            phase_name: "Subsystem Initialization".to_string(),
-            duration: phase3_duration,
-            success: subsystem_result.is_ok(),
-            error_message: subsystem_result.err().map(|e| e.to_string()),
-        });
-
-        // On cold startup (real scan was performed), reconcile size_state.json
-        // so eviction decisions use accurate size immediately.
-        if !scan_summary.loaded_from_state_files {
-            if let Some(tracker) = size_tracker.as_ref() {
-                tracker
-                    .update_size_from_scan(
-                        scan_summary.total_size,
-                        scan_summary.write_cached_size,
-                        scan_summary.total_objects,
-                    )
-                    .await;
+        // No startup count of the cache (Ed, 2026-10-10). When the persisted figure is overdue,
+        // missing or unreadable, the scheduler is asked for its usual pass under
+        // `validation.lock`: one proxy walks while every proxy serves. See
+        // `startup_validation_request`.
+        if let Some(tracker) = size_tracker.as_ref() {
+            match self.startup_validation_request().await {
+                StartupValidation::None => {}
+                StartupValidation::RecordEmpty => tracker.record_empty_cache_validation().await,
+                StartupValidation::Request(kind) => tracker.request_validation(kind),
             }
         }
 
@@ -234,13 +228,6 @@ impl CacheInitializationCoordinator {
             }
         };
 
-        phase_results.push(PhaseResult {
-            phase_name: "Cross-Validation".to_string(),
-            duration: phase4_duration,
-            success: validation_result.is_ok(),
-            error_message: validation_result.err().map(|e| e.to_string()),
-        });
-
         let total_duration = start_time.elapsed();
 
         // Finalize performance metrics
@@ -269,7 +256,6 @@ impl CacheInitializationCoordinator {
 
         Ok(InitializationSummary {
             total_duration,
-            phase_results,
             scan_summary,
             subsystem_results,
             validation_results,
@@ -355,7 +341,7 @@ impl CacheInitializationCoordinator {
                             self.cache_dir, e
                         )
                     }
-                    std::io::ErrorKind::Other if e.to_string().contains("No space") => {
+                    _ if crate::disk_cache::is_disk_full_error(&e) => {
                         format!(
                             "No space left on device for cache directory {:?}: {}. \
                             Please free up disk space or choose a different cache location.",
@@ -427,7 +413,7 @@ impl CacheInitializationCoordinator {
                                 subdir, e, subdir_path
                             )
                         }
-                        std::io::ErrorKind::Other if e.to_string().contains("No space") => {
+                        _ if crate::disk_cache::is_disk_full_error(&e) => {
                             format!(
                                 "No space left on device for cache subdirectory '{}': {}. \
                                 Please free up disk space.",
@@ -493,14 +479,9 @@ impl CacheInitializationCoordinator {
         Ok(())
     }
 
-    /// Perform coordinated metadata scan with consistency validation
-    ///
-    /// This method enhances the existing metadata scan with comprehensive consistency
-    /// validation as required by the atomic metadata writes specification.
-    ///
-    /// # Requirements
-    /// Load scan results from size_state.json instead of walking all .meta files.
-    /// Used on warm startup when validation is fresh (<23h).
+    /// The startup figures, read from `size_state.json` as it stands, with no `.meta` walk.
+    /// A missing or unparseable document reads as zeros here;
+    /// [`Self::startup_validation_request`] is what reports and repairs that state.
     async fn load_scan_results_from_size_state(
         &self,
         performance_metrics: &mut PerformanceMetrics,
@@ -515,7 +496,7 @@ impl CacheInitializationCoordinator {
         let read_cached_size = state.total_size.saturating_sub(state.write_cache_size);
 
         info!(
-            "Cache initialization: Skipping scan (validation fresh) - \
+            "Cache initialization: no startup scan - \
              loaded from size_state.json: total={}, write_cache={}, objects={}",
             format_bytes_human(state.total_size),
             format_bytes_human(state.write_cache_size),
@@ -539,132 +520,165 @@ impl CacheInitializationCoordinator {
         }
     }
 
-    /// - Requirement 10.1: Integrate metadata consistency validation into Phase 2
-    /// - Requirement 10.2: Check validation freshness (23-hour validity)
-    /// - Requirement 10.3: Skip validation if fresh validation exists
-    /// - Requirement 10.4: Perform recovery from failed/incomplete validation
-    /// - Requirement 10.5: Use existing distributed locking for coordination
-    async fn scan_cache_metadata_with_consistency_validation(
+    /// Phase 2: the startup figure is `size_state.json`, read as it stands. No `.meta` file is
+    /// walked on this path, in any state (Ed, 2026-10-10: a proxy must not count the cache on
+    /// start).
+    ///
+    /// # Why there is no startup count
+    ///
+    /// The count used to run whenever `validation.json` was more than 23 hours old, and it
+    /// installed its census as an absolute figure holding `global_consolidation.lock` but not
+    /// `validation.lock`. A proxy restarting while a peer's full validation was mid-walk
+    /// therefore landed an absolute install between that pass's baseline and its relative
+    /// install, and the peer then corrected the same drift a second time. It was also a whole
+    /// walk of shared storage per overdue restart, per proxy. The scheduled validation does the
+    /// same count under `validation.lock`, one proxy at a time, so startup asks for that pass
+    /// instead: see [`Self::startup_validation_request`].
+    ///
+    /// [`Self::perform_validation_recovery_if_needed`] still runs here: it touches only
+    /// `validation.lock` and `validation.json`, never a `.meta` file.
+    async fn load_size_state_at_startup(
         &self,
         performance_metrics: &mut PerformanceMetrics,
     ) -> Result<ObjectsScanResults> {
-        let scan_start = Instant::now();
-        info!(
-            "Cache initialization: Starting coordinated metadata scan with consistency validation"
-        );
-
-        // Check validation freshness first (Requirement 10.3)
-        let validation_freshness = self.check_validation_freshness().await;
-        match validation_freshness {
-            Ok(freshness_info) => {
-                if freshness_info.is_fresh {
-                    info!(
-                        "Cache initialization: Validation is fresh ({}), skipping metadata scan",
-                        freshness_info.message
-                    );
-                    // Load from size_state.json instead of walking all .meta files
-                    return Ok(self
-                        .load_scan_results_from_size_state(performance_metrics)
-                        .await);
-                } else {
-                    info!(
-                        "Cache initialization: Validation is stale ({}), performing comprehensive consistency validation",
-                        freshness_info.message
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Cache initialization: Failed to check validation freshness: {}. Proceeding with comprehensive validation.",
-                    e
-                );
-            }
-        }
-
-        // Check for failed/incomplete validation and perform recovery if needed (Requirement 10.4)
         if let Err(recovery_error) = self.perform_validation_recovery_if_needed().await {
             warn!(
-                "Cache initialization: Validation recovery failed: {}. Continuing with scan.",
+                "Cache initialization: Validation recovery failed: {}. Continuing.",
                 recovery_error
             );
         }
+        Ok(self
+            .load_scan_results_from_size_state(performance_metrics)
+            .await)
+    }
 
-        // Perform regular metadata scan
-        let mut scan_results = self
-            .scan_cache_metadata_with_metrics(performance_metrics)
-            .await?;
-
-        // Enhance scan results with consistency validation
-        let consistency_validation_start = std::time::Instant::now();
-        let consistency_results = self
-            .perform_metadata_consistency_validation(&scan_results)
-            .await;
-        let consistency_validation_duration = consistency_validation_start.elapsed();
-
-        match consistency_results {
-            Ok(consistency_info) => {
-                info!(
-                    "Cache initialization: Metadata consistency validation completed in {}: {}",
-                    format_duration_human(consistency_validation_duration),
-                    consistency_info.summary_string()
-                );
-
-                // Add consistency validation results to scan results
-                if consistency_info.corruption_count > 0 {
-                    warn!(
-                        "Cache initialization: Found {} corrupted metadata files during consistency validation",
-                        consistency_info.corruption_count
-                    );
-                    // Add consistency errors to scan results
-                    for error_msg in consistency_info.errors {
-                        scan_results
-                            .scan_errors
-                            .push(crate::cache_initialization_coordinator::ScanError::new(
-                            std::path::PathBuf::from("consistency_validation"),
-                            error_msg,
-                            crate::cache_initialization_coordinator::ScanErrorCategory::Validation,
-                        ));
+    /// What startup must ask the validation scheduler for, if anything.
+    ///
+    /// - [`ValidationRequestKind::FigureUnvalidated`] when `size_state.json` is unreadable, is
+    ///   missing on a cache that holds data, or holds bytes with a `cached_objects` of 0 (a
+    ///   document from a release before the object count existed). The figure in force
+    ///   under-counts the cache (0, or the persisted bytes with no objects), so size-based
+    ///   eviction fires late, never early, until the requested full pass installs.
+    ///   The statvfs free-space floor still applies throughout. Logged at WARN.
+    /// - Otherwise [`ValidationRequestKind::Overdue`] when `validation.json` is older than the
+    ///   23-hour gate ([`Self::check_validation_freshness`]).
+    ///
+    /// "Holds data" is one `read_dir` of `metadata/` ([`Self::cache_holds_data`]), not a walk.
+    ///
+    /// An overdue validation on a cache holding no data whose figure is zero (missing or all
+    /// zeros) is [`StartupValidation::RecordEmpty`] instead: the census is 0 and equals the
+    /// figure, so the record is exact. See `CacheSizeTracker::record_empty_cache_validation`.
+    /// "Holding no data" means `metadata/` is absent or was listed to the end with no bucket
+    /// directory. A `metadata/` that cannot be listed is not evidence of an empty cache, so it
+    /// takes [`ValidationRequestKind::FigureUnvalidated`] instead.
+    pub(crate) async fn startup_validation_request(&self) -> StartupValidation {
+        let size_state_path = self.cache_dir.join("size_tracking").join("size_state.json");
+        let mut figure_is_zero = false;
+        let unvalidated = match tokio::fs::read_to_string(&size_state_path).await {
+            Ok(content) => match serde_json::from_str::<SizeState>(&content) {
+                Ok(state) if state.cached_objects == 0 && state.total_size > 0 => Some(format!(
+                    "size_state.json holds {} but no object count",
+                    format_bytes_human(state.total_size)
+                )),
+                Ok(state) => {
+                    figure_is_zero = state.total_size == 0
+                        && state.write_cache_size == 0
+                        && state.cached_objects == 0;
+                    None
+                }
+                Err(e) => Some(format!("size_state.json is unreadable ({})", e)),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match self.cache_holds_data().await {
+                    Ok(true) => {
+                        Some("size_state.json is missing on a cache that holds data".to_string())
                     }
+                    Ok(false) => {
+                        figure_is_zero = true;
+                        None
+                    }
+                    Err(e) => Some(format!(
+                        "size_state.json is missing and metadata/ could not be listed ({})",
+                        e
+                    )),
                 }
-
-                if consistency_info.head_only_expired_removed > 0 {
+            }
+            Err(e) => Some(format!("size_state.json is unreadable ({})", e)),
+        };
+        if let Some(reason) = unvalidated {
+            warn!(
+                "Cache size: {}. The tracked size is UNVALIDATED: it under-counts the cache, so \
+                 size-based eviction fires late until the full validation requested now \
+                 completes (one pass under validation.lock, run by one proxy). No startup scan \
+                 is performed.",
+                reason
+            );
+            return StartupValidation::Request(ValidationRequestKind::FigureUnvalidated);
+        }
+        let freshness = self.check_validation_freshness().await;
+        if matches!(&freshness, Ok(info) if info.is_fresh) {
+            return StartupValidation::None;
+        }
+        if figure_is_zero {
+            match self.cache_holds_data().await {
+                Ok(false) => {
                     info!(
-                        "Cache initialization: Removed {} stale HEAD-only metadata entries (expired >1 day, no cached object data)",
-                        consistency_info.head_only_expired_removed
+                        "Cache initialization: empty cache with a zero size figure; recording \
+                         its validation without a scan"
                     );
+                    return StartupValidation::RecordEmpty;
                 }
-
-                // Update validation timestamp to mark this validation as complete
-                if let Err(e) = self.update_validation_timestamp().await {
+                Ok(true) => {}
+                Err(e) => {
                     warn!(
-                        "Cache initialization: Failed to update validation timestamp: {}",
+                        "Cache size: the size figure is zero and metadata/ could not be listed \
+                         ({}). The tracked size is UNVALIDATED: requesting a full validation \
+                         rather than recording an empty cache.",
                         e
                     );
+                    return StartupValidation::Request(ValidationRequestKind::FigureUnvalidated);
                 }
             }
+        }
+        match freshness {
+            Ok(info) => {
+                info!(
+                    "Cache initialization: validation is overdue ({}); requesting the scheduled \
+                     validation now instead of counting the cache at startup",
+                    info.message
+                );
+                StartupValidation::Request(ValidationRequestKind::Overdue)
+            }
             Err(e) => {
-                error!(
-                    "Cache initialization: Metadata consistency validation failed: {}. Continuing with regular scan results.",
+                warn!(
+                    "Cache initialization: could not check validation freshness ({}); \
+                     requesting the scheduled validation now",
                     e
                 );
-                // Add validation failure as an error
-                scan_results.scan_errors.push(
-                    crate::cache_initialization_coordinator::ScanError::new(
-                        std::path::PathBuf::from("consistency_validation"),
-                        format!("Consistency validation failed: {}", e),
-                        crate::cache_initialization_coordinator::ScanErrorCategory::Validation,
-                    ),
-                );
+                StartupValidation::Request(ValidationRequestKind::Overdue)
             }
         }
+    }
 
-        let total_duration = scan_start.elapsed();
-        info!(
-            "Cache initialization: Metadata scan with consistency validation completed in {}",
-            format_duration_human(total_duration)
-        );
-
-        Ok(scan_results)
+    /// Whether `metadata/` holds anything but this cache's own `_`-prefixed state directories
+    /// (`_journals`, `_shard_state`, `_write_ledger`). One directory listing: S3 bucket names
+    /// cannot start with `_`, so any other entry is a bucket's data.
+    ///
+    /// `Ok(false)` only when `metadata/` is absent (NotFound) or was listed to the end with no
+    /// such entry. Any other error, opening the directory or mid-listing, is `Err`: an
+    /// unreadable `metadata/` is not evidence of an empty cache.
+    async fn cache_holds_data(&self) -> std::io::Result<bool> {
+        let mut entries = match tokio::fs::read_dir(self.cache_dir.join("metadata")).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_name().to_string_lossy().starts_with('_') {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Check validation freshness (23-hour validity)
@@ -743,18 +757,83 @@ impl CacheInitializationCoordinator {
         let validation_file = self.cache_dir.join("size_tracking").join("validation.json");
         let validation_lock = self.cache_dir.join("size_tracking").join("validation.lock");
 
-        // Check for stale validation lock
+        // Remove the validation lock file ONLY if no instance currently holds the lock.
+        //
+        // # The liveness signal is the lock itself, never the mtime
+        //
+        // This used to remove `validation.lock` whenever its mtime was more than an hour old,
+        // with no check on whether a validation pass was running. Two facts make that unsafe,
+        // and the second is what turns it from useless into harmful:
+        //
+        //  - **The mtime never advances.** `try_acquire_validation_lock` opens the file with
+        //    `.create(true).write(true).truncate(false)` and then only `flock`s it; nothing ever
+        //    writes a byte, sets the mtime, or syncs it. So the mtime is fixed at the instant the
+        //    inode was first created — possibly weeks before any given pass — and `age > 1 hour`
+        //    was satisfied on essentially every start, regardless of what any instance was doing.
+        //  - **`flock` binds to the open file description, not to the path.** Removing the path
+        //    does not release a held lock: the holder keeps it, while the next instance to open
+        //    the recreated path gets a *different inode* and therefore an *independent* lock. So
+        //    the removal did not recover a stuck lock — it manufactured concurrent validation.
+        //
+        // Concurrent validation is not a cosmetic problem. `update_size_from_validation` is an
+        // absolute install of `total_size`, `write_cache_size` and `cached_objects` that takes no
+        // lock of its own, and it also calls `reset_all_delta_files()` and
+        // `size_accumulator.reset()`. Two overlapping passes therefore discard each other's
+        // post-scan deltas, and a rolling pass's *extrapolated* figures can land on top of a full
+        // pass's census. This `flock` is the only thing serialising them.
+        //
+        // # There is no such thing as a stale `flock`, which is why the removal recovers nothing
+        //
+        // The kernel drops an `flock` when the holding descriptor closes, including on process
+        // death — so a crashed instance leaves no lock behind (on NFS, after at most the
+        // server's lease). A *wedged* instance still holds a live lock, and removing its path
+        // would not take the lock away from it; it would only let a second instance acquire an
+        // independent one, which is the outcome above. Either way, removal is not the remedy.
+        //
+        // What is left for this code to do is bounded housekeeping: drop the file when it is
+        // provably unheld, so a deployment does not accumulate a sentinel whose mtime misleads
+        // the next reader. Acquiring the lock IS the proof, so that is what is required. On
+        // contention the file is left exactly as it is.
         if validation_lock.exists() {
-            if let Ok(metadata) = tokio::fs::metadata(&validation_lock).await {
-                if let Ok(modified) = metadata.modified() {
-                    let age = std::time::SystemTime::now()
-                        .duration_since(modified)
-                        .unwrap_or(std::time::Duration::ZERO);
-                    if age > std::time::Duration::from_secs(3600) {
-                        // 1 hour
-                        info!("Cache initialization: Removing stale validation lock (age: {:.1} hours)", age.as_secs_f64() / 3600.0);
-                        let _ = tokio::fs::remove_file(&validation_lock).await;
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&validation_lock)
+            {
+                Ok(probe) => {
+                    if fs4::FileExt::try_lock(&probe).is_ok() {
+                        // Nobody holds it. Remove while still holding, so an instance that
+                        // opens the path between the unlink and the unlock contends with us
+                        // rather than acquiring a second, independent lock.
+                        info!(
+                            "Cache initialization: removing an unheld validation lock file at {:?}",
+                            validation_lock
+                        );
+                        if let Err(e) = tokio::fs::remove_file(&validation_lock).await {
+                            debug!(
+                                "Cache initialization: could not remove the unheld validation \
+                                 lock at {:?}: {}. Harmless — it is a zero-byte sentinel.",
+                                validation_lock, e
+                            );
+                        }
+                        let _ = fs4::FileExt::unlock(&probe);
+                    } else {
+                        // A live holder. This is the case the old mtime test could not see, and
+                        // the one where removal would have created a second concurrent pass.
+                        info!(
+                            "Cache initialization: another instance holds the validation lock; \
+                             leaving it in place. A held lock is never stale — the kernel \
+                             releases it if that instance dies."
+                        );
                     }
+                }
+                Err(e) => {
+                    debug!(
+                        "Cache initialization: could not open the validation lock at {:?} to test \
+                         whether it is held: {}. Leaving it alone.",
+                        validation_lock, e
+                    );
                 }
             }
         }
@@ -790,744 +869,6 @@ impl CacheInitializationCoordinator {
         }
 
         Ok(())
-    }
-
-    /// Perform metadata consistency validation on scan results
-    ///
-    /// # Requirements
-    /// - Requirement 10.1: Validate metadata consistency during initialization
-    async fn perform_metadata_consistency_validation(
-        &self,
-        scan_results: &ObjectsScanResults,
-    ) -> Result<ConsistencyValidationInfo> {
-        let validation_start = std::time::Instant::now();
-        let mut corruption_count = 0;
-        let mut errors = Vec::new();
-        let mut validated_count = 0;
-        let mut head_only_expired_removed = 0;
-        let now = std::time::SystemTime::now();
-        let one_day = std::time::Duration::from_secs(24 * 3600);
-
-        // Create cache validator for consistency checks
-        let validator = crate::cache_validator::CacheValidator::new(self.cache_dir.clone());
-
-        // Validate each metadata entry for consistency
-        for entry in &scan_results.metadata_entries {
-            if let Some(metadata) = &entry.metadata {
-                validated_count += 1;
-
-                // Clean up HEAD-only entries expired for more than 1 day.
-                // These have no cached body data (ranges is empty) and the HEAD
-                // metadata is stale — keeping them wastes disk space and NFS I/O.
-                if metadata.ranges.is_empty() {
-                    if let Some(head_expires) = metadata.head_expires_at {
-                        if let Ok(expired_for) = now.duration_since(head_expires) {
-                            if expired_for > one_day {
-                                // Remove the .meta file
-                                if entry.file_path.exists() {
-                                    match std::fs::remove_file(&entry.file_path) {
-                                        Ok(_) => {
-                                            head_only_expired_removed += 1;
-                                            debug!(
-                                                "Removed stale HEAD-only entry: {} (expired {:.1} days ago)",
-                                                entry.cache_key,
-                                                expired_for.as_secs_f64() / 86400.0
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to remove stale HEAD-only entry {}: {}",
-                                                entry.cache_key, e
-                                            );
-                                        }
-                                    }
-                                }
-                                // Also remove lock file if present
-                                let lock_path = entry.file_path.with_extension("meta.lock");
-                                if lock_path.exists() {
-                                    let _ = std::fs::remove_file(&lock_path);
-                                }
-                                continue; // Skip further validation for removed entry
-                            }
-                        }
-                    } else {
-                        // head_expires_at is None — HEAD was never cached or already cleared.
-                        // If object-level expires_at is also >1 day expired, remove it.
-                        if let Ok(expired_for) = now.duration_since(metadata.expires_at) {
-                            if expired_for > one_day {
-                                if entry.file_path.exists() {
-                                    match std::fs::remove_file(&entry.file_path) {
-                                        Ok(_) => {
-                                            head_only_expired_removed += 1;
-                                            debug!(
-                                                "Removed stale HEAD-only entry (no head_expires_at): {} (object expired {:.1} days ago)",
-                                                entry.cache_key,
-                                                expired_for.as_secs_f64() / 86400.0
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to remove stale HEAD-only entry {}: {}",
-                                                entry.cache_key, e
-                                            );
-                                        }
-                                    }
-                                }
-                                let lock_path = entry.file_path.with_extension("meta.lock");
-                                if lock_path.exists() {
-                                    let _ = std::fs::remove_file(&lock_path);
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // Perform metadata integrity validation
-                match validator.validate_metadata_integrity(metadata).await {
-                    Ok(integrity_result) => {
-                        if !integrity_result.is_valid {
-                            corruption_count += 1;
-                            for error in integrity_result.errors {
-                                errors.push(format!(
-                                    "Metadata integrity error in {}: {}",
-                                    entry.cache_key, error
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        errors.push(format!(
-                            "Failed to validate metadata integrity for {}: {}",
-                            entry.cache_key, e
-                        ));
-                    }
-                }
-
-                // Perform consistency validation (check if range files exist)
-                match validator
-                    .validate_consistency_integrity(&metadata.cache_key)
-                    .await
-                {
-                    Ok(consistency_result) => {
-                        if !consistency_result.is_consistent {
-                            corruption_count += 1;
-                            errors.push(format!(
-                                "Consistency error for {}: {} missing files, {} orphaned files",
-                                entry.cache_key,
-                                consistency_result.missing_range_files.len(),
-                                consistency_result.orphaned_range_files.len()
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        errors.push(format!(
-                            "Failed to validate consistency for {}: {}",
-                            entry.cache_key, e
-                        ));
-                    }
-                }
-            }
-        }
-
-        let validation_duration = validation_start.elapsed();
-
-        Ok(ConsistencyValidationInfo {
-            validated_count,
-            corruption_count,
-            head_only_expired_removed,
-            errors,
-            validation_duration,
-        })
-    }
-
-    /// Update validation timestamp to mark validation as complete
-    ///
-    /// # Requirements
-    /// - Requirement 10.3: Track validation completion time
-    async fn update_validation_timestamp(&self) -> Result<()> {
-        let size_tracking_dir = self.cache_dir.join("size_tracking");
-        tokio::fs::create_dir_all(&size_tracking_dir)
-            .await
-            .map_err(|e| {
-                crate::error::ProxyError::CacheError(format!(
-                    "Failed to create size tracking directory: {}",
-                    e
-                ))
-            })?;
-
-        let validation_file = size_tracking_dir.join("validation.json");
-        let timestamp = std::time::SystemTime::now();
-        let timestamp_secs = timestamp
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_secs();
-
-        let validation_data = serde_json::json!({
-            "last_validation": timestamp_secs,
-            "status": "completed",
-            "completed_at": timestamp_secs,
-            "validation_type": "metadata_consistency"
-        });
-
-        tokio::fs::write(&validation_file, validation_data.to_string())
-            .await
-            .map_err(|e| {
-                crate::error::ProxyError::CacheError(format!(
-                    "Failed to write validation timestamp: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Perform coordinated metadata scan with performance metrics collection and optimizations
-    ///
-    /// This method implements the core requirement of scanning the cache metadata
-    /// once and providing results to all subsystems. It uses parallel processing,
-    /// lazy parsing for disabled subsystems, and memory-efficient streaming for
-    /// large directories.
-    ///
-    /// # Requirements
-    /// - Requirement 1.1: Single coordinated scan of cache metadata
-    /// - Requirement 1.2: Collect metadata for both write cache and size validation
-    /// - Requirement 6.1: Single directory traversal, parallel file processing where safe
-    /// - Requirement 6.2: Parse each file at most once, lazy parsing for disabled subsystems
-    /// - Requirement 6.3: Memory-efficient streaming for large directories
-    /// - Requirement 6.4: Track scan duration, parse duration
-    /// - Requirement 6.5: Add memory usage monitoring
-    /// - Requirement 7.1: Handle metadata parsing failures gracefully
-    async fn scan_cache_metadata_with_metrics(
-        &self,
-        performance_metrics: &mut PerformanceMetrics,
-    ) -> Result<ObjectsScanResults> {
-        let scan_start = Instant::now();
-        info!("Cache initialization: Starting coordinated metadata scan with performance tracking");
-
-        // Create cache validator for shared utilities
-        let validator = CacheValidator::new(self.cache_dir.clone());
-
-        // Scan metadata directory for metadata files
-        let metadata_dir = self.cache_dir.join("metadata");
-        if !metadata_dir.exists() {
-            info!("Cache initialization: Metadata directory does not exist, creating empty scan results");
-            performance_metrics.scan_duration = scan_start.elapsed();
-            return Ok(ObjectsScanResults::empty());
-        }
-
-        // Perform optimized parallel scan with lazy parsing and memory-efficient streaming
-        let parse_start = Instant::now();
-        let cache_file_results = match self
-            .scan_and_process_optimized(&validator, &metadata_dir, performance_metrics)
-            .await
-        {
-            Ok(results) => {
-                debug!(
-                    "Cache initialization: Successfully processed {} files",
-                    results.len()
-                );
-                performance_metrics.files_processed = results.len() as u64;
-                results
-            }
-            Err(e) => {
-                // Graceful error recovery for directory access failures
-                let error_msg = e.to_string();
-                if error_msg.contains("Permission denied") {
-                    error!(
-                        "Cache initialization: Permission denied accessing metadata directory: {}. \
-                        Check directory permissions and run with appropriate privileges.",
-                        e
-                    );
-                } else if error_msg.contains("No such file or directory")
-                    || error_msg.contains("not found")
-                {
-                    info!(
-                        "Cache initialization: Metadata directory not found: {}. \
-                        Starting with empty cache state.",
-                        e
-                    );
-                } else {
-                    warn!(
-                        "Cache initialization: Directory scan failed: {}. \
-                        Continuing with empty results to allow proxy startup.",
-                        e
-                    );
-                }
-                performance_metrics.scan_duration = scan_start.elapsed();
-                return Ok(ObjectsScanResults::empty());
-            }
-        };
-
-        performance_metrics.parse_duration = parse_start.elapsed();
-
-        // Convert CacheFileResult to CacheMetadataEntry and collect statistics
-        let mut metadata_entries = Vec::new();
-        let mut scan_errors = Vec::new();
-        let mut total_objects = 0u64;
-        let mut total_size = 0u64;
-        let mut write_cached_objects = 0u64;
-        let mut write_cached_size = 0u64;
-        let mut read_cached_objects = 0u64;
-        let mut read_cached_size = 0u64;
-        let mut parsed_files = 0u64;
-
-        for cache_result in cache_file_results {
-            // Convert to CacheMetadataEntry
-            let mut entry = CacheMetadataEntry::new(cache_result.file_path.clone());
-            entry.compressed_size = cache_result.compressed_size;
-            entry.is_write_cached = cache_result.is_write_cached;
-            entry.metadata = cache_result.metadata.clone();
-            entry.parse_errors = cache_result.parse_errors.clone();
-
-            // Extract cache key from metadata if available
-            if let Some(metadata) = &cache_result.metadata {
-                entry.cache_key = metadata.cache_key.clone();
-                parsed_files += 1;
-            }
-
-            // Collect errors
-            for error_msg in &cache_result.parse_errors {
-                scan_errors.push(ScanError::new(
-                    cache_result.file_path.clone(),
-                    error_msg.clone(),
-                    if error_msg.contains("JSON parse error") {
-                        ScanErrorCategory::JsonParse
-                    } else if error_msg.contains("File read error") {
-                        ScanErrorCategory::FileRead
-                    } else {
-                        ScanErrorCategory::Other
-                    },
-                ));
-            }
-
-            // Update statistics only for valid entries
-            if entry.is_valid() {
-                total_objects += 1;
-                total_size += cache_result.compressed_size;
-
-                // Classify through the single shared staged-range predicate so this scan
-                // reports the same figure the accumulator would for the same on-disk
-                // state, and do it PER RANGE where the ranges are available — the
-                // accumulator credits per range, so classifying at object granularity
-                // (all ranges or none, from the flag alone) is what let the two disagree.
-                //
-                // **`metadata` being `Some` does not mean it was fully parsed.** There are
-                // two producers of these results and they retain different amounts:
-                // `process_metadata_file_lazy` builds a MINIMAL `NewCacheMetadata` that
-                // copies `is_write_cached` but carries **no ranges**, putting the summed
-                // range bytes in `compressed_size` instead. So a range-based predicate
-                // alone reports such an object as unstaged, which is wrong and is exactly
-                // the "find every producer, not the first one" trap in
-                // `cache-tier-verification.md`. Branch on whether ranges are actually
-                // present, and fall back to the flag plus `compressed_size` when they are
-                // not.
-                // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
-                let (is_staged, staged_bytes) = match cache_result.metadata.as_ref() {
-                    Some(m) if !m.ranges.is_empty() => {
-                        (m.has_staged_range(), m.staged_compressed_size())
-                    }
-                    _ if cache_result.is_write_cached => (true, cache_result.compressed_size),
-                    _ => (false, 0),
-                };
-
-                if is_staged {
-                    write_cached_objects += 1;
-                    write_cached_size += staged_bytes;
-                    // A partially-staged object contributes its unstaged remainder to
-                    // the read tier, so the two subtotals still sum to total_size.
-                    read_cached_size += cache_result.compressed_size.saturating_sub(staged_bytes);
-                } else {
-                    read_cached_objects += 1;
-                    read_cached_size += cache_result.compressed_size;
-                }
-            }
-
-            metadata_entries.push(entry);
-        }
-
-        let scan_duration = scan_start.elapsed();
-        performance_metrics.scan_duration = scan_duration;
-        performance_metrics.metadata_files_parsed = parsed_files;
-
-        let results = ObjectsScanResults {
-            total_objects,
-            total_size,
-            write_cached_objects,
-            write_cached_size,
-            read_cached_objects,
-            read_cached_size,
-            metadata_entries,
-            scan_duration,
-            scan_errors,
-            loaded_from_state_files: false,
-        };
-
-        info!(
-            "Cache initialization: Coordinated metadata scan completed in {}: {}",
-            format_duration_human(scan_duration),
-            results.summary_string()
-        );
-
-        // Log performance metrics for this phase
-        info!(
-            "Cache initialization: Scan performance - processed {} files in {}, parsing took {}, rate: {:.1} files/s",
-            performance_metrics.files_processed,
-            format_duration_human(performance_metrics.scan_duration),
-            format_duration_human(performance_metrics.parse_duration),
-            if performance_metrics.scan_duration.as_secs_f64() > 0.0 {
-                performance_metrics.files_processed as f64 / performance_metrics.scan_duration.as_secs_f64()
-            } else {
-                0.0
-            }
-        );
-
-        if results.has_errors() {
-            warn!(
-                "Cache initialization: Scan encountered {} errors during metadata processing",
-                results.error_count()
-            );
-        }
-
-        Ok(results)
-    }
-
-    /// Optimized scan and process with lazy parsing and memory-efficient streaming
-    ///
-    /// This method implements performance optimizations for large cache directories:
-    /// - Lazy parsing: Only parse metadata needed for enabled subsystems
-    /// - Memory-efficient streaming: Process files in batches to limit memory usage
-    /// - Parallel processing: Use parallel processing where safe
-    ///
-    /// # Requirements
-    /// - Requirement 6.1: Parallel file processing where safe
-    /// - Requirement 6.2: Lazy parsing for disabled subsystems
-    /// - Requirement 6.3: Memory-efficient streaming for large directories
-    async fn scan_and_process_optimized(
-        &self,
-        validator: &CacheValidator,
-        objects_dir: &std::path::Path,
-        performance_metrics: &mut PerformanceMetrics,
-    ) -> Result<Vec<crate::cache_validator::CacheFileResult>> {
-        use rayon::prelude::*;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
-
-        let scan_start = Instant::now();
-        debug!("Starting optimized scan with lazy parsing and memory-efficient streaming");
-
-        // First, collect all metadata file paths using memory-efficient streaming
-        let metadata_files = self.scan_directory_streaming(objects_dir).await?;
-
-        if metadata_files.is_empty() {
-            debug!("No metadata files found in directory: {:?}", objects_dir);
-            return Ok(Vec::new());
-        }
-
-        let total_files = metadata_files.len();
-        info!(
-            "Cache initialization: Found {} metadata files, processing with optimizations",
-            total_files
-        );
-
-        // Determine what parsing is needed based on enabled subsystems
-        let need_write_cache_parsing = self.write_cache_enabled;
-        let _need_size_tracking_parsing = true; // Size tracking is always enabled
-
-        // For lazy parsing optimization: if write cache is disabled, we can skip detailed parsing
-        // of write cache specific fields and just focus on size calculation
-        let lazy_parsing_mode = !need_write_cache_parsing;
-
-        if lazy_parsing_mode {
-            info!("Cache initialization: Using lazy parsing mode (write cache disabled)");
-        }
-
-        // Process files in batches for memory efficiency (Requirement 6.3)
-        const BATCH_SIZE: usize = 1000; // Process 1000 files at a time to limit memory usage
-        let mut all_results = Vec::with_capacity(total_files);
-        let processed_count = Arc::new(AtomicU64::new(0));
-        let memory_peak = Arc::new(AtomicU64::new(0));
-
-        for (batch_index, batch) in metadata_files.chunks(BATCH_SIZE).enumerate() {
-            let batch_start = Instant::now();
-
-            // Monitor memory usage during batch processing
-            let batch_memory_start = get_current_memory_usage();
-
-            // Process batch in parallel (Requirement 6.1: parallel processing where safe)
-            let batch_results: Vec<crate::cache_validator::CacheFileResult> = batch
-                .par_iter()
-                .map(|path| {
-                    // Use optimized parsing based on subsystem requirements
-                    if lazy_parsing_mode {
-                        self.process_metadata_file_lazy(validator, path)
-                    } else {
-                        self.process_metadata_file_full(validator, path)
-                    }
-                })
-                .collect();
-
-            // Update processed count
-            let batch_processed = batch_results.len() as u64;
-            processed_count.fetch_add(batch_processed, Ordering::Relaxed);
-
-            // Monitor peak memory usage during batch processing
-            let batch_memory_end = get_current_memory_usage();
-            let current_peak = memory_peak.load(Ordering::Relaxed);
-            if batch_memory_end > current_peak {
-                memory_peak.store(batch_memory_end, Ordering::Relaxed);
-            }
-
-            all_results.extend(batch_results);
-
-            let batch_duration = batch_start.elapsed();
-            let total_processed = processed_count.load(Ordering::Relaxed);
-
-            debug!(
-                "Cache initialization: Processed batch {}/{} ({} files) in {} - total: {}/{} ({:.1}%)",
-                batch_index + 1,
-                total_files.div_ceil(BATCH_SIZE),
-                batch_processed,
-                format_duration_human(batch_duration),
-                total_processed,
-                total_files,
-                (total_processed as f64 / total_files as f64) * 100.0
-            );
-
-            // Log memory usage for this batch
-            debug!(
-                "Cache initialization: Batch memory usage - start: {}, end: {}, peak so far: {}",
-                format_bytes_human(batch_memory_start),
-                format_bytes_human(batch_memory_end),
-                format_bytes_human(memory_peak.load(Ordering::Relaxed))
-            );
-
-            // Optional: yield control to allow other tasks to run between batches
-            // This helps prevent blocking the async runtime for too long
-            if batch_index % 10 == 9 {
-                // Every 10 batches
-                tokio::task::yield_now().await;
-            }
-        }
-
-        let total_duration = scan_start.elapsed();
-        let final_processed = processed_count.load(Ordering::Relaxed);
-        let final_memory_peak = memory_peak.load(Ordering::Relaxed);
-
-        // Update performance metrics
-        performance_metrics.files_processed = final_processed;
-        if final_memory_peak > performance_metrics.peak_memory_usage {
-            performance_metrics.peak_memory_usage = final_memory_peak;
-        }
-
-        let valid_count = all_results.iter().filter(|r| r.metadata.is_some()).count();
-        let error_count = all_results
-            .iter()
-            .filter(|r| !r.parse_errors.is_empty())
-            .count();
-
-        info!(
-            "Cache initialization: Optimized scan completed - processed {} files, {} valid, {} errors in {} \
-             (rate: {:.1} files/s, peak memory: {}, lazy parsing: {})",
-            final_processed,
-            valid_count,
-            error_count,
-            format_duration_human(total_duration),
-            if total_duration.as_secs_f64() > 0.0 {
-                final_processed as f64 / total_duration.as_secs_f64()
-            } else {
-                0.0
-            },
-            format_bytes_human(final_memory_peak),
-            if lazy_parsing_mode { "enabled" } else { "disabled" }
-        );
-
-        Ok(all_results)
-    }
-
-    /// Memory-efficient directory scanning using streaming
-    ///
-    /// This method scans directories using a streaming approach to minimize
-    /// memory usage when dealing with large cache directories.
-    ///
-    /// # Requirements
-    /// - Requirement 6.3: Memory-efficient streaming for large directories
-    async fn scan_directory_streaming(&self, dir: &std::path::Path) -> Result<Vec<PathBuf>> {
-        use walkdir::WalkDir;
-
-        let mut metadata_files = Vec::new();
-        let mut processed_entries = 0u64;
-        const PROGRESS_INTERVAL: u64 = 10000; // Log progress every 10k entries
-
-        // Use walkdir for efficient directory traversal
-        for entry in WalkDir::new(dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            processed_entries += 1;
-
-            // Log progress for very large directories
-            if processed_entries.is_multiple_of(PROGRESS_INTERVAL) {
-                debug!(
-                    "Cache initialization: Scanned {} directory entries, found {} metadata files",
-                    processed_entries,
-                    metadata_files.len()
-                );
-            }
-
-            let path = entry.path();
-
-            // Filter for metadata files
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "meta") {
-                metadata_files.push(path.to_path_buf());
-            }
-
-            // Yield control periodically to prevent blocking the async runtime
-            if processed_entries.is_multiple_of(1000) {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        debug!(
-            "Cache initialization: Directory streaming scan completed - processed {} entries, found {} metadata files",
-            processed_entries,
-            metadata_files.len()
-        );
-
-        Ok(metadata_files)
-    }
-
-    /// Process metadata file with lazy parsing optimization
-    ///
-    /// This method implements lazy parsing by only extracting the minimal
-    /// information needed when certain subsystems are disabled.
-    ///
-    /// # Requirements
-    /// - Requirement 6.2: Lazy parsing for disabled subsystems
-    fn process_metadata_file_lazy(
-        &self,
-        _validator: &CacheValidator,
-        path: &PathBuf,
-    ) -> crate::cache_validator::CacheFileResult {
-        let mut result = crate::cache_validator::CacheFileResult {
-            file_path: path.clone(),
-            compressed_size: 0,
-            is_write_cached: false,
-            metadata: None,
-            parse_errors: Vec::new(),
-        };
-
-        // In lazy parsing mode, we only need to extract size information
-        // and can skip detailed metadata parsing for disabled subsystems
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                // Try to parse just enough to get size information
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(json_value) => {
-                        // Extract compressed size from ranges without full parsing
-                        if let Some(ranges) = json_value.get("ranges").and_then(|r| r.as_array()) {
-                            let mut total_size = 0u64;
-                            for range in ranges {
-                                if let Some(compressed_size) =
-                                    range.get("compressed_size").and_then(|s| s.as_u64())
-                                {
-                                    total_size += compressed_size;
-                                }
-                            }
-                            result.compressed_size = total_size;
-                        }
-
-                        // Extract write_cached flag if available (minimal parsing)
-                        if let Some(object_metadata) = json_value.get("object_metadata") {
-                            if let Some(is_write_cached) = object_metadata
-                                .get("is_write_cached")
-                                .and_then(|w| w.as_bool())
-                            {
-                                result.is_write_cached = is_write_cached;
-                            }
-                        }
-
-                        // In lazy mode, we still need to create a minimal metadata object
-                        // for proper object counting and categorization
-                        if let Some(cache_key) =
-                            json_value.get("cache_key").and_then(|k| k.as_str())
-                        {
-                            // Create a minimal metadata object with just the essential fields
-                            let minimal_metadata = NewCacheMetadata {
-                                cache_key: cache_key.to_string(),
-                                object_metadata: crate::cache_types::ObjectMetadata {
-                                    etag: "lazy-parsed".to_string(),
-                                    content_type: None,
-                                    content_length: result.compressed_size,
-                                    last_modified: "lazy-parsed".to_string(),
-                                    is_write_cached: result.is_write_cached,
-                                    ..Default::default()
-                                },
-                                ranges: Vec::new(), // Empty ranges in lazy mode
-                                created_at: std::time::SystemTime::now(),
-                                expires_at: std::time::SystemTime::now()
-                                    + std::time::Duration::from_secs(3600),
-                                compression_info: Default::default(),
-                                ..Default::default()
-                            };
-                            result.metadata = Some(minimal_metadata);
-                        }
-                    }
-                    Err(e) => {
-                        result
-                            .parse_errors
-                            .push(format!("JSON parse error (lazy): {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                result.parse_errors.push(format!("File read error: {}", e));
-            }
-        }
-
-        result
-    }
-
-    /// Process metadata file with full parsing
-    ///
-    /// This method performs complete metadata parsing when all subsystems
-    /// are enabled and need detailed information.
-    fn process_metadata_file_full(
-        &self,
-        validator: &CacheValidator,
-        path: &PathBuf,
-    ) -> crate::cache_validator::CacheFileResult {
-        let mut result = crate::cache_validator::CacheFileResult {
-            file_path: path.clone(),
-            compressed_size: 0,
-            is_write_cached: false,
-            metadata: None,
-            parse_errors: Vec::new(),
-        };
-
-        // Full parsing for when all subsystems need detailed information
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                match serde_json::from_str::<NewCacheMetadata>(&content) {
-                    Ok(metadata) => {
-                        // Calculate compressed size from ranges
-                        result.compressed_size =
-                            validator.calculate_compressed_size(&metadata.ranges);
-                        result.is_write_cached = metadata.object_metadata.is_write_cached;
-                        result.metadata = Some(metadata);
-                    }
-                    Err(e) => {
-                        result.parse_errors.push(format!("JSON parse error: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                result.parse_errors.push(format!("File read error: {}", e));
-            }
-        }
-
-        result
     }
 
     /// Initialize subsystems with detailed logging
@@ -1584,10 +925,6 @@ impl CacheInitializationCoordinator {
                     scan_results.write_cache_percentage(),
                 );
                 results.write_cache_initialized = true;
-                // Deliberately the live in-flight figure (zero at startup), not the
-                // scan's resident figure. Reporting the scan figure here is what made the
-                // startup summary read as though the tier were already full.
-                results.write_cache_usage = 0;
             } else {
                 warn!("Write cache capacity tracking: Manager not provided despite being enabled");
             }
@@ -1601,9 +938,8 @@ impl CacheInitializationCoordinator {
                 .initialize_size_tracker_safe(tracker, scan_results)
                 .await
             {
-                Ok(usage) => {
+                Ok(_usage) => {
                     results.size_tracker_initialized = true;
-                    results.size_tracker_usage = usage;
                 }
                 Err(e) => {
                     error!(
@@ -1612,7 +948,6 @@ impl CacheInitializationCoordinator {
                         e
                     );
                     results.size_tracker_initialized = false;
-                    results.size_tracker_usage = 0;
                 }
             }
         } else {
@@ -1762,7 +1097,7 @@ impl CacheInitializationCoordinator {
             })?;
 
         // Try to acquire exclusive lock (non-blocking)
-        lock_file.try_lock_exclusive().map_err(|e| {
+        fs4::FileExt::try_lock(&lock_file).map_err(|e| {
             ProxyError::CacheError(format!("Failed to acquire initialization lock: {}", e))
         })?;
 
@@ -1871,7 +1206,7 @@ impl CacheInitializationCoordinator {
     /// # Requirements
     /// - Requirement 10.2: Add coordination for shared cache validation
     /// - Requirement 10.3: Ensure consistent view after initialization
-    pub async fn ensure_cache_state_consistency_post_init(
+    pub(crate) async fn ensure_cache_state_consistency_post_init(
         &self,
         size_tracker: Option<&Arc<CacheSizeTracker>>,
     ) -> Result<CacheConsistencyInfo> {
@@ -1949,125 +1284,6 @@ impl CacheInitializationCoordinator {
         consistency_info.subsystem_consistency_status = "CHECKED_DURING_INIT".to_string();
         consistency_info.subsystem_consistency_message =
             Some("Cross-validation performed during initialization".to_string());
-
-        info!(
-            "Cache initialization: Cache state consistency check completed - {} warnings",
-            consistency_info.warnings
-        );
-
-        Ok(consistency_info)
-    }
-
-    /// Ensure consistent cache state across instances
-    ///
-    /// This method implements cache state consistency checks to ensure all instances
-    /// have a consistent view of the cache after initialization.
-    ///
-    /// # Requirements
-    /// - Requirement 10.2: Add coordination for shared cache validation
-    /// - Requirement 10.3: Ensure consistent view after initialization
-    pub async fn ensure_cache_state_consistency(
-        &self,
-        write_cache_manager: Option<&WriteCacheManager>,
-        size_tracker: Option<&Arc<CacheSizeTracker>>,
-    ) -> Result<CacheConsistencyInfo> {
-        info!("Cache initialization: Verifying cache state consistency across instances");
-
-        let mut consistency_info = CacheConsistencyInfo::new();
-
-        // Check if shared cache validation is needed
-        if let Some(tracker) = size_tracker {
-            match self.verify_shared_cache_validation(tracker).await {
-                Ok(validation_info) => {
-                    consistency_info.shared_validation_status = validation_info.status.clone();
-                    consistency_info.shared_validation_message =
-                        Some(validation_info.message.clone());
-
-                    if validation_info.needs_attention {
-                        consistency_info.warnings += 1;
-                        warn!(
-                            "Cache initialization: Shared cache validation needs attention: {}",
-                            validation_info.message
-                        );
-                    } else {
-                        debug!(
-                            "Cache initialization: Shared cache validation successful: {}",
-                            validation_info.message
-                        );
-                    }
-                }
-                Err(e) => {
-                    consistency_info.warnings += 1;
-                    consistency_info.shared_validation_status = "FAILED".to_string();
-                    consistency_info.shared_validation_message =
-                        Some(format!("Validation failed: {}", e));
-                    warn!(
-                        "Cache initialization: Shared cache validation failed: {}",
-                        e
-                    );
-                }
-            }
-        }
-
-        // Verify cache directory consistency
-        match self.verify_cache_directory_consistency().await {
-            Ok(dir_info) => {
-                consistency_info.directory_consistency_status = dir_info.status.clone();
-                consistency_info.directory_consistency_message = Some(dir_info.message.clone());
-
-                if dir_info.needs_attention {
-                    consistency_info.warnings += 1;
-                    warn!(
-                        "Cache initialization: Directory consistency needs attention: {}",
-                        dir_info.message
-                    );
-                } else {
-                    debug!(
-                        "Cache initialization: Directory consistency verified: {}",
-                        dir_info.message
-                    );
-                }
-            }
-            Err(e) => {
-                consistency_info.warnings += 1;
-                consistency_info.directory_consistency_status = "FAILED".to_string();
-                consistency_info.directory_consistency_message =
-                    Some(format!("Directory check failed: {}", e));
-                warn!(
-                    "Cache initialization: Directory consistency check failed: {}",
-                    e
-                );
-            }
-        }
-
-        // Verify subsystem consistency if both are available
-        if write_cache_manager.is_some() && size_tracker.is_some() {
-            match self
-                .cross_validate_subsystems(write_cache_manager, size_tracker)
-                .await
-            {
-                Ok(validation_results) => {
-                    if validation_results.was_performed() {
-                        consistency_info.subsystem_consistency_status =
-                            validation_results.status_string();
-                        consistency_info.subsystem_consistency_message =
-                            Some(validation_results.summary_string());
-
-                        if validation_results.has_serious_discrepancy()
-                            || validation_results.has_minor_discrepancy()
-                        {
-                            consistency_info.warnings += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    consistency_info.warnings += 1;
-                    consistency_info.subsystem_consistency_status = "FAILED".to_string();
-                    consistency_info.subsystem_consistency_message =
-                        Some(format!("Cross-validation failed: {}", e));
-                }
-            }
-        }
 
         info!(
             "Cache initialization: Cache state consistency check completed - {} warnings",
@@ -2282,8 +1498,6 @@ impl CacheInitializationCoordinator {
 pub struct InitializationSummary {
     /// Total initialization duration
     pub total_duration: Duration,
-    /// Results from each phase
-    pub phase_results: Vec<PhaseResult>,
     /// Scan results summary
     pub scan_summary: ObjectsScanResults,
     /// Subsystem initialization results
@@ -2296,19 +1510,6 @@ pub struct InitializationSummary {
     pub total_warnings: u32,
     /// Performance metrics collected during initialization
     pub performance_metrics: PerformanceMetrics,
-}
-
-/// Result from a single initialization phase
-#[derive(Debug, Clone)]
-pub struct PhaseResult {
-    /// Name of the phase
-    pub phase_name: String,
-    /// Duration of the phase
-    pub duration: Duration,
-    /// Whether the phase succeeded
-    pub success: bool,
-    /// Error message if phase failed
-    pub error_message: Option<String>,
 }
 
 /// Performance metrics collected during cache initialization
@@ -2481,7 +1682,7 @@ impl PerformanceMetrics {
     }
 
     /// Calculate derived metrics from collected data
-    pub fn calculate_derived_metrics(&mut self) {
+    pub(crate) fn calculate_derived_metrics(&mut self) {
         // Calculate file processing rate
         if self.scan_duration.as_secs_f64() > 0.0 {
             self.file_processing_rate =
@@ -2502,12 +1703,12 @@ impl PerformanceMetrics {
     }
 
     /// Get memory usage delta (final - initial)
-    pub fn memory_usage_delta(&self) -> i64 {
+    pub(crate) fn memory_usage_delta(&self) -> i64 {
         self.final_memory_usage as i64 - self.initial_memory_usage as i64
     }
 
     /// Format performance summary for logging
-    pub fn format_summary(&self) -> String {
+    pub(crate) fn format_summary(&self) -> String {
         format!(
             "Performance: scan={}ms, parse={}ms, subsystems={}ms, validation={}ms, \
              files={}, parsed={}, rate={:.1}/s, parse_rate={:.1}/s, \
@@ -2536,7 +1737,7 @@ impl PerformanceMetrics {
     }
 
     /// Get detailed performance report
-    pub fn detailed_report(&self) -> String {
+    pub(crate) fn detailed_report(&self) -> String {
         let mut report = String::new();
         report.push_str("=== Cache Initialization Performance Report ===\n");
         report.push_str(&format!(
@@ -2917,12 +2118,8 @@ pub enum ScanErrorCategory {
 pub struct SubsystemResults {
     /// Whether write cache manager was initialized
     pub write_cache_initialized: bool,
-    /// Write cache usage in bytes
-    pub write_cache_usage: u64,
     /// Whether size tracker was initialized
     pub size_tracker_initialized: bool,
-    /// Size tracker usage in bytes
-    pub size_tracker_usage: u64,
 }
 
 impl SubsystemResults {
@@ -2930,9 +2127,7 @@ impl SubsystemResults {
     pub fn empty() -> Self {
         Self {
             write_cache_initialized: false,
-            write_cache_usage: 0,
             size_tracker_initialized: false,
-            size_tracker_usage: 0,
         }
     }
 }
@@ -2965,7 +2160,7 @@ impl ValidationResults {
     }
 
     /// Create validation results indicating no cross-validation was performed
-    pub fn not_performed(reason: String) -> Self {
+    pub(crate) fn not_performed(reason: String) -> Self {
         Self {
             write_cache_consistent: true,
             size_discrepancy_percent: 0.0,
@@ -3006,72 +2201,6 @@ impl ValidationResults {
         }
     }
 
-    /// Get detailed discrepancy report
-    pub fn detailed_discrepancy_report(&self) -> String {
-        if !self.was_performed() {
-            return "Cross-validation was not performed - detailed report unavailable".to_string();
-        }
-
-        let manager_size = self.write_cache_manager_size.unwrap_or(0);
-        let tracker_size = self.size_tracker_write_cache_size.unwrap_or(0);
-        let absolute_diff = (manager_size as i64 - tracker_size as i64).unsigned_abs();
-
-        let mut report = String::new();
-        report.push_str("=== Cross-Validation Detailed Report ===\n");
-        report.push_str(&format!(
-            "WriteCacheManager size: {} ({} bytes)\n",
-            format_bytes_human(manager_size),
-            manager_size
-        ));
-        report.push_str(&format!(
-            "CacheSizeTracker write cache size: {} ({} bytes)\n",
-            format_bytes_human(tracker_size),
-            tracker_size
-        ));
-        report.push_str(&format!(
-            "Absolute difference: {} ({} bytes)\n",
-            format_bytes_human(absolute_diff),
-            absolute_diff
-        ));
-        report.push_str(&format!(
-            "Percentage difference: {:.2}%\n",
-            self.size_discrepancy_percent
-        ));
-        report.push_str(&format!(
-            "Consistency status: {}\n",
-            if self.write_cache_consistent {
-                "CONSISTENT"
-            } else {
-                "INCONSISTENT"
-            }
-        ));
-
-        if !self.validation_warnings.is_empty() {
-            report.push_str("Warnings:\n");
-            for (i, warning) in self.validation_warnings.iter().enumerate() {
-                report.push_str(&format!("  {}. {}\n", i + 1, warning));
-            }
-        }
-
-        report.push_str("========================================");
-        report
-    }
-
-    /// Get validation status as a simple string
-    pub fn status_string(&self) -> String {
-        if !self.was_performed() {
-            "NOT_PERFORMED".to_string()
-        } else if self.write_cache_consistent {
-            "CONSISTENT".to_string()
-        } else if self.size_discrepancy_percent > 20.0 {
-            "ERROR_THRESHOLD_EXCEEDED".to_string()
-        } else if self.size_discrepancy_percent > 5.0 {
-            "WARNING_THRESHOLD_EXCEEDED".to_string()
-        } else {
-            "INCONSISTENT".to_string()
-        }
-    }
-
     /// Check if validation indicates a serious problem
     pub fn has_serious_discrepancy(&self) -> bool {
         self.was_performed() && self.size_discrepancy_percent > 20.0
@@ -3083,29 +2212,42 @@ impl ValidationResults {
             && self.size_discrepancy_percent > 5.0
             && self.size_discrepancy_percent <= 20.0
     }
+}
 
-    /// Get recommendation based on validation results
-    pub fn get_recommendation(&self) -> Option<String> {
-        if !self.was_performed() {
-            return None;
-        }
+/// The removal predicate for a HEAD-only entry.
+///
+/// `Some((reason, expired_for))` when the entry holds no ranges and either its HEAD expiry
+/// or, failing that, its object expiry passed more than `grace` ago. `None` otherwise.
+///
+/// A free function over a `NewCacheMetadata` value, so the validation pass
+/// (`cache_size_tracker::stale_head_only_removable`, one day's `grace`) can evaluate the same
+/// predicate twice — once on the scan's read as a filter, and again on a fresh read taken under
+/// the key's metadata slot lock, which is the read the deletion acts on.
+pub(crate) fn stale_head_only_entry(
+    metadata: &NewCacheMetadata,
+    now: std::time::SystemTime,
+    grace: Duration,
+) -> Option<(&'static str, Duration)> {
+    let (reason, expires) = head_only_expiry(metadata)?;
+    now.duration_since(expires)
+        .ok()
+        .filter(|expired_for| *expired_for > grace)
+        .map(|expired_for| (reason, expired_for))
+}
 
-        if self.has_serious_discrepancy() {
-            Some(
-                "Consider running cache validation to identify and resolve inconsistencies. \
-                  Large discrepancies may indicate cache corruption or synchronization issues."
-                    .to_string(),
-            )
-        } else if self.has_minor_discrepancy() {
-            Some(
-                "Monitor cache consistency. Minor discrepancies may resolve automatically \
-                  during normal operation, but persistent issues should be investigated."
-                    .to_string(),
-            )
-        } else {
-            None
-        }
+/// The instant a range-less document's HEAD expiry is judged against, with its source:
+/// `head_expires_at`, or the object-level `expires_at` when HEAD was never cached or was
+/// cleared. `None` when the document lists a range.
+pub(crate) fn head_only_expiry(
+    metadata: &NewCacheMetadata,
+) -> Option<(&'static str, std::time::SystemTime)> {
+    if !metadata.ranges.is_empty() {
+        return None;
     }
+    Some(match metadata.head_expires_at {
+        Some(head_expires) => ("head_expires_at", head_expires),
+        None => ("no head_expires_at, object expires_at", metadata.expires_at),
+    })
 }
 
 /// Format duration in human-readable format
@@ -3158,7 +2300,7 @@ pub struct InitializationLock {
 impl Drop for InitializationLock {
     fn drop(&mut self) {
         // Unlock the file when the guard is dropped
-        let _ = self.file.unlock();
+        let _ = fs4::FileExt::unlock(&self.file);
         debug!(
             "Cache initialization: Released initialization lock at {:?}",
             self.path
@@ -3213,7 +2355,7 @@ impl CacheConsistencyInfo {
     }
 
     /// Get overall consistency status
-    pub fn overall_status(&self) -> String {
+    pub(crate) fn overall_status(&self) -> String {
         if self.warnings == 0 {
             "CONSISTENT".to_string()
         } else if self.warnings <= 2 {
@@ -3253,43 +2395,6 @@ pub struct ValidationFreshnessInfo {
     pub last_validation: Option<std::time::SystemTime>,
 }
 
-/// Information about consistency validation results
-#[derive(Debug, Clone)]
-pub struct ConsistencyValidationInfo {
-    /// Number of metadata entries validated
-    pub validated_count: usize,
-    /// Number of corrupted metadata entries found
-    pub corruption_count: usize,
-    /// Number of HEAD-only expired entries removed
-    pub head_only_expired_removed: usize,
-    /// List of validation errors
-    pub errors: Vec<String>,
-    /// Duration of validation process
-    pub validation_duration: std::time::Duration,
-}
-
-impl ConsistencyValidationInfo {
-    /// Get summary string for logging
-    pub fn summary_string(&self) -> String {
-        let mut parts = vec![
-            format!("validated {} entries", self.validated_count),
-            format!("found {} corrupted", self.corruption_count),
-            format!("{} errors", self.errors.len()),
-        ];
-        if self.head_only_expired_removed > 0 {
-            parts.push(format!(
-                "removed {} stale HEAD-only entries",
-                self.head_only_expired_removed
-            ));
-        }
-        format!(
-            "{} in {}",
-            parts.join(", "),
-            format_duration_human(self.validation_duration)
-        )
-    }
-}
-
 /// Information about a specific validation check
 #[derive(Debug, Clone)]
 pub struct ValidationInfo {
@@ -3305,7 +2410,7 @@ pub struct ValidationInfo {
 mod tests {
     use super::*;
     use crate::config::{EvictionAlgorithm, InitializationConfig, SharedStorageConfig};
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn create_test_cache_config() -> CacheConfig {
@@ -3314,10 +2419,11 @@ mod tests {
             max_cache_size: 1024 * 1024 * 1024, // 1GB
             ram_cache_enabled: false,
             max_ram_cache_size: 0,
-            eviction_algorithm: EvictionAlgorithm::LRU,
+            eviction_algorithm: EvictionAlgorithm::TinyLFU,
             write_cache_enabled: true,
             write_cache_percent: 0.5,
             write_cache_max_object_size: 1024 * 1024 * 100, // 100MB
+            disk_safety_free_space_floor: 1024 * 1024 * 1024, // 1 GiB
             put_ttl: Duration::from_secs(86400),            // 1 day
             get_ttl: Duration::from_secs(3600),             // 1 hour
             head_ttl: Duration::from_secs(300),             // 5 minutes
@@ -3327,18 +2433,16 @@ mod tests {
             range_merge_gap_threshold: 1024 * 1024, // 1MB
             eviction_buffer_percent: 5,
             ram_cache_flush_interval: Duration::from_secs(60),
-            ram_cache_flush_threshold: 100,
-            ram_cache_flush_on_eviction: false,
             ram_cache_verification_interval: Duration::from_secs(1),
             incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
             initialization: InitializationConfig::default(),
             cache_bypass_headers_enabled: true, // Default enabled
             metadata_cache: crate::config::MetadataCacheConfig::default(),
             eviction_trigger_percent: 95, // Trigger eviction at 95% capacity
-            eviction_target_percent: 80,  // Reduce to 80% after eviction
+            eviction_target_percent: 80,
             full_object_check_threshold: 67_108_864, // 64 MiB
-            disk_streaming_threshold: 1_048_576, // 1 MiB
-            compression_batch_size: 1_048_576, // 1 MiB
+            disk_streaming_threshold: 1_048_576,     // 1 MiB
+            compression_batch_size: 1_048_576,       // 1 MiB
             read_cache_enabled: true,
             bucket_settings_staleness_threshold: Duration::from_secs(60),
             evaluate_conditions_from_cache: true,
@@ -3362,7 +2466,7 @@ mod tests {
         );
 
         assert_eq!(coordinator.cache_dir(), temp_dir.path());
-        assert!(coordinator.is_write_cache_enabled());
+        assert!(coordinator.write_cache_enabled);
         assert_eq!(
             coordinator.config().write_cache_enabled,
             config.write_cache_enabled
@@ -3444,128 +2548,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_cache_metadata_empty_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = create_test_cache_config();
-
-        let coordinator =
-            CacheInitializationCoordinator::new(temp_dir.path().to_path_buf(), true, config);
-
-        let mut performance_metrics = PerformanceMetrics::new();
-        let results = coordinator
-            .scan_cache_metadata_with_metrics(&mut performance_metrics)
-            .await
-            .unwrap();
-
-        assert_eq!(results.total_objects, 0);
-        assert_eq!(results.total_size, 0);
-        assert_eq!(results.write_cached_objects, 0);
-        assert_eq!(results.read_cached_objects, 0);
-        assert!(results.metadata_entries.is_empty());
-        assert!(!results.has_errors());
-    }
-
-    #[tokio::test]
-    async fn test_scan_cache_metadata_with_valid_files() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = create_test_cache_config();
-
-        // Create metadata directory
-        let metadata_dir = temp_dir.path().join("metadata");
-        std::fs::create_dir_all(&metadata_dir).unwrap();
-
-        // Create a valid metadata file
-        let metadata = NewCacheMetadata {
-            cache_key: "test-bucket/test-object".to_string(),
-            object_metadata: crate::cache_types::ObjectMetadata {
-                etag: "test-etag".to_string(),
-                content_type: Some("text/plain".to_string()),
-                content_length: 1024,
-                last_modified: "Mon, 01 Jan 2024 00:00:00 GMT".to_string(),
-                is_write_cached: true,
-                ..Default::default()
-            },
-            ranges: vec![crate::cache_types::RangeSpec {
-                start: 0,
-                end: 1023,
-                file_path: "test.bin".to_string(),
-                compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
-                compressed_size: 512,
-                uncompressed_size: 1024,
-                created_at: SystemTime::now(),
-                last_accessed: SystemTime::now(),
-                access_count: 1,
-                staged: None,
-            }],
-            created_at: SystemTime::now(),
-            expires_at: SystemTime::now() + Duration::from_secs(3600),
-            compression_info: Default::default(),
-            ..Default::default()
-        };
-
-        let metadata_file = metadata_dir.join("test.meta");
-        let metadata_json = serde_json::to_string(&metadata).unwrap();
-        std::fs::write(&metadata_file, metadata_json).unwrap();
-
-        let coordinator =
-            CacheInitializationCoordinator::new(temp_dir.path().to_path_buf(), true, config);
-
-        let mut performance_metrics = PerformanceMetrics::new();
-        let results = coordinator
-            .scan_cache_metadata_with_metrics(&mut performance_metrics)
-            .await
-            .unwrap();
-
-        assert_eq!(results.total_objects, 1);
-        assert_eq!(results.total_size, 512);
-        assert_eq!(results.write_cached_objects, 1);
-        assert_eq!(results.write_cached_size, 512);
-        assert_eq!(results.read_cached_objects, 0);
-        assert_eq!(results.read_cached_size, 0);
-        assert_eq!(results.metadata_entries.len(), 1);
-        assert!(!results.has_errors());
-
-        let entry = &results.metadata_entries[0];
-        assert_eq!(entry.cache_key, "test-bucket/test-object");
-        assert_eq!(entry.compressed_size, 512);
-        assert!(entry.is_write_cached);
-        assert!(entry.is_valid());
-    }
-
-    #[tokio::test]
-    async fn test_scan_cache_metadata_with_invalid_files() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = create_test_cache_config();
-
-        // Create metadata directory
-        let metadata_dir = temp_dir.path().join("metadata");
-        std::fs::create_dir_all(&metadata_dir).unwrap();
-
-        // Create an invalid metadata file
-        let invalid_file = metadata_dir.join("invalid.meta");
-        std::fs::write(&invalid_file, "invalid json content").unwrap();
-
-        let coordinator =
-            CacheInitializationCoordinator::new(temp_dir.path().to_path_buf(), true, config);
-
-        let mut performance_metrics = PerformanceMetrics::new();
-        let results = coordinator
-            .scan_cache_metadata_with_metrics(&mut performance_metrics)
-            .await
-            .unwrap();
-
-        assert_eq!(results.total_objects, 0); // Invalid files don't count as objects
-        assert_eq!(results.total_size, 0);
-        assert_eq!(results.metadata_entries.len(), 1); // But they are still included in entries
-        assert!(results.has_errors());
-        assert_eq!(results.error_count(), 1);
-
-        let entry = &results.metadata_entries[0];
-        assert!(!entry.is_valid());
-        assert!(entry.has_errors());
-    }
-
-    #[tokio::test]
     async fn test_cross_validate_subsystems_both_available() {
         use crate::cache::CacheEvictionAlgorithm;
         use crate::cache_size_tracker::{CacheSizeConfig, CacheSizeTracker};
@@ -3594,7 +2576,7 @@ mod tests {
             50.0,        // 50% for write cache
             config.put_ttl,
             config.incomplete_upload_ttl,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             config.write_cache_max_object_size,
         );
         // No seeding: `initialize_from_scan_results` was removed in task 27 because
@@ -3695,7 +2677,7 @@ mod tests {
             50.0,
             config.put_ttl,
             config.incomplete_upload_ttl,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             config.write_cache_max_object_size,
         );
         // Nothing in flight — the correct state for a freshly started process (R7.2).
@@ -3846,7 +2828,7 @@ mod tests {
             50.0,        // 50% for write cache
             config.put_ttl,
             config.incomplete_upload_ttl,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             config.write_cache_max_object_size,
         );
 
@@ -3896,7 +2878,7 @@ mod tests {
             50.0,        // 50% for write cache
             config.put_ttl,
             config.incomplete_upload_ttl,
-            CacheEvictionAlgorithm::LRU,
+            CacheEvictionAlgorithm::TinyLFU,
             config.write_cache_max_object_size,
         );
 
@@ -3972,33 +2954,15 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_results_detailed_reporting() {
-        // Test detailed discrepancy report
+    fn test_validation_results_serious_threshold() {
         let mut results = ValidationResults::empty();
         results.write_cache_manager_size = Some(1000);
         results.size_tracker_write_cache_size = Some(750);
         results.size_discrepancy_percent = 25.0;
         results.write_cache_consistent = false;
-        results.validation_warnings.push("Test warning".to_string());
 
-        let detailed_report = results.detailed_discrepancy_report();
-        assert!(detailed_report.contains("Cross-Validation Detailed Report"));
-        assert!(detailed_report.contains("WriteCacheManager size: 1000 B"));
-        assert!(detailed_report.contains("CacheSizeTracker write cache size: 750 B"));
-        assert!(detailed_report.contains("Absolute difference: 250 B"));
-        assert!(detailed_report.contains("Percentage difference: 25.00%"));
-        assert!(detailed_report.contains("Consistency status: INCONSISTENT"));
-        assert!(detailed_report.contains("Test warning"));
-
-        // Test status string
-        assert_eq!(results.status_string(), "ERROR_THRESHOLD_EXCEEDED");
         assert!(results.has_serious_discrepancy());
         assert!(!results.has_minor_discrepancy());
-
-        // Test recommendation
-        let recommendation = results.get_recommendation().unwrap();
-        assert!(recommendation.contains("Consider running cache validation"));
-        assert!(recommendation.contains("cache corruption"));
     }
 
     #[test]
@@ -4009,13 +2973,8 @@ mod tests {
         results.size_discrepancy_percent = 10.0;
         results.write_cache_consistent = false;
 
-        assert_eq!(results.status_string(), "WARNING_THRESHOLD_EXCEEDED");
         assert!(!results.has_serious_discrepancy());
         assert!(results.has_minor_discrepancy());
-
-        let recommendation = results.get_recommendation().unwrap();
-        assert!(recommendation.contains("Monitor cache consistency"));
-        assert!(recommendation.contains("Minor discrepancies"));
     }
 
     #[test]
@@ -4026,10 +2985,8 @@ mod tests {
         results.size_discrepancy_percent = 0.0;
         results.write_cache_consistent = true;
 
-        assert_eq!(results.status_string(), "CONSISTENT");
         assert!(!results.has_serious_discrepancy());
         assert!(!results.has_minor_discrepancy());
-        assert!(results.get_recommendation().is_none());
 
         let summary = results.summary_string();
         assert!(summary.contains("Write cache sizes consistent"));
@@ -4039,13 +2996,9 @@ mod tests {
     fn test_validation_results_not_performed() {
         let results = ValidationResults::not_performed("test reason".to_string());
 
-        assert_eq!(results.status_string(), "NOT_PERFORMED");
         assert!(!results.has_serious_discrepancy());
         assert!(!results.has_minor_discrepancy());
-        assert!(results.get_recommendation().is_none());
-
-        let detailed_report = results.detailed_discrepancy_report();
-        assert!(detailed_report.contains("Cross-validation was not performed"));
+        assert_eq!(results.summary_string(), "Cross-validation not performed");
     }
 
     #[tokio::test]
@@ -4149,7 +3102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_cache_state_consistency() {
+    async fn test_ensure_cache_state_consistency_post_init() {
         let temp_dir = TempDir::new().unwrap();
         let config = create_test_cache_config();
 
@@ -4213,10 +3166,7 @@ mod tests {
         );
 
         let consistency_info = coordinator
-            .ensure_cache_state_consistency(
-                None, // No write cache manager
-                Some(&size_tracker),
-            )
+            .ensure_cache_state_consistency_post_init(Some(&size_tracker))
             .await
             .unwrap();
 
@@ -4226,6 +3176,158 @@ mod tests {
         assert!(
             consistency_info.shared_validation_status == "WORKING"
                 || consistency_info.shared_validation_status == "BUSY"
+        );
+    }
+}
+
+/// Stale-validation-lock handling in `perform_validation_recovery_if_needed`.
+///
+/// # Why these tests exist and what they can and cannot prove
+///
+/// The removal used to be gated on `mtime age > 1 hour` with no liveness check. Nothing
+/// advances that mtime — the lock file is a zero-byte sentinel opened `truncate(false)` and
+/// only `flock`ed — so the predicate was satisfied by any lock file older than an hour whether
+/// or not a pass was running. And because `flock` binds to the open file description rather
+/// than to the path, removing the path does not release a held lock: it lets the next opener
+/// take an *independent* lock on a new inode, so two validation passes run at once, each doing
+/// a lock-free absolute install of `total_size` / `write_cache_size` / `cached_objects`.
+///
+/// **These tests pin the DECISION, on the local filesystem, and nothing more.** Whether the
+/// underlying survives-unlink / independent-lock behaviour holds on EFS, FSx for OpenZFS or FSx
+/// for NetApp ONTAP is a property of each backend's lock implementation (NFS `flock` is emulated
+/// with POSIX byte-range locks, and lease-expiry timing differs per server) and CANNOT be
+/// established here. A local pass is therefore necessary and not sufficient; the shared-storage
+/// arm is a fleet test, designed in `dr-adapt-findings.md` § 5 and owned by the follow-up unit.
+///
+/// Spec: cache-eviction-at-scale.
+#[cfg(test)]
+mod validation_lock_staleness_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    use tempfile::TempDir;
+
+    fn coordinator_over(dir: &TempDir) -> CacheInitializationCoordinator {
+        let cache_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(cache_dir.join("size_tracking")).unwrap();
+        let config = crate::config::CacheConfig {
+            cache_dir: cache_dir.clone(),
+            ..Default::default()
+        };
+        CacheInitializationCoordinator::new(cache_dir, false, config)
+    }
+
+    fn lock_path(dir: &TempDir) -> std::path::PathBuf {
+        dir.path().join("size_tracking").join("validation.lock")
+    }
+
+    /// A lock nobody holds is removed, however old or new its mtime.
+    ///
+    /// This is the arm that keeps the housekeeping intent alive, so the fix cannot be mistaken
+    /// for "stop removing the file".
+    #[tokio::test]
+    async fn unheld_validation_lock_is_removed() {
+        let dir = TempDir::new().unwrap();
+        let coordinator = coordinator_over(&dir);
+        let path = lock_path(&dir);
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            path.exists(),
+            "FIXTURE: the lock file must exist to be removed"
+        );
+
+        coordinator
+            .perform_validation_recovery_if_needed()
+            .await
+            .expect("recovery must not error");
+
+        assert!(
+            !path.exists(),
+            "an UNHELD validation lock must be removed; it survived at {:?}",
+            path
+        );
+    }
+
+    /// A lock a peer currently holds is LEFT IN PLACE.
+    ///
+    /// This is the discriminator. Against the pre-fix code it FAILS: the file's mtime is its
+    /// creation time, which the fixture backdates past the old 1-hour threshold, so the old
+    /// branch removed it while the lock was held — the exact step that produces two concurrent
+    /// validation passes. The fix reaches the same conclusion the mtime never could, by asking
+    /// the lock.
+    ///
+    /// The held lock is taken on a SEPARATE open file description, which is what makes the
+    /// exclusion real rather than an artefact of one handle being reused.
+    #[tokio::test]
+    async fn held_validation_lock_is_left_alone_however_old_its_mtime() {
+        let dir = TempDir::new().unwrap();
+        let coordinator = coordinator_over(&dir);
+        let path = lock_path(&dir);
+
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        fs4::FileExt::try_lock(&holder).expect("FIXTURE: the holder must acquire the lock");
+
+        // Backdate the mtime well past the retired 1-hour threshold, so this test would have
+        // been red on the old code for the reason it is about rather than by accident of timing.
+        let two_days_ago = filetime::FileTime::from_system_time(
+            SystemTime::now() - Duration::from_secs(2 * 86400),
+        );
+        filetime::set_file_mtime(&path, two_days_ago).unwrap();
+
+        coordinator
+            .perform_validation_recovery_if_needed()
+            .await
+            .expect("recovery must not error");
+
+        assert!(
+            path.exists(),
+            "a HELD validation lock must NOT be removed, whatever its mtime says. Removing it \
+             does not release the holder's flock — it lets the next instance take an independent \
+             lock on a new inode and validate concurrently, and concurrent passes each install \
+             absolute size figures and reset the delta files."
+        );
+
+        drop(holder);
+    }
+
+    /// After the holder releases, the same call now removes it — so the fix defers the
+    /// housekeeping rather than abandoning it.
+    #[tokio::test]
+    async fn lock_is_removed_once_the_holder_releases() {
+        let dir = TempDir::new().unwrap();
+        let coordinator = coordinator_over(&dir);
+        let path = lock_path(&dir);
+
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        fs4::FileExt::try_lock(&holder).expect("FIXTURE: the holder must acquire the lock");
+
+        coordinator
+            .perform_validation_recovery_if_needed()
+            .await
+            .unwrap();
+        assert!(
+            path.exists(),
+            "FIXTURE: held lock should have survived pass 1"
+        );
+
+        drop(holder);
+
+        coordinator
+            .perform_validation_recovery_if_needed()
+            .await
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "once released, the lock file must be removed by the next recovery pass"
         );
     }
 }

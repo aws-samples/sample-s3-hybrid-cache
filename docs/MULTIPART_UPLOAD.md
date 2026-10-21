@@ -1,264 +1,253 @@
-# Multipart Upload Caching
+# Multipart upload caching
 
-Scope: this document covers the proxy's **write-through cache for S3 multipart uploads** — `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and `AbortMultipartUpload`. It does not cover multipart *reads* (`GetObject?partNumber=N`), which are a separate concern on the read path in `http_proxy.rs`.
+Hybrid Cache for Amazon S3 caches a multipart upload as its parts pass through, so the completed object can be read from the cache as soon as `CompleteMultipartUpload` succeeds. S3 stays the source of truth: the proxy keeps the object only when S3 accepted the upload and the cached parts match what S3 assembled. This page covers `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload` and `AbortMultipartUpload`; reads of one part (`GetObject?partNumber=N`) are covered in [Part number cache](CACHE_READ_PATHS.md#part-number-cache).
 
-Related docs: [CACHING.md](CACHING.md) covers the write-through cache policy at a higher level. [ARCHITECTURE.md#trust-and-integrity-model](ARCHITECTURE.md#trust-and-integrity-model) frames what the cache does and does not verify. The compressor's integrity guarantees are in [COMPRESSION.md](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame).
+## Turn it on
 
-Primary source file: `src/signed_put_handler.rs`.
+Multipart caching is part of the write cache, which is on by default:
 
-## Table of Contents
-
-- [Why multipart caching matters](#why-multipart-caching-matters)
-- [The four operations](#the-four-operations)
-- [On-disk layout](#on-disk-layout)
-- [State machine](#state-machine)
-- [Correctness gates](#correctness-gates)
-- [Concurrency](#concurrency)
-- [Multi-instance deployments](#multi-instance-deployments)
-- [aws-chunked bodies](#aws-chunked-bodies)
-- [Failure paths](#failure-paths)
-- [Compression and integrity](#compression-and-integrity)
-- [Threat model](#threat-model)
-- [Tests to consult](#tests-to-consult)
-- [Common gotchas](#common-gotchas)
-
-## Why multipart caching matters
-
-S3 multipart uploads let clients split large objects into parts uploaded in parallel, then assemble them into a single object. Without caching, every subsequent read of that object has to be fetched from S3 over the network. The write-through cache assembles the proxy-local copy as parts arrive, so the object is cache-hot from the moment `CompleteMultipartUpload` succeeds.
-
-## The four operations
-
-All four multipart operations carry AWS SigV4 signatures. The proxy holds no credentials and cannot sign, so the signed bytes and headers are forwarded to S3 verbatim — the outer HTTP transfer framing, however, is re-established by the proxy when the request body is `Transfer-Encoding: chunked` (see the "Wire framing" note below). The cache work runs *in addition to* forwarding, never *instead of* it.
-
-| Operation | HTTP | Query | Handler |
-| --- | --- | --- | --- |
-| `CreateMultipartUpload` | `POST` | `?uploads` | `handle_create_multipart_upload` |
-| `UploadPart` | `PUT` | `?uploadId=X&partNumber=N` | `handle_upload_part` |
-| `CompleteMultipartUpload` | `POST` | `?uploadId=X` (no partNumber) | `handle_complete_multipart_upload` |
-| `AbortMultipartUpload` | `DELETE` | `?uploadId=X` | `handle_abort_multipart_upload` |
-
-Routing lives in `handle_signed_put`; detection helpers are `is_create_multipart_upload`, `parse_upload_part_query`, `is_complete_multipart_upload`, `is_abort_multipart_upload`.
-
-### Wire framing: signed bytes are verbatim, outer HTTP framing is not always a relay
-
-`UploadPart` bodies are commonly aws-chunked (an *inner* SigV4 streaming-signature framing carried inside the HTTP body), and that inner layer is untouched by the proxy on the way to S3 — same chunk data, same per-chunk signatures. Separately, the client's *outer* HTTP transfer encoding for that body can be either `Content-Length` (the AWS CLI's CRT client) or `Transfer-Encoding: chunked` (pyarrow and some other SDK clients). Hyper strips whichever outer framing the client used before the proxy sees the body, and for a chunked request the proxy re-establishes real HTTP chunk framing around each forwarded frame rather than writing hyper's already-unwrapped bytes straight to the upstream socket. A raw relay of those unwrapped bytes is not valid HTTP chunking or a valid Content-Length body, and S3 rejects it with `IncompleteBody` (GitHub issue #19). See `src/signed_request_proxy.rs`'s `forward_signed_request_streaming` for the implementation and `.kiro/specs/chunked-request-framing/` for the full requirements.
-
-## On-disk layout
-
-While an upload is in progress, all its state lives under `{cache_dir}/mpus_in_progress/{uploadId}/`:
-
+```yaml
+cache:
+  write_cache_enabled: true   # The default; false stops caching PUT and multipart uploads
 ```
-mpus_in_progress/{uploadId}/
+
+A cache rule can also turn the write cache off for matching keys. [Write cache configuration](CONFIGURATION.md#write-cache-configuration) lists the write cache fields, and [Caching](CACHING.md) describes the write cache as a whole.
+
+## How it works
+
+S3 requires every part except the last to be at least 5 MiB. The proxy stages each part as it arrives, and on a successful `CompleteMultipartUpload` turns the parts the request names into one cached range per part, at the part's byte offsets in the final object.
+
+### The four operations
+
+All four operations carry AWS SigV4 signatures. The proxy holds no credentials and cannot sign, so it forwards the signed bytes and headers to S3 unchanged, adding only an unsigned `Via` header unless the request signs `via`. The caching runs beside the forwarding and never replaces it.
+
+| Operation | HTTP | Query |
+| --- | --- | --- |
+| `CreateMultipartUpload` | `POST` | `?uploads` |
+| `UploadPart` | `PUT` | `?uploadId=X&partNumber=N` |
+| `CompleteMultipartUpload` | `POST` | `?uploadId=X` (no `partNumber`) |
+| `AbortMultipartUpload` | `DELETE` | `?uploadId=X` |
+
+### Wire framing
+
+`UploadPart` bodies are often aws-chunked: an inner SigV4 streaming-signature framing inside the HTTP body. The proxy passes that inner layer to S3 untouched, with the same chunk data and the same per-chunk signatures.
+
+The outer HTTP framing is separate. A client sends the body either with `Content-Length` (the AWS CLI's CRT client) or with `Transfer-Encoding: chunked` (pyarrow and some SDK clients). The proxy's HTTP server removes whichever outer framing the client used before the proxy sees the body. For a chunked request, the proxy therefore wraps each forwarded frame in HTTP chunk framing again. Writing the unwrapped bytes straight to S3 would be neither valid HTTP chunking nor a valid `Content-Length` body, and S3 would reject it with `IncompleteBody`.
+
+### On-disk layout
+
+While an upload is in progress, its state lives under `{cache_dir}/mpus_in_progress/{hash(uploadId)}/`, where `hash(uploadId)` is the 64-character lowercase hex BLAKE3 digest of the upload ID. The upload ID itself is recorded in `upload.meta`:
+
+```text
+mpus_in_progress/{hash(uploadId)}/
 ├── upload.meta       # Upload-level facts, written once at CreateMultipartUpload
-├── upload.lock       # fs2 exclusive lock file (held by finalize only)
-├── part1.bin         # LZ4-framed part bytes (compressed or wrapped)
-├── part1.json        # Part 1's CachedPartInfo: size, ETag, compression algorithm
-├── part1.lock        # fs2 exclusive lock file, scoped to part 1
+├── upload.lock       # Exclusive lock file for the whole upload
+├── part1.bin         # Part 1's bytes in an LZ4 frame (compressed or stored)
+├── part1.json        # Part 1's record: size, ETag, compression algorithm
+├── part1.lock        # Exclusive lock file for part 1
 ├── part2.bin
 ├── part2.json
 ├── part2.lock
 └── ...
 ```
 
-**A part owns its own files.** There is no shared document that each `UploadPart` appends to. `part{N}.json` is written once, atomically (`.tmp` + fsync + rename), by whichever instance cached part N — see `record_part_blocking`. Per-part cost is therefore independent of how many parts precede it, and two parts never contend.
+There are two lock namespaces. `part{N}.lock` guards the publishing and recording of one part and is taken on every `UploadPart`. `upload.lock` covers the whole upload and is taken only by `CompleteMultipartUpload`; the incomplete-upload sweep also respects it (see [What reaps abandoned staging](#what-reaps-abandoned-staging)). Neither holder takes the other lock, so a part never waits on a completion and a completion never waits on one part's lock. Complete observes the parts by polling instead, as described in [Complete waits for the parts it names](#complete-waits-for-the-parts-it-names).
 
-`upload.meta` carries only upload-level facts:
+Each part owns its own files: no shared document grows with every `UploadPart`. `part{N}.json` is written once, atomically (a `.tmp` file, fsync, then rename), by whichever proxy cached part N. The cost of a part therefore does not depend on how many parts came before it, and two parts never contend.
+
+`upload.meta` holds only upload-level facts:
 
 ```json
 {
   "upload_id": "...",
   "cache_key": "bucket/key",
   "started_at": { ... },
-  "content_type": "image/jpeg"
+  "content_type": "image/jpeg",
+  "representation_headers": { ... }
 }
 ```
 
-`load_tracker_blocking` assembles a `cache_types::MultipartUploadTracker` at finalize time from `upload.meta` plus the per-part records on disk. Two consequences worth knowing:
+At completion the proxy assembles the upload from `upload.meta` plus the part records on disk. A `parts` array or `total_size` in `upload.meta` is ignored; the parts always come from `part{N}.json`. A part record that fails to parse is skipped with a warning, so that part counts as not cached and the missing-parts gate declines to finalize, as if the part had never arrived.
 
-- A `parts` array or `total_size` in an older-format `upload.meta` is **ignored** — the loader clears both and rebuilds from `part{N}.json`.
-- A missing or unparseable `upload.meta` is deliberately non-fatal. Upload-level fields are synthesised from the request and the parts still come from disk, so an upload whose `CreateMultipartUpload` this fleet never saw can still cache. Only `content_type` is lost.
+Each proxy publishes the bytes of the parts it has staged to `metadata/_shard_state/in_progress_parts/{instance_id}.inprog` once per consolidation cycle (every `cache.shared_storage.consolidation_interval` on a healthy volume). Readers that need the fleet-wide figure combine those documents with the background collection's walk of `mpus_in_progress/` instead of walking it themselves. The walk remains the check: `cache.in_progress_part_bytes_drift_bytes` reports how far the published figures stood from it. A proxy's readers go back to walking the volume when a published figure reads below the walk, when a proxy publishes nothing, or when a document is older than three of its publication intervals. The limit of 5,000 in-progress entries is counted from a walk either way. See [Where the in-progress multipart term comes from](CACHE_INTERNALS.md#where-the-in-progress-multipart-term-comes-from).
 
-A part record that fails to parse is skipped with a warning rather than failing the load. That part then counts as not cached, and the missing-parts gate declines to finalise — the same outcome as if it had never landed.
+### Starting an upload
 
-On successful `CompleteMultipartUpload`, each `part{N}.bin` is renamed from the upload directory into the sharded ranges tree at `ranges/{bucket}/{XX}/{YYY}/{key}_{start}-{end}.bin`, where `start` and `end` are the part's byte offsets in the final object. The `mpus_in_progress/{uploadId}/` directory is then removed. The range files become first-class cache entries indistinguishable (on the read path) from any other cached range.
+The proxy forwards `CreateMultipartUpload` unchanged. When S3 succeeds, the proxy records the upload and the object's representation headers in `upload.meta`. It answers the client when S3 answers, and waits at most 500 ms for the disk-safety check and the `upload.meta` write. If either is still running then, the upload is not cached, and a tracker written later is removed.
 
-## State machine
+No `upload.meta` is written, so the upload is not cached, when:
 
-```
-                     CreateMultipartUpload
-                            │
-                            ▼
-                   ┌────────────────────┐
-                   │  upload.meta       │
-                   │  created (upload-  │
-                   │  level facts only) │
-                   └────────┬───────────┘
-                            │
-             UploadPart ────┤───── UploadPart
-                            │      (any order, any count)
-                            ▼
-                   ┌────────────────────┐
-                   │  partN.bin  +      │
-                   │  partN.json,       │
-                   │  one pair per part │
-                   └────┬───────────┬───┘
-                        │           │
-                        │           │
-        CompleteMultipart│      Abort│MultipartUpload
-        Upload           │           │
-                        ▼           ▼
-      ┌────────────────────────────┐  ┌───────────────┐
-      │ Wait for the named parts'  │  │ Delete entire │
-      │ records to land (≤10s)     │  │ mpus_in_progress/{uploadId}/ │
-      │ Rename parts into ranges/  │  └───────────────┘
-      │ Write object metadata      │
-      │ Clean up dir               │
-      └────────────────────────────┘
+- the write cache's backlog is full;
+- the cache volume already holds 5,000 in-progress multipart entries: one per tracked upload plus one per recorded part, across every proxy sharing the volume. This is counted as `multipart_tracking_full` in `skipped_puts_total`, or `multipart_tracking_unknown` when the count cannot be read.
+
+These cases also invalidate the key's cached copy when S3 succeeds:
+
+- an SSE-C `CreateMultipartUpload`, counted as an `sse-c` bypass;
+- a key whose cache rules turn the write cache off, counted as `write_cache_disabled` in `skipped_puts_total`;
+- a Create forwarded uncached because the bucket's origin marker or the first cache-size read did not finish within 250 ms, counted as `origin_marker_unresolved` or `capacity_unknown`.
+
+Past the same 5,000-entry limit, an `UploadPart` is forwarded without being staged and its upload stops being cached: the upload's directory and any parts it had recorded are removed. A part whose upload directory does not exist yet counts as two entries, because staging it creates the directory too. When the count cannot be read, the part is forwarded unstaged and the parts already recorded are kept.
+
+### Uploading parts
+
+```text
+CreateMultipartUpload
+  └─ writes upload.meta (upload-level facts only)
+
+UploadPart (any order, any number of times)
+  └─ writes part{N}.bin and part{N}.json, one pair per part
+
+CompleteMultipartUpload                      AbortMultipartUpload
+  ├─ waits up to 10 s for the named parts       └─ deletes mpus_in_progress/{hash(uploadId)}/
+  ├─ renames the parts into ranges/
+  ├─ writes the object's metadata
+  └─ removes the upload directory
 ```
 
-The happy path on `UploadPart` is idempotent: re-uploading the same part number rewrites `part{N}.json` (new size, new ETag) and overwrites `part{N}.bin`. This matches S3's own behaviour — a new `UploadPart` with the same part number overwrites the previous one.
+Uploading the same part number again rewrites `part{N}.json` (new size, new ETag) and overwrites `part{N}.bin`. This matches S3, where a new `UploadPart` with the same part number replaces the previous one.
 
 ### Complete waits for the parts it names
 
-`CompleteMultipartUpload` does not evaluate the cache immediately. It first polls for the `part{N}.json` records naming the parts **its own request body lists**, for up to `MULTIPART_COMPLETE_CACHE_WAIT` (10 seconds, a fixed internal constant) at a 100 ms interval. See `await_tracker_parts`.
+The proxy answers `CompleteMultipartUpload` when S3 answers. Cache finalization runs in the background, and the response waits for it for at most 250 ms. If S3 answers `200` with an `<Error>` document, or the result carries no ETag, the upload is not cached, its staged parts are removed, and the body is passed to the client unchanged. Finalization takes one of the write cache's store slots, which also bound PUT stores. With none free, the completed object is not cached (`skipped_puts_total{backlog_full}`) and its staged parts are left for the incomplete-upload sweep; the client's response is unaffected.
 
-This exists because the per-part cache task is fire-and-forget and deliberately lags the client's response: the forward path answers the client, and only then does the cache task drain the tee, await S3's result and finalise. Clients send Complete as soon as the last part is acknowledged — 147 ms after the first part was recorded, in the measured case — so without the wait, Complete reads a set of records covering a fraction of the parts and declines to cache. The wait is the normal path on a working cache, not an exception.
+Finalization first polls for the `part{N}.json` records of the parts its own request body lists, for up to 10 seconds (a fixed internal limit) at 100 ms intervals. The wait exists because each part's cache task finishes after the client's response for that part. The proxy answers the client first, then drains the part's body into the cache, waits for S3's result and finalizes the part. Clients send Complete as soon as S3 acknowledges the last part, often before the last record lands, so without the wait Complete would find only some of the parts and decline to cache. On a working cache, waiting is the normal path.
 
 Two properties follow:
 
-- **Complete latency now includes local cache work.** It previously returned as soon as S3 did. The cost is bounded by the constant above, is only paid on multipart uploads, and buys the object being cached at all. Uploads with very large part counts sit at the slower end of that range.
-- **Exceeding the bound is not an error.** S3 has already accepted the upload. The wait returns, the missing-parts gate reports it, and the object simply is not cached.
+- Complete latency includes at most 250 ms of local cache work. The wait for part records runs in the background finalization, so it delays caching, not the client. A GET sent right after a slow Complete is served from S3 until the finalization publishes the object.
+- Running out of time is not an error. S3 has already accepted the upload. The wait returns, the missing-parts gate reports it, and the object is not cached.
 
-The poll reads records **without** taking `upload.lock` — taking the exclusive lock every 100 ms would contend with the very part tasks being waited for. The authoritative read happens under the lock afterwards. Polling shared-volume state, rather than tracking spawned tasks in process memory, is what makes this correct on a fleet: parts of one upload may be served by several proxies and Complete by a fourth.
+The poll reads records without taking `upload.lock`, because taking the exclusive lock every 100 ms would contend with the part tasks it is waiting for; the authoritative read happens under the lock afterwards. Polling the cache volume, rather than tracking tasks in process memory, is what makes this correct on a fleet: one upload's parts may pass through several proxies and its Complete through another.
+
+### Publishing the completed object
+
+On a successful completion, each `part{N}.bin` is renamed from the upload directory into the sharded ranges tree at `ranges/{bucket}/{XX}/{YYY}/{key}_{start}-{end}.bin`, where `start` and `end` are the part's byte offsets in the final object. The upload directory is then removed. On the read path, the range files are indistinguishable from any other cached range.
+
+When the completion replaces an object that is still cached, it removes that object's range files and `.meta` under the key's metadata lock before renaming any part. A new range with the same byte offsets as an old one has the same file path, so removing the old files first keeps the new object's bytes at that path.
+
+The completed object is published as a staged object in the write cache. Each of its ranges gets a staging record in the write ledger (see [Eviction](EVICTION.md)) before its `.meta` is renamed into place. A proxy that stops between the two steps leaves records for an object that was never published; staging reclamation reads those as absent and discards them once they are older than 60 seconds. It never leaves a published staged object that staging reclamation cannot find. If a record cannot be written, the completion is not cached.
+
+CompleteMultipartUpload caches an upload only when its `upload.meta` records the representation headers from CreateMultipartUpload. An upload without that record is not cached, and its staged parts are removed at Complete. That happens when the Create was answered while the backlog was full or its cache setup took longer than 500 ms. It also happens when the disk-safety check or the in-progress multipart limit refused it, or when no proxy in the fleet saw the Create.
 
 ## Correctness gates
 
-The cache retains a completed multipart object only when **all** of the following hold. If any fails, no object is cached — S3 still returns its success response to the client; the proxy just loses a cache hit. Most failures also clean up the upload directory; the exceptions are listed in [Failure paths](#failure-paths).
+The cache keeps a completed multipart object only when all of the following hold. If any fails, nothing is cached for that object; S3 still returns its success response, and the proxy only loses a cache hit. Most failures also remove the upload directory; [Failure paths](#failure-paths) lists the exceptions.
 
-1. **S3 returned 2xx for the `CompleteMultipartUpload`**. S3 is the source of truth; if S3 rejected the Complete (missing parts, bad ETag, etc.), there is nothing to cache. Staging is left in place so a client retry can still succeed.
-2. **The `CompleteMultipartUpload` request body parses as a valid XML `<CompleteMultipartUpload>` document**. Malformed or empty bodies skip finalization. See `parse_complete_mpu_request`. There is no safe way to finalise without the requested part list: it is the only statement of what the completed object contains, and it is also the set the wait above waits for. Treating a parse failure as "use whatever is cached" made gates 4 and 5 vacuous and let a partially recorded upload finalise as a shorter object.
-3. **The assembled part set is non-empty.**
-4. **Every part listed in the request body is present locally** — both a `part{N}.json` record and the on-disk `part{N}.bin` file. A requested part can be missing because its cache task has not finished (which the 10-second wait exists for), because it went to a different proxy instance, because it was uploaded directly to S3 bypassing the proxy, or because the proxy restarted mid-upload.
-5. **ETag equality between the request and the part records**, normalized by stripping surrounding quotes. For each part the request lists, `normalize_etag(request_etag) == normalize_etag(recorded_etag)` must hold. Any mismatch skips cache finalization.
-6. **The assembled part count agrees with S3's own.** A multipart ETag has the form `"<md5-of-md5s>-<part-count>"`, and that suffix is compared against the number of parts assembled. On disagreement, nothing is cached.
+1. S3 returned 2xx for the `CompleteMultipartUpload`. S3 is the source of truth, so if it rejected the Complete (missing parts, a bad ETag) there is nothing to cache. The staged parts are kept so that a client retry can still succeed.
+2. The `CompleteMultipartUpload` request body parses as a valid `<CompleteMultipartUpload>` XML document. A malformed or empty body skips finalization. The requested part list is the only statement of what the completed object contains, and it is the set the wait waits for. Without it, gates 4 and 5 would have nothing to check, and a partly recorded upload could finalize as a shorter object.
+3. The assembled part set is not empty.
+4. Every part listed in the request body is present locally, as both a `part{N}.json` record and a `part{N}.bin` file. A requested part can be missing because its cache task has not finished, which the 10-second wait covers. It can also be missing because it went to a proxy that does not share this cache volume, because it was uploaded directly to S3, or because the proxy restarted mid-upload.
+5. Each part's ETag in the request equals its recorded ETag, after removing surrounding quotes from both. Any mismatch skips finalization.
+6. The assembled part count agrees with S3's. A multipart ETag has the form `"<md5-of-md5s>-<part-count>"`, and the proxy compares that suffix with the number of parts it assembled. On disagreement nothing is cached. The comparison runs after any object this upload replaces has been removed from the cache, and before any part moves into `ranges/`. A disagreement therefore leaves the key uncached and removes the upload directory with its parts.
 
-   This is the only gate anchored to S3 rather than to the proxy's own bookkeeping. Byte offsets and `content_length` are derived purely by summing recorded part sizes and are otherwise never compared with S3, so a part set holding a subset yields self-consistent metadata describing a **shorter** object, and a later GET then serves the wrong length and the wrong bytes. The gates above make that unreachable, but they check the proxy against itself. The Complete response carries no object length, so the ETag's part-count suffix is the only size-related fact available without an extra HEAD on a client-visible path — and a missing part is exactly the truncation signature it catches.
+Gate 6 is the only one anchored to S3 rather than to the proxy's own records. Byte offsets and `content_length` come from adding up the recorded part sizes and are otherwise never compared with S3. A part set holding a subset of the parts would yield consistent metadata for a shorter object, and a later GET would serve the wrong length and the wrong bytes. Gates 1 to 5 make that unreachable, but they check the proxy against itself. The Complete response carries no object length, so the part-count suffix is the only size-related fact available without an extra HEAD on the client's path, and a missing part is exactly the truncation it catches.
 
-**Unreferenced parts** (cached locally but not listed in the Complete request) are deleted from disk before the object metadata is written. See `unreferenced_parts` in `finalize_multipart_upload`.
+Parts cached locally but not listed in the Complete request are deleted before the object's metadata is written.
 
 ## Concurrency
 
-Publishing a part's bytes and writing its record are one critical section, guarded by an exclusive `fs2` lock on `part{N}.lock`. In production this is `finalize_and_record_cached_part`, reached from the streaming part sink (`open_multipart_part_sink` + `MultipartPartSink::finalize`); `cache_upload_part` is a `#[cfg(test)]` buffered equivalent retained for the multipart test suite and never ships in the release binary.
+Publishing a part's bytes and writing its record form one critical section, guarded by an exclusive lock on `part{N}.lock`. The lock is per part because the rule it protects is per part: this part's bytes must match this part's recorded ETag. Two writers of the same part number serialize; writers of different part numbers never contend.
 
-**The lock is per part, not per upload.** The invariant is per part — this part's bytes must agree with this part's recorded ETag — so nothing here ever needed to exclude a different part number. Two writers racing the same part number still serialise; two writers on different part numbers do not contend at all.
+The part file is renamed inside the lock. Renaming it outside would let two concurrent `UploadPart` calls for the same part number leave upload A's bytes on disk with upload B's recorded ETag. That entry would pass the ETag check at completion and serve the wrong bytes.
 
-Why the scope matters: a single per-upload `upload.lock` around a whole-tracker read-modify-write serialised every part of every concurrent upload on one cross-instance lock on a network filesystem, at O(n²) bytes over an upload. Each waiter occupied a `spawn_blocking` thread for up to its 30-second timeout, and the forward path needs that same pool. Measured at 2,000 parts on a three-proxy fleet: 1,214 lock timeouts, 1,220 part-record failures, and the client's upload failed with `Connection reset by peer`. At ten concurrent parts, the same queueing left records unlanded past the Complete wait, so the object was not cached at all.
+At most four part finalizations run at once in each proxy, so slow finalizations (a degraded cache volume, an unusually large part) hold at most four blocking threads. Four is below the AWS CLI's default upload concurrency of 10.
 
-The ordering invariant itself is older and still holds. Before 1.11.0 the part file was renamed *outside* the lock, so two concurrent `UploadPart` calls for the same part number could leave the bytes on disk from upload A and the recorded ETag from upload B — an entry that passed the finalize ETag check but served the wrong bytes, reproducible across two proxy processes sharing an EFS volume. `test_cache_upload_part_concurrent_same_part_keeps_file_and_tracker_consistent` drives the race.
-
-A process-wide semaphore (`PART_FINALIZE_SLOTS`, 4) caps how many finalizations may occupy a `spawn_blocking` thread at once. Since per-part locking removed the contention it was introduced for, it is a backstop against any one finalization being slow — a degraded shared volume, an unusually large part — rather than a fix for a live defect. Four sits below the AWS CLI's default upload concurrency of 10.
-
-The `fs2` file lock works across processes and across hosts on shared NFS/EFS, so the invariant holds for multi-proxy fleets on a shared cache volume.
+The part lock is an OS file lock that works across processes and across hosts on NFS and EFS, so the rule holds for a fleet sharing one cache volume.
 
 ## Multi-instance deployments
 
-The proxy is designed to scale horizontally. For multipart uploads, there are three relevant deployment shapes:
+Three deployment shapes matter for multipart uploads:
 
-**Single proxy, single upload**: Simplest. The same process handles every operation for a given `uploadId`. Staging is exclusive to this process. No coordination needed beyond the per-part file lock.
+- **One proxy**: the same process handles every operation for an upload, and the per-part lock is the only coordination needed.
+- **A fleet sharing one cache volume** (EFS or NFS): different proxies may handle different `UploadPart` calls for the same upload, and any proxy may handle the Complete. Because `mpus_in_progress/` is on the cache volume, each part's record is written by whichever proxy cached the part and read by whichever proxy completes the upload. Only writers of the same part number need to exclude each other, and `part{N}.lock` does that, with the usual caveats about NFS lock recovery. Complete polls the cache volume for the records it needs, so nothing depends on which proxy holds what in memory.
+- **A fleet where each proxy has its own cache**: an upload is cached only when all of its operations reach one proxy. Consistent-hash affinity on the request path does that with no other coordination. All four operations carry the object in the path and none carries a `Range` header, so hashing on the path routes them together (see [Request-aware routing](REQUEST_AWARE_ROUTING.md)). Leave `hash-balance-factor` unset, since every part of an upload shares one routing key and bounded load would spill parts to other proxies. Without affinity, the proxy that handles the Complete waits in the background for the full 10 seconds for records that never arrive, declines at the missing-parts gate, and leaves the staged parts for the sweep. S3 still completes the upload and the client's Complete waits at most 250 ms; the cost is a lower hit rate. [Local NVMe cache](LOCAL_NVME_CACHE.md) covers this deployment.
 
-**Multi-proxy, shared cache volume** (EFS/NFS): Different proxy instances may handle different `UploadPart` calls for the same `uploadId`, and any instance may handle the `Complete`. Because `mpus_in_progress/{uploadId}/` is on shared storage, each part's record is written by whichever instance cached it and read by whichever instance completes. Cross-instance exclusion is needed only between writers of the *same* part number, which `part{N}.lock` provides — an OS file lock that NFS respects, with the usual caveats about NFS lock recovery. Complete's correctness comes from polling the shared volume for the records it needs, so nothing depends on which instance holds what in memory. No additional coordination layer needed.
-
-**Multi-proxy, independent cache volumes**: Each proxy has its own local `mpus_in_progress/` directory, so an upload is cached only when all of its operations reach one instance. Consistent-hash affinity achieves that with no extra coordination: all four operations carry the object in the request path and none carries a `Range` header, so hashing on the path routes them together (see [Request-Aware Routing](REQUEST_AWARE_ROUTING.md)). Leave `hash-balance-factor` out, since every part of an upload shares one routing key and bounded load would spill parts to other instances. Without affinity, the instance that handles `Complete` waits the full 10 seconds for records that will never appear, declines at the missing-parts gate, and leaves staging for the TTL sweep. S3 still completes the upload; the proxy just doesn't retain the object. This is a degraded cache hit rate and a slower Complete, not a correctness problem. [LOCAL_NVME_CACHE.md](LOCAL_NVME_CACHE.md) covers this deployment in full.
-
-In all three shapes the correctness gates guarantee the same invariant: **the cache either holds the exact bytes S3 holds, or holds nothing for that object.**
+In all three shapes the correctness gates keep the same rule: the cache holds exactly the bytes S3 holds for an object, or nothing.
 
 ## aws-chunked bodies
 
-AWS CLI and SDKs wrap `UploadPart` bodies in aws-chunked transfer encoding. The proxy forwards the chunked body **unmodified** to S3 (so the SigV4 signature over the original bytes stays valid) and **separately decodes** for caching.
+The AWS CLI and the SDKs wrap `UploadPart` bodies in aws-chunked encoding. The proxy forwards the chunked body to S3 unmodified, so the SigV4 signature over the original bytes stays valid, and decodes it separately for the cache. Single PUTs and multipart parts use the same decoder. It detects aws-chunked from the `content-encoding` and `x-amz-content-sha256` headers, never from the body bytes, and reads the expected decoded length from `x-amz-decoded-content-length` when present.
 
-Both the multipart path (`handle_upload_part`) and the non-multipart PUT path (`handle_with_caching`) use the shared `crate::aws_chunked_decoder` module:
-
-- `is_aws_chunked(&headers)` — detects aws-chunked via `content-encoding` / `x-amz-content-sha256`. Does not sniff body bytes.
-- `decode_aws_chunked(&bytes)` — returns decoded bytes or an error.
-- `get_decoded_content_length(&headers)` — reads `x-amz-decoded-content-length` if present.
-
-If the header says the decoded body should be N bytes and the decoder produces M ≠ N, the proxy skips caching that part and records `record_cache_bypass("aws_chunked_decode_error")`. S3 still gets the original chunked body; the cache just refuses to cache potentially-wrong bytes.
-
-**Do not reinvent chunk parsing.** An earlier version of `handle_upload_part` had its own byte-sniffing stripper, which was replaced in 1.11.0 with a call into the shared decoder.
+If decoding fails, or the decoded length differs from the header, the proxy skips caching that part. S3 still receives the original chunked body.
 
 ## Failure paths
 
-| Failure | Proxy behaviour | Client sees |
+| Failure | What the proxy does | What the client sees |
 | --- | --- | --- |
-| S3 rejects `UploadPart` | Don't cache the part. Log error. | S3's error response. |
-| S3 rejects `CompleteMultipartUpload` | Don't finalize cache. `mpus_in_progress/` untouched so a retry can still succeed. | S3's error response. |
-| Request body malformed XML | Skip finalize. No cleanup — staging is left for the TTL sweep. | S3's response (whatever it was — likely an error). |
-| Requested part still missing after the wait | Skip finalize. **No cleanup** — staging is left for the TTL sweep. | S3's success response (but no cache hit for future reads). |
-| Part ETag mismatch vs. record | Skip finalize, clean up upload dir. | S3's success response. |
-| Assembled part count disagrees with S3's ETag | Skip finalize. No cleanup — staging is left for the TTL sweep. | S3's success response. |
-| A part record is unreadable | That part counts as not cached, which then trips the missing-parts gate. | S3's success response. |
-| aws-chunked decode fails | Skip caching that part only; bypass metric. Upload continues. | S3's success response. |
-| `AbortMultipartUpload` | Always clean up `mpus_in_progress/{uploadId}/` regardless of S3's response code. | S3's response. |
-| Proxy restarts mid-upload | `mpus_in_progress/` persists. Subsequent UploadParts on the same instance resume correctly. Another proxy instance without shared storage starts fresh (degraded cache). | Transparent (no client-visible change). |
+| S3 rejects `UploadPart` | Does not cache the part, and logs the error | S3's error response |
+| S3 rejects `CompleteMultipartUpload` | Does not finalize; the staged parts stay so a retry can succeed | S3's error response |
+| Request body is malformed XML | Does not finalize, and leaves the staged parts for the sweep | S3's response, most likely an error |
+| A requested part is still missing after the wait | Does not finalize, and leaves the staged parts for the sweep | S3's success response; later reads miss the cache |
+| A part's ETag differs from its record | Does not finalize, and removes the upload directory | S3's success response |
+| The part count disagrees with S3's ETag | Does not finalize. The replaced object is still removed; the upload directory is removed and no part reaches `ranges/` | S3's success response |
+| A staging record for a part cannot be written | Does not finalize: no `.meta` is published and the renamed range files are removed. Counted in `write_cache.mpu_completion_ledger_declines_total` | S3's success response |
+| A part record is unreadable | That part counts as not cached, which trips the missing-parts gate | S3's success response |
+| aws-chunked decoding fails | Skips caching that part only; the upload continues | S3's success response |
+| `AbortMultipartUpload` | Always removes the upload directory, whatever S3 answers | S3's response |
+| The proxy restarts mid-upload | `mpus_in_progress/` persists, so later parts sent through the same cache volume resume normally. A proxy with its own cache starts without the earlier parts and does not cache the object | No change |
 
 ### Why the missing-parts path does not clean up
 
-Deleting the staging directory when parts appear to be missing is unsafe, and was the source of a misleading error cascade. The parts being declared missing may still be mid-write, on this instance or another; `remove_dir_all` then pulls the directory — including the lock files and any `.tmp` — out from under those writers, which fail `ENOENT` on rename or `ESTALE` on the lock. Those errors name missing files and stale handles, so they read like a fault on the cache volume and are not.
+Deleting the upload directory when parts appear to be missing is unsafe. The parts declared missing may still be mid-write, on this proxy or another. Removing the directory pulls its lock files and any `.tmp` file out from under those writers, which then fail with `ENOENT` on rename or `ESTALE` on the lock. Those errors name missing files and stale handles, so they read like a fault on the cache volume when there is none.
 
-The paths that still clean up are the ones where the staging state itself is unusable rather than merely incomplete: a tracker that fails to load, an empty part set, a recorded part whose `.bin` is gone, an ETag mismatch, an `AbortMultipartUpload`, and a successful finalize.
+The paths that do clean up are the ones where the staged state itself is unusable rather than incomplete. They are an upload that fails to load, an empty part set, a recorded part whose `.bin` is gone, an ETag mismatch, an `AbortMultipartUpload`, and a successful finalization.
 
 ### What reaps abandoned staging
 
-`cleanup_incomplete_uploads_on_startup` removes any `mpus_in_progress/{uploadId}/` older than `cache.incomplete_upload_ttl` (default 1 day, valid range 1 hour to 7 days), judged by the mtime of `upload.meta` or, if absent, of the directory itself.
+The incomplete-upload sweep removes any upload directory idle for longer than `cache.incomplete_upload_ttl` (default 1 day, valid range 1 hour to 7 days). Idle time runs from the upload's last activity: the newest of the directory's modification time, `upload.meta`'s, and every `part{N}.json` record's. An upload that keeps receiving parts is never reaped, however long it runs. Abandoned uploads count against the in-progress multipart limit until the sweep removes them, so many abandoned uploads leave room for fewer new ones.
 
-**It runs at startup only** — there is no periodic timer driving it. So staging left behind by a declined finalize is reclaimed at the next proxy restart, not within the TTL. On a long-running instance with many declined completions, that space stays occupied until then. Sizing note: staging holds the part bytes, so the worst case is bounded by the object sizes of uploads that failed to finalise since the last restart.
+The sweep runs at startup and then on every proxy as a background pass every `min(incomplete_upload_ttl / 4, 1h)`. With the default TTL, abandoned parts are reclaimed at most an hour after their TTL passes. The sweep does not depend on the daily validation scan.
+
+An upload being completed is never reaped. `CompleteMultipartUpload` holds the upload's `upload.lock` while it checks and moves the parts. The sweep skips any upload whose lock is held or cannot be taken, checks the idle time again under the lock, and renames the directory aside before removing it. If a part file disappears during finalization anyway, the proxy declines to cache the object, removes any part it had already moved, and publishes no metadata. S3 still completes the upload. Staged parts are not counted in the cache size until Complete, so reaping an upload does not change the cache size figure.
 
 ## Compression and integrity
 
-Each `part{N}.bin` goes through the standard compression path, with the
-compress-or-store decision made per part by `CacheManager::effective_compression`. Parts of compressible content types are LZ4-compressed; parts of incompressible content are wrapped in an uncompressed LZ4 frame. Either way, the frame carries an xxhash32 content checksum — disk bit-flips produce decode errors, handled as cache misses on read. See [COMPRESSION.md](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame).
+Each `part{N}.bin` goes through the standard compression path, which decides per part whether to compress. Parts of compressible content types are LZ4-compressed, and parts of incompressible content are stored in an uncompressed LZ4 frame. Either way the frame carries an xxHash32 content checksum, so a flipped bit on disk produces a decode error, which a read handles as a cache miss. See [Integrity: every write is a checksummed LZ4 frame](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame).
 
-Each part's `compression_algorithm` is recorded in its `part{N}.json` and carried through into the final range metadata, so the correct decoder is used at read time.
+Each part's compression algorithm is recorded in its `part{N}.json` and carried into the final range metadata, so a read uses the right decoder.
 
 ## Threat model
 
-See [ARCHITECTURE.md#trust-and-integrity-model](ARCHITECTURE.md#trust-and-integrity-model) for the full framing. Specific to multipart:
+[Trust and integrity model](ARCHITECTURE.md#trust-and-integrity-model) gives the full framing. For multipart uploads:
 
-- **uploadId path traversal (mitigated)**: The `uploadId` query parameter arrives from the client and is used to construct the `mpus_in_progress/{uploadId}/` directory path. A malicious `uploadId` containing path separators (`/`, `\`) or traversal sequences (`..`) could escape the cache directory, potentially allowing arbitrary directory creation (`create_dir_all`) or deletion (`remove_dir_all`). **Mitigation**: All three multipart handlers (`handle_upload_part`, `handle_complete_multipart_upload`, `handle_abort_multipart_upload`) validate the `uploadId` with `is_safe_path_component` at entry, before any filesystem path construction. On reject, the request is forwarded to S3 unmodified (preserving the SigV4 response) and all local cache work is skipped. The validation rejects empty strings, path separators, `..` substrings, NUL bytes, and control characters.
-- **In scope**: All the correctness gates above, enforced unconditionally. LZ4 frame integrity on disk. Concurrent-same-part-number writes on the same `uploadId` — serialised by `part{N}.lock`; writes to *different* part numbers are not serialised and do not need to be.
-- **Not a security boundary, just cache behaviour**: A client who holds valid S3 credentials uploading parts *directly* to S3 bypassing the proxy. The proxy's cache for that upload will be incomplete and will fail the missing-parts gate. Nothing is cached, the client gets S3's response, there is no corruption risk.
-- **Residual gap**: A sophisticated attacker who intercepts a client's multipart upload and injects their own part via direct-to-S3 UploadPart, while also producing an MD5 collision to match the ETag the original client will send in `CompleteMultipartUpload`. On SSE-S3 single-part ETags (= MD5) this is mathematically feasible. Mitigations are at the bucket/client layer, not the proxy:
-  - Specify `--checksum-algorithm SHA256` at `CreateMultipartUpload` time. Per-part SHA256 checksums then flow through the Complete request body and S3 verifies end-to-end.
-  - Use SSE-KMS; ETags become opaque and non-forgeable via content manipulation.
+- **Upload ID path traversal (mitigated)**: the `uploadId` query parameter comes from the client. A path built from it could escape the cache through path separators (`/`, `\`) or traversal sequences (`..`), letting the proxy create or delete directories elsewhere. The upload ID is never a path component: the upload directory is named by its BLAKE3 hex digest, which contains only `[0-9a-f]`, so no upload ID can name anything outside `mpus_in_progress/`. The proxy also refuses to cache an upload ID that is empty or contains anything other than printable ASCII, which keeps control characters out of the logs. Such a request is forwarded to S3 unmodified with no local cache work.
+- **In scope**: every correctness gate above, enforced unconditionally; LZ4 frame integrity on disk; concurrent writes of the same part number of one upload, serialized by `part{N}.lock`.
+- **Cache behavior, outside the security boundary**: a client with valid S3 credentials uploading parts directly to S3. The proxy's record of that upload is incomplete and fails the missing-parts gate, so nothing is cached and there is no risk of corruption.
+- **Residual gap**: an attacker who intercepts a client's multipart upload and injects a part directly into S3, while producing an MD5 collision that matches the ETag the client will send in `CompleteMultipartUpload`. On SSE-S3, where a part's ETag is its MD5, that collision is feasible. The mitigations sit with the bucket and the client, not the proxy:
+  - Specify `--checksum-algorithm SHA256` at `CreateMultipartUpload`. Per-part SHA-256 checksums then travel in the Complete request body and S3 verifies them end to end.
+  - Use SSE-KMS, whose ETags are opaque and cannot be forged by changing the content.
 
-## Tests to consult
+## Limits
 
-Integration-level invariants:
-- `test_cache_upload_part` — baseline single-part path.
-- `test_cache_multiple_upload_parts` — part records accumulate correctly.
-- `test_finalize_multipart_upload_etag_mismatch` — ETag gate rejects.
-- `test_finalize_multipart_upload_with_missing_parts` / `_missing_directory` — bail paths.
-- `test_finalize_multipart_upload_deletes_unreferenced_parts` — unreferenced cleanup.
-- `test_cache_upload_part_concurrent_same_part_keeps_file_and_tracker_consistent` — concurrency invariant (added in 1.11.0, now at per-part scope).
-- `complete_arriving_before_part_tasks_finish_still_caches_every_part` — the Complete wait.
-- `tracker_holding_a_subset_does_not_finalize_a_short_object` — truncation gates.
-- `unparseable_complete_body_does_not_finalize_the_cache` — gate 2.
-- `test_finalize_multipart_upload_streamed_parts_cleanup_on_missing_part` — asserts staging **survives** the missing-parts path.
+These bounds are fixed in the proxy, with no configuration field:
 
-When reading these, note that a test cannot inspect `upload.meta` for part facts. Use the `tracker_from_disk` helper, which goes through the same loader production uses, so a test cannot pass against a layout the product does not read.
+- 5,000 in-progress multipart entries per cache volume, counting one per tracked upload and one per recorded part.
+- 500 ms for the disk-safety check and the `upload.meta` write on `CreateMultipartUpload`.
+- 250 ms for the bucket's origin marker or the first cache-size read on a Create.
+- 250 ms of cache finalization added to a `CompleteMultipartUpload` response.
+- 10 seconds, polled every 100 ms, for the part records a Complete names.
+- Four part finalizations at once per proxy.
 
-Property-based tests (`quickcheck`):
-- `prop_multipart_part_storage` — round-trip.
-- `prop_multipart_completion_creates_linked_metadata` — finalize produces consistent metadata.
-- `prop_abort_upload_cleanup` — abort always cleans up.
-- `prop_part_filtering_preserves_only_requested_parts` — unreferenced filtering.
-- `prop_part_ranges_build_correctly_from_sizes` — byte-offset arithmetic.
-- `prop_etag_validation_rejects_mismatches` — ETag gate correctness.
+`cache.incomplete_upload_ttl` (default 1 day, 1 hour to 7 days) bounds how long abandoned parts stay on the cache volume.
+
+## Observe it
+
+- `signed_put.skipped_puts_total`, by reason: `backlog_full`, `multipart_tracking_full`, `multipart_tracking_unknown`, `write_cache_disabled`, `origin_marker_unresolved`, `capacity_unknown` and `disk_safety`. See [`signed_put`](METRICS_REFERENCE.md#signed_put).
+- `write_cache.mpu_completion_ledger_declines_total`: completions not cached because a staging record could not be written. See [`write_cache`](METRICS_REFERENCE.md#write_cache).
+- `cache.in_progress_part_bytes_drift_bytes`: how far the published in-progress part bytes stood from the last walk. See [`cache`](METRICS_REFERENCE.md#cache).
+- The application log records each S3 error on Complete as `CompleteMultipartUpload S3 error: bucket=..., key=..., status=...`.
 
 ## Common gotchas
 
-- **Content-Type** for the completed object comes from `upload.meta` (captured at `CreateMultipartUpload` time), not from the `CompleteMultipartUpload` response. The Complete response carries `Content-Type: application/xml` which is the XML body's type, not the object's.
-- **Content-Length** in the Complete response is the XML response size, not the object size. It's filtered out of cached response headers.
-- **An HTTP 200 on `CompleteMultipartUpload` can still contain an embedded error in the XML body.** S3 sends whitespace keep-alives during long assemblies, then writes the final status into the body. `extract_etag_from_xml` handles this; on failure the cache is not written.
-- **Part file size on disk** is the *compressed* size; the `size` field in `part{N}.json` is the *original uncompressed* size. Don't conflate them when computing byte offsets at finalize — use the recorded `size`.
-- **Part numbers are 1-based** in the S3 API and in the tracker.
+- The completed object's `Content-Type` and other representation headers come from `upload.meta`, captured at `CreateMultipartUpload`, not from the `CompleteMultipartUpload` response. The Complete response's `Content-Type: application/xml` describes its XML body, not the object, and an upload without the record is not cached.
+- The `Content-Length` of the Complete response is the size of the XML response, not of the object, and is removed from the cached response headers.
+- An HTTP 200 on `CompleteMultipartUpload` can still carry an error in its XML body. S3 sends whitespace to keep the connection alive during a long assembly, then writes the final status into the body. The proxy reads the ETag from the body and caches nothing when that fails.
+- A part file's size on disk is its compressed size, while the `size` in `part{N}.json` is the original size. Byte offsets at completion use the recorded `size`.
+- Part numbers start at 1, in the S3 API and in the part records.
+
+## See also
+
+- [Caching](CACHING.md): the write cache and what is cached
+- [Part number cache](CACHE_READ_PATHS.md#part-number-cache): serving `?partNumber=N` reads from the cache
+- [Eviction](EVICTION.md): how staged objects are reclaimed
+- [Running a fleet on one cache volume](SHARED_STORAGE.md): mount and lock requirements

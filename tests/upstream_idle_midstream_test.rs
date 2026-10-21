@@ -129,7 +129,7 @@ async fn make_test_cache(config: &Config) -> (TempDir, Arc<CacheManager>, Arc<Ra
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,

@@ -1,21 +1,17 @@
-//! Cache Consistency Demo
+//! Cache consistency demo
 //!
-//! Demonstrates how the cache system stores per-entry compression metadata
-//! (`CompressionInfo::body_algorithm`) so that reads never depend on the
-//! *current* compression configuration — only on what was recorded when the
-//! entry was written. This is what lets denylist / threshold / cache-rule
-//! changes take effect for new writes without invalidating or needing to
-//! migrate existing cache entries.
+//! Shows that each cache entry records how it was compressed
+//! (`CompressionInfo::body_algorithm`), so a read depends only on what was recorded when the
+//! entry was written, never on the current compression configuration. That is what lets a
+//! change to the denylist, the threshold or a cache rule apply to new writes without
+//! invalidating or migrating existing entries.
 //!
-//! Reworked for the compression-content-aware-fix change: the compression
-//! decision is now made by the caller (`CacheManager::effective_compression`,
-//! combining per-key cache-rule overrides, the size threshold, and the
-//! built-in extension denylist) and passed into
-//! `CompressionHandler::compress_with_metadata`. There is no longer a
-//! `should_recompress_entry` / `compress_cache_entry` / `decompress_cache_entry`
-//! API on `CacheManager` — those were dead code with zero production callers.
-//! This demo now drives `CompressionHandler` directly, which is what those
-//! removed helpers did internally anyway.
+//! The proxy makes the compression decision in `CacheManager::effective_compression`, which
+//! combines per-key cache-rule overrides, the size threshold and the built-in extension
+//! denylist, and passes it to `CompressionHandler::compress_with_metadata`. This demo drives
+//! `CompressionHandler` directly.
+//!
+//! Run with: cargo run --release --example cache_consistency_demo
 
 use s3_proxy::compression::CompressionHandler;
 

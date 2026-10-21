@@ -1,6 +1,6 @@
 //! Resolve-once-per-request regression test.
 //!
-//! Spec: `.kiro/specs/cache-match-patterns/`
+//! Spec: the cache match patterns feature
 //! Task: 5.3
 //!
 //! Locks in the resolve-once-per-request optimization (design "Performance" →
@@ -16,7 +16,7 @@
 //! delegates to). The test observes the genuine production resolve path through
 //! `CacheManager::get_bucket_settings_manager().resolve_call_count()` — not a
 //! mock — so a regression that reintroduces a per-range resolve (e.g. inside the
-//! spawned `store_range_new_storage` task) makes the count exceed 1 and fails
+//! spawned `DiskCacheManager::store_range` task) makes the count exceed 1 and fails
 //! this test.
 //!
 //! Why the partial-cache merge path: it is the real multi-range fan-out. With a
@@ -83,7 +83,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false, // compression disabled — keeps stored bytes 1:1 with range size
         config.cache.get_ttl,
@@ -177,8 +177,10 @@ async fn multi_range_request_resolves_settings_exactly_once() {
     // range_handler, which does NOT resolve settings, so the resolve counter is
     // still 0 after priming.
     let cached_data = vec![0xABu8; (CACHED_END - CACHED_START + 1) as usize];
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             &cache_key,
             CACHED_START,
             CACHED_END,
@@ -264,7 +266,7 @@ async fn multi_range_request_resolves_settings_exactly_once() {
     // Drive the multi-range request through the real range path. Coordination is
     // disabled and the request is unsigned, so this routes into
     // forward_range_request_to_s3's partial-cache merge branch, which spawns one
-    // store_range_new_storage task per missing range — each reusing the single
+    // DiskCacheManager::store_range task per missing range — each reusing the single
     // threaded `resolved` rather than re-resolving.
     let uri: hyper::Uri = "https://bucket.s3.amazonaws.com/multi-range-object.bin"
         .parse()

@@ -1,7 +1,9 @@
-# Development configuration — local cache, verbose logging, loopback dashboard.
+# Development configuration: a local cache, debug logging and a loopback
+# dashboard.
 #
-# Ports avoid the defaults used by the health (8080), dashboard (8081),
-# metrics (9090), and TLS proxy (3129) listeners, so nothing collides.
+# The HTTP and HTTPS ports avoid the defaults of the health (8080), dashboard
+# (8081) and metrics (9090) listeners and the TLS proxy listener (3129), so
+# nothing collides.
 #
 # Verified to load with: s3-proxy --config docs/examples/config-development.yaml
 
@@ -14,7 +16,7 @@ cache:
   max_cache_size: 1073741824        # 1 GiB
   ram_cache_enabled: true
   # 128 MiB with the default ram_cache_shard_count: 8 clamps to 2 effective
-  # shards to honour the 64 MiB admission ceiling, and logs a warning at
+  # shards to honor the 64 MiB admission ceiling, and logs a warning at
   # startup. That is expected here; raise to 512 MiB to get all 8 shards.
   max_ram_cache_size: 134217728     # 128 MiB
 

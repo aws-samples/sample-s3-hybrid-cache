@@ -1,5 +1,5 @@
-// Cache Key Sanitization Demonstration
-// Shows how the new cache key format reduces length and improves performance
+// Cache key sanitization demo: prints how cache keys are formed and sanitized for use as
+// file names.
 
 use s3_proxy::cache::CacheManager;
 use tempfile::TempDir;

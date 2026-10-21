@@ -52,6 +52,15 @@ pub struct TlsProxyListener {
     inflight_tracker: Arc<InFlightTracker>,
     proxy_referer: Option<String>,
     destination_policy: Arc<DestinationPolicy>,
+    /// Destination policy for the **HTTP forwarding path** (non-CONNECT requests),
+    /// built at `server.http_port` rather than 443.
+    ///
+    /// Separate from `destination_policy` because `DestinationPolicy::check` gates
+    /// on the port before the allowlist and before DNS, so the 443-valued CONNECT
+    /// policy rejects every plain-HTTP forward outright. `None` when
+    /// `server.tls.connect_allowlist` is unset, which is the gating that keeps the
+    /// default deployment free of any policy evaluation on either listener.
+    http_destination_policy: Option<Arc<DestinationPolicy>>,
     resolver: Arc<TokioResolver>,
 }
 
@@ -115,9 +124,21 @@ impl TlsProxyListener {
 
         let destination_policy = Arc::new(DestinationPolicy::new(
             443,
-            connect_allowlist,
-            endpoint_override_ips,
+            connect_allowlist.clone(),
+            endpoint_override_ips.clone(),
         ));
+
+        // Second policy for the non-CONNECT HTTP forwarding path, built the way
+        // `HttpProxy::new` builds its own: same allowlist, same endpoint-override
+        // carve-out, but `allowed_port` at the HTTP endpoint port. `map` over the
+        // allowlist gives the gate — no allowlist, no policy, no evaluation.
+        let http_destination_policy = connect_allowlist.map(|allowlist| {
+            Arc::new(DestinationPolicy::new(
+                config.server.http_port,
+                Some(allowlist),
+                endpoint_override_ips,
+            ))
+        });
 
         Ok(Self {
             listen_addr,
@@ -133,6 +154,7 @@ impl TlsProxyListener {
             inflight_tracker,
             proxy_referer,
             destination_policy,
+            http_destination_policy,
             resolver,
         })
     }
@@ -143,9 +165,27 @@ impl TlsProxyListener {
     /// and delegates decrypted HTTP streams to the HTTP proxy request handler.
     /// Follows the same pattern as `HttpProxy::start()` including shutdown
     /// handling and connection draining.
-    pub async fn start(&self, mut shutdown_signal: ShutdownSignal) -> Result<()> {
+    pub async fn start(&self, shutdown_signal: ShutdownSignal) -> Result<()> {
+        let listener = self.bind().await?;
+        self.serve(listener, shutdown_signal).await
+    }
+
+    /// Bind `listen_addr` without accepting. Connections arriving before [`Self::serve`]
+    /// wait in the kernel backlog, as the HTTP listener's do while the cache initializes.
+    pub async fn bind(&self) -> Result<TcpListener> {
         let listener = TcpListener::bind(self.listen_addr).await?;
-        info!("TLS proxy listener on {}", self.listen_addr);
+        info!("TLS proxy listener bound on {}", self.listen_addr);
+        Ok(listener)
+    }
+
+    /// Run the accept loop on a listener from [`Self::bind`] until shutdown.
+    pub async fn serve(
+        &self,
+        listener: TcpListener,
+        mut shutdown_signal: ShutdownSignal,
+    ) -> Result<()> {
+        info!("TLS proxy listener accepting on {}", self.listen_addr);
+        let mut accept_errors = crate::accept_policy::AcceptErrorLog::new();
 
         loop {
             tokio::select! {
@@ -171,6 +211,7 @@ impl TlsProxyListener {
                             let inflight_tracker = Arc::clone(&self.inflight_tracker);
                             let proxy_referer = self.proxy_referer.clone();
                             let destination_policy = Arc::clone(&self.destination_policy);
+                            let http_destination_policy = self.http_destination_policy.clone();
                             let resolver = Arc::clone(&self.resolver);
 
                             tokio::spawn(async move {
@@ -199,6 +240,7 @@ impl TlsProxyListener {
                                     let inflight_tracker = Arc::clone(&inflight_tracker);
                                     let proxy_referer = proxy_referer.clone();
                                     let destination_policy = Arc::clone(&destination_policy);
+                                    let http_destination_policy = http_destination_policy.clone();
                                     let resolver = Arc::clone(&resolver);
 
                                     async move {
@@ -214,16 +256,47 @@ impl TlsProxyListener {
                                             .await;
                                         }
 
-                                        // Non-CONNECT requests: the destination policy's
-                                        // port check (allowed_port: 443) is appropriate
-                                        // for CONNECT tunnels but not for HTTP forwarding,
-                                        // where the target port is the HTTP endpoint port
-                                        // (typically 80). Pass None so the HTTP path
-                                        // behaves identically to the port-80 listener —
-                                        // the SSRF protection that matters (IP range
-                                        // blocking) is applied by the connection pool's
-                                        // own checks, and the CONNECT handler above
-                                        // already gates tunnel destinations.
+                                        // Non-CONNECT requests take the HTTP forwarding
+                                        // path and are evaluated against
+                                        // `http_destination_policy`, a second policy
+                                        // built at `server.http_port`. Two policies
+                                        // rather than one because
+                                        // `DestinationPolicy::check` gates on the port
+                                        // before the allowlist and before DNS, so the
+                                        // 443-valued policy the CONNECT handler above
+                                        // uses would reject every plain-HTTP forward.
+                                        // Both are built from the same
+                                        // `server.tls.connect_allowlist`, and both are
+                                        // absent when no allowlist is configured — so
+                                        // the default deployment evaluates no policy on
+                                        // either listener, and configuring an allowlist
+                                        // covers both.
+                                        //
+                                        // The check is a pre-flight rejection, not a
+                                        // pinning of the connection to validated
+                                        // addresses: `check` returns the IPs it accepted
+                                        // and `handle_request` discards them, because
+                                        // `S3Client` re-resolves through the connection
+                                        // pool when it dials. It bounds which
+                                        // destinations may be attempted; it does not
+                                        // guarantee the bytes leave for an address the
+                                        // policy saw.
+                                        let (http_policy, http_policy_resolver) =
+                                            match &http_destination_policy {
+                                                // Reuse the CONNECT path's resolver
+                                                // rather than building a third. Its
+                                                // `use_hosts_file = Never` is
+                                                // load-bearing: the deployment model
+                                                // routes S3 hostnames back to the proxy
+                                                // through /etc/hosts, so a policy check
+                                                // that consulted it would classify every
+                                                // destination as loopback.
+                                                Some(policy) => (
+                                                    Some(Arc::clone(policy)),
+                                                    Some(Arc::clone(&resolver)),
+                                                ),
+                                                None => (None, None),
+                                            };
                                         let inflight_ledger = s3_client.get_inflight_ledger();
                                         HttpProxy::handle_request(
                                             req,
@@ -237,8 +310,8 @@ impl TlsProxyListener {
                                             logger_manager,
                                             inflight_tracker,
                                             proxy_referer,
-                                            None,
-                                            None,
+                                            http_policy,
+                                            http_policy_resolver,
                                             inflight_ledger,
                                         )
                                         .await
@@ -269,7 +342,7 @@ impl TlsProxyListener {
                             });
                         }
                         Err(e) => {
-                            error!("Failed to accept TLS connection: {}", e);
+                            accept_errors.on_accept_error("TLS proxy listener", &e).await;
                         }
                     }
                 }

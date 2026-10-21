@@ -76,30 +76,6 @@ async fn test_record_lock_acquisition_failed() {
     );
 }
 
-/// Test that stale lock recovery metric increments correctly
-/// Requirement 7.3: Track the number of stale locks forcibly acquired
-#[tokio::test]
-async fn test_record_stale_lock_recovered() {
-    let metrics_manager = MetricsManager::new();
-
-    // Initial state should be 0
-    let initial_stats = metrics_manager.get_eviction_coordination_stats().await;
-    assert_eq!(
-        initial_stats.stale_locks_recovered, 0,
-        "Initial stale locks recovered should be 0"
-    );
-
-    // Record a stale lock recovery
-    metrics_manager.record_stale_lock_recovered().await;
-
-    // Verify increment
-    let stats = metrics_manager.get_eviction_coordination_stats().await;
-    assert_eq!(
-        stats.stale_locks_recovered, 1,
-        "Stale locks recovered should be 1 after recording"
-    );
-}
-
 /// Test that lock hold time metric accumulates correctly
 /// Requirement 7.4: Track the total time spent holding the eviction lock
 #[tokio::test]
@@ -192,7 +168,6 @@ async fn test_all_metrics_independent() {
     metrics_manager.record_lock_acquisition_successful().await;
     metrics_manager.record_lock_acquisition_successful().await;
     metrics_manager.record_lock_acquisition_failed().await;
-    metrics_manager.record_stale_lock_recovered().await;
     metrics_manager.record_lock_hold_time(500).await;
     metrics_manager.record_eviction_coordinated().await;
     metrics_manager.record_eviction_coordinated().await;
@@ -203,7 +178,6 @@ async fn test_all_metrics_independent() {
     let stats = metrics_manager.get_eviction_coordination_stats().await;
     assert_eq!(stats.lock_acquisitions_successful, 2);
     assert_eq!(stats.lock_acquisitions_failed, 1);
-    assert_eq!(stats.stale_locks_recovered, 1);
     assert_eq!(stats.total_lock_hold_time_ms, 500);
     assert_eq!(stats.evictions_coordinated, 3);
     assert_eq!(stats.evictions_skipped_lock_held, 1);
@@ -218,7 +192,6 @@ async fn test_metrics_included_in_system_metrics() {
     // Record some metrics
     metrics_manager.record_lock_acquisition_successful().await;
     metrics_manager.record_lock_acquisition_failed().await;
-    metrics_manager.record_stale_lock_recovered().await;
     metrics_manager.record_lock_hold_time(200).await;
     metrics_manager.record_eviction_coordinated().await;
     metrics_manager.record_eviction_skipped_lock_held().await;
@@ -235,7 +208,6 @@ async fn test_metrics_included_in_system_metrics() {
     let eviction_metrics = system_metrics.eviction_coordination.unwrap();
     assert_eq!(eviction_metrics.lock_acquisitions_successful, 1);
     assert_eq!(eviction_metrics.lock_acquisitions_failed, 1);
-    assert_eq!(eviction_metrics.stale_locks_recovered, 1);
     assert_eq!(eviction_metrics.total_lock_hold_time_ms, 200);
     assert_eq!(eviction_metrics.evictions_coordinated, 1);
     assert_eq!(eviction_metrics.evictions_skipped_lock_held, 1);
@@ -361,13 +333,6 @@ async fn test_concurrent_metric_recording() {
         }));
     }
 
-    for _ in 0..3 {
-        let mm = Arc::clone(&metrics_manager);
-        handles.push(tokio::spawn(async move {
-            mm.record_stale_lock_recovered().await;
-        }));
-    }
-
     // Wait for all tasks to complete
     for handle in handles {
         handle.await.expect("Task should complete successfully");
@@ -382,9 +347,5 @@ async fn test_concurrent_metric_recording() {
     assert_eq!(
         stats.lock_acquisitions_failed, 5,
         "Should have 5 failed acquisitions"
-    );
-    assert_eq!(
-        stats.stale_locks_recovered, 3,
-        "Should have 3 stale locks recovered"
     );
 }

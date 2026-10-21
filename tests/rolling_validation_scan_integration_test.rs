@@ -71,6 +71,8 @@ fn create_meta_file(path: &std::path::Path, compressed_size: u64) {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         }],
         created_at: now,
         expires_at: now + Duration::from_secs(86400),
@@ -79,6 +81,7 @@ fn create_meta_file(path: &std::path::Path, compressed_size: u64) {
         head_last_accessed: None,
         head_access_count: 0,
         head_cached_at: None,
+        last_validated_at: None,
     };
     let json = serde_json::to_string_pretty(&meta).unwrap();
     std::fs::write(path, json).unwrap();
@@ -165,9 +168,23 @@ fn seed_full_scan_state(cache_dir: &std::path::Path, duration_secs: f64) {
     });
     let path = cache_dir.join("size_tracking").join("validation.json");
     std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    // Schedule state lives in its own file now — mode selection reads it, not the results
+    // file. A full scan stamps both, exactly as `perform_full_validation` does.
+    let schedule = serde_json::json!({
+        "validation_type": "full",
+        "last_full_scan_duration_secs": duration_secs,
+        "rolling_cursor": 0,
+        "last_visit_at": now_epoch,
+    });
+    let schedule_path = cache_dir.join("size_tracking").join("schedule.json");
+    std::fs::write(
+        &schedule_path,
+        serde_json::to_string_pretty(&schedule).unwrap(),
+    )
+    .unwrap();
 }
 
-/// Seed validation.json with a rolling scan state.
+/// Seed schedule.json with a rolling scan state.
 fn seed_rolling_scan_state(
     cache_dir: &std::path::Path,
     cursor: u8,
@@ -181,9 +198,7 @@ fn seed_rolling_scan_state(
         .unwrap()
         .as_secs();
     let mut json = serde_json::json!({
-        "last_validation": now_epoch,
-        "status": "completed",
-        "completed_at": now_epoch,
+        "last_visit_at": now_epoch,
         "validation_type": "rolling",
         "rolling_cursor": cursor,
         "rolling_dirs_scanned": dirs_scanned,
@@ -196,13 +211,13 @@ fn seed_rolling_scan_state(
     if let Some(dur) = last_full_scan_duration_secs {
         json["last_full_scan_duration_secs"] = serde_json::json!(dur);
     }
-    let path = cache_dir.join("size_tracking").join("validation.json");
+    let path = cache_dir.join("size_tracking").join("schedule.json");
     std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 }
 
-/// Read validation.json and return the parsed JSON value.
-fn read_validation_json(cache_dir: &std::path::Path) -> serde_json::Value {
-    let path = cache_dir.join("size_tracking").join("validation.json");
+/// Read schedule.json — cursor, mode and rotation state — and return the parsed value.
+fn read_schedule_json(cache_dir: &std::path::Path) -> serde_json::Value {
+    let path = cache_dir.join("size_tracking").join("schedule.json");
     let content = std::fs::read_to_string(&path).unwrap();
     serde_json::from_str(&content).unwrap()
 }
@@ -279,8 +294,8 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
     }
 
     let dirs_scanned = 4usize;
-    let tracked_size = consolidator.get_current_size().await;
-    let tracked_objects = consolidator.get_size_state().await.cached_objects;
+    let tracked_size = consolidator.get_current_size().await.unwrap();
+    let tracked_objects = consolidator.get_size_state().await.unwrap().cached_objects;
 
     // Apply proportional correction
     let (corrected_size, corrected_objects) = tracker.apply_proportional_correction(
@@ -312,6 +327,7 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
                 .as_secs(),
         ),
         last_full_scan_duration_secs: Some(max_duration.as_secs_f64() + 100.0),
+        last_visit_at: None,
     };
     let cycle_stats = RollingCycleStats {
         dirs_scanned: dirs_scanned as u64,
@@ -328,17 +344,17 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
     assert!(persisted.scan_rate.is_some(), "Scan rate should be set");
 
     // Verify size state was updated
-    let size_state = consolidator.get_size_state().await;
+    let size_state = consolidator.get_size_state().await.unwrap();
     assert!(
         size_state.total_size > 0,
         "Size state should be updated after rolling scan"
     );
 
-    // Verify validation.json has rolling type
-    let val_json = read_validation_json(&cache_dir);
-    assert_eq!(val_json["validation_type"], "rolling");
-    assert_eq!(val_json["rolling_cursor"], 4);
-    assert_eq!(val_json["rolling_dirs_scanned"], 4);
+    // Verify schedule.json has rolling type
+    let sched_json = read_schedule_json(&cache_dir);
+    assert_eq!(sched_json["validation_type"], "rolling");
+    assert_eq!(sched_json["rolling_cursor"], 4);
+    assert_eq!(sched_json["rolling_dirs_scanned"], 4);
 }
 
 // ===========================================================================
@@ -383,6 +399,7 @@ async fn test_rolling_scan_cursor_continuity() {
                 .as_secs(),
         ),
         last_full_scan_duration_secs: Some(max_duration.as_secs_f64() + 50.0),
+        last_visit_at: None,
     };
     let first_stats = RollingCycleStats {
         dirs_scanned: first_dirs_scanned as u64,
@@ -436,6 +453,7 @@ async fn test_rolling_scan_cursor_continuity() {
         full_rotation_count: 0,
         rotation_start_time: second_state_read.rotation_start_time,
         last_full_scan_duration_secs: second_state_read.last_full_scan_duration_secs,
+        last_visit_at: second_state_read.last_visit_at,
     };
     let second_stats = RollingCycleStats {
         dirs_scanned: second_dirs_scanned as u64,
@@ -453,10 +471,10 @@ async fn test_rolling_scan_cursor_continuity() {
         "After second cycle, cursor should be 8"
     );
 
-    // Verify validation.json reflects second cycle
-    let val_json = read_validation_json(&cache_dir);
-    assert_eq!(val_json["rolling_cursor"], 8);
-    assert_eq!(val_json["rolling_dirs_scanned"], 4);
+    // Verify schedule.json reflects second cycle
+    let sched_json = read_schedule_json(&cache_dir);
+    assert_eq!(sched_json["rolling_cursor"], 8);
+    assert_eq!(sched_json["rolling_dirs_scanned"], 4);
 }
 
 // ===========================================================================
@@ -475,7 +493,7 @@ async fn test_full_scan_when_no_history() {
     let max_duration = Duration::from_secs(4 * 3600); // 4 hours
     let tracker = create_test_tracker(cache_dir.clone(), consolidator.clone(), max_duration).await;
 
-    // No validation.json exists → read_rolling_state should return defaults
+    // Neither schedule.json nor validation.json exists → defaults
     let state = tracker.read_rolling_state().unwrap();
     assert_eq!(state.cursor, 0, "Default cursor should be 0");
     assert!(
@@ -545,10 +563,10 @@ async fn test_full_scan_persists_duration_and_type() {
     // Manually persist full scan duration (mimicking persist_full_scan_duration)
     seed_full_scan_state(&cache_dir, 120.0);
 
-    // Read back and verify
-    let val_json = read_validation_json(&cache_dir);
-    assert_eq!(val_json["validation_type"], "full");
-    assert_eq!(val_json["last_full_scan_duration_secs"], 120.0);
+    // Read back and verify — mode and duration are schedule state
+    let sched_json = read_schedule_json(&cache_dir);
+    assert_eq!(sched_json["validation_type"], "full");
+    assert_eq!(sched_json["last_full_scan_duration_secs"], 120.0);
 
     // Mode selection should stay Full since 120s < 4h
     let (mode, _) = determine_scan_mode(Some("full"), Some(120.0), None, None, max_duration);
@@ -614,6 +632,7 @@ async fn test_mode_transition_full_to_rolling_and_back() {
                 .as_secs(),
         ),
         last_full_scan_duration_secs: Some(full_scan_duration),
+        last_visit_at: None,
     };
     let cycle_stats = RollingCycleStats {
         dirs_scanned: rolling_dirs_scanned,

@@ -27,24 +27,6 @@ fn find_range_files_for_key(ranges_dir: &std::path::Path, cache_key: &str) -> Ve
         .collect()
 }
 
-/// Helper function to create test metadata
-#[allow(dead_code)]
-fn create_test_metadata(
-    etag: &str,
-    last_modified: &str,
-    content_length: u64,
-) -> s3_proxy::cache_types::CacheMetadata {
-    s3_proxy::cache_types::CacheMetadata {
-        etag: etag.to_string(),
-        last_modified: last_modified.to_string(),
-        content_length,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    }
-}
-
 /// Test that PutObject invalidates existing cached data before storing new data
 /// Requirement 8.1: WHEN receiving PutObject request, THEN the Cache System SHALL invalidate any existing cached data for that key
 #[tokio::test]

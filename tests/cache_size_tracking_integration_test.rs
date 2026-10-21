@@ -26,7 +26,7 @@ async fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheMa
         cache_dir,
         false, // RAM cache disabled for simplicity
         0,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -219,7 +219,7 @@ async fn test_actively_remove_cached_data_flag_behavior() {
             cache_dir.clone(),
             false,
             0,
-            s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+            s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
             1024,
             true,
             Duration::from_secs(3600),
@@ -250,7 +250,7 @@ async fn test_actively_remove_cached_data_flag_behavior() {
             cache_dir.clone(),
             false,
             0,
-            s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+            s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
             1024,
             true,
             Duration::from_secs(3600),
@@ -338,6 +338,7 @@ async fn create_test_consolidator(
         stale_entry_timeout_secs: 300,
         consolidation_cycle_timeout: Duration::from_secs(30),
         max_keys_per_cycle: 5000,
+        ..ConsolidationConfig::default()
     };
     let consolidator = Arc::new(JournalConsolidator::new(
         cache_dir,
@@ -363,6 +364,8 @@ fn create_test_range_spec(start: u64, end: u64, compressed_size: u64) -> RangeSp
         last_accessed: now,
         access_count: 1,
         staged: None,
+        unservable: false,
+        file_identity: None,
     }
 }
 
@@ -386,7 +389,9 @@ fn create_test_journal_entry(
         new_ttl_secs: None,
         object_ttl_secs: None,
         access_increment: None,
-        object_metadata: None,
+        // A range fill carries the response's metadata; only that may create the `.meta`.
+        object_metadata: Some(s3_proxy::cache_types::ObjectMetadata::default()),
+        fill_witness: None,
     }
 }
 
@@ -452,12 +457,12 @@ async fn test_full_consolidation_cycle_with_size_tracking() {
 
     // Verify initial size is 0
     assert_eq!(
-        consolidator.get_current_size().await,
+        consolidator.get_current_size().await.unwrap(),
         0,
         "Initial size should be 0"
     );
     assert_eq!(
-        consolidator.get_write_cache_size().await,
+        consolidator.get_write_cache_size().await.unwrap(),
         0,
         "Initial write cache size should be 0"
     );
@@ -514,7 +519,7 @@ async fn test_full_consolidation_cycle_with_size_tracking() {
     );
 
     // Verify size state is updated
-    let size_state = consolidator.get_size_state().await;
+    let size_state = consolidator.get_size_state().await.unwrap();
     assert_eq!(
         size_state.total_size, 2000,
         "Total size should be 2000 bytes"
@@ -596,7 +601,7 @@ async fn test_consolidation_cycle_with_remove_operations() {
     );
 
     // Verify size state
-    let size_state = consolidator.get_size_state().await;
+    let size_state = consolidator.get_size_state().await.unwrap();
     assert_eq!(
         size_state.total_size, 0,
         "Total size should be 0 after remove"
@@ -679,6 +684,7 @@ async fn test_crash_recovery_with_existing_size_state() {
         last_consolidation: SystemTime::now() - Duration::from_secs(60),
         consolidation_count: 10,
         last_updated_by: "previous-instance:12345".to_string(),
+        ..Default::default()
     };
 
     let size_state_path = cache_dir.join("size_tracking").join("size_state.json");
@@ -689,7 +695,7 @@ async fn test_crash_recovery_with_existing_size_state() {
     let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
     // Verify size state was recovered from disk
-    let recovered_state = consolidator.get_size_state().await;
+    let recovered_state = consolidator.get_size_state().await.unwrap();
     assert_eq!(
         recovered_state.total_size, 5000,
         "Total size should be recovered"
@@ -709,12 +715,12 @@ async fn test_crash_recovery_with_existing_size_state() {
 
     // Verify get_current_size() returns recovered value
     assert_eq!(
-        consolidator.get_current_size().await,
+        consolidator.get_current_size().await.unwrap(),
         5000,
         "get_current_size should return recovered value"
     );
     assert_eq!(
-        consolidator.get_write_cache_size().await,
+        consolidator.get_write_cache_size().await.unwrap(),
         500,
         "get_write_cache_size should return recovered value"
     );
@@ -733,7 +739,7 @@ async fn test_startup_with_missing_size_state() {
     let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
     // Verify size state starts at default values
-    let size_state = consolidator.get_size_state().await;
+    let size_state = consolidator.get_size_state().await.unwrap();
     assert_eq!(
         size_state.total_size, 0,
         "Total size should be 0 for fresh start"
@@ -776,7 +782,7 @@ async fn test_validation_scan_corrects_drift() {
         .await;
 
     // Verify size was corrected
-    let size_state = consolidator.get_size_state().await;
+    let size_state = consolidator.get_size_state().await.unwrap();
     assert_eq!(
         size_state.total_size, correct_size,
         "Total size should be corrected by validation"
@@ -848,7 +854,7 @@ async fn test_graceful_shutdown_persists_size_state() {
     let new_consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
     // Verify size state was persisted and recovered
-    let recovered_state = new_consolidator.get_size_state().await;
+    let recovered_state = new_consolidator.get_size_state().await.unwrap();
     assert_eq!(
         recovered_state.total_size, 1000,
         "Size should be recovered after restart"
@@ -916,7 +922,7 @@ async fn test_multiple_consolidation_cycles_accumulate_size() {
     );
 
     // Verify consolidation count
-    let size_state = consolidator.get_size_state().await;
+    let size_state = consolidator.get_size_state().await.unwrap();
     assert_eq!(
         size_state.consolidation_count, 2,
         "Consolidation count should be 2"
@@ -947,7 +953,7 @@ async fn test_empty_consolidation_cycle() {
     assert_eq!(result.current_size, 0, "Current size should remain 0");
 
     // Verify size state wasn't modified
-    let size_state = consolidator.get_size_state().await;
+    let size_state = consolidator.get_size_state().await.unwrap();
     assert_eq!(
         size_state.consolidation_count, 0,
         "Consolidation count should remain 0"
@@ -990,7 +996,7 @@ async fn test_size_never_goes_negative() {
         "Size should be 0 (saturating subtraction)"
     );
     assert_eq!(
-        consolidator.get_current_size().await,
+        consolidator.get_current_size().await.unwrap(),
         0,
         "get_current_size should return 0"
     );

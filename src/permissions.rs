@@ -172,6 +172,131 @@ impl PermissionValidator {
     }
 }
 
+/// An NFS mount holding the cache directory whose options leave negative lookup caching on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegativeLookupCacheMount {
+    /// The mount point, unescaped.
+    pub mount_point: String,
+    /// `nfs` or `nfs4`.
+    pub fstype: String,
+    /// The per-mount and per-superblock options as `/proc/self/mountinfo` lists them.
+    ///
+    /// Not for logging: it carries `addr=`, `clientaddr=` and `sec=`. Log
+    /// [`Self::relevant_options`].
+    pub options: String,
+}
+impl NegativeLookupCacheMount {
+    /// The options the warning is about: `vers`/`nfsvers` and any `lookupcache`, joined with
+    /// `, `, followed by `no lookupcache option` when none is set. Every other option is left
+    /// out, so the log never carries `addr=`, `clientaddr=`, `mountaddr=` or `sec=`.
+    pub(crate) fn relevant_options(&self) -> String {
+        let mut kept: Vec<&str> = self
+            .options
+            .split(',')
+            .filter(|o| {
+                o.starts_with("lookupcache=") || o.starts_with("vers=") || o.starts_with("nfsvers=")
+            })
+            .collect();
+        if !kept.iter().any(|o| o.starts_with("lookupcache=")) {
+            kept.push("no lookupcache option");
+        }
+        kept.join(", ")
+    }
+    /// The startup WARN's text for cache directory `dir` on this mount.
+    pub(crate) fn warning(&self, dir: &Path) -> String {
+        format!(
+            "Cache directory {:?} is on {} mount {} whose options ({}) include neither \
+             lookupcache=pos nor lookupcache=none. lookupcache=pos is required on a shared \
+             cache volume: without it this proxy can cache another proxy's new files and \
+             directories as absent, and writes that need them fail. Remount with \
+             lookupcache=pos; see Mount requirements in docs/SHARED_STORAGE.md.",
+            dir,
+            self.fstype,
+            self.mount_point,
+            self.relevant_options()
+        )
+    }
+}
+/// The mount `cache_dir` sits on, from `mountinfo` (the format of `/proc/self/mountinfo`),
+/// when it is NFS and its options carry neither `lookupcache=pos` nor `lookupcache=none`.
+///
+/// The longest mount point that contains `cache_dir` wins; among equal mount points the later
+/// line wins, because a later mount stacks on top. `cache_dir` must be absolute and should be
+/// canonical, or no mount point will contain it. Pure, so it can be tested over sample lines.
+pub fn nfs_negative_lookup_cache_mount(
+    mountinfo: &str,
+    cache_dir: &Path,
+) -> Option<NegativeLookupCacheMount> {
+    let mut best: Option<(usize, NegativeLookupCacheMount)> = None;
+    for line in mountinfo.lines() {
+        // `id parent maj:min root mount_point mount_opts [optional...] - fstype source super_opts`
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let pre: Vec<&str> = pre.split(' ').collect();
+        if pre.len() < 6 {
+            continue;
+        }
+        let mount_point = unescape_mountinfo(pre[4]);
+        if !cache_dir.starts_with(Path::new(&mount_point)) {
+            continue;
+        }
+        let depth = Path::new(&mount_point).components().count();
+        if best.as_ref().is_some_and(|(d, _)| depth < *d) {
+            continue;
+        }
+        let mut post = post.split(' ');
+        let fstype = post.next().unwrap_or("").to_string();
+        let _source = post.next();
+        let super_opts = post.next().unwrap_or("");
+        let options = format!("{},{}", pre[5], super_opts);
+        best = Some((
+            depth,
+            NegativeLookupCacheMount {
+                mount_point,
+                fstype,
+                options,
+            },
+        ));
+    }
+    let (_, mount) = best?;
+    if mount.fstype != "nfs" && mount.fstype != "nfs4" {
+        return None;
+    }
+    let caches_no_negatives = mount
+        .options
+        .split(',')
+        .any(|o| o == "lookupcache=pos" || o == "lookupcache=none");
+    if caches_no_negatives {
+        None
+    } else {
+        Some(mount)
+    }
+}
+/// `/proc/self/mountinfo` escapes space, tab, newline and backslash as octal.
+fn unescape_mountinfo(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+/// Log one WARN at startup when `cache_dir` is on an NFS mount that caches negative lookups.
+///
+/// Without `lookupcache=pos` an NFS client can cache "absent" for a directory or file a peer
+/// proxy has since created, and a write that needs it then fails. Linux 6.15 and later make one
+/// such case reachable: `create_dir_all` returns EEXIST because `mkdir` reaches the server while
+/// the `stat` straight after trusts the cached absence. Advisory only: nothing is refused and
+/// no behaviour changes. Silent when `/proc/self/mountinfo` is unreadable (not Linux).
+pub fn warn_if_nfs_caches_negative_lookups(cache_dir: &Path) {
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let dir = fs::canonicalize(cache_dir).unwrap_or_else(|_| cache_dir.to_path_buf());
+    if let Some(mount) = nfs_negative_lookup_cache_mount(&mountinfo, &dir) {
+        warn!("{}", mount.warning(&dir));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +472,125 @@ mod tests {
             content, "original content",
             "Sentinel file must not be modified through symlink"
         );
+    }
+}
+
+#[cfg(test)]
+mod nfs_lookupcache_tests {
+    use super::*;
+    const ROOT_XFS: &str = "22 1 259:1 / / rw,noatime shared:1 - xfs /dev/nvme0n1p1 rw,attr2,inode64,logbufs=8,logbsize=32k,noquota";
+    const EFS_DEFAULT: &str = "412 22 0:52 / /mnt/efs rw,relatime shared:220 - nfs4 fs-0123.efs.us-west-2.amazonaws.com:/ rw,vers=4.1,rsize=1048576,wsize=1048576,namlen=255,hard,noresvport,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.0.34.221,local_lock=none,addr=10.0.40.1";
+    fn mountinfo(lines: &[&str]) -> String {
+        lines.join("\n") + "\n"
+    }
+    #[test]
+    fn nfs4_without_lookupcache_warns() {
+        let found = nfs_negative_lookup_cache_mount(
+            &mountinfo(&[ROOT_XFS, EFS_DEFAULT]),
+            Path::new("/mnt/efs/cache"),
+        )
+        .expect("an nfs4 mount without lookupcache must be reported");
+        assert_eq!(found.mount_point, "/mnt/efs");
+        assert_eq!(found.fstype, "nfs4");
+        assert!(found.options.contains("vers=4.1"), "{}", found.options);
+    }
+    /// The startup WARN names the mount and only the options it is about: never the NFS
+    /// server's or this host's address, nor the security flavour.
+    #[test]
+    fn the_warning_logs_no_address_or_security_option() {
+        let found = nfs_negative_lookup_cache_mount(
+            &mountinfo(&[ROOT_XFS, EFS_DEFAULT]),
+            Path::new("/mnt/efs/cache"),
+        )
+        .expect("fixture: reported");
+        let text = found.warning(Path::new("/mnt/efs/cache"));
+        for leaked in ["10.0.40.1", "10.0.34.221", "addr=", "sec="] {
+            assert!(
+                !text.contains(leaked),
+                "the warning must not log {leaked}: {text}"
+            );
+        }
+        assert!(text.contains("nfs4 mount /mnt/efs "), "{text}");
+        assert!(text.contains("(vers=4.1, no lookupcache option)"), "{text}");
+    }
+    #[test]
+    fn nfs4_with_lookupcache_pos_is_silent() {
+        let line = EFS_DEFAULT.replace("local_lock=none", "lookupcache=pos,local_lock=none");
+        assert_eq!(
+            nfs_negative_lookup_cache_mount(
+                &mountinfo(&[ROOT_XFS, &line]),
+                Path::new("/mnt/efs/cache")
+            ),
+            None
+        );
+    }
+    #[test]
+    fn nfs_with_lookupcache_none_is_silent() {
+        let line = EFS_DEFAULT
+            .replace(" nfs4 ", " nfs ")
+            .replace("vers=4.1", "vers=3,lookupcache=none");
+        assert_eq!(
+            nfs_negative_lookup_cache_mount(
+                &mountinfo(&[ROOT_XFS, &line]),
+                Path::new("/mnt/efs/cache")
+            ),
+            None
+        );
+    }
+    #[test]
+    fn local_ext4_or_xfs_is_silent() {
+        let ext4 = "40 22 259:2 / /var/cache rw,relatime shared:30 - ext4 /dev/nvme1n1 rw";
+        let info = mountinfo(&[ROOT_XFS, ext4]);
+        assert_eq!(
+            nfs_negative_lookup_cache_mount(&info, Path::new("/var/cache/s3")),
+            None
+        );
+        assert_eq!(
+            nfs_negative_lookup_cache_mount(&info, Path::new("/srv/cache")),
+            None,
+            "the root xfs mount holds this path"
+        );
+    }
+    #[test]
+    fn the_deeper_mount_wins() {
+        let nested_ext4 = "41 412 259:2 / /mnt/efs/local rw,relatime - ext4 /dev/nvme1n1 rw";
+        assert_eq!(
+            nfs_negative_lookup_cache_mount(
+                &mountinfo(&[ROOT_XFS, EFS_DEFAULT, nested_ext4]),
+                Path::new("/mnt/efs/local/cache")
+            ),
+            None,
+            "a local mount nested under the bad NFS mount holds the cache"
+        );
+        let good_outer = EFS_DEFAULT
+            .replace("/mnt/efs ", "/mnt ")
+            .replace("local_lock=none", "lookupcache=pos");
+        let bad_inner = EFS_DEFAULT.replace("412 22", "413 412");
+        let found = nfs_negative_lookup_cache_mount(
+            &mountinfo(&[ROOT_XFS, &good_outer, &bad_inner]),
+            Path::new("/mnt/efs/cache"),
+        )
+        .expect("the deeper, bad mount holds the cache");
+        assert_eq!(found.mount_point, "/mnt/efs");
+    }
+    #[test]
+    fn a_sibling_with_a_common_prefix_does_not_match() {
+        assert_eq!(
+            nfs_negative_lookup_cache_mount(
+                &mountinfo(&[ROOT_XFS, EFS_DEFAULT]),
+                Path::new("/mnt/efs2/cache")
+            ),
+            None
+        );
+    }
+    #[test]
+    fn an_escaped_mount_point_is_unescaped() {
+        let line = EFS_DEFAULT.replace("/mnt/efs ", "/mnt/my\\040cache ");
+        let found = nfs_negative_lookup_cache_mount(
+            &mountinfo(&[ROOT_XFS, &line]),
+            Path::new("/mnt/my cache/c"),
+        )
+        .expect("the escaped mount point must match");
+        assert_eq!(found.mount_point, "/mnt/my cache");
     }
 }

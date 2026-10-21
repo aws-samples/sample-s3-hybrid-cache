@@ -23,26 +23,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Test configuration for S3 integration tests
-#[allow(dead_code)]
-struct S3TestConfig {
-    endpoint: String,
-    bucket: String,
-    test_object_key: String,
-    test_data: Vec<u8>,
-}
-
-impl Default for S3TestConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: "s3.amazonaws.com".to_string(),
-            bucket: "test-bucket".to_string(),
-            test_object_key: "test-object.txt".to_string(),
-            test_data: b"Hello, S3 Proxy Integration Test!".to_vec(),
-        }
-    }
-}
-
 /// Create a test configuration for integration tests
 fn create_test_config() -> Config {
     Config {
@@ -60,10 +40,11 @@ fn create_test_config() -> Config {
             max_cache_size: 100 * 1024 * 1024, // 100MB
             ram_cache_enabled: false,
             max_ram_cache_size: 50 * 1024 * 1024, // 50MB
-            eviction_algorithm: EvictionAlgorithm::LRU,
+            eviction_algorithm: EvictionAlgorithm::TinyLFU,
             write_cache_enabled: true,
             write_cache_percent: 10.0,
             write_cache_max_object_size: 256 * 1024 * 1024, // 256MB
+            disk_safety_free_space_floor: 1024 * 1024 * 1024, // 1 GiB
             put_ttl: Duration::from_secs(3600),
             get_ttl: Duration::from_secs(3600),
             head_ttl: Duration::from_secs(3600),
@@ -72,8 +53,6 @@ fn create_test_config() -> Config {
             shared_storage: SharedStorageConfig::default(),
             range_merge_gap_threshold: 256 * 1024, // 256KB
             ram_cache_flush_interval: Duration::from_secs(60),
-            ram_cache_flush_threshold: 100,
-            ram_cache_flush_on_eviction: false,
             ram_cache_verification_interval: Duration::from_secs(1),
             incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
             initialization: s3_proxy::config::InitializationConfig::default(),
@@ -97,6 +76,7 @@ fn create_test_config() -> Config {
         logging: LoggingConfig {
             access_log_dir: PathBuf::from("/tmp/s3_proxy_test_logs/access"),
             app_log_dir: PathBuf::from("/tmp/s3_proxy_test_logs/app"),
+            local_state_dir: PathBuf::from("/tmp/s3_proxy_test_logs/state"),
             access_log_enabled: true,
             access_log_mode: AccessLogMode::All,
             log_level: "info".to_string(),

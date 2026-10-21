@@ -1,6 +1,6 @@
 //! Bug condition exploration — download-coordination TTL correctness
 //!
-//! Spec: `.kiro/specs/download-coordination-ttl-correctness/`
+//! Spec: the download coordination ttl correctness feature
 //!
 //! This test is Task 1 of the bugfix workflow. It exercises the two
 //! interlocking defects described in `bugfix.md` and `design.md`:
@@ -205,7 +205,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,

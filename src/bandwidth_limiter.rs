@@ -100,7 +100,7 @@ impl FairnessKey {
 ///    On success → `Caller(sanitize_log_field(value))`.
 /// 2. Otherwise (disabled / absent / invalid) → `Bucket(resolved_bucket)` if
 ///    a bucket was resolved, else `Default`.
-pub fn resolve_fairness_key(
+pub(crate) fn resolve_fairness_key(
     headers: &std::collections::HashMap<String, String>,
     resolved_bucket: Option<&str>,
     cfg: &CallerIdConfig,
@@ -291,13 +291,8 @@ impl BandwidthLimiter {
     }
 
     /// Update the instance ceiling (called by the fleet cold-path task).
-    pub fn set_ceiling_bps(&self, bps: u64) {
+    pub(crate) fn set_ceiling_bps(&self, bps: u64) {
         self.ceiling_bps.store(bps, Ordering::Relaxed);
-    }
-
-    /// Current instance ceiling in bytes/s.
-    pub fn ceiling_bps(&self) -> u64 {
-        self.ceiling_bps.load(Ordering::Relaxed)
     }
 
     /// Cumulative fail-open events.
@@ -306,7 +301,7 @@ impl BandwidthLimiter {
     }
 
     /// Resolve the per-request fairness key from headers.
-    pub fn resolve_key(
+    pub(crate) fn resolve_key(
         &self,
         headers: &std::collections::HashMap<String, String>,
         resolved_bucket: Option<&str>,
@@ -349,7 +344,7 @@ impl BandwidthLimiter {
     }
 
     /// Refund unused tokens back to the bucket (called on stream end/drop).
-    pub fn refund(&self, bytes: u64) {
+    pub(crate) fn refund(&self, bytes: u64) {
         if bytes == 0 || self.is_disabled() {
             return;
         }
@@ -376,7 +371,7 @@ impl BandwidthLimiter {
     /// Called from [`ThrottleStream`] after each frame is delivered.  Uses the
     /// top-K tracker so cardinality is bounded.
     #[inline]
-    pub fn record_bytes(&self, key: &FairnessKey, bytes: u64) {
+    pub(crate) fn record_bytes(&self, key: &FairnessKey, bytes: u64) {
         if bytes > 0 {
             self.byte_tracker.record(&key.label(), bytes);
         }
@@ -400,7 +395,7 @@ impl BandwidthLimiter {
     /// On channel send failure (DRR task has exited) this returns a receiver
     /// whose sender is immediately dropped, so the caller will see it resolve
     /// with `Err(RecvError)` and can fail open.
-    pub fn enqueue_blocked(&self, key: FairnessKey, bytes: u64) -> oneshot::Receiver<()> {
+    pub(crate) fn enqueue_blocked(&self, key: FairnessKey, bytes: u64) -> oneshot::Receiver<()> {
         let (grant_tx, grant_rx) = oneshot::channel();
         let req = DrrRequest {
             key,
@@ -535,7 +530,7 @@ static GLOBAL_LIMITER: OnceLock<Arc<BandwidthLimiter>> = OnceLock::new();
 /// Must be called once before any requests are served.  Subsequent calls on the
 /// same process are silently ignored (the existing limiter is reused).  The DRR
 /// task is detached — it runs for the lifetime of the process/runtime.
-pub fn init_global_limiter(cfg: &DownloadBandwidthConfig) {
+pub(crate) fn init_global_limiter(cfg: &DownloadBandwidthConfig) {
     if GLOBAL_LIMITER.get().is_some() {
         return; // Already initialized (e.g. in a test that creates multiple proxies)
     }
@@ -552,7 +547,7 @@ pub fn init_global_limiter(cfg: &DownloadBandwidthConfig) {
 ///
 /// `cache_dir` is the proxy's `cache.cache_dir` value.  When `None` or when the
 /// ceiling is `0` (feature disabled), no fleet I/O task is started.
-pub fn init_global_limiter_with_fleet(
+pub(crate) fn init_global_limiter_with_fleet(
     cfg: &DownloadBandwidthConfig,
     cache_dir: Option<std::path::PathBuf>,
 ) {
@@ -570,7 +565,7 @@ pub fn init_global_limiter_with_fleet(
 ///
 /// Returns a **disabled** limiter if `init_global_limiter` has not been called
 /// (safe default for tests and library users that do not need QoS).
-pub fn global_limiter() -> Arc<BandwidthLimiter> {
+pub(crate) fn global_limiter() -> Arc<BandwidthLimiter> {
     GLOBAL_LIMITER
         .get()
         .cloned()
@@ -589,7 +584,7 @@ fn burst_capacity(ceiling_bps: u64) -> u64 {
 ///
 /// Isolated as a pure function so Phase-B demand-weighted reconciliation can
 /// replace just this function without touching enforcement.
-pub fn compute_local_ceiling(aggregate_bps: u64, instance_count: u32) -> u64 {
+pub(crate) fn compute_local_ceiling(aggregate_bps: u64, instance_count: u32) -> u64 {
     if aggregate_bps == 0 {
         // Configured-disabled — preserve the "off" semantics (Layer 0 bypass).
         return 0;
@@ -609,7 +604,9 @@ pub fn compute_local_ceiling(aggregate_bps: u64, instance_count: u32) -> u64 {
 /// Every `refresh_interval` (floor: 10 s):
 /// 1. Touches `cache_dir/qos/heartbeats/{instance_id}.qos` as a heartbeat.
 /// 2. Reads the `qos/heartbeats/` directory and counts `.qos` files with mtime
-///    within `instance_staleness` → live instance count `N`.  Clearly-dead
+///    within the effective staleness window
+///    (`FleetSharingConfig::effective_instance_staleness`) → live instance
+///    count `N`.  Clearly-dead
 ///    heartbeats (mtime past the cleanup grace) are removed in the same pass.
 /// 3. Sets `global_limiter().ceiling_bps = aggregate / max(N, 1)` (floored to ≥1).
 ///
@@ -640,6 +637,11 @@ async fn fleet_bandwidth_task(
 
     let mut last_n = cfg.fallback_instance_count;
 
+    let staleness = cfg.effective_instance_staleness();
+    if let Some(message) = cfg.instance_staleness_warning() {
+        warn!("[BANDWIDTH_FLEET] {}", message);
+    }
+
     loop {
         interval.tick().await;
 
@@ -658,7 +660,6 @@ async fn fleet_bandwidth_task(
         }
 
         // Step 2: count live instances by reading the qos/heartbeats/ directory.
-        let staleness = cfg.instance_staleness;
         let n_result = tokio::task::spawn_blocking({
             let heartbeat_dir = heartbeat_dir.clone();
             move || count_live_instances(&heartbeat_dir, staleness)
@@ -1139,6 +1140,105 @@ mod tests {
         assert!(
             stale.exists(),
             "within-grace stale file must not be deleted"
+        );
+    }
+
+    /// A live peer whose heartbeat lands one second late must still count.
+    ///
+    /// The peer writes its heartbeat every `refresh_interval`, so at the moment
+    /// this instance reads the directory the peer's newest heartbeat is anywhere
+    /// from 0 to one full interval old, plus whatever the write, the shared
+    /// file system's mtime and the two hosts' clocks add. When the staleness
+    /// window equals the interval, that extra second drops the peer out of `N`
+    /// and this instance takes the peer's share of the aggregate ceiling.
+    #[test]
+    fn fleet_default_staleness_counts_a_live_peer_one_second_late() {
+        let cfg = crate::config::FleetSharingConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("self.qos"), b"\n").unwrap();
+        let peer = dir.path().join("peer.qos");
+        std::fs::write(&peer, b"\n").unwrap();
+        let last_beat = std::time::SystemTime::now()
+            .checked_sub(cfg.refresh_interval + std::time::Duration::from_secs(1))
+            .unwrap();
+        filetime::set_file_mtime(&peer, filetime::FileTime::from_system_time(last_beat)).unwrap();
+
+        let count = count_live_instances(dir.path(), cfg.effective_instance_staleness()).unwrap();
+        assert_eq!(
+            count,
+            2,
+            "a peer one refresh interval plus 1s since its last heartbeat is live; \
+             staleness={:?} refresh_interval={:?}",
+            cfg.effective_instance_staleness(),
+            cfg.refresh_interval
+        );
+    }
+
+    /// An explicit staleness equal to the refresh interval (what the example
+    /// config shipped until this change) is raised to three intervals and warns;
+    /// a value at or above twice the interval is used as written and does not.
+    #[test]
+    fn fleet_staleness_below_twice_refresh_is_raised_with_a_warning() {
+        use std::time::Duration;
+        let explicit = crate::config::FleetSharingConfig {
+            fallback_instance_count: 1,
+            instance_staleness: Duration::from_secs(30),
+            refresh_interval: Duration::from_secs(30),
+        };
+        assert_eq!(
+            explicit.effective_instance_staleness(),
+            Duration::from_secs(90)
+        );
+        let message = explicit
+            .instance_staleness_warning()
+            .expect("a raised staleness window must warn");
+        assert!(
+            message.contains("download_bandwidth.fleet.instance_staleness")
+                && message.contains("Using 90s"),
+            "the warning must name the field and the value used: {message}"
+        );
+
+        // Just under the threshold is raised too.
+        let just_under = crate::config::FleetSharingConfig {
+            instance_staleness: Duration::from_secs(59),
+            ..explicit.clone()
+        };
+        assert_eq!(
+            just_under.effective_instance_staleness(),
+            Duration::from_secs(90)
+        );
+
+        // Control: at the threshold the operator's value stands, silently.
+        let at_threshold = crate::config::FleetSharingConfig {
+            instance_staleness: Duration::from_secs(60),
+            ..explicit.clone()
+        };
+        assert_eq!(
+            at_threshold.effective_instance_staleness(),
+            Duration::from_secs(60)
+        );
+        assert!(at_threshold.instance_staleness_warning().is_none());
+
+        // The default is not raised and does not warn.
+        let default = crate::config::FleetSharingConfig::default();
+        assert_eq!(
+            default.effective_instance_staleness(),
+            default.instance_staleness
+        );
+        assert!(default.instance_staleness_warning().is_none());
+
+        // The raised window keeps a one-second-late peer in N.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("self.qos"), b"\n").unwrap();
+        let peer = dir.path().join("peer.qos");
+        std::fs::write(&peer, b"\n").unwrap();
+        let last_beat = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(31))
+            .unwrap();
+        filetime::set_file_mtime(&peer, filetime::FileTime::from_system_time(last_beat)).unwrap();
+        assert_eq!(
+            count_live_instances(dir.path(), explicit.effective_instance_staleness()).unwrap(),
+            2
         );
     }
 

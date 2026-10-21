@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
+mod common;
+use common::seed_validation_metadata;
+
 /// Helper to create test metadata
 fn create_test_metadata(etag: &str, content_length: u64) -> CacheMetadata {
     CacheMetadata {
@@ -71,6 +74,22 @@ fn age_entry_past_admission_window(cache_dir: &std::path::Path, cache_key: &str)
 
 /// Helper to create and initialize a test cache manager with JournalConsolidator
 async fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheManager> {
+    // Keep the background validation scan out of the test body.
+    //
+    // `initialize()` starts it, and it runs IMMEDIATELY when `validation.json` is absent,
+    // which it always is in a fresh `TempDir`. A full scan re-grounds the size state from
+    // its own disk snapshot, so a scan whose snapshot predates the test's writes overwrites
+    // the figure the test then asserts on — and it fails reporting a plausible-looking zero.
+    // `common::seed_validation_metadata` documents this race in full; the instruction there
+    // is to adopt the helper in a test file as it is touched rather than in one sweep.
+    //
+    // Measured on `test_cache_size_calculation_new_format`, 25 runs of the release binary
+    // each side: 0 failures before the rolling-pass change, 4 after. The change did not
+    // create the race — it widened the window, because the scan now yields at the
+    // `spawn_blocking` boundary where it used to run to completion inside a single poll and
+    // so could not interleave with the test on a current-thread runtime.
+    seed_validation_metadata(&cache_dir);
+
     let cache_manager = Arc::new(CacheManager::new_with_defaults(cache_dir, false, 0));
 
     // Must call create_configured_disk_cache_manager() to set up the JournalConsolidator

@@ -70,6 +70,7 @@ impl TcpProxy {
     /// Start the TCP proxy server
     pub async fn start(&self, mut shutdown_signal: crate::shutdown::ShutdownSignal) -> Result<()> {
         let listener = TcpListener::bind(self.listen_addr).await?;
+        let mut accept_errors = crate::accept_policy::AcceptErrorLog::new();
 
         loop {
             tokio::select! {
@@ -107,7 +108,7 @@ impl TcpProxy {
                             });
                         }
                         Err(e) => {
-                            error!("Failed to accept TCP connection: {}", e);
+                            accept_errors.on_accept_error("TCP proxy", &e).await;
                         }
                     }
                 }
@@ -338,8 +339,14 @@ impl TcpProxy {
             return None;
         }
 
-        let hostname = &data[5..5 + name_len];
-        String::from_utf8(hostname.to_vec()).ok()
+        let hostname = String::from_utf8(data[5..5 + name_len].to_vec()).ok()?;
+        // A control character or a quote can never be part of a resolvable host name, and
+        // the name is printed in many log lines, so a CR/LF here could forge log entries.
+        // Treat it as no SNI: the connection is closed, as it would be at DNS resolution.
+        if hostname.chars().any(|c| c.is_control() || c == '"') {
+            return None;
+        }
+        Some(hostname)
     }
 
     /// Establish TCP tunnel to target endpoint
@@ -364,7 +371,9 @@ impl TcpProxy {
             // Override IPs still need policy validation (prohibited-range check)
             match policy.classify_ips(target_host, ips) {
                 Ok(allowed) => {
-                    info!("Using endpoint override for {}: {:?}", target_host, allowed);
+                    // Per connection, so `debug!`: every HTTPS passthrough connection to an
+                    // overridden host passes through here.
+                    debug!("Using endpoint override for {}: {:?}", target_host, allowed);
                     allowed
                 }
                 Err(reason) => {
@@ -854,6 +863,27 @@ mod tests {
         assert_eq!(TcpProxy::extract_sni_from_tls_handshake(&data), None);
     }
 
+    #[test]
+    fn test_extract_sni_rejects_control_characters_and_quotes() {
+        // A name with CR/LF would otherwise reach every log line that prints the host.
+        for name in [
+            "evil.example\r\n2026-10-19T00:00:00Z  INFO forged line",
+            "evil.example\u{85}next",
+            "evil\".example",
+        ] {
+            let record = build_client_hello_with_sni(name);
+            assert_eq!(
+                TcpProxy::extract_sni_from_tls_handshake(&record),
+                None,
+                "SNI {name:?} must be rejected"
+            );
+        }
+        let record = build_client_hello_with_sni("s3.us-west-2.amazonaws.com");
+        assert_eq!(
+            TcpProxy::extract_sni_from_tls_handshake(&record).as_deref(),
+            Some("s3.us-west-2.amazonaws.com")
+        );
+    }
     #[test]
     fn test_extract_sni_rejects_too_short() {
         assert_eq!(

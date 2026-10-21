@@ -1,6 +1,6 @@
 //! Integration tests for coalesced full-flow correctness.
 //!
-//! Spec: `.kiro/specs/download-coordination-ttl-correctness/`
+//! Spec: the download coordination ttl correctness feature
 //! Task: 11
 //!
 //! These tests exercise the full coordination + validated-serve + real S3
@@ -256,7 +256,7 @@ async fn make_integration_cache(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false, // compression disabled for integration tests
         config.cache.get_ttl,

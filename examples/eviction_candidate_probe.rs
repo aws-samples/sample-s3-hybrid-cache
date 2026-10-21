@@ -1,50 +1,40 @@
-//! Drive the real eviction candidate collector over a cache tree and report what it
-//! discovered.
+//! Drive the eviction candidate collector over a cache tree and report what it found.
 //!
-//! Spec: `cache-eviction-at-scale`, task 9 (fixture verification). Requirements: 13.1,
-//! 13.4.
+//! # What this is for
 //!
-//! # What this is for, and what it deliberately is not
+//! A generated cache fixture is useful only if the proxy's own code can read it. A fixture
+//! checked only by its own read-back proves that its writer and its parser agree, and nothing
+//! else. This binary calls `CacheManager::collect_range_candidates_for_eviction`, the entry
+//! point the disk eviction pass uses, over a tree on the real cache volume, and reports the
+//! identities and byte figures it recovered, for comparison with the fixture's manifest.
 //!
-//! Task 9's artefact is only valid if **product** code can discover it. A generator
-//! validated by its own read-back proves that its writer and its parser agree and
-//! nothing else, which is task 8's stated risk. So this binary calls
-//! `CacheManager::collect_range_candidates_for_eviction` — the same entry point the
-//! disk eviction pass uses — over a tree on the real shared backend, and reports the
-//! identity and byte figures it recovered so they can be compared against the
-//! fixture's manifest.
+//! It does not measure eviction: it runs no pass, has no byte target and reports no
+//! throughput. Keep a "does the fixture work" check apart from any measurement of the proxy,
+//! so that a fixture defect is not reported as a product defect.
 //!
-//! It is **not** a measurement of eviction. It does not drive a pass, does not run to
-//! a byte target, and reports no throughput conclusion. Selection cost at scale, the
-//! byte-target failure, and eviction-versus-ingest are tasks 11 to 13, and mixing a
-//! "does the artefact work" check with a "how fast is the product" measurement is how
-//! a fixture defect gets reported as a product defect. Keep them apart.
+//! # `size` versus `compressed_size`
 //!
-//! # `size` versus `compressed_size` — read this before using the output
-//!
-//! `collect_candidates_from_metadata_file` stats the `.bin` and puts the **actual file
-//! length** in `RangeEvictionCandidate::size`, falling back to `compressed_size` only
-//! when the stat fails. On a count-scale fixture (`PayloadMode::RecordedSizeOnly`) the
-//! `.bin` is a small stub while the `.meta` records a realistic size, so `size` is the
-//! stub and `compressed_size` is the figure a byte-valued measurement wants. This
-//! binary prints both sums side by side precisely so that the asymmetry is impossible
-//! to miss, rather than being a footnote someone reads after publishing a wrong number.
+//! `collect_candidates_from_metadata_file` stats the `.bin` and puts the actual file length in
+//! `RangeEvictionCandidate::size`, falling back to `compressed_size` only when the stat fails.
+//! On a count-scale fixture (`PayloadMode::RecordedSizeOnly`) the `.bin` is a small stub while
+//! the `.meta` records a realistic size, so `size` is the stub and `compressed_size` is the
+//! figure a byte-valued measurement needs. This binary prints both sums side by side.
 //!
 //! # Usage
 //!
 //! ```text
 //! cargo run --release --example eviction_candidate_probe -- \
-//!     --cache-dir /mnt/efs/fixture-a-count-scale-subset --subset
+//!     --cache-dir /mnt/cache-fixture/subset --subset
 //!
 //! # whole tree, with manifest agreement asserted
 //! cargo run --release --example eviction_candidate_probe -- \
 //!     --cache-dir tmp/fixture-small
 //! ```
 //!
-//! `--subset` says the tree is a bounded slice of a larger fixture (a few L1 shards),
-//! so counts are compared as "at most the manifest's" rather than "equal to". State
-//! the bound wherever the output is quoted; a subset does not establish that the whole
-//! artefact is discoverable, only that its content is well formed where it was checked.
+//! `--subset` says the tree is a bounded slice of a larger fixture (a few L1 shards), so counts
+//! are compared as "at most the manifest's" rather than "equal to". State the bound wherever
+//! the output is quoted: a subset shows that the fixture's content is well formed where it was
+//! checked, not that the whole fixture is discoverable.
 
 use s3_proxy::cache::CacheManager;
 use std::collections::HashSet;

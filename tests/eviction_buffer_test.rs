@@ -1,11 +1,17 @@
 //! Test for range-based eviction with unified eviction system
 //!
+//! Drives `CacheManager::enforce_disk_cache_limits` (the background eviction path),
+//! not the removed request-path `evict_if_needed` — see cache-eviction-at-scale
+//! design-review-2026-08-30 § D2. Background eviction now triggers at
+//! `eviction_trigger_percent` against what is actually on disk, rather than only at
+//! 100% of `max_cache_size` plus a separate request-path lookahead check.
+//!
 //! Validates Requirements:
 //! - 1.1: Each range is an independent eviction candidate
 //! - 1.4: Sort by individual range access statistics
 //! - 1.5: Allow evicting any subset of ranges independently
 //! - 2.1: Select ranges based on configured algorithm
-//! - 2.2: Use LRU algorithm (oldest last_accessed first)
+//! - 2.2: (LRU algorithm; deleted with LRU, cache-eviction-at-scale R10.1)
 //! - 2.3: Use TinyLFU algorithm (lowest frequency/recency score first)
 //! - 2.4: Break ties using oldest created_at
 //! - 3.1: Trigger eviction at 95% of max capacity
@@ -74,7 +80,9 @@ async fn store_test_range(
     // Create test data
     let data = vec![0u8; data_size];
 
-    // Get sharded range file path using the same logic as DiskCacheManager
+    // Build the range file's path through `get_sharded_path`, the same helper
+    // `DiskCacheManager`'s range writers call. Range paths have no flat/sharded sibling,
+    // so this is the only layout rather than one of two.
     let ranges_base_dir = cache_manager.get_cache_dir().join("ranges");
     let suffix = format!("_{}-{}.bin", start, end);
     let range_path = get_sharded_path(&ranges_base_dir, cache_key, &suffix)
@@ -137,7 +145,7 @@ async fn test_eviction_triggers_at_95_percent() {
     let temp_dir = TempDir::new().unwrap();
     let max_cache_size = 1_000_000u64; // 1MB
     let cache_manager =
-        create_test_cache_manager(&temp_dir, max_cache_size, CacheEvictionAlgorithm::LRU);
+        create_test_cache_manager(&temp_dir, max_cache_size, CacheEvictionAlgorithm::TinyLFU);
 
     // Fill cache to 90% (should not trigger eviction)
     let now = SystemTime::now();
@@ -169,9 +177,28 @@ async fn test_eviction_triggers_at_95_percent() {
         current_size
     );
 
-    // Try to add 100KB more (would bring total to ~1MB = 100%, but trigger is at 95%)
-    // This should trigger eviction
-    let result = cache_manager.evict_if_needed(100_000).await;
+    // Store one more 100KB range, bringing the cache to ~1MB (over the 95% trigger).
+    // `evict_if_needed`'s request-path lookahead (checking whether adding N bytes
+    // would exceed trigger, before the bytes exist on disk) was removed under D2
+    // (cache-eviction-at-scale design-review-2026-08-30) — background eviction now
+    // reacts only to what is actually on disk, via `enforce_disk_cache_limits`.
+    store_test_range(
+        &cache_manager,
+        "test-bucket/object-9",
+        0,
+        99_999,
+        100_000,
+        now,
+        now,
+        10,
+        ttl,
+    )
+    .await
+    .unwrap();
+
+    // This should trigger eviction (background path, replaces the removed
+    // request-path `evict_if_needed` call).
+    let result = cache_manager.enforce_disk_cache_limits().await;
 
     // Eviction should succeed
     assert!(result.is_ok(), "Eviction should succeed: {:?}", result);
@@ -185,88 +212,6 @@ async fn test_eviction_triggers_at_95_percent() {
         target_size,
         final_size
     );
-}
-
-#[tokio::test]
-async fn test_eviction_uses_lru_algorithm() {
-    let temp_dir = TempDir::new().unwrap();
-    let max_cache_size = 1_000_000u64; // 1MB
-    let cache_manager =
-        create_test_cache_manager(&temp_dir, max_cache_size, CacheEvictionAlgorithm::LRU);
-
-    let now = SystemTime::now();
-    let ttl = Duration::from_secs(3600);
-
-    // Store 3 ranges with different access times
-    // Total: ~1.2MB with max 1MB, target is 80% (800KB)
-    // Need to evict ~400KB+ to get below 800KB
-    // With 3x400KB ranges, eviction will remove the 2 oldest to get to ~400KB
-
-    // Range 1: Oldest access (should be evicted first)
-    store_test_range(
-        &cache_manager,
-        "test-bucket/object-1",
-        0,
-        399_999,
-        400_000, // 400KB
-        now - Duration::from_secs(7200),
-        now - Duration::from_secs(7200), // Accessed 2 hours ago
-        5,
-        ttl,
-    )
-    .await
-    .unwrap();
-
-    // Range 2: Recent access (should be kept - most recent)
-    store_test_range(
-        &cache_manager,
-        "test-bucket/object-2",
-        0,
-        399_999,
-        400_000, // 400KB
-        now - Duration::from_secs(3600),
-        now - Duration::from_secs(60), // Accessed 1 minute ago
-        10,
-        ttl,
-    )
-    .await
-    .unwrap();
-
-    // Range 3: Medium access (will be evicted - second oldest)
-    store_test_range(
-        &cache_manager,
-        "test-bucket/object-3",
-        0,
-        399_999,
-        400_000, // 400KB
-        now - Duration::from_secs(5400),
-        now - Duration::from_secs(1800), // Accessed 30 minutes ago
-        8,
-        ttl,
-    )
-    .await
-    .unwrap();
-
-    // Total: ~1.2MB, should trigger eviction to 80% target (800KB)
-    // Trigger eviction
-    cache_manager.evict_if_needed(0).await.unwrap();
-
-    // Verify that object-1 (oldest access) was evicted
-    let metadata_path_1 = cache_manager.get_new_metadata_file_path("test-bucket/object-1");
-    assert!(
-        !metadata_path_1.exists(),
-        "Object 1 (oldest access) should be evicted"
-    );
-
-    // Verify that object-2 (most recent access) still exists
-    let metadata_path_2 = cache_manager.get_new_metadata_file_path("test-bucket/object-2");
-    assert!(
-        metadata_path_2.exists(),
-        "Object 2 (most recent access) should be kept"
-    );
-
-    // Note: Object 3 may or may not be evicted depending on exact eviction target
-    // The key property is that LRU evicts oldest first, which we verified with object-1
 }
 
 #[tokio::test]
@@ -331,7 +276,7 @@ async fn test_eviction_uses_tinylfu_algorithm() {
 
     // Total: ~1.2MB, should trigger eviction to 80% target (800KB)
     // Trigger eviction
-    cache_manager.evict_if_needed(0).await.unwrap();
+    cache_manager.enforce_disk_cache_limits().await.unwrap();
 
     // Verify that object-1 (low frequency) was evicted
     let metadata_path_1 = cache_manager.get_new_metadata_file_path("test-bucket/object-1");
@@ -356,7 +301,7 @@ async fn test_eviction_frees_sufficient_space() {
     let temp_dir = TempDir::new().unwrap();
     let max_cache_size = 1_000_000u64; // 1MB
     let cache_manager =
-        create_test_cache_manager(&temp_dir, max_cache_size, CacheEvictionAlgorithm::LRU);
+        create_test_cache_manager(&temp_dir, max_cache_size, CacheEvictionAlgorithm::TinyLFU);
 
     let now = SystemTime::now();
     let ttl = Duration::from_secs(3600);
@@ -388,7 +333,7 @@ async fn test_eviction_frees_sufficient_space() {
     );
 
     // Trigger eviction (should bring down to 80% target)
-    cache_manager.evict_if_needed(0).await.unwrap();
+    cache_manager.enforce_disk_cache_limits().await.unwrap();
 
     // Verify cache is at or below 80% (800KB) - the new unified eviction target
     let final_size = cache_manager.calculate_disk_cache_size().await.unwrap();
@@ -416,7 +361,7 @@ async fn test_no_eviction_below_95_percent() {
     let temp_dir = TempDir::new().unwrap();
     let max_cache_size = 1_000_000u64; // 1MB
     let cache_manager =
-        create_test_cache_manager(&temp_dir, max_cache_size, CacheEvictionAlgorithm::LRU);
+        create_test_cache_manager(&temp_dir, max_cache_size, CacheEvictionAlgorithm::TinyLFU);
 
     let now = SystemTime::now();
     let ttl = Duration::from_secs(3600);
@@ -447,8 +392,8 @@ async fn test_no_eviction_below_95_percent() {
         initial_size
     );
 
-    // Try to trigger eviction with small required space
-    cache_manager.evict_if_needed(10_000).await.unwrap();
+    // Try to trigger eviction while under the trigger threshold
+    cache_manager.enforce_disk_cache_limits().await.unwrap();
 
     // Verify cache size hasn't changed (no eviction occurred)
     let final_size = cache_manager.calculate_disk_cache_size().await.unwrap();

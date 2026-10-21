@@ -5,7 +5,7 @@
 
 // Removed unused import
 use s3_proxy::cache_initialization_coordinator::CacheInitializationCoordinator;
-use s3_proxy::cache_size_tracker::{CacheSizeConfig, CacheSizeTracker};
+use s3_proxy::cache_size_tracker::{CacheSizeConfig, CacheSizeTracker, ValidationRequestKind};
 use s3_proxy::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::config::{CacheConfig, EvictionAlgorithm, InitializationConfig, SharedStorageConfig};
@@ -109,10 +109,11 @@ fn create_test_cache_config(cache_dir: PathBuf, write_cache_enabled: bool) -> Ca
         max_cache_size: 1024 * 1024 * 1024, // 1GB
         ram_cache_enabled: false,
         max_ram_cache_size: 0,
-        eviction_algorithm: EvictionAlgorithm::LRU,
+        eviction_algorithm: EvictionAlgorithm::TinyLFU,
         write_cache_enabled,
         write_cache_percent: 0.5,
         write_cache_max_object_size: 1024 * 1024 * 100, // 100MB
+        disk_safety_free_space_floor: 1024 * 1024 * 1024, // 1 GiB
         put_ttl: Duration::from_secs(86400),            // 1 day
         get_ttl: Duration::from_secs(3600),             // 1 hour
         head_ttl: Duration::from_secs(300),             // 5 minutes
@@ -121,8 +122,6 @@ fn create_test_cache_config(cache_dir: PathBuf, write_cache_enabled: bool) -> Ca
         range_merge_gap_threshold: 1024 * 1024, // 1MB
         eviction_buffer_percent: 5,
         ram_cache_flush_interval: Duration::from_secs(60),
-        ram_cache_flush_threshold: 100,
-        ram_cache_flush_on_eviction: false,
         ram_cache_verification_interval: Duration::from_secs(1),
         incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
         initialization: InitializationConfig::default(),
@@ -173,6 +172,8 @@ fn create_test_metadata(
             last_accessed: SystemTime::now(),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         }],
         created_at: SystemTime::now(),
         expires_at: SystemTime::now() + Duration::from_secs(3600),
@@ -220,7 +221,7 @@ async fn test_full_initialization_process() {
         50.0,        // 50% for write cache
         config.put_ttl,
         config.incomplete_upload_ttl,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         config.write_cache_max_object_size,
     );
 
@@ -239,12 +240,13 @@ async fn test_full_initialization_process() {
     // Verify initialization summary
     assert!(summary.total_duration > Duration::ZERO);
     assert_eq!(summary.total_errors, 0);
-    assert_eq!(summary.scan_summary.total_objects, 3);
-    assert_eq!(summary.scan_summary.total_size, 1792); // 512 + 256 + 1024
-    assert_eq!(summary.scan_summary.write_cached_objects, 2);
-    assert_eq!(summary.scan_summary.write_cached_size, 1536); // 512 + 1024
-    assert_eq!(summary.scan_summary.read_cached_objects, 1);
-    assert_eq!(summary.scan_summary.read_cached_size, 256);
+    // No startup scan: the summary is size_state.json as seeded (1536 bytes, all write-cache,
+    // no object count), not a count of the three `.meta` files.
+    assert_eq!(summary.performance_metrics.files_processed, 0);
+    assert_eq!(summary.scan_summary.total_objects, 0);
+    assert_eq!(summary.scan_summary.total_size, 1536);
+    assert_eq!(summary.scan_summary.write_cached_size, 1536);
+    assert_eq!(summary.scan_summary.read_cached_size, 0);
 
     // Verify subsystem initialization
     assert!(summary.subsystem_results.write_cache_initialized);
@@ -298,13 +300,19 @@ async fn test_initialization_write_cache_disabled() {
 
     // Verify initialization summary
     assert_eq!(summary.total_errors, 0);
-    assert_eq!(summary.scan_summary.total_objects, 2);
-    assert_eq!(summary.scan_summary.total_size, 768); // 512 + 256
-
-    // With write cache disabled, objects are still categorized based on their metadata
-    // but the write cache manager is not initialized
-    assert_eq!(summary.scan_summary.write_cached_objects, 1); // Only the one marked as write-cached
-    assert_eq!(summary.scan_summary.read_cached_objects, 1); // The one marked as read-cached
+    // No startup scan, and size_state.json is missing on a cache holding data: the figure
+    // starts at 0 and a full validation is requested from the scheduler instead.
+    assert_eq!(summary.performance_metrics.files_processed, 0);
+    assert_eq!(summary.scan_summary.total_objects, 0);
+    assert_eq!(summary.scan_summary.total_size, 0);
+    assert_eq!(
+        size_tracker
+            .as_ref()
+            .unwrap()
+            .validation_request()
+            .map(|r| r.kind),
+        Some(ValidationRequestKind::FigureUnvalidated)
+    );
 
     // Verify subsystem initialization
     assert!(!summary.subsystem_results.write_cache_initialized);
@@ -337,7 +345,7 @@ async fn test_initialization_empty_cache() {
         50.0,
         config.put_ttl,
         config.incomplete_upload_ttl,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         config.write_cache_max_object_size,
     );
 
@@ -412,7 +420,7 @@ async fn test_initialization_with_corrupted_metadata() {
         50.0,
         config.put_ttl,
         config.incomplete_upload_ttl,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         config.write_cache_max_object_size,
     );
 
@@ -428,22 +436,14 @@ async fn test_initialization_with_corrupted_metadata() {
         .await
         .unwrap();
 
-    // Verify initialization handled errors gracefully
-    assert_eq!(summary.total_errors, 0); // Errors should be handled gracefully
-    assert!(summary.total_warnings > 0); // But warnings should be generated
-
-    // Only valid metadata should be counted
-    assert_eq!(summary.scan_summary.total_objects, 1);
+    // Startup reads no `.meta` file, so corrupt ones neither fail it nor warn: the summary is
+    // size_state.json as seeded. The scheduled validation's scan owns corrupt files.
+    assert_eq!(summary.total_errors, 0);
+    assert_eq!(summary.performance_metrics.files_processed, 0);
     assert_eq!(summary.scan_summary.total_size, 512);
-    assert_eq!(summary.scan_summary.write_cached_objects, 1);
     assert_eq!(summary.scan_summary.write_cached_size, 512);
-
-    // Should have processed all files (valid and invalid)
-    assert_eq!(summary.scan_summary.metadata_entries.len(), 4);
-
-    // Should have scan errors for corrupted files
-    assert!(summary.scan_summary.has_errors());
-    assert!(summary.scan_summary.error_count() > 0);
+    assert!(summary.scan_summary.metadata_entries.is_empty());
+    assert!(!summary.scan_summary.has_errors());
 
     // Subsystems should still be initialized
     assert!(summary.subsystem_results.write_cache_initialized);
@@ -481,7 +481,7 @@ async fn test_multi_instance_coordination() {
         50.0,
         config.put_ttl,
         config.incomplete_upload_ttl,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         config.write_cache_max_object_size,
     );
 
@@ -491,7 +491,7 @@ async fn test_multi_instance_coordination() {
         50.0,
         config.put_ttl,
         config.incomplete_upload_ttl,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         config.write_cache_max_object_size,
     );
 
@@ -575,7 +575,7 @@ async fn test_configuration_driven_behavior() {
         50.0,
         config.put_ttl,
         config.incomplete_upload_ttl,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         config.write_cache_max_object_size,
     );
 
@@ -593,7 +593,8 @@ async fn test_configuration_driven_behavior() {
 
     // Verify initialization respects configuration
     assert_eq!(summary.total_errors, 0);
-    assert_eq!(summary.scan_summary.total_objects, 1);
+    // size_state.json as seeded: 512 bytes and no object count. No startup scan.
+    assert_eq!(summary.scan_summary.total_objects, 0);
     assert_eq!(summary.scan_summary.total_size, 512);
 
     // Verify cross-validation was performed (as configured)

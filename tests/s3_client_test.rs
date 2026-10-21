@@ -2,29 +2,10 @@
 
 use bytes::Bytes;
 use hyper::{Method, Uri};
-use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::ConnectionPoolConfig;
 use s3_proxy::s3_client::{build_s3_request_context, S3Client};
 use std::collections::HashMap;
 use std::time::Duration;
-
-/// Helper function to create test metadata
-#[allow(dead_code)]
-fn create_test_cache_metadata(
-    etag: &str,
-    last_modified: &str,
-    content_length: u64,
-) -> CacheMetadata {
-    CacheMetadata {
-        etag: etag.to_string(),
-        last_modified: last_modified.to_string(),
-        content_length,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    }
-}
 
 fn create_test_config() -> ConnectionPoolConfig {
     ConnectionPoolConfig {
@@ -74,7 +55,17 @@ fn test_build_s3_request_context() {
 
     assert_eq!(context.method, Method::GET);
     assert_eq!(context.uri, uri);
-    assert_eq!(context.headers, headers);
+    // The input headers are kept, and this process's `Via` entry is the one addition.
+    let mut forwarded = context.headers.clone();
+    let via = forwarded
+        .remove("Via")
+        .expect("every request context carries this process's Via header");
+    assert_eq!(forwarded, headers);
+    assert_eq!(
+        via,
+        format!("1.1 {}", s3_proxy::signed_request_proxy::via_pseudonym()),
+        "Via is `1.1 <this process's pseudonym>`"
+    );
     assert_eq!(context.body, body);
     assert_eq!(context.host, host);
     assert_eq!(context.request_size, Some(9)); // "test body".len()

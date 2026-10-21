@@ -31,7 +31,7 @@ fn create_shared_storage_cache_manager(cache_dir: std::path::PathBuf) -> CacheMa
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -39,8 +39,7 @@ fn create_shared_storage_cache_manager(cache_dir: std::path::PathBuf) -> CacheMa
         Duration::from_secs(3600),
         false,
         SharedStorageConfig {
-            lock_timeout: Duration::from_secs(60),
-            lock_refresh_interval: Duration::from_secs(30),
+            lock_acquire_wait_budget: Duration::from_secs(60),
             ..Default::default()
         },
         10.0,

@@ -176,7 +176,7 @@ async fn make_test_cache(config: &Config) -> (TempDir, Arc<CacheManager>, Arc<Ra
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,
@@ -810,7 +810,7 @@ async fn test_range_no_hedging_when_budget_none() {
 }
 
 // ---------------------------------------------------------------------------
-// Signed range request hedging (fleet-verification-gaps, T38d regression)
+// Signed range request hedging (fleet-verification-gaps regression)
 // ---------------------------------------------------------------------------
 //
 // A client that signs its Range header (e.g. the AWS CLI's
@@ -819,9 +819,9 @@ async fn test_range_no_hedging_when_budget_none() {
 // `stream_range_from_s3_with_caching`/`fetch_missing_ranges`. Before this fix,
 // that path never called into `hedged_fetch` at all, regardless of
 // `resolved.hedging_enabled` — a real coverage gap discovered when the fleet
-// deployment-verification suite's T38d assertion (range GET through a
+// the fleet test assertion (range GET through a
 // 400ms-delayed origin) failed to observe `hedged_requests.issued`
-// incrementing, while the equivalent full-object GET (T38b) did.
+// incrementing, while the equivalent full-object GET (the fleet test) did.
 //
 // These tests dispatch through `forward_range_with_coordination` with
 // `is_signed: true` and coordination disabled, which is the public entry

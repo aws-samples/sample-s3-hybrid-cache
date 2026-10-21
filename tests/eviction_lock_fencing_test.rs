@@ -24,7 +24,7 @@ fn create_cache_manager_with_timeout(
         false,
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),
@@ -32,8 +32,12 @@ fn create_cache_manager_with_timeout(
         Duration::from_secs(3600),
         false,
         SharedStorageConfig {
-            lock_timeout: eviction_lock_timeout,
-            lock_refresh_interval: Duration::from_secs(30),
+            // The field this helper's parameter NAMES. It used to set `lock_timeout` — the
+            // metadata slot lock's field, a different lock — so `eviction_lock_timeout` stayed
+            // at its 60s default and every caller's argument was discarded. Correcting it does
+            // not change any verdict in this file, for the reason recorded on
+            // `test_stale_takeover_when_lock_exceeds_timeout`.
+            eviction_lock_timeout,
             ..Default::default()
         },
         10.0,
@@ -140,7 +144,7 @@ async fn test_verify_eviction_fence_ok_when_uuid_matches() {
     assert!(acquired, "Should acquire lock");
 
     // Fence verification should succeed — UUID in lockfile matches our UUID
-    let result = cache_manager.verify_eviction_fence();
+    let result = cache_manager.verify_eviction_fence().await;
     assert!(
         result.is_ok(),
         "verify_eviction_fence should return Ok when UUID matches, got: {:?}",
@@ -173,7 +177,7 @@ async fn test_verify_eviction_fence_ok_multiple_calls() {
 
     // Multiple verifications should all pass
     for i in 0..5 {
-        let result = cache_manager.verify_eviction_fence();
+        let result = cache_manager.verify_eviction_fence().await;
         assert!(
             result.is_ok(),
             "verify_eviction_fence call {} should succeed",
@@ -209,7 +213,7 @@ async fn test_verify_eviction_fence_err_on_uuid_mismatch() {
     assert!(acquired, "Should acquire lock");
 
     // Verify fence is initially valid
-    assert!(cache_manager.verify_eviction_fence().is_ok());
+    assert!(cache_manager.verify_eviction_fence().await.is_ok());
 
     // Simulate another instance taking over: overwrite lockfile with different UUID
     let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
@@ -226,7 +230,7 @@ async fn test_verify_eviction_fence_err_on_uuid_mismatch() {
     std::fs::write(&lock_file_path, intruder_json).expect("Failed to overwrite lock file");
 
     // Now verify_eviction_fence should detect the mismatch and return Err
-    let result = cache_manager.verify_eviction_fence();
+    let result = cache_manager.verify_eviction_fence().await;
     assert!(
         result.is_err(),
         "verify_eviction_fence should return Err when UUID doesn't match"
@@ -263,7 +267,7 @@ async fn test_verify_eviction_fence_err_when_lockfile_deleted() {
     std::fs::remove_file(&lock_file_path).expect("Failed to remove lock file");
 
     // verify_eviction_fence should fail because it can't read the lockfile
-    let result = cache_manager.verify_eviction_fence();
+    let result = cache_manager.verify_eviction_fence().await;
     assert!(
         result.is_err(),
         "verify_eviction_fence should return Err when lockfile is missing"
@@ -281,7 +285,7 @@ async fn test_verify_eviction_fence_err_when_no_uuid_set() {
     setup_locks_dir(&cache_dir);
 
     // Don't acquire the lock — verify_eviction_fence should fail immediately
-    let result = cache_manager.verify_eviction_fence();
+    let result = cache_manager.verify_eviction_fence().await;
     assert!(
         result.is_err(),
         "verify_eviction_fence should return Err when lock is not held"
@@ -396,6 +400,19 @@ async fn test_release_does_not_truncate_when_uuid_changed() {
 
 /// When acquired_at_ms + timeout < now, the lock is considered stale and eligible
 /// for takeover by another instance.
+///
+/// # This test does NOT reach the takeover branch, and never has
+///
+/// It writes a stale payload but nothing holds an `flock` on the file, so the initial
+/// non-blocking `try_lock` in `try_acquire_global_eviction_lock` SUCCEEDS and the normal
+/// acquisition path writes a fresh UUID. Every assertion below is satisfied by that path,
+/// whatever the timeout is — which is why the test passed for the whole time the helper was
+/// setting the wrong config field entirely.
+///
+/// Reaching the real branch needs a live holder in another process, the way
+/// `remove_corrupt_metadata_refuses_while_a_peer_holds_the_slot_then_deletes` does it. Until
+/// then the stale-takeover arm — including the `stale_locks_recovered` increment inside it —
+/// has no automated coverage. Do not read a pass here as evidence that it works.
 #[tokio::test]
 async fn test_stale_takeover_when_lock_exceeds_timeout() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -442,7 +459,7 @@ async fn test_stale_takeover_when_lock_exceeds_timeout() {
 
     // Verify fence is valid after takeover
     assert!(
-        cache_manager.verify_eviction_fence().is_ok(),
+        cache_manager.verify_eviction_fence().await.is_ok(),
         "Fence should be valid after stale takeover"
     );
 

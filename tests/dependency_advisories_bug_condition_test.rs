@@ -1,6 +1,6 @@
 //! Bug condition exploration — dependency security advisories
 //!
-//! Spec: `.kiro/specs/dependency-security-upgrades/`
+//! Spec: the dependency security upgrades feature
 //!
 //! This test is Task 1 of the bugfix workflow. It reads `Cargo.lock` and
 //! asserts that none of the three known-vulnerable crate versions are present.
@@ -20,7 +20,7 @@
 //!   RUSTSEC-2026-0099, RUSTSEC-2026-0049. Four advisories covering CRL
 //!   parsing panics, URI/wildcard name-constraint bypass, and CRL
 //!   distribution-point matching bugs. Reached transitively through
-//!   `rustls 0.23.x`, `tokio-rustls 0.26.x`, and dev-dep `ureq 2.x`.
+//!   `rustls 0.23.x` and `tokio-rustls 0.26.x`.
 //!
 //! - **idna 0.4.0** — RUSTSEC-2024-0421. Accepts Punycode labels that
 //!   decode to pure-ASCII, enabling IDN homograph bypasses. Reached only
@@ -142,7 +142,7 @@ fn no_vulnerable_dependency_versions_in_cargo_lock() {
     // RUSTSEC-2026-0098 (URI name constraints incorrectly accepted),
     // RUSTSEC-2026-0099 (wildcard name constraints incorrectly accepted),
     // RUSTSEC-2026-0049 (CRL distribution-point matching bug).
-    // Fix: upgrade rustls / tokio-rustls / ureq so that rustls-webpki
+    // Fix: upgrade rustls / tokio-rustls so that rustls-webpki
     // resolves to >= 0.103.13.
     assert!(
         !contains_package(&packages, "rustls-webpki", "0.103.8"),
@@ -152,7 +152,7 @@ fn no_vulnerable_dependency_versions_in_cargo_lock() {
          RUSTSEC-2026-0098 (URI name constraints incorrectly accepted), \
          RUSTSEC-2026-0099 (wildcard name constraints incorrectly accepted), \
          RUSTSEC-2026-0049 (CRL distribution-point matching bug). \
-         Fix: run `cargo update -p rustls -p tokio-rustls -p ureq -p rustls-webpki` \
+         Fix: run `cargo update -p rustls -p tokio-rustls -p rustls-webpki` \
          and verify `cargo tree -i rustls-webpki` shows >= 0.103.13."
     );
 

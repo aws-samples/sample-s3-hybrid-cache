@@ -1,69 +1,58 @@
-# Docker Deployment
+# Docker deployment
 
-Building and running Hybrid Cache for Amazon S3 in a container. This is an alternative
-to the [systemd service](GETTING_STARTED.md#running-as-a-systemd-service-recommended-for-production)
-path in [Getting Started](GETTING_STARTED.md) — pick whichever fits your orchestration
-(Kubernetes, ECS, Nomad, plain `docker compose`).
+This guide builds Hybrid Cache for Amazon S3 into a container image and runs it. It is an
+alternative to the [systemd service](GETTING_STARTED.md#running-as-a-systemd-service-recommended-for-production)
+in [Getting started](GETTING_STARTED.md); use whichever fits your orchestration (Kubernetes,
+Amazon ECS, Nomad or plain `docker compose`).
 
-Commands below use `docker`; any Docker-API-compatible CLI works the same way,
-including [Finch](https://runfinch.com/) (`finch build`, `finch run`, `finch
-compose`) — this guide's Dockerfile and compose file were verified end-to-end with
-Finch (see [Verified](#verified) below).
+Commands below use `docker`. Any Docker-API-compatible CLI works the same way, including
+[Finch](https://runfinch.com/) (`finch build`, `finch run`, `finch compose`).
 
-## Table of Contents
+## Contents
 
-- [Why the Binary Fits a Container](#why-the-binary-fits-a-container)
+- [Why the binary fits a container](#why-the-binary-fits-a-container)
 - [Dockerfile](#dockerfile)
-  - [Base Image Choice](#base-image-choice)
-  - [Healthcheck Tradeoff](#healthcheck-tradeoff)
+  - [Base image choice](#base-image-choice)
+  - [Health check trade-off](#health-check-trade-off)
 - [Building](#building)
-- [Configuration in a Container](#configuration-in-a-container)
-  - [Config File vs Environment Variables](#config-file-vs-environment-variables)
-- [Cache Persistence](#cache-persistence)
-- [Privilege Model: Ports 80/443 vs proxy_only](#privilege-model-ports-80443-vs-proxy_only)
-- [docker compose Example](#docker-compose-example)
-- [Bind Addresses: Loopback Defaults Are a Container Trap](#bind-addresses-loopback-defaults-are-a-container-trap)
-- [Multi-Instance / Shared Cache](#multi-instance--shared-cache)
-- [TLS Proxy Listener in a Container](#tls-proxy-listener-in-a-container)
+- [Configuration in a container](#configuration-in-a-container)
+  - [Configuration file or environment variables](#configuration-file-or-environment-variables)
+- [Cache persistence](#cache-persistence)
+- [Privilege model: ports 80 and 443 or proxy_only](#privilege-model-ports-80-and-443-or-proxy_only)
+- [TLS proxy listener in a container](#tls-proxy-listener-in-a-container)
+- [docker compose example](#docker-compose-example)
+- [Bind addresses: loopback defaults in a container](#bind-addresses-loopback-defaults-in-a-container)
+- [Fleets sharing a cache volume](#fleets-sharing-a-cache-volume)
+  - [Each container needs its own hostname](#each-container-needs-its-own-hostname)
 - [Upgrading](#upgrading)
-- [Kubernetes Notes](#kubernetes-notes)
-- [Verified](#verified)
+- [Kubernetes notes](#kubernetes-notes)
 
-## Why the Binary Fits a Container
+## Why the binary fits a container
 
-The release binary is a single ~20 MB executable that statically links the Rust
-standard library and all crates, and dynamically links only glibc and a small set of
-standard Linux libraries — see
-[Binary Portability](GETTING_STARTED.md#binary-portability). No OpenSSL: TLS is
-`rustls`, so the build needs no `libssl-dev`/`pkg-config`. That makes a minimal,
-non-shell runtime image a natural fit rather than a stretch — it needs a glibc and
-essentially nothing else.
+The release binary is a single executable. It statically links the Rust standard library and
+every crate, and dynamically links only glibc and a few standard Linux libraries; see
+[Binary portability](GETTING_STARTED.md#binary-portability). TLS uses `rustls` rather than
+OpenSSL, so the build needs no `libssl-dev` or `pkg-config`. A minimal runtime image with no
+shell is enough: it needs glibc and little else.
 
 ## Dockerfile
 
-Build from the source already in this repository, not by re-fetching a tarball from
-GitHub by commit hash inside the Dockerfile. Pinning a commit hash in an `ARG` is a
-legitimate pattern for building a standalone image *outside* a clone of this repo —
-it does give a reproducible, inspectable record of what's running. It's the wrong
-choice here specifically because the Dockerfile already lives inside the checkout
-it would be re-fetching: the pinned hash has to be bumped by hand for every release
-and can silently drift from the actual `HEAD` you're building at, and the fetch adds
-a build-time dependency on GitHub being reachable for no benefit over `COPY src
-./src`, which can't drift because it *is* the checkout.
+Save this as `Dockerfile` at the root of a clone of this repository and build from that
+checkout. `COPY src ./src` builds the tree you have checked out, so there is no commit hash
+to bump per release and no fetch from GitHub during the build.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-# Keep this pinned to the same version as rust-toolchain.toml and the CI image tag
-# in .gitlab-ci.yml. All three must move together — see rust-toolchain.toml's comment.
-FROM rust:1.96-slim-bookworm AS builder
+# Use the Rust version pinned in rust-toolchain.toml.
+FROM rust:1.98-slim-bookworm AS builder
 
 WORKDIR /build
 
 # --- Dependency layer ---
 # Copy only the manifest and build script first, so this layer (and its cargo
-# registry download) is cached across builds and only invalidates when
-# Cargo.toml/Cargo.lock actually change — not on every source edit.
+# registry download) is cached across builds and rebuilds only when
+# Cargo.toml or Cargo.lock change, not on every source edit.
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs && \
@@ -73,8 +62,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release
 
 # --- Source layer ---
-# Now bring in the real source and rebuild. The `touch` guards against cargo's
-# mtime-based fingerprinting deciding the dummy main.rs build above is still current.
+# Bring in the real source and rebuild. The `touch` stops cargo's mtime-based
+# fingerprinting from treating the dummy main.rs build above as current.
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
@@ -84,72 +73,73 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     strip /build/s3-proxy
 
 # --- Runtime ---
-# distroless/cc: glibc + libgcc, no shell, no package manager. Matches the systemd
-# unit's hardening posture (NoNewPrivileges, ProtectSystem=strict, etc. — see
-# config/s3-proxy.service) by removing everything an attacker could use if they
-# gained code execution inside the container. Debian release must be >= the
-# builder's (bookworm/12) per the Binary Portability glibc rule; debian12 pins an
-# exact match so there's no ambiguity about which glibc the binary links against.
+# distroless/cc holds glibc and libgcc, with no shell and no package manager, in
+# line with the systemd unit's hardening (NoNewPrivileges, ProtectSystem=strict;
+# see config/s3-proxy.service). The Debian release must be the builder's
+# (bookworm, 12) or newer, per the glibc rule in Binary Portability; debian12
+# matches it exactly.
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /build/s3-proxy /usr/bin/s3-proxy
 
-# The full set of ports the proxy can bind; trim this list to the ones your
-# config.yaml actually enables. See server.mode in config.example.yaml — standard
-# mode uses 80/443, proxy_only uses proxy_port (default 3128) instead. EXPOSE is
-# documentation only; it does not publish anything (that's -p at run time).
+# Every port the proxy can bind; trim the list to the ones your config.yaml
+# enables. Standard mode uses 80 and 443, proxy_only mode uses proxy_port
+# (default 3128) instead, and the TLS proxy listener uses 3129 in either mode.
+# EXPOSE only documents ports; publishing them is -p at run time.
 EXPOSE 80 443 3128 3129 8080 8081 9090
 
 ENTRYPOINT ["/usr/bin/s3-proxy"]
 CMD ["-c", "/etc/s3-proxy/config.yaml"]
 ```
 
-Notable differences from a naive Dockerfile:
+How this Dockerfile differs from a typical one:
 
-- **`COPY src ./src`, not a GitHub tarball fetch.** The image is built from exactly
-  the checked-out commit. `docker build` in CI or a release script has the same
-  provenance as any other artifact you ship.
-- **No `apt-get install libssl-dev pkg-config`.** This crate doesn't link OpenSSL
-  (see [Why the Binary Fits a Container](#why-the-binary-fits-a-container)). Adding
-  those packages is dead weight that also doesn't help — a common copy-paste from
-  Dockerfiles for openssl-linked Rust crates that doesn't apply here.
-- **`nonroot` distroless variant.** Runs as a non-root UID by default. This matters
-  for ports 80/443 — see [Privilege Model](#privilege-model-ports-80443-vs-proxy_only).
-- **`--bin s3-proxy` is implicit.** `cargo build --release` with no `--examples`
-  flag builds the lib + the one binary, not the six files under `examples/`. No
-  need to exclude them explicitly.
+- **`COPY src ./src`, not a GitHub tarball fetch.** The image has the same provenance as any
+  other artifact you build from the checkout, in CI or in a release script.
+- **No `apt-get install libssl-dev pkg-config`.** Dockerfiles for OpenSSL-linked Rust crates
+  often carry these packages; this build does not use them (see
+  [Why the binary fits a container](#why-the-binary-fits-a-container)).
+- **The `nonroot` distroless variant.** It runs as a non-root UID, which cannot bind ports 80
+  and 443 without extra steps; see
+  [Privilege model](#privilege-model-ports-80-and-443-or-proxy_only).
+- **No `--bin s3-proxy` flag.** `cargo build --release` without `--examples` builds the library
+  and the one binary, not the files under `examples/`.
+- **Base images named by tag.** A tag such as `nonroot` or `bookworm-slim` moves as its
+  publisher ships updates, so two builds can get different layers. For a reproducible build,
+  pin each `FROM` to a digest (`FROM gcr.io/distroless/cc-debian12:nonroot@sha256:<digest>`)
+  and update the digest deliberately.
 
-### Base Image Choice
+### Base image choice
 
 | | distroless/cc (recommended) | debian:bookworm-slim | scratch |
 |---|---|---|---|
-| Shell/package manager | None | Full (apt, bash, coreutils) | None |
-| Attack surface if the proxy is compromised | Minimal — no tools to pivot with | Normal Debian userland available | Minimal, but no CA certs, no glibc |
+| Shell and package manager | None | Full (apt, bash, coreutils) | None |
+| Attack surface if the proxy is compromised | Minimal: no tools to pivot with | The normal Debian userland | Minimal, but no CA certificates and no glibc |
 | `docker exec sh` for debugging | No | Yes | No |
-| Built-in Docker `HEALTHCHECK` | No (no executable to run) | Yes, if `curl`/`wget` installed | No |
-| CA certificates for upstream TLS | Bundled | Needs `ca-certificates` installed | Needs certs copied in manually |
+| Built-in Docker `HEALTHCHECK` | No (no executable to run) | Yes, with `curl` or `wget` installed | No |
+| CA certificates for upstream TLS | Bundled | Needs `ca-certificates` installed | Copy them in yourself |
 
-`scratch` needs the CA bundle and any glibc dependency handled manually (or requires
-a static musl build, which this project doesn't produce) — more setup for no
-security gain over distroless/cc, since distroless already strips the shell and
-package manager. Use `debian:bookworm-slim` only if you specifically want an
-in-container `HEALTHCHECK` or interactive debugging and are willing to trade the
-smaller attack surface for it.
+`scratch` needs the CA bundle and glibc handled by hand, or a static musl build, which this
+project does not produce. That is more setup than distroless/cc for no security gain, since
+distroless already leaves out the shell and package manager. Choose `debian:bookworm-slim` only
+when you want an in-container `HEALTHCHECK` or interactive debugging and accept the larger
+attack surface for it.
 
-### Healthcheck Tradeoff
+### Health check trade-off
 
-A distroless runtime has no shell and no `curl`/`wget`, so a Docker `HEALTHCHECK
-CMD curl ...` instruction cannot run — there's no binary to execute. This is a real
-tradeoff, not an oversight: decide before copying a Dockerfile that includes one.
+A distroless runtime has no shell and no `curl` or `wget`, so a Docker
+`HEALTHCHECK CMD curl ...` instruction has nothing to execute. Decide which approach you want
+before copying a Dockerfile that includes one.
 
-- **Recommended**: skip the in-image `HEALTHCHECK` and let your orchestrator probe
-  `:8080/health` over the network instead — a Kubernetes `livenessProbe`/
-  `readinessProbe` with `httpGet`, an ECS/ALB target group health check, or an
-  external monitor. None of these need an executable inside the container; they
-  just make an HTTP request to the exposed port.
-- **If you need `docker compose`'s built-in `healthcheck:`** (which only supports
-  in-container commands), switch the runtime stage to `debian:bookworm-slim` and
-  install `curl`:
+- **Recommended:** leave `HEALTHCHECK` out of the image and let your orchestrator probe
+  `:8080/health` over the network: a Kubernetes `livenessProbe` or `readinessProbe` with
+  `httpGet`, an Amazon ECS or load balancer target group health check, or an external monitor.
+  None of these needs an executable inside the container. Each makes an HTTP request to the
+  published port, which needs `health.bind_address: "0.0.0.0"` (see
+  [Bind addresses](#bind-addresses-loopback-defaults-in-a-container)).
+- **For the `healthcheck:` key in `docker compose`**, which runs only in-container commands,
+  switch the runtime stage to `debian:bookworm-slim` and install `curl`:
+
   ```dockerfile
   FROM debian:bookworm-slim
   RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
@@ -160,43 +150,42 @@ tradeoff, not an oversight: decide before copying a Dockerfile that includes one
   ENTRYPOINT ["/usr/bin/s3-proxy"]
   CMD ["-c", "/etc/s3-proxy/config.yaml"]
   ```
-  This gives up the shell-free hardening for operability. Reasonable if you're
-  running plain `docker compose` without an external health-checking layer.
+
+  This gives up the shell-free image for an in-container check, which suits plain
+  `docker compose` with no external health checking.
 
 ## Building
 
 ```bash
-docker build -t s3-hybrid-cache:2.4.2 .
+docker build -t s3-hybrid-cache:<version> .  # <version> from Cargo.toml
 ```
 
-Tag with the version from `Cargo.toml` rather than `latest`, so a running container
-maps back to a specific `s3-proxy --version` output — the same discipline
-[Upgrading](GETTING_STARTED.md#upgrading) recommends for bare-binary deploys.
+Tag with the version from `Cargo.toml` rather than `latest`, so each running container maps to
+one `s3-proxy --version` output.
 
-## Configuration in a Container
+## Configuration in a container
 
-### Config File vs Environment Variables
+### Configuration file or environment variables
 
-The proxy loads config in three layers — YAML file, environment variable overrides,
-then CLI flags — see `config.rs` and [Configuration Reference](CONFIGURATION.md).
-Two ways to configure a container, and they compose:
+The proxy reads its configuration in three layers: the YAML file, then environment variable
+overrides, then command-line flags; see the [Configuration reference](CONFIGURATION.md). A
+container can use both of the first two.
 
-**Mount a config file** (recommended for anything beyond the simplest setup):
+**Mount a configuration file** (recommended for anything beyond the simplest setup):
 
 ```bash
 docker run -v /host/path/config.yaml:/etc/s3-proxy/config.yaml:ro ...
 ```
 
-Keeping config outside the image means changing `cache_dir`, TTLs, or adding
-`cache_rules.json` never requires a rebuild — only a container restart. This extends
-the project's [upgrade contract](UPGRADING.md) (config stays backward-compatible at
-the field level, so no config edits are needed across versions) to the container
-boundary: the image is the binary, the config is data.
+With the configuration outside the image, changing `cache_dir` or a TTL takes a container
+restart, not a rebuild. A `cache_rules.json` in `cache_dir` needs neither: the proxy re-reads it
+on its own (see [Cache rules](CONFIGURATION.md#cache-rules)). Existing configuration keeps
+working across upgrades ([Upgrading](UPGRADING.md)), so the image can change while the mounted
+file stays the same.
 
-**Or override specific fields via environment variables.** The ones most useful in a
-container are below; for the complete 33-variable set, the units each one expects, and
-which fields have no override at all, see
-[Configuration — Environment Variable Reference](CONFIGURATION.md#environment-variable-reference).
+**Or override specific fields with environment variables.** The ones most useful in a container
+are below. For the complete set, the units each one expects and the fields with no override,
+see [Environment variable reference](CONFIGURATION.md#environment-variable-reference).
 
 | Variable | Overrides |
 |---|---|
@@ -206,152 +195,203 @@ which fields have no override at all, see
 | `LOG_LEVEL` | `logging.log_level` |
 | `HTTP_PORT` / `HTTPS_PORT` | `server.http_port` / `server.https_port` |
 | `MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` |
-| `RAM_CACHE_ENABLED` / `WRITE_CACHE_ENABLED` / `COMPRESSION_ENABLED` | corresponding booleans |
-| `DASHBOARD_ENABLED` / `DASHBOARD_PORT` / `DASHBOARD_BIND_ADDRESS` | dashboard settings |
+| `RAM_CACHE_ENABLED` / `WRITE_CACHE_ENABLED` / `COMPRESSION_ENABLED` | The matching booleans |
+| `DASHBOARD_ENABLED` / `DASHBOARD_PORT` / `DASHBOARD_BIND_ADDRESS` | Dashboard settings |
 | `OTLP_ENDPOINT` / `OTLP_EXPORT_INTERVAL` | OTLP metrics export (setting the endpoint also enables it) |
 
-Duration variables take a bare integer of seconds, not a duration string, and a value
-that fails to parse is silently ignored.
+Duration variables take a whole number of seconds, not a duration string, and a value that
+fails to parse is ignored without a message.
 
-There is no `S3_PROXY_`-prefixed family of variables — every name above is used
-as-is. `RUST_LOG` is also honored, but separately: it overrides `logging.log_level`
-at the `tracing` subscriber level (see `logging.rs`), independent of the config
-system's own `LOG_LEVEL` override.
+The variable names have no prefix. `RUST_LOG`, when set, overrides `logging.log_level` (and
+`LOG_LEVEL`) for the application log.
 
-Environment variables are useful for orchestration-level per-instance overrides
-(e.g. a Kubernetes `env` block setting `CACHE_DIR` differently per pod) without
-templating multiple YAML files. For anything with more than a couple of fields to
-change, mount a full config file — it's easier to diff and version.
+Environment variables suit per-container overrides from the orchestrator, for example a
+Kubernetes `env` block that sets `CACHE_DIR` per pod, without templating several YAML files.
+When more than a couple of fields change, mount a full configuration file, which is easier to
+diff and version.
 
-## Cache Persistence
+## Cache persistence
 
-The proxy's entire value is a persistent cache. A cache directory that lives inside
-the container's writable layer is destroyed on every `docker rm`/recreate, and most
-orchestrators recreate containers routinely (rolling updates, node drains, restarts
-on crash) — so this isn't an edge case, it's the normal lifecycle. **Always mount
-`cache_dir` as a volume or bind mount**, never leave it as unmounted container
-storage:
+A `cache_dir` in the container's writable layer is lost on every `docker rm` or recreate,
+and most orchestrators recreate containers routinely (rolling updates, node drains, restarts
+after a crash). Mount `cache_dir` as a volume or a bind mount:
 
 ```bash
 docker run \
   -v s3-proxy-cache:/var/lib/s3-proxy/cache \
   -v s3-proxy-logs:/var/lib/s3-proxy/logs \
+  -v s3-proxy-state:/var/lib/s3-proxy/state \
   ...
 ```
 
-The `nonroot` distroless image runs as a fixed non-root UID (65532, aka `nonroot`).
-The cache and log storage must be writable by that UID, and how you achieve that
-depends on whether you're using a named volume or a host bind mount — these behave
-differently in practice, verified against finch's Lima-based VM:
+The third volume holds the proxy's host-local state, a small pending-stamp log. Set
+`logging.local_state_dir` to its path (`/var/lib/s3-proxy/state`), as the compose example's
+`config.yaml` does (see [Logging configuration](CONFIGURATION.md#logging-configuration)). The
+field's default, `/var/lib/s3-proxy`, is not writable by the image's user, so without the
+volume the proxy logs an ERROR at startup, reports `cache.write_stamp_log_memory_only` as `1`
+and holds write-order retries in memory only. Put this volume on the host's own disk, never on
+the cache volume.
 
-**Named volumes (recommended)**: chown from inside a throwaway container, then reuse
-the volume by name. The chown runs as root inside that container, so it needs no host
-privileges, and the resulting ownership is visible to the proxy container:
+The `nonroot` distroless image runs as the fixed non-root UID 65532 (`nonroot`). The cache, log
+and state storage must be writable by that UID. How to arrange that depends on whether you use
+a named volume or a host bind mount, which behave differently on VM-backed runtimes.
+
+**Named volumes (recommended):** change the ownership from inside a throwaway container, then
+reuse the volume by name. The `chown` runs as root inside that container, so it needs no host
+privileges, and the proxy container sees the new ownership:
 
 ```bash
-docker volume create s3-proxy-cache
-docker run --rm -v s3-proxy-cache:/mnt alpine chown -R 65532:65532 /mnt
+for v in s3-proxy-cache s3-proxy-logs s3-proxy-state; do
+  docker volume create "$v"
+  docker run --rm -v "$v":/mnt alpine chown -R 65532:65532 /mnt
+done
 ```
 
-**Host bind mounts**: on a Linux host with a native container runtime, a host-side
-`sudo chown -R 65532:65532 /host/cache` maps straight through as you'd expect. On
-**VM-backed runtimes on macOS** (Finch/Lima, Docker Desktop) it does not reliably do
-so — the directory can appear owned by `root` inside the container regardless of the
-host-side ownership, because the file sharing layer between host and VM does its own
-UID mapping. The proxy then fails to start with
-`ConfigError("Failed to create cache subdirectory 'metadata': Permission denied")`.
-If you bind-mount (e.g. to inspect cache contents from the host), check the ownership
-the *container* sees rather than trusting the host-side chown:
+**Host bind mounts:** on a Linux host with a native container runtime, a host-side
+`sudo chown -R 65532:65532 /host/cache` takes effect inside the container. VM-backed runtimes
+on macOS (Finch with Lima, Docker Desktop) do not pass it through reliably: the directory can
+appear owned by `root` inside the container whatever its owner on the host, because the
+file-sharing layer between host and VM maps UIDs itself. The proxy then fails to start with a
+`Failed to create cache subdirectory` error reporting `Permission denied`. If you bind-mount,
+for example to inspect cache contents from the host, check the ownership the container sees:
 
 ```bash
 docker run --rm -v /host/cache:/mnt/cache alpine ls -la /mnt/cache
 ```
 
-The proxy also sets `umask(0o077)` on startup (owner-only file permissions — see
-`main.rs`), so files it creates inside the cache directory are readable only by the
-UID that created them. If you switch the container to run as root or a different
-UID, the volume ownership must match whichever UID the process actually runs as, or
-the proxy will fail to write to its own cache and log directories — the exact
-`ConfigError("Failed to create cache subdirectory ...: Permission denied")` message
-you'll see if it doesn't.
+The proxy sets `umask(0o077)` at startup, so the files it creates are readable only by the UID
+that created them. If you run the container as root or as another UID, the volume ownership
+must match that UID, or the proxy cannot write its cache and log directories and fails with the
+same error.
 
-## Privilege Model: Ports 80/443 vs proxy_only
+## Privilege model: ports 80 and 443 or proxy_only
 
-Binding a port below 1024 requires `CAP_NET_BIND_SERVICE` or root **for the process
-doing the bind**, which is the proxy inside the container. Publishing a port
-(`-p 80:3128`) does not change that, because the host-side forwarding and the
-container-side `bind()` are separate operations — the kernel checks the privilege on
-the latter. This is the containerised form of the systemd unit's
-[privilege tradeoff](GETTING_STARTED.md#privilege-tradeoff-userroot):
+Binding a port below 1024 needs root or `CAP_NET_BIND_SERVICE` in the process that binds it,
+which is the proxy inside the container. Publishing a port (`-p 80:3128`) does not change that:
+the host-side forwarding and the container-side `bind()` are separate operations, and the
+kernel checks the privilege on the `bind()`. This is the container form of the systemd unit's
+[privilege trade-off](GETTING_STARTED.md#privilege-tradeoff-userroot). The options, recommended
+first:
 
-- **Standard mode (ports 80/443)**: run the container as root (drop the `nonroot`
-  distroless tag or add `USER root` — this undoes part of the hardening in
-  [Base Image Choice](#base-image-choice)), or keep the non-root user and grant the
-  capability:
-  ```bash
-  docker run --cap-add=NET_BIND_SERVICE --user=65532:65532 ...
-  ```
-  Be aware that `--cap-add` puts the capability in the container's *permitted* set,
-  which a non-root process does not automatically get in its *effective* set — the
-  binary has no file capabilities set on it, so on many runtimes this combination
-  still fails to bind. Verify it in your environment instead of assuming, and use
-  one of the two options below if it doesn't work.
-- **Recommended for containers: `proxy_only` mode on port 3128.** No capability
-  juggling — 3128 is unprivileged, so the `nonroot` image works unmodified:
+- **`proxy_only` mode (recommended for containers).** Its listeners, the forward proxy on 3128
+  and the TLS proxy listener on 3129, use unprivileged ports, so the `nonroot` image works
+  unchanged:
+
   ```yaml
   server:
     mode: "proxy_only"
     proxy_port: 3128
   ```
-  This is also the path [Getting Started](GETTING_STARTED.md#proxy-only-mode-no-sudo-required)
-  recommends as the simplest deployment overall, independent of containers — it
-  composes cleanly here.
-- **Or publish an unprivileged container port on a privileged host port**: run the
-  proxy on 3128 inside the container and map it with `-p 80:3128`. The container-side
-  `bind()` is unprivileged; only the host-side publish uses port 80, and that's done
-  by the container runtime's own (already privileged) daemon rather than by the proxy.
-  This works with any server mode without touching capabilities — the simplest option
-  when you specifically need the *client-facing* port to be 80 or 443.
 
-## docker compose Example
+  [Proxy-only mode](GETTING_STARTED.md#proxy-only-mode-no-sudo-required) describes the same
+  mode for hosts without root.
+- **Standard mode on unprivileged container ports.** Set `server.http_port` and
+  `server.https_port` to unprivileged ports (for example `8000` and `8443`) and publish them on
+  the host's privileged ports with `-p 80:8000 -p 443:8443`. Only the host-side publish uses
+  ports 80 and 443, and the container runtime's own privileged daemon performs it, so no
+  capability is needed. Use this when clients must reach the proxy on port 80, as in the DNS
+  alternative in [TLS proxy listener in a container](#tls-proxy-listener-in-a-container).
+- **Standard mode on ports 80 and 443 inside the container.** Run the container as root (drop
+  the `nonroot` tag or add `USER root`, which undoes part of the hardening in
+  [Base image choice](#base-image-choice)), or keep the non-root user and grant the capability:
 
-Using `proxy_only` mode (recommended default above) with a mounted config and
-persistent volumes:
+  ```bash
+  docker run --cap-add=NET_BIND_SERVICE --user=65532:65532 ...
+  ```
+
+  `--cap-add` puts the capability in the container's permitted set, and a non-root process does
+  not get it in its effective set automatically. The binary carries no file capabilities, so on
+  many runtimes this combination still fails to bind. Test it in your environment, and use one
+  of the options above if it fails.
+
+## TLS proxy listener in a container
+
+Point clients at the TLS proxy listener: set `HTTP_PROXY=https://<proxy-host>:3129` and
+`--endpoint-url http://s3.<region>.amazonaws.com`. The client hop is encrypted and responses
+are still cached, on-premises and across Regions. Where the network segment between clients and
+proxies is secure and cleartext on it is acceptable, a DNS zone that resolves S3's hostnames to
+the proxies is a simpler alternative: clients need no proxy setting and connect on port 80.
+[Configure client routing](GETTING_STARTED.md#3-configure-client-routing) compares the options.
+
+The listener is the `server.tls` block. Its port, 3129 by default, is unprivileged, so the
+listener runs in the `nonroot` image in either server mode. Mount the certificate and key
+read-only beside the configuration file, and point `cert_path` and `key_path` at them:
+
+```bash
+docker run \
+  -v /host/tls/cert.pem:/etc/s3-proxy/tls/cert.pem:ro \
+  -v /host/tls/key.pem:/etc/s3-proxy/tls/key.pem:ro \
+  -p 3129:3129 \
+  ...
+```
+
+```yaml
+server:
+  tls:
+    enabled: true
+    tls_proxy_port: 3129
+    cert_path: "/etc/s3-proxy/tls/cert.pem"
+    key_path: "/etc/s3-proxy/tls/key.pem"
+```
+
+The key must be readable by UID 65532. Mount the certificate and key at run time rather than
+copying them into the image: a `COPY` puts the private key in every layer of every tag you push,
+including in any registry.
+
+Only the AWS CRT transfer client verifies the proxy's certificate; botocore-based clients
+(`aws s3api`, `aws s3` with the classic transfer client, boto3) encrypt the hop without
+verifying it. See [Configuring clients to trust the certificate](GETTING_STARTED.md#configuring-clients-to-trust-the-certificate),
+and [TLS proxy listener configuration](GETTING_STARTED.md#tls-proxy-listener-configuration) for
+creating the certificate.
+
+## docker compose example
+
+`proxy_only` mode with the TLS proxy listener, a mounted configuration file and persistent
+volumes:
 
 ```yaml
 services:
   s3-proxy:
-    image: s3-hybrid-cache:2.4.2
+    image: s3-hybrid-cache:<version>
     build: .
     restart: unless-stopped
     ports:
-      - "3128:3128"             # proxy_port — the S3 traffic path
-      - "8080:8080"             # health (binds 0.0.0.0 by default)
-      - "9090:9090"             # metrics (binds 0.0.0.0 by default)
-      - "127.0.0.1:8081:8081"   # dashboard — host loopback only; see note below
+      - "3129:3129"             # TLS proxy listener: the client path
+      - "8080:8080"             # health (config.yaml below opens it to 0.0.0.0)
+      - "9090:9090"             # metrics (config.yaml below opens it to 0.0.0.0)
+      - "127.0.0.1:8081:8081"   # dashboard: host loopback only; see Bind addresses
     volumes:
       - ./config.yaml:/etc/s3-proxy/config.yaml:ro
+      - ./tls:/etc/s3-proxy/tls:ro
       - s3-proxy-cache:/var/lib/s3-proxy/cache
       - s3-proxy-logs:/var/lib/s3-proxy/logs
+      - s3-proxy-state:/var/lib/s3-proxy/state
     environment:
       - LOG_LEVEL=info
-      # Required for the dashboard to be reachable outside the container at all —
-      # its code default is 127.0.0.1, which in a container means container-only.
-      # Paired with the loopback-only host publish above so it is not world-reachable.
-      # See "Bind Addresses" below.
+      # The dashboard defaults to 127.0.0.1, which in a container is reachable only
+      # from inside it. The loopback-only host publish above keeps it off other hosts.
       - DASHBOARD_BIND_ADDRESS=0.0.0.0
 
 volumes:
   s3-proxy-cache:
   s3-proxy-logs:
+  s3-proxy-state:
 ```
 
-Matching `config.yaml`:
+Change the ownership of all three volumes to UID 65532 first, as in
+[Cache persistence](#cache-persistence).
+
+The matching `config.yaml`:
 
 ```yaml
 server:
   mode: "proxy_only"
   proxy_port: 3128
+  tls:
+    enabled: true
+    tls_proxy_port: 3129
+    cert_path: "/etc/s3-proxy/tls/cert.pem"
+    key_path: "/etc/s3-proxy/tls/key.pem"
 
 cache:
   cache_dir: "/var/lib/s3-proxy/cache"
@@ -360,84 +400,91 @@ cache:
 logging:
   access_log_dir: "/var/lib/s3-proxy/logs/access"
   app_log_dir: "/var/lib/s3-proxy/logs/app"
+  local_state_dir: "/var/lib/s3-proxy/state"  # the host-local state volume, not the cache
+
+# Both default to 127.0.0.1, which inside a container is unreachable through -p.
+health:
+  bind_address: "0.0.0.0"
+metrics:
+  bind_address: "0.0.0.0"
 ```
 
-Client side, same as any `proxy_only` deployment — see
-[Option A: HTTP_PROXY](GETTING_STARTED.md#option-a-http_proxy-single-instance--no-dns-changes):
+On the client:
 
 ```bash
-export HTTP_PROXY=http://<docker-host>:3128
-aws s3 cp s3://your-bucket/key ./local \
-  --endpoint-url http://s3.us-east-1.amazonaws.com \
-  --region us-east-1
+export HTTP_PROXY=https://<proxy-host>:3129
+aws s3 cp s3://<bucket>/<key> ./local \
+  --endpoint-url http://s3.<region>.amazonaws.com \
+  --region <region>
 ```
 
-For standard mode (80/443) instead of `proxy_only`, see
-[Privilege Model](#privilege-model-ports-80443-vs-proxy_only). For why the dashboard
-needs `DASHBOARD_BIND_ADDRESS` when nothing else does, see
-[Bind Addresses](#bind-addresses-loopback-defaults-are-a-container-trap).
+The forward proxy on 3128 is the cleartext form of the same client setting
+(`HTTP_PROXY=http://<proxy-host>:3128`). Publish `3128:3128` for it only where the network
+segment condition above holds.
 
-## Bind Addresses: Loopback Defaults Are a Container Trap
+## Bind addresses: loopback defaults in a container
 
-A service bound to `127.0.0.1` inside a container is reachable only from *within that
-container* — the container has its own loopback interface, so `-p 8081:8081` publishes
-a port that nothing is listening on from the host's perspective. On a bare host a
-loopback bind is a mild inconvenience (SSH-tunnel to reach it); in a container it
-looks like the feature is broken.
+A listener bound to `127.0.0.1` inside a container is reachable only from inside that container,
+which has its own loopback interface. `-p 8081:8081` then publishes a port that nothing listens
+on from the host's side. On a host, a loopback bind means reaching the listener through an SSH
+tunnel; in a container, the listener looks broken.
 
-The defaults differ per service, so check before publishing:
+The three monitoring listeners (health, metrics and dashboard) default to loopback, because none
+of them requires authentication:
 
-| Service | Port | Default `bind_address` | Reachable via `-p` out of the box? |
+| Listener | Port | Default `bind_address` | Reachable through `-p` without a change |
 |---|---|---|---|
-| Health | 8080 | `0.0.0.0` | Yes |
-| Metrics | 9090 | `0.0.0.0` | Yes |
-| Dashboard | 8081 | **`127.0.0.1`** | **No** — must be overridden |
+| Health | 8080 | `127.0.0.1` | No |
+| Metrics | 9090 | `127.0.0.1` | No |
+| Dashboard | 8081 | `127.0.0.1` | No |
 
-The dashboard's loopback default is deliberate (it is unauthenticated and read-only —
-see the `dashboard` section of
-[`config/config.example.yaml`](../config/config.example.yaml)). To reach it from
-outside the container, set it explicitly:
+A Kubernetes `httpGet` probe, an Amazon ECS or load balancer health check, and a Prometheus
+scrape all connect to the container's own address, so each fails against a loopback bind. To
+reach a listener from outside the container, set its address:
 
 ```yaml
+health:
+  bind_address: "0.0.0.0"
+metrics:
+  bind_address: "0.0.0.0"
 dashboard:
   bind_address: "0.0.0.0"
 ```
 
-or via the environment override, which is often cleaner in a compose file:
+The dashboard also has an environment variable, often the cleaner choice in a compose file.
+Health and metrics have none, so set them in `config.yaml`:
 
 ```yaml
 environment:
   - DASHBOARD_BIND_ADDRESS=0.0.0.0
 ```
 
-**Overriding this makes an unauthenticated dashboard reachable from anywhere the
-published port is reachable.** Publish it only on an interface you control — bind the
-host side to loopback (`-p 127.0.0.1:8081:8081`) and tunnel in, or restrict it with
-security groups or firewall rules. Do not expose it to the internet.
+With its address changed, the dashboard is reachable without authentication from anywhere the
+published port is reachable. Publish it only on an interface you control: bind the host side to
+loopback (`-p 127.0.0.1:8081:8081`) and tunnel in, or restrict the port with security groups or
+firewall rules. Keep it off the internet.
 
-Note that `config/config.example.yaml` ships `dashboard.bind_address: "0.0.0.0"`
-explicitly, so a config copied from that file already has this set; a minimal
-hand-written config that omits the `dashboard` section falls back to the `127.0.0.1`
-code default.
+`config/config.example.yaml` sets `bind_address: "0.0.0.0"` in all three sections, so a
+configuration copied from it already has them. A minimal configuration that omits them gets the
+`127.0.0.1` default.
 
-## Multi-Instance / Shared Cache
+## Fleets sharing a cache volume
 
-Running more than one proxy container against a shared cache follows the same rules
-as bare-metal multi-instance deployments — see
-[High Availability: Shared NFS Cache Pattern](GETTING_STARTED.md#high-availability-shared-nfs-cache-pattern).
-The container adds two constraints worth getting right: the shared volume must be
-mounted with `lookupcache=pos`, and it must enforce advisory file locks between hosts.
-Both are correctness requirements for cache coordination, not performance tweaks — see
-[NFS Mount Requirements](CONFIGURATION.md#nfs-mount-requirements).
+A fleet of proxy containers on one cache volume follows the same rules as a fleet on hosts;
+[Running a fleet on one cache volume](SHARED_STORAGE.md) explains them. Two of them depend on how the container gets
+its mount: the cache volume must be mounted with `lookupcache=pos`, and it must enforce advisory
+file locks between hosts. Both are required for the proxies to coordinate correctly; see
+[NFS mount requirements](CONFIGURATION.md#nfs-mount-requirements).
 
-Two ways to satisfy them:
+There are two ways to meet them:
 
-- **Mount on the host, bind-mount into the container.** The host owns the NFS mount
-  (with `lookupcache=pos` in `/etc/fstab` or the `mount` command), and each container
-  bind-mounts the already-mounted path. Simplest to verify, since `mount | grep nfs`
-  on the host shows exactly what options are in effect.
-- **Pass the options to the volume driver.** Docker's built-in `local` driver accepts
-  NFS options directly, so the mount happens per-volume rather than on the host:
+- **Mount on the host and bind-mount into the container.** The host owns the NFS mount, with
+  `lookupcache=pos` in `/etc/fstab` or on the `mount` command, and each container bind-mounts
+  the mounted path. This is the easiest to verify, since `mount | grep nfs` on the host shows the
+  options in effect.
+- **Pass the options to the volume driver.** Docker's built-in `local` driver accepts NFS
+  options, so each volume mounts itself:
+
   ```bash
   docker volume create --driver local \
     --opt type=nfs \
@@ -445,128 +492,93 @@ Two ways to satisfy them:
     --opt device=:/export/s3-proxy-cache \
     s3-proxy-cache
   ```
-  Confirm the options actually landed (`docker volume inspect`, then check the mount
-  inside a running container) rather than assuming — a silently-dropped
-  `lookupcache=pos` degrades coordination correctness without any error. Never add
-  `nolock` or `local_lock` to the option string; either makes advisory locks
-  host-local, which lets every container hold the same coordination lock at once.
 
-Locking is the constraint containers are most likely to get wrong, because a
-container that shares the host's network and mount namespace still relies on the host
-having a working NFS lock path. Verify it across two containers on **different hosts**,
-not two on the same host — same-host containers can appear to lock correctly even when
-the mount is not enforcing locks between hosts:
+  Confirm the options took effect (`docker volume inspect`, then check the mount inside a
+  running container). A dropped `lookupcache=pos` is logged once at startup, naming the mount, and the proxy still
+  starts while the proxies no longer coordinate correctly. Leave `nolock` and `local_lock` out of the option string: either makes
+  advisory locks local to one host, so every container can hold the same coordination lock at
+  once.
 
-```bash
-# Container on host A - hold an exclusive lock for 30 seconds
-docker exec <container-a> flock -x /cache/.locktest -c 'sleep 30'
-
-# Container on host B, while A still holds it - must fail
-docker exec <container-b> flock -n -x /cache/.locktest -c true && echo BROKEN || echo OK
-```
-
-`BROKEN` means the volume is unsafe for multi-instance use. This also requires
-`flock(1)` in the image; if it is absent, run the same check from the hosts against
-the underlying mount path.
-
-## TLS Proxy Listener in a Container
-
-If you terminate TLS at the proxy itself (see
-[TLS Proxy Listener Configuration](GETTING_STARTED.md#tls-proxy-listener-configuration)),
-mount the certificate and key read-only alongside the config:
+Locking is the requirement containers most often get wrong, because a container that shares the
+host's network and mount namespace still depends on the host having a working NFS lock path.
+Test it from two containers on different hosts. Two containers on the same host can appear to
+lock correctly even when the mount does not enforce locks between hosts:
 
 ```bash
-docker run \
-  -v /host/tls/cert.pem:/etc/proxy/tls/cert.pem:ro \
-  -v /host/tls/key.pem:/etc/proxy/tls/key.pem:ro \
-  -p 3129:3129 \
-  ...
+docker exec <container-a> flock -x /cache/.locktest -c 'sleep 30'  # On host A: hold an exclusive lock for 30 seconds
+docker exec <container-b> flock -n -x /cache/.locktest -c true && echo BROKEN || echo OK  # On host B, while A holds it: must print OK
 ```
 
-Do not `COPY` certificates into the image — that bakes a private key into every
-layer of every tag you push, including to any registry. Mount them at runtime.
+`BROKEN` means the volume is unsafe for a fleet. The check needs `flock(1)` in the image. The
+distroless image has none, so run the same check from the hosts against the mounted path.
+
+### Each container needs its own hostname
+
+Proxies sharing a cache volume must have distinct hostnames; see
+[Each proxy needs its own hostname](SHARED_STORAGE.md#each-proxy-needs-its-own-hostname) for
+why. Docker gives each container its own hostname by default, so the common case needs nothing.
+Two deployment choices break it:
+
+- **A fixed `--hostname` (or `hostname:` in compose) repeated across replicas.** Set it per
+  replica, or leave it unset and let Docker assign one.
+- **`network_mode: host` on machines cloned from one image.** The container takes the host's
+  hostname, and cloned hosts often share one. Set distinct host names before deploying.
+
+Check it from the running containers:
+
+```bash
+docker exec <container-a> cat /etc/hostname
+docker exec <container-b> cat /etc/hostname
+```
+
+Two identical values on different proxies are the problem. Each proxy also reports it:
+`cache.hostname_collisions_total` on `/metrics` rises above zero, and one ERROR names both
+identities. When two containers share a hostname and both run the proxy as process 1, they hold
+one whole identity, and each also stops write-caching, counted as `hostname_not_unique` in
+`signed_put.skipped_puts_total`; see
+[Each proxy needs its own hostname](SHARED_STORAGE.md#each-proxy-needs-its-own-hostname).
 
 ## Upgrading
 
-Same flow as [Upgrading](GETTING_STARTED.md#upgrading), translated to containers:
-rebuild the image from the new source, then recreate the container. The cache
-volume is preserved across the recreate (it's not part of the container's
-writable layer), so there's no cold-start cost:
+Upgrading replaces the binary and restarts the proxy; existing configuration keeps working.
+Before upgrading a fleet to 3.0.0, read [Upgrading to 3.0.0](UPGRADING.md#upgrading-to-300).
+
+In a container, rebuild the image from the new source and recreate the container. The cache
+volume is not part of the container's writable layer, so its contents survive the recreate:
 
 ```bash
 docker build -t s3-hybrid-cache:<new-version> .
 docker compose up -d  # recreates the container, keeps the named volumes
 ```
 
-Confirm which binary you actually got. Both of these work against a distroless image
-because they exec the proxy binary directly rather than going through a shell:
+Confirm which binary you got. Both commands work against a distroless image, because they run
+the proxy binary directly rather than through a shell:
 
 ```bash
 docker run --rm --entrypoint /usr/bin/s3-proxy s3-hybrid-cache:<new-version> --version
 docker logs <container> | grep Starting  # the proxy logs its version on startup
 ```
 
-The startup log line is the more useful of the two, because it reports the version of
-the binary in the *running* container rather than of an image tag.
+The startup log line is the more useful of the two: it reports the version of the binary in the
+running container rather than of an image tag.
 
-Config compatibility rules are unchanged: an existing mounted `config.yaml` keeps
-parsing across versions (see [Upgrading](GETTING_STARTED.md#upgrading) and
-[UPGRADING.md](UPGRADING.md) for release-specific defaults). Check
-[UPGRADING.md](UPGRADING.md) for any manual step or default change between your
-running version and the target before recreating.
+## Kubernetes notes
 
-## Kubernetes Notes
+The container patterns above carry over to Kubernetes, with these points:
 
-The container patterns above translate directly, with a few Kubernetes-specific
-points:
-
-- **`livenessProbe`/`readinessProbe`** should use `httpGet` against `:8080/health`
-  rather than an `exec` probe — the distroless runtime has no shell for `exec`
-  probes to run in. This is the same reasoning as
-  [Healthcheck Tradeoff](#healthcheck-tradeoff).
-- **`securityContext.runAsNonRoot: true`** works out of the box with the
-  `nonroot` distroless tag. Pair with `proxy_only` mode (see
-  [Privilege Model](#privilege-model-ports-80443-vs-proxy_only)) to avoid needing
-  `NET_BIND_SERVICE` at all.
-- **Cache volume**: use a `PersistentVolumeClaim` backed by a filesystem that
-  supports both the `lookupcache=pos`-equivalent consistency guarantee and cross-host
-  advisory locking, for multi-replica deployments sharing one cache — see
-  [Multi-Instance / Shared Cache](#multi-instance--shared-cache). A `ReadWriteMany`
-  PVC on EFS or an NFS-backed storage class both work; verify the mount options the
-  storage class actually applies, since `mountOptions` on a `StorageClass` are the
-  only place `nolock` or `local_lock` would creep in, and run the two-host lock check
-  above between replicas scheduled on different nodes.
-- **ConfigMap for `config.yaml`**, mounted as a volume — equivalent to the bind
-  mount shown in [docker compose Example](#docker-compose-example). Changing the
-  ConfigMap and rolling the pods is the container-native version of "edit config,
-  restart" from [Upgrading](GETTING_STARTED.md#upgrading).
-
-## Verified
-
-The [Dockerfile](#dockerfile) above was built and run end-to-end against this
-repository's source at 2.4.2, using Finch v1.17.2 on macOS/arm64.
-
-What was confirmed:
-
-- The two-stage build completes, with the dependency layer and source layer caching
-  as described.
-- The resulting image reports `s3-proxy 2.4.2`, matching `Cargo.toml`.
-- It runs as UID 65532, from the `nonroot` distroless base.
-- A container in `proxy_only` mode with named-volume cache and log storage starts
-  cleanly, initialises the cache, and answers `GET /health` with `200` and
-  `"status": "Healthy"`.
-- Image size ~58 MB (arm64).
-
-The [bind-mount ownership caveat](#cache-persistence) was found during this run, not
-reasoned about in advance: the first attempt used host bind mounts and failed with
-`ConfigError("Failed to create cache subdirectory 'metadata': Permission denied")`
-despite a host-side `chown` to 65532. Named volumes fixed it.
-
-Not yet verified, so treat with more caution than the above: the
-`debian:bookworm-slim` runtime variant with `HEALTHCHECK`, the `--cap-add` route for
-binding 80/443 as a non-root user, the NFS volume-driver options under
-[Multi-Instance / Shared Cache](#multi-instance--shared-cache), and the Kubernetes
-manifests, none of which were exercised. The bind-address behaviour in
-[Bind Addresses](#bind-addresses-loopback-defaults-are-a-container-trap) is read from
-the defaults in `src/config.rs`; only the health endpoint (`0.0.0.0`) was confirmed
-reachable in a live container.
+- **`livenessProbe` and `readinessProbe`** should use `httpGet` against `:8080/health`, not an
+  `exec` probe, because the distroless runtime has no shell for an `exec` probe (see
+  [Health check trade-off](#health-check-trade-off)). The kubelet probes the pod IP, so set
+  `health.bind_address: "0.0.0.0"`; with the loopback default every probe fails.
+- **`securityContext.runAsNonRoot: true`** works with the `nonroot` distroless tag. Pair it with
+  `proxy_only` mode (see [Privilege model](#privilege-model-ports-80-and-443-or-proxy_only)) so
+  the pod needs no `NET_BIND_SERVICE`.
+- **Cache volume:** for a fleet sharing one cache, use a `PersistentVolumeClaim` on a file system
+  that gives the consistency `lookupcache=pos` gives and enforces advisory locks across hosts; see
+  [Fleets sharing a cache volume](#fleets-sharing-a-cache-volume). A `ReadWriteMany` claim on
+  Amazon EFS or on an NFS-backed storage class works. Check the mount options the storage class
+  applies, since `mountOptions` on a `StorageClass` is where `nolock` or `local_lock` would
+  appear, and run the two-host lock check between replicas on different nodes.
+- **A ConfigMap for `config.yaml`**, mounted as a volume, takes the place of the bind mount in
+  the [docker compose example](#docker-compose-example). Changing the ConfigMap and rolling the
+  pods is the Kubernetes form of editing the configuration file and restarting the proxy.

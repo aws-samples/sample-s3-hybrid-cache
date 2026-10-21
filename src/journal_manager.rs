@@ -13,6 +13,176 @@ use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+/// Red-side lever (a): restore the whole-file read-modify-write append (read the
+/// journal, write `.journal.tmp`, rename over it).
+#[cfg(test)]
+const RMW_APPEND_LEVER: bool = false;
+
+/// Red-side lever (b): skip the torn-tail newline guard in the `O_APPEND` path.
+#[cfg(test)]
+const SKIP_TORN_TAIL_GUARD_LEVER: bool = false;
+
+/// How many times [`lock_journal_lock_file`] reopens a lock file that was unlinked between
+/// its open and its lock before giving up.
+const JOURNAL_LOCK_REOPEN_ATTEMPTS: usize = 4;
+
+/// True when `lock_path` still names the inode `file` was opened on.
+///
+/// A lock file can be unlinked by `cleanup_stale_lock_files` (only while that cleanup holds
+/// its flock) after another task opened it but before that task locked it. The late locker
+/// then holds a flock on a dead inode that no later opener can see, so it must detect the
+/// unlink and reopen.
+pub(crate) fn lock_file_still_named(file: &std::fs::File, lock_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), std::fs::metadata(lock_path)) {
+            (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, lock_path);
+        true
+    }
+}
+
+/// Open `lock_path` (creating it) and take its flock, returning the held file.
+///
+/// Every holder of a `.journal.lock` goes through here, so a lock file unlinked by the
+/// stale-lock cleanup cannot split mutual exclusion across two inodes: after the flock is
+/// granted, the path is re-checked to still name the locked inode, and a mismatch drops the
+/// lock and reopens.
+///
+/// `blocking = false` returns `Ok(None)` when another holder has the lock (or the lock
+/// call itself fails), which callers treat as busy. `blocking = true` waits. Either mode
+/// returns `Ok(None)` if the file kept being unlinked for every attempt. An open failure is
+/// `Err`.
+pub(crate) fn lock_journal_lock_file(
+    lock_path: &Path,
+    blocking: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    for _ in 0..JOURNAL_LOCK_REOPEN_ATTEMPTS {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        if blocking {
+            fs4::FileExt::lock(&file)?;
+        } else {
+            match fs4::FileExt::try_lock(&file) {
+                Ok(()) => {}
+                Err(fs4::TryLockError::WouldBlock) => return Ok(None),
+                Err(fs4::TryLockError::Error(e)) => {
+                    debug!(
+                        "Journal lock acquisition I/O error: path={:?}, error={}",
+                        lock_path, e
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        if lock_file_still_named(&file, lock_path) {
+            return Ok(Some(file));
+        }
+        debug!(
+            "Journal lock file was unlinked between open and lock, reopening: path={:?}",
+            lock_path
+        );
+    }
+    Ok(None)
+}
+
+/// Append newline-terminated `lines` to `{instance_id}.journal` in `journals_dir` under its
+/// `.journal.lock`, for a writer outside [`JournalManager`] (the cache-hit buffer flush).
+///
+/// The lock is tried `attempts` times, `retry_delay` apart. A [`JournalManager`] append holds
+/// it for one short write, so a brief retry nearly always lands on the primary journal; a
+/// consolidator cleanup holds it across a whole-journal read and rewrite, so when every
+/// attempt finds it busy the lines go to a uniquely named `{instance_id}:{nanos}.journal`
+/// instead, as [`JournalManager::append_range_entry`] does. Writing the primary without the
+/// lock would let cleanup's rename discard the lines it had not read.
+///
+/// With `sync`, the written file is `fdatasync`ed before the lock is released; a sync
+/// failure is logged and not returned, because the bytes are already readable.
+/// Returns the path the lines were written to.
+pub(crate) async fn append_lines_locked_or_fresh(
+    journals_dir: &Path,
+    instance_id: &str,
+    lines: &str,
+    attempts: usize,
+    retry_delay: std::time::Duration,
+    sync: bool,
+) -> std::io::Result<PathBuf> {
+    let primary = journals_dir.join(format!("{}.journal", instance_id));
+    let lock_path = primary.with_extension("journal.lock");
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            tokio::time::sleep(retry_delay).await;
+        }
+        let Some(_lock) = lock_journal_lock_file(&lock_path, false)? else {
+            continue;
+        };
+        JournalManager::append_lines_to_primary(&primary, lines).await?;
+        if sync {
+            sync_data_best_effort(&primary).await;
+        }
+        refresh_ready_record(journals_dir, instance_id);
+        return Ok(primary);
+    }
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let fresh = journals_dir.join(format!("{}:{}.journal", instance_id, nanos));
+    debug!(
+        "Journal lock busy after {} attempts, writing fresh journal: path={:?}",
+        attempts, fresh
+    );
+    tokio::fs::write(&fresh, lines).await?;
+    if sync {
+        sync_data_best_effort(&fresh).await;
+    }
+    refresh_ready_record(journals_dir, instance_id);
+    Ok(fresh)
+}
+
+/// After an append to a journal in `journals_dir` (`{cache_dir}/metadata/_journals`), keep
+/// `instance_id`'s `.ready` record current: see
+/// [`crate::staged_authority::refresh_ready_record_after_journal_append`]. Never waits.
+fn refresh_ready_record(journals_dir: &Path, instance_id: &str) {
+    if let Some(cache_dir) = journals_dir.parent().and_then(Path::parent) {
+        crate::staged_authority::refresh_ready_record_after_journal_append(cache_dir, instance_id);
+    }
+}
+
+async fn sync_data_best_effort(path: &Path) {
+    let result = match tokio::fs::File::open(path).await {
+        Ok(f) => f.sync_data().await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        error!(
+            "Failed to fdatasync journal file: path={:?}, error={} \
+             (bytes are in page cache and readable; sync is best-effort)",
+            path, e
+        );
+    }
+}
+
+/// The earlier append, kept only so lever (a) can show the inode guard going red.
+#[cfg(test)]
+async fn rmw_append_for_red_side(journal_path: &Path, lines: &str) -> std::io::Result<()> {
+    let temp_path = journal_path.with_extension("journal.tmp");
+    let existing = tokio::fs::read_to_string(journal_path)
+        .await
+        .unwrap_or_default();
+    tokio::fs::write(&temp_path, format!("{}{}", existing, lines)).await?;
+    tokio::fs::rename(&temp_path, journal_path).await
+}
+
 /// Journal entry for write-ahead logging of metadata operations
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JournalEntry {
@@ -36,6 +206,12 @@ pub struct JournalEntry {
     /// Contains response_headers needed for serving cached responses with correct headers
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<crate::cache_types::ObjectMetadata>,
+    /// A GET-miss range fill's version witness: the write-order marker token its key
+    /// held before the fill's S3 request (empty when none could be established). The
+    /// consolidator folds an `Add` carrying one only while the marker still holds it. Absent on
+    /// every other entry and on entries written by earlier versions, which fold as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_witness: Option<String>,
 }
 
 /// Types of journal operations
@@ -103,7 +279,10 @@ impl MultipartCleanupIntegration {
     }
 
     /// Clean up journal entries for a specific cache key during multipart upload cleanup
-    pub async fn cleanup_journal_entries_for_cache_key(&self, cache_key: &str) -> Result<u64> {
+    pub(crate) async fn cleanup_journal_entries_for_cache_key(
+        &self,
+        cache_key: &str,
+    ) -> Result<u64> {
         debug!(
             "Starting journal cleanup for multipart upload: cache_key={}",
             cache_key
@@ -185,94 +364,146 @@ impl MultipartCleanupIntegration {
         Ok(removed_count)
     }
 
-    /// Remove entries for a specific cache key from a journal file
+    /// Remove entries for a specific cache key from a journal file.
+    ///
+    /// Reachable only from [`JournalManager::cleanup_for_multipart`], which nothing in the
+    /// production request path calls; it is kept for the tests that drive it. It still obeys
+    /// the journal protocol: the read, filter and rewrite happen under the journal's
+    /// `.journal.lock` (blocking, off the runtime), and the rewrite is a temp file renamed
+    /// over the journal, so an append holding the lock is never overwritten and a crash
+    /// never leaves a half-written journal. Lines are kept verbatim, including ones this
+    /// build cannot parse.
     async fn remove_entries_from_journal_file(
         &self,
         journal_path: &Path,
         cache_key: &str,
     ) -> Result<u64> {
-        // Read existing entries
-        let existing_entries = if journal_path.exists() {
-            match tokio::fs::read_to_string(journal_path).await {
-                Ok(content) => {
-                    let mut entries = Vec::new();
-                    for line in content.lines() {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<JournalEntry>(line) {
-                            Ok(entry) => entries.push(entry),
-                            Err(e) => {
-                                // Parse errors can occur during concurrent writes on shared storage
-                                debug!(
-                                    "Failed to parse journal entry during cleanup: file={:?}, line={}, error={}",
-                                    journal_path, line, e
-                                );
-                            }
-                        }
-                    }
-                    entries
-                }
-                Err(e) => {
-                    // Stale file handle and other transient errors are expected on shared storage
-                    debug!(
-                        "Failed to read journal file during cleanup: file={:?}, error={}",
-                        journal_path, e
-                    );
-                    return Ok(0);
-                }
+        let path = journal_path.to_path_buf();
+        let key = cache_key.to_string();
+        tokio::task::spawn_blocking(move || Ok(remove_entries_under_lock(&path, &key)))
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("Journal rewrite task failed: {}", e)))?
+    }
+}
+
+/// The body of [`MultipartCleanupIntegration::remove_entries_from_journal_file`], run on a
+/// blocking thread while it holds the journal's flock. Returns the number of lines removed;
+/// every failure is logged and counts as zero, as before.
+fn remove_entries_under_lock(journal_path: &Path, cache_key: &str) -> u64 {
+    if !journal_path.exists() {
+        return 0;
+    }
+    let lock_path = journal_path.with_extension("journal.lock");
+    let _lock = match lock_journal_lock_file(&lock_path, true) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            debug!(
+                "Journal lock kept being unlinked during cleanup: file={:?}",
+                journal_path
+            );
+            return 0;
+        }
+        Err(e) => {
+            debug!(
+                "Failed to lock journal file during cleanup: file={:?}, error={}",
+                journal_path, e
+            );
+            return 0;
+        }
+    };
+
+    // Read under the lock, so no append can land between this read and the rename below.
+    let content = match std::fs::read_to_string(journal_path) {
+        Ok(c) => c,
+        Err(e) => {
+            // Stale file handle and other transient errors are expected on shared storage
+            debug!(
+                "Failed to read journal file during cleanup: file={:?}, error={}",
+                journal_path, e
+            );
+            return 0;
+        }
+    };
+
+    let mut kept = String::with_capacity(content.len());
+    let mut removed = 0u64;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<JournalEntry>(line) {
+            Ok(entry) if entry.cache_key == cache_key => removed += 1,
+            Ok(_) => {
+                kept.push_str(line);
+                kept.push('\n');
             }
-        } else {
-            return Ok(0);
-        };
-
-        // Filter out entries for the specified cache key
-        let original_count = existing_entries.len();
-        let filtered_entries: Vec<JournalEntry> = existing_entries
-            .into_iter()
-            .filter(|entry| entry.cache_key != cache_key)
-            .collect();
-        let removed_count = original_count - filtered_entries.len();
-
-        if removed_count > 0 {
-            // Write back the filtered entries
-            if filtered_entries.is_empty() {
-                // Remove the file if no entries remain
-                if let Err(e) = tokio::fs::remove_file(journal_path).await {
-                    warn!(
-                        "Failed to remove empty journal file: file={:?}, error={}",
-                        journal_path, e
-                    );
-                }
-            } else {
-                // Write back remaining entries
-                let mut content = String::new();
-                for entry in &filtered_entries {
-                    match serde_json::to_string(entry) {
-                        Ok(json) => {
-                            content.push_str(&json);
-                            content.push('\n');
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to serialize journal entry during cleanup: entry={:?}, error={}",
-                                entry, e
-                            );
-                        }
-                    }
-                }
-
-                if let Err(e) = tokio::fs::write(journal_path, content).await {
-                    warn!(
-                        "Failed to write filtered journal file: file={:?}, error={}",
-                        journal_path, e
-                    );
-                }
+            Err(e) => {
+                // Kept verbatim: a newer build's entry, or a torn tail.
+                debug!(
+                    "Unparseable journal line kept during cleanup: file={:?}, error={}",
+                    journal_path, e
+                );
+                kept.push_str(line);
+                kept.push('\n');
             }
         }
-
-        Ok(removed_count as u64)
     }
+    if removed == 0 {
+        return 0;
+    }
+
+    let is_fresh_journal = journal_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::eviction_worklist::is_fresh_journal_name);
+    if kept.is_empty() && is_fresh_journal {
+        // A fresh journal is never appended to again; remove it outright.
+        if let Err(e) = std::fs::remove_file(journal_path) {
+            warn!(
+                "Failed to remove empty journal file: file={:?}, error={}",
+                journal_path, e
+            );
+        }
+        return removed;
+    }
+
+    if kept.is_empty() {
+        // Truncate the emptied primary in place and keep it, so the lock file never outlives
+        // its journal and its instance stays in the readiness roster. Appenders write only
+        // under the lock held here, so no append lands between the read above and this
+        // truncate. No `.journal.tmp` is created: a peer's orphan evidence reads one as
+        // indeterminate.
+        let truncate = (|| -> std::io::Result<()> {
+            let f = std::fs::OpenOptions::new().write(true).open(journal_path)?;
+            f.set_len(0)?;
+            f.sync_all()
+        })();
+        if let Err(e) = truncate {
+            warn!(
+                "Failed to truncate emptied journal file: file={:?}, error={}",
+                journal_path, e
+            );
+        }
+        return removed;
+    }
+    // Primary journals are kept so the lock file never outlives its journal.
+    let tmp_path = journal_path.with_extension("journal.tmp");
+    let rewrite = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(kept.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp_path, journal_path)
+    })();
+    if let Err(e) = rewrite {
+        crate::disk_cache::note_disk_full(&e, "journal.rewrite");
+        warn!(
+            "Failed to write filtered journal file: file={:?}, error={}",
+            journal_path, e
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    removed
 }
 
 impl JournalManager {
@@ -290,11 +521,6 @@ impl JournalManager {
         }
     }
 
-    /// Set multipart cleanup integration
-    pub fn set_cleanup_integration(&mut self, integration: Arc<MultipartCleanupIntegration>) {
-        self.cleanup_integration = Some(integration);
-    }
-
     /// Get journal file path for this instance (single per-instance journal)
     ///
     /// All journal entries from this instance go to a single file:
@@ -302,7 +528,7 @@ impl JournalManager {
     ///
     /// This matches the format used by CacheHitUpdateBuffer and simplifies
     /// journal consolidation by avoiding per-object journal files.
-    pub fn get_journal_path(&self, _cache_key: &str) -> Result<PathBuf> {
+    pub(crate) fn get_journal_path(&self, _cache_key: &str) -> Result<PathBuf> {
         let journal_path = self
             .cache_dir
             .join("metadata")
@@ -317,7 +543,61 @@ impl JournalManager {
         Ok(journal_path)
     }
 
-    /// Append a journal entry atomically with enhanced error handling.
+    /// Append complete, newline-terminated `lines` to the primary journal at `journal_path`.
+    ///
+    /// The caller MUST hold the journal's `.journal.lock` flock: cleanup takes the same
+    /// lock before it truncates or rewrites the file by rename, so opening by path under
+    /// the lock always reaches the current inode, and no cleanup can replace the file
+    /// between the open and the write.
+    ///
+    /// One `O_APPEND` `write_all` of the whole buffer, so the cost is the size of the
+    /// new lines, not of the journal. If the file's last byte is not `\n` (a torn tail
+    /// left by a crash mid-append), a `\n` is written first so the new lines cannot
+    /// glue onto the torn fragment and become unparseable with it. A spurious `\n`
+    /// is a blank line, which every reader skips. No fsync, as before.
+    async fn append_lines_to_primary(journal_path: &Path, lines: &str) -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+        #[cfg(test)]
+        if RMW_APPEND_LEVER {
+            return rmw_append_for_red_side(journal_path, lines).await;
+        }
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(journal_path)
+            .await?;
+
+        let len = file.metadata().await?.len();
+        let mut needs_separator = false;
+        if len > 0 {
+            file.seek(std::io::SeekFrom::End(-1)).await?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last).await?;
+            needs_separator = last[0] != b'\n';
+        }
+        #[cfg(test)]
+        if SKIP_TORN_TAIL_GUARD_LEVER {
+            needs_separator = false;
+        }
+
+        let buf = if needs_separator {
+            let mut b = String::with_capacity(lines.len() + 1);
+            b.push('\n');
+            b.push_str(lines);
+            b
+        } else {
+            lines.to_string()
+        };
+        // O_APPEND: the write lands at end-of-file whatever the seek above left.
+        file.write_all(buf.as_bytes()).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Append a journal entry with enhanced error handling.
     ///
     /// Uses a mutex to serialize appends within this instance (Bug 4 fix).
     /// Uses non-blocking file lock to coordinate with cleanup operations.
@@ -355,18 +635,11 @@ impl JournalManager {
         let primary_journal_path = journals_dir.join(format!("{}.journal", self.instance_id));
         let lock_path = primary_journal_path.with_extension("journal.lock");
 
-        // Try to acquire file lock (non-blocking)
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                ProxyError::CacheError(format!("Failed to open journal lock file: {}", e))
-            })?;
-
-        use fs2::FileExt;
-        let got_lock = lock_file.try_lock_exclusive().is_ok();
+        // Try to acquire file lock (non-blocking); held until `_lock_file` drops.
+        let _lock_file = lock_journal_lock_file(&lock_path, false).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to open journal lock file: {}", e))
+        })?;
+        let got_lock = _lock_file.is_some();
 
         let journal_path = if got_lock {
             // Got lock - use primary journal file
@@ -387,52 +660,18 @@ impl JournalManager {
             fresh_path
         };
 
-        // For fresh journal files, just append directly (no read-modify-write needed)
-        // For primary journal with lock, do read-modify-write atomically
+        // Primary journal (lock held): O_APPEND the one line, O(entry) not O(journal).
+        // Fresh journal (lock busy): a uniquely named new file holding just this entry.
         if got_lock {
-            // Append to journal file atomically (read-modify-write with lock held)
-            let temp_path = journal_path.with_extension("journal.tmp");
-
-            // Read existing content if file exists
-            let existing_content = if journal_path.exists() {
-                match tokio::fs::read_to_string(&journal_path).await {
-                    Ok(content) => content,
-                    Err(e) => {
-                        warn!(
-                            "Failed to read existing journal file, starting fresh: cache_key={}, path={:?}, error={}",
-                            cache_key, journal_path, e
-                        );
-                        String::new()
-                    }
-                }
-            } else {
-                String::new()
-            };
-
-            // Write existing content + new entry to temp file
-            let new_content = format!("{}{}\n", existing_content, json_entry);
-
-            if let Err(e) = tokio::fs::write(&temp_path, &new_content).await {
+            let line = format!("{}\n", json_entry);
+            if let Err(e) = Self::append_lines_to_primary(&journal_path, &line).await {
+                crate::disk_cache::note_disk_full(&e, "journal.append");
                 error!(
-                    "Failed to write journal temp file: cache_key={}, temp_path={:?}, error={}",
-                    cache_key, temp_path, e
+                    "Failed to append to journal file: cache_key={}, path={:?}, error={}",
+                    cache_key, journal_path, e
                 );
-                let _ = tokio::fs::remove_file(&temp_path).await;
                 return Err(ProxyError::CacheError(format!(
-                    "Failed to write journal temp file: {}",
-                    e
-                )));
-            }
-
-            // Atomic rename
-            if let Err(e) = tokio::fs::rename(&temp_path, &journal_path).await {
-                error!(
-                    "Failed to rename journal file: cache_key={}, temp_path={:?}, final_path={:?}, error={}",
-                    cache_key, temp_path, journal_path, e
-                );
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(ProxyError::CacheError(format!(
-                    "Failed to rename journal file: {}",
+                    "Failed to append to journal file: {}",
                     e
                 )));
             }
@@ -440,6 +679,7 @@ impl JournalManager {
             // Fresh journal file - just write the single entry
             let content = format!("{}\n", json_entry);
             if let Err(e) = tokio::fs::write(&journal_path, &content).await {
+                crate::disk_cache::note_disk_full(&e, "journal.append_fresh");
                 error!(
                     "Failed to write fresh journal file: cache_key={}, path={:?}, error={}",
                     cache_key, journal_path, e
@@ -455,13 +695,14 @@ impl JournalManager {
             "Appended journal entry: cache_key={}, operation={:?}, path={:?}, fresh={}",
             cache_key, entry.operation, journal_path, !got_lock
         );
+        refresh_ready_record(&journals_dir, &self.instance_id);
 
         Ok(())
     }
 
     /// Append multiple journal entries for a single cache key in one file operation.
     /// Serializes all entries, acquires the append mutex once, and writes them
-    /// in a single read-modify-write cycle.
+    /// in a single `O_APPEND` write.
     pub async fn append_range_entries_batch(
         &self,
         cache_key: &str,
@@ -508,18 +749,11 @@ impl JournalManager {
         let primary_journal_path = journals_dir.join(format!("{}.journal", self.instance_id));
         let lock_path = primary_journal_path.with_extension("journal.lock");
 
-        // Try to acquire file lock (non-blocking)
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                ProxyError::CacheError(format!("Failed to open journal lock file: {}", e))
-            })?;
-
-        use fs2::FileExt;
-        let got_lock = lock_file.try_lock_exclusive().is_ok();
+        // Try to acquire file lock (non-blocking); held until `_lock_file` drops.
+        let _lock_file = lock_journal_lock_file(&lock_path, false).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to open journal lock file: {}", e))
+        })?;
+        let got_lock = _lock_file.is_some();
 
         let journal_path = if got_lock {
             // Got lock - use primary journal file
@@ -540,58 +774,24 @@ impl JournalManager {
             fresh_path
         };
 
-        // For fresh journal files, just write directly (no read-modify-write needed)
-        // For primary journal with lock, do read-modify-write atomically
+        // Primary journal (lock held): one O_APPEND write of all lines.
+        // Fresh journal (lock busy): a uniquely named new file holding just these entries.
         if got_lock {
-            // Append to journal file atomically (read-modify-write with lock held)
-            let temp_path = journal_path.with_extension("journal.tmp");
-
-            // Read existing content if file exists
-            let existing_content = if journal_path.exists() {
-                match tokio::fs::read_to_string(&journal_path).await {
-                    Ok(content) => content,
-                    Err(e) => {
-                        warn!(
-                            "Failed to read existing journal file, starting fresh: cache_key={}, path={:?}, error={}",
-                            cache_key, journal_path, e
-                        );
-                        String::new()
-                    }
-                }
-            } else {
-                String::new()
-            };
-
-            // Write existing content + all new entries to temp file
-            let new_content = format!("{}{}", existing_content, serialized_lines);
-
-            if let Err(e) = tokio::fs::write(&temp_path, &new_content).await {
+            if let Err(e) = Self::append_lines_to_primary(&journal_path, &serialized_lines).await {
+                crate::disk_cache::note_disk_full(&e, "journal.batch_append");
                 error!(
-                    "Failed to write journal temp file: cache_key={}, temp_path={:?}, error={}",
-                    cache_key, temp_path, e
+                    "Failed to append to journal file: cache_key={}, path={:?}, error={}",
+                    cache_key, journal_path, e
                 );
-                let _ = tokio::fs::remove_file(&temp_path).await;
                 return Err(ProxyError::CacheError(format!(
-                    "Failed to write journal temp file: {}",
-                    e
-                )));
-            }
-
-            // Atomic rename
-            if let Err(e) = tokio::fs::rename(&temp_path, &journal_path).await {
-                error!(
-                    "Failed to rename journal file: cache_key={}, temp_path={:?}, final_path={:?}, error={}",
-                    cache_key, temp_path, journal_path, e
-                );
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(ProxyError::CacheError(format!(
-                    "Failed to rename journal file: {}",
+                    "Failed to append to journal file: {}",
                     e
                 )));
             }
         } else {
             // Fresh journal file - write all entries
             if let Err(e) = tokio::fs::write(&journal_path, &serialized_lines).await {
+                crate::disk_cache::note_disk_full(&e, "journal.batch_append_fresh");
                 error!(
                     "Failed to write fresh journal file: cache_key={}, path={:?}, error={}",
                     cache_key, journal_path, e
@@ -610,6 +810,7 @@ impl JournalManager {
             journal_path,
             !got_lock
         );
+        refresh_ready_record(&journals_dir, &self.instance_id);
 
         Ok(())
     }
@@ -662,7 +863,7 @@ impl JournalManager {
     /// Since we now use per-instance journals (not per-object), this returns all
     /// instance journal files in the _journals directory. The caller must filter
     /// entries by cache_key when reading.
-    pub async fn find_all_journal_files(&self, _cache_key: &str) -> Result<Vec<PathBuf>> {
+    pub(crate) async fn find_all_journal_files(&self, _cache_key: &str) -> Result<Vec<PathBuf>> {
         let journals_dir = self.cache_dir.join("metadata").join("_journals");
 
         if !journals_dir.exists() {
@@ -701,95 +902,6 @@ impl JournalManager {
         Ok(journal_files)
     }
 
-    /// Remove specific journal entries from the journal file
-    pub async fn remove_entries(
-        &self,
-        cache_key: &str,
-        entries_to_remove: &[JournalEntry],
-    ) -> Result<()> {
-        let journal_path = self.get_journal_path(cache_key)?;
-
-        if !journal_path.exists() {
-            return Ok(());
-        }
-
-        // Read existing entries
-        let content = tokio::fs::read_to_string(&journal_path)
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Failed to read journal file: {}", e)))?;
-
-        let mut existing_entries = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<JournalEntry>(line) {
-                Ok(entry) => existing_entries.push(entry),
-                Err(e) => {
-                    // Parse errors can occur during concurrent writes on shared storage
-                    debug!(
-                        "Failed to parse journal entry during removal: cache_key={}, line={}, error={}",
-                        cache_key, line, e
-                    );
-                }
-            }
-        }
-
-        // Filter out entries to remove
-        let original_count = existing_entries.len();
-        let filtered_entries: Vec<JournalEntry> = existing_entries
-            .into_iter()
-            .filter(|entry| !entries_to_remove.contains(entry))
-            .collect();
-        let removed_count = original_count - filtered_entries.len();
-
-        if removed_count > 0 {
-            if filtered_entries.is_empty() {
-                // Remove the file if no entries remain
-                tokio::fs::remove_file(&journal_path).await.map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to remove empty journal file: {}", e))
-                })?;
-                debug!(
-                    "Removed empty journal file: cache_key={}, path={:?}",
-                    cache_key, journal_path
-                );
-            } else {
-                // Write back remaining entries
-                let mut new_content = String::new();
-                for entry in &filtered_entries {
-                    match serde_json::to_string(entry) {
-                        Ok(json) => {
-                            new_content.push_str(&json);
-                            new_content.push('\n');
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to serialize journal entry during removal: entry={:?}, error={}",
-                                entry, e
-                            );
-                        }
-                    }
-                }
-
-                tokio::fs::write(&journal_path, new_content)
-                    .await
-                    .map_err(|e| {
-                        ProxyError::CacheError(format!(
-                            "Failed to write filtered journal file: {}",
-                            e
-                        ))
-                    })?;
-
-                debug!(
-                    "Updated journal file after removal: cache_key={}, removed={}, remaining={}, path={:?}",
-                    cache_key, removed_count, filtered_entries.len(), journal_path
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     /// Clean up journal entries for a multipart upload
     pub async fn cleanup_for_multipart(&self, cache_key: &str) -> Result<()> {
         if let Some(cleanup_integration) = &self.cleanup_integration {
@@ -813,7 +925,7 @@ impl JournalManager {
     /// scanning the entire journal directory. Use this when the caller already has a
     /// pre-built index (e.g. from `discover_pending_cache_keys_indexed`) to avoid
     /// redundant full-directory scans on every key during a consolidation cycle.
-    pub async fn get_entries_from_files(
+    pub(crate) async fn get_entries_from_files(
         &self,
         cache_key: &str,
         journal_files: &[std::path::PathBuf],
@@ -937,7 +1049,163 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         }
+    }
+
+    fn entry_a(cache_key: &str, start: u64) -> JournalEntry {
+        let mut range_spec = create_test_range_spec();
+        range_spec.start = start;
+        range_spec.end = start + 99;
+        JournalEntry {
+            timestamp: SystemTime::now(),
+            instance_id: "case61".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec,
+            operation: JournalOperation::Add,
+            range_file_path: String::new(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(3600),
+            access_increment: None,
+            object_metadata: None,
+            fill_witness: None,
+        }
+    }
+
+    /// Throughput guard: an append writes only its own line into the existing file.
+    /// The whole-file RMW rewrote the journal into a new inode on every append, so
+    /// per-append cost grew with journal size; an unchanged inode and a length that
+    /// grows by exactly the new line pin O(entry) cost. Red side: `RMW_APPEND_LEVER`.
+    #[tokio::test]
+    async fn appends_extend_the_primary_journal_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+        let jm = JournalManager::new(temp.path().to_path_buf(), "case61".to_string());
+        let key = "bkt/case61/in-place";
+        jm.append_range_entry(key, entry_a(key, 0)).await.unwrap();
+        let path = jm.get_journal_path(key).unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        for i in 1..200u64 {
+            let entry = entry_a(key, i * 100);
+            let line_len = serde_json::to_string(&entry).unwrap().len() as u64 + 1;
+            let before = std::fs::metadata(&path).unwrap().len();
+            jm.append_range_entry(key, entry).await.unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                meta.ino(),
+                ino,
+                "append {} replaced the journal file (whole-file rewrite)",
+                i
+            );
+            assert_eq!(meta.len(), before + line_len, "append {} length", i);
+        }
+        assert!(!path.with_extension("journal.tmp").exists());
+        assert_eq!(jm.get_pending_entries(key).await.unwrap().len(), 200);
+    }
+
+    /// The multipart rewrite waits for an appender holding `.journal.lock`, then reads the
+    /// journal including that append, so the appended line survives the rewrite. Before
+    /// the rewrite took no lock and a `tokio::fs::write` could overwrite the append.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multipart_rewrite_racing_an_append_loses_no_line() {
+        let temp = TempDir::new().unwrap();
+        let jm = JournalManager::new(temp.path().to_path_buf(), "case38".to_string());
+        let gone = "bkt/case38/gone";
+        let kept = "bkt/case38/kept";
+        jm.append_range_entry(gone, entry_a(gone, 0)).await.unwrap();
+        let path = jm.get_journal_path(gone).unwrap();
+        let lock_path = path.with_extension("journal.lock");
+
+        // An appender holds the lock and has not written yet.
+        let held = lock_journal_lock_file(&lock_path, true)
+            .unwrap()
+            .expect("fixture: the appender must take the lock");
+        let integration = MultipartCleanupIntegration::new(temp.path().to_path_buf());
+        let rewrite_path = path.clone();
+        let rewrite = tokio::spawn(async move {
+            integration
+                .remove_entries_from_journal_file(&rewrite_path, gone)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !rewrite.is_finished(),
+            "the rewrite ran while an appender held the journal lock"
+        );
+
+        // The appender's write, under its hold, then release.
+        let line = format!("{}\n", serde_json::to_string(&entry_a(kept, 0)).unwrap());
+        JournalManager::append_lines_to_primary(&path, &line)
+            .await
+            .unwrap();
+        drop(held);
+
+        assert_eq!(rewrite.await.unwrap().unwrap(), 1, "removed count");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(kept),
+            "the append racing the rewrite was lost"
+        );
+        assert!(!content.contains(gone), "the target key must be removed");
+        assert!(!path.with_extension("journal.tmp").exists());
+    }
+
+    /// Torn-line tolerance: a partial last line is skipped by every reader in this
+    /// module, is seen exactly once when completed, and a crash-torn tail that is never
+    /// completed does not swallow the next append. Red side: `SKIP_TORN_TAIL_GUARD_LEVER`.
+    #[tokio::test]
+    async fn torn_tail_is_skipped_completed_once_and_never_glued() {
+        use std::io::Write;
+        let temp = TempDir::new().unwrap();
+        let jm = JournalManager::new(temp.path().to_path_buf(), "case61".to_string());
+        let key = "bkt/case61/torn";
+        jm.append_range_entry(key, entry_a(key, 0)).await.unwrap();
+        let path = jm.get_journal_path(key).unwrap();
+        let raw_append = |s: &str| {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(s.as_bytes()).unwrap();
+        };
+        async fn counts(jm: &JournalManager, key: &str, path: &Path) -> (usize, usize, usize) {
+            let files = vec![path.to_path_buf()];
+            (
+                jm.get_pending_entries(key).await.unwrap().len(),
+                jm.get_all_entries_for_cache_key(key).await.unwrap().len(),
+                jm.get_entries_from_files(key, &files).await.unwrap().len(),
+            )
+        }
+
+        // An in-progress append: half a line, no newline yet.
+        let second = serde_json::to_string(&entry_a(key, 100)).unwrap();
+        let (head, tail) = second.split_at(second.len() / 2);
+        raw_append(head);
+        assert_eq!(
+            counts(&jm, key, &path).await,
+            (1, 1, 1),
+            "torn tail must be skipped"
+        );
+
+        // The append completes: the line is seen, once.
+        raw_append(&format!("{}\n", tail));
+        assert_eq!(
+            counts(&jm, key, &path).await,
+            (2, 2, 2),
+            "completed line seen once"
+        );
+
+        // A crash-torn tail that never completes, then a normal append.
+        let third = serde_json::to_string(&entry_a(key, 200)).unwrap();
+        raw_append(&third[..third.len() / 2]);
+        jm.append_range_entry(key, entry_a(key, 300)).await.unwrap();
+        assert_eq!(
+            counts(&jm, key, &path).await,
+            (3, 3, 3),
+            "the append after a torn tail was glued onto it and lost"
+        );
     }
 
     #[test]
@@ -955,6 +1223,7 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         };
 
         // Test serialization
@@ -983,6 +1252,7 @@ mod tests {
             object_ttl_secs: None,
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         };
 
         // Test serialization
@@ -1012,6 +1282,7 @@ mod tests {
             object_ttl_secs: None,
             access_increment: Some(5),
             object_metadata: None,
+            fill_witness: None,
         };
 
         // Test serialization
@@ -1046,6 +1317,7 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         };
 
         // Test append
@@ -1069,29 +1341,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal_files.len(), 1);
-
-        // Test remove entries
-        journal_manager
-            .remove_entries(cache_key, &entries)
-            .await
-            .unwrap();
-
-        let remaining_entries = journal_manager
-            .get_pending_entries(cache_key)
-            .await
-            .unwrap();
-        assert_eq!(remaining_entries.len(), 0);
     }
 
     #[tokio::test]
     async fn test_multipart_cleanup_integration() {
         let temp_dir = TempDir::new().unwrap();
-        let cleanup_integration = MultipartCleanupIntegration::new(temp_dir.path().to_path_buf());
-
         let cache_key = "test-bucket/test-object";
-        let mut journal_manager =
+        // `JournalManager::new` wires a `MultipartCleanupIntegration` for this cache_dir.
+        let journal_manager =
             JournalManager::new(temp_dir.path().to_path_buf(), "test-instance".to_string());
-        journal_manager.set_cleanup_integration(Arc::new(cleanup_integration));
 
         // Add some journal entries
         let range_spec = create_test_range_spec();
@@ -1107,6 +1365,7 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         };
 
         let entry2 = JournalEntry {
@@ -1121,6 +1380,7 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         };
 
         journal_manager
@@ -1202,6 +1462,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         let entry = JournalEntry {
@@ -1219,6 +1481,7 @@ mod tests {
             },
             access_increment: final_increment,
             object_metadata: None,
+            fill_witness: None,
         };
 
         // Serialize to JSON
@@ -1257,5 +1520,35 @@ mod tests {
         }
 
         TestResult::passed()
+    }
+    /// Removing a key's last entries truncates a primary journal in place, keeping its file and
+    /// inode with no `.journal.tmp`, and deletes a fresh journal outright.
+    #[test]
+    fn removing_the_last_entries_truncates_a_primary_in_place_and_deletes_a_fresh_journal() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+        let journals = temp.path().join("metadata").join("_journals");
+        std::fs::create_dir_all(&journals).unwrap();
+        let key = "bkt/emptied";
+        let line = format!("{}\n", serde_json::to_string(&entry_a(key, 0)).unwrap());
+        let primary = journals.join("host-a:42.journal");
+        let fresh = journals.join("host-a:42:1700000000000000000.journal");
+        std::fs::write(&primary, &line).unwrap();
+        std::fs::write(&fresh, &line).unwrap();
+        let inode = std::fs::metadata(&primary).unwrap().ino();
+        assert_eq!(remove_entries_under_lock(&primary, key), 1);
+        assert_eq!(remove_entries_under_lock(&fresh, key), 1);
+        let after = std::fs::metadata(&primary).expect("the emptied primary journal is kept");
+        assert_eq!(after.len(), 0, "the primary journal is emptied");
+        assert_eq!(
+            after.ino(),
+            inode,
+            "the primary journal is truncated in place, not replaced"
+        );
+        assert!(
+            !primary.with_extension("journal.tmp").exists(),
+            "no .journal.tmp is left"
+        );
+        assert!(!fresh.exists(), "a fresh journal is deleted");
     }
 }

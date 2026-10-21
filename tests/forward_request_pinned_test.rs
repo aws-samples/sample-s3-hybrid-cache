@@ -23,9 +23,9 @@
 //! `get_hostname_for_ip` mapping.
 //!
 //! It is covered instead by fleet deployment verification, which has a real
-//! origin and real overrides: T22/T23/T24 exercise the override transport paths,
-//! and T38 exercises hedging (and therefore pinning) end to end. See
-//! `.kiro/steering/pre-push-checklist.md` step 8.
+//! origin and real overrides: the fleet tests exercise the override transport paths,
+//! and a fleet test exercises hedging (and therefore pinning) end to end. See
+//! the pre-push checklist step 8.
 
 mod common;
 

@@ -51,7 +51,7 @@ async fn test_range_stored_with_configured_ttl() {
         graduation_accounted: false,
     };
 
-    // Store range with a 10-year TTL (like the config default)
+    // Store range with a 10-year TTL (the validated maximum)
     let ten_years = Duration::from_secs(315360000); // ~10 years
     disk_cache
         .store_range(

@@ -26,7 +26,7 @@ async fn test_cache_manager_multipart_integration() {
         false,              // RAM cache disabled for this test
         1024 * 1024,        // 1MB RAM cache
         1024 * 1024 * 1024, // 1GB max cache size
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,                                // 1KB compression threshold
         true,                                // compression enabled
         std::time::Duration::from_secs(300), // GET TTL
@@ -107,7 +107,7 @@ async fn test_regular_put_with_conflict_invalidation() {
         false,              // RAM cache disabled for this test
         1024 * 1024,        // 1MB RAM cache
         1024 * 1024 * 1024, // 1GB max cache size
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,                                // 1KB compression threshold
         true,                                // compression enabled
         std::time::Duration::from_secs(300), // GET TTL

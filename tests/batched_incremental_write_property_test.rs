@@ -171,7 +171,8 @@ fn prop_batched_write_byte_identity() {
                         e
                     ));
                 }
-            };
+            }
+            .expect("the capacity guard admits with an unconfigured floor");
 
             for (i, chunk) in chunks.iter().enumerate() {
                 if let Err(e) = DiskCacheManager::write_range_chunk(&mut writer, chunk) {
@@ -290,7 +291,8 @@ fn prop_batched_write_equivalence_to_single_shot() {
                         e
                     ));
                 }
-            };
+            }
+            .expect("the capacity guard admits with an unconfigured floor");
 
             for (i, chunk) in chunks.iter().enumerate() {
                 if let Err(e) = DiskCacheManager::write_range_chunk(&mut writer, chunk) {
@@ -469,7 +471,8 @@ fn prop_residual_flush_on_commit() {
                         e
                     ));
                 }
-            };
+            }
+            .expect("the capacity guard admits with an unconfigured floor");
 
             for (i, chunk) in chunks.iter().enumerate() {
                 if let Err(e) = DiskCacheManager::write_range_chunk(&mut writer, chunk) {
@@ -604,7 +607,8 @@ async fn test_residual_flush_100k_bytes_64k_batch() {
     let mut writer = cache_manager
         .begin_incremental_range_write(cache_key, start, end, true)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the capacity guard admits with an unconfigured floor");
 
     // Feed in uneven chunks to exercise mixed-threshold batching.
     for chunk in input.chunks(4099) {
@@ -693,7 +697,8 @@ async fn test_residual_flush_3mib_plus_1_byte_at_1mib_batch() {
     let mut writer = cache_manager
         .begin_incremental_range_write(cache_key, start, end, true)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the capacity guard admits with an unconfigured floor");
     for chunk in input.chunks(8192) {
         DiskCacheManager::write_range_chunk(&mut writer, chunk).unwrap();
     }

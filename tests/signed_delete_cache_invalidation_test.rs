@@ -27,7 +27,7 @@ async fn create_test_cache_manager() -> (Arc<CacheManager>, TempDir) {
         false, // RAM cache disabled
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         std::time::Duration::from_secs(3600),

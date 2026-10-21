@@ -650,11 +650,6 @@ impl GenOptions {
             ..Self::default()
         }
     }
-
-    pub fn with_threads(mut self, threads: usize) -> Self {
-        self.threads = threads;
-        self
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,8 +1005,8 @@ fn emit_object(
         let payload_len = ctx.stub_bytes.map(|s| s as u64).unwrap_or(size);
         write_payload(&bin_path, payload_len, obj_index, range_index)?;
 
-        // `last_accessed` spread across [min_age, max_age] so LRU and
-        // TinyLFU orderings are both non-degenerate; `created_at` is at
+        // `last_accessed` spread across [min_age, max_age] so the TinyLFU
+        // ordering is non-degenerate; `created_at` is at
         // least as old as `last_accessed`, which is what the product
         // guarantees.
         let access_age = rng.next_range_u64(ctx.min_age, ctx.max_age);

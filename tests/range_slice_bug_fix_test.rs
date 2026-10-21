@@ -18,7 +18,7 @@ fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheManager>
         false, // RAM cache disabled for tests
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         std::time::Duration::from_secs(3600), // GET TTL
@@ -87,8 +87,10 @@ async fn test_range_slice_single_cached_range_larger_than_requested() {
         ..Default::default()
     };
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             cached_start,
             cached_end,
@@ -210,8 +212,10 @@ async fn test_range_slice_middle_of_cached_range() {
         ..Default::default()
     };
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             cached_start,
             cached_end,
@@ -312,8 +316,10 @@ async fn test_range_slice_end_of_cached_range() {
         ..Default::default()
     };
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             cached_start,
             cached_end,
@@ -417,8 +423,10 @@ async fn test_range_slice_exact_match_no_slicing() {
         ..Default::default()
     };
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             cached_start,
             cached_end,
@@ -535,8 +543,10 @@ async fn test_range_slice_multiple_cached_ranges() {
         ..Default::default()
     };
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             0,
             1099,
@@ -548,8 +558,10 @@ async fn test_range_slice_multiple_cached_ranges() {
         .await
         .unwrap();
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             1000,
             2099,
@@ -561,8 +573,10 @@ async fn test_range_slice_multiple_cached_ranges() {
         .await
         .unwrap();
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             2000,
             3099,
@@ -718,8 +732,10 @@ async fn test_range_slice_multiple_cached_ranges_with_gaps() {
         ..Default::default()
     };
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             0,
             1999,
@@ -731,8 +747,10 @@ async fn test_range_slice_multiple_cached_ranges_with_gaps() {
         .await
         .unwrap();
 
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             cache_key,
             3000,
             5099,

@@ -31,7 +31,7 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
         false, // RAM cache disabled
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         std::time::Duration::from_secs(3600),
@@ -167,7 +167,7 @@ async fn test_invalidate_stale_ranges() -> Result<()> {
         false, // RAM cache disabled
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         std::time::Duration::from_secs(3600),
@@ -268,7 +268,7 @@ async fn test_invalidate_stale_ranges_no_mismatch() -> Result<()> {
         false, // RAM cache disabled
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         std::time::Duration::from_secs(3600),
@@ -358,7 +358,7 @@ async fn test_invalidate_stale_ranges_no_metadata() -> Result<()> {
         false, // RAM cache disabled
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         std::time::Duration::from_secs(3600),

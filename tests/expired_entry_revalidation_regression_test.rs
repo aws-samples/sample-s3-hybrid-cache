@@ -1,4 +1,4 @@
-//! Failing-first regressions for `.kiro/specs/expired-entry-revalidation/`.
+//! Failing-first regressions for the expired entry revalidation feature.
 //!
 //! Spec: Requirements 2, 3, 7.1, 7.2, 7.3. GitHub issue #17.
 //!
@@ -52,8 +52,8 @@ use hyper::StatusCode;
 
 use common::expired_fixture::{
     body_of, conditional_requests, not_modified, short_ttl, signed_range_authorization,
-    test_config, test_config_coordinated, test_config_full_object_checks, zero_ttl, Fixture,
-    SeedSpec, NEW_FILL, OLD_FILL,
+    test_config, test_config_coordinated, test_config_full_object_checks,
+    test_config_full_object_checks_with_get_ttl, zero_ttl, Fixture, SeedSpec, NEW_FILL, OLD_FILL,
 };
 use common::{StubResponse, StubS3Client};
 
@@ -388,7 +388,7 @@ async fn expired_signed_range_get_preserves_raw_range_on_conditional() {
     client_headers.insert("authorization".to_string(), authorization.clone());
     client_headers.insert("range".to_string(), raw_range.clone());
     assert!(
-        s3_proxy::signed_request_proxy::is_range_signed(&client_headers),
+        s3_proxy::signed_request_proxy::is_range_signed(&client_headers, "/"),
         "PRECONDITION MISSING: the fixture Authorization header does not sign `range`, \
          so this test would measure the unsigned case"
     );
@@ -730,7 +730,7 @@ async fn expired_range_get_with_missing_range_file_does_not_serve_cached_bytes()
     // Delete the .bin but LEAVE the metadata entry claiming coverage. Removing
     // the metadata entry too would make coverage incomplete and reclassify the
     // request as an ordinary miss, which is a different path — the same trap
-    // recorded for the T45 fleet group.
+    // recorded for the fleet test.
     let bin = fixture.bin_path(cache_key, start, end);
     assert!(bin.exists(), "PRECONDITION MISSING: fixture .bin absent");
     std::fs::remove_file(&bin).expect("remove .bin");
@@ -967,17 +967,14 @@ async fn range_paths_early_full_object_shortcut_must_honour_live_ttl() {
 }
 
 /// Guard for R1.3: making expired entries discoverable must not weaken the
-/// **part-scoped** serve path, which has no live-TTL gate at all today.
+/// **part-scoped** serve path, which sends no conditional request before serving.
 ///
 /// `CacheManager::lookup_part` calls `DiskCacheManager::find_cached_ranges`
-/// directly with no `current_etag` and no `check_object_expiration`, so its only
-/// freshness bound is stored expiry. This test pins that bound so a
-/// `RevalidationCandidate` default could not silently reach it: a Stored_Expired
-/// entry must remain a part-cache miss.
-///
-/// This documents existing behaviour rather than a defect. `lookup_part` ignoring
-/// `get_ttl` entirely is a separate invariant-1 gap, recorded in
-/// `.kiro/steering/cache-coherency-invariants.md` and out of scope here.
+/// directly with no `current_etag`, so it has two freshness bounds: stored expiry
+/// (`FreshServe`), pinned here so a `RevalidationCandidate` default could not
+/// silently reach it, and the live `get_ttl` verdict it applies before that,
+/// pinned by the second half: a Stored_Fresh entry older than the resolved
+/// `get_ttl` is a miss too.
 ///
 /// Requirements: 1.3, 1.6.
 #[tokio::test]
@@ -1006,15 +1003,57 @@ async fn part_scoped_lookup_remains_fresh_only_for_expired_entries() {
 
     let cached_part = fixture
         .cache_manager
-        .lookup_part(cache_key, 1)
+        // `Matches` — this test's subject is the part-scoped lookup's freshness contract, so
+        // it must reach that contract rather than being declined by the origin guard.
+        .lookup_part(
+            cache_key,
+            1,
+            s3_proxy::origin_identity::OriginVerdict::Matches,
+        )
         .await
         .expect("lookup_part must not error");
 
     assert!(
         cached_part.is_none(),
         "R1.3: the part-scoped lookup is Fresh_Only — a Stored_Expired entry must stay a \
-         miss there, because that path applies no live-TTL gate and no conditional \
-         validation before serving"
+         miss there, because that path applies no conditional validation before serving"
+    );
+
+    // The live verdict: the same part, Stored_Fresh but cached 2h ago, under a 60s
+    // `get_ttl`, is a miss. Before the change, stored expiry alone decided, so a rule that
+    // lowered `get_ttl` after caching had no effect on part GETs.
+    let live_config =
+        test_config_full_object_checks_with_get_ttl(OBJECT_SIZE, Duration::from_secs(60));
+    let live_fixture = Fixture::new(live_config).await;
+    let mut live_spec =
+        SeedSpec::stored_fresh_live_expired(vec![(start, end)], OBJECT_SIZE, "\"part-v1\"");
+    live_spec.extents = vec![(start, end)];
+    live_fixture.seed(cache_key, &live_spec);
+    let mut live_metadata = live_fixture.read_meta(cache_key).expect(".meta");
+    live_metadata.object_metadata.parts_count = Some(1);
+    live_metadata
+        .object_metadata
+        .part_ranges
+        .insert(1, (start, end));
+    std::fs::write(
+        live_fixture.meta_path(cache_key),
+        serde_json::to_string_pretty(&live_metadata).expect("serialize"),
+    )
+    .expect("write .meta");
+    live_fixture.invalidate_metadata_cache(cache_key).await;
+    let live_part = live_fixture
+        .cache_manager
+        .lookup_part(
+            cache_key,
+            1,
+            s3_proxy::origin_identity::OriginVerdict::Matches,
+        )
+        .await
+        .expect("lookup_part must not error");
+    assert!(
+        live_part.is_none(),
+        "SCN1: a Stored_Fresh part entry cached 2h ago was served under a 60s get_ttl; the \
+         part lookup must apply the live get_ttl verdict"
     );
 }
 
@@ -1198,14 +1237,20 @@ async fn concurrent_expired_range_reads_serve_cached_bytes_with_no_body_transfer
 /// durable, the next request revalidates again rather than serving on the strength of
 /// a refresh that did not land.
 ///
-/// # Why this is testable without forcing a write to fail
+/// # How the refresh is made non-durable
 ///
-/// `refresh_object_ttl` records a TTL-refresh **journal entry** rather than writing
-/// the `.meta`, so the persisted `expires_at` does not move until the background
-/// consolidator applies it. Inside that window the refresh is exactly as
-/// non-durable as a failed write, and it occurs naturally on every `304` — no
-/// fault injection, no read-only filesystem, no platform-specific permission
-/// trickery.
+/// An origin `304` records the validation with a synchronous locked `.meta` write
+/// (`DiskCacheManager::record_origin_validation`), which takes the key's metadata slot
+/// lock in a single non-blocking attempt and skips the write when the slot is held.
+/// So holding the slot lock across pass 1 is a real undurable refresh, reached through
+/// the production code's own contention arm: no fault injection, no read-only
+/// filesystem. Until the refresh was a journal entry, and the consolidation window
+/// supplied this state for free; the synchronous write closed that window, so the
+/// fixture now constructs it.
+///
+/// Pass 3 is the other side: once a refresh has landed, a read inside `get_ttl`
+/// must NOT revalidate, so the count assertion cannot be satisfied by a path that
+/// revalidates every read.
 ///
 /// This is the case R2.3's "SHALL revalidate again on the next request rather than
 /// treating the failed refresh as durable" is written for, and it uses a NON-ZERO
@@ -1241,8 +1286,19 @@ async fn nonzero_ttl_second_read_revalidates_again_while_refresh_is_undurable() 
                 .with_header("etag", "\"undurable-v2\""),
         );
 
-    for pass in 1..=2 {
+    let cache_dir = fixture.cache_manager.get_cache_dir().to_path_buf();
+    let mut conditionals_after = Vec::new();
+    for pass in 1..=3 {
         fixture.invalidate_metadata_cache(cache_key).await;
+        // Pass 1 runs with the key's slot lock held by "a peer", so its refresh is skipped.
+        let peer_lock = if pass == 1 {
+            Some(
+                s3_proxy::metadata_lock_manager::try_acquire_slot_lock(&cache_dir, cache_key)
+                    .expect("fixture: the slot lock must be free before pass 1"),
+            )
+        } else {
+            None
+        };
         let response = fixture
             .range_get(
                 cache_key,
@@ -1256,32 +1312,42 @@ async fn nonzero_ttl_second_read_revalidates_again_while_refresh_is_undurable() 
         assert_eq!(
             body_of(response).await,
             old_bytes(len),
-            "R2.2: pass {} must serve the cached bytes after 304",
+            "R2.2: pass {} must serve the cached bytes",
             pass
         );
+        drop(peer_lock);
+        if pass == 1 {
+            // The refresh did not land, which is what makes pass 2's revalidation
+            // correct rather than wasteful. Asserted so a change that stops honouring
+            // the lock fails HERE, naming the reason.
+            let metadata = fixture.read_meta(cache_key).expect(".meta must exist");
+            assert!(
+                std::time::SystemTime::now() > metadata.expires_at
+                    && metadata.last_validated_at.is_none(),
+                "FIXTURE: with the slot lock held the pass-1 refresh must be skipped, but the \
+                 .meta moved (expires_at={:?}, last_validated_at={:?})",
+                metadata.expires_at,
+                metadata.last_validated_at
+            );
+        }
+        conditionals_after.push(conditional_requests(&stub.captured()).len());
     }
 
-    // Two passes, two conditionals. One would mean the second read served on the
-    // strength of a refresh that is not yet on disk.
-    let conditionals = conditional_requests(&stub.captured()).len();
-    assert!(
-        conditionals >= 2,
-        "R2.3: a 304 authorises ONE Validated_Serve; with the refreshed TTL not yet \
-         persisted the next request must revalidate again. Observed {} conditional \
-         request(s) across 2 passes",
-        conditionals
+    // Pass 1 and pass 2 each revalidate: pass 2 must not serve on the strength of
+    // pass 1's refresh, which never reached the `.meta`.
+    assert_eq!(
+        conditionals_after[1], 2,
+        "R2.3: a 304 authorises ONE Validated_Serve; with the refreshed TTL not \
+         persisted the next request must revalidate again. Conditionals after each \
+         pass: {:?}",
+        conditionals_after
     );
-
-    // The `.meta` still carries the pre-refresh expiry, which is what makes the
-    // second revalidation correct rather than wasteful. Asserted so a future change
-    // that makes the refresh synchronous fails HERE, naming the reason, instead of
-    // making the count assertion above mysteriously flaky.
-    let metadata = fixture.read_meta(cache_key).expect(".meta must exist");
-    assert!(
-        std::time::SystemTime::now() > metadata.expires_at,
-        "the persisted expires_at is expected to be UNCHANGED inside the \
-         consolidation window — if the TTL refresh has become synchronous, this test's \
-         premise no longer holds and it needs rewriting against a real write failure"
+    // Pass 2's refresh landed, so pass 3, inside the 60s get_ttl, is served without S3.
+    assert_eq!(
+        conditionals_after[2], 2,
+        "once a 304's refresh is durable, a read inside get_ttl must not revalidate. \
+         Conditionals after each pass: {:?}",
+        conditionals_after
     );
 }
 

@@ -17,7 +17,7 @@ const MAX_TTL_SECS: u64 = 315_360_000;
 ///
 /// Only call this when TTL > 0. TTL=0 means "do not cache / per-request auth"
 /// and should bypass expiry computation entirely.
-pub fn safe_expiry(base: SystemTime, ttl: Duration) -> SystemTime {
+pub(crate) fn safe_expiry(base: SystemTime, ttl: Duration) -> SystemTime {
     const MAX_TTL: Duration = Duration::from_secs(MAX_TTL_SECS);
     let clamped_ttl = if ttl > MAX_TTL { MAX_TTL } else { ttl };
     base.checked_add(clamped_ttl)
@@ -43,7 +43,7 @@ pub enum ObjectExpirationResult {
 /// Why a caller is looking up cached range coverage.
 ///
 /// The two mechanisms this distinguishes are documented in
-/// `.kiro/steering/cache-coherency-invariants.md` § "The two freshness
+/// the cache coherency invariants § "The two freshness
 /// mechanisms". Stored expiry (`NewCacheMetadata::expires_at`) bounds the lookup;
 /// live TTL (`created_at` against the currently resolved `get_ttl`,
 /// `DiskCacheManager::check_object_expiration`) is the mainline serve gate.
@@ -55,7 +55,7 @@ pub enum ObjectExpirationResult {
 /// live-TTL check and the whole conditional-request path unreachable. Every
 /// sequential re-read of an expired-but-present entry became a full body
 /// transfer plus a cache rewrite. See
-/// `.kiro/specs/expired-entry-revalidation/` and GitHub issue #17.
+/// the expired entry revalidation feature and GitHub issue #17.
 ///
 /// # Choosing one
 ///
@@ -160,29 +160,6 @@ impl RangeLookupResult {
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
-
-    /// Did the entry backing this coverage sit past its stored expiry?
-    ///
-    /// A `true` here means "revalidation candidate", never "serveable".
-    pub fn is_stored_expired(&self) -> bool {
-        self.stored_freshness == StoredFreshness::Expired
-    }
-}
-
-/// Cache entry for storing S3 objects and metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheEntry {
-    pub cache_key: String,
-    pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,
-    pub ranges: Vec<Range>,
-    pub metadata: CacheMetadata,
-    pub created_at: SystemTime,
-    pub expires_at: SystemTime,
-    /// Separate expiration for metadata validation (typically shorter than data TTL)
-    /// Allows HEAD requests to validate object freshness without invalidating cached body
-    pub metadata_expires_at: SystemTime,
-    pub compression_info: CompressionInfo,
 }
 
 /// Cache metadata for S3 objects
@@ -265,15 +242,60 @@ pub struct PartInfo {
 pub struct CachedPartInfo {
     /// Part number (1-10000 per S3 spec)
     pub part_number: u32,
-    /// Size of the part in bytes
+    /// **Uncompressed** size of the part in bytes, i.e. the number of object bytes
+    /// this part contributes.
+    ///
+    /// This is the S3-facing figure: it is what the completed object's byte offsets
+    /// and `total_size` are built from (`finalize_multipart_upload`). It is
+    /// deliberately NOT the length of `part{N}.bin` on disk, which is compressed
+    /// whenever compression applies — see [`Self::compressed_size`]. The two are
+    /// separate figures in separate units and must not be harmonised.
     pub size: u64,
+    /// **Compressed on-disk length** of `mpus_in_progress/{uploadId}/part{N}.bin`,
+    /// `stat`-ed at part-finalize time inside the `part{N}.lock` hold, immediately
+    /// after the rename that published the file.
+    ///
+    /// This is the unit `in_progress_part_bytes` is summed in: real bytes occupying
+    /// the shared volume. It is measured here rather than derived from [`Self::size`]
+    /// because the on-disk file is LZ4-framed, and it is measured *here* rather than
+    /// when the sum is taken because on a retried `CompleteMultipartUpload` the
+    /// `.bin` has already been renamed into `ranges/` and a later `stat` would fail.
+    ///
+    /// # `#[serde(default)]` here is a struct-literal convenience and MUST NOT be used to
+    /// read the byte figure
+    ///
+    /// A record written by a build predating this field has no such key, and this default
+    /// maps that to `0` — the same value a measured zero produces. Summing `P` through this
+    /// type therefore **under-counts** a mixed-version fleet's in-progress bytes, and
+    /// § 16.6.2 is explicit that under-counting is the unsafe direction because it makes the
+    /// staging eviction trigger fire late.
+    ///
+    /// `in_progress_part_bytes` consequently reads part records through its own
+    /// presence-preserving `PartRecordSizeProbe` (`Option<u64>`) and reports UNREADABLE for
+    /// a record with no field, so the fold retains its previous figure rather than
+    /// installing a short one. Do not "simplify" that back to this type.
+    ///
+    /// Spec: cache-eviction-at-scale §§ 16.6.2, 16.6.6.
+    #[serde(default)]
+    pub compressed_size: u64,
     /// ETag returned by S3 for this part
     pub etag: String,
     /// Compression algorithm used for this part (None if uncompressed)
     #[serde(default)]
     pub compression_algorithm: crate::compression::CompressionAlgorithm,
+    /// Identity of the part's `.bin` as its writer published it
+    /// ([`RangeSpec::file_identity`]). The completion renames that file into `ranges/`
+    /// unchanged, which keeps its length and modification time, so it is carried onto the
+    /// range the part becomes. `None` for a record written before the field existed, or one
+    /// whose recorded identity is incomplete ([`lenient_file_identity`]), whose range is then
+    /// unverified. Omitted from the record when `None`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_file_identity",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_identity: Option<RangeFileIdentity>,
 }
-
 impl CachedPartInfo {
     /// Create a new CachedPartInfo
     pub fn new(
@@ -285,19 +307,42 @@ impl CachedPartInfo {
         Self {
             part_number,
             size,
+            compressed_size: 0,
             etag,
             compression_algorithm,
+            file_identity: None,
         }
     }
 
     /// Create a new CachedPartInfo with default compression (Lz4)
-    pub fn new_uncompressed(part_number: u32, size: u64, etag: String) -> Self {
+    ///
+    /// Test seam: production builds parts with [`Self::new`] and an explicit algorithm.
+    #[cfg(test)]
+    pub(crate) fn new_uncompressed(part_number: u32, size: u64, etag: String) -> Self {
         Self {
             part_number,
             size,
+            compressed_size: 0,
             etag,
             compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+            file_identity: None,
         }
+    }
+
+    /// Attach the measured compressed on-disk length of `part{N}.bin`.
+    ///
+    /// A builder rather than a constructor parameter so that the measurement site is
+    /// visibly separate from the S3-facing [`Self::size`]: the only correct source is
+    /// a `stat` of the finalized part file, and no caller should be able to pass
+    /// `size` here by mistake.
+    pub(crate) fn with_compressed_size(mut self, compressed_size: u64) -> Self {
+        self.compressed_size = compressed_size;
+        self
+    }
+    /// Attach the identity of the part file its writer published.
+    pub(crate) fn with_file_identity(mut self, file_identity: Option<RangeFileIdentity>) -> Self {
+        self.file_identity = file_identity;
+        self
     }
 }
 
@@ -335,7 +380,7 @@ impl MultipartUploadTracker {
     }
 
     /// Create a new MultipartUploadTracker with content-type
-    pub fn new_with_content_type(
+    pub(crate) fn new_with_content_type(
         upload_id: String,
         cache_key: String,
         content_type: Option<String>,
@@ -351,7 +396,7 @@ impl MultipartUploadTracker {
     }
 
     /// Add a part to the tracker
-    pub fn add_part(&mut self, part_info: CachedPartInfo) {
+    pub(crate) fn add_part(&mut self, part_info: CachedPartInfo) {
         self.total_size += part_info.size;
 
         // Check if part already exists (re-upload of same part number)
@@ -369,27 +414,10 @@ impl MultipartUploadTracker {
     }
 
     /// Get parts sorted by part number (required for CompleteMultipartUpload)
-    pub fn get_sorted_parts(&self) -> Vec<&CachedPartInfo> {
+    pub(crate) fn get_sorted_parts(&self) -> Vec<&CachedPartInfo> {
         let mut sorted: Vec<&CachedPartInfo> = self.parts.iter().collect();
         sorted.sort_by_key(|p| p.part_number);
         sorted
-    }
-
-    /// Calculate byte offsets for all parts after sorting
-    /// Returns Vec of (part_number, start_offset, end_offset)
-    pub fn calculate_byte_offsets(&self) -> Vec<(u32, u64, u64)> {
-        let sorted_parts = self.get_sorted_parts();
-        let mut offsets = Vec::with_capacity(sorted_parts.len());
-        let mut current_offset: u64 = 0;
-
-        for part in sorted_parts {
-            let start = current_offset;
-            let end = current_offset + part.size - 1;
-            offsets.push((part.part_number, start, end));
-            current_offset += part.size;
-        }
-
-        offsets
     }
 
     /// Check if the upload has exceeded the given TTL
@@ -406,7 +434,7 @@ impl MultipartUploadTracker {
     }
 
     /// Deserialize from JSON
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+    pub(crate) fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
 }
@@ -560,7 +588,7 @@ impl ObjectMetadata {
     /// that; it is enforced by never calling it with anything else.
     ///
     /// Spec: write-cache-last-modified. Requirements: 3.1, 3.2
-    pub fn set_last_modified(&mut self, last_modified: String) {
+    pub(crate) fn set_last_modified(&mut self, last_modified: String) {
         self.last_modified.clone_from(&last_modified);
         self.response_headers
             .retain(|name, _| !name.eq_ignore_ascii_case("last-modified"));
@@ -626,39 +654,8 @@ impl ObjectMetadata {
             graduation_accounted: false,
         }
     }
-    /// Create a new ObjectMetadata with compression information and complete headers
-    pub fn new_with_compression_and_headers(
-        etag: String,
-        last_modified: String,
-        content_length: u64,
-        content_type: Option<String>,
-        response_headers: HashMap<String, String>,
-        compression_algorithm: CompressionAlgorithm,
-        compressed_size: u64,
-    ) -> Self {
-        Self {
-            etag,
-            last_modified,
-            content_length,
-            content_type,
-            response_headers,
-            upload_state: UploadState::Complete,
-            cumulative_size: content_length,
-            parts: Vec::new(),
-            compression_algorithm,
-            compressed_size,
-            parts_count: None,
-            part_ranges: HashMap::new(),
-            upload_id: None,
-            is_write_cached: false,
-            write_cache_expires_at: None,
-            write_cache_created_at: None,
-            write_cache_last_accessed: None,
-            graduation_accounted: false,
-        }
-    }
     /// Check if write cache entry is expired
-    pub fn is_write_cache_expired(&self) -> bool {
+    pub(crate) fn is_write_cache_expired(&self) -> bool {
         if !self.is_write_cached {
             return false;
         }
@@ -824,6 +821,158 @@ pub struct RangeSpec {
     /// Spec: write-cache-accounting-and-eviction. Requirements: 12.1
     #[serde(default)]
     pub staged: Option<bool>,
+
+    /// The extent is listed only so its `.bin` stays named and evictable; its bytes may
+    /// belong to another object version and must never be served.
+    ///
+    /// Set by `retire_other_version_fills` when an other-version fill's `.bin` cannot be
+    /// unlinked. Every range lookup ([`crate::disk_cache::DiskCacheManager::find_cached_ranges`])
+    /// skips such an extent, so it reads as missing and the request refetches. A later
+    /// consolidation that unlinks the file, an eviction of the extent, or a current-version
+    /// fill that republishes the extent removes or replaces the listing.
+    ///
+    /// A field rather than a sentinel in an existing field: every existing field (`file_path`,
+    /// sizes, timestamps, `access_count`) is read by eviction, accounting or LRU ordering, which
+    /// must keep working on this extent. A `bool` default of `false` is correct for every
+    /// `.meta` written before the field existed, since no earlier release marked an extent.
+    /// Omitted from the document when `false`, so ordinary `.meta` bytes are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unservable: bool,
+
+    /// Identity of the `.bin` its writer published ([`RangeFileIdentity`]): the file's length
+    /// and modification time, taken by `fstat` of a descriptor the writer opens after it has
+    /// synced and closed the one it wrote through. The listing's ETag says which version the
+    /// range is; this says which file holds it. A read serves the range only when `fstat` of
+    /// the descriptor it reads through reports a matching identity
+    /// ([`RangeFileIdentity::matches`]), so another version's file renamed over the same path
+    /// (the `.bin` path is version-independent) is a miss, not a wrong-version serve.
+    ///
+    /// Carried unchanged through the journal `Add` (whose `range_spec` is this struct), the
+    /// multipart part record ([`CachedPartInfo::file_identity`]) and every consolidation that
+    /// clones a listing. A listing rebuilt without it never invents one.
+    ///
+    /// `None` for every listing written before 3.0.0, for a writer whose `fstat` failed, and
+    /// for carriers that name an extent without describing a file (`Remove`, `Graduation`,
+    /// cache-hit updates). A `None` listing that starts at offset 0 and stops short of the object is
+    /// refetched once on its first read (see `is_unverified_prefix`); every other `None` listing is
+    /// served unverified, as every listing was before.
+    ///
+    /// Additive: omitted from the document when `None`, and no struct that parses a `.meta`
+    /// or a journal line rejects unknown fields, so a pre-3.0 proxy parses a listing carrying
+    /// it. That proxy drops it when it rewrites the `.meta` (it has no field to keep it in),
+    /// and the listing is then unverified. A `content_hash` written by an unreleased 3.0
+    /// development build is an unknown field here and is ignored the same way, and so is an
+    /// identity that build recorded as inode number and length: it records no modification
+    /// time, so it parses to `None` ([`lenient_file_identity`]).
+    #[serde(
+        default,
+        deserialize_with = "lenient_file_identity",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_identity: Option<RangeFileIdentity>,
+}
+
+/// Which file a range listing describes: length and modification time of the published `.bin`
+/// ([`RangeSpec::file_identity`]).
+///
+/// - `size` is the file's length after the writer's sync, which every client sees once it
+///   opens the file (close-to-open). Two versions of one extent can share a length (store-mode
+///   frames of equal-length data), so it is never enough alone.
+/// - `mtime_ns` is the file's modification time, in nanoseconds since the Unix epoch. The
+///   rename that publishes the file keeps it, and so does a copy of the cache made with a tool
+///   that preserves modification times (`cp -a`, `rsync -a`), so a copied cache stays valid.
+///   A file renamed over the path was written at another time.
+/// - When the writer takes it: from a descriptor opened after the writing descriptor is
+///   closed ([`crate::disk_cache::identity_after_close`]). An NFS server stamps the
+///   modification time on each WRITE it applies. Closing flushes and releases the writer's
+///   open, and the next open revalidates the attributes with the server, so the writer
+///   records the server's value, which is what a reader's open on any client sees. An
+///   `fstat` of the still-open writer descriptor would report the client's cached
+///   attributes, current only if the bookkeeping of every WRITE reply was.
+/// - Not the inode number: a copy or restore of the volume gives every file a new one, so
+///   every range of a copied cache would miss once, and a file system can hand a freed number
+///   to the next file it creates.
+/// - Not `st_dev`: an NFS client's device number is local to that client.
+///
+/// [`Self::matches`] compares `size` exactly and `mtime_ns` within [`MTIME_MATCH_WINDOW_NS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeFileIdentity {
+    /// `st_size` of the published file, in bytes on disk (the encoded frames).
+    pub size: u64,
+    /// `st_mtime` of the published file, in nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
+}
+
+/// How far apart a recorded and an observed modification time may be and still describe one
+/// file: 1 ms. Amazon EFS stores modification times to the millisecond, so a cache copied with
+/// `cp -a` from a finer file system (ext4, OpenZFS) onto EFS keeps each time only to the
+/// millisecond; exact equality would make about 999 of 1000 of its ranges miss once. The
+/// window costs no discrimination: on EFS 1 ms is the stored granule, and ext4 and OpenZFS
+/// stamp from the kernel clock tick (about 4 to 10 ms), which is coarser, so two fills of one
+/// extent fall inside it only if they share a tick and a compressed length. A copy tool that
+/// truncates to whole seconds (default `tar`, older `rsync`) leaves most times outside it:
+/// those ranges miss, are healed and refill, never served from the wrong file. Not a
+/// configuration field.
+pub const MTIME_MATCH_WINDOW_NS: u64 = 1_000_000;
+
+impl RangeFileIdentity {
+    /// The identity `fstat` (or `stat`) reported. `None` off Unix, or when the modification
+    /// time does not fit `i64` nanoseconds: the range is then recorded unverified.
+    pub fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mtime_ns = meta
+                .mtime()
+                .checked_mul(1_000_000_000)?
+                .checked_add(meta.mtime_nsec())?;
+            Some(Self {
+                size: meta.len(),
+                mtime_ns,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            None
+        }
+    }
+
+    /// Whether `found` (what `fstat` of a read's descriptor reports) is the file this recorded
+    /// identity describes: the same length, and modification times less than
+    /// [`MTIME_MATCH_WINDOW_NS`] apart.
+    pub fn matches(&self, found: &Self) -> bool {
+        self.size == found.size && self.mtime_ns.abs_diff(found.mtime_ns) < MTIME_MATCH_WINDOW_NS
+    }
+}
+
+/// Read a recorded [`RangeFileIdentity`] without ever failing the document that carries it. A
+/// value that is not a complete identity reads as `None`, so its range is unverified rather
+/// than its `.meta`, journal line or part record unreadable. That covers the inode-and-length
+/// identity an earlier 3.0 development build recorded (`{"ino":..,"size":..}`, no `mtime_ns`),
+/// whose inode number is ignored.
+fn lenient_file_identity<'de, D>(deserializer: D) -> Result<Option<RangeFileIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Recorded {
+        size: Option<u64>,
+        mtime_ns: Option<i64>,
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Recorded(Recorded),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Recorded(Recorded {
+            size: Some(size),
+            mtime_ns: Some(mtime_ns),
+        })) => Some(RangeFileIdentity { size, mtime_ns }),
+        _ => None,
+    })
 }
 
 impl RangeSpec {
@@ -853,6 +1002,69 @@ impl RangeSpec {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
+        }
+    }
+    /// Record the identity of the file this listing describes ([`Self::file_identity`]).
+    /// Writers call it with the identity of the file they published; `None` leaves the
+    /// listing unverified.
+    pub fn with_file_identity(mut self, file_identity: Option<RangeFileIdentity>) -> Self {
+        self.file_identity = file_identity;
+        self
+    }
+
+    /// Is this a listing the read paths must not serve, because a release before 3.0.0 may
+    /// have stored another offset's bytes under it? `content_length` is the object's length
+    /// as the listing's document (or journal `Add`) records it.
+    ///
+    /// True for an extent that records no file identity, starts at offset 0, and does not
+    /// reach the end of the object (or whose document records no length at all).
+    ///
+    /// # Why this shape
+    ///
+    /// Before 3.0.0 an open-ended `Range: bytes=N-` or a suffix `Range: bytes=-N` on a key
+    /// with no cached length was forwarded with the client's header, and the `206` body was
+    /// cached as the extent `0..=(len - 1)`: the bytes at offset `N` named as the object's
+    /// first bytes, under the object's true ETag and length. Every such extent starts at 0
+    /// and stops short of the object's end, and every one was written by a release that
+    /// recorded no file identity. Every 3.0.0 writer that publishes a range file records
+    /// one ([`Self::file_identity`]), so a 3.0.0 listing never matches.
+    ///
+    /// The stored response headers cannot tell a shifted extent from a legitimate first
+    /// chunk: a HEAD or a part GET rewrites them, a refill does not refresh them, and a
+    /// document's headers can come from a different fill than the extent. So the rule
+    /// trusts no pre-3.0.0 extent of this shape. A legitimate one (a transfer manager's first
+    /// chunk, a player's opening range, a `bytes=0-99` probe) is fetched from S3 once and
+    /// listed again with an identity, after which the rule never matches it.
+    ///
+    /// Not matched, and served as before: an extent with an identity, a whole-object extent
+    /// (`end + 1 == content_length`), and an extent that starts above 0.
+    ///
+    /// # Where it is applied
+    ///
+    /// `DiskCacheManager::find_cached_ranges` skips a matching `.meta` listing and removes it
+    /// (with its `.bin` and its accounting) under the key's slot lock, so the refill is
+    /// listed in its place; the pending-journal scan behind every journal fallback skips a
+    /// matching `Add`; and the streaming serves' re-read of the `.meta` treats a matching
+    /// listing as unservable.
+    ///
+    /// Off Unix no writer can record an identity ([`RangeFileIdentity::of`]), so the rule
+    /// would refuse every first chunk forever; it is compiled to `false` there.
+    ///
+    /// Compatibility code with an expiry: it can be deleted once no listing written before
+    /// 3.0.0 can remain on a cache volume, one release after every fleet has upgraded.
+    pub fn is_unverified_prefix(&self, content_length: u64) -> bool {
+        #[cfg(unix)]
+        {
+            self.file_identity.is_none()
+                && self.start == 0
+                && (content_length == 0 || self.end.saturating_add(1) < content_length)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = content_length;
+            false
         }
     }
 
@@ -940,9 +1152,36 @@ pub struct NewCacheMetadata {
     /// metadata has no anchor and falls back to `created_at` for freshness.
     #[serde(default)]
     pub head_cached_at: Option<SystemTime>,
+    /// When S3 last confirmed this representation with a `304`. The live GET age is
+    /// measured from the later of this and `created_at` ([`Self::freshness_anchor`]), so a
+    /// revalidated entry is fresh for another `get_ttl` instead of revalidating on every
+    /// read. `created_at` is left alone because eviction, upload timeouts and write-ledger
+    /// ordering read it. `None` for an entry never revalidated, and for metadata written
+    /// before the field existed; omitted from the `.meta` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_validated_at: Option<SystemTime>,
 }
 
 impl NewCacheMetadata {
+    /// The instant the live GET age is measured from: the later of `created_at` and
+    /// `last_validated_at`.
+    pub fn freshness_anchor(&self) -> SystemTime {
+        match self.last_validated_at {
+            Some(validated) if validated > self.created_at => validated,
+            _ => self.created_at,
+        }
+    }
+
+    /// Record that S3 confirmed this representation with a `304`: stored expiry moves to
+    /// `now + ttl` and the live GET age re-anchors to now. Only an origin `304` may call this.
+    /// A Mode B `If-Match` served from cache compares the client's ETag against the cache's
+    /// own and must use [`Self::refresh_object_ttl`] instead.
+    pub fn record_origin_validation(&mut self, ttl: Duration) {
+        let now = SystemTime::now();
+        self.expires_at = safe_expiry(now, ttl);
+        self.last_validated_at = Some(now);
+    }
+
     /// Check if HEAD cache has expired
     /// Returns true if head_expires_at is None or in the past
     pub fn is_head_expired(&self) -> bool {
@@ -1020,6 +1259,7 @@ impl Default for NewCacheMetadata {
             head_last_accessed: None,
             head_access_count: 0,
             head_cached_at: None,
+            last_validated_at: None,
         }
     }
 }
@@ -1158,6 +1398,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         // Serialize
@@ -1246,6 +1488,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         let json = serde_json::to_string(&range_spec).unwrap();
@@ -1405,6 +1649,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         let score = range.lru_score();
@@ -1423,6 +1669,8 @@ mod tests {
             last_accessed: now - std::time::Duration::from_secs(3600),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         assert!(range.lru_score() > older_range.lru_score());
@@ -1444,6 +1692,8 @@ mod tests {
             last_accessed: now - std::time::Duration::from_secs(10),
             access_count: 100,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         // Infrequently accessed, old range
@@ -1458,6 +1708,8 @@ mod tests {
             last_accessed: now - std::time::Duration::from_secs(3600),
             access_count: 5,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         // Hot range should have higher score (less likely to be evicted)
@@ -1478,6 +1730,8 @@ mod tests {
             last_accessed: now - std::time::Duration::from_secs(1800),
             access_count: 5,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         let old_last_accessed = range.last_accessed;
@@ -1925,41 +2179,6 @@ mod tests {
     }
 
     #[test]
-    fn test_multipart_upload_tracker_calculate_byte_offsets() {
-        let mut tracker = MultipartUploadTracker::new(
-            "abc123xyz".to_string(),
-            "test-bucket/test-object".to_string(),
-        );
-
-        // Add parts with different sizes
-        tracker.add_part(CachedPartInfo::new_uncompressed(
-            1,
-            5242880,
-            "\"e1\"".to_string(),
-        ));
-        tracker.add_part(CachedPartInfo::new_uncompressed(
-            2,
-            5242880,
-            "\"e2\"".to_string(),
-        ));
-        tracker.add_part(CachedPartInfo::new_uncompressed(
-            3,
-            1000000,
-            "\"e3\"".to_string(),
-        ));
-
-        let offsets = tracker.calculate_byte_offsets();
-
-        assert_eq!(offsets.len(), 3);
-        // Part 1: 0 to 5242879
-        assert_eq!(offsets[0], (1, 0, 5242879));
-        // Part 2: 5242880 to 10485759
-        assert_eq!(offsets[1], (2, 5242880, 10485759));
-        // Part 3: 10485760 to 11485759
-        assert_eq!(offsets[2], (3, 10485760, 11485759));
-    }
-
-    #[test]
     fn test_multipart_upload_tracker_serialization() {
         let mut tracker = MultipartUploadTracker::new(
             "abc123xyz".to_string(),
@@ -2062,85 +2281,6 @@ mod tests {
         )
     }
 
-    /// **Feature: write-through-cache-finalization, Property 6: Multipart byte offset calculation**
-    /// *For any* multipart upload with N parts, the final byte offsets SHALL be calculated such that
-    /// part K starts at sum(size of parts 1 to K-1) and ends at sum(size of parts 1 to K) - 1.
-    /// **Validates: Requirements 2.3, 3.2**
-    #[quickcheck]
-    fn prop_multipart_byte_offset_calculation(part_sizes: Vec<u16>) -> TestResult {
-        // Filter out invalid inputs
-        if part_sizes.is_empty() || part_sizes.len() > 20 {
-            return TestResult::discard();
-        }
-
-        // Ensure all parts have non-zero size
-        let part_sizes: Vec<u64> = part_sizes
-            .iter()
-            .map(|&s| (s as u64).max(1) * 1024) // At least 1KB per part
-            .collect();
-
-        let mut tracker = MultipartUploadTracker::new(
-            "test-upload".to_string(),
-            "test-bucket/test-object".to_string(),
-        );
-
-        // Add parts with the given sizes
-        for (i, &size) in part_sizes.iter().enumerate() {
-            let part_number = (i + 1) as u32;
-            let part = CachedPartInfo::new_uncompressed(
-                part_number,
-                size,
-                format!("\"etag{}\"", part_number),
-            );
-            tracker.add_part(part);
-        }
-
-        // Calculate byte offsets
-        let offsets = tracker.calculate_byte_offsets();
-
-        // Verify the number of offsets matches the number of parts
-        if offsets.len() != part_sizes.len() {
-            return TestResult::failed();
-        }
-
-        // Verify byte offset properties:
-        // 1. Part K starts at sum(size of parts 1 to K-1)
-        // 2. Part K ends at sum(size of parts 1 to K) - 1
-        // 3. No gaps or overlaps between consecutive parts
-        let mut expected_start: u64 = 0;
-
-        for (i, (part_number, start, end)) in offsets.iter().enumerate() {
-            let expected_size = part_sizes[i];
-            let expected_end = expected_start + expected_size - 1;
-
-            // Verify part number is correct (1-indexed)
-            if *part_number != (i + 1) as u32 {
-                return TestResult::failed();
-            }
-
-            // Verify start offset
-            if *start != expected_start {
-                return TestResult::failed();
-            }
-
-            // Verify end offset
-            if *end != expected_end {
-                return TestResult::failed();
-            }
-
-            // Update expected start for next part
-            expected_start = expected_end + 1;
-        }
-
-        // Verify total size matches sum of all parts
-        let total_size: u64 = part_sizes.iter().sum();
-        if tracker.total_size != total_size {
-            return TestResult::failed();
-        }
-
-        TestResult::passed()
-    }
-
     /// **Feature: write-through-cache-finalization, Property 9: Abort upload cleanup**
     /// *For any* AbortMultipartUpload request, all cached parts and tracking metadata for that uploadId SHALL be immediately removed.
     /// **Validates: Requirements 4.5, 8.5**
@@ -2176,7 +2316,8 @@ mod tests {
             // buffered `cache_upload_part` helper was removed as dead code; this
             // test targets abort cleanup (`cleanup_multipart_upload`), so it only
             // needs parts present on disk, not the write path itself.
-            let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+            let multipart_dir =
+                crate::signed_put_handler::mpu_upload_dir(temp_dir.path(), upload_id);
             tokio::fs::create_dir_all(&multipart_dir).await.unwrap();
 
             let mut tracker =
@@ -2261,13 +2402,14 @@ mod tests {
                 10.0,                       // 10% for write cache
                 Duration::from_secs(86400), // 1 day write TTL
                 ttl,                        // Short incomplete upload TTL for testing
-                CacheEvictionAlgorithm::LRU,
+                CacheEvictionAlgorithm::TinyLFU,
                 256 * 1024 * 1024, // 256MB max object size
             );
 
             // Create an incomplete multipart upload
             let upload_id = "test-upload-eviction";
-            let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+            let multipart_dir =
+                crate::signed_put_handler::mpu_upload_dir(temp_dir.path(), upload_id);
 
             if tokio::fs::create_dir_all(&multipart_dir).await.is_err() {
                 return TestResult::failed();
@@ -2444,6 +2586,79 @@ mod head_cached_at_tests {
         assert_eq!(parsed.cache_key, "bucket/key");
     }
 
+    #[test]
+    fn metadata_without_last_validated_at_parses_and_serializes_unchanged() {
+        let value = serde_json::to_value(NewCacheMetadata::default()).unwrap();
+        assert!(
+            value.get("last_validated_at").is_none(),
+            "an unvalidated entry must not grow the .meta"
+        );
+        let metadata: NewCacheMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(metadata.last_validated_at, None);
+        assert_eq!(metadata.freshness_anchor(), metadata.created_at);
+    }
+
+    /// a `.meta` range written before `unservable` existed parses as servable, and a
+    /// servable range does not grow the document. A marked range round-trips.
+    #[test]
+    fn range_spec_without_unservable_parses_as_servable_and_round_trips() {
+        let mut value = serde_json::to_value(RangeSpec::new(
+            0,
+            9,
+            "b/x_0-9.bin".into(),
+            CompressionAlgorithm::Lz4,
+            10,
+            10,
+        ))
+        .unwrap();
+        assert!(
+            value.get("unservable").is_none(),
+            "a servable range must not grow the .meta"
+        );
+        value.as_object_mut().unwrap().remove("unservable");
+        let parsed: RangeSpec = serde_json::from_value(value).unwrap();
+        assert!(!parsed.unservable, "a pre-field range is servable");
+
+        let marked = RangeSpec {
+            unservable: true,
+            file_identity: None,
+            ..parsed
+        };
+        let text = serde_json::to_string(&marked).unwrap();
+        assert!(text.contains("\"unservable\":true"));
+        let back: RangeSpec = serde_json::from_str(&text).unwrap();
+        assert!(back.unservable, "the marker survives a .meta round trip");
+    }
+
+    #[test]
+    fn record_origin_validation_reanchors_age_but_not_created_at() {
+        let created = SystemTime::now() - Duration::from_secs(7200);
+        let mut metadata = NewCacheMetadata {
+            created_at: created,
+            ..Default::default()
+        };
+        metadata.record_origin_validation(Duration::from_secs(3600));
+        assert_eq!(metadata.created_at, created, "created_at keeps its meaning");
+        assert!(metadata.freshness_anchor().elapsed().unwrap() < Duration::from_secs(5));
+        assert!(metadata.expires_at > SystemTime::now());
+
+        // Mode B's refresh moves stored expiry only.
+        let mut mode_b = NewCacheMetadata {
+            created_at: created,
+            ..Default::default()
+        };
+        mode_b.refresh_object_ttl(Duration::from_secs(3600));
+        assert_eq!(mode_b.freshness_anchor(), created);
+
+        // An anchor older than created_at (a stale field on a re-cached entry) never makes
+        // an entry look older than it is.
+        let recached = NewCacheMetadata {
+            last_validated_at: Some(created),
+            ..Default::default()
+        };
+        assert_eq!(recached.freshness_anchor(), recached.created_at);
+    }
+
     // Spec: write-cache-last-modified. Requirements: 1.2, 11.11 (task 1.1)
 
     #[test]
@@ -2583,5 +2798,63 @@ mod head_cached_at_tests {
             om.effective_last_modified(),
             Some("Wed, 09 Sep 2026 10:28:17 GMT")
         );
+    }
+}
+
+/// [`RangeSpec::is_unverified_prefix`] at each boundary it branches on, beside the value one
+/// step across it.
+#[cfg(all(test, unix))]
+mod unverified_prefix_tests {
+    use super::*;
+
+    const LEN: u64 = 4_194_304;
+
+    fn spec(start: u64, end: u64, identity: bool) -> RangeSpec {
+        RangeSpec::new(
+            start,
+            end,
+            format!("b/XX/YYY/k_{}-{}.bin", start, end),
+            CompressionAlgorithm::Lz4,
+            end - start + 1,
+            end - start + 1,
+        )
+        .with_file_identity(identity.then_some(RangeFileIdentity {
+            size: end - start + 1,
+            mtime_ns: 1,
+        }))
+    }
+
+    #[test]
+    fn a_pre_3_0_0_extent_at_zero_short_of_the_end_is_refused() {
+        assert!(spec(0, 99, false).is_unverified_prefix(LEN));
+        // One byte short of the whole object: still refused.
+        assert!(spec(0, LEN - 2, false).is_unverified_prefix(LEN));
+        // A document that records no length.
+        assert!(spec(0, 99, false).is_unverified_prefix(0));
+    }
+
+    #[test]
+    fn the_adjacent_shapes_are_served() {
+        // The whole object.
+        assert!(!spec(0, LEN - 1, false).is_unverified_prefix(LEN));
+        // Starts one byte later.
+        assert!(!spec(1, 99, false).is_unverified_prefix(LEN));
+        // Written by 3.0.0.
+        assert!(!spec(0, 99, true).is_unverified_prefix(LEN));
+        assert!(!spec(0, 99, true).is_unverified_prefix(0));
+    }
+
+    /// A listing a pre-3.0.0 writer left has no `file_identity` key at all, and one an
+    /// earlier 3.0 development build left has an inode-and-length identity; both parse to
+    /// `None` and are refused.
+    #[test]
+    fn pre_3_0_0_listings_parse_to_no_identity() {
+        let mut value = serde_json::to_value(spec(0, 99, true)).unwrap();
+        value.as_object_mut().unwrap().remove("file_identity");
+        let legacy: RangeSpec = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.is_unverified_prefix(LEN));
+        value["file_identity"] = serde_json::json!({"ino": 7, "size": 100});
+        let dev: RangeSpec = serde_json::from_value(value).unwrap();
+        assert!(dev.is_unverified_prefix(LEN));
     }
 }

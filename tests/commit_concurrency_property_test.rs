@@ -130,6 +130,7 @@ async fn setup(cache_dir: &Path) -> (Arc<DiskCacheManager>, Arc<JournalConsolida
         stale_entry_timeout_secs: 300,
         consolidation_cycle_timeout: Duration::from_secs(30),
         max_keys_per_cycle: 5000,
+        ..ConsolidationConfig::default()
     };
     let consolidator = Arc::new(JournalConsolidator::new(
         cache_dir,
@@ -176,7 +177,8 @@ async fn commit_one_range(
     let mut writer = cache_manager
         .begin_incremental_range_write(&cache_key, start, end, false)
         .await
-        .map_err(|e| format!("begin_incremental_range_write failed: {}", e))?;
+        .map_err(|e| format!("begin_incremental_range_write failed: {}", e))?
+        .expect("the capacity guard admits with an unconfigured floor");
 
     // Deterministic content so decompression (if ever re-enabled) would round-trip.
     let payload: Vec<u8> = (0..RANGE_SIZE).map(|i| (i % 251) as u8).collect();

@@ -304,7 +304,8 @@ fn prop_single_task_incremental_equivalent_to_store_range() {
                         e
                     ));
                 }
-            };
+            }
+            .expect("the capacity guard admits with an unconfigured floor");
 
             for (i, chunk) in chunks.iter().enumerate() {
                 if let Err(e) = DiskCacheManager::write_range_chunk(&mut writer, chunk) {

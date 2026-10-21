@@ -26,9 +26,30 @@ fn test_system_metrics() -> SystemMetrics {
         cache: Some(CacheMetrics {
             total_cache_size: 1_000_000,
             max_cache_size_limit: 10_000_000,
+            consumed_bytes: 1_000_000,
+            capacity_guard: s3_proxy::capacity_guard::CapacityGuardGauges::default(),
+            read_fills_declined_max_cache_size_total: 3,
+            hostname_collisions_total: 4,
             read_cache_size: 800_000,
+            read_cache_size_inverted_secs: 1800,
             write_cache_size: 200_000,
             ram_cache_size: 50_000,
+            // Non-zero deliberately: `in_progress_part_bytes` is its own gauge and must
+            // not be folded into any of the three size figures above.
+            in_progress_part_bytes: Some(700_000),
+            in_progress_part_bytes_age_secs: Some(2),
+            in_progress_part_bytes_drift_bytes: Some(0),
+            // No eviction pass has completed on this fixture's volume. OTLP export of the
+            // shared eviction result is I6's scope, not this fixture's.
+            eviction_last_result: None,
+            // The size fold's three gauges. Default rather than hand-seeded: OTLP selects
+            // metrics by JSON path and does not name any of them, so this fixture asserts
+            // nothing about them and a seeded figure would imply it did.
+            st_size_fold: Default::default(),
+            tail_partition: Default::default(),
+            tail_selection: Default::default(),
+            eviction_executor: Default::default(),
+            eviction_rates: Default::default(),
             cache_hit_rate_percent: 85.0,
             ram_cache_hit_rate_percent: 40.0,
             total_requests: 1000,
@@ -37,42 +58,71 @@ fn test_system_metrics() -> SystemMetrics {
             evictions: 10,
             corruption_metadata_total: 0,
             corruption_missing_range_total: 0,
-            inconsistency_fixed_total: 0,
-            partial_write_cleanup_total: 0,
             disk_full_events_total: 0,
-            orphaned_files_cleaned_total: 0,
-            lock_timeout_total: 0,
+            metadata_lock_retry_exhausted_total: 0,
+            tee_backpressure_events_total_get: 0,
+            tee_backpressure_wait_ms_total_get: 0,
+            tee_backpressure_events_total_put: 0,
+            tee_backpressure_wait_ms_total_put: 0,
+            tee_abandoned_total_put: 0,
+            metadata_heal_overwrite_total: 0,
+            upstream_idle_abort_total_mid_stream: 0,
+            upstream_idle_abort_total_pre_stream: 0,
+            upstream_idle_retry_total: 0,
+
+            dirent_type_resolution_failures_total: 0,
+            metadata_read_stale_handles_total: 0,
+            metadata_read_stale_handle_misses_total: 0,
             metadata_parse_duration_ms: 1.5,
             metadata_file_size_bytes: 512,
             range_file_count: 42,
             range_load_duration_ms: 3.2,
-            old_cache_key_encounters: 0,
-            cache_write_failures_total: 0,
             incomplete_range_fallbacks: 0,
             cache_bypasses_by_reason: HashMap::new(),
+            origin_marker_mismatch_bypasses_total: 0,
+            origin_marker_unparseable_bypasses_total: 0,
+            origin_marker_unresolved_bypasses_total: 0,
+            uncacheable_aws_host_bypasses_total: 0,
+            write_stamp_retried_total: 0,
+            write_stamp_retry_landed_total: 0,
+            write_stamp_retry_overflow_keys: 0,
+            write_stamp_retry_active_keys: 0,
+            write_stamp_retry_abandoned_total: 0,
+            write_stamp_log_pending_keys: 0,
+            write_stamp_log_replayed_total: 0,
+            write_stamp_log_torn_records_total: 0,
+            write_stamp_log_write_failures_total: 0,
+            write_stamp_log_memory_only: 0,
+            write_stamp_pending_declined_total: 0,
+            volume_stall_breaker_open: 0,
+            volume_stall_breaker_trips_total: 0,
             cache_etag_validations_total: 100,
             cache_etag_mismatches_total: 2,
             cache_range_invalidations_total: 1,
             cache_orphaned_ranges_cleaned_total: 0,
-            cache_operation_duration_ms: 2.0,
             cache_cleanup_failures_total: 0,
             cache_part_hits: 50,
             cache_part_misses: 10,
             cache_part_stores: 60,
             cache_part_evictions: 5,
             cache_part_errors: 0,
-            write_cache_hits: 20,
             incomplete_uploads_evicted: 1,
             ram_cache_hits: 400,
             ram_cache_misses: 600,
             ram_cache_evictions: 30,
             ram_cache_max_size: 100_000,
+            ram_cache_entries: 3,
+            ram_cache_eligibility_skips_total: 7,
             metadata_cache_hits: 300,
             metadata_cache_misses: 200,
             metadata_cache_entries: 500,
             metadata_cache_max_entries: 10_000,
             metadata_cache_evictions: 5,
             metadata_cache_stale_refreshes: 2,
+            metadata_cache_head_hits: 120,
+            metadata_cache_head_misses: 40,
+            metadata_cache_head_disk_hits: 15,
+            metadata_cache_disk_hits: 25,
             bytes_served_from_cache: 50_000_000,
             read_cache_disabled_invalidations_total: 0,
             ttl_revalidations_total: 0,
@@ -87,8 +137,6 @@ fn test_system_metrics() -> SystemMetrics {
             average_compression_ratio: 0.7,
         }),
         connection_pool: Some(ConnectionPoolMetrics {
-            failed_connections: 2,
-            average_latency_ms: 15,
             success_rate_percent: 99.8,
             dns_refresh_count: 5,
             ip_addresses: vec!["52.216.100.1".to_string()],
@@ -103,6 +151,11 @@ fn test_system_metrics() -> SystemMetrics {
         cache_size: None,
         atomic_metadata: None,
         consolidation: None,
+        // No cache-hit update buffer on this fixture. OTLP names no `cache_hit_buffer.*`
+        // instrument, so this fixture asserts nothing about the section, and a populated
+        // value would imply it did.
+        cache_hit_buffer: None,
+        fill_visibility: None,
         coalescing: Some(CoalescingMetrics {
             waits_total: 50,
             cache_hits_after_wait_total: 30,
@@ -144,6 +197,7 @@ fn test_system_metrics() -> SystemMetrics {
             permits_held: 3,
             permits_available: 47,
             permits_held_peak: 5,
+            access_log_records_dropped: 0,
         },
         bucket_traffic: HashMap::new(),
         download_bandwidth: s3_proxy::bandwidth_limiter::BandwidthLimiterSnapshot {
@@ -160,6 +214,11 @@ fn test_system_metrics() -> SystemMetrics {
         },
         inflight_memory: s3_proxy::metrics::InflightMemoryMetrics::default(),
         write_cache: s3_proxy::metrics::WriteCacheMetrics::default(),
+        write_ledger: Default::default(),
+        metrics_collection: Default::default(),
+        volume_snapshot: Default::default(),
+        orphan_reclaim: Default::default(),
+        eviction_worklist: Default::default(),
     }
 }
 
@@ -278,6 +337,11 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
         cache_size: None,
         atomic_metadata: None,
         consolidation: None,
+        // No cache-hit update buffer on this fixture. OTLP names no `cache_hit_buffer.*`
+        // instrument, so this fixture asserts nothing about the section, and a populated
+        // value would imply it did.
+        cache_hit_buffer: None,
+        fill_visibility: None,
         coalescing: None,
         cache_rules: None,
         page_cache: s3_proxy::metrics::PageCacheMetrics {
@@ -307,6 +371,7 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
             permits_held: 0,
             permits_available: 0,
             permits_held_peak: 0,
+            access_log_records_dropped: 0,
         },
         bucket_traffic: HashMap::new(),
         download_bandwidth: s3_proxy::bandwidth_limiter::BandwidthLimiterSnapshot {
@@ -323,6 +388,11 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
         },
         inflight_memory: s3_proxy::metrics::InflightMemoryMetrics::default(),
         write_cache: s3_proxy::metrics::WriteCacheMetrics::default(),
+        write_ledger: Default::default(),
+        metrics_collection: Default::default(),
+        volume_snapshot: Default::default(),
+        orphan_reclaim: Default::default(),
+        eviction_worklist: Default::default(),
     };
 
     let result = exporter.export_metrics(&metrics).await;
@@ -347,28 +417,4 @@ async fn shutdown_without_initialization_is_safe() {
         result.is_ok(),
         "shutdown without initialization should be safe"
     );
-}
-
-// =============================================================================
-// 7. record_proxy_request and record_s3_request are no-ops (don't panic)
-// =============================================================================
-
-#[test]
-fn record_proxy_request_is_noop() {
-    let config = OtlpConfig::default();
-    let exporter = OtlpExporter::new(config);
-
-    // Should not panic
-    exporter.record_proxy_request("GET", 200, 1024, true);
-    exporter.record_proxy_request("PUT", 500, 0, false);
-}
-
-#[test]
-fn record_s3_request_is_noop() {
-    let config = OtlpConfig::default();
-    let exporter = OtlpExporter::new(config);
-
-    // Should not panic
-    exporter.record_s3_request("GET", 100, 2048, true, Some(200));
-    exporter.record_s3_request("HEAD", 50, 0, false, None);
 }

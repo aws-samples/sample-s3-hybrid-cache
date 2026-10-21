@@ -1,21 +1,14 @@
-//! CLI front end for the graded cache-tree fixture generator.
+//! Command-line front end for the graded cache-tree fixture generator.
 //!
-//! Spec: `cache-eviction-at-scale`, task 8. Requirements: 13.1.
+//! The generator lives in `tests/common/graded_fixture.rs` and is included here with
+//! `#[path]`. It has to be reachable from `tests/`, because the fixture is validated by reading
+//! it back through the proxy's own code (`CacheManager::collect_range_candidates_for_eviction`)
+//! inside the test suite, and `cargo test` does not run `#[test]` functions that live in an
+//! example. One copy of the generator with two entry points keeps the command-line path and the
+//! tested path the same code.
 //!
-//! The generator itself lives in `tests/common/graded_fixture.rs` and is pulled in
-//! here with `#[path]`. That split is deliberate: the module has to be reachable
-//! from `tests/`, because task 8's validation requirement is that the fixture is
-//! read back through **product** code (`CacheManager::collect_range_candidates_for_eviction`)
-//! inside the gated test suite, and `cargo test` does not run `#[test]`s that live
-//! in an example. Keeping one copy of the generator and two entry points avoids the
-//! alternative, which is a generator whose CLI and whose tested path are different
-//! code.
-//!
-//! # This does NOT build Fixture A or Fixture B
-//!
-//! Those are tasks 9 and 10 and they need an infrastructure decision that has not
-//! been taken. This binary is the tool; the two artefacts are separate work. Use
-//! `--dry-run` to print the plan and the projected footprint without writing.
+//! This binary writes fixture trees; choosing the tree a measurement needs is up to the caller.
+//! Use `--dry-run` to print the plan and the projected footprint without writing anything.
 //!
 //! # Usage
 //!
@@ -23,11 +16,11 @@
 //! cargo run --release --example graded_cache_fixture_gen -- \
 //!     --out tmp/fixture-small --objects 2000 --seed 1 --payload genuine
 //!
-//! # count-scale shape (Fixture A's mode), stub payloads, realistic recorded sizes
+//! # count-scale shape: stub payloads, realistic recorded sizes
 //! cargo run --release --example graded_cache_fixture_gen -- \
 //!     --out tmp/fixture-count --objects 200000 --max-ranges 5 --payload stub:512
 //!
-//! # R13.3 degenerate shapes
+//! # degenerate size distributions
 //! cargo run --release --example graded_cache_fixture_gen -- \
 //!     --out tmp/fixture-uniform --objects 5000 --distribution uniform:65536
 //! cargo run --release --example graded_cache_fixture_gen -- \

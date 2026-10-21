@@ -18,10 +18,38 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Red-side lever for task 49 amendment 2: restore the early return that skipped `.ready`
+/// publication once fold authority latched.
+#[cfg(test)]
+const LATCHED_SKIPS_CAPABILITY_REPUBLISH: bool = false;
+/// Red-side lever: the latched republication runs behind the consolidation
+/// lock again, inside `maintain_staged_authority`, so a lock-losing proxy never refreshes.
+#[cfg(test)]
+const LATCHED_REPUBLISH_UNDER_LOCK: bool = false;
 
 /// Maximum concurrent cache keys processed in a single consolidation cycle
 const KEY_CONCURRENCY_LIMIT: usize = 32;
+
+/// Consolidation intervals the in-loop read-tier trigger waits after a pass that authored
+/// nothing, in place of one.
+///
+/// Named for the observation, not for one of its causes: a pass can author nothing because a
+/// work-list generation is still in flight, because a peer holds the global eviction lock,
+/// because the shortfall came out at zero, or because the capability gate read `NotCapable`.
+/// The backoff is right in all four, so it keys on the observation.
+///
+/// A pass that authors nothing while a work-list generation is still in flight has read every
+/// chunk's done-marker to find that out: 1.2 to 3.4 s of shared-volume reads for 200 to 500
+/// chunks, measured on FSx for NetApp ONTAP. Repeating it on every interval for the length of a
+/// drain would put that read load on the volume the executors are deleting from. Two, because
+/// the drain this waits out took 4.7 to 7.8 s in that cell against a 5 s interval, so one
+/// backoff covers it; a longer one would give the cadence back to the drain.
+const INLOOP_TRIGGER_BARREN_INTERVALS: u32 = 2;
+/// How often the per-generation pickup (`JournalConsolidator::spawn_authored_executor_pass`)
+/// retries the executor claim while a scheduled pass holds it.
+const AUTHORED_PICKUP_CLAIM_POLL: Duration = Duration::from_millis(50);
 
 /// Minimum seconds between Write_Ledger compaction passes.
 ///
@@ -32,6 +60,17 @@ const KEY_CONCURRENCY_LIMIT: usize = 32;
 /// I/O while still keeping the ledger proportional to what is actually staged, and most
 /// retirement happens opportunistically inside `evict_staging_tier` anyway.
 const LEDGER_COMPACTION_INTERVAL_SECS: u64 = 300;
+
+/// Seconds before a budget-stopped Write_Ledger compaction pass resumes from its cursor.
+///
+/// A pass that stops at its budget used to leave itself due on the very next cycle, so on a
+/// ledger too large for one budget every lock-holder cycle spent its budget (and, before the
+/// shard rotation, an unbudgeted whole-volume rewrite read) compacting while journal entries
+/// from every proxy waited behind it. Resuming after this delay instead caps compaction's
+/// share of the global consolidation lock at roughly one budget per minute rather than one
+/// budget per cycle, and still finishes a rotation far sooner than one pass per
+/// [`LEDGER_COMPACTION_INTERVAL_SECS`] would.
+const LEDGER_COMPACTION_RESUME_SECS: u64 = 60;
 
 /// Result of journal discovery, including per-file entry counts for optimized cleanup.
 ///
@@ -70,6 +109,57 @@ mod systemtime_serde {
     }
 }
 
+/// `graduation_noop_entries_total` — `Graduation` journal entries parsed, applied as
+/// cleanup-only no-ops, and retired since process start (design § 16.6.7, § 16.6.8).
+///
+/// Per-instance, like every other `/metrics` counter, and read through
+/// [`graduation_noop_entries_total`].
+///
+/// # What a non-zero value means, and it is NOT a fault
+///
+/// It is the drain rate of the legacy debit channel. After activation, every `Graduation`
+/// entry still in a journal file — written during Phase L, or by a peer that had not yet
+/// observed the epoch — passes through the no-op arm and is retired. So this counter rises
+/// after activation and then stops, and a value that keeps rising indefinitely means
+/// something is still **writing** Graduation entries, which after activation only a
+/// pre-C-behaving instance does. Read it with
+/// `staged_authority_foreign_write_total`.
+///
+/// A process-global `AtomicU64` rather than a field, because it is incremented from
+/// `apply_journal_entries`, which is `&self`, synchronous, and not `Result`-returning — the
+/// same shape and the same reason as `staged_fold`'s counters.
+static GRADUATION_NOOP_ENTRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// `graduation_noop_entries_total`, per-instance since process start. See
+/// [`GRADUATION_NOOP_ENTRIES_TOTAL`] for how to read it.
+pub(crate) fn graduation_noop_entries_total() -> u64 {
+    GRADUATION_NOOP_ENTRIES_TOTAL.load(Ordering::Relaxed)
+}
+/// Journal lines the most recent `cleanup_consolidated_entries` pass that removed anything
+/// found it could not parse and left in place. A gauge, per-instance: non-zero during a
+/// rolling upgrade is expected (a newer build's entries this build cannot apply) and should
+/// return to zero once every instance runs the newer build; non-zero on a uniform fleet means
+/// torn or corrupt journal lines.
+static RETAINED_UNPARSEABLE_JOURNAL_LINES: AtomicU64 = AtomicU64::new(0);
+/// `journal_unparseable_lines_retained`. See [`RETAINED_UNPARSEABLE_JOURNAL_LINES`].
+pub(crate) fn retained_unparseable_journal_lines() -> u64 {
+    RETAINED_UNPARSEABLE_JOURNAL_LINES.load(Ordering::Relaxed)
+}
+/// Range `Add` and `Update` journal entries discarded because their range file was still absent after
+/// `stale_entry_timeout_secs`, so the credit they carried was never applied. Published as
+/// `atomic_metadata.journal_validation_failures`. Per-instance, monotone since process start.
+///
+/// Only the range-file arm of `validate_journal_entries_with_staleness` counts. An entry
+/// dropped because its range was just evicted is expected and not counted, nor is an
+/// object-level entry whose `.meta` has gone.
+static JOURNAL_VALIDATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// `atomic_metadata.journal_validation_failures`. See [`JOURNAL_VALIDATION_FAILURES`].
+pub(crate) fn journal_validation_failures() -> u64 {
+    JOURNAL_VALIDATION_FAILURES.load(Ordering::Relaxed)
+}
+/// Minimum interval between WARNs about retained unparseable journal lines.
+const UNPARSEABLE_WARN_INTERVAL_SECS: u64 = 300;
+
 /// Persistent size state - source of truth for cache size
 /// File: size_tracking/size_state.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,14 +193,58 @@ pub struct SizeState {
     /// global lock, and re-grounded absolutely by a full Validation_Scan. No other
     /// component may write it.
     ///
+    /// # The subset invariant holds on projections, not on this document
+    ///
+    /// `write_cache_size <= total_size` (Requirement 6.4) is enforced by the validation
+    /// install on the figures projected by the pending delta files and its carry, not on what
+    /// it persists. So a persisted document can hold `write_cache_size > total_size` between a
+    /// carried install and the next delta apply by any instance, normally one consolidation
+    /// cycle. The cycle's delta apply clamps neither figure against the other either. Every
+    /// reader that derives the read tier from this document must saturate
+    /// (`total_size.saturating_sub(write_cache_size)`), never subtract.
+    ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 9.5
     pub write_cache_size: u64,
 
-    /// Number of distinct cached objects (unique cache keys with at least one range on disk).
-    /// Incremented when a new object is first evicted (metadata deleted = all ranges gone).
-    /// Recalculated during validation scans by counting .meta files.
+    /// Number of cache metadata (`.meta`) entries on the shared volume, ranged and
+    /// HEAD-only alike: the population the `st_size` shard sum counts.
+    /// Incremented when a `.meta` appears where no parseable one existed, decremented when
+    /// one is unlinked, and re-grounded by every validation census, which counts `.meta`
+    /// files.
     #[serde(default)]
     pub cached_objects: u64,
+
+    /// `Schema_Fence` — the document's schema version, bumped as part of the staged-authority
+    /// activation transaction and at no other time.
+    ///
+    /// `#[serde(default)]` yields
+    /// [`crate::staged_authority::SIZE_STATE_SCHEMA_LEGACY`] (`0`) for every
+    /// `size_state.json` on any fleet today, which is correct: throughout Phase L a C-capable
+    /// binary deliberately keeps writing `0`, so a node can still be rolled back to a pre-C
+    /// binary during the upgrade window. It becomes
+    /// [`crate::staged_authority::SIZE_STATE_SCHEMA_FOLD`] at activation, after which
+    /// rollback is not supported.
+    ///
+    /// **Read the fence constant's doc before relying on this.** Its efficacy is conditional
+    /// on a property of the *old* binary that no new code can establish, and it is tested at
+    /// the Phase 4 fleet gate rather than here.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.6.
+    #[serde(default)]
+    pub schema: u32,
+
+    /// The staged-authority epoch this document was written under, mirrored from
+    /// `staged_authority_epoch.json` by the activation transaction.
+    ///
+    /// It is duplicated here rather than only in its own document because
+    /// `Foreign_Write_Detection` needs a signature **inside the file a pre-C binary
+    /// rewrites**. A pre-C binary cannot write this field, so after activation a
+    /// `size_state.json` reporting `0` here means one has — which is the whole detection
+    /// (see [`crate::staged_authority::detect_foreign_size_state`]).
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.6.
+    #[serde(default)]
+    pub staged_authority_epoch: u64,
 
     /// Timestamp of last consolidation
     #[serde(with = "systemtime_serde")]
@@ -129,6 +263,8 @@ impl Default for SizeState {
             total_size: 0,
             write_cache_size: 0,
             cached_objects: 0,
+            schema: crate::staged_authority::SIZE_STATE_SCHEMA_LEGACY,
+            staged_authority_epoch: crate::staged_authority::EPOCH_LEGACY,
             last_consolidation: UNIX_EPOCH,
             consolidation_count: 0,
             last_updated_by: String::new(),
@@ -163,6 +299,38 @@ pub struct ConsolidationConfig {
     /// Limits NFS I/O during discovery and ensures the cycle completes within the timeout.
     /// When the backlog exceeds this cap, remaining keys are processed in subsequent cycles.
     pub max_keys_per_cycle: usize,
+    /// Interval floor for the `st_size` fold, from `cache.shared_storage.shard_fold_interval`
+    /// (default: 1h).
+    ///
+    /// Carried here because the scheduler holds a `ConsolidationConfig` and nothing else that
+    /// reaches the application configuration. Without these two fields the pass ran on
+    /// `SharedStorageConfig::default()` whatever an operator had set, which was a defect in the
+    /// direction of more shared-storage I/O than asked for: the value is a floor, and the reason
+    /// to raise it is almost always a volume that cannot take the default.
+    pub shard_fold_interval: Duration,
+    /// Wall-clock budget for one `st_size` fold pass, from
+    /// `cache.shared_storage.shard_fold_max_duration` (default: 30m). See
+    /// [`Self::shard_fold_interval`] for why it lives here.
+    pub shard_fold_max_duration: Duration,
+    /// Minimum **compressed** range size for a tail-delta append, from
+    /// `cache.shared_storage.tail_floor_bytes` (default: 1 MiB).
+    ///
+    /// Must be the same floor the rolling pass builds partitions with, or the delta and the
+    /// partitions disagree about membership. Carried here for the same reason as the two fold
+    /// fields above: the consolidation cycle holds a `ConsolidationConfig` and nothing else that
+    /// reaches the application configuration.
+    ///
+    /// Spec: cache-eviction-at-scale § 4.4.
+    pub tail_floor_bytes: u64,
+    /// Per-instance cap on tail-delta records, from
+    /// `cache.shared_storage.tail_delta_max_entries` (default: 4096).
+    ///
+    /// The append site is the only place the file can be size-capped, and capping it is what
+    /// makes § 4.5's read of it bounded independently of cache size. Carried here for the same
+    /// reason as [`Self::tail_floor_bytes`].
+    ///
+    /// Spec: cache-eviction-at-scale § 4.4, § 4.5. Requirements: 3.3, 1.5.
+    pub tail_delta_max_entries: usize,
 }
 
 impl Default for ConsolidationConfig {
@@ -177,6 +345,15 @@ impl Default for ConsolidationConfig {
             stale_entry_timeout_secs: 300, // 5 minutes
             consolidation_cycle_timeout: Duration::from_secs(30),
             max_keys_per_cycle: 5000,
+            // Read off `SharedStorageConfig::default()` rather than restated, so the two figures
+            // have one source and cannot drift from the ones `config/config.example.yaml`
+            // documents.
+            shard_fold_interval: crate::config::SharedStorageConfig::default().shard_fold_interval,
+            shard_fold_max_duration: crate::config::SharedStorageConfig::default()
+                .shard_fold_max_duration,
+            tail_floor_bytes: crate::config::SharedStorageConfig::default().tail_floor_bytes,
+            tail_delta_max_entries: crate::config::SharedStorageConfig::default()
+                .tail_delta_max_entries,
         }
     }
 }
@@ -217,6 +394,12 @@ pub struct ConsolidationCycleResult {
     /// Net size change from this cycle (can be negative)
     pub size_delta: i64,
 
+    /// Net write-cache size change collected from the accumulators' delta files and applied
+    /// with `size_delta`. Graduation debits from this cycle's journal keys are not included;
+    /// they are counted by `entries_consolidated`. Matches the `write_cache_delta=` field of
+    /// the `Consolidation cycle complete` line.
+    pub write_cache_delta: i64,
+
     /// Duration of the consolidation cycle
     pub cycle_duration: Duration,
 
@@ -229,7 +412,7 @@ pub struct ConsolidationCycleResult {
     /// byte count exists, and a `bytes_evicted` field here was structurally always 0
     /// from v1.1.35 until it was removed. The real figure is logged by the spawned task
     /// itself ("Background eviction completed: bytes_freed=..."); exposing it on
-    /// `/metrics` is owned by Requirement 12.1 of `.kiro/specs/cache-eviction-at-scale/`.
+    /// `/metrics` is owned by Requirement 12.1 of the cache eviction at scale feature.
     pub eviction_triggered: bool,
 
     /// Current total cache size after this cycle
@@ -292,6 +475,500 @@ pub struct GlobalConsolidationLock {
     pub timeout_seconds: u64,
 }
 
+/// Age past which `reset_all_delta_files` and `reap_stale_delta_tmp_files` remove a
+/// `delta_*.json.tmp`.
+///
+/// `SizeAccumulator::write_delta_file` writes the temp file and renames it in the same call,
+/// so a live writer holds one for one small write plus one rename. An hour is far beyond any
+/// shared-storage stall that write could survive, so an older temp file has no writer left.
+/// If the rule is ever wrong, the writer's rename fails and `flush` restores the delta to the
+/// accumulator, so the cost is a retried flush rather than a lost delta.
+const STALE_DELTA_TMP_MIN_AGE: Duration = Duration::from_secs(3600);
+
+/// Bound on taking `size_state.lock` for a delta apply or a validation install.
+const SIZE_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A held `size_state.lock`: the flocked descriptor plus this process's gate in front of it.
+///
+/// Field order is drop order: the descriptor closes (releasing the flock) before the gate
+/// opens, so the next in-process caller never starts a kernel wait the holder still blocks.
+struct SizeStateLock {
+    _file: std::fs::File,
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+impl Drop for SizeStateLock {
+    /// Unlock before the fields drop: a child forked while the file was open keeps the flock
+    /// alive otherwise (see [`unlock_lock_file`]).
+    fn drop(&mut self) {
+        unlock_lock_file(&self._file, "size_state.lock");
+    }
+}
+
+/// `size_state.json`'s synchronous read and atomic write, owned so a read-modify-write can run
+/// on the blocking thread that holds `size_state.lock`.
+///
+/// A holder that awaited `tokio::fs` while it held the flock needed a SECOND blocking-pool
+/// thread to finish its critical section. Any other pool consumer that filled the pool then
+/// stalled it while it held a fleet-wide lock, and every peer's accounting stalled behind it.
+/// Running the whole read-modify-write on the thread that took the flock means the holder
+/// never asks the pool for anything. See [`JournalConsolidator::with_size_state_locked`].
+#[derive(Clone)]
+struct SizeStateFile {
+    path: PathBuf,
+    cache_dir: PathBuf,
+    /// The consolidator's last reading of the file: `None` before any read, `Some(None)` when
+    /// the last read failed, `Some(Some(state))` after a successful read or write. Served to
+    /// `/health`, `/metrics` and the dashboard so a scrape reads no shared storage.
+    memo: Arc<Mutex<Option<Option<SizeState>>>>,
+}
+
+/// The memo type [`SizeStateFile`] and the consolidator share.
+type SizeStateMemo = Arc<Mutex<Option<Option<SizeState>>>>;
+
+impl SizeStateFile {
+    /// Synchronous body of [`JournalConsolidator::load_size_state`]; records the result in
+    /// the scrape memo.
+    fn load(&self) -> Result<SizeState> {
+        let loaded = self.load_from_disk();
+        if let Ok(mut memo) = self.memo.lock() {
+            *memo = Some(loaded.as_ref().ok().cloned());
+        }
+        loaded
+    }
+
+    /// Synchronous body of [`JournalConsolidator::persist_size_state_internal`]; records the
+    /// written state in the scrape memo.
+    fn persist(&self, state: &SizeState) -> Result<()> {
+        let written = self.persist_to_disk(state);
+        if written.is_ok() {
+            if let Ok(mut memo) = self.memo.lock() {
+                *memo = Some(Some(state.clone()));
+            }
+        }
+        written
+    }
+
+    fn load_from_disk(&self) -> Result<SizeState> {
+        if !self.path.exists() {
+            debug!(
+                "Size state file does not exist, using default: path={:?}",
+                self.path
+            );
+            return Ok(SizeState::default());
+        }
+
+        let content = std::fs::read_to_string(&self.path).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to read size state file: {}", e))
+        })?;
+
+        let state: SizeState = serde_json::from_str(&content).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to parse size state file: {}", e))
+        })?;
+
+        debug!(
+            "Loaded size state: total_size={}, consolidation_count={}",
+            state.total_size, state.consolidation_count
+        );
+
+        Ok(state)
+    }
+
+    /// The write itself; [`JournalConsolidator::persist_size_state_internal`]'s doc comment
+    /// explains the `Schema_Fence` re-stamp.
+    fn persist_to_disk(&self, state: &SizeState) -> Result<()> {
+        let mut owned;
+        let state = if crate::staged_authority::fold_authority_active_latched(&self.cache_dir)
+            && (state.schema != crate::staged_authority::SIZE_STATE_SCHEMA_FOLD
+                || state.staged_authority_epoch != crate::staged_authority::EPOCH_FOLD)
+        {
+            owned = state.clone();
+            owned.schema = crate::staged_authority::SIZE_STATE_SCHEMA_FOLD;
+            owned.staged_authority_epoch = crate::staged_authority::EPOCH_FOLD;
+            debug!(
+                "Re-stamped the size_state Schema_Fence on write: the epoch is active, so a \
+                 document carrying schema {} / epoch {} would be indistinguishable from a pre-C \
+                 write.",
+                state.schema, state.staged_authority_epoch
+            );
+            &owned
+        } else {
+            state
+        };
+        // Ensure parent directory exists
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProxyError::CacheError(format!("Failed to create size_tracking directory: {}", e))
+            })?;
+        }
+
+        // Serialize to JSON
+        let json_content = serde_json::to_string_pretty(&state).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to serialize size state: {}", e))
+        })?;
+
+        // Atomic write: write to temp file then rename
+        // Use instance-specific tmp file to avoid race conditions on shared storage
+        let instance_suffix = format!(
+            "{}.{}",
+            gethostname::gethostname().to_string_lossy(),
+            std::process::id()
+        );
+        let tmp_extension = format!("json.tmp.{}", instance_suffix);
+        let temp_path = self.path.with_extension(&tmp_extension);
+
+        // Write to temporary file
+        if let Err(e) = std::fs::write(&temp_path, &json_content) {
+            warn!(
+                "Failed to write size state temp file: temp_path={:?}, error={}",
+                temp_path, e
+            );
+            // Clean up temp file on write failure
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(ProxyError::CacheError(format!(
+                "Failed to write size state temp file: {}",
+                e
+            )));
+        }
+
+        // Atomic rename
+        if let Err(e) = std::fs::rename(&temp_path, &self.path) {
+            warn!(
+                "Failed to rename size state file: temp_path={:?}, final_path={:?}, error={}",
+                temp_path, self.path, e
+            );
+            // Clean up temp file on rename failure
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(ProxyError::CacheError(format!(
+                "Failed to rename size state file: {}",
+                e
+            )));
+        }
+
+        debug!(
+            "Persisted size state: total_size={}, write_cache_size={}, path={:?}",
+            state.total_size, state.write_cache_size, self.path
+        );
+
+        Ok(())
+    }
+}
+
+/// [`JournalConsolidator::with_size_state_locked`]'s handshake between the caller's budget
+/// and the blocking thread: whichever side moves it off `PENDING` first decides whether the
+/// critical section runs.
+const SIZE_STATE_CLAIM_PENDING: u8 = 0;
+const SIZE_STATE_CLAIM_RUNNING: u8 = 1;
+const SIZE_STATE_CLAIM_ABANDONED: u8 = 2;
+
+/// Abandons a [`JournalConsolidator::with_size_state_locked`] call whose caller is dropped
+/// while the claim is still `PENDING`.
+///
+/// The critical section runs on a blocking thread, which outlives a dropped caller: without
+/// this, a caller cancelled while its thread waits in `flock` (the shutdown path's
+/// `timeout` around the final cycle) leaves that thread to take the flock later and write.
+/// The delta apply keeps its delta files when its caller never saw `Ok`, so that late write
+/// would be applied a second time by the next cycle. On every other path the claim has
+/// already left `PENDING` and the CAS is a no-op.
+struct SizeStateClaimDropGuard(Arc<std::sync::atomic::AtomicU8>);
+
+impl Drop for SizeStateClaimDropGuard {
+    fn drop(&mut self) {
+        let _ = self.0.compare_exchange(
+            SIZE_STATE_CLAIM_PENDING,
+            SIZE_STATE_CLAIM_ABANDONED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+/// Whether a delta temp file's mtime is older than [`STALE_DELTA_TMP_MIN_AGE`]. A file whose
+/// mtime cannot be read, or lies in the future, is treated as fresh and left alone.
+async fn delta_tmp_is_stale(path: &Path) -> bool {
+    match tokio::fs::metadata(path).await.and_then(|m| m.modified()) {
+        Ok(mtime) => SystemTime::now()
+            .duration_since(mtime)
+            .is_ok_and(|age| age > STALE_DELTA_TMP_MIN_AGE),
+        Err(_) => false,
+    }
+}
+
+/// The figures a full validation's census is corrected against: `size_state.json` projected
+/// forward by every pending delta file, read before the walk. See
+/// [`JournalConsolidator::validation_baseline`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidationBaseline {
+    pub(crate) total_size: u64,
+    pub(crate) write_cache_size: u64,
+    pub(crate) cached_objects: u64,
+    /// `size_state.json` was unreadable when the baseline was read, so the figures above are
+    /// the pending delta files projected from zero. See
+    /// [`JournalConsolidator::install_validation_correction`].
+    pub(crate) state_unreadable: bool,
+}
+
+/// What [`JournalConsolidator::collect_deltas`] read: the summed deltas and the files they came
+/// from, still on disk until the caller has persisted the sum.
+#[derive(Debug, Default)]
+pub(crate) struct CollectedDeltas {
+    pub(crate) delta: i64,
+    pub(crate) write_cache_delta: i64,
+    /// Net `cached_objects` change carried by the files: request-path publishes and unlinks,
+    /// accumulated in memory and applied once per cycle.
+    pub(crate) cached_objects_delta: i64,
+    pub(crate) paths: Vec<PathBuf>,
+}
+
+/// One-shot fault for `collect_deltas`' directory listing, keyed by cache_dir so parallel
+/// tests cannot trip each other's.
+#[cfg(test)]
+pub(crate) mod delta_listing_fault {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static FAIL_AFTER: Mutex<Vec<(PathBuf, u32)>> = Mutex::new(Vec::new());
+
+    /// Fail the next listing step of `cache_dir` once `collected` delta files have been taken.
+    pub(crate) fn arm(cache_dir: &Path, collected: u32) {
+        FAIL_AFTER
+            .lock()
+            .unwrap()
+            .push((cache_dir.to_path_buf(), collected));
+    }
+
+    pub(super) fn should_fail(cache_dir: &Path, collected: u32) -> bool {
+        let mut armed = FAIL_AFTER.lock().unwrap();
+        match armed
+            .iter()
+            .position(|(dir, n)| dir == cache_dir && *n == collected)
+        {
+            Some(i) => {
+                armed.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// One-shot park point in the consolidation cycle, keyed by cache_dir: after the fenced
+/// size-state persist has returned `Ok` and before the applied delta files are deleted. Lets a
+/// test take the lock over in exactly the window between the two.
+#[cfg(test)]
+pub(crate) mod applied_delta_delete_hook {
+    use super::LockParkHook;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    static ARMED: Mutex<Vec<(PathBuf, Arc<LockParkHook>)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(cache_dir: &Path, hook: Arc<LockParkHook>) {
+        ARMED.lock().unwrap().push((cache_dir.to_path_buf(), hook));
+    }
+
+    pub(super) fn park(cache_dir: &Path) {
+        let hook = {
+            let mut armed = ARMED.lock().unwrap();
+            armed
+                .iter()
+                .position(|(dir, _)| dir == cache_dir)
+                .map(|i| armed.remove(i).1)
+        };
+        if let Some(hook) = hook {
+            hook.reached.wait();
+            hook.release.wait();
+        }
+    }
+}
+
+/// One-shot hook run by [`JournalConsolidator::projected_sizes`] between its delta-directory
+/// read and its `size_state.json` read, keyed by cache_dir. Lets a test put a consolidation
+/// cycle's apply-then-delete exactly inside the window the read order is chosen for.
+#[cfg(test)]
+pub(crate) mod projected_read_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(cache_dir: &Path, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap()
+            .push((cache_dir.to_path_buf(), Box::new(hook)));
+    }
+
+    pub(super) fn run(cache_dir: &Path) {
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(dir, _)| dir == cache_dir)
+                .map(|i| hooks.remove(i).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Park point inside the consolidation cycle's key loop, keyed by cache_dir: every key future
+/// waits here before it consolidates, so a test can hold the loop open across several intervals
+/// and watch what the cycle does meanwhile. Not one-shot: it parks every key until released.
+///
+/// `release` is a state channel rather than a notification, so a release that lands before a key
+/// reaches the park still frees it.
+#[cfg(test)]
+pub(crate) mod key_loop_park_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) struct KeyLoopPark {
+        /// Notified by each key future as it reaches the park.
+        pub(crate) reached: Arc<tokio::sync::Notify>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl KeyLoopPark {
+        /// Free every parked key, and every key that reaches the park later.
+        pub(crate) fn release(&self) {
+            let _ = self.release.send(true);
+        }
+    }
+
+    static ARMED: Mutex<Vec<(PathBuf, Arc<KeyLoopPark>)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(cache_dir: &Path) -> Arc<KeyLoopPark> {
+        let park = Arc::new(KeyLoopPark {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: tokio::sync::watch::channel(false).0,
+        });
+        ARMED
+            .lock()
+            .unwrap()
+            .push((cache_dir.to_path_buf(), park.clone()));
+        park
+    }
+
+    pub(super) async fn park(cache_dir: &Path) {
+        let park = ARMED
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(dir, _)| dir == cache_dir)
+            .map(|(_, p)| p.clone());
+        let Some(park) = park else { return };
+        park.reached.notify_one();
+        let mut rx = park.release.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// What one consolidation cycle carries between its in-loop capacity checks.
+///
+/// Each tier holds its own not-before instant rather than deferring the shared wake: a pass that
+/// did nothing in one tier says nothing about the other two, and holding all three back for it
+/// would hand one tier's cadence to another's drain. A tier backs off for
+/// [`INLOOP_TRIGGER_BARREN_INTERVALS`] intervals after a pass that did no work, and a pass that
+/// did work leaves it unbacked.
+#[derive(Debug, Default)]
+struct InloopTriggerState {
+    /// The staging tier's cumulative freed-bytes counter as of the last in-loop nudge, so the
+    /// next check can tell a pass that freed something from one that freed nothing.
+    staging_freed_at_nudge: Option<u64>,
+    /// Earliest instant at which the staging trigger may be evaluated again, set when the pass
+    /// the last nudge started freed nothing.
+    staging_check_not_before: Option<tokio::time::Instant>,
+}
+
+/// The read-tier author tick's barren memo, held for the process rather than for one
+/// consolidation cycle.
+///
+/// A tick that authors nothing while the live generation is still draining has taken the global
+/// eviction lock and read every chunk's done-marker to find that out: 0.4 to 3.3 s of
+/// shared-volume reads for 85 to 314 chunks, measured on FSx for OpenZFS and FSx for NetApp
+/// ONTAP, against a volume the executors are deleting from. The earlier gate stopped that repeating
+/// inside one cycle only, because it lived on [`InloopTriggerState`], which is a local of
+/// `run_consolidation_cycle`; across cycles the end-of-cycle and idle sites re-authored every 1
+/// to 4 s for the length of a drain. 23 of 34 OpenZFS ticks and 8 of 19 ONTAP ticks in that cell
+/// were barren.
+///
+/// Both fields move here unchanged, so the in-loop gate's predicate is the one shipped and
+/// its test still pins it; what changes is the lifetime of the answer and the set of sites that
+/// read it.
+#[derive(Debug, Default)]
+struct ReadTierBarrenMemo {
+    /// `JournalConsolidator::read_tier_author_progress` as of the last trigger evaluation that
+    /// decided to spawn a read-tier pass, so the next evaluation can tell a pass that did
+    /// something from one that did nothing.
+    progress_at_last_spawn: Option<u64>,
+    /// When the pass that followed the last spawn was first observed to have done nothing.
+    /// Cleared by progress, and by the ceiling letting a tick through.
+    barren_since: Option<tokio::time::Instant>,
+}
+
+/// `true` for a collectable delta file name: `delta_*.json`, never a `.json.tmp`.
+fn is_delta_file_name(file_name: &str) -> bool {
+    file_name.starts_with("delta_") && file_name.ends_with(".json")
+}
+
+/// The fields one delta file carries, as [`JournalConsolidator::collect_deltas`] and
+/// [`JournalConsolidator::pending_delta_sum`] both read them: `(delta, write_cache_delta,
+/// instance_id)`. A missing field reads as 0 (or `"unknown"`).
+fn parse_delta_content(content: &str) -> serde_json::Result<(i64, i64, String)> {
+    parse_delta_content_full(content).map(|(d, wc, _, id)| (d, wc, id))
+}
+
+/// [`parse_delta_content`] plus the `cached_objects_delta` field: `(delta, write_cache_delta,
+/// cached_objects_delta, instance_id)`. A file written before the field existed reads 0.
+fn parse_delta_content_full(content: &str) -> serde_json::Result<(i64, i64, i64, String)> {
+    let json: serde_json::Value = serde_json::from_str(content)?;
+    let delta = json.get("delta").and_then(|v| v.as_i64()).unwrap_or(0);
+    let wc_delta = json
+        .get("write_cache_delta")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let objects_delta = json
+        .get("cached_objects_delta")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let instance_id = json
+        .get("instance_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Ok((delta, wc_delta, objects_delta, instance_id))
+}
+
+/// Red-side lever: the scrape accessor reads `size_state.json` per call again.
+#[cfg(test)]
+const SCRAPE_READS_DISK: bool = false;
+
+/// Red-side lever: `increment_cached_objects` takes `size_state.lock` per call again (the
+/// earlier locked read-modify-write), for
+/// `request_path_cached_object_changes_take_no_lock_and_apply_exactly_per_cycle`.
+#[cfg(test)]
+const INCREMENT_LOCKED: bool = false;
+/// Red-side lever: `decrement_cached_objects` takes `size_state.lock` per call again (a locked
+/// read-modify-write), for `request_path_cached_object_debits_take_no_lock_while_a_peer_holds_it`.
+#[cfg(test)]
+const DECREMENT_LOCKED: bool = false;
+
+/// `n` as a signed delta, saturating at `i64::MAX`.
+fn objects_as_delta(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// `base + delta`, clamped at 0, for a projected size.
+fn project(base: u64, delta: i64) -> u64 {
+    (base as i128 + delta as i128).clamp(0, u64::MAX as i128) as u64
+}
+
 /// In-memory size accumulator for tracking cache size deltas.
 ///
 /// Holds two AtomicI64 counters: one for total cache size delta and one for write-cache
@@ -305,6 +982,11 @@ pub struct SizeAccumulator {
     delta: AtomicI64,
     /// Net write-cache size delta since last flush
     write_cache_delta: AtomicI64,
+    /// Net `cached_objects` change since last flush: +1 per `.meta` a request path publishes
+    /// where none was counted, -1 per counted `.meta` it unlinks. Applied to `size_state.json`
+    /// by the consolidation cycle with the byte deltas, so no request path takes
+    /// `size_state.lock`.
+    cached_objects_delta: AtomicI64,
     /// Instance ID for delta file naming
     instance_id: String,
     /// Directory for delta files: `{cache_dir}/size_tracking/`
@@ -322,6 +1004,124 @@ pub struct SizeAccumulator {
     /// [`Self::subtract_range`] rather than [`Self::subtract`] wherever the range's
     /// identity is known.
     recent_ranges: Mutex<HashSet<(u64, u64, u64)>>,
+    /// Serialises [`Self::flush`] from swap to write-or-restore, so a flush's `Ok` covers every
+    /// delta applied before it was called: a concurrent flush that swapped those bytes has
+    /// either written them or restored them by the time this one swaps.
+    flush_gate: tokio::sync::Mutex<()>,
+    /// Test seam: run once inside the next flush, after the swap and before the write. `true`
+    /// fails that flush's write, so it restores the delta as a real write error does.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    mid_flush: Mutex<
+        Option<
+            Box<
+                dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+                    + Send,
+            >,
+        >,
+    >,
+}
+
+/// Accounted-payload bytes this process has ADMITTED to the cache, since start.
+///
+/// # What an admission is, and why this is the site
+///
+/// R12.3's eviction rate is meaningless without the figure it is racing, and § 8 names two
+/// admission figures for the comparison. Neither existed — design § 10 labels
+/// `cache.admission_bytes_per_sec` "(existing)" and it never has been.
+///
+/// An admission is **one range's `compressed_size` entering the accounted total**, counted inside
+/// [`SizeAccumulator::add_range`] on the branch that actually credits. That is the single
+/// chokepoint for the population eviction debits: `add_range` is the only production credit path
+/// for `total_size`, reached from **four** sites — `CacheManager::credit_staged_range`,
+/// `DiskCacheManager::store_range`'s hybrid arm, `DiskCacheManager::commit_incremental_range`, and
+/// [`JournalConsolidator::write_multipart_journal_entries`] — so instrumenting the callee counts
+/// all four and cannot drift from them.
+///
+/// Counting at the callee rather than per caller is what makes that robust, and the count above is
+/// why: a first reading of this tree found three sites, because the fourth lives in this file and
+/// was hidden by a grep scoped to exclude it. A per-caller counter would have shipped
+/// three-quarters of the population and read as complete.
+///
+/// **What it EXCLUDES, deliberately, each for a reason rather than by omission:**
+/// - **Dedup-skipped writes.** The `else` arm means another writer already has these bytes in the
+///   accounted total on this volume; crediting the rate would count one arrival twice.
+/// - **`range_already_existed` writes.** All three call sites gate on that before calling, so a
+///   second instance re-caching bytes already on shared storage is not an arrival.
+/// - **Write-tier credits.** [`SizeAccumulator::add_write_cache`] is a **sub-total** of the same
+///   bytes, not a separate arrival; counting it would double every write-through PUT.
+/// - **[`SizeAccumulator::add`]**, the identity-free variant. It has no production caller (every
+///   hit in `src/`, `tests/` and `examples/` is a test or a comment), so including it would add no
+///   production population and would make the figure un-deduplicated if one ever appeared.
+/// - **RAM-tier promotions**, which do not touch the accounted disk total at all.
+/// - **Multipart parts staged under `mpus_in_progress/`**, which have no `.meta`, are not credited
+///   here, and are published separately as `cache.in_progress_part_bytes`. § 3.7 keeps them out of
+///   the accounted total deliberately; this figure inherits that boundary rather than re-deciding
+///   it.
+///
+/// Per-instance, since process start. On a fleet, sum it across proxies before dividing — one
+/// proxy taking the writes while another wins the eviction locks is the case no single proxy's own
+/// quotient can answer.
+///
+/// Spec: cache-eviction-at-scale § 8. Requirements: 12.3, 2.3.
+static ADMISSION_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Ranges admitted by the same site, same population, same exclusions.
+///
+/// **Ranges, not entries.** One entry is an object's `.meta` plus N of these. R12.3 asks for
+/// entries/s; there is no entry-level figure on either side of the comparison, and naming a range
+/// count "entries" is the substitution that makes a published unit disagree with its own name.
+static ADMISSION_RANGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// What this process has admitted to the accounted cache total — R12.3's admission numerators.
+///
+/// Published as cumulative `cache.*` counters beside the rates derived from them, so that a
+/// consumer differencing two scrapes gets a windowed rate the since-start quotient cannot give,
+/// and so that a fleet figure can be summed. See [`ADMISSION_BYTES_TOTAL`] for the population.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionAccumulator {
+    /// Accounted-payload bytes admitted, since process start.
+    pub admission_bytes_total: u64,
+    /// Ranges admitted, since process start. Ranges, not entries.
+    pub admission_ranges_total: u64,
+}
+
+/// Read the admission accumulator. Safe to call from a metrics scrape.
+pub fn collect_admission_accumulator() -> AdmissionAccumulator {
+    AdmissionAccumulator {
+        admission_bytes_total: ADMISSION_BYTES_TOTAL.load(Ordering::Relaxed),
+        admission_ranges_total: ADMISSION_RANGES_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// The projected read-tier size this process last compared against the eviction trigger, or `-1`
+/// before any site has read one. A size is never negative, so `-1` is an unambiguous sentinel.
+///
+/// Written by [`JournalConsolidator::projected_sizes`], which is the one path every trigger site
+/// takes to the figure, and read by the `/metrics` collector. Process-local, so a scrape pays no
+/// shared-volume I/O to publish it.
+static LAST_PROJECTED_CACHE_SIZE: AtomicI64 = AtomicI64::new(-1);
+
+/// Record a projected read-tier reading. `i64::MAX` for a figure past `i64`, which cannot occur
+/// on any real volume and still must not wrap.
+fn record_projected_cache_size(projected: u64) {
+    LAST_PROJECTED_CACHE_SIZE.store(
+        i64::try_from(projected).unwrap_or(i64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// The projected read-tier size the eviction trigger last read in this process, or `None` before
+/// the first reading.
+///
+/// This is the figure a pass actually fires on: `size_state.total_size` plus every size change the
+/// fleet has recorded and no consolidation cycle has yet applied. It is as fresh as this process's
+/// last trigger evaluation, which on the consolidation-lock winner is one
+/// `consolidation_interval` and on a proxy that never wins the lock is the last eviction pass it
+/// ran. Safe to call from a metrics scrape: one relaxed atomic load.
+pub fn last_projected_cache_size() -> Option<u64> {
+    let v = LAST_PROJECTED_CACHE_SIZE.load(Ordering::Relaxed);
+    (v >= 0).then_some(v as u64)
 }
 
 impl SizeAccumulator {
@@ -333,11 +1133,33 @@ impl SizeAccumulator {
         Self {
             delta: AtomicI64::new(0),
             write_cache_delta: AtomicI64::new(0),
+            cached_objects_delta: AtomicI64::new(0),
             instance_id,
             size_tracking_dir,
             flush_sequence: AtomicU64::new(0),
             recent_ranges: Mutex::new(HashSet::new()),
+            flush_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            mid_flush: Mutex::new(None),
         }
+    }
+
+    /// Red-side lever: flushes run concurrently again, so a flush that finds the delta already
+    /// swapped by a peer returns `Ok` while that peer's write can still fail and restore it.
+    #[cfg(test)]
+    const FLUSH_UNGATED: bool = false;
+
+    /// Test seam: arm [`Self::mid_flush`] for the next flush.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn arm_mid_flush(
+        &self,
+        hook: Box<
+            dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+                + Send,
+        >,
+    ) {
+        *self.mid_flush.lock().unwrap() = Some(hook);
     }
 
     /// Increment the total size delta. Called after successful range write.
@@ -363,6 +1185,19 @@ impl SizeAccumulator {
             drop(recent); // release lock before atomic op
             self.delta
                 .fetch_add(compressed_size as i64, Ordering::Relaxed);
+            // R12.3's admission numerators, on the branch that actually credits — so the rate
+            // counts the same arrivals the accounted total does, and the dedup `else` arm below
+            // (another writer already holds these bytes) contributes nothing.
+            // Spec: cache-eviction-at-scale § 8. Requirements: 12.3, 2.3.
+            ADMISSION_BYTES_TOTAL.fetch_add(compressed_size, Ordering::Relaxed);
+            ADMISSION_RANGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            // The same bytes, against the figure the two `max_cache_size` admission
+            // decisions read, until a consolidation cycle folds them into it. Counted on this
+            // branch and nowhere else, so the count and the delta this line sits beside carry
+            // the same bytes. See `crate::cache::UnconsolidatedAdmissions`.
+            if let Some(cache_dir) = self.size_tracking_dir.parent() {
+                crate::cache::note_accounted_admission(cache_dir, compressed_size);
+            }
             debug!(
                 "SIZE_ACCUM add_range: +{} bytes, range={}-{}, instance={}",
                 compressed_size, start, end, self.instance_id
@@ -451,39 +1286,107 @@ impl SizeAccumulator {
             .fetch_sub(compressed_size as i64, Ordering::Relaxed);
     }
 
+    /// Add `n` (signed) to the pending `cached_objects` delta. Lock-free; the consolidation
+    /// cycle applies it.
+    pub fn add_cached_objects(&self, n: i64) {
+        self.cached_objects_delta.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The pending `cached_objects` delta (for testing/debugging).
+    #[cfg(test)]
+    pub fn current_cached_objects_delta(&self) -> i64 {
+        self.cached_objects_delta.load(Ordering::Relaxed)
+    }
+
     /// Check if there are any pending deltas to flush.
     pub fn has_pending_delta(&self) -> bool {
         self.delta.load(Ordering::Relaxed) != 0
             || self.write_cache_delta.load(Ordering::Relaxed) != 0
+            || self.cached_objects_delta.load(Ordering::Relaxed) != 0
     }
 
     /// Atomically swap both accumulators to zero and write to delta file.
     /// If both are zero, returns Ok(()) without writing.
     /// If the file write fails, restores the swapped values to prevent data loss.
+    ///
+    /// Flushes are serialised end to end, so `Ok` means every delta applied before this call
+    /// reached a delta file, including one a concurrent flush had swapped and then failed to
+    /// write. Without the gate a flush that found zero returned `Ok` while a peer's failing write
+    /// was about to restore those bytes, and the DR-EVICT executor published progress for a
+    /// debit still in memory.
     pub async fn flush(&self) -> Result<()> {
+        #[cfg(test)]
+        let ungated = Self::FLUSH_UNGATED;
+        #[cfg(not(test))]
+        let ungated = false;
+        let _gate = if ungated {
+            None
+        } else {
+            Some(self.flush_gate.lock().await)
+        };
+        // Read before the swap: see `crate::cache::unflushed_accounted_bytes` for why that
+        // direction is the safe one. These are the credits the file this flush writes carries,
+        // and the record written below is released on that file's own fate.
+        let cache_dir = self.size_tracking_dir.parent().map(|d| d.to_path_buf());
+        let admitted = cache_dir
+            .as_deref()
+            .map(crate::cache::unflushed_accounted_bytes)
+            .unwrap_or(0);
         let delta = self.delta.swap(0, Ordering::Relaxed);
         let wc_delta = self.write_cache_delta.swap(0, Ordering::Relaxed);
+        let objects_delta = self.cached_objects_delta.swap(0, Ordering::Relaxed);
 
         // Do NOT clear dedup set on flush — ranges written in previous windows
         // should still be deduplicated. The set is cleared only during validation
         // scan (reset()) which reconciles the tracked size with actual disk usage.
 
-        if delta == 0 && wc_delta == 0 {
+        if delta == 0 && wc_delta == 0 && objects_delta == 0 {
+            // Nothing for a cycle to apply, so nothing for the figure to absorb: credits since
+            // the last flush were cancelled by debits of the same bytes, and both are absent
+            // from the figure together.
+            if let Some(cache_dir) = cache_dir.as_deref() {
+                crate::cache::note_delta_file_flushed(cache_dir, None, admitted);
+            }
             return Ok(());
         }
 
         info!(
-            "SIZE_ACCUM flush: instance={}, delta={:+}, write_cache_delta={:+}",
-            self.instance_id, delta, wc_delta
+            "SIZE_ACCUM flush: instance={}, delta={:+}, write_cache_delta={:+}, \
+             cached_objects_delta={:+}",
+            self.instance_id, delta, wc_delta, objects_delta
         );
 
-        match self.write_delta_file(delta, wc_delta).await {
-            Ok(()) => Ok(()),
+        #[cfg(test)]
+        let hook = self.mid_flush.lock().unwrap().take();
+        #[cfg(test)]
+        let forced_failure = match hook {
+            Some(h) => h().await,
+            None => false,
+        };
+        #[cfg(not(test))]
+        let forced_failure = false;
+        let written: Result<PathBuf> = if forced_failure {
+            Err(ProxyError::CacheError(
+                "test seam: mid-flush write failure".to_string(),
+            ))
+        } else {
+            self.write_delta_file(delta, wc_delta, objects_delta).await
+        };
+        match written {
+            Ok(path) => {
+                // The figure folds these bytes when a cycle consumes this file.
+                if let Some(cache_dir) = cache_dir.as_deref() {
+                    crate::cache::note_delta_file_flushed(cache_dir, Some(path), admitted);
+                }
+                Ok(())
+            }
             Err(e) => {
                 // Restore values on failure so the delta is not lost
                 self.delta.fetch_add(delta, Ordering::Relaxed);
                 self.write_cache_delta
                     .fetch_add(wc_delta, Ordering::Relaxed);
+                self.cached_objects_delta
+                    .fetch_add(objects_delta, Ordering::Relaxed);
                 warn!(
                     "SIZE_ACCUM flush failed, restored: instance={}, delta={:+}, wc_delta={:+}, error={}",
                     self.instance_id, delta, wc_delta, e
@@ -497,8 +1400,15 @@ impl SizeAccumulator {
     /// Each flush creates a separate file to eliminate NFS stale read races.
     ///
     /// File name: `delta_{instance_id}_{sequence}.json`
-    /// JSON format: {"delta": i64, "write_cache_delta": i64, "instance_id": string, "timestamp": string}
-    async fn write_delta_file(&self, delta: i64, write_cache_delta: i64) -> Result<()> {
+    /// JSON format: {"delta": i64, "write_cache_delta": i64, "cached_objects_delta": i64,
+    /// "instance_id": string, "timestamp": string}. A reader that predates
+    /// `cached_objects_delta` ignores it.
+    async fn write_delta_file(
+        &self,
+        delta: i64,
+        write_cache_delta: i64,
+        cached_objects_delta: i64,
+    ) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.size_tracking_dir)
             .await
             .map_err(|e| {
@@ -515,6 +1425,7 @@ impl SizeAccumulator {
         let content = serde_json::json!({
             "delta": delta,
             "write_cache_delta": write_cache_delta,
+            "cached_objects_delta": cached_objects_delta,
             "instance_id": self.instance_id,
             "timestamp": chrono::Utc::now().to_rfc3339()
         });
@@ -540,7 +1451,7 @@ impl SizeAccumulator {
                 ))
             })?;
 
-        Ok(())
+        Ok(file_path)
     }
 
     /// Get the current delta value (for testing/debugging)
@@ -553,18 +1464,28 @@ impl SizeAccumulator {
         self.write_cache_delta.load(Ordering::Relaxed)
     }
 
-    /// Get the size tracking directory path (for testing/debugging)
-    pub fn delta_file_path(&self) -> &Path {
-        &self.size_tracking_dir
-    }
-
     /// Reset both accumulators to zero. Called after validation scan corrects drift.
     pub fn reset(&self) {
+        // The census re-grounded the figure from the volume, so every credited byte is in it
+        // and the unflushed delta this clears will never reach a delta file.
+        if let Some(cache_dir) = self.size_tracking_dir.parent() {
+            crate::cache::note_accounting_reground(cache_dir);
+        }
         self.delta.store(0, Ordering::Relaxed);
         self.write_cache_delta.store(0, Ordering::Relaxed);
+        self.cached_objects_delta.store(0, Ordering::Relaxed);
         let mut recent = self.recent_ranges.lock().unwrap();
         recent.clear();
     }
+}
+
+/// Who appends a staged range's Write_Ledger entry in `write_multipart_journal_entries_inner`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedLedger {
+    /// The credit site appends, and credits the write tier only if the append landed.
+    AppendHere,
+    /// The caller appended before publishing the `.meta`, and every append landed.
+    AlreadyRecorded,
 }
 
 /// Journal consolidator for background consolidation of journal entries
@@ -583,8 +1504,13 @@ pub struct JournalConsolidator {
     evicted_ranges: Mutex<HashMap<String, Vec<(u64, u64)>>>,
     /// Global consolidation lock file handle (kept open while lock is held)
     consolidation_lock_file: Mutex<Option<std::fs::File>>,
+    /// In-process gate in front of `size_state.lock`'s blocking `flock`. See
+    /// [`Self::with_size_state_locked`].
+    size_state_gate: Arc<tokio::sync::Mutex<()>>,
     /// In-memory size accumulator for this instance
     size_accumulator: Arc<SizeAccumulator>,
+    /// Last reading of `size_state.json` by any load or persist; see [`SizeStateFile::memo`].
+    size_state_memo: SizeStateMemo,
     /// Guard to prevent concurrent eviction spawns
     eviction_in_progress: Arc<AtomicBool>,
     /// Append-only record of staged (write-cached, un-graduated) ranges, so staging
@@ -604,7 +1530,316 @@ pub struct JournalConsolidator {
     /// O(ledger) and verifies each entry against its `.meta`, which is far too much work
     /// to repeat every cycle. Requirement 2.6.
     last_ledger_compaction_secs: Arc<AtomicU64>,
+    /// Unix seconds of the last staged fold that reached a **Complete_Install**.
+    ///
+    /// Deliberately named for completion rather than for the attempt. The ledger
+    /// compaction gate above stamps at pass *start*, so a pass that fails consumes the
+    /// full retry interval and a pass slower than the interval re-qualifies the instant it
+    /// finishes. Neither is acceptable for the fold: a figure nobody could install must not
+    /// be reported fresh, and the interval must bound the fold's share of shared-storage
+    /// I/O rather than its start rate. § 16.6.9. Retries of a retain are spaced by
+    /// `last_staged_fold_attempt_secs` below.
+    last_staged_fold_completed_secs: Arc<AtomicU64>,
+    /// Unix seconds of the last staged fold pass that ran, installed or retained. A scanner
+    /// deferral does not stamp it.
+    ///
+    /// Gates the next attempt on the same interval as the completion stamp, so a retain that
+    /// persists (an unparseable shard checkpoint, which neither fold rewrites) costs one pass
+    /// per interval per instance rather than one per consolidation cycle. A transient retain
+    /// therefore retries after at most one interval (300 s), well inside the 24 h authority
+    /// age. Process-local rather than read from `staged_fold_freshness.json`: that document is
+    /// fleet-wide, and gating on it would add a shared read per cycle and turn this
+    /// per-instance cadence into a fleet claim.
+    last_staged_fold_attempt_secs: Arc<AtomicU64>,
+    /// Whether a staged fold pass is running in this process.
+    ///
+    /// A separate flag rather than reusing the completion timestamp as a CAS token,
+    /// because the two answer different questions: "may another pass start" is not "when
+    /// did one last succeed", and collapsing them is exactly what makes a failed pass
+    /// consume the cadence.
+    staged_fold_in_progress: Arc<AtomicBool>,
+    /// Unix seconds at which a ledger-completeness repair pass last made progress.
+    ///
+    /// Progress rather than attempt, for the same reason the fold's timestamp is named for
+    /// completion: a pass that refused on an incomplete input must be retried promptly rather
+    /// than waiting out the interval. § 16.6.6 precondition 3b.
+    last_ledger_repair_secs: Arc<AtomicU64>,
+    /// Whether a ledger-completeness repair pass is running in this process.
+    ///
+    /// A flag of its own rather than sharing the fold's: the two rotations are independent and
+    /// run on different windows, so a fold pass in flight must not suppress a repair pass or
+    /// vice versa.
+    ledger_repair_in_progress: Arc<AtomicBool>,
+    /// `cache.incomplete_upload_ttl` in seconds, set by [`Self::set_incomplete_upload_ttl`]
+    /// (default one day). The incomplete-upload sweep reaps uploads idle past it and runs every
+    /// [`incomplete_upload_sweep_interval_secs`] of it.
+    incomplete_upload_ttl_secs: Arc<AtomicU64>,
+    /// Unix seconds at which this process's incomplete-upload sweep last completed.
+    last_incomplete_upload_sweep_secs: Arc<AtomicU64>,
+    /// Whether an incomplete-upload sweep is running in this process.
+    incomplete_upload_sweep_in_progress: Arc<AtomicBool>,
+    /// The staged-authority readiness evidence last read from the volume, and when.
+    ///
+    /// `maintain_staged_authority` used to read every fold checkpoint, walk the shard population
+    /// and read every repair document on every non-idle cycle, under the global consolidation
+    /// lock: O(shards) at ~1.4 ms per document on EFS. The evidence changes only when a fold or
+    /// repair pass installs (on any instance) or when an age crosses a bound of 1 h or 24 h, so it
+    /// is held for at most [`READINESS_MEMO_MAX_AGE_SECS`] and its ages are re-evaluated against
+    /// `now` on every use. See [`ReadinessMemo`] for the three rules that keep a cached value from
+    /// ever activating the epoch.
+    ///
+    /// Shared (`Arc`) because the staged fold and the ledger repair run on their own tasks and
+    /// invalidate it on completion. See [`MaintenancePasses`].
+    readiness_memo: Arc<Mutex<Option<ReadinessMemo>>>,
+    /// Bumped by every invalidation of `readiness_memo`.
+    ///
+    /// With the passes off the cycle, a readiness read can straddle a pass's install: the read
+    /// starts, the pass installs and invalidates, and the read then stores its pre-install
+    /// figures, which would be served for up to [`READINESS_MEMO_MAX_AGE_SECS`]. Those figures
+    /// are conservative (older ages), so they cannot activate the epoch, but they would delay
+    /// activation. `current_readiness` stores its read only if this did not move during it.
+    readiness_memo_generation: Arc<AtomicU64>,
+    /// The K2 controller for this instance's staged fold passes (§ 16.6.13 K3). One per kind.
+    fold_limiter: Arc<Mutex<crate::scanner_limiter::ScannerLimiter>>,
+    /// The K2 controller for this instance's ledger repair passes.
+    repair_limiter: Arc<Mutex<crate::scanner_limiter::ScannerLimiter>>,
+    /// Set by [`Self::shutdown`]: no maintenance pass is spawned after it.
+    maintenance_stopped: Arc<AtomicBool>,
+    /// The maintenance pass tasks spawned by [`Self::spawn_maintenance_passes`] and not yet
+    /// reaped. Aborted by [`Self::shutdown`]; awaited by [`Self::await_maintenance_passes`].
+    maintenance_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Unix seconds of the last tail-delta cross-shard sweep.
+    ///
+    /// Its own timestamp rather than sharing the Write_Ledger's: the two read different files and
+    /// verify against different documents, so one suppressing the other would silently halve a
+    /// cadence. Both use [`LEDGER_COMPACTION_INTERVAL_SECS`] as the interval, which is the
+    /// pattern § 4.4 names. Spec: cache-eviction-at-scale § 4.4.
+    last_tail_delta_compaction_secs: Arc<AtomicU64>,
+    /// This instance's fill-visibility tracker, set once by
+    /// `CacheManager::create_configured_disk_cache_manager`. A fold that writes a key's `.meta`
+    /// drops the key's entry, which that `.meta` supersedes. Empty for a consolidator built
+    /// without a `CacheManager`, which then drops nothing.
+    fill_visibility_tracker:
+        std::sync::OnceLock<Arc<crate::fill_visibility_tracker::FillVisibilityTracker>>,
+    /// Journal lines the last `cleanup_consolidated_entries` pass found it could not parse
+    /// and kept in their files: complete lines (typically a newer build's entries on a
+    /// mixed-version fleet) plus torn unterminated tails. Mirrored to
+    /// [`RETAINED_UNPARSEABLE_JOURNAL_LINES`] for `/metrics`.
+    retained_unparseable_journal_lines: AtomicU64,
+    /// Unix seconds of the last WARN about retained unparseable lines (rate limit).
+    last_unparseable_warn_secs: AtomicU64,
+    /// When an idle cycle last read `size_state.json` and found both byte triggers under.
+    /// Held for [`IDLE_EVICTION_MEMO_TTL`] and cleared by every non-idle cycle. See
+    /// [`Self::maybe_evict_on_idle_cycle`].
+    idle_eviction_memo: Mutex<Option<std::time::Instant>>,
+    /// The read-tier barren-author memo. See [`ReadTierBarrenMemo`].
+    read_tier_barren: Mutex<ReadTierBarrenMemo>,
+    /// Size-state reads [`Self::maybe_evict_on_idle_cycle`] has made. Per-process.
+    idle_eviction_reads: AtomicU64,
+    /// Trigger evaluations that passed the byte threshold and won the `eviction_in_progress`
+    /// compare-exchange, i.e. decided to spawn a pass. Counted at the decision, before the
+    /// cache-manager upgrade, so it records the decision rather than the task. Per-process.
+    eviction_trigger_fires: AtomicU64,
+    /// Projected-size reads [`Self::inloop_eviction_check`] has made: what the in-loop trigger
+    /// costs the shared volume. Per-process.
+    inloop_projected_reads: AtomicU64,
+    /// Staging-tier nudges [`Self::maybe_trigger_staging_eviction`] has made, from the in-loop
+    /// check and from the end of the cycle alike. Per-process.
+    staging_trigger_nudges: AtomicU64,
+    /// Unix milliseconds at which this process took the global consolidation lock, `0` while it
+    /// does not hold it. Read by the lock watchdog and by the `consolidation_lock_held_secs`
+    /// gauge, and (through the Arc) by the delta apply's fence check on its blocking thread.
+    /// Written only under `consolidation_lock_file`'s mutex.
+    lock_held_since_ms: Arc<AtomicU64>,
+    /// Bumped on every acquisition of the global consolidation lock and on every watchdog
+    /// takeover. Together with `held_lock_generation` it is the fence the lock-dependent writers
+    /// check: a cycle whose lock the watchdog dropped sees the two differ and abandons its write.
+    lock_generation: Arc<AtomicU64>,
+    /// `lock_generation` as it stood when this process last acquired the lock.
+    held_lock_generation: Arc<AtomicU64>,
+    /// The token of the consolidation cycle's (or idle eviction's) own acquisition, `0` when
+    /// none. The cycle-internal fenced writers read it through [`Self::lock_fence_intact`].
+    /// Validation installs take the lock by token and never write it, so a validation that
+    /// re-acquires after a takeover cannot make a stuck cycle's fence read intact again.
+    cycle_lock_token: Arc<AtomicU64>,
+    /// Watchdog takeovers since process start. Per-process.
+    lock_takeovers: AtomicU64,
+    /// Wall-clock budget for one Write_Ledger compaction pass, in milliseconds. See
+    /// [`Self::ledger_compaction_budget`].
+    ledger_compaction_budget_ms: AtomicU64,
+    /// Where this process's last compaction pass stopped: the shard (or the legacy unit) to
+    /// visit next and, when it stopped inside that unit, the last cache key it assessed there.
+    /// `None` once a pass reaches the end of the rotation. A record of what this process
+    /// published, not the resume point: the next pass on any instance resumes from
+    /// `SharedLedgerCompactionState`.
+    ledger_compaction_resume_after: Mutex<Option<LedgerCompactionCursor>>,
+    /// Test hook: park a cycle inside the locked region on a blocking barrier pair.
+    #[cfg(test)]
+    lock_park_hook: Mutex<Option<Arc<LockParkHook>>>,
 }
+
+/// What one Write_Ledger compaction pass covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LedgerCompactionPass {
+    /// Candidates whose `.meta` this pass assessed.
+    pub(crate) assessed: usize,
+    /// True when the pass reached the end of the staged set; false when its budget stopped it.
+    pub(crate) complete: bool,
+    /// Compaction units (shard directories, plus the legacy unit) this pass visited.
+    pub(crate) units_visited: usize,
+    /// Ledger files the pass's rewrite step read under their lock: the files of the units it
+    /// visited, never the whole volume.
+    pub(crate) files_read: usize,
+}
+
+/// A compaction unit's sort key: `(0, bucket, l1)` for a shard directory, `(1, "", "")` for
+/// the legacy flat files at the ledger root, which sort after every shard.
+type LedgerCompactionUnit = (u8, String, String);
+
+/// Where the next compaction pass resumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LedgerCompactionCursor {
+    /// The first unit the next pass visits.
+    unit: LedgerCompactionUnit,
+    /// Within `unit`, the last cache key already assessed; `None` to start the unit fresh.
+    after_key: Option<String>,
+}
+
+/// One acquisition of the global consolidation lock: the lock generation it set. Fenced
+/// checks and the release compare against it, so a holder whose lock was taken over cannot
+/// act on, or release, a later acquisition's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConsolidationLockToken(u64);
+
+/// A cycle parked inside the locked region waits on `reached`, then on `release`.
+#[cfg(test)]
+pub(crate) struct LockParkHook {
+    pub(crate) reached: std::sync::Barrier,
+    pub(crate) release: std::sync::Barrier,
+}
+
+/// Upper bound on one Write_Ledger compaction pass's wall clock. The pass also stops at a third
+/// of `consolidation_cycle_timeout` when that is smaller, so it never dominates a cycle.
+const LEDGER_COMPACTION_MAX_BUDGET: Duration = Duration::from_secs(10);
+
+/// `metadata/_shard_state/ledger_compaction_cursor.json`: the fleet's one compaction rotation.
+const LEDGER_COMPACTION_STATE_FILE: &str = "ledger_compaction_cursor.json";
+
+/// Schema of [`SharedLedgerCompactionState`]. A document with any other value reads as absent.
+const LEDGER_COMPACTION_STATE_SCHEMA: u32 = 1;
+
+/// The Write_Ledger compaction rotation, shared by every instance on the volume.
+///
+/// Whichever instance holds the consolidation lock reads this before deciding to compact, so
+/// the fleet runs one budgeted pass per resume interval and one rotation, rather than one of
+/// each per proxy. Written only by a lock holder at the end of a pass, atomically (temp →
+/// `sync_all` → rename, instance-suffixed temp), so a holder that crashes mid-pass leaves the
+/// previous pass's document in place and the next holder redoes only the lost pass.
+///
+/// Advisory: it decides who does the work and when, never whether a rewrite is safe (that is
+/// the per-file lock in `retire_in_files`). An absent, unparseable or wrong-schema document,
+/// or a cursor naming a unit that no longer exists, starts a fresh rotation. An instance on an
+/// older build never reads it and keeps its own per-process rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SharedLedgerCompactionState {
+    /// [`LEDGER_COMPACTION_STATE_SCHEMA`].
+    schema: u32,
+    /// Unix seconds before which no lock holder starts a pass.
+    next_due_at: u64,
+    /// Where the next pass resumes; `None` starts a fresh rotation.
+    #[serde(default)]
+    cursor: Option<LedgerCompactionCursor>,
+    /// `hostname:pid` of the writer, for diagnosis only.
+    #[serde(default)]
+    written_by: String,
+}
+
+impl SharedLedgerCompactionState {
+    fn path(cache_dir: &Path) -> PathBuf {
+        cache_dir
+            .join("metadata")
+            .join("_shard_state")
+            .join(LEDGER_COMPACTION_STATE_FILE)
+    }
+
+    /// The document, or `None` when it is absent, unparseable or of another schema: all three
+    /// start a fresh rotation, so they need no distinct reading.
+    fn load(cache_dir: &Path) -> Option<Self> {
+        let content = std::fs::read_to_string(Self::path(cache_dir)).ok()?;
+        let doc: Self = serde_json::from_str(&content).ok()?;
+        (doc.schema == LEDGER_COMPACTION_STATE_SCHEMA).then_some(doc)
+    }
+
+    /// Install atomically: temp → `sync_all` → rename, with a `{doc}.tmp.{host}.{pid}` temp name
+    /// that two instances cannot share and that `reap_dead_instance_temps` recognises.
+    fn install(&self, cache_dir: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let path = Self::path(cache_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::other(format!("serialize compaction state: {e}")))?;
+        let tmp = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            gethostname::gethostname()
+                .to_string_lossy()
+                .replace(['/', '\\'], "_"),
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)
+    }
+}
+
+/// Floor of the consolidation-lock watchdog's threshold. The threshold is
+/// `max(10 × consolidation_cycle_timeout, 5 min)`.
+const LOCK_WATCHDOG_MIN_THRESHOLD: Duration = Duration::from_secs(300);
+
+/// Handle to the consolidation-lock watchdog thread. [`Self::stop`] (or dropping the handle)
+/// ends the thread.
+pub struct LockWatchdog {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LockWatchdog {
+    /// Stop the watchdog thread and wait for it to exit. It exits within one poll interval.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        // Dropping the sender disconnects the channel, which wakes `recv_timeout` at once.
+        self.stop_tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for LockWatchdog {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How long an idle cycle holds an under-trigger byte verdict before reading `size_state.json`
+/// again. On an idle fleet `total_size` rises only
+/// by an absolute install (a validation scan or census), so this bounds how long such a rise goes
+/// unenforced.
+pub(crate) const IDLE_EVICTION_MEMO_TTL: Duration = Duration::from_secs(60);
 
 /// Get unique instance ID for this process (hostname:pid)
 fn get_instance_id() -> String {
@@ -613,6 +1848,1934 @@ fn get_instance_id() -> String {
         gethostname::gethostname().to_string_lossy(),
         std::process::id()
     )
+}
+
+/// How old a dead-instance temp must be before [`reap_dead_instance_temps`] removes it.
+///
+/// Every producer's temp lives only from `File::create` to `rename`, which is milliseconds, so a
+/// temp older than this is abandoned. The grace covers the one case where the pid test is wrong
+/// in the dangerous direction: a peer sharing this hostname in another pid namespace (a
+/// container with a shared UTS namespace), whose live pid reads as dead here. Its in-flight temp
+/// is seconds old and survives. Fifteen minutes also absorbs NFS server/client clock skew on the
+/// mtime comparison. Pid reuse is the safe direction (a dead writer looks alive, so its temp
+/// waits for a later start) and needs no grace.
+pub(crate) const DEAD_INSTANCE_TEMP_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// Instance-prefixed temp suffixes: `{hostname}:{pid}{suffix}`. Exact, anchored at the end.
+///
+/// Deliberately **temps only**. `.ledger` and `.ledger.mark` are the live sequence floor a
+/// reused instance identity seeds from (`write_ledger`: a removed one lets a later process
+/// re-issue sequence numbers an installed cut already passed), and no entry here is a suffix of
+/// either: every entry ends in `.tmp`, and neither live name does.
+const INSTANCE_TEMP_SUFFIXES: &[&str] = &[
+    ".pending.tmp",        // staged_fold: `{instance}.pending` rewrite
+    ".ledger.tmp",         // write_ledger: per-shard `{instance}.ledger` compaction (H3)
+    ".ledger.mark.tmp",    // write_ledger: `{instance}.ledger.mark` write (H2)
+    ".tail-delta.cap.tmp", // cache_size_tracker: tail-delta cap compaction (I1)
+    ".tail-delta.tmp",     // cache_size_tracker: tail-delta retirement (I2)
+];
+
+/// The trees [`reap_dead_instance_temps`] walks, relative to `cache_dir`.
+const DEAD_INSTANCE_TEMP_ROOTS: &[&str] = &[
+    "metadata/_shard_state",
+    "metadata/_write_ledger",
+    "size_tracking",
+];
+
+/// `Some(pid)` if `name` is a temp shape a producer in the three trees constructs, naming one of
+/// `my_hosts` and the writer's pid; `None` for every other name. Three shapes, all anchored:
+///
+/// 1. `{doc}.tmp.{host}.{pid}` — the shared `Shared::Yes` scheme (checkpoints, claims, freshness,
+///    repair, eviction results, epoch, ready and retired records, drift sample, size state).
+/// 2. `{host}:{pid}.resv.tmp.{pid}` — capacity reservations; both pids must agree.
+/// 3. `{host}:{pid}[:...]{suffix}` for a suffix in [`INSTANCE_TEMP_SUFFIXES`].
+pub(crate) fn dead_instance_temp_owner(name: &str, my_hosts: &[String]) -> Option<u32> {
+    fn parse_pid(s: &str) -> Option<u32> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // 0 is a process group and above i32::MAX is negative to kill(): never a single pid.
+        s.parse::<u32>()
+            .ok()
+            .filter(|p| *p > 0 && *p <= i32::MAX as u32)
+    }
+    /// `{host}:{pid}` or `{host}:{pid}:{rest}`, with `host` one of `my_hosts`.
+    fn parse_instance(instance: &str, my_hosts: &[String]) -> Option<u32> {
+        let mut parts = instance.splitn(3, ':');
+        let host = parts.next()?;
+        let pid = parse_pid(parts.next()?)?;
+        my_hosts.iter().any(|h| h == host).then_some(pid)
+    }
+
+    for suffix in INSTANCE_TEMP_SUFFIXES {
+        if let Some(instance) = name.strip_suffix(suffix) {
+            return parse_instance(instance, my_hosts);
+        }
+    }
+    let (rest, pid_str) = name.rsplit_once('.')?;
+    let pid = parse_pid(pid_str)?;
+    if let Some(instance) = rest.strip_suffix(".resv.tmp") {
+        return (parse_instance(instance, my_hosts)? == pid).then_some(pid);
+    }
+    for host in my_hosts {
+        let tail = format!(".tmp.{}", host);
+        if rest.len() > tail.len() && rest.ends_with(&tail) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Whether this process may still decide that another process **of its own host** has stopped
+/// by testing that pid locally.
+///
+/// Every own-host shortcut below rests on one inference: an instance id whose `{host}` equals
+/// this machine's hostname names a process in this machine's process table, so `kill(pid, 0)`
+/// answers about it. Two proxies sharing a hostname on one cache volume break that, and the
+/// detector (`signed_put_handler::detect_hostname_collision_blocking`) latches
+/// [`crate::cache::hostname_uniqueness_holds`] to `false` the first time it sees one.
+///
+/// After that each shortcut falls back to the rule it would apply to a file it cannot test: the
+/// two temp sweeps to their mtime grace alone ([`DEAD_INSTANCE_TEMP_GRACE`], which exists for
+/// this case and whose own comment names it), and the pending-file, retired-state and journal
+/// reapers to their foreign-instance rules, which test no pid. Those are slower, never unsafe,
+/// and none of them touches a client request.
+pub(crate) fn own_host_pid_test_trusted() -> bool {
+    #[cfg(test)]
+    if OWN_HOST_REAPS_IGNORE_THE_FLAG {
+        return true;
+    }
+    crate::cache::hostname_uniqueness_holds()
+}
+
+/// Red-side lever: the own-host reap decisions ignore the collision flag, which is the
+/// tree before this unit: a live peer sharing this hostname is judged by a `kill(pid, 0)` that
+/// answers about some other machine's process table.
+#[cfg(test)]
+const OWN_HOST_REAPS_IGNORE_THE_FLAG: bool = false;
+
+/// Red-side lever: `initialize` runs the own-host reap pass as its first
+/// statement, before any detector pass, which is the order left. The flag every one of
+/// those reaps reads is then `false` by construction on every process start, colliding fleet or
+/// not, so the guard cannot fire in production.
+#[cfg(test)]
+const INITIALIZE_REAPS_BEFORE_IT_DETECTS: bool = false;
+
+/// Deferred own-host reap passes this process has finished, for the tests.
+///
+/// `initialize` runs that pass on a detached task behind a watch, so a test that asserts what
+/// the pass did has to wait for it rather than race it. Counted rather than flagged so a second
+/// consolidator in one test can be waited for too.
+#[cfg(test)]
+static STARTUP_OWN_HOST_REAP_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// Wait for one more deferred own-host reap pass to finish than had finished at `before`.
+///
+/// Returns whether it did. Bounded, so a timeout is distinguishable from the pass having run
+/// and done nothing: `false` means the pass never arrived.
+#[cfg(test)]
+pub(crate) async fn wait_for_startup_own_host_reap_pass(before: u64) -> bool {
+    for _ in 0..600 {
+        if STARTUP_OWN_HOST_REAP_PASSES.load(std::sync::atomic::Ordering::Acquire) > before {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// How many deferred own-host reap passes have finished, for a test to wait from.
+#[cfg(test)]
+pub(crate) fn startup_own_host_reap_passes() -> u64 {
+    STARTUP_OWN_HOST_REAP_PASSES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether `pid` may be running. Only `ESRCH` means dead: `EPERM` is a live process owned by
+/// another user, and anything else is treated as live, which can only delay a reap.
+pub(crate) fn pid_may_be_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Reap temp files left by dead processes of this host under `metadata/_shard_state/`,
+/// `metadata/_write_ledger/` and `size_tracking/`. Returns `(files, bytes)` removed.
+///
+/// A file is removed only if [`dead_instance_temp_owner`] names one of `my_hosts` and a pid,
+/// that pid is not `my_pid`, `kill(pid, 0)` reports `ESRCH`, and its mtime is at least `grace`
+/// before `now`. The same own-host / non-current-pid / `kill(pid, 0)` rule
+/// `cleanup_dead_instance_journals` applies to `_journals/`, extended to these trees for temp
+/// names only. Symlinks are not followed.
+pub(crate) fn reap_dead_instance_temps(
+    cache_dir: &Path,
+    my_hosts: &[String],
+    my_pid: u32,
+    grace: Duration,
+    now: SystemTime,
+) -> (u64, u64) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack: Vec<PathBuf> = DEAD_INSTANCE_TEMP_ROOTS
+        .iter()
+        .map(|r| cache_dir.join(r))
+        .collect();
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(pid) = dead_instance_temp_owner(name, my_hosts) else {
+                continue;
+            };
+            // Age alone once the hostname is known to be shared: a temp lives from
+            // `File::create` to `rename`, so one `grace` old is abandoned whoever wrote it.
+            if pid == my_pid || (own_host_pid_test_trusted() && pid_may_be_alive(pid)) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let old_enough = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= grace);
+            if !old_enough {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    files += 1;
+                    bytes += meta.len();
+                    debug!("Removed dead instance temp: file={:?}, pid={}", path, pid);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("Failed to remove dead instance temp {:?}: {}", path, e),
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// `Some(pid)` if `name` is a range temp this host's `{pid}` staged under `ranges/`:
+///
+/// - family D, `{key}_{s}-{e}.bin.tmp.{host}.{pid}` (`store_range`, multipart completion, the
+///   full-object GET store);
+/// - family E1, `{key}_{s}-{e}.{rand:08x}.tmp.{host}.{pid}` (`begin_incremental_range_write`,
+///   the streamed GET-miss fill and write-cache sink).
+///
+/// Both are built by `cache::instance_scoped_range_tmp_path`. The earlier names
+/// (`{key}_{s}-{e}.bin.tmp`, `{stem}.{rand}.tmp`) carry no host or pid and never match, so a peer
+/// still running an older build is never judged by this.
+pub(crate) fn dead_instance_range_temp_owner(name: &str, my_hosts: &[String]) -> Option<u32> {
+    let pid = dead_instance_temp_owner(name, my_hosts)?;
+    let (rest, _) = name.rsplit_once('.')?;
+    for host in my_hosts {
+        let Some(stem) = rest.strip_suffix(&format!(".tmp.{}", host)) else {
+            continue;
+        };
+        if stem.len() > ".bin".len() && stem.ends_with(".bin") {
+            return Some(pid);
+        }
+        if let Some((prefix, nonce)) = stem.rsplit_once('.') {
+            if !prefix.is_empty()
+                && nonce.len() == 8
+                && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// Reap this host's dead-process range temps anywhere under `ranges/`. Returns
+/// `(files, bytes)` removed. Same conditions as [`reap_dead_instance_temps`]: the name matches
+/// [`dead_instance_range_temp_owner`] for one of `my_hosts`, the pid is not `my_pid`,
+/// `kill(pid, 0)` reports `ESRCH`, and the mtime is at least `grace` old. Symlinks are not
+/// followed. A temp was never credited to the size accumulator (credit follows publication), so
+/// nothing is debited.
+pub(crate) fn reap_dead_instance_range_temps(
+    cache_dir: &Path,
+    my_hosts: &[String],
+    my_pid: u32,
+    grace: Duration,
+    now: SystemTime,
+) -> (u64, u64) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack = vec![cache_dir.join("ranges")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(pid) = dead_instance_range_temp_owner(name, my_hosts) else {
+                continue;
+            };
+            // Age alone once the hostname is known to be shared, as in
+            // [`reap_dead_instance_temps`].
+            if pid == my_pid || (own_host_pid_test_trusted() && pid_may_be_alive(pid)) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let old_enough = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= grace);
+            if !old_enough {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    files += 1;
+                    bytes += meta.len();
+                    debug!(
+                        "Removed dead instance range temp: file={:?}, pid={}",
+                        path, pid
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    "Failed to remove dead instance range temp {:?}: {}",
+                    path, e
+                ),
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// A range file an earlier build wrote flat at the `ranges/` root for an unshardable key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReapedFlatRange {
+    pub cache_key: String,
+    pub start: u64,
+    pub end: u64,
+    pub bytes: u64,
+}
+
+/// The cache key a root-level flat file names, if it is one an earlier build wrote for an
+/// unshardable (bucket-root) key: `{sanitized}.meta` under `metadata/`, or
+/// `{sanitized}_{s}-{e}.bin` under `ranges/`. `None` for `_`-prefixed internal files, temps, other
+/// extensions, and any stem that percent-decodes to a shardable key.
+fn legacy_flat_root_key(name: &str, is_ranges: bool) -> Option<(String, Option<(u64, u64)>)> {
+    if name.starts_with('_') || name.contains(".tmp") {
+        return None;
+    }
+    let (stem, range) = if is_ranges {
+        let body = name.strip_suffix(".bin")?;
+        let (stem, span) = body.rsplit_once('_')?;
+        let (s, e) = span.split_once('-')?;
+        (stem, Some((s.parse::<u64>().ok()?, e.parse::<u64>().ok()?)))
+    } else {
+        (name.strip_suffix(".meta")?, None)
+    };
+    if stem.is_empty() {
+        return None;
+    }
+    let key = percent_encoding::percent_decode_str(stem)
+        .decode_utf8_lossy()
+        .to_string();
+    if crate::disk_cache::parse_cache_key(&key).is_ok() {
+        return None;
+    }
+    Some((key, range))
+}
+
+/// Remove the flat `metadata/{key}.meta` and `ranges/{key}_{s}-{e}.bin` files builds before
+/// an earlier version wrote at the tier roots for bucket-root requests. Only direct children of the two
+/// roots; never a subdirectory, never a `_`-prefixed name; only stems that fail
+/// `parse_cache_key`; only files at least `grace` old. Returns the removed `.meta` count and
+/// the removed ranges. The caller does not debit them: see `cleanup_dead_instance_temps` for
+/// why whether they are still in `total_size` cannot be known per range.
+pub(crate) fn reap_legacy_flat_root_files(
+    cache_dir: &Path,
+    grace: Duration,
+    now: SystemTime,
+) -> (u64, Vec<ReapedFlatRange>) {
+    let mut metas = 0u64;
+    let mut ranges = Vec::new();
+    for (root, is_ranges) in [("metadata", false), ("ranges", true)] {
+        let Ok(entries) = std::fs::read_dir(cache_dir.join(root)) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some((key, span)) = legacy_flat_root_key(name, is_ranges) else {
+                continue;
+            };
+            let Ok(meta) = entry.metadata() else { continue };
+            let old_enough = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= grace);
+            if !old_enough {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => match span {
+                    Some((start, end)) => ranges.push(ReapedFlatRange {
+                        cache_key: key,
+                        start,
+                        end,
+                        bytes: meta.len(),
+                    }),
+                    None => metas += 1,
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    "Failed to remove legacy flat cache file {:?}: {}",
+                    entry.path(),
+                    e
+                ),
+            }
+        }
+    }
+    (metas, ranges)
+}
+
+/// How long another host's **empty** `staged_pending/{instance}.pending` must have gone
+/// unmodified before this host may reap it.
+pub(crate) const FOREIGN_PENDING_REAP_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Reap `metadata/_shard_state/staged_pending/{instance}.pending` files (and their
+/// `.pending.lock`) that no fold can still need. Returns `(files, bytes)` removed, counting a
+/// `.pending` and its lock as one.
+pub(crate) fn reap_dead_instance_pending_files(
+    cache_dir: &Path,
+    my_hosts: &[String],
+    my_pid: u32,
+    grace: Duration,
+    foreign_grace: Duration,
+    now: SystemTime,
+) -> (u64, u64) {
+    let dir = cache_dir
+        .join("metadata")
+        .join("_shard_state")
+        .join("staged_pending");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return (0, 0);
+    };
+    let old_enough = |meta: &std::fs::Metadata, bound: Duration| {
+        meta.modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= bound)
+    };
+    // Reads the shard checkpoints once, and only if a dead own-host file holds credits.
+    let mut reaper = crate::staged_fold::PendingReaper::new(cache_dir);
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for entry in entries.filter_map(|e| e.ok()) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(instance) = name.strip_suffix(".pending.lock") {
+            // A lock whose `.pending` is gone (a reader re-created it after a reap): removed
+            // only for a dead own-host pid past the grace, where no appender can exist.
+            let mut parts = instance.splitn(3, ':');
+            let (Some(host), Some(pid)) = (
+                parts.next(),
+                parts.next().and_then(|p| p.parse::<u32>().ok()),
+            ) else {
+                continue;
+            };
+            let path = entry.path();
+            if my_hosts.iter().any(|h| h == host)
+                && own_host_pid_test_trusted()
+                && pid > 0
+                && pid <= i32::MAX as u32
+                && pid != my_pid
+                && !pid_may_be_alive(pid)
+                && !dir.join(format!("{instance}.pending")).exists()
+                && entry.metadata().is_ok_and(|m| old_enough(&m, grace))
+                && std::fs::remove_file(&path).is_ok()
+            {
+                debug!("Removed orphan pending lock {:?}", path);
+            }
+            continue;
+        }
+        let Some(instance) = name.strip_suffix(".pending") else {
+            continue;
+        };
+        let mut parts = instance.splitn(3, ':');
+        let (Some(host), Some(pid_str)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        let path = entry.path();
+        // A shared hostname sends an own-host file down the foreign arm below, which tests no
+        // pid: empty under its own lock and untouched for `foreign_grace`.
+        let retired = if my_hosts.iter().any(|h| h == host) && own_host_pid_test_trusted() {
+            let Some(pid) = pid_str
+                .parse::<u32>()
+                .ok()
+                .filter(|p| *p > 0 && *p <= i32::MAX as u32)
+            else {
+                continue;
+            };
+            if pid == my_pid || pid_may_be_alive(pid) || !old_enough(&meta, grace) {
+                continue;
+            }
+            reaper.retire(&path, false)
+        } else {
+            // Another host: its pid cannot be tested here. Every append to a `.pending`
+            // holds that file's lock (`PendingStore::append`), so an empty file re-read empty
+            // under the lock has no append in flight, and one untouched for a day belongs to
+            // no live writer that has credited anything since.
+            if meta.len() != 0 || !old_enough(&meta, foreign_grace) {
+                continue;
+            }
+            reaper.retire(&path, true)
+        };
+        match retired {
+            Ok(Some(n)) => {
+                files += 1;
+                bytes += n;
+                debug!("Removed dead instance pending file {:?}", path);
+            }
+            Ok(None) => {}
+            Err(e) => warn!(
+                "Failed to retire dead instance pending file {:?}: {}",
+                path, e
+            ),
+        }
+    }
+    (files, bytes)
+}
+
+/// How long a retired id's header-only shard ledger files must have gone
+/// unmodified before [`reap_dead_instance_state`] removes them, own host or not. The activation
+/// gate's quiet bound for record-less ids (`staged_authority::RECORDLESS_QUIET_RETIRE_SECS`,
+/// design § 16.6.6 B8), so removing the files never drops an id from the activation population
+/// sooner than the gate itself would.
+pub(crate) const RETIRED_LEDGER_QUIET: Duration =
+    Duration::from_secs(crate::staged_authority::RECORDLESS_QUIET_RETIRE_SECS);
+
+/// What [`reap_dead_instance_state`] removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeadInstanceStateCounts {
+    /// Header-only `_write_ledger/{bucket}/{XX}/{instance}.ledger` files.
+    pub ledger_files: u64,
+    /// Expired `_shard_state/capacity_reservations/{instance}.resv` documents.
+    pub reservations: u64,
+    /// Lapsed `_shard_state/scanners/` documents.
+    pub scanner_docs: u64,
+}
+
+/// Red-side levers: [`reap_dead_instance_state`] skips one kind.
+#[cfg(test)]
+const STATE_REAPER_SKIPS_LEDGER: bool = false;
+#[cfg(test)]
+const STATE_REAPER_SKIPS_RESERVATIONS: bool = false;
+#[cfg(test)]
+const STATE_REAPER_SKIPS_SCANNERS: bool = false;
+
+/// Whether `instance` (`{host}:{pid}`) is retired, quiet since `quiet_since`, by the rule
+/// [`reap_dead_instance_pending_files`] and [`reap_instance_journals`] apply. An own-host id
+/// (`host` one of `my_hosts`) is retired when its pid is not `my_pid`, reads dead by
+/// [`pid_may_be_alive`], and has been quiet for `own_grace`. Another host's pid cannot be tested
+/// here, so its id is retired once quiet for `foreign_grace`.
+pub(crate) fn instance_retired(
+    instance: &str,
+    quiet_since: SystemTime,
+    my_hosts: &[String],
+    my_pid: u32,
+    own_grace: Duration,
+    foreign_grace: Duration,
+    now: SystemTime,
+) -> bool {
+    let mut parts = instance.splitn(3, ':');
+    let (Some(host), Some(pid_str)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let quiet_for = |bound: Duration| {
+        now.duration_since(quiet_since)
+            .is_ok_and(|age| age >= bound)
+    };
+    // A shared hostname takes the foreign branch, which tests no pid: quiet for
+    // `foreign_grace` and nothing else. See [`own_host_pid_test_trusted`].
+    if my_hosts.iter().any(|h| h == host) && own_host_pid_test_trusted() {
+        let Some(pid) = pid_str
+            .parse::<u32>()
+            .ok()
+            .filter(|p| *p > 0 && *p <= i32::MAX as u32)
+        else {
+            return false;
+        };
+        pid != my_pid && !pid_may_be_alive(pid) && quiet_for(own_grace)
+    } else {
+        quiet_for(foreign_grace)
+    }
+}
+
+/// Remove the per-instance state of retired ids that no reader needs.
+///
+/// - Header-only shard ledger files ([`crate::write_ledger::WriteLedger::reap_retired_header_only_files`]),
+///   for an id retired by [`instance_retired`] with [`RETIRED_LEDGER_QUIET`] as both graces and
+///   whose `staged_pending/{instance}.pending` is absent or empty, so no pending credit is left
+///   for the file's cut to decide. Run after [`reap_dead_instance_pending_files`].
+/// - Expired reservations ([`crate::capacity_guard::reap_retired_reservations`]) and lapsed
+///   scanner documents ([`crate::scanner_registry::reap_retired`]), for an id retired by
+///   [`instance_retired`] with `grace` and `foreign_grace`, measured from when the lease lapsed.
+///
+/// `{instance}.ledger.mark` is never removed: it is the sequence floor a process reusing the id
+/// seeds from (`WriteLedger::seed_sequence`), and nothing bounds when pid reuse happens.
+pub(crate) fn reap_dead_instance_state(
+    cache_dir: &Path,
+    my_hosts: &[String],
+    my_pid: u32,
+    grace: Duration,
+    foreign_grace: Duration,
+    now: SystemTime,
+) -> DeadInstanceStateCounts {
+    let mut counts = DeadInstanceStateCounts::default();
+    let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let pending_dir = cache_dir
+        .join("metadata")
+        .join("_shard_state")
+        .join("staged_pending");
+    let no_pending_credit =
+        |instance: &str| match std::fs::metadata(pending_dir.join(format!("{instance}.pending"))) {
+            Ok(m) => m.len() == 0,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+    let retired = |instance: &str, quiet_since: SystemTime| {
+        instance_retired(
+            instance,
+            quiet_since,
+            my_hosts,
+            my_pid,
+            grace,
+            foreign_grace,
+            now,
+        )
+    };
+    #[cfg(test)]
+    let skip = (
+        STATE_REAPER_SKIPS_LEDGER,
+        STATE_REAPER_SKIPS_RESERVATIONS,
+        STATE_REAPER_SKIPS_SCANNERS,
+    );
+    #[cfg(not(test))]
+    let skip = (false, false, false);
+    if !skip.0 {
+        counts.ledger_files = crate::write_ledger::WriteLedger::reap_retired_header_only_files(
+            cache_dir,
+            &|instance, quiet_since| {
+                instance_retired(
+                    instance,
+                    quiet_since,
+                    my_hosts,
+                    my_pid,
+                    RETIRED_LEDGER_QUIET,
+                    RETIRED_LEDGER_QUIET,
+                    now,
+                ) && no_pending_credit(instance)
+            },
+        );
+    }
+    if !skip.1 {
+        counts.reservations =
+            crate::capacity_guard::reap_retired_reservations(cache_dir, now_secs, &retired);
+    }
+    if !skip.2 {
+        counts.scanner_docs = crate::scanner_registry::reap_retired(cache_dir, now_secs, &retired);
+    }
+    counts
+}
+
+/// What [`reap_instance_journals`] removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JournalReapCounts {
+    /// Own-host journals of dead pids removed: holding nothing to apply, older than the
+    /// replay limit, or a `.journal.tmp`.
+    pub dead_files: u64,
+    pub dead_bytes: u64,
+    /// Own-host journals of dead pids left in place for the consolidation cycle to apply.
+    pub dead_kept_files: u64,
+    /// Other hosts' journals holding nothing to apply, older than the grace.
+    pub foreign_files: u64,
+    pub foreign_bytes: u64,
+}
+
+/// How long a foreign-host journal must have gone unmodified before another host may reap it
+/// (and only when it holds nothing to apply; see [`foreign_journal_is_reapable`]).
+pub(crate) const FOREIGN_JOURNAL_REAP_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether a foreign-host journal's content holds nothing left to apply.
+///
+/// `cleanup_consolidated_entries` removes every applied entry from the file it came from
+/// (truncating a fully consolidated primary journal to empty, deleting a fully consolidated
+/// fresh one), so an entry still present is one not yet applied. Reapable content is therefore:
+/// no complete (newline-terminated) non-blank line, and at most one trailing unterminated
+/// fragment that does not parse as a [`JournalEntry`], i.e. a torn tail. A complete line this
+/// build cannot parse is kept: it may be a newer build's entry.
+fn foreign_journal_is_reapable(content: &[u8]) -> bool {
+    let mut segments = content.split(|&b| b == b'\n');
+    let tail = segments.next_back().unwrap_or(&[]);
+    if segments.any(|line| !line.trim_ascii().is_empty()) {
+        return false;
+    }
+    let tail = tail.trim_ascii();
+    tail.is_empty() || serde_json::from_slice::<JournalEntry>(tail).is_err()
+}
+
+/// Release an `flock` explicitly before the descriptor closes.
+///
+/// A flock belongs to the open file description, not to one descriptor. A child forked while the
+/// file is open (a test spawning a process, or any future fork) keeps a copy of the description,
+/// so dropping the `File` alone leaves the lock held until that child execs or exits. The
+/// unlock releases it regardless. An unlock error is logged and the drop still happens.
+pub(crate) fn unlock_lock_file(file: &std::fs::File, what: &str) {
+    if let Err(e) = fs4::FileExt::unlock(file) {
+        warn!("Failed to unlock {}: {}", what, e);
+    }
+}
+
+/// A journal append-lock file whose flock is released explicitly when it drops.
+pub(crate) struct UnlockOnDrop(pub(crate) std::fs::File);
+
+impl std::ops::Deref for UnlockOnDrop {
+    type Target = std::fs::File;
+    fn deref(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+impl Drop for UnlockOnDrop {
+    fn drop(&mut self) {
+        unlock_lock_file(&self.0, "journal lock file");
+    }
+}
+
+/// Reap one foreign-host journal if it is reapable, holding its append lock so no appender can
+/// write between the check and the unlink. Returns the bytes removed.
+fn reap_foreign_journal(path: &Path, now: SystemTime, grace: Duration) -> Option<u64> {
+    let lock_path = path.with_extension("journal.lock");
+    // Busy means an appender or a cleanup holds it: not idle, skip. Held until return.
+    let _lock_file =
+        UnlockOnDrop(crate::journal_manager::lock_journal_lock_file(&lock_path, false).ok()??);
+    let meta = std::fs::metadata(path).ok()?;
+    let idle = meta
+        .modified()
+        .ok()
+        .and_then(|m| now.duration_since(m).ok())
+        .is_some_and(|age| age >= grace);
+    if !idle {
+        return None;
+    }
+    let content = std::fs::read(path).ok()?;
+    if !foreign_journal_is_reapable(&content) {
+        return None;
+    }
+    // The lock file is left for `cleanup_stale_lock_files`: unlinking a lock another host may
+    // be about to open would split the mutual exclusion across two inodes.
+    match std::fs::remove_file(path) {
+        Ok(()) => Some(content.len() as u64),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to remove foreign journal {:?}: {}", path, e);
+            }
+            None
+        }
+    }
+}
+
+/// Remove a `.journal.lock` whose journal is absent, but only while holding its flock.
+///
+/// An appender opens the lock file, takes the flock, and only then creates the primary
+/// journal (`JournalManager::append_range_entry` and `append_lines_locked_or_fresh` in
+/// `src/journal_manager.rs`), so "journal absent" alone does not mean "lock unused": an
+/// unlink in that window would let a second opener create a fresh lock inode and hold it
+/// alongside the first holder. So the lock file is opened without creating it, try-locked,
+/// re-checked to still name the opened inode and to still have no journal, and unlinked
+/// while held. A busy lock is left alone. Any task that opened the old inode and locks it
+/// after this unlink sees the path no longer names it (`lock_journal_lock_file`) and
+/// reopens. Returns true if the file was removed.
+fn remove_lock_file_if_unheld(lock_path: &Path, journal_path: &Path) -> bool {
+    let lock_file = match std::fs::OpenOptions::new().write(true).open(lock_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    #[cfg(test)]
+    if STALE_LOCK_SKIP_TRY_LOCK_LEVER {
+        return std::fs::remove_file(lock_path).is_ok();
+    }
+    if fs4::FileExt::try_lock(&lock_file).is_err() {
+        debug!("Lock file is held, not removing: {:?}", lock_path);
+        return false;
+    }
+    let lock_file = UnlockOnDrop(lock_file);
+    if !crate::journal_manager::lock_file_still_named(&lock_file, lock_path)
+        || journal_path.exists()
+    {
+        return false;
+    }
+    match std::fs::remove_file(lock_path) {
+        Ok(()) => true,
+        Err(e) => {
+            // Another instance may have already cleaned it
+            debug!(
+                "Failed to remove stale lock file: {:?}, error={}",
+                lock_path, e
+            );
+            false
+        }
+    }
+}
+
+/// Red-side lever for `remove_lock_file_if_unheld`: unlink without the try-lock.
+#[cfg(test)]
+const STALE_LOCK_SKIP_TRY_LOCK_LEVER: bool = false;
+
+/// What [`reap_dead_own_host_journal`] did with one journal of a dead process of this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadJournalReap {
+    /// Left in place: it holds entries to apply, or its lock was busy.
+    Kept,
+    /// Removed, holding nothing to apply. Carries the bytes removed.
+    Empty(u64),
+    /// Removed unapplied, unmodified for longer than the replay limit.
+    Expired {
+        bytes: u64,
+        lines: u64,
+        age: Duration,
+    },
+}
+
+/// Decide one `.journal` (primary, or a `{host}:{pid}:{nanos}` fresh journal) of a dead
+/// process of this host, under its append lock.
+///
+/// `cleanup_consolidated_entries` removes every applied entry from the file it came from, so a
+/// complete line still present is an entry no consolidation has applied. Such a journal is
+/// kept, and the normal cycle (whose discovery reads every `*.journal`) applies it. One holding
+/// nothing to apply ([`foreign_journal_is_reapable`]) is removed. One unmodified for longer
+/// than `replay_max_age` is removed unapplied: folding an `Add` into an absent `.meta` stamps
+/// `created_at`, the GET freshness anchor, with the fold time, so replaying a fill from before
+/// a long outage would extend its freshness by the length of the outage.
+///
+/// The lock file is left for `cleanup_stale_lock_files`, as [`reap_foreign_journal`] leaves it.
+fn reap_dead_own_host_journal(
+    path: &Path,
+    now: SystemTime,
+    replay_max_age: Duration,
+) -> DeadJournalReap {
+    let lock_path = path.with_extension("journal.lock");
+    // A dead process holds no lock. Busy means a live consolidator is cleaning this journal up,
+    // or the pid test misread a live process: either way it is not to be removed now.
+    let Some(_lock_file) = crate::journal_manager::lock_journal_lock_file(&lock_path, false)
+        .ok()
+        .flatten()
+        .map(UnlockOnDrop)
+    else {
+        return DeadJournalReap::Kept;
+    };
+    let Ok(content) = std::fs::read(path) else {
+        return DeadJournalReap::Kept;
+    };
+    let bytes = content.len() as u64;
+    let verdict = if foreign_journal_is_reapable(&content) {
+        DeadJournalReap::Empty(bytes)
+    } else {
+        // An mtime that cannot be read, or one in the future, reads as young: keep.
+        let age = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| now.duration_since(m).ok());
+        match age {
+            Some(age) if age > replay_max_age => {
+                let mut segments = content.split(|&b| b == b'\n');
+                segments.next_back();
+                let lines = segments.filter(|l| !l.trim_ascii().is_empty()).count() as u64;
+                DeadJournalReap::Expired { bytes, lines, age }
+            }
+            _ => return DeadJournalReap::Kept,
+        }
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => verdict,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to remove dead instance journal {:?}: {}", path, e);
+            }
+            DeadJournalReap::Kept
+        }
+    }
+}
+
+/// Reap `metadata/_journals/` files of dead processes of this host.
+///
+/// Journal names encode the instance as `{hostname}:{pid}.journal` (or `.journal.tmp`, or
+/// `{hostname}:{pid}:{timestamp}.journal` for a fresh journal written under lock contention).
+/// Another host's `.journal` is removed only by [`reap_foreign_journal`]: under its append lock,
+/// unmodified for `foreign_grace`, and holding nothing to apply ([`foreign_journal_is_reapable`]).
+///
+/// An own-host file is considered only if its pid is not `my_pid` and the pid is dead by [`pid_may_be_alive`] (`kill(pid, 0)` reports `ESRCH`; `EPERM` and any other
+/// error count as alive). A dead pid's `.journal.tmp` is removed. Its `.journal` and fresh
+/// journals are decided by [`reap_dead_own_host_journal`]: kept while they hold entries to
+/// apply, unless unmodified for longer than `replay_max_age`. No lock file is removed here.
+pub(crate) fn reap_instance_journals(
+    journals_dir: &Path,
+    my_hostname: &str,
+    my_pid: u32,
+    now: SystemTime,
+    foreign_grace: Duration,
+    replay_max_age: Duration,
+) -> JournalReapCounts {
+    let mut counts = JournalReapCounts::default();
+    let entries = match std::fs::read_dir(journals_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                "Failed to read journals dir for dead instance cleanup: {}",
+                e
+            );
+            return counts;
+        }
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let instance_part = match file_name
+            .strip_suffix(".journal.tmp")
+            .or_else(|| file_name.strip_suffix(".journal"))
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        let parts: Vec<&str> = instance_part.splitn(3, ':').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let hostname = parts[0];
+        // A shared hostname sends this host's own journals down the foreign path too: it takes
+        // the append lock, requires nothing to apply and waits out `foreign_grace`, so a live
+        // peer's journal is never removed on a pid test this machine cannot answer.
+        if hostname != my_hostname || !own_host_pid_test_trusted() {
+            // No host can test another host's pid. A foreign journal is reaped only when it
+            // holds nothing to apply and has been idle for the grace; `.journal.tmp` is an
+            // appender's in-flight temp and is never touched from another host.
+            if file_name.ends_with(".journal") {
+                if let Some(bytes) = reap_foreign_journal(&path, now, foreign_grace) {
+                    counts.foreign_files += 1;
+                    counts.foreign_bytes += bytes;
+                    debug!(
+                        "Removed idle empty foreign-host journal: file={}",
+                        file_name
+                    );
+                }
+            }
+            continue;
+        }
+        let pid: u32 = match parts[1].parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == my_pid {
+            continue;
+        }
+        // Only ESRCH is dead: EPERM is a live process of another user.
+        if pid_may_be_alive(pid) {
+            continue;
+        }
+        if file_name.ends_with(".journal.tmp") {
+            // A cleanup's staging file. The primary journal keeps every line until the rename
+            // replaces it, so removing the temp loses nothing: a rewrite still in progress
+            // fails its rename and the primary's lines are applied again.
+            let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    counts.dead_files += 1;
+                    counts.dead_bytes += file_size;
+                    debug!(
+                        "Removed dead instance journal temp: file={}, pid={}, size={}",
+                        file_name, pid, file_size
+                    );
+                }
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(
+                            "Failed to remove dead instance journal temp {}: {}",
+                            file_name, e
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        match reap_dead_own_host_journal(&path, now, replay_max_age) {
+            DeadJournalReap::Kept => {
+                counts.dead_kept_files += 1;
+                debug!(
+                    "Kept dead instance journal for consolidation: file={}, pid={}",
+                    file_name, pid
+                );
+            }
+            DeadJournalReap::Empty(bytes) => {
+                counts.dead_files += 1;
+                counts.dead_bytes += bytes;
+                debug!(
+                    "Removed dead instance journal with nothing to apply: file={}, pid={}, size={}",
+                    file_name, pid, bytes
+                );
+            }
+            DeadJournalReap::Expired { bytes, lines, age } => {
+                counts.dead_files += 1;
+                counts.dead_bytes += bytes;
+                warn!(
+                    "Discarded unapplied journal of a stopped process on this host, unmodified for longer than the replay limit: file={}, pid={}, bytes={}, lines={}, age_secs={}, limit_secs={}",
+                    file_name,
+                    pid,
+                    bytes,
+                    lines,
+                    age.as_secs(),
+                    replay_max_age.as_secs()
+                );
+            }
+        }
+    }
+    counts
+}
+
+/// A `SystemTime` as nanoseconds since the epoch, 0 for a pre-epoch value.
+///
+/// Nanoseconds, never seconds: these figures go into a tail-delta record whose `at` is part of a
+/// compaction identity, and second granularity there makes the identity silently match nothing
+/// (§ 2 trap 1).
+fn nanos_since_epoch(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether `entry` can be the source of a new `.meta` when none exists: an `Add` or `Update`
+/// that carries the S3 response's `object_metadata` (and, by type, a range).
+///
+/// Every production range fill journals an `Add` with `object_metadata` (the `JournalOnly`
+/// writes in `disk_cache.rs`). `Remove`, `TtlRefresh`, `AccessUpdate` and `Graduation`
+/// describe an object that already has a document, and an `Add` without `object_metadata`
+/// gives no ETag or headers to serve under, so none of them may create one.
+fn entry_can_create_document(entry: &JournalEntry) -> bool {
+    matches!(
+        entry.operation,
+        JournalOperation::Add | JournalOperation::Update
+    ) && entry.object_metadata.is_some()
+}
+
+/// True when the key's `.meta` is absent and no entry can create it, so folding them would
+/// only write a default document (empty ETag, no ranges) for an object that is already gone.
+///
+/// `meta_exists` is consulted only when no entry can create a document. An empty slice is
+/// never skipped.
+fn no_document_source_for_absent_meta(
+    entries: &[JournalEntry],
+    meta_exists: impl FnOnce() -> bool,
+) -> bool {
+    !entries.is_empty() && !entries.iter().any(entry_can_create_document) && !meta_exists()
+}
+
+/// What `load_or_create_metadata_with_journal_entries` found for a key.
+enum LoadedMetadata {
+    /// The document to fold into. `Some(reason)` when an unloadable `.meta` was unlinked and
+    /// this is a fresh document replacing it. The `bool` is whether the document is new: no
+    /// parseable `.meta` was there before this fold (the absent-key create and the
+    /// corrupt-heal create), which is what credits `cached_objects` once it is written.
+    Document(
+        Box<NewCacheMetadata>,
+        Option<crate::disk_cache::CorruptReason>,
+        bool,
+    ),
+    /// An unloadable `.meta` was unlinked and no entry can create a document, so the key now
+    /// has none.
+    RemovedWithoutReplacement,
+}
+
+/// Test seam: unlink an armed key's `.meta` after validation and before the document guard,
+/// the way a peer's eviction appears between the two.
+#[cfg(test)]
+mod meta_unlink_seam {
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn arm(cache_key: &str) {
+        ARMED.lock().unwrap().push(cache_key.to_string());
+    }
+
+    pub(super) fn take(cache_key: &str) -> bool {
+        let mut armed = ARMED.lock().unwrap();
+        match armed.iter().position(|k| k == cache_key) {
+            Some(i) => {
+                armed.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// What the range fills (`Add`/`Update`) of one consolidation batch say about the extents they
+/// share ([`disputed_fill_extents`]).
+#[derive(Debug, Default)]
+struct FillDisputes {
+    /// Unlisted and unlinked whatever `created_at` says
+    /// ([`JournalConsolidator::retire_disagreeing_fills`]).
+    retire: HashSet<(u64, u64)>,
+    /// Same or absent ETags, different recorded file identities: the file now at the path
+    /// says which fill renamed last ([`JournalConsolidator::settle_identity_disputes`]). The
+    /// candidates are the fills' listings that record an identity.
+    by_identity: HashMap<(u64, u64), Vec<RangeSpec>>,
+}
+
+/// Extents two range fills in one consolidation batch disagree about.
+///
+/// The `.bin` path is `(key, start, end)` whatever the version, so for a shared extent the file
+/// holds whichever fill renamed last. A fill's `created_at` is stamped when its `.tmp` is
+/// finished, before the slot lock its rename takes, so two proxies' prepare order can invert
+/// their rename order: ordering by `created_at` can keep a listing whose file holds the other
+/// fill's bytes.
+///
+/// - **Two recorded ETags differ** (quote-insensitive): the extent is retired (unlisted, file
+///   unlinked) and the next read refills it. The exception is a key whose `.meta` already
+///   existed before this pass (`meta_existed`) where every fill of the extent records a file
+///   identity: the other-version partition keeps the other version's fills out of the listing,
+///   and a read serves the surviving listing only when the file it opens has the identity the
+///   listing records. Retiring it here would also drop a correct listing, such as a multipart
+///   part that renamed last over a GET fill of the same extent.
+/// - **Otherwise, two recorded file identities differ**: the fill whose identity equals the
+///   file now at the path is the one that renamed last, and is listed
+///   ([`JournalConsolidator::settle_identity_disputes`], one `stat` per such extent). When none
+///   matches, the extent is retired.
+///
+/// A fill with no recorded ETag or no recorded identity gives nothing to compare on that axis,
+/// so legacy entries keep the existing `created_at` and other-version handling.
+fn disputed_fill_extents(entries: &[JournalEntry], meta_existed: bool) -> FillDisputes {
+    let mut etags: HashMap<(u64, u64), &str> = HashMap::new();
+    let mut etag_disputed: HashSet<(u64, u64)> = HashSet::new();
+    let mut unidentified: HashSet<(u64, u64)> = HashSet::new();
+    let mut identified: HashMap<(u64, u64), Vec<RangeSpec>> = HashMap::new();
+    for entry in entries {
+        if !matches!(
+            entry.operation,
+            JournalOperation::Add | JournalOperation::Update
+        ) {
+            continue;
+        }
+        let extent = (entry.range_spec.start, entry.range_spec.end);
+        let etag = entry
+            .object_metadata
+            .as_ref()
+            .map(|om| om.etag.as_str())
+            .filter(|e| !e.is_empty());
+        if let Some(etag) = etag {
+            match etags.get(&extent) {
+                Some(first) if !crate::revalidation::etags_equal_ignoring_quotes(first, etag) => {
+                    etag_disputed.insert(extent);
+                }
+                Some(_) => {}
+                None => {
+                    etags.insert(extent, etag);
+                }
+            }
+        }
+        match entry.range_spec.file_identity {
+            Some(identity) => {
+                let candidates = identified.entry(extent).or_default();
+                if !candidates.iter().any(|c| c.file_identity == Some(identity)) {
+                    candidates.push(entry.range_spec.clone());
+                }
+            }
+            None => {
+                unidentified.insert(extent);
+            }
+        }
+    }
+    let mut disputes = FillDisputes::default();
+    for extent in etag_disputed {
+        if !(meta_existed && !unidentified.contains(&extent)) {
+            disputes.retire.insert(extent);
+        }
+        identified.remove(&extent);
+    }
+    disputes.by_identity = identified
+        .into_iter()
+        .filter(|(_, candidates)| candidates.len() > 1)
+        .collect();
+    disputes
+}
+
+/// Split `entries` into those that may fold into `metadata` and range fills (`Add`/`Update`)
+/// whose recorded ETag names a different object version than `metadata`'s.
+///
+/// An entry with no `object_metadata`, or a `.meta` with no ETag, gives nothing to compare
+/// and is kept.
+fn partition_other_version_fills(
+    metadata: &NewCacheMetadata,
+    entries: Vec<JournalEntry>,
+) -> (Vec<JournalEntry>, Vec<JournalEntry>) {
+    let meta_etag = metadata.object_metadata.etag.as_str();
+    if meta_etag.is_empty() {
+        return (entries, Vec::new());
+    }
+    entries.into_iter().partition(|entry| {
+        let is_fill = matches!(
+            entry.operation,
+            JournalOperation::Add | JournalOperation::Update
+        );
+        match (&entry.object_metadata, is_fill) {
+            (Some(om), true) if !om.etag.is_empty() => {
+                crate::revalidation::etags_equal_ignoring_quotes(&om.etag, meta_etag)
+            }
+            _ => true,
+        }
+    })
+}
+
+/// Longest a [`ReadinessMemo`] is served before the volume is read again, seconds.
+///
+/// The staged fold's own interval, [`crate::staged_fold::STAGED_FOLD_INTERVAL_SECS`] (300 s): the
+/// fold, the repair rotation ([`crate::ledger_repair::LEDGER_REPAIR_INTERVAL_SECS`], also 300 s)
+/// and therefore the evidence they install cannot change on this instance's own cadence faster
+/// than that, and the activation bounds the evidence is compared against are 1 h and 24 h.
+const READINESS_MEMO_MAX_AGE_SECS: u64 = crate::staged_fold::STAGED_FOLD_INTERVAL_SECS;
+
+/// Volume-derived staged-authority readiness evidence, read once and re-evaluated against `now`.
+///
+/// # Why a cached value cannot activate the epoch
+///
+/// 1. **Ages are evaluated against `now`, rounded against the cache.** Each figure is stored as
+///    an age at read time, and every use adds the elapsed time rounded UP. With no install in
+///    between, the true age grows by exactly that much; an install only makes it younger. So the
+///    cached age is never younger than a fresh read's, and a cached `true` turns `false` by
+///    ageing no later than the uncached predicate would.
+/// 2. **Other regressions are bounded by [`READINESS_MEMO_MAX_AGE_SECS`].** A newly observed
+///    shard with no sweep, or a document that became unreadable, is invisible to a cached
+///    value until it expires.
+/// 3. **Activation re-reads.** Whatever rule 2 lets through never reaches the epoch:
+///    `maintain_staged_authority` re-reads the volume, republishes, and re-evaluates the verdict
+///    before acting on a `Permitted` computed from cached evidence. Every readiness field except
+///    `fold_incomplete_total` (a live process counter, never cached) is derived from shared
+///    documents, so that fresh read is the same evaluation every instance's record makes.
+///
+/// It is invalidated when this instance's own fold installs or its repair pass makes progress,
+/// so the common case — this instance did the work — pays no added delay at all.
+#[derive(Debug, Clone, Copy)]
+struct ReadinessMemo {
+    /// Stamped BEFORE the reads, so the elapsed time measured from it is never shorter than the
+    /// time since the ages were computed.
+    read_at_nanos: u64,
+    /// [`crate::staged_fold::rotation_evidence`].
+    fold: Option<u64>,
+    /// [`crate::ledger_repair::RepairReadinessEvidence`].
+    repair: crate::ledger_repair::RepairReadinessEvidence,
+}
+
+impl ReadinessMemo {
+    /// Read the evidence from the volume. Synchronous `std::fs`: O(shards) document reads.
+    fn read(cache_dir: &Path) -> Self {
+        let read_at_nanos = nanos_since_epoch(SystemTime::now());
+        let fold = crate::staged_fold::rotation_evidence(cache_dir);
+        // One shard walk and one read of the repair documents, for both repair figures.
+        let population = crate::ledger_repair::observed_shards_on_disk(cache_dir);
+        let docs = crate::ledger_repair::read_repair_checkpoints(cache_dir);
+        let repair =
+            crate::ledger_repair::RepairReadinessEvidence::from_read(population.as_ref(), &docs);
+        Self {
+            read_at_nanos,
+            fold,
+            repair,
+        }
+    }
+
+    /// Seconds since [`Self::read_at_nanos`], rounded UP. 0 if the clock stepped back.
+    fn elapsed_secs_ceil(&self, now_nanos: u64) -> u64 {
+        now_nanos
+            .saturating_sub(self.read_at_nanos)
+            .div_ceil(1_000_000_000)
+    }
+
+    /// Whether this memo may still be served at `now_nanos`.
+    fn is_current(&self, now_nanos: u64) -> bool {
+        self.elapsed_secs_ceil(now_nanos) < READINESS_MEMO_MAX_AGE_SECS
+    }
+
+    /// `(rotation_complete, repair_rotation_complete, repair_stalest_age_secs)` at `now_nanos`.
+    fn evaluate(&self, now_nanos: u64) -> (bool, bool, Option<u64>) {
+        let elapsed = self.elapsed_secs_ceil(now_nanos);
+        (
+            crate::staged_fold::rotation_complete_given(self.fold, elapsed),
+            self.repair.rotation_complete_after(elapsed),
+            self.repair.stalest_age_secs_after(elapsed),
+        )
+    }
+}
+
+/// Reset an in-progress flag when dropped, so an aborted pass task cannot leave it set.
+///
+/// A spawned pass is cancelled at an await point by [`JournalConsolidator::shutdown`]. Without
+/// this the flag would stay `true` and no later pass on this consolidator could start; with it,
+/// every exit from the pass — completion, early return, or abort — clears the flag.
+struct InProgressReset(Arc<AtomicBool>);
+
+impl Drop for InProgressReset {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The handles the three maintenance passes need, cloned out of the consolidator so a pass can
+/// run on its own task.
+///
+/// # Why the passes run off the consolidation cycle
+///
+/// The staged fold, the `st_size` fold and the ledger repair used to be awaited inline at the
+/// top of `run_consolidation_cycle`. Each gates on a last-run timestamp that is 0 at process
+/// start, so all three ran in the first cycle, and the `st_size` fold is O(resident range files)
+/// with a 30-minute budget. While a pass ran, this instance consolidated no journal entry and
+/// applied no size delta. The first cycle after a fleet restart took 104 s, 78 s of it the
+/// `st_size` fold, and the same stall recurred once per `shard_fold_interval`.
+///
+/// Every field here is the one the consolidator itself holds, so gates, cadence timestamps,
+/// in-progress flags and the readiness-memo invalidation are the same state either way. The
+/// ordering argument for moving each pass is in
+/// the investigation record; the short form is that all three
+/// already ran outside the global consolidation lock, so they already ran concurrently with
+/// every peer's delta apply, consolidation and activation, and the two same-instance
+/// interactions that remained are kept by `readiness_memo_generation` and by
+/// `maintain_staged_authority` declining to evaluate activation while this instance's own
+/// staged fold or ledger repair is in flight.
+#[derive(Clone)]
+struct MaintenancePasses {
+    cache_dir: PathBuf,
+    write_ledger: Arc<crate::write_ledger::WriteLedger>,
+    last_staged_fold_completed_secs: Arc<AtomicU64>,
+    last_staged_fold_attempt_secs: Arc<AtomicU64>,
+    staged_fold_in_progress: Arc<AtomicBool>,
+    last_ledger_repair_secs: Arc<AtomicU64>,
+    ledger_repair_in_progress: Arc<AtomicBool>,
+    readiness_memo: Arc<Mutex<Option<ReadinessMemo>>>,
+    readiness_memo_generation: Arc<AtomicU64>,
+    fold_limiter: Arc<Mutex<crate::scanner_limiter::ScannerLimiter>>,
+    repair_limiter: Arc<Mutex<crate::scanner_limiter::ScannerLimiter>>,
+    shard_fold_interval: Duration,
+    shard_fold_max_duration: Duration,
+    incomplete_upload_ttl_secs: Arc<AtomicU64>,
+    last_incomplete_upload_sweep_secs: Arc<AtomicU64>,
+    incomplete_upload_sweep_in_progress: Arc<AtomicBool>,
+    /// For the `incomplete_upload_evicted` statistic; `None` before `set_cache_manager`.
+    cache_manager: Option<Weak<crate::cache::CacheManager>>,
+}
+
+/// `cache.incomplete_upload_ttl`'s default, one day, until
+/// [`JournalConsolidator::set_incomplete_upload_ttl`].
+const DEFAULT_INCOMPLETE_UPLOAD_TTL_SECS: u64 = 86_400;
+
+/// The incomplete-upload sweep's interval for a TTL: a quarter of it, capped at one hour, so an
+/// abandoned upload is reaped at most a quarter-TTL (or an hour) after it expires. At least 1 s.
+pub fn incomplete_upload_sweep_interval_secs(ttl_secs: u64) -> u64 {
+    (ttl_secs / 4).clamp(1, 3600)
+}
+
+/// Maintenance passes deferred by the scanner gate, per kind (`Fold`, `Repair`, `Validation`),
+/// per-instance since process start. Counts deferred CYCLES: one per pass that was due and
+/// claimed but did not run because `n ≥ k` and the bypass did not apply.
+static SCAN_DEFERRED_TOTAL: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn scan_kind_index(kind: crate::scanner_registry::ScanKind) -> usize {
+    use crate::scanner_registry::ScanKind;
+    match kind {
+        ScanKind::Fold => 0,
+        ScanKind::Repair => 1,
+        ScanKind::Validation => 2,
+    }
+}
+
+/// `scan_deferred_total` for `kind`: deferred consolidation cycles, per-instance since start.
+pub(crate) fn scan_deferred_total(kind: crate::scanner_registry::ScanKind) -> u64 {
+    SCAN_DEFERRED_TOTAL[scan_kind_index(kind)].load(Ordering::Relaxed)
+}
+
+/// The live peer-scanner count `n` the gate last read for each kind, per-instance. 0 until the
+/// gate has run for that kind.
+static SCAN_LAST_OBSERVED: [std::sync::atomic::AtomicU32; 3] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
+/// `scanner_concurrency_observed` for `kind`: the `n` the gate last read.
+pub(crate) fn scan_last_observed(kind: crate::scanner_registry::ScanKind) -> u32 {
+    SCAN_LAST_OBSERVED[scan_kind_index(kind)].load(Ordering::Relaxed)
+}
+
+/// Whether a pass bypasses the scanner gate (§ 16.6.13 K3/K4): its rotation's stalest age is
+/// above three quarters of the window, or unreadable. Deliberately takes no rotation
+/// reachability or projected-rotation input: K3 forbids gating the bypass on either.
+fn scan_gate_bypass(stalest_age_secs: Option<u64>, window_secs: u64) -> bool {
+    match stalest_age_secs {
+        None => true,
+        Some(age) => age.saturating_mul(4) > window_secs.saturating_mul(3),
+    }
+}
+
+/// This instance's own live documents of kinds other than `kind`, which
+/// `scanner_registry::count_live_others` includes and the gate must not count.
+fn own_live_other_kinds(
+    cache_dir: &Path,
+    instance_id: &str,
+    kind: crate::scanner_registry::ScanKind,
+    now: u64,
+) -> u32 {
+    use crate::scanner_registry::{scanners_dir, ScanKind, ScannerDocument, SCANNER_DOC_SCHEMA};
+    [ScanKind::Fold, ScanKind::Repair, ScanKind::Validation]
+        .into_iter()
+        .filter(|k| *k != kind)
+        .filter(|k| {
+            let path = scanners_dir(cache_dir).join(format!("{instance_id}.{}.scan", k.as_str()));
+            std::fs::read(path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<ScannerDocument>(&b).ok())
+                .is_some_and(|d| {
+                    d.schema == SCANNER_DOC_SCHEMA
+                        && d.instance_id == instance_id
+                        && d.kind == *k
+                        && d.ended_at.is_none()
+                        && d.published_at.saturating_add(d.lease_secs) > now
+                })
+        })
+        .count() as u32
+}
+
+/// The gate's `n`: live peer scanners, excluding this instance's own documents of other kinds.
+/// One function so the gate and the per-visit sampler cannot count differently.
+fn gate_peer_count(
+    cache_dir: &Path,
+    instance_id: &str,
+    kind: crate::scanner_registry::ScanKind,
+    now: u64,
+) -> u32 {
+    crate::scanner_registry::count_live_others(cache_dir, instance_id, kind, now)
+        .saturating_sub(own_live_other_kinds(cache_dir, instance_id, kind, now))
+}
+
+/// Per-visit sampling for one scan pass (§ 16.6.13 K2 steps 1-3).
+///
+/// A pass body that is handed one reads `n` at each **claimed** visit's start and end and feeds
+/// `(n_start, n_end, metas_read, elapsed)` to the limiter when the visit completes. A busy,
+/// refused or skipped visit records nothing. The end reading of visit `i` is reused as visit
+/// `i + 1`'s start reading, which halves the registry reads; a visit that does not complete
+/// hands its start reading on unchanged.
+pub(crate) struct VisitSampler<'a> {
+    cache_dir: &'a Path,
+    instance_id: &'a str,
+    kind: crate::scanner_registry::ScanKind,
+    limiter: &'a Mutex<crate::scanner_limiter::ScannerLimiter>,
+    /// Test hook run after every peer-count read, so a fixture can publish a peer document
+    /// between a visit's two reads.
+    #[cfg(test)]
+    after_read: Option<Box<dyn Fn() + Send + Sync + 'a>>,
+}
+
+impl<'a> VisitSampler<'a> {
+    pub(crate) fn new(
+        cache_dir: &'a Path,
+        instance_id: &'a str,
+        kind: crate::scanner_registry::ScanKind,
+        limiter: &'a Mutex<crate::scanner_limiter::ScannerLimiter>,
+    ) -> Self {
+        Self {
+            cache_dir,
+            instance_id,
+            kind,
+            limiter,
+            #[cfg(test)]
+            after_read: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_read(mut self, hook: impl Fn() + Send + Sync + 'a) -> Self {
+        self.after_read = Some(Box::new(hook));
+        self
+    }
+
+    /// Read `n` now, exactly as the gate does.
+    pub(crate) fn peer_count(&self) -> u32 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let n = gate_peer_count(self.cache_dir, self.instance_id, self.kind, now);
+        #[cfg(test)]
+        if let Some(hook) = &self.after_read {
+            hook();
+        }
+        n
+    }
+
+    /// Record one completed visit. A visit that read no `.meta` carries no rate information
+    /// about the backend (a fold visit of a shard with no staged candidates is pure claim and
+    /// ledger cost), so it is not recorded: a zero rate would read as contention.
+    pub(crate) fn record(&self, n_start: u32, n_end: u32, metas_read: u64, elapsed: Duration) {
+        if metas_read == 0 {
+            return;
+        }
+        self.limiter
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_visit(n_start, n_end, metas_read, elapsed);
+    }
+}
+
+/// Highest level probed when asking a limiter whether it holds any visit sample.
+const LIMITER_EVIDENCE_LEVEL_CAP: u32 = 1024;
+
+/// Whether `limiter` has recorded no visit at all, kept or discarded. While it holds none, the
+/// gate re-seeds it at `k = k_max` every pass, so a raised ceiling is followed at once and nothing
+/// defers without evidence. Once a visit has been sampled the re-seed stops and `set_k_max` takes
+/// over: a later rise in `k_max` is climbed by the probe, deliberately, because resetting the
+/// table on every fleet growth would return `k` to `k_max` and re-flood a backend whose aggregate
+/// falls past a peak.
+fn limiter_has_no_evidence(limiter: &crate::scanner_limiter::ScannerLimiter) -> bool {
+    limiter.samples_discarded() == 0
+        && (1..=LIMITER_EVIDENCE_LEVEL_CAP).all(|j| limiter.samples_at(j) == 0)
+}
+
+/// This instance's scanner document for one pass. Dropping it ends the document, so every exit
+/// from the pass (return, early return, error outcome, panic unwind, task abort) ends it. Errors
+/// are logged at debug and never fail the pass.
+struct ScanDocGuard {
+    cache_dir: PathBuf,
+    instance_id: String,
+    kind: crate::scanner_registry::ScanKind,
+}
+
+impl Drop for ScanDocGuard {
+    fn drop(&mut self) {
+        if let Err(e) = crate::scanner_registry::end(&self.cache_dir, &self.instance_id, self.kind)
+        {
+            debug!(
+                "Scanner document end failed: kind={}, error={}",
+                self.kind.as_str(),
+                e
+            );
+        }
+    }
+}
+
+impl MaintenancePasses {
+    /// Drop the held readiness evidence and advance the generation, so a read that straddled
+    /// this call does not store what it read.
+    fn invalidate_readiness_memo(&self) {
+        invalidate_memo(&self.readiness_memo, &self.readiness_memo_generation);
+    }
+
+    /// The staged fold's gate and in-progress claim, taken synchronously.
+    ///
+    /// `Some` means this caller now owns the pass: the interval has elapsed and the flag was
+    /// clear and is now set. The returned guard clears it when dropped. Split from the pass body
+    /// so [`JournalConsolidator::spawn_maintenance_passes`] can set the flag BEFORE the cycle
+    /// reaches `maintain_staged_authority` — otherwise a pass spawned in this very cycle (the
+    /// first cycle after start, always) would not yet be visible as in flight there.
+    fn claim_staged_fold(&self) -> Option<(u64, InProgressReset)> {
+        use crate::staged_fold::STAGED_FOLD_INTERVAL_SECS;
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last_completed = self.last_staged_fold_completed_secs.load(Ordering::Relaxed);
+        // `last_completed == 0` means no fold has ever completed in this process, and
+        // `now - 0` is enormous, so the first cycle after start always runs one.
+        if now_secs.saturating_sub(last_completed) < STAGED_FOLD_INTERVAL_SECS {
+            return None;
+        }
+        let last_attempt = self.last_staged_fold_attempt_secs.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(last_attempt) < STAGED_FOLD_INTERVAL_SECS {
+            return None;
+        }
+        if self
+            .staged_fold_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some((
+            now_secs,
+            InProgressReset(Arc::clone(&self.staged_fold_in_progress)),
+        ))
+    }
+
+    fn limiter(
+        &self,
+        kind: crate::scanner_registry::ScanKind,
+    ) -> &Mutex<crate::scanner_limiter::ScannerLimiter> {
+        match kind {
+            crate::scanner_registry::ScanKind::Repair => &self.repair_limiter,
+            _ => &self.fold_limiter,
+        }
+    }
+
+    /// The scanner gate (§ 16.6.13 K3/K4), evaluated before a claimed pass.
+    ///
+    /// `None` is a DEFERRAL: `n ≥ k` live peer scanners and the bypass does not apply. The caller
+    /// must then return without touching its cadence stamp, its freshness record or the readiness
+    /// memo, so the next cycle asks again. `stalest_age` is read only when the gate would
+    /// otherwise defer, so an uncontended pass pays no extra traversal.
+    ///
+    /// `Some` publishes this instance's document for `kind` and returns the guard that ends it.
+    fn admit_scan(
+        &self,
+        kind: crate::scanner_registry::ScanKind,
+        window_secs: u64,
+        stalest_age: impl FnOnce() -> Option<u64>,
+    ) -> Option<ScanDocGuard> {
+        use crate::scanner_registry as reg;
+        let instance_id = self.write_ledger.instance_id();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Peers only: this instance's own pass of another kind is not a competing scanner here.
+        // `k_max` counts instances, so counting our own other-kind document in `n` would make a
+        // lone instance's fold and repair defer each other every cycle.
+        let n = gate_peer_count(&self.cache_dir, instance_id, kind, now);
+        SCAN_LAST_OBSERVED[scan_kind_index(kind)].store(n, Ordering::Relaxed);
+        let k_max = reg::k_max_including(&self.cache_dir, Some(instance_id), now);
+        let k = {
+            let mut limiter = self.limiter(kind).lock().unwrap_or_else(|p| p.into_inner());
+            if limiter_has_no_evidence(&limiter) {
+                *limiter = crate::scanner_limiter::ScannerLimiter::new(k_max);
+            } else {
+                limiter.set_k_max(k_max);
+            }
+            limiter.k()
+        };
+        if n >= k {
+            let age = stalest_age();
+            if !scan_gate_bypass(age, window_secs) {
+                SCAN_DEFERRED_TOTAL[scan_kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Maintenance pass deferred: kind={}, live_others={}, k={}, k_max={}, stalest_age_secs={:?}",
+                    kind.as_str(),
+                    n,
+                    k,
+                    k_max,
+                    age
+                );
+                return None;
+            }
+        }
+        if let Err(e) = reg::publish(&self.cache_dir, instance_id, kind) {
+            debug!(
+                "Scanner document publish failed: kind={}, error={}",
+                kind.as_str(),
+                e
+            );
+        }
+        Some(ScanDocGuard {
+            cache_dir: self.cache_dir.clone(),
+            instance_id: instance_id.to_string(),
+            kind,
+        })
+    }
+
+    /// Close the pass on `kind`'s limiter, which turns this pass's visit samples into the `k`
+    /// the next pass respects.
+    fn end_scan_pass(&self, kind: crate::scanner_registry::ScanKind) {
+        self.limiter(kind)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .end_pass(fastrand::f64());
+    }
+
+    /// The staged fold pass, run under a claim from [`Self::claim_staged_fold`]. `None` means the
+    /// scanner gate deferred it.
+    async fn run_claimed_staged_fold(
+        &self,
+        now_secs: u64,
+        claim: InProgressReset,
+    ) -> Option<crate::staged_fold::FoldOutcome> {
+        let cache_dir = self.cache_dir.clone();
+        self.run_claimed_staged_fold_given(now_secs, claim, move || {
+            crate::staged_fold::rotation_evidence(&cache_dir)
+        })
+        .await
+    }
+
+    /// [`Self::run_claimed_staged_fold`] with the stalest-age read injected, for tests.
+    async fn run_claimed_staged_fold_given(
+        &self,
+        now_secs: u64,
+        _claim: InProgressReset,
+        stalest_age: impl FnOnce() -> Option<u64>,
+    ) -> Option<crate::staged_fold::FoldOutcome> {
+        use crate::scanner_registry::ScanKind;
+        // A deferral returns here: no cadence stamp, no fold attempt, no memo invalidation.
+        let _scan = self.admit_scan(
+            ScanKind::Fold,
+            crate::staged_fold::MAX_AUTHORITY_AGE_SECS,
+            stalest_age,
+        )?;
+        let sampler = VisitSampler::new(
+            &self.cache_dir,
+            self.write_ledger.instance_id(),
+            ScanKind::Fold,
+            self.limiter(ScanKind::Fold),
+        );
+        let outcome = crate::staged_fold::run_staged_fold_sampled(
+            &self.cache_dir,
+            &self.write_ledger,
+            self.write_ledger.instance_id(),
+            Some(&sampler),
+        )
+        .await;
+
+        // Every pass that ran, so a persistent retain waits out the interval too.
+        self.last_staged_fold_attempt_secs
+            .store(now_secs, Ordering::Relaxed);
+        if outcome.installed() {
+            // The ONLY write to this timestamp. A retain must not reach it.
+            self.last_staged_fold_completed_secs
+                .store(now_secs, Ordering::Relaxed);
+            // New checkpoints are on disk: the next readiness publication reads them.
+            self.invalidate_readiness_memo();
+        }
+        // § 16.6.7's three-state badge is derived from three freshness fields, and this is the only
+        // site that writes them. Recorded for EVERY attempt, including the ones that installed
+        // nothing — a badge whose `Unknown` state means "the last attempt did not complete" cannot
+        // be derived from a field only successful attempts write.
+        crate::staged_fold::record_fold_attempt(&self.cache_dir, now_secs, outcome.installed());
+        self.end_scan_pass(ScanKind::Fold);
+        // `_scan` then `_claim` drop here, after every write above: the scanner document is
+        // ended, then the flag clears last.
+        Some(outcome)
+    }
+
+    /// Claim and run in one call: the test entry point `JournalConsolidator::maybe_run_staged_fold`.
+    /// Production claims in `spawn_maintenance_passes` and runs the claimed pass on a task.
+    #[cfg(test)]
+    async fn staged_fold_if_due(&self) -> Option<crate::staged_fold::FoldOutcome> {
+        let (now_secs, claim) = self.claim_staged_fold()?;
+        self.run_claimed_staged_fold(now_secs, claim).await
+    }
+
+    /// The ledger repair's gate and in-progress claim, taken synchronously. Same split, and for
+    /// the same reason, as [`Self::claim_staged_fold`]. § 16.6.6 precondition 3b.
+    ///
+    /// Same cadence shape as the staged fold and for the same reasons: the timestamp advances
+    /// only on progress, so a refusal does not consume the retry interval, and an in-progress
+    /// flag keeps two passes from overlapping.
+    ///
+    /// **A separate rotation, deliberately, and not folded into the fold's pass.** A repair
+    /// sweep is `O(objects in shard)` where a fold visit is `O(staged candidates in shard)`, and
+    /// its target window is 24 h against the fold's 1 h. Driving both from one pass would put
+    /// the expensive rare-event sweep on the cheap frequent figure's cadence.
+    fn claim_ledger_repair(&self) -> Option<(u64, InProgressReset)> {
+        use crate::ledger_repair::LEDGER_REPAIR_INTERVAL_SECS;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = self.last_ledger_repair_secs.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(last) < LEDGER_REPAIR_INTERVAL_SECS {
+            return None;
+        }
+        if self
+            .ledger_repair_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some((
+            now_secs,
+            InProgressReset(Arc::clone(&self.ledger_repair_in_progress)),
+        ))
+    }
+
+    /// The incomplete-upload sweep's gate and in-progress claim, taken synchronously, on the same
+    /// pattern as [`Self::claim_ledger_repair`]: due every
+    /// [`incomplete_upload_sweep_interval_secs`] of `cache.incomplete_upload_ttl`, and never two
+    /// at once in one process. No fleet-wide lock: the sweep's per-upload `upload.lock` and
+    /// rename-aside already make concurrent sweeps on several instances safe.
+    fn claim_incomplete_upload_sweep(&self) -> Option<(u64, InProgressReset)> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ttl_secs = self.incomplete_upload_ttl_secs.load(Ordering::Relaxed);
+        let last = self
+            .last_incomplete_upload_sweep_secs
+            .load(Ordering::Relaxed);
+        if last != 0
+            && now_secs.saturating_sub(last) < incomplete_upload_sweep_interval_secs(ttl_secs)
+        {
+            return None;
+        }
+        if self
+            .incomplete_upload_sweep_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some((
+            now_secs,
+            InProgressReset(Arc::clone(&self.incomplete_upload_sweep_in_progress)),
+        ))
+    }
+
+    /// The incomplete-upload sweep, run under a claim from
+    /// [`Self::claim_incomplete_upload_sweep`].
+    async fn run_claimed_incomplete_upload_sweep(
+        &self,
+        now_secs: u64,
+        claim: InProgressReset,
+    ) -> crate::write_cache_manager::IncompleteUploadSweep {
+        let _claim = claim;
+        let ttl = Duration::from_secs(self.incomplete_upload_ttl_secs.load(Ordering::Relaxed));
+        let outcome =
+            crate::write_cache_manager::sweep_incomplete_uploads(self.cache_dir.clone(), ttl).await;
+        self.last_incomplete_upload_sweep_secs
+            .store(now_secs.max(1), Ordering::Relaxed);
+        if outcome.evicted > 0 {
+            if let Some(cm) = self.cache_manager.as_ref().and_then(|w| w.upgrade()) {
+                for _ in 0..outcome.evicted {
+                    cm.record_incomplete_upload_evicted();
+                }
+            }
+        }
+        outcome
+    }
+
+    /// The ledger repair pass, run under a claim from [`Self::claim_ledger_repair`]. `None` means
+    /// the scanner gate deferred it.
+    async fn run_claimed_ledger_repair(
+        &self,
+        now_secs: u64,
+        claim: InProgressReset,
+    ) -> Option<crate::ledger_repair::RepairOutcome> {
+        let cache_dir = self.cache_dir.clone();
+        self.run_claimed_ledger_repair_given(now_secs, claim, move || {
+            crate::ledger_repair::repair_stalest_age_secs(&cache_dir)
+        })
+        .await
+    }
+
+    /// [`Self::run_claimed_ledger_repair`] with the stalest-age read injected, for tests.
+    async fn run_claimed_ledger_repair_given(
+        &self,
+        now_secs: u64,
+        _claim: InProgressReset,
+        stalest_age: impl FnOnce() -> Option<u64>,
+    ) -> Option<crate::ledger_repair::RepairOutcome> {
+        use crate::scanner_registry::ScanKind;
+        // A deferral returns here: no cadence stamp, no memo invalidation.
+        let _scan = self.admit_scan(
+            ScanKind::Repair,
+            crate::ledger_repair::MAX_REPAIR_AGE_SECS,
+            stalest_age,
+        )?;
+        let sampler = VisitSampler::new(
+            &self.cache_dir,
+            self.write_ledger.instance_id(),
+            ScanKind::Repair,
+            self.limiter(ScanKind::Repair),
+        );
+        let outcome = crate::ledger_repair::run_ledger_repair_sampled(
+            &self.cache_dir,
+            &self.write_ledger,
+            self.write_ledger.instance_id(),
+            Some(&sampler),
+        )
+        .await;
+        if outcome.made_progress() {
+            // The ONLY write to this timestamp. A refusal must not reach it.
+            self.last_ledger_repair_secs
+                .store(now_secs, Ordering::Relaxed);
+            // New repair documents are on disk: the next readiness publication reads them.
+            self.invalidate_readiness_memo();
+        }
+        self.end_scan_pass(ScanKind::Repair);
+        Some(outcome)
+    }
+
+    /// The `st_size` pass at the operator's cadence. Its gate, cadence statics and in-progress
+    /// flag live in [`crate::st_size_fold`] and are unchanged.
+    async fn st_size_fold_if_due(&self) -> Option<crate::st_size_fold::StSizeFoldOutcome> {
+        crate::st_size_fold::maybe_run_st_size_fold(
+            &self.cache_dir,
+            self.shard_fold_interval,
+            self.shard_fold_max_duration,
+            self.write_ledger.instance_id(),
+        )
+        .await
+    }
+}
+
+/// Drop the held readiness evidence and advance its generation. One function so the two can
+/// never be done separately.
+fn invalidate_memo(memo: &Mutex<Option<ReadinessMemo>>, generation: &AtomicU64) {
+    generation.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut memo) = memo.lock() {
+        *memo = None;
+    }
 }
 
 impl JournalConsolidator {
@@ -624,10 +3787,16 @@ impl JournalConsolidator {
         config: ConsolidationConfig,
     ) -> Self {
         let size_state_path = cache_dir.join("size_tracking").join("size_state.json");
+        let ledger_compaction_budget_ms = LEDGER_COMPACTION_MAX_BUDGET
+            .min(config.consolidation_cycle_timeout / 3)
+            .as_millis() as u64;
         let instance_id = get_instance_id();
         let size_accumulator = Arc::new(SizeAccumulator::new(&cache_dir, instance_id.clone()));
         // Same instance identity as the journal and the accumulator, so an instance's
-        // files sort together and dead-instance cleanup can match them by name.
+        // files sort together. Dead-instance cleanup reaps only its TEMP files by name
+        // (`{instance}.ledger.tmp`, `{instance}.ledger.mark.tmp`, via
+        // `reap_dead_instance_temps`); `.ledger` and `.ledger.mark` are never removed, because
+        // they are the sequence floor a reused identity seeds from.
         let write_ledger = Arc::new(crate::write_ledger::WriteLedger::new(
             cache_dir.clone(),
             instance_id,
@@ -641,11 +3810,93 @@ impl JournalConsolidator {
             cache_manager: Mutex::new(None),
             evicted_ranges: Mutex::new(HashMap::new()),
             consolidation_lock_file: Mutex::new(None),
+            size_state_gate: Arc::new(tokio::sync::Mutex::new(())),
             size_accumulator,
+            size_state_memo: Arc::new(Mutex::new(None)),
             eviction_in_progress: Arc::new(AtomicBool::new(false)),
             write_ledger,
             last_ledger_compaction_secs: Arc::new(AtomicU64::new(0)),
+            last_staged_fold_completed_secs: Arc::new(AtomicU64::new(0)),
+            last_staged_fold_attempt_secs: Arc::new(AtomicU64::new(0)),
+            staged_fold_in_progress: Arc::new(AtomicBool::new(false)),
+            last_ledger_repair_secs: Arc::new(AtomicU64::new(0)),
+            ledger_repair_in_progress: Arc::new(AtomicBool::new(false)),
+            incomplete_upload_ttl_secs: Arc::new(AtomicU64::new(
+                DEFAULT_INCOMPLETE_UPLOAD_TTL_SECS,
+            )),
+            last_incomplete_upload_sweep_secs: Arc::new(AtomicU64::new(0)),
+            incomplete_upload_sweep_in_progress: Arc::new(AtomicBool::new(false)),
+            readiness_memo: Arc::new(Mutex::new(None)),
+            readiness_memo_generation: Arc::new(AtomicU64::new(0)),
+            fold_limiter: Arc::new(Mutex::new(crate::scanner_limiter::ScannerLimiter::new(1))),
+            repair_limiter: Arc::new(Mutex::new(crate::scanner_limiter::ScannerLimiter::new(1))),
+            maintenance_stopped: Arc::new(AtomicBool::new(false)),
+            maintenance_tasks: Mutex::new(Vec::new()),
+            last_tail_delta_compaction_secs: Arc::new(AtomicU64::new(0)),
+            fill_visibility_tracker: std::sync::OnceLock::new(),
+            retained_unparseable_journal_lines: AtomicU64::new(0),
+            last_unparseable_warn_secs: AtomicU64::new(0),
+            idle_eviction_memo: Mutex::new(None),
+            read_tier_barren: Mutex::new(ReadTierBarrenMemo::default()),
+            idle_eviction_reads: AtomicU64::new(0),
+            eviction_trigger_fires: AtomicU64::new(0),
+            inloop_projected_reads: AtomicU64::new(0),
+            staging_trigger_nudges: AtomicU64::new(0),
+            lock_held_since_ms: Arc::new(AtomicU64::new(0)),
+            lock_generation: Arc::new(AtomicU64::new(0)),
+            held_lock_generation: Arc::new(AtomicU64::new(0)),
+            cycle_lock_token: Arc::new(AtomicU64::new(0)),
+            lock_takeovers: AtomicU64::new(0),
+            ledger_compaction_budget_ms: AtomicU64::new(ledger_compaction_budget_ms),
+            ledger_compaction_resume_after: Mutex::new(None),
+            #[cfg(test)]
+            lock_park_hook: Mutex::new(None),
         }
+    }
+    /// Journal lines the last cleanup pass could not parse and kept. See the field.
+    /// Test seam: `/metrics` reads the process-global free function of the same name; this
+    /// per-instance copy lets a test assert its own consolidator's count in isolation.
+    #[cfg(test)]
+    pub(crate) fn retained_unparseable_journal_lines(&self) -> u64 {
+        self.retained_unparseable_journal_lines
+            .load(Ordering::Relaxed)
+    }
+    /// Publish a cleanup pass's retained-unparseable count, and WARN at most once per
+    /// [`UNPARSEABLE_WARN_INTERVAL_SECS`] while it is non-zero.
+    fn record_retained_unparseable(&self, count: u64) {
+        self.retained_unparseable_journal_lines
+            .store(count, Ordering::Relaxed);
+        RETAINED_UNPARSEABLE_JOURNAL_LINES.store(count, Ordering::Relaxed);
+        if count == 0 {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = self.last_unparseable_warn_secs.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < UNPARSEABLE_WARN_INTERVAL_SECS {
+            return;
+        }
+        if self
+            .last_unparseable_warn_secs
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            warn!(
+                "Journal cleanup kept {} journal line(s) this build cannot parse (a newer build's entries on a mixed-version fleet, or torn writes); they are left in place for a build that can apply them",
+                count
+            );
+        }
+    }
+
+    /// Wire this instance's fill-visibility tracker. The first call wins; later calls with the
+    /// process-wide instance are no-ops.
+    pub(crate) fn set_fill_visibility_tracker(
+        &self,
+        tracker: Arc<crate::fill_visibility_tracker::FillVisibilityTracker>,
+    ) {
+        let _ = self.fill_visibility_tracker.set(tracker);
     }
 
     /// Set the cache manager reference for eviction triggering
@@ -661,6 +3912,50 @@ impl JournalConsolidator {
         }
     }
 
+    /// Raise the maintenance shutdown signal: no maintenance pass is
+    /// spawned after it.
+    /// [`Self::shutdown`] calls it first.
+    pub(crate) fn stop_maintenance(&self) {
+        self.maintenance_stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Publish this instance's in-progress multipart figure when it is due.
+    ///
+    /// A failure is logged at `debug!` and nothing else: a decider that cannot read a complete
+    /// set of published figures falls back to a walk, which is where every reader of `P` was
+    /// before these documents existed, so an unwritable document costs volume I/O rather than
+    /// correctness.
+    async fn publish_in_progress_figure(&self) {
+        let cache_dir = self.cache_dir.clone();
+        // This cycle's interval travels with the document: a reader derives the lease it trusts
+        // the document for from the cadence its writer publishes on, not from its own.
+        let interval = self.config.interval;
+        let published = tokio::task::spawn_blocking(move || {
+            crate::signed_put_handler::publish_own_in_progress_if_due_blocking(&cache_dir, interval)
+        })
+        .await;
+        match published {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => debug!(
+                "Could not publish this instance's in-progress multipart figure under {}: {}. Readers of P fall back to a walk.",
+                self.cache_dir.display(),
+                e
+            ),
+            Err(e) => debug!(
+                "Publishing this instance's in-progress multipart figure did not complete: {}.",
+                e
+            ),
+        }
+    }
+
+    /// Whether `run_consolidation_cycle` would take its idle return right now.
+    #[cfg(test)]
+    pub(crate) fn cycle_would_be_idle(&self) -> bool {
+        !self.size_accumulator.has_pending_delta()
+            && !self.has_pending_journal_files()
+            && !self.has_pending_delta_files()
+    }
+
     /// Get reference to the size accumulator (for store_range and eviction to call)
     pub fn size_accumulator(&self) -> &Arc<SizeAccumulator> {
         &self.size_accumulator
@@ -674,18 +3969,49 @@ impl JournalConsolidator {
     /// preferred entry point.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 2.1
+    /// Copies of the fold and repair scanner limiters, `(fold, repair)`, for `/metrics`.
+    pub(crate) fn scanner_limiter_snapshots(
+        &self,
+    ) -> (
+        crate::scanner_limiter::ScannerLimiter,
+        crate::scanner_limiter::ScannerLimiter,
+    ) {
+        let read = |m: &Mutex<crate::scanner_limiter::ScannerLimiter>| {
+            m.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        };
+        (read(&self.fold_limiter), read(&self.repair_limiter))
+    }
+
     pub fn write_ledger(&self) -> &Arc<crate::write_ledger::WriteLedger> {
         &self.write_ledger
     }
 
-    /// Append a staged range to the Write_Ledger, best-effort.
+    /// Append a staged range to the Write_Ledger, and say whether it landed.
     ///
-    /// Separate from the accumulator credit rather than folded into it, because the two
-    /// have different failure semantics: a lost credit is an accounting error that
-    /// persists until the next Validation_Scan re-grounds the figure, whereas a lost
-    /// ledger append only makes the entry invisible to staging eviction until the same
-    /// scan re-appends it (R2.7). Neither may fail the upload — S3 already holds the
-    /// object by this point — so this returns nothing and logs at WARN.
+    /// A failure never fails the upload, since S3 already holds the object by this point,
+    /// so it is logged at WARN here. It is **returned** rather than swallowed because the
+    /// caller must not publish the matching `add_write_cache` credit when it is `false`:
+    /// the credit and the ledger entry are one event, and a credit with no entry is drift
+    /// no mechanism looks for (the invariant `disk_cache::refuse_unledgered_staged_credit`
+    /// states). Declining the credit leaves a bounded under-count instead, which
+    /// `ledger_repair`'s rotation closes by range identity from the `.meta` and a full
+    /// Validation_Scan re-grounds absolutely.
+    ///
+    /// Callers therefore append **first** and credit only on `true`, so the credit is
+    /// never visible before its entry exists.
+    ///
+    /// # Unshardable keys
+    ///
+    /// A key [`crate::staged_fold::shard_of`] cannot place makes the append fail with
+    /// `write_ledger::unshardable_key_error`, and it takes the same path: the
+    /// write-tier credit is declined and the range is admitted counted in `total_size`
+    /// only. Declining the whole caching decision was the alternative, and it is not
+    /// available here: the `.bin` and `.meta` are already published when this runs, so
+    /// declining would mean a new deletion path on shared storage. Declining the credit
+    /// is also the choice that keeps the incumbent figure agreeing with the staged fold,
+    /// which discards an unshardable key and so counts it nowhere either. Such a key is
+    /// not expected to arrive at all: `.meta` and `.bin` paths go through the same
+    /// `parse_cache_key`, so a key it rejects fails before any credit site is reached.
     ///
     /// # Which ranges belong here
     ///
@@ -693,33 +4019,42 @@ impl JournalConsolidator {
     /// `WriteCacheManager::evict_write_cached_object` can actually evict. That is
     /// single-part write-through PUTs and completed multipart uploads.
     ///
-    /// Deliberately **not** in-progress multipart parts under `mpus_in_progress/`, even
-    /// though `classify_new_range_as_staged` classifies them as staged and they do credit
-    /// `add_write_cache`. They have a tracker rather than a `.meta` with ranges, so the
-    /// staging evictor cannot act on them and every such entry would verify as
-    /// `MetadataAbsent` — pure noise in the ledger. Incomplete uploads are reclaimed by
-    /// `WriteCacheManager::evict_incomplete_uploads` on `incomplete_upload_ttl`, which is
-    /// a separate mechanism that already owns them.
+    /// Deliberately **not** in-progress multipart parts under `mpus_in_progress/`. They are not
+    /// credited to any size figure while staged (credit happens at Complete; the in-progress
+    /// figure is derived live from `part{N}.json` records) and they have a tracker rather than
+    /// a `.meta` with ranges, so the staging evictor cannot act on them and every such entry
+    /// would verify as `MetadataAbsent`. Abandoned uploads are reaped by
+    /// `write_cache_manager::sweep_incomplete_uploads`, run as one of this consolidator's
+    /// maintenance passes and at startup, on `incomplete_upload_ttl`.
     ///
-    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.1, 2.7
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.1, 2.7;
+    /// cache-eviction-at-scale § 16.6.12 point 3 (L1, L3).
+    #[must_use = "a staged write-cache credit may be published only when this returns true"]
     pub async fn record_staged_range(
         &self,
         cache_key: &str,
         range_start: u64,
         range_end: u64,
         compressed_size: u64,
-    ) {
-        if let Err(e) = self
+    ) -> bool {
+        match self
             .write_ledger
             .append_staged_range(cache_key, range_start, range_end, compressed_size)
             .await
         {
-            warn!(
-                "Failed to append Write_Ledger entry: cache_key={}, range={}-{}, size={}, error={}. \
-                 The entry stays cached and correctly accounted, but is invisible to staging \
-                 eviction until the next full validation scan re-appends it.",
-                cache_key, range_start, range_end, compressed_size, e
-            );
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Failed to append Write_Ledger entry: cache_key={}, range={}-{}, size={}, error={}. \
+                     The range stays cached and counted in total_size; its write-cache credit is \
+                     declined. The ledger-repair rotation re-appends the entry from the .meta. \
+                     A peer whose identity is not shared can re-append the range, but a pass \
+                     refused on a shared identity keeps its claim on the shard, so the entry \
+                     can stay unindexed until the hostnames are made distinct.",
+                    cache_key, range_start, range_end, compressed_size, e
+                );
+                false
+            }
         }
     }
 
@@ -737,35 +4072,102 @@ impl JournalConsolidator {
         }
     }
 
-    /// Read all delta files, sum deltas, reset files to zero.
+    /// Quick check for an uncollected size delta file from ANY instance, for idle detection.
+    ///
+    /// `SizeAccumulator::has_pending_delta` sees only this instance's in-memory atomics, and delta
+    /// files are also written outside a cycle — `shutdown` step 0 and both eviction paths flush
+    /// directly — so without this a delta flushed by an instance that then stops is invisible to
+    /// every running proxy's idle check until the next write anywhere. measured that at
+    /// 5 min 12 s with `total_size` low by the whole delta, and `shutdown`'s own final cycle,
+    /// which runs after its flush, returned idle and left its own file behind.
+    ///
+    /// One `read_dir` of `size_tracking/`, stopping at the first `delta_*.json`; no file is
+    /// opened. That directory otherwise holds `size_state.json`, `validation.json` and their two
+    /// lock files, and delta files are deleted when collected, so the listing is a handful of
+    /// entries. `.json.tmp` files are excluded, as `collect_and_apply_deltas` skips them too.
+    fn has_pending_delta_files(&self) -> bool {
+        match std::fs::read_dir(self.cache_dir.join("size_tracking")) {
+            Ok(entries) => entries.filter_map(|e| e.ok()).any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("delta_") && n.ends_with(".json"))
+            }),
+            Err(_) => false,
+        }
+    }
+
+    /// Test-only form of the cycle's first two steps without the apply: collect every delta
+    /// file, then delete what was collected. Production never deletes before the apply persists
+    /// (see [`Self::collect_deltas`]); the existing test callers only want the sum and an empty
+    /// directory afterwards.
+    #[cfg(test)]
+    pub(crate) async fn collect_and_apply_deltas(&self) -> Result<(i64, i64)> {
+        let collected = self.collect_deltas().await;
+        self.delete_applied_delta_files(&collected.paths).await;
+        Ok((collected.delta, collected.write_cache_delta))
+    }
+
+    /// Read all delta files and sum them, **without deleting any of them**.
     /// Called during run_consolidation_cycle() under global lock.
     ///
-    /// Returns (total_delta, total_write_cache_delta).
-    /// Handles missing directory gracefully (returns (0, 0)).
-    /// Skips files with invalid JSON (logs warning).
-    pub(crate) async fn collect_and_apply_deltas(&self) -> Result<(i64, i64)> {
+    /// The caller applies the sum with [`Self::atomic_update_size_delta`] and only then deletes
+    /// the returned paths with [`Self::delete_applied_delta_files`]. Deleting on read lost the
+    /// collected bytes whenever the apply failed (a `size_state.lock` timeout, a load or persist
+    /// error), because the files no longer existed for the next cycle to re-apply. Pinned by
+    /// `a_delta_whose_apply_times_out_on_the_size_state_lock_survives_and_applies_once`.
+    ///
+    /// Handles a missing or unreadable directory gracefully (empty result). A listing error
+    /// part-way through returns what was already collected: nothing has been deleted, so the
+    /// unlisted files stay for the next cycle. Pinned by
+    /// `a_listing_error_after_the_first_file_applies_it_once_and_keeps_the_rest`.
+    /// Deletes zero-valued files, renames files with invalid JSON to `{name}.corrupt` (logs a
+    /// warning), and leaves a file it could not read for the next cycle to retry. Neither of
+    /// the first two carries a collectable delta, so neither depends on the apply.
+    pub(crate) async fn collect_deltas(&self) -> CollectedDeltas {
         let size_tracking_dir = self.cache_dir.join("size_tracking");
+        let mut collected = CollectedDeltas::default();
 
         // Handle missing directory gracefully
         if !size_tracking_dir.exists() {
-            return Ok((0, 0));
+            return collected;
         }
 
         let mut total_delta: i64 = 0;
         let mut total_wc_delta: i64 = 0;
+        let mut total_objects_delta: i64 = 0;
         let mut files_processed: u32 = 0;
 
         let mut entries = match tokio::fs::read_dir(&size_tracking_dir).await {
             Ok(entries) => entries,
             Err(e) => {
                 warn!("Failed to read size_tracking directory: {}", e);
-                return Ok((0, 0));
+                return collected;
             }
         };
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            ProxyError::CacheError(format!("Failed to read size_tracking entry: {}", e))
-        })? {
+        loop {
+            #[cfg(test)]
+            let next = if delta_listing_fault::should_fail(&self.cache_dir, files_processed) {
+                Err(std::io::Error::other(
+                    "injected size_tracking listing fault",
+                ))
+            } else {
+                entries.next_entry().await
+            };
+            #[cfg(not(test))]
+            let next = entries.next_entry().await;
+            let entry = match next {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(
+                        "Failed to read size_tracking entry after collecting {} delta file(s): \
+                         {}. Applying those; the rest stay for the next cycle.",
+                        files_processed, e
+                    );
+                    break;
+                }
+            };
             let path = entry.path();
             let file_name = path
                 .file_name()
@@ -773,12 +4175,7 @@ impl JournalConsolidator {
                 .unwrap_or("")
                 .to_string();
 
-            if !file_name.starts_with("delta_") || !file_name.ends_with(".json") {
-                continue;
-            }
-
-            // Skip tmp files
-            if file_name.ends_with(".json.tmp") {
+            if !is_delta_file_name(&file_name) {
                 continue;
             }
 
@@ -790,47 +4187,61 @@ impl JournalConsolidator {
                 }
             };
 
-            let json: serde_json::Value = match serde_json::from_str(&content) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("Invalid JSON in delta file {:?}: {}", path, e);
-                    continue;
+            let (delta, wc_delta, objects_delta, instance_id) =
+                match parse_delta_content_full(&content) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        // Renamed aside rather than left: a skipped `delta_*.json` matches
+                        // `has_pending_delta_files`, so it made every idle cycle fleet-wide take the
+                        // global lock until the next validation scan deleted it. `.corrupt` keeps the
+                        // bytes for diagnosis under a name neither that predicate nor
+                        // `reset_all_delta_files` matches, so nothing removes it automatically. The
+                        // writer renames a complete temp file into place, so an unparseable file is
+                        // not a write in progress. Pinned by
+                        // `an_unparseable_delta_file_is_renamed_aside_and_idle_cycles_stop_locking`.
+                        let aside = size_tracking_dir.join(format!("{}.corrupt", file_name));
+                        match tokio::fs::rename(&path, &aside).await {
+                            Ok(()) => warn!(
+                            "Invalid JSON in delta file {:?}: {}. Renamed to {:?}; its delta, if \
+                             any, is not applied.",
+                            path, e, aside
+                        ),
+                            Err(re) => warn!(
+                            "Invalid JSON in delta file {:?}: {}. Could not rename it aside: {}",
+                            path, e, re
+                        ),
+                        }
+                        continue;
+                    }
+                };
+
+            // A zero-delta file carries nothing, so delete it rather than skip it: left in place
+            // it matches `has_pending_delta_files` and keeps every idle cycle taking the global
+            // lock. Each flush writes a new, uniquely-named file and never rewrites one, so no
+            // writer can be adding to it. Pinned by
+            // `a_zero_valued_delta_file_is_deleted_and_idle_cycles_stop_locking`.
+            if delta == 0 && wc_delta == 0 && objects_delta == 0 {
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    warn!("Failed to delete zero-valued delta file {:?}: {}", path, e);
                 }
-            };
-
-            let delta = json.get("delta").and_then(|v| v.as_i64()).unwrap_or(0);
-            let wc_delta = json
-                .get("write_cache_delta")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-
-            let instance_id = json
-                .get("instance_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            // Skip zero-delta files (nothing to collect)
-            if delta == 0 && wc_delta == 0 {
                 continue;
             }
 
             info!(
-                "SIZE_ACCUM collect: file={}, instance={}, delta={:+}, wc_delta={:+}",
-                file_name, instance_id, delta, wc_delta
+                "SIZE_ACCUM collect: file={}, instance={}, delta={:+}, wc_delta={:+}, \
+                 cached_objects_delta={:+}",
+                file_name, instance_id, delta, wc_delta, objects_delta
             );
 
             total_delta += delta;
             total_wc_delta += wc_delta;
+            total_objects_delta = total_objects_delta.saturating_add(objects_delta);
             files_processed += 1;
 
-            // DELETE the delta file after reading (instead of resetting to 0).
-            // This eliminates the race condition where an instance flushes a new delta
-            // between our read and reset, causing the new value to be overwritten with 0.
-            // With delete: if an instance flushes after we delete, it creates a new file
-            // (additive write_delta_file handles missing file gracefully).
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Failed to delete delta file {:?}: {}", path, e);
-            }
+            // Not deleted here: the caller deletes it once the sum has persisted. Each flush
+            // writes a new, uniquely-named file and never rewrites one, so a file read here
+            // cannot gain a later delta that the deferred delete would discard.
+            collected.paths.push(path);
         }
 
         if files_processed > 0 {
@@ -840,10 +4251,50 @@ impl JournalConsolidator {
             );
         }
 
-        Ok((total_delta, total_wc_delta))
+        collected.delta = total_delta;
+        collected.write_cache_delta = total_wc_delta;
+        collected.cached_objects_delta = total_objects_delta;
+        collected
     }
 
-    /// Reset all delta files to zero. Called after validation scan corrects drift.
+    /// [`Self::delete_applied_delta_files`] for the cycle's zero-sum files, which nothing was
+    /// persisted for: deletes nothing once the watchdog has taken the lock away, leaving them to
+    /// the current holder. Files whose sum the fenced persist applied are deleted unfenced.
+    async fn delete_applied_delta_files_fenced(&self, paths: &[PathBuf]) {
+        if !self.lock_fence_intact() {
+            warn!(
+                "Consolidation lock was taken over during this cycle; leaving {} delta file(s) \
+                 for the current lock holder",
+                paths.len()
+            );
+            return;
+        }
+        self.delete_applied_delta_files(paths).await;
+    }
+
+    /// Delete the delta files whose sum has been applied to `size_state.json`.
+    ///
+    /// A delete that fails after a successful persist leaves the file for the next cycle,
+    /// which applies it a second time. That residual double-apply is the price of never losing
+    /// a delta; the WARN names the file so an operator can match it to a later drift.
+    pub(crate) async fn delete_applied_delta_files(&self, paths: &[PathBuf]) {
+        for path in paths {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                // Already gone (a validation install's `reset_all_delta_files`): nothing to
+                // re-apply, so nothing to warn about.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    "Failed to delete applied delta file {:?}: {}. Its delta is already in \
+                     size_state, so the next cycle will apply it again.",
+                    path, e
+                ),
+            }
+        }
+    }
+
+    /// Delete every remaining delta file, along with `delta_*.json.tmp` files older than an
+    /// hour. Called after a validation scan installs a corrected size.
     pub(crate) async fn reset_all_delta_files(&self) {
         let size_tracking_dir = self.cache_dir.join("size_tracking");
 
@@ -864,12 +4315,18 @@ impl JournalConsolidator {
             let path = entry.path();
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            if !file_name.starts_with("delta_") || !file_name.ends_with(".json") {
+            if !file_name.starts_with("delta_") {
                 continue;
             }
+            // Tested before the `.json` filter below, which a `.json.tmp` name never passes.
+            // `.corrupt` files match neither and are left for an operator to remove by hand.
             if file_name.ends_with(".json.tmp") {
-                // Clean up stale tmp files too
-                let _ = tokio::fs::remove_file(&path).await;
+                if delta_tmp_is_stale(&path).await {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                continue;
+            }
+            if !file_name.ends_with(".json") {
                 continue;
             }
 
@@ -887,6 +4344,26 @@ impl JournalConsolidator {
                 "SIZE_ACCUM reset_all: deleted {} delta files",
                 deleted_count
             );
+        }
+    }
+
+    /// Remove every `delta_*.json.tmp` older than an hour: its writer died between writing it
+    /// and renaming it to `.json`. Live delta files are not touched. The full validation's
+    /// install runs it, since that install no longer calls [`Self::reset_all_delta_files`].
+    pub(crate) async fn reap_stale_delta_tmp_files(&self) {
+        let Ok(mut entries) = tokio::fs::read_dir(self.cache_dir.join("size_tracking")).await
+        else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let delta_tmp = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("delta_") && n.ends_with(".json.tmp"));
+            if delta_tmp && delta_tmp_is_stale(&path).await {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
         }
     }
 
@@ -937,7 +4414,7 @@ impl JournalConsolidator {
     ///
     /// # Arguments
     /// * `evicted_ranges` - Vec of (cache_key, range_start, range_end, size, bin_file_path)
-    pub async fn write_eviction_journal_entries(
+    pub(crate) async fn write_eviction_journal_entries(
         &self,
         evicted_ranges: Vec<(String, u64, u64, u64, String)>,
     ) {
@@ -959,7 +4436,7 @@ impl JournalConsolidator {
             //
             // `staged: None` is deliberate and is NOT an R12.2 violation: a Remove
             // entry's `RangeSpec` is a carrier for the extent and size, and the Remove
-            // arm of `consolidate_key` strips a matching range from the `.meta` rather
+            // arm of `apply_journal_entries` strips a matching range from the `.meta` rather
             // than writing this one into it. Nothing persists it, so there is no
             // membership to record.
             let range_spec = RangeSpec {
@@ -973,6 +4450,8 @@ impl JournalConsolidator {
                 last_accessed: now,
                 access_count: 0,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             };
 
             let journal_entry = JournalEntry {
@@ -987,6 +4466,7 @@ impl JournalConsolidator {
                 object_ttl_secs: None,
                 access_increment: None,
                 object_metadata: None,
+                fill_witness: None,
             };
 
             grouped.entry(cache_key).or_default().push(journal_entry);
@@ -1033,14 +4513,15 @@ impl JournalConsolidator {
     /// between this and every other accounting site in this file: the accumulator is
     /// per-instance, and two proxies can graduate the same key concurrently, so a local
     /// debit would double-count (Requirement 1.2). The decrement is applied by
-    /// `consolidate_key` instead — see `JournalOperation::Graduation`.
+    /// `apply_journal_entries`' `JournalOperation::Graduation` arm instead, whose aggregate
+    /// `run_consolidation_cycle` applies to Size_State.
     ///
     /// Returns `true` when the entry was appended. A `false` means the graduation's
     /// accounting was lost and the entry's bytes stay in `write_cache_size` until the
     /// next full Validation_Scan; the caller surfaces that (Requirement 1.7).
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 1.2, 1.3
-    pub async fn write_graduation_journal_entry(
+    pub(crate) async fn write_graduation_journal_entry(
         &self,
         cache_key: &str,
         staged_compressed_size: u64,
@@ -1066,6 +4547,8 @@ impl JournalConsolidator {
                 last_accessed: now,
                 access_count: 0,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             },
             operation: JournalOperation::Graduation,
             range_file_path: String::new(),
@@ -1074,6 +4557,7 @@ impl JournalConsolidator {
             object_ttl_secs: None,
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
             // The `.meta` transition was already written synchronously by
             // `refresh_write_cache_ttl` before this entry was appended.
         };
@@ -1116,6 +4600,117 @@ impl JournalConsolidator {
         ranges: Vec<RangeSpec>,
         object_metadata: ObjectMetadata,
     ) {
+        self.write_multipart_journal_entries_inner(
+            cache_key,
+            ranges,
+            object_metadata,
+            StagedLedger::AppendHere,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_multipart_journal_entries`] for a full-object GET fill, whose `Add`s carry
+    /// its version witness so a fold after a newer acknowledged write drops them.
+    pub(crate) async fn write_multipart_journal_entries_witnessed(
+        &self,
+        cache_key: &str,
+        ranges: Vec<RangeSpec>,
+        object_metadata: ObjectMetadata,
+        fill_witness: Option<String>,
+    ) {
+        self.write_multipart_journal_entries_inner(
+            cache_key,
+            ranges,
+            object_metadata,
+            StagedLedger::AppendHere,
+            fill_witness,
+        )
+        .await
+    }
+
+    /// Append a Write_Ledger entry for every staged range of an object whose `.meta` is
+    /// about to be published, and say whether **all** of them landed.
+    ///
+    /// For callers that publish the `.meta` themselves: `CompleteMultipartUpload`'s cache
+    /// finalize calls this after writing its temp `.meta` and before renaming it into place,
+    /// then calls [`Self::write_multipart_journal_entries_prerecorded`] after the rename. The
+    /// order is the point. A crash after this and before the rename leaves ledger entries
+    /// naming a `.meta` that does not exist, which `write_ledger::assess_staged_candidate`
+    /// reads as `MetadataAbsent` and retires once the entries are older than
+    /// `write_ledger::ABSENT_RETIREMENT_GRACE`. The reverse order left a published staged
+    /// `.meta` with no entry, which staging eviction cannot find and the fold does not count
+    /// until the ledger-repair rotation reaches it. Cache-eviction-at-scale § 16.6.12 L3.
+    ///
+    /// Stops at the first failure: the caller declines the whole publish on `false`, so
+    /// entries after the first failure would only add `MetadataAbsent` candidates. Entries
+    /// that landed before it name an unpublished `.meta` and take the same retirement path
+    /// as the crash case.
+    ///
+    /// Unlike [`Self::write_multipart_journal_entries`], this does not skip a range whose
+    /// `(cache_key, start, end)` the size accumulator already holds, because the
+    /// accumulator's dedup has not run yet at this point. A repeated range therefore gets a
+    /// second entry, which is harmless: both name the same extent, and eviction groups
+    /// entries by key.
+    #[must_use = "the .meta may be published as staged only when every staged range's entry landed"]
+    pub async fn record_staged_ranges_before_publish(
+        &self,
+        cache_key: &str,
+        ranges: &[RangeSpec],
+        is_write_cached: bool,
+    ) -> bool {
+        for range_spec in ranges {
+            let staged = crate::cache_types::is_staged_range_spec(range_spec, is_write_cached);
+            if !staged {
+                continue;
+            }
+            if !self
+                .record_staged_range(
+                    cache_key,
+                    range_spec.start,
+                    range_spec.end,
+                    range_spec.compressed_size,
+                )
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [`Self::write_multipart_journal_entries`] for ranges whose Write_Ledger entries were
+    /// already appended by [`Self::record_staged_ranges_before_publish`] and all landed.
+    ///
+    /// Writes the journal `Add` entries and credits both size channels, and appends nothing
+    /// to the ledger. The journal entries are deliberately still written after the publish:
+    /// consolidation creates a `.meta` from `Add` entries when none exists
+    /// (`load_or_create_metadata_with_journal_entries`), so writing them before the rename
+    /// would let a crash in between publish the object anyway, as staged.
+    pub async fn write_multipart_journal_entries_prerecorded(
+        &self,
+        cache_key: &str,
+        ranges: Vec<RangeSpec>,
+        object_metadata: ObjectMetadata,
+    ) {
+        self.write_multipart_journal_entries_inner(
+            cache_key,
+            ranges,
+            object_metadata,
+            StagedLedger::AlreadyRecorded,
+            None,
+        )
+        .await
+    }
+
+    async fn write_multipart_journal_entries_inner(
+        &self,
+        cache_key: &str,
+        ranges: Vec<RangeSpec>,
+        object_metadata: ObjectMetadata,
+        ledger: StagedLedger,
+        fill_witness: Option<String>,
+    ) {
         if ranges.is_empty() {
             return;
         }
@@ -1151,6 +4746,7 @@ impl JournalConsolidator {
                 object_ttl_secs: None, // Multipart completion writes metadata directly with correct TTL
                 access_increment: None,
                 object_metadata: Some(object_metadata.clone()),
+                fill_witness: fill_witness.clone(),
                 // This prevents double-counting when consolidation processes these entries
             };
 
@@ -1185,21 +4781,31 @@ impl JournalConsolidator {
                     // re-deriving it, so the credit and the persisted flag cannot
                     // disagree. Requirements: 12.2, 12.4
                     if credited && counts_as_staged {
-                        self.size_accumulator
-                            .add_write_cache(range_spec.compressed_size);
-                        // Paired with the credit, exactly as in
-                        // `CacheManager::credit_staged_range`. Gated on `credited` for
-                        // the same reason the write-cache credit is: a duplicate range
-                        // was already recorded by whoever credited it first, and a second
-                        // ledger entry for it would only add a candidate that verifies as
-                        // superseded. Requirements: 2.1
-                        self.record_staged_range(
-                            cache_key,
-                            range_spec.start,
-                            range_spec.end,
-                            range_spec.compressed_size,
-                        )
-                        .await;
+                        // Append first, credit only if it landed, exactly as in
+                        // `CacheManager::credit_staged_range` — see
+                        // `record_staged_range`. Gated on `credited` because a duplicate
+                        // range was already recorded by whoever credited it first, and a
+                        // second ledger entry for it would only add a candidate that
+                        // verifies as superseded. Requirements: 2.1
+                        //
+                        // `AlreadyRecorded`: the caller appended the entry before publishing
+                        // the `.meta` and only reaches here when it landed.
+                        let landed = match ledger {
+                            StagedLedger::AlreadyRecorded => true,
+                            StagedLedger::AppendHere => {
+                                self.record_staged_range(
+                                    cache_key,
+                                    range_spec.start,
+                                    range_spec.end,
+                                    range_spec.compressed_size,
+                                )
+                                .await
+                            }
+                        };
+                        if landed {
+                            self.size_accumulator
+                                .add_write_cache(range_spec.compressed_size);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1251,90 +4857,53 @@ impl JournalConsolidator {
     ///
     /// Returns the loaded state, or a default state if the file doesn't exist.
     pub async fn load_size_state(&self) -> Result<SizeState> {
-        if !self.size_state_path.exists() {
-            debug!(
-                "Size state file does not exist, using default: path={:?}",
-                self.size_state_path
-            );
-            return Ok(SizeState::default());
-        }
-
-        let content = tokio::fs::read_to_string(&self.size_state_path)
+        let file = self.size_state_file();
+        tokio::task::spawn_blocking(move || file.load())
             .await
-            .map_err(|e| {
-                ProxyError::CacheError(format!("Failed to read size state file: {}", e))
-            })?;
+            .map_err(|e| ProxyError::CacheError(format!("Size state read task failed: {}", e)))?
+    }
 
-        let state: SizeState = serde_json::from_str(&content).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to parse size state file: {}", e))
-        })?;
-
-        debug!(
-            "Loaded size state: total_size={}, consolidation_count={}",
-            state.total_size, state.consolidation_count
-        );
-
-        Ok(state)
+    /// The owned handle a size-state read-modify-write runs against on its blocking thread.
+    fn size_state_file(&self) -> SizeStateFile {
+        SizeStateFile {
+            path: self.size_state_path.clone(),
+            cache_dir: self.cache_dir.clone(),
+            memo: Arc::clone(&self.size_state_memo),
+        }
     }
 
     /// Persist size state to disk with atomic write (temp file + rename)
+    ///
+    /// # The `Schema_Fence` is re-stamped here, at the single writer, and that is deliberate
+    ///
+    /// Several callers do `load_size_state()` → on error `SizeState::default()` → mutate two or
+    /// three fields → persist. `SizeState::default()` carries `schema: 0` and
+    /// `staged_authority_epoch: 0`, which after activation is **byte-for-byte the pre-C shape**
+    /// `detect_foreign_size_state` treats as a foreign write. So one transient read error on an
+    /// activated volume used to persist a document that armed the fold's refusal permanently and
+    /// blamed a binary that did not exist. `update_size_from_validation` is the clearest instance
+    /// and the startup `cached_objects` back-fill is a second.
+    ///
+    /// Fixing it per call site means every future call site has to remember. Re-stamping at the
+    /// one function that writes the document means none of them can get it wrong: if this
+    /// volume's epoch latch says the fold is the authority, then this binary is C-capable and
+    /// activated, so any document it writes MUST carry the fence.
+    ///
+    /// Reading the **latch** rather than the document being written is what makes this safe from
+    /// self-reference: the latch comes from `staged_authority_epoch.json`, a different file with
+    /// a different writer (`activate`, under the global consolidation lock).
+    ///
+    /// During Phase L the latch is `EPOCH_LEGACY` and nothing is stamped — required, not
+    /// incidental: § 16.6.6 keeps Phase L writing the legacy schema precisely so a node can
+    /// still be rolled back to a pre-C binary during the upgrade window.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.6.
     async fn persist_size_state_internal(&self, state: &SizeState) -> Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = self.size_state_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create size_tracking directory: {}", e))
-            })?;
-        }
-
-        // Serialize to JSON
-        let json_content = serde_json::to_string_pretty(&state).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to serialize size state: {}", e))
-        })?;
-
-        // Atomic write: write to temp file then rename
-        // Use instance-specific tmp file to avoid race conditions on shared storage
-        let instance_suffix = format!(
-            "{}.{}",
-            gethostname::gethostname().to_string_lossy(),
-            std::process::id()
-        );
-        let tmp_extension = format!("json.tmp.{}", instance_suffix);
-        let temp_path = self.size_state_path.with_extension(&tmp_extension);
-
-        // Write to temporary file
-        if let Err(e) = tokio::fs::write(&temp_path, &json_content).await {
-            warn!(
-                "Failed to write size state temp file: temp_path={:?}, error={}",
-                temp_path, e
-            );
-            // Clean up temp file on write failure
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(ProxyError::CacheError(format!(
-                "Failed to write size state temp file: {}",
-                e
-            )));
-        }
-
-        // Atomic rename
-        if let Err(e) = tokio::fs::rename(&temp_path, &self.size_state_path).await {
-            warn!(
-                "Failed to rename size state file: temp_path={:?}, final_path={:?}, error={}",
-                temp_path, self.size_state_path, e
-            );
-            // Clean up temp file on rename failure
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(ProxyError::CacheError(format!(
-                "Failed to rename size state file: {}",
-                e
-            )));
-        }
-
-        debug!(
-            "Persisted size state: total_size={}, write_cache_size={}, path={:?}",
-            state.total_size, state.write_cache_size, self.size_state_path
-        );
-
-        Ok(())
+        let file = self.size_state_file();
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || file.persist(&state))
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("Size state write task failed: {}", e)))?
     }
 
     /// Persist size state to disk
@@ -1342,187 +4911,294 @@ impl JournalConsolidator {
         self.persist_size_state_internal(state).await
     }
 
-    /// Get current cache size (reads from disk for multi-instance consistency)
-    pub async fn get_current_size(&self) -> u64 {
+    /// Get current cache size (reads from disk for multi-instance consistency).
+    ///
+    /// # `None` is the UNREADABLE sentinel, and it is not a stylistic preference
+    ///
+    /// This used to return `u64` and produce `0` from an unreadable or unparseable
+    /// `size_state.json`. `0` is also the healthy empty-cache value, and worse, it is below
+    /// every threshold this figure is compared against: the eviction trigger's
+    /// `current_size <= trigger_threshold` in [`Self::maybe_trigger_eviction`] and the
+    /// max-size half of admission. So one unreadable document silently disabled read-tier
+    /// eviction, leaving only the statvfs floor, and published a reassuring number while
+    /// doing it.
+    ///
+    /// **The fail-open posture is unchanged** (R7.5). Every caller flattens `None` to `0`
+    /// with `unwrap_or(0)` and behaves exactly as before. What has changed is that the
+    /// flattening is now visible at the call site instead of hidden in this getter, so a
+    /// caller that *can* act on the distinction is able to, and the condition logs at
+    /// `warn!` rather than `debug!` because it disables a guard.
+    ///
+    /// An ABSENT document is NOT unreadable: [`Self::load_size_state`] returns
+    /// `Ok(SizeState::default())` for a path that does not exist, so a fresh volume reads
+    /// `Some(0)` and nothing warns.
+    ///
+    /// Same shape and the same reasoning as [`crate::write_ledger::WriteLedger::count_entries`]
+    /// (§ 16.6.3) and [`crate::write_ledger::LedgerReadOutcome`].
+    ///
+    /// Spec: cache-eviction-at-scale (§ 7.1).
+    pub async fn get_current_size(&self) -> Option<u64> {
         match self.load_size_state().await {
-            Ok(state) => state.total_size,
+            Ok(state) => Some(state.total_size),
             Err(e) => {
-                debug!("Failed to read size state from disk: {}", e);
-                0
+                warn!(
+                    "Cache size read: could not read size state from disk: {}. Reporting \
+                     UNREADABLE rather than 0, which is also the empty-cache value and is \
+                     below every eviction trigger and max_cache_size check. Callers fail \
+                     open, so size-based eviction and admission are not enforced until this \
+                     clears. path={:?}",
+                    e, self.size_state_path
+                );
+                None
             }
         }
     }
 
-    /// Get current write cache size (reads from disk for multi-instance consistency)
-    pub async fn get_write_cache_size(&self) -> u64 {
+    /// Get current write cache size (reads from disk for multi-instance consistency).
+    ///
+    /// `None` is the UNREADABLE sentinel — see [`Self::get_current_size`] for why a number
+    /// is the wrong thing to return here. `0` is also the fully-graduated staging tier, so
+    /// an unreadable document used to present as a drained one and disable the write-cache
+    /// byte eviction trigger.
+    ///
+    /// Fail-open behaviour is unchanged: callers apply `unwrap_or(0)`.
+    ///
+    /// Spec: cache-eviction-at-scale (§ 7.1).
+    pub async fn get_write_cache_size(&self) -> Option<u64> {
         match self.load_size_state().await {
-            Ok(state) => state.write_cache_size,
+            Ok(state) => Some(state.write_cache_size),
             Err(e) => {
-                debug!("Failed to read size state from disk: {}", e);
-                0
+                warn!(
+                    "Write-cache size read: could not read size state from disk: {}. \
+                     Reporting UNREADABLE rather than 0, which is also the drained value. \
+                     The write-cache byte eviction trigger is not enforced until this \
+                     clears. path={:?}",
+                    e, self.size_state_path
+                );
+                None
             }
         }
     }
 
-    /// Get size state for metrics/dashboard (async version)
+    /// Sum every pending `delta_*.json` file, `(delta, write_cache_delta)`, with no side
+    /// effects: unlike [`Self::collect_deltas`] it deletes no zero-valued file and renames no
+    /// unparseable one aside, so any instance may call it outside the consolidation lock. An
+    /// unreadable or unparseable file contributes nothing. Shares `collect_deltas`' parse.
+    pub(crate) async fn pending_delta_sum(&self) -> (i64, i64) {
+        let mut sum = (0i64, 0i64);
+        let Ok(mut entries) = tokio::fs::read_dir(self.cache_dir.join("size_tracking")).await
+        else {
+            return sum;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let named = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_delta_file_name);
+            if !named {
+                continue;
+            }
+            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            if let Ok((delta, wc_delta, _)) = parse_delta_content(&content) {
+                sum.0 = sum.0.saturating_add(delta);
+                sum.1 = sum.1.saturating_add(wc_delta);
+            }
+        }
+        sum
+    }
+
+    /// `(total_size, write_cache_size)` projected forward by every pending delta file, each
+    /// clamped at 0. `None` is the UNREADABLE sentinel of [`Self::get_current_size`].
+    ///
+    /// # Why the delta directory is read FIRST
+    ///
+    /// A pass's debit sits in a flushed delta file until a consolidation-lock winner collects
+    /// it, and `size_state.json` alone omits it, so a second pass in that window re-frees the
+    /// first pass's amount. Summing the files fixes that. The order decides what a concurrent
+    /// cycle can do to the sum: the cycle persists `size_state` before it deletes the files it
+    /// applied, so reading the files first can only see a delta twice (once in the file, once
+    /// applied), never zero times. A debit counted twice under-states the size, which errs
+    /// toward evicting less. Read the other way round, a delete between the two reads drops
+    /// the debit entirely and the re-read is as stale as before.
+    pub(crate) async fn projected_sizes(&self) -> Option<(u64, u64)> {
+        let (delta, wc_delta) = self.pending_delta_sum().await;
+        #[cfg(test)]
+        projected_read_hook::run(&self.cache_dir);
+        let total = self.get_current_size().await?;
+        let write_cache = self.get_write_cache_size().await?;
+        let projected = (project(total, delta), project(write_cache, wc_delta));
+        // Published for `/metrics` from here rather than from the trigger, so every site that
+        // reads the figure a pass fires on also refreshes what an operator is shown.
+        record_projected_cache_size(projected.0);
+        Some(projected)
+    }
+
+    /// `total_size` projected forward by every pending delta file. See [`Self::projected_sizes`].
+    pub(crate) async fn get_projected_size(&self) -> Option<u64> {
+        Some(self.projected_sizes().await?.0)
+    }
+
+    /// `write_cache_size` projected forward by every pending delta file. See
+    /// [`Self::projected_sizes`].
+    pub(crate) async fn get_projected_write_cache_size(&self) -> Option<u64> {
+        Some(self.projected_sizes().await?.1)
+    }
+
+    /// Get size state for metrics/dashboard (async version).
     ///
     /// Reads from the shared disk file to ensure all instances see the same value.
-    /// Returns default state if file doesn't exist or read fails.
-    pub async fn get_size_state(&self) -> SizeState {
+    ///
+    /// `None` is the UNREADABLE sentinel. This used to return `SizeState::default()`, which
+    /// is a document of zeros indistinguishable from a genuinely empty cache — so an
+    /// operator investigating stalled eviction was shown a healthy-looking zero by the very
+    /// endpoint they would reach for. `None` serialises as JSON `null`, which a dashboard, a
+    /// `python3` parse, and a human can all tell apart from `0`.
+    ///
+    /// An absent document still yields `Some(SizeState::default())`, because that is a real
+    /// reading of an empty cache rather than a failure to observe one.
+    ///
+    /// Spec: cache-eviction-at-scale (§ 7.1).
+    pub async fn get_size_state(&self) -> Option<SizeState> {
         match self.load_size_state().await {
-            Ok(state) => state,
+            Ok(state) => Some(state),
             Err(e) => {
-                debug!(
-                    "Failed to read size state from disk, returning default: {}",
-                    e
+                warn!(
+                    "Size-state read: could not read size state from disk: {}. Reporting \
+                     UNREADABLE rather than a defaulted document of zeros, which is \
+                     indistinguishable from an empty cache. path={:?}",
+                    e, self.size_state_path
                 );
-                SizeState::default()
+                None
             }
         }
     }
 
-    /// Atomically decrement cached_objects count after eviction removes metadata files.
+    /// The size state for `/health`, `/metrics` and the dashboard: this consolidator's last
+    /// reading of `size_state.json`, with no shared-storage I/O.
     ///
-    /// Called after eviction completes with the number of objects whose metadata was deleted.
-    pub async fn decrement_cached_objects(&self, objects_removed: u64) {
+    /// Every load and persist refreshes it, and every consolidation cycle loads, so it lags
+    /// the file by up to one consolidation interval. `None` is the UNREADABLE sentinel of
+    /// [`Self::get_size_state`]: the last read failed. Before any read has happened (a
+    /// scrape racing startup) this reads the file once.
+    pub async fn get_size_state_for_scrape(&self) -> Option<SizeState> {
+        #[cfg(test)]
+        if SCRAPE_READS_DISK {
+            return self.get_size_state().await;
+        }
+        let memo = self.size_state_memo.lock().ok().and_then(|m| m.clone());
+        match memo {
+            Some(last) => last,
+            None => self.get_size_state().await,
+        }
+    }
+
+    /// Debit `cached_objects` by `objects_removed` (counted `.meta` files unlinked).
+    ///
+    /// Adds to this instance's [`SizeAccumulator`] `cached_objects` delta and returns: no lock,
+    /// no shared-storage I/O. The consolidation cycle applies the delta to `size_state.json`
+    /// with the byte deltas, so the published count moves once per cycle. Request paths
+    /// (invalidations, re-PUT replacement) and eviction both call this.
+    pub(crate) async fn decrement_cached_objects(&self, objects_removed: u64) {
         if objects_removed == 0 {
             return;
         }
-
-        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
-        if let Some(parent) = lock_file_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                warn!(
-                    "Failed to create size_tracking directory for object count update: {}",
-                    e
-                );
-                return;
-            }
+        #[cfg(test)]
+        if DECREMENT_LOCKED {
+            return self
+                .apply_removed_objects_now_for_lever(objects_removed)
+                .await;
         }
-
-        let lock_file = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking({
-                let lock_path = lock_file_path.clone();
-                move || {
-                    use fs2::FileExt;
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&lock_path)?;
-                    file.lock_exclusive()?;
-                    Ok::<_, std::io::Error>(file)
-                }
-            }),
-        )
-        .await
-        {
-            Ok(Ok(Ok(file))) => file,
-            _ => {
-                warn!("Failed to acquire size state lock for cached_objects decrement");
-                return;
-            }
-        };
-
-        let mut state = match self.load_size_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = lock_file.unlock();
-                warn!(
-                    "Failed to load size state for cached_objects decrement: {}",
-                    e
-                );
-                return;
-            }
-        };
-
-        state.cached_objects = state.cached_objects.saturating_sub(objects_removed);
-        state.last_updated_by = get_instance_id();
-
-        if let Err(e) = self.persist_size_state_internal(&state).await {
-            warn!(
-                "Failed to persist size state after cached_objects decrement: {}",
-                e
-            );
-        }
-        let _ = lock_file.unlock();
+        self.size_accumulator
+            .add_cached_objects(-objects_as_delta(objects_removed));
         debug!(
-            "Decremented cached_objects by {}, new count={}",
-            objects_removed, state.cached_objects
+            "cached_objects: -{} pending for the next consolidation cycle",
+            objects_removed
         );
     }
 
-    /// Atomically increment cached_objects count when a new object is first cached.
+    /// Credit `cached_objects` by `objects_added` (`.meta` files published where none was
+    /// counted). Lock-free; see [`Self::decrement_cached_objects`].
+    pub(crate) async fn increment_cached_objects(&self, objects_added: u64) {
+        if objects_added == 0 {
+            return;
+        }
+        #[cfg(test)]
+        if INCREMENT_LOCKED {
+            return self.apply_new_objects_now(objects_added).await;
+        }
+        self.size_accumulator
+            .add_cached_objects(objects_as_delta(objects_added));
+        debug!(
+            "cached_objects: +{} pending for the next consolidation cycle",
+            objects_added
+        );
+    }
+
+    /// Apply `objects_added` to `size_state.json` now, under `size_state.lock`.
     ///
-    /// Called when consolidation writes a new metadata file for a previously unseen cache key.
-    pub async fn increment_cached_objects(&self, objects_added: u64) {
+    /// Only the consolidation cycle calls this, for the objects its own fold created; no
+    /// request path does. Request paths use [`Self::increment_cached_objects`].
+    pub(crate) async fn apply_new_objects_now(&self, objects_added: u64) {
         if objects_added == 0 {
             return;
         }
 
-        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
-        if let Some(parent) = lock_file_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                warn!(
-                    "Failed to create size_tracking directory for object count update: {}",
-                    e
-                );
-                return;
-            }
+        let locked = self
+            .with_size_state_locked(
+                "cached_objects increment",
+                SIZE_STATE_LOCK_TIMEOUT,
+                move |file| {
+                    let mut state = match file.load() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "Failed to load size state for cached_objects increment: {}",
+                                e
+                            );
+                            return;
+                        }
+                    };
+
+                    state.cached_objects = state.cached_objects.saturating_add(objects_added);
+                    state.last_updated_by = get_instance_id();
+
+                    if let Err(e) = file.persist(&state) {
+                        warn!(
+                            "Failed to persist size state after cached_objects increment: {}",
+                            e
+                        );
+                    }
+                    debug!(
+                        "Incremented cached_objects by {}, new count={}",
+                        objects_added, state.cached_objects
+                    );
+                },
+            )
+            .await;
+        if locked.is_err() {
+            warn!("Failed to acquire size state lock for cached_objects increment");
         }
+    }
 
-        let lock_file = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking({
-                let lock_path = lock_file_path.clone();
-                move || {
-                    use fs2::FileExt;
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&lock_path)?;
-                    file.lock_exclusive()?;
-                    Ok::<_, std::io::Error>(file)
-                }
-            }),
-        )
-        .await
-        {
-            Ok(Ok(Ok(file))) => file,
-            _ => {
-                warn!("Failed to acquire size state lock for cached_objects increment");
-                return;
-            }
-        };
-
-        let mut state = match self.load_size_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = lock_file.unlock();
-                warn!(
-                    "Failed to load size state for cached_objects increment: {}",
-                    e
-                );
-                return;
-            }
-        };
-
-        state.cached_objects = state.cached_objects.saturating_add(objects_added);
-        state.last_updated_by = get_instance_id();
-
-        if let Err(e) = self.persist_size_state_internal(&state).await {
-            warn!(
-                "Failed to persist size state after cached_objects increment: {}",
-                e
-            );
-        }
-        let _ = lock_file.unlock();
-        debug!(
-            "Incremented cached_objects by {}, new count={}",
-            objects_added, state.cached_objects
-        );
+    /// The `DECREMENT_LOCKED` lever's body: debit `size_state.json` now, under
+    /// `size_state.lock`, the shape a regressed request-path debit would take.
+    #[cfg(test)]
+    async fn apply_removed_objects_now_for_lever(&self, objects_removed: u64) {
+        let _ = self
+            .with_size_state_locked(
+                "cached_objects decrement (lever)",
+                SIZE_STATE_LOCK_TIMEOUT,
+                move |file| {
+                    if let Ok(mut state) = file.load() {
+                        state.cached_objects = state.cached_objects.saturating_sub(objects_removed);
+                        let _ = file.persist(&state);
+                    }
+                },
+            )
+            .await;
     }
 
     /// Try to acquire the global consolidation lock
@@ -1532,21 +5208,49 @@ impl JournalConsolidator {
     /// where multiple instances process the same journal entries.
     ///
     /// Returns Ok(true) if lock acquired, Ok(false) if held by another instance.
+    ///
+    /// Boolean form of `try_acquire_consolidation_lock_token` for the consolidation cycle's
+    /// lock, released with [`Self::release_global_consolidation_lock`]. Validation installs
+    /// take and release by token.
     pub fn try_acquire_global_consolidation_lock(&self) -> Result<bool> {
-        use fs2::FileExt;
+        Ok(self.try_acquire_cycle_lock()?.is_some())
+    }
 
+    /// Acquire for the consolidation cycle or idle eviction: the token also becomes
+    /// `cycle_lock_token`, which the cycle-internal fenced writers check.
+    fn try_acquire_cycle_lock(&self) -> Result<Option<ConsolidationLockToken>> {
+        let token = self.try_acquire_consolidation_lock_token()?;
+        if let Some(t) = token {
+            self.cycle_lock_token.store(t.0, Ordering::SeqCst);
+        }
+        Ok(token)
+    }
+
+    /// Try to acquire the global consolidation lock, returning this acquisition's token.
+    ///
+    /// The token is the lock generation this acquisition set. Every fenced write checks
+    /// [`Self::lock_fence_intact_for`] with the caller's own token, and
+    /// [`Self::release_consolidation_lock`] releases only for the token that holds the lock.
+    /// A process-wide fence was not enough: after a watchdog takeover the same process can
+    /// re-acquire (a validation install, the rolling write phase), and the stuck cycle's
+    /// fence then read intact again and its scopeguard released the new holder's lock.
+    ///
+    /// `Ok(None)` when another instance, or another holder in this process, has it.
+    pub(crate) fn try_acquire_consolidation_lock_token(
+        &self,
+    ) -> Result<Option<ConsolidationLockToken>> {
         let mut guard = match self.consolidation_lock_file.lock() {
             Ok(g) => g,
             Err(e) => {
                 warn!("Failed to acquire consolidation lock mutex: {}", e);
-                return Ok(false);
+                return Ok(None);
             }
         };
 
         // Check if we already hold the lock
         if guard.is_some() {
             debug!("Consolidation lock already held by this instance");
-            return Ok(false);
+            return Ok(None);
         }
 
         let lock_file_path = self
@@ -1583,7 +5287,7 @@ impl JournalConsolidator {
         };
 
         // Try to acquire exclusive lock (non-blocking)
-        match lock_file.try_lock_exclusive() {
+        match fs4::FileExt::try_lock(&lock_file) {
             Ok(()) => {
                 debug!("Acquired global consolidation lock");
 
@@ -1603,30 +5307,182 @@ impl JournalConsolidator {
 
                 // Store the lock file so it stays open (and locked) until released
                 *guard = Some(lock_file);
-                Ok(true)
+                let generation = self.lock_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                self.held_lock_generation
+                    .store(generation, Ordering::SeqCst);
+                self.lock_held_since_ms
+                    .store(unix_millis_now().max(1), Ordering::SeqCst);
+                Ok(Some(ConsolidationLockToken(generation)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(fs4::TryLockError::WouldBlock) => {
                 debug!("Global consolidation lock held by another instance");
-                Ok(false)
+                Ok(None)
             }
-            Err(e) => {
+            Err(fs4::TryLockError::Error(e)) => {
                 warn!("Failed to acquire consolidation lock: {}", e);
-                Ok(false)
+                Ok(None)
             }
         }
     }
 
-    /// Release the global consolidation lock
-    ///
-    /// With flock-based locking, release is automatic when the file handle is dropped.
-    /// This method explicitly drops the lock file handle.
+    /// Release the lock taken by the consolidation cycle or idle eviction (the boolean
+    /// acquire). Releases by `cycle_lock_token`, so it is a no-op after a takeover.
     pub fn release_global_consolidation_lock(&self) {
+        let token = ConsolidationLockToken(self.cycle_lock_token.load(Ordering::SeqCst));
+        self.release_consolidation_lock(token);
+    }
+
+    /// Release the global consolidation lock if `token` is the acquisition that holds it.
+    ///
+    /// A no-op on a stale token: after a watchdog takeover and a re-acquisition in this
+    /// process, the stuck holder's release must not drop the new holder's lock file.
+    pub(crate) fn release_consolidation_lock(&self, token: ConsolidationLockToken) {
         if let Ok(mut guard) = self.consolidation_lock_file.lock() {
-            if guard.is_some() {
-                *guard = None;
+            if guard.is_some() && self.token_is_current(token) {
+                if let Some(file) = guard.take() {
+                    unlock_lock_file(&file, "global consolidation lock");
+                }
+                self.lock_held_since_ms.store(0, Ordering::SeqCst);
                 debug!("Released global consolidation lock");
+            } else if guard.is_some() {
+                debug!("Stale consolidation lock token; release skipped");
             }
         }
+    }
+
+    fn token_is_current(&self, token: ConsolidationLockToken) -> bool {
+        token.0 != 0
+            && self.lock_generation.load(Ordering::SeqCst) == token.0
+            && self.held_lock_generation.load(Ordering::SeqCst) == token.0
+    }
+
+    /// Whether the acquisition `token` still holds the global consolidation lock: held, and
+    /// neither a watchdog takeover nor a later acquisition has happened since.
+    pub(crate) fn lock_fence_intact_for(&self, token: ConsolidationLockToken) -> bool {
+        self.lock_held_since_ms.load(Ordering::SeqCst) != 0 && self.token_is_current(token)
+    }
+
+    /// Whether the cycle that acquired the global consolidation lock still holds it: the lock
+    /// is held and no watchdog takeover has happened since the acquisition.
+    ///
+    /// The lock-dependent writers (the size-delta apply, delta-file deletion, Write_Ledger and
+    /// tail-delta compaction rewrites) check this immediately before writing, and abandon when it
+    /// is false. A cycle the watchdog took the lock from can resume at any point once its stuck
+    /// call returns; by then another instance may hold the lock and be doing the same work.
+    ///
+    /// Per acquisition: it compares against the cycle's own token (`cycle_lock_token`), not
+    /// whatever this process last acquired, so a validation install that re-acquires after a
+    /// takeover leaves the stuck cycle's fence broken.
+    pub(crate) fn lock_fence_intact(&self) -> bool {
+        self.lock_fence_intact_for(ConsolidationLockToken(
+            self.cycle_lock_token.load(Ordering::SeqCst),
+        ))
+    }
+
+    /// Seconds this process has held the global consolidation lock, `0` when it does not hold
+    /// it. Per-instance. Published as `consolidation.consolidation_lock_held_secs`.
+    pub fn consolidation_lock_held_secs(&self) -> u64 {
+        let since = self.lock_held_since_ms.load(Ordering::SeqCst);
+        if since == 0 {
+            return 0;
+        }
+        unix_millis_now().saturating_sub(since) / 1000
+    }
+
+    /// Watchdog takeovers since process start. Published as
+    /// `consolidation.consolidation_lock_takeovers`.
+    pub fn consolidation_lock_takeovers(&self) -> u64 {
+        self.lock_takeovers.load(Ordering::Relaxed)
+    }
+
+    /// The production watchdog threshold: `max(10 × consolidation_cycle_timeout, 5 min)`.
+    pub fn lock_watchdog_threshold(&self) -> Duration {
+        (self.config.consolidation_cycle_timeout * 10).max(LOCK_WATCHDOG_MIN_THRESHOLD)
+    }
+
+    /// Take the lock away from a cycle that has held it for at least `threshold`.
+    ///
+    /// Drops the parked `File`, which releases the flock without the stuck task's cooperation,
+    /// and bumps the lock generation so that task's remaining lock-dependent writes abandon.
+    /// Returns true when it took the lock. Logs at error once per takeover: the takeover resets
+    /// `lock_held_since_ms`, so a stuck episode is reported once.
+    fn take_over_stale_lock(&self, threshold: Duration) -> bool {
+        let Ok(mut guard) = self.consolidation_lock_file.lock() else {
+            return false;
+        };
+        let since = self.lock_held_since_ms.load(Ordering::SeqCst);
+        if guard.is_none() || since == 0 {
+            return false;
+        }
+        let held_ms = unix_millis_now().saturating_sub(since);
+        if held_ms < threshold.as_millis() as u64 {
+            return false;
+        }
+        self.lock_generation.fetch_add(1, Ordering::SeqCst);
+        self.lock_held_since_ms.store(0, Ordering::SeqCst);
+        if let Some(file) = guard.take() {
+            unlock_lock_file(&file, "global consolidation lock");
+        }
+        self.lock_takeovers.fetch_add(1, Ordering::Relaxed);
+        error!(
+            "Consolidation lock watchdog: a consolidation cycle has held the global consolidation \
+             lock for {} ms (threshold {} ms). Released the lock so another instance can \
+             consolidate; the stuck cycle's remaining lock-dependent writes will be abandoned.",
+            held_ms,
+            threshold.as_millis()
+        );
+        true
+    }
+
+    /// Start the consolidation-lock watchdog on a dedicated OS thread.
+    ///
+    /// A dedicated thread rather than a tokio task: a cycle stuck in an inline `std::fs` call
+    /// pins its worker, and neither a tokio task nor a `tokio::time::timeout` around the cycle
+    /// is guaranteed to run then. The thread holds a `Weak`, so it never keeps the consolidator
+    /// alive, and exits when the handle is stopped or dropped.
+    pub fn start_lock_watchdog(self: &Arc<Self>, threshold: Duration) -> LockWatchdog {
+        let weak = Arc::downgrade(self);
+        let poll = (threshold / 20).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("consolidation-lock-watchdog".to_string())
+            .spawn(move || loop {
+                match stop_rx.recv_timeout(poll) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => return,
+                }
+                let Some(consolidator) = weak.upgrade() else {
+                    return;
+                };
+                consolidator.take_over_stale_lock(threshold);
+            })
+            .ok();
+        if handle.is_none() {
+            warn!("Failed to start the consolidation lock watchdog thread");
+        }
+        LockWatchdog {
+            stop_tx: Some(stop_tx),
+            handle,
+        }
+    }
+
+    /// Install a [`LockParkHook`] the next cycle that takes the lock will park on.
+    #[cfg(test)]
+    pub(crate) fn set_lock_park_hook(&self, hook: Arc<LockParkHook>) {
+        *self.lock_park_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Override the Write_Ledger compaction budget.
+    #[cfg(test)]
+    pub(crate) fn set_ledger_compaction_budget(&self, budget: Duration) {
+        self.ledger_compaction_budget_ms
+            .store(budget.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Wall-clock budget for one Write_Ledger compaction pass:
+    /// `min(10 s, consolidation_cycle_timeout / 3)`, 10 s at the default 30 s cycle timeout.
+    fn ledger_compaction_budget(&self) -> Duration {
+        Duration::from_millis(self.ledger_compaction_budget_ms.load(Ordering::Relaxed))
     }
 
     /// Update size state from validation scan (Task 12)
@@ -1652,66 +5508,157 @@ impl JournalConsolidator {
     /// clamped with a WARN rather than accepted, because accepting it would make
     /// `read_cache_size = total_size - write_cache_size` underflow at every reporting
     /// site downstream.
+    /// # Prefer [`Self::update_size_from_validation_with_kind`] from production code
+    ///
+    /// This three-argument form cannot say **which** validation produced its figures, and that
+    /// decides whether the accounting drift it samples is evaluable at all (R12.6 wants two
+    /// independent producers; a rolling cycle's proportional correction is computed *from* the
+    /// counter it would be compared against). It therefore records the drift sample with
+    /// `sample_kind: "unspecified"` and every gauge unevaluable by name.
+    ///
+    /// Every remaining caller of this form is a test. It survives so that ~13 test call sites did
+    /// not have to be rewritten to publish a figure none of them asserts, and the wire spelling
+    /// makes a future production caller that reaches for it visible rather than silent.
     pub async fn update_size_from_validation(
         &self,
         scanned_size: u64,
         write_cache_size: Option<u64>,
         cached_objects: Option<u64>,
     ) {
-        // Read current state from disk first
-        let mut state = match self.load_size_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to load size state for validation update: {}", e);
-                SizeState::default()
-            }
-        };
+        self.update_size_from_validation_with_kind(
+            scanned_size,
+            write_cache_size,
+            cached_objects,
+            crate::cache_size_tracker::ValidationSampleKind::Unspecified,
+        )
+        .await
+    }
 
-        let old_size = state.total_size;
-        let old_write_cache_size = state.write_cache_size;
-        state.total_size = scanned_size;
-        if let Some(wc_size) = write_cache_size {
-            // Requirement 6.4: enforce the subset invariant. Clamp with a WARN rather
-            // than trusting the input — see the doc comment for why accepting it would
-            // underflow every read-cache figure derived from the difference.
-            if wc_size > scanned_size {
-                warn!(
-                    "Validation write_cache_size {} exceeds total_size {} — clamping to \
+    /// As [`Self::update_size_from_validation`], naming the validation that produced the figures
+    /// so R12.6-R12.8's drift gauges can say whether they are evaluable.
+    pub async fn update_size_from_validation_with_kind(
+        &self,
+        scanned_size: u64,
+        write_cache_size: Option<u64>,
+        cached_objects: Option<u64>,
+        sample_kind: crate::cache_size_tracker::ValidationSampleKind,
+    ) {
+        // Under `size_state.lock`, like `atomic_update_size_delta`: without it a peer's delta
+        // apply that loaded before this install and persisted after it overwrote the install,
+        // and this install could overwrite a peer's apply mid-flight. On failure nothing is
+        // installed and the delta files and accumulator are left alone, so no delta is lost;
+        // the next validation retries. Pinned by
+        // `a_validation_install_waits_for_a_peer_holding_the_size_state_lock`.
+        let persisted = match self
+            .with_size_state_locked("validation update", SIZE_STATE_LOCK_TIMEOUT, move |file| {
+                // Read current state from disk first
+                //
+                // `state_readable` is carried forward deliberately: on the error arm every persisted
+                // figure below is a struct default, so a difference against it is the whole reference
+                // figure rather than a drift. R12.8 forbids publishing that as a number, so the drift
+                // sample names the cause instead.
+                let (mut state, state_readable) = match file.load() {
+                    Ok(s) => (s, true),
+                    Err(e) => {
+                        warn!("Failed to load size state for validation update: {}", e);
+                        (SizeState::default(), false)
+                    }
+                };
+
+                let old_size = state.total_size;
+                let old_write_cache_size = state.write_cache_size;
+                let old_cached_objects = state.cached_objects;
+                state.total_size = scanned_size;
+                if let Some(wc_size) = write_cache_size {
+                    // Requirement 6.4: enforce the subset invariant. Clamp with a WARN rather
+                    // than trusting the input — see the doc comment for why accepting it would
+                    // underflow every read-cache figure derived from the difference.
+                    if wc_size > scanned_size {
+                        warn!(
+                            "Validation write_cache_size {} exceeds total_size {} — clamping to \
                      total_size. The two figures were computed from inconsistent views; \
                      suspect a partial scan being installed as a whole-cache figure.",
-                    wc_size, scanned_size
-                );
-                state.write_cache_size = scanned_size;
-            } else {
-                state.write_cache_size = wc_size;
-            }
-        }
-        if let Some(objects) = cached_objects {
-            state.cached_objects = objects;
-        }
-        state.last_updated_by = get_instance_id();
+                            wc_size, scanned_size
+                        );
+                        state.write_cache_size = scanned_size;
+                    } else {
+                        state.write_cache_size = wc_size;
+                    }
+                }
+                if let Some(objects) = cached_objects {
+                    state.cached_objects = objects;
+                }
+                state.last_updated_by = get_instance_id();
 
-        // Requirement 6.5: log the write-cache drift corrected alongside the total, so
-        // recurring drift in either figure is visible without diffing state files.
-        info!(
-            "Updated size state from validation: old_size={}, new_size={}, drift={}, \
+                // Requirement 6.5: log the write-cache drift corrected alongside the total, so
+                // recurring drift in either figure is visible without diffing state files.
+                info!(
+                    "Updated size state from validation: old_size={}, new_size={}, drift={}, \
              old_write_cache_size={}, new_write_cache_size={}, write_cache_drift={}, \
              cached_objects={}",
-            old_size,
-            scanned_size,
-            scanned_size as i64 - old_size as i64,
-            old_write_cache_size,
-            state.write_cache_size,
-            state.write_cache_size as i64 - old_write_cache_size as i64,
-            state.cached_objects
-        );
+                    old_size,
+                    scanned_size,
+                    scanned_size as i64 - old_size as i64,
+                    old_write_cache_size,
+                    state.write_cache_size,
+                    state.write_cache_size as i64 - old_write_cache_size as i64,
+                    state.cached_objects
+                );
 
-        // Persist the updated state
-        if let Err(e) = self.persist_size_state_internal(&state).await {
+                // =====================================================================
+                // R12.6-R12.8: publish the drift as ALARMABLE GAUGES, not only as the line above.
+                //
+                // The line above has existed throughout, and R12.6 exists because it was not enough: R7.4's
+                // drift stayed visible in it for at least five days while every assertion in the project
+                // passed. Nothing exported it and nothing could alarm on it.
+                //
+                // Three gauges, not two. The `info!` line computes `drift` and `write_cache_drift` and
+                // then prints `cached_objects` as a bare new value, so the third population R12.6 names
+                // had no drift producer at all — both of its terms were already in hand here and only the
+                // subtraction was missing.
+                //
+                // Written to the shared volume rather than held in a process-local gauge because any
+                // instance may run the validation: a local gauge would read "no sample" on every proxy
+                // that had not run one, and R12.7's staleness alarm would then fire on healthy
+                // instances. § 16.6.7's reasoning for the eviction result applies unchanged.
+                //
+                // Best-effort: a failed write costs one sample's diagnosis, and failing a size
+                // re-grounding over a bookkeeping write would be worse.
+                // Spec: cache-eviction-at-scale. Requirements: 12.6, 12.7, 12.8.
+                // =====================================================================
+                let drift_sample = crate::cache_size_tracker::AccountingDriftSample::new(
+                    get_instance_id(),
+                    sample_kind,
+                    state_readable,
+                    (old_size, old_write_cache_size, old_cached_objects),
+                    (scanned_size, write_cache_size, cached_objects),
+                );
+                if let Err(e) = drift_sample.install(&file.cache_dir) {
+                    debug!("Could not publish the accounting drift sample: {}", e);
+                }
+
+                // Persist the updated state
+                file.persist(&state)
+            })
+            .await
+        {
+            Ok(persisted) => persisted,
+            Err(e) => {
+                warn!(
+                    "Skipping validation size install: size state lock unavailable: {}",
+                    e
+                );
+                return;
+            }
+        };
+        if let Err(e) = persisted {
+            // Nothing was installed, so the pending deltas are still owed to the old figure:
+            // keep the delta files and the accumulator rather than discarding them.
             warn!(
                 "Failed to persist size state after validation update: {}",
                 e
             );
+            return;
         }
 
         // Reset all delta files to prevent stale deltas from being re-applied
@@ -1719,6 +5666,436 @@ impl JournalConsolidator {
 
         // Reset the in-memory accumulator to zero
         self.size_accumulator.reset();
+    }
+
+    /// The figures a full validation's census is corrected against, read with the caller
+    /// holding `global_consolidation.lock`: `size_state.json` projected forward by every pending
+    /// delta file, after flushing this instance's accumulator so its pending credits are in a
+    /// file. See `CacheSizeTracker::install_full_scan_figures`.
+    ///
+    /// `Some` with `state_unreadable` when `size_state.json` is unreadable. It used to be
+    /// `None`, deferring the install, so nothing but a rolling pass or the (removed) startup
+    /// census could ever repair the document. A correction applied to a struct default
+    /// would install the whole census on top of zero and then add every delta again.
+    ///
+    /// Under the consolidation lock no cycle is between collecting a delta file and deleting
+    /// it, so each pending credit is in exactly one of the two reads. Two residuals: a credit
+    /// still in a peer's accumulator is in neither, and a holder the lock watchdog displaced
+    /// after its fenced persist can still delete the files it applied (the window
+    /// [`Self::delete_applied_delta_files_fenced`] names), so a file can be read here and in
+    /// `size_state.json` both.
+    pub(crate) async fn validation_baseline(&self) -> Option<ValidationBaseline> {
+        if let Err(e) = self.size_accumulator.flush().await {
+            // The accumulator keeps what it could not write, so those credits are in neither
+            // read below, like a peer's unflushed credits.
+            warn!(
+                "Validation baseline: could not flush the size accumulator: {}",
+                e
+            );
+        }
+        let (state, state_unreadable) = match self.load_size_state().await {
+            Ok(state) => (state, false),
+            Err(e) => {
+                // Read as zeros. No cycle can apply a delta to an unreadable document, so
+                // installing `census - pending` grounds it exactly: see
+                // `install_validation_correction`.
+                warn!(
+                    "Validation baseline: size state unreadable ({}); this pass will ground it \
+                     from its census",
+                    e
+                );
+                (SizeState::default(), true)
+            }
+        };
+        let (delta, wc_delta, objects_delta) = self.pending_delta_sum_with_objects().await;
+        Some(ValidationBaseline {
+            total_size: project(state.total_size, delta),
+            write_cache_size: project(state.write_cache_size, wc_delta),
+            cached_objects: project(state.cached_objects, objects_delta),
+            state_unreadable,
+        })
+    }
+
+    /// [`Self::pending_delta_sum`] with the `cached_objects_delta` field as a third term.
+    async fn pending_delta_sum_with_objects(&self) -> (i64, i64, i64) {
+        let mut sum = (0i64, 0i64, 0i64);
+        let Ok(mut entries) = tokio::fs::read_dir(self.cache_dir.join("size_tracking")).await
+        else {
+            return sum;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let named = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_delta_file_name);
+            if !named {
+                continue;
+            }
+            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            if let Ok((delta, wc_delta, objects_delta, _)) = parse_delta_content_full(&content) {
+                sum.0 = sum.0.saturating_add(delta);
+                sum.1 = sum.1.saturating_add(wc_delta);
+                sum.2 = sum.2.saturating_add(objects_delta);
+            }
+        }
+        sum
+    }
+
+    /// Install a full validation's census as `current + (census - baseline)` under
+    /// `size_state.lock`, the caller holding `global_consolidation.lock`. Writes and deletes no
+    /// delta file, so every credit still reaches `size_state.json` exactly once through the
+    /// usual pipeline. Returns whether the install was persisted. The R12.6 drift sample
+    /// compares the census against the baseline, the figures taken before the walk.
+    ///
+    /// # The clamp acts on `size_state` plus the pending delta files
+    ///
+    /// `current` excludes credits still in delta files. A large negative correction landing
+    /// while a large positive delta is unapplied (consolidation stalled during the walk) would
+    /// clamp at 0, and the later apply would over-count by the part the clamp cut. That part,
+    /// up to the positive pending sum, is carried into this instance's accumulator instead, so
+    /// it is applied with those files. Credits still in a peer's accumulator are invisible
+    /// here, so beyond the pending sum the clamp still cuts.
+    ///
+    /// This instance's accumulator is flushed first, so its credits since the baseline count in
+    /// the pending sum that caps the carry, as a peer's flushed credits do.
+    ///
+    /// Requirement 6.4's subset invariant (`write_cache_size <= total_size`) is enforced on the
+    /// figures projected by the pending deltas and the carry, not on `size_state.json` alone: a
+    /// total clamped at 0 with its cut carried would otherwise clamp the write-cache figure to
+    /// that transient 0 with nothing carried, under-counting write-cache once the deltas apply.
+    /// The persisted document can therefore hold `write_cache_size > total_size` until the next
+    /// apply; see [`SizeState::write_cache_size`].
+    ///
+    /// # An unreadable `size_state.json`
+    ///
+    /// When the baseline found the document unreadable (`state_unreadable`) and it still is, the
+    /// install treats it as zeros: no cycle can apply a delta to it meanwhile, so
+    /// `0 + census - pending_at_baseline` plus every pending file once applied is the census plus
+    /// the credits after the baseline, exactly. A document that became readable since, or a
+    /// readable baseline whose document is now unreadable, defers: the two reads disagree about
+    /// what the pending files are relative to.
+    ///
+    /// On a lock timeout nothing is installed.
+    pub(crate) async fn install_validation_correction(
+        &self,
+        census_size: u64,
+        census_write_cache_size: u64,
+        census_objects: u64,
+        baseline: ValidationBaseline,
+        sample_kind: crate::cache_size_tracker::ValidationSampleKind,
+    ) -> bool {
+        // Flushed first so this instance's own credits since the baseline are in a file, inside
+        // the cap below.
+        if let Err(e) = self.size_accumulator.flush().await {
+            warn!(
+                "Validation correction: could not flush the size accumulator: {}",
+                e
+            );
+        }
+        // Read under the caller's consolidation lock: no cycle is between collecting a file and
+        // deleting it, so these are exactly the credits `size_state.json` does not hold yet.
+        let (pending_size, pending_write_cache, pending_objects) =
+            self.pending_delta_sum_with_objects().await;
+        let outcome = self
+            .with_size_state_locked(
+                "validation correction",
+                SIZE_STATE_LOCK_TIMEOUT,
+                move |file| -> Result<(u64, u64, u64)> {
+                    let mut state = match (file.load(), baseline.state_unreadable) {
+                        (Ok(_), true) => {
+                            return Err(ProxyError::CacheError(
+                                "size_state.json became readable after an unreadable baseline"
+                                    .to_string(),
+                            ))
+                        }
+                        (Ok(state), false) => state,
+                        (Err(_), true) => SizeState::default(),
+                        (Err(e), false) => return Err(e),
+                    };
+                    // The clamped figure, and the part the clamp cut that the pending files can
+                    // absorb.
+                    let shift =
+                        |current: u64, census: u64, base: u64, pending: i64| -> (u64, u64) {
+                            let raw = current as i128 + census as i128 - base as i128;
+                            let carry = if raw < 0 {
+                                (-raw).min(i128::from(pending.max(0))) as u64
+                            } else {
+                                0
+                            };
+                            (raw.clamp(0, u64::MAX as i128) as u64, carry)
+                        };
+                    let old_size = state.total_size;
+                    let (total_size, size_carry) = shift(
+                        state.total_size,
+                        census_size,
+                        baseline.total_size,
+                        pending_size,
+                    );
+                    let (write_cache_size, write_cache_carry) = shift(
+                        state.write_cache_size,
+                        census_write_cache_size,
+                        baseline.write_cache_size,
+                        pending_write_cache,
+                    );
+                    let (cached_objects, objects_carry) = shift(
+                        state.cached_objects,
+                        census_objects,
+                        baseline.cached_objects,
+                        pending_objects,
+                    );
+                    state.total_size = total_size;
+                    state.write_cache_size = write_cache_size;
+                    state.cached_objects = cached_objects;
+                    // Requirement 6.4's subset invariant, on the figures once the pending deltas
+                    // and the carry have applied: a total clamped at 0 with its cut carried is
+                    // transient, and clamping write-cache to it would lose write-cache bytes.
+                    let projected = |figure: u64, pending: i64, carry: u64| -> u64 {
+                        (figure as i128 + i128::from(pending) - carry as i128)
+                            .clamp(0, u64::MAX as i128) as u64
+                    };
+                    let projected_total = projected(state.total_size, pending_size, size_carry);
+                    let projected_write_cache = projected(
+                        state.write_cache_size,
+                        pending_write_cache,
+                        write_cache_carry,
+                    );
+                    if projected_write_cache > projected_total {
+                        let cut =
+                            (projected_write_cache - projected_total).min(state.write_cache_size);
+                        warn!(
+                            "Validation correction: write_cache_size {} would exceed total_size {} \
+                             once the pending deltas apply; reducing write_cache_size by {}",
+                            projected_write_cache, projected_total, cut
+                        );
+                        state.write_cache_size -= cut;
+                    }
+                    state.last_updated_by = get_instance_id();
+
+                    info!(
+                        "Updated size state from validation: baseline_size={}, census_size={}, \
+                         drift={}, old_size={}, new_size={}, baseline_write_cache_size={}, \
+                         census_write_cache_size={}, write_cache_drift={}, cached_objects={}",
+                        baseline.total_size,
+                        census_size,
+                        census_size as i64 - baseline.total_size as i64,
+                        old_size,
+                        state.total_size,
+                        baseline.write_cache_size,
+                        census_write_cache_size,
+                        census_write_cache_size as i64 - baseline.write_cache_size as i64,
+                        state.cached_objects
+                    );
+
+                    // R12.6-R12.8: the same sample the absolute install publishes, with the
+                    // baseline as the persisted term. See `update_size_from_validation_with_kind`.
+                    let drift_sample = crate::cache_size_tracker::AccountingDriftSample::new(
+                        get_instance_id(),
+                        sample_kind,
+                        true,
+                        (
+                            baseline.total_size,
+                            baseline.write_cache_size,
+                            baseline.cached_objects,
+                        ),
+                        (
+                            census_size,
+                            Some(census_write_cache_size),
+                            Some(census_objects),
+                        ),
+                    );
+                    if let Err(e) = drift_sample.install(&file.cache_dir) {
+                        debug!("Could not publish the accounting drift sample: {}", e);
+                    }
+
+                    file.persist(&state)?;
+                    Ok((size_carry, write_cache_carry, objects_carry))
+                },
+            )
+            .await;
+        match outcome {
+            Ok(Ok((size_carry, write_cache_carry, objects_carry))) => {
+                if size_carry > 0 || write_cache_carry > 0 || objects_carry > 0 {
+                    warn!(
+                        "Validation correction: the clamp at 0 cut {} bytes, {} write-cache bytes \
+                         and {} objects; carried into the accumulator to apply with the pending \
+                         delta files",
+                        size_carry, write_cache_carry, objects_carry
+                    );
+                    self.size_accumulator.subtract(size_carry);
+                    self.size_accumulator
+                        .subtract_write_cache(write_cache_carry);
+                    self.size_accumulator
+                        .add_cached_objects(-i64::try_from(objects_carry).unwrap_or(i64::MAX));
+                }
+                true
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Skipping validation correction: could not load or persist size state: {}",
+                    e
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    "Skipping validation correction: size state lock unavailable: {}",
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// Run `critical` against `size_state.json` while holding `size_state.lock`, with the lock
+    /// acquisition bounded at `budget`.
+    ///
+    /// Every read-modify-write of `size_state.json` goes through here: the delta apply, the
+    /// validation install, the cycle's own `cached_objects` batch (`apply_new_objects_now`) and
+    /// startup back-fill, and the `Schema_Fence` bump. So they all serialise on the same gate and
+    /// fail the same way. No request path calls it: request-path `cached_objects` changes go
+    /// through the [`SizeAccumulator`] and the cycle's delta apply.
+    ///
+    /// # At most one blocking thread per process waits in this flock
+    ///
+    /// `flock` excludes per open file description, so two descriptors in ONE process exclude
+    /// each other (measured on EFS too). Every caller opens its own descriptor, so before the
+    /// gate each concurrent caller parked one blocking-pool thread in the kernel wait. Under
+    /// write load (then one locked `cached_objects` increment per PUT that published a new
+    /// `.meta`, one decrement per deleted key) the waiters filled all 512 pool threads, the holder's next
+    /// `tokio::fs` call queued behind them, and nothing could release: a deadlock that also
+    /// starved `/health` and `/metrics`. `tokio::time::timeout` abandons a `spawn_blocking`
+    /// task without cancelling the kernel wait, so each expiry left a thread parked.
+    ///
+    /// The gate is an async mutex taken BEFORE the blocking thread is requested, so waiters
+    /// queue without holding a thread. Its owned guard moves INTO the blocking closure: a
+    /// caller whose budget expires mid-`flock` leaves the guard with the abandoned thread, so
+    /// the next caller cannot start a second kernel wait until that one is granted and
+    /// dropped. Cross-instance exclusion is unchanged; the `flock` still provides it.
+    ///
+    /// # The holder never needs a second pool thread
+    ///
+    /// `critical` runs synchronously on the same blocking thread that took the flock, and the
+    /// flock is released on that thread before it returns. A holder that instead awaited
+    /// `tokio::fs` reads and writes while holding the flock could be stalled by ANY other pool
+    /// consumer that filled the pool, while it held a lock every peer instance waits on.
+    ///
+    /// # The budget bounds acquisition only
+    ///
+    /// Once the flock is granted the thread claims the call (`PENDING` to `RUNNING`) and the
+    /// caller waits for `critical` to finish, past the budget if need be: that wait needs no
+    /// pool thread and no lock beyond the one already held. A caller whose budget expires first
+    /// marks the call `ABANDONED`, and the thread then releases the flock without running
+    /// `critical`. So `Err` always means nothing was written, which the delta apply relies on
+    /// to keep its delta files. A caller DROPPED while the claim is `PENDING` marks it
+    /// `ABANDONED` the same way ([`SizeStateClaimDropGuard`]), so a cancelled caller's thread
+    /// writes nothing either.
+    ///
+    /// Lock order: the gate, then `size_state.lock`. Both are released together (flock
+    /// first, by field order). Callers that hold the global consolidation lock take it
+    /// before either. `critical` must not take any other lock.
+    async fn with_size_state_locked<R, F>(
+        &self,
+        purpose: &str,
+        budget: Duration,
+        critical: F,
+    ) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&SizeStateFile) -> R + Send + 'static,
+    {
+        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
+
+        // Ensure directory exists
+        if let Some(parent) = lock_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ProxyError::CacheError(format!("Failed to create size_tracking directory: {}", e))
+            })?;
+        }
+
+        let gate = Arc::clone(&self.size_state_gate);
+        let claim = Arc::new(std::sync::atomic::AtomicU8::new(SIZE_STATE_CLAIM_PENDING));
+        let worker_claim = Arc::clone(&claim);
+        let _drop_guard = SizeStateClaimDropGuard(Arc::clone(&claim));
+        let file = self.size_state_file();
+        let attempt = async move {
+            let gate_guard = gate.lock_owned().await;
+            tokio::task::spawn_blocking(move || {
+                let lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_file_path)?;
+                fs4::FileExt::lock(&lock)?;
+                let held = SizeStateLock {
+                    _file: lock,
+                    _gate: gate_guard,
+                };
+                if worker_claim
+                    .compare_exchange(
+                        SIZE_STATE_CLAIM_PENDING,
+                        SIZE_STATE_CLAIM_RUNNING,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    // The caller's budget expired first: release without writing.
+                    return Ok(None);
+                }
+                let out = critical(&file);
+                drop(held);
+                Ok::<_, std::io::Error>(Some(out))
+            })
+            .await
+        };
+        tokio::pin!(attempt);
+
+        let joined = match tokio::time::timeout(budget, &mut attempt).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                if claim
+                    .compare_exchange(
+                        SIZE_STATE_CLAIM_PENDING,
+                        SIZE_STATE_CLAIM_ABANDONED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    warn!("Size state lock timeout for {}", purpose);
+                    return Err(ProxyError::CacheError(
+                        "Size state lock timeout".to_string(),
+                    ));
+                }
+                // Granted and claimed before the budget expired: `critical` is running on
+                // its own thread and needs nothing else, so wait for it.
+                attempt.await
+            }
+        };
+
+        match joined {
+            Ok(Ok(Some(out))) => Ok(out),
+            Ok(Ok(None)) => Err(ProxyError::CacheError(
+                "Size state lock timeout".to_string(),
+            )),
+            Ok(Err(e)) => {
+                warn!("Failed to acquire size state lock for {}: {}", purpose, e);
+                Err(ProxyError::CacheError(format!(
+                    "Size state lock acquisition failed: {}",
+                    e
+                )))
+            }
+            Err(e) => {
+                warn!("Size state lock task failed: {}", e);
+                Err(ProxyError::CacheError(format!(
+                    "Size state lock task failed: {}",
+                    e
+                )))
+            }
+        }
     }
 
     /// Atomically update size state with deltas from consolidation
@@ -1738,337 +6115,129 @@ impl JournalConsolidator {
         size_delta: i64,
         write_cache_delta: i64,
     ) -> Result<u64> {
-        #[allow(unused_imports)]
-        use fs2::FileExt;
+        self.atomic_update_size_delta_inner(size_delta, write_cache_delta, 0, false)
+            .await
+    }
 
+    /// [`Self::atomic_update_size_delta`] for a caller holding the global consolidation lock:
+    /// checks [`Self::lock_fence_intact`] before taking the size-state lock and again before the
+    /// persist, and returns `Err` without writing when the watchdog has taken the lock away.
+    /// Also applies the collected `cached_objects` delta, saturating at 0.
+    async fn atomic_update_size_delta_fenced(
+        &self,
+        size_delta: i64,
+        write_cache_delta: i64,
+        cached_objects_delta: i64,
+    ) -> Result<u64> {
+        self.atomic_update_size_delta_inner(
+            size_delta,
+            write_cache_delta,
+            cached_objects_delta,
+            true,
+        )
+        .await
+    }
+
+    async fn atomic_update_size_delta_inner(
+        &self,
+        size_delta: i64,
+        write_cache_delta: i64,
+        cached_objects_delta: i64,
+        fenced: bool,
+    ) -> Result<u64> {
         // Skip if no changes
-        if size_delta == 0 && write_cache_delta == 0 {
-            return Ok(self.get_current_size().await);
+        if size_delta == 0 && write_cache_delta == 0 && cached_objects_delta == 0 {
+            return Ok(self.get_current_size().await.unwrap_or(0));
+        }
+        if fenced && !self.lock_fence_intact() {
+            return Err(ProxyError::CacheError(
+                "consolidation lock was taken over; size delta not applied".to_string(),
+            ));
         }
 
-        // Use a dedicated lock file for size state updates
-        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
+        // The second fence check runs on the blocking thread, so it reads the same atomics
+        // `lock_fence_intact` reads, through their Arcs. A takeover or a re-acquisition bumps
+        // `lock_generation`; a release zeroes `lock_held_since_ms` WITHOUT bumping it, so the
+        // held term is what stops a write after the cycle's own scopeguard released the lock
+        // (a cancelled cycle whose thread outlived it).
+        let own_token = self.cycle_lock_token.load(Ordering::SeqCst);
+        let lock_held_since_ms = Arc::clone(&self.lock_held_since_ms);
+        let lock_generation = Arc::clone(&self.lock_generation);
+        let held_lock_generation = Arc::clone(&self.held_lock_generation);
+        let fence_intact = move || {
+            own_token != 0
+                && lock_held_since_ms.load(Ordering::SeqCst) != 0 // FENCE_HELD
+                && lock_generation.load(Ordering::SeqCst) == own_token
+                && held_lock_generation.load(Ordering::SeqCst) == own_token
+        };
 
-        // Ensure directory exists
-        if let Some(parent) = lock_file_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create size_tracking directory: {}", e))
-            })?;
-        }
-
-        // Acquire exclusive lock with timeout
-        let lock_file = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking({
-                let lock_path = lock_file_path.clone();
-                move || {
-                    use fs2::FileExt;
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&lock_path)?;
-                    file.lock_exclusive()?;
-                    Ok::<_, std::io::Error>(file)
+        self.with_size_state_locked("delta update", SIZE_STATE_LOCK_TIMEOUT, move |file| {
+            // Read current state while holding lock
+            let mut state = match file.load() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to load size state for atomic delta update: {}", e);
+                    return Err(e);
                 }
-            }),
-        )
-        .await
-        {
-            Ok(Ok(Ok(file))) => file,
-            Ok(Ok(Err(e))) => {
-                warn!("Failed to acquire size state lock for delta update: {}", e);
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock acquisition failed: {}",
-                    e
-                )));
+            };
+
+            // Apply size deltas
+            let old_size = state.total_size;
+            if size_delta >= 0 {
+                state.total_size = state.total_size.saturating_add(size_delta as u64);
+            } else {
+                state.total_size = state.total_size.saturating_sub((-size_delta) as u64);
             }
-            Ok(Err(e)) => {
-                warn!("Size state lock task failed: {}", e);
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock task failed: {}",
-                    e
-                )));
+
+            if write_cache_delta >= 0 {
+                state.write_cache_size = state
+                    .write_cache_size
+                    .saturating_add(write_cache_delta as u64);
+            } else {
+                state.write_cache_size = state
+                    .write_cache_size
+                    .saturating_sub((-write_cache_delta) as u64);
             }
-            Err(_) => {
-                warn!("Size state lock timeout for delta update");
+
+            state.cached_objects = if cached_objects_delta >= 0 {
+                state
+                    .cached_objects
+                    .saturating_add(cached_objects_delta as u64)
+            } else {
+                state
+                    .cached_objects
+                    .saturating_sub(cached_objects_delta.unsigned_abs())
+            };
+
+            state.last_consolidation = SystemTime::now();
+            state.consolidation_count += 1;
+            state.last_updated_by = get_instance_id();
+
+            if fenced && !fence_intact() {
                 return Err(ProxyError::CacheError(
-                    "Size state lock timeout".to_string(),
+                    "consolidation lock was taken over; size delta not applied".to_string(),
                 ));
             }
-        };
 
-        // Read current state while holding lock
-        let mut state = match self.load_size_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                // Release lock
-                let _ = lock_file.unlock();
-                warn!("Failed to load size state for atomic delta update: {}", e);
+            // Persist while still holding lock
+            if let Err(e) = file.persist(&state) {
+                warn!(
+                    "Failed to persist size state after atomic delta update: {}",
+                    e
+                );
                 return Err(e);
             }
-        };
 
-        // Apply size deltas
-        let old_size = state.total_size;
-        if size_delta >= 0 {
-            state.total_size = state.total_size.saturating_add(size_delta as u64);
-        } else {
-            state.total_size = state.total_size.saturating_sub((-size_delta) as u64);
-        }
-
-        if write_cache_delta >= 0 {
-            state.write_cache_size = state
-                .write_cache_size
-                .saturating_add(write_cache_delta as u64);
-        } else {
-            state.write_cache_size = state
-                .write_cache_size
-                .saturating_sub((-write_cache_delta) as u64);
-        }
-
-        state.last_consolidation = SystemTime::now();
-        state.consolidation_count += 1;
-        state.last_updated_by = get_instance_id();
-
-        // Persist while still holding lock
-        if let Err(e) = self.persist_size_state_internal(&state).await {
-            // Release lock
-            let _ = lock_file.unlock();
-            warn!(
-                "Failed to persist size state after atomic delta update: {}",
-                e
+            debug!(
+                "Atomic size delta update: old_size={}, size_delta={:+}, write_cache_delta={:+}, new_size={}",
+                old_size, size_delta, write_cache_delta, state.total_size
             );
-            return Err(e);
-        }
 
-        // Release lock
-        if let Err(e) = lock_file.unlock() {
-            warn!("Failed to release size state lock: {}", e);
-        }
-
-        debug!(
-            "Atomic size delta update: old_size={}, size_delta={:+}, write_cache_delta={:+}, new_size={}",
-            old_size, size_delta, write_cache_delta, state.total_size
-        );
-
-        Ok(state.total_size)
+            Ok(state.total_size)
+        })
+        .await?
     }
 
-    /// Atomically subtract bytes from the size state after eviction
-    ///
-    /// Uses file locking to ensure atomic read-modify-write across multiple instances.
-    /// This prevents lost updates when multiple instances evict concurrently.
-    ///
-    /// # Arguments
-    /// * `bytes_freed` - Number of bytes freed by eviction
-    ///
-    /// # Returns
-    /// * `Ok(new_size)` - The new total size after subtraction
-    /// * `Err` - If locking or persistence fails
-    pub async fn atomic_subtract_size(&self, bytes_freed: u64) -> Result<u64> {
-        #[allow(unused_imports)]
-        use fs2::FileExt;
-
-        if bytes_freed == 0 {
-            return Ok(self.get_current_size().await);
-        }
-
-        // Use a dedicated lock file for size state updates
-        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
-
-        // Ensure directory exists
-        if let Some(parent) = lock_file_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create size_tracking directory: {}", e))
-            })?;
-        }
-
-        // Acquire exclusive lock with timeout
-        let lock_file = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking({
-                let lock_path = lock_file_path.clone();
-                move || {
-                    use fs2::FileExt;
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&lock_path)?;
-                    file.lock_exclusive()?;
-                    Ok::<_, std::io::Error>(file)
-                }
-            }),
-        )
-        .await
-        {
-            Ok(Ok(Ok(file))) => file,
-            Ok(Ok(Err(e))) => {
-                warn!("Failed to acquire size state lock: {}", e);
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock acquisition failed: {}",
-                    e
-                )));
-            }
-            Ok(Err(e)) => {
-                warn!("Size state lock task failed: {}", e);
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock task failed: {}",
-                    e
-                )));
-            }
-            Err(_) => {
-                warn!("Size state lock timeout");
-                return Err(ProxyError::CacheError(
-                    "Size state lock timeout".to_string(),
-                ));
-            }
-        };
-
-        // Read current state while holding lock
-        let mut state = match self.load_size_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                // Release lock
-                let _ = lock_file.unlock();
-                warn!("Failed to load size state for atomic subtract: {}", e);
-                return Err(e);
-            }
-        };
-
-        // Subtract bytes_freed
-        let old_size = state.total_size;
-        state.total_size = state.total_size.saturating_sub(bytes_freed);
-        state.last_updated_by = get_instance_id();
-
-        // Persist while still holding lock
-        if let Err(e) = self.persist_size_state_internal(&state).await {
-            // Release lock
-            let _ = lock_file.unlock();
-            warn!("Failed to persist size state after atomic subtract: {}", e);
-            return Err(e);
-        }
-
-        // Release lock
-        if let Err(e) = lock_file.unlock() {
-            warn!("Failed to release size state lock: {}", e);
-        }
-
-        debug!(
-            "Atomic size subtract: old_size={}, bytes_freed={}, new_size={}",
-            old_size, bytes_freed, state.total_size
-        );
-
-        Ok(state.total_size)
-    }
-    /// Atomically add bytes to the size state when caching new data
-    ///
-    /// Uses file locking to ensure atomic read-modify-write across multiple instances.
-    /// This prevents lost updates when multiple instances cache concurrently.
-    ///
-    /// # Arguments
-    /// * `bytes_added` - Number of bytes added to cache
-    ///
-    /// # Returns
-    /// * `Ok(new_size)` - The new total size after addition
-    /// * `Err` - If locking or persistence fails
-    pub async fn atomic_add_size(&self, bytes_added: u64) -> Result<u64> {
-        #[allow(unused_imports)]
-        use fs2::FileExt;
-
-        if bytes_added == 0 {
-            return Ok(self.get_current_size().await);
-        }
-
-        // Use a dedicated lock file for size state updates
-        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
-
-        // Ensure directory exists
-        if let Some(parent) = lock_file_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create size_tracking directory: {}", e))
-            })?;
-        }
-
-        // Acquire exclusive lock with timeout
-        let lock_file = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking({
-                let lock_path = lock_file_path.clone();
-                move || {
-                    use fs2::FileExt;
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&lock_path)?;
-                    file.lock_exclusive()?;
-                    Ok::<_, std::io::Error>(file)
-                }
-            }),
-        )
-        .await
-        {
-            Ok(Ok(Ok(file))) => file,
-            Ok(Ok(Err(e))) => {
-                warn!("Failed to acquire size state lock for add: {}", e);
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock acquisition failed: {}",
-                    e
-                )));
-            }
-            Ok(Err(e)) => {
-                warn!("Size state lock task failed for add: {}", e);
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock task failed: {}",
-                    e
-                )));
-            }
-            Err(_) => {
-                warn!("Size state lock timeout for add");
-                return Err(ProxyError::CacheError(
-                    "Size state lock timeout".to_string(),
-                ));
-            }
-        };
-
-        // Read current state while holding lock
-        let mut state = match self.load_size_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                // Release lock
-                let _ = lock_file.unlock();
-                warn!("Failed to load size state for atomic add: {}", e);
-                return Err(e);
-            }
-        };
-
-        // Add bytes
-        let old_size = state.total_size;
-        state.total_size = state.total_size.saturating_add(bytes_added);
-        state.last_updated_by = get_instance_id();
-
-        // Persist while still holding lock
-        if let Err(e) = self.persist_size_state_internal(&state).await {
-            // Release lock
-            let _ = lock_file.unlock();
-            warn!("Failed to persist size state after atomic add: {}", e);
-            return Err(e);
-        }
-
-        // Release lock
-        if let Err(e) = lock_file.unlock() {
-            warn!("Failed to release size state lock after add: {}", e);
-        }
-
-        debug!(
-            "Atomic size add: old_size={}, bytes_added={}, new_size={}",
-            old_size, bytes_added, state.total_size
-        );
-
-        Ok(state.total_size)
-    }
     /// Atomically add bytes to size state with non-blocking try-lock
     ///
     /// Initialize the consolidator by loading size state from disk
@@ -2077,11 +6246,82 @@ impl JournalConsolidator {
     /// If no size state file exists, the consolidator starts with default (zero) values
     /// and logs that validation will calculate the actual size.
     pub async fn initialize(&self) -> Result<()> {
-        // Clean up stale journal files from dead instances before loading size state.
-        // After OOM kills or crashes, journal files from the dead PID remain on shared
-        // storage and are re-read every consolidation cycle. With 500k+ objects this can
-        // be 800+ MB of stale data, causing memory pressure that triggers more OOM kills.
-        self.cleanup_dead_instance_journals().await;
+        // The cadence this process publishes on, which is the cadence the detector and the
+        // watch below are derived from.
+        let interval = self.config.interval;
+        #[cfg(test)]
+        let reap_before_detecting = INITIALIZE_REAPS_BEFORE_IT_DETECTS;
+        #[cfg(not(test))]
+        let reap_before_detecting = false;
+        if reap_before_detecting {
+            self.cleanup_dead_instance_journals().await;
+            // The seam a test waits on, so a run under this lever reports the pass as having
+            // happened and the verdict comes from what the pass decided.
+            #[cfg(test)]
+            STARTUP_OWN_HOST_REAP_PASSES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let retire_dir = self.cache_dir.clone();
+            tokio::spawn(async move {
+                crate::signed_put_handler::retire_dead_own_host_in_progress_figures(
+                    &retire_dir,
+                    interval,
+                )
+                .await;
+            });
+        } else {
+            // One detector pass before any own-host reap decision, synchronously, because every
+            // one of those decisions reads `cache::hostname_uniqueness_holds` and this is the
+            // only thing that can set it. Condition 1, the exact-identity nonce clash, needs no
+            // second observation, so it latches here. One `read_dir` of a directory holding one
+            // small document per proxy.
+            let detect_dir = self.cache_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::signed_put_handler::detect_hostname_collision_blocking(&detect_dir, interval)
+            })
+            .await;
+
+            // Then the own-host reap pass, and after it this host's stopped predecessors'
+            // published figures, both deferred behind the watch the retire derives from the
+            // publishers' own cadence. The wait is what lets condition 2 — a document whose pid
+            // reads dead here and whose `written_at` moves anyway — latch before a reap trusts
+            // that pid test. Detached: startup waits on neither, and no client request does.
+            //
+            // The reap stays ahead of the retire inside this task, because removing a
+            // predecessor's journal is what takes it out of the roster and so makes its
+            // document a retire candidate at all.
+            let deferred_dir = self.cache_dir.clone();
+            let replay_max_age = Duration::from_secs(self.config.stale_entry_timeout_secs);
+            tokio::spawn(async move {
+                let watch_dir = deferred_dir.clone();
+                let watch = tokio::task::spawn_blocking(move || {
+                    crate::signed_put_handler::published_cadence_watch_blocking(
+                        &watch_dir, interval,
+                    )
+                })
+                .await
+                .unwrap_or(interval);
+                tokio::time::sleep(watch).await;
+                Self::cleanup_dead_instance_journals_at(deferred_dir.clone(), replay_max_age).await;
+                let retired = crate::signed_put_handler::retire_dead_own_host_in_progress_figures(
+                    &deferred_dir,
+                    interval,
+                )
+                .await;
+                if retired > 0 {
+                    debug!(
+                        "Retired {} stopped-process in-progress figures of this host at startup",
+                        retired
+                    );
+                }
+                #[cfg(test)]
+                STARTUP_OWN_HOST_REAP_PASSES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            });
+        }
+        // This process's `.ready` record, before the listener reports ready and so before this
+        // `{host}:{pid}` writes its first journal entry. The DR-EVICT capability gate reads every
+        // proxy with a recent journal, and an id with a journal and no record reads `NotCapable`,
+        // which aborts a live work-list generation; every restart is a new id. Overwrites any
+        // record a previous process with the same id left. The first non-idle cycle refreshes it.
+        self.publish_lightweight_ready_record().await;
 
         match self.load_size_state().await {
             Ok(state) => {
@@ -2092,71 +6332,10 @@ impl JournalConsolidator {
                     );
                 }
 
-                // If cached_objects is 0 but we have cached data, count .meta files now.
-                // This handles the upgrade case where cached_objects was not previously tracked.
-                // Acquire the size state lock before writing to prevent a concurrent consolidation
-                // cycle on another instance from overwriting our result with cached_objects=0.
-                if state.cached_objects == 0 && state.total_size > 0 {
-                    let metadata_dir = self.cache_dir.join("metadata");
-                    let count = tokio::task::spawn_blocking(move || {
-                        use walkdir::WalkDir;
-                        WalkDir::new(&metadata_dir)
-                            .follow_links(false)
-                            .into_iter()
-                            .filter_map(|e| e.ok())
-                            .filter(|e| e.path().extension().is_some_and(|ext| ext == "meta"))
-                            .count() as u64
-                    })
-                    .await
-                    .unwrap_or(0);
-
-                    if count > 0 {
-                        let lock_file_path =
-                            self.cache_dir.join("size_tracking").join("size_state.lock");
-                        let lock_acquired = tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            tokio::task::spawn_blocking({
-                                let lock_path = lock_file_path.clone();
-                                move || {
-                                    use fs2::FileExt;
-                                    let file = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .write(true)
-                                        .truncate(false)
-                                        .open(&lock_path)?;
-                                    file.lock_exclusive()?;
-                                    Ok::<_, std::io::Error>(file)
-                                }
-                            }),
-                        )
-                        .await;
-
-                        if let Ok(Ok(Ok(lock_file))) = lock_acquired {
-                            // Re-read under lock — another instance may have already populated it
-                            let current = self.load_size_state().await.unwrap_or_default();
-                            if current.cached_objects == 0 {
-                                let mut updated = current;
-                                updated.cached_objects = count;
-                                updated.last_updated_by = get_instance_id();
-                                if let Err(e) = self.persist_size_state_internal(&updated).await {
-                                    warn!(
-                                        "Failed to persist cached_objects after startup scan: {}",
-                                        e
-                                    );
-                                } else {
-                                    info!("Initialized cached_objects={} from startup .meta file count", count);
-                                }
-                            } else {
-                                info!("cached_objects already populated ({}) by another instance, skipping", current.cached_objects);
-                            }
-                            let _ = lock_file.unlock();
-                        } else {
-                            warn!(
-                                "Could not acquire size state lock for cached_objects startup init"
-                            );
-                        }
-                    }
-                }
+                // A document with bytes but no object count (written before `cached_objects`
+                // existed) used to be back-filled here by walking every `.meta` file. No
+                // startup walk runs now (Ed, 2026-10-10): the coordinator requests a full
+                // validation under `validation.lock` instead, whose census grounds the count.
             }
             Err(e) => {
                 // No size state file - this is a fresh install or first run after migration
@@ -2206,6 +6385,7 @@ impl JournalConsolidator {
                 None => return,
             }
         };
+        self.staging_trigger_nudges.fetch_add(1, Ordering::Relaxed);
         cache_manager.nudge_staging_eviction();
     }
 
@@ -2229,12 +6409,54 @@ impl JournalConsolidator {
     /// the same class of cost as the `metadata/` walk Phase B removed, just moved off the
     /// request path. [`LEDGER_COMPACTION_INTERVAL_SECS`] bounds it instead.
     ///
-    /// Called from `run_consolidation_cycle` while the global consolidation lock is held,
-    /// which is what makes it safe for this to rewrite *other* instances' ledger files.
+    /// # Why it runs under the global consolidation lock, and what the lock is NOT for
+    ///
+    /// Called from `run_consolidation_cycle` while the global consolidation lock is held. The
+    /// lock is a **fleet-wide singleton election**, so one instance compacts at a time instead
+    /// of every proxy re-reading the same ledger files and contending with appends for their
+    /// per-file locks. It is not what makes rewriting other instances' files safe: that is
+    /// [`crate::write_ledger::WriteLedger::retire_identities`]'s per-file `fs4` lock, held
+    /// across each file's read, filter, temp write and rename (the lock every append takes),
+    /// together with naming removals rather than a retain set. Staging eviction already runs
+    /// the same rewrite under a different lock (`global_eviction.lock`), concurrently with this
+    /// pass, on that argument. Moving this pass off the consolidation lock therefore needs a
+    /// separate lease or per-shard claim for efficiency, not for correctness.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 2.6
-    async fn maybe_compact_write_ledger(&self) {
-        use crate::write_ledger::StagedCandidateVerdict;
+    ///
+    /// # Time budget, and why the work is a shard rotation
+    ///
+    /// The pass walks compaction **units** in a fixed order: every shard directory
+    /// `{bucket}/{l1}` under the ledger root, then one unit for any legacy flat files. Per unit
+    /// it reads that unit's ledger files (one per instance that has credited the shard),
+    /// assesses each candidate's `.meta` in cache-key order, and retires the terminal entries
+    /// from **that unit's files only**. A key's entries all live in its own shard directory,
+    /// whichever instance wrote them, so a unit is self-contained.
+    ///
+    /// It stops at [`Self::ledger_compaction_budget`] (`min(10 s,
+    /// consolidation_cycle_timeout / 3)`), checked before each unit and before each candidate,
+    /// and records a cursor (the unit, and the last key assessed in it). At least one candidate
+    /// or unit is processed per pass, so a pass always makes progress. A budget-stopped pass is
+    /// due again after [`LEDGER_COMPACTION_RESUME_SECS`], not on the next cycle; a pass that
+    /// reaches the end of the rotation restores the full [`LEDGER_COMPACTION_INTERVAL_SECS`].
+    ///
+    /// # One rotation for the fleet
+    ///
+    /// The cursor and the resume time live in `metadata/_shard_state/ledger_compaction_cursor.json`
+    /// ([`SharedLedgerCompactionState`]), read at the start of each lock holder's decision and
+    /// written at the end of its pass. Whichever instance holds the lock continues the fleet's
+    /// rotation and honours the fleet's resume time, so the fleet runs at most one budget per
+    /// resume interval, not one per proxy. The local stamp still gates the read (it mirrors the
+    /// shared resume time once read) and stops two overlapping cycles in one process.
+    ///
+    /// The worst-case hold per cycle is therefore one budget plus one unit's overrun: the
+    /// `1 + B` shard listing, one candidate's `.meta` read, and one unit's read and rewrite.
+    /// The previous shape read every ledger file on the volume twice per pass (the candidate
+    /// read and the rewrite), outside the budget, and was due again on every cycle.
+    ///
+    /// Returns `None` when the pass did not run, otherwise what it covered.
+    async fn maybe_compact_write_ledger(&self) -> Option<LedgerCompactionPass> {
+        use crate::write_ledger::{LedgerCompactionStats, StagedCandidateVerdict, WriteLedger};
 
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2242,7 +6464,30 @@ impl JournalConsolidator {
             .as_secs();
         let last = self.last_ledger_compaction_secs.load(Ordering::Relaxed);
         if now_secs.saturating_sub(last) < LEDGER_COMPACTION_INTERVAL_SECS {
-            return;
+            return None;
+        }
+        if !self.lock_fence_intact() {
+            return None;
+        }
+        // The fleet's resume time: whichever instance compacted last set it. Clamped to one
+        // interval ahead, so a document written by a clock far ahead of this one delays the
+        // rotation by at most an interval.
+        let shared = SharedLedgerCompactionState::load(&self.cache_dir);
+        if let Some(doc) = &shared {
+            let due = doc
+                .next_due_at
+                .min(now_secs + LEDGER_COMPACTION_INTERVAL_SECS);
+            if due > now_secs {
+                // Mirror it into the local gate, so this process reads the document again only
+                // once the fleet's pass is due rather than on every cycle.
+                let _ = self.last_ledger_compaction_secs.compare_exchange(
+                    last,
+                    due.saturating_sub(LEDGER_COMPACTION_INTERVAL_SECS),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return None;
+            }
         }
         // CAS so two overlapping cycles in this process cannot both compact.
         if self
@@ -2250,62 +6495,1025 @@ impl JournalConsolidator {
             .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
+            return None;
+        }
+
+        let started = std::time::Instant::now();
+        let budget = self.ledger_compaction_budget();
+
+        // The units, in rotation order. `1 + B` readdirs and no file opened.
+        let mut units: Vec<LedgerCompactionUnit> = match self.write_ledger.ledger_shards().await {
+            Ok(shards) => shards.into_iter().map(|(b, l1)| (0u8, b, l1)).collect(),
+            Err(e) => {
+                warn!(
+                    "Write-ledger compaction: failed to list ledger shards: {}",
+                    e
+                );
+                return None;
+            }
+        };
+        units.sort();
+        match self.write_ledger.legacy_ledger_file_count().await {
+            Ok(n) if n > 0 => units.push((1u8, String::new(), String::new())),
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Write-ledger compaction: failed to list legacy files: {}",
+                e
+            ),
+        }
+
+        // The fleet's rotation, not this process's: continue wherever the last pass on any
+        // instance stopped. A cursor naming a unit that no longer exists starts a fresh rotation.
+        let cursor = shared
+            .and_then(|doc| doc.cursor)
+            .filter(|c| units.binary_search(&c.unit).is_ok());
+        let start = cursor
+            .as_ref()
+            .map(|c| units.partition_point(|u| u < &c.unit))
+            .unwrap_or(0);
+
+        let mut retired_total = LedgerCompactionStats::default();
+        let mut dropped_by_reason: HashMap<&'static str, u64> = HashMap::new();
+        let mut assessed = 0usize;
+        let mut units_visited = 0usize;
+        let mut files_read = 0usize;
+        let mut stopped: Option<LedgerCompactionCursor> = None;
+
+        for unit in &units[start..] {
+            if (assessed > 0 || units_visited > 0) && started.elapsed() >= budget {
+                stopped = Some(LedgerCompactionCursor {
+                    unit: unit.clone(),
+                    after_key: None,
+                });
+                break;
+            }
+            units_visited += 1;
+
+            let files = if unit.0 == 0 {
+                self.write_ledger.shard_ledger_files_of(&unit.1, &unit.2)
+            } else {
+                self.write_ledger.legacy_ledger_files_list().await
+            };
+            let files = match files {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(
+                        "Write-ledger compaction: failed to list unit {:?}: {}",
+                        unit, e
+                    );
+                    continue;
+                }
+            };
+            let entries = WriteLedger::read_files_hint(&files).await;
+            let mut candidates = WriteLedger::group_by_key(entries);
+            // Cache-key order, so a budget-stopped pass has a stable place to resume from.
+            candidates.sort_by(|a, b| a.cache_key.cmp(&b.cache_key));
+            let mut last_key = cursor
+                .as_ref()
+                .filter(|c| &c.unit == unit)
+                .and_then(|c| c.after_key.clone());
+            if let Some(after) = &last_key {
+                candidates.retain(|c| c.cache_key.as_str() > after.as_str());
+            }
+
+            // Named as removals rather than as a retain set, so an entry appended after the
+            // read above is not deleted for the sole reason that this pass did not see it. The
+            // window between that unlocked read and the rewrite holds one `.meta` read per
+            // candidate; naming removals is what makes it safe. The window inside the rewrite
+            // itself is closed there by holding each file's lock across its read, filter, temp
+            // write and rename.
+            let mut retire: HashSet<(String, u64, u64, SystemTime, String)> = HashSet::new();
+            for candidate in &candidates {
+                if assessed > 0 && started.elapsed() >= budget {
+                    stopped = Some(LedgerCompactionCursor {
+                        unit: unit.clone(),
+                        after_key: last_key.clone(),
+                    });
+                    break;
+                }
+                assessed += 1;
+                last_key = Some(candidate.cache_key.clone());
+                // `assess_` rather than `verify_`: the terminal arm retires the entries whose
+                // OWN extent is terminal, not every entry the candidate carries. See
+                // `StagedCandidateAssessment` for loss mode L6: a key-scoped `Superseded`
+                // retirement deletes live siblings of a re-PUT whose ledger append was lost.
+                let assessment =
+                    crate::write_ledger::assess_staged_candidate(&self.cache_dir, candidate).await;
+                match assessment.verdict {
+                    StagedCandidateVerdict::Evictable | StagedCandidateVerdict::Unreadable => {
+                        // Still staged, or its `.meta` could not be read: one failed read on
+                        // shared storage is not evidence an object is gone. Keep it by not
+                        // naming it.
+                    }
+                    verdict => {
+                        if assessment.retirable.is_empty() {
+                            continue;
+                        }
+                        retire.extend(assessment.retirable.iter().cloned());
+                        *dropped_by_reason.entry(verdict.reason()).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // The rewrite edits other instances' files. Safe under the per-file lock alone (see
+            // above), but a pass whose election was taken over stops here so two instances do
+            // not both compact.
+            if !self.lock_fence_intact() {
+                warn!(
+                    "Write-ledger compaction: the consolidation lock was taken over during the \
+                     pass; abandoning the rewrite"
+                );
+                return Some(LedgerCompactionPass {
+                    assessed,
+                    complete: false,
+                    units_visited,
+                    files_read,
+                });
+            }
+            // Run even with an empty retire set: the rewrite is also what quarantines torn lines
+            // and drops blank ones, and it reads only this unit's files.
+            let stats = self.write_ledger.retire_identities_in(files, &retire).await;
+            files_read +=
+                (stats.files_rewritten + stats.files_unchanged + stats.files_removed) as usize;
+            retired_total.entries_before += stats.entries_before;
+            retired_total.entries_after += stats.entries_after;
+            retired_total.files_rewritten += stats.files_rewritten;
+            retired_total.files_unchanged += stats.files_unchanged;
+            retired_total.files_removed += stats.files_removed;
+
+            if stopped.is_some() {
+                break;
+            }
+        }
+
+        let complete = stopped.is_none();
+        if let Ok(mut c) = self.ledger_compaction_resume_after.lock() {
+            *c = stopped.clone();
+        }
+        // Publish the rotation for whichever instance holds the lock next. A failed install
+        // costs efficiency only: the next holder redoes this pass from the previous cursor.
+        let shared_next = SharedLedgerCompactionState {
+            schema: LEDGER_COMPACTION_STATE_SCHEMA,
+            next_due_at: now_secs
+                + if complete {
+                    LEDGER_COMPACTION_INTERVAL_SECS
+                } else {
+                    LEDGER_COMPACTION_RESUME_SECS
+                },
+            cursor: stopped.clone(),
+            written_by: get_instance_id(),
+        };
+        if let Err(e) = shared_next.install(&self.cache_dir) {
+            warn!(
+                "Write-ledger compaction: could not publish the shared rotation cursor ({}); \
+                 the next lock holder repeats this pass",
+                e
+            );
+        }
+        if !complete {
+            // Due again after the resume delay, not on the next cycle: the stamp is set so the
+            // interval gate above opens `LEDGER_COMPACTION_RESUME_SECS` from now.
+            self.last_ledger_compaction_secs.store(
+                now_secs.saturating_sub(
+                    LEDGER_COMPACTION_INTERVAL_SECS - LEDGER_COMPACTION_RESUME_SECS,
+                ),
+                Ordering::Relaxed,
+            );
+        }
+
+        if retired_total.entries_dropped() > 0 {
+            info!(
+                "Write-ledger compaction: dropped {} entries across {} objects, {} retained in \
+                 the units visited, candidates_assessed={}, units_visited={}, files_read={}, \
+                 rewritten={}, removed={}, complete={}, elapsed_ms={}, reasons={:?}",
+                retired_total.entries_dropped(),
+                dropped_by_reason.values().sum::<u64>(),
+                retired_total.entries_after,
+                assessed,
+                units_visited,
+                files_read,
+                retired_total.files_rewritten,
+                retired_total.files_removed,
+                complete,
+                started.elapsed().as_millis(),
+                dropped_by_reason
+            );
+        } else {
+            debug!(
+                "Write-ledger compaction dropped nothing: candidates_assessed={}, \
+                 units_visited={}, files_read={}, complete={}, elapsed_ms={}, budget_ms={}, \
+                 resume={:?}",
+                assessed,
+                units_visited,
+                files_read,
+                complete,
+                started.elapsed().as_millis(),
+                budget.as_millis(),
+                stopped
+            );
+        }
+        Some(LedgerCompactionPass {
+            assessed,
+            complete,
+            units_visited,
+            files_read,
+        })
+    }
+
+    /// Make the Write_Ledger compaction pass due now, as if its interval had elapsed.
+    #[cfg(test)]
+    pub(crate) fn make_ledger_compaction_due(&self) {
+        self.last_ledger_compaction_secs.store(0, Ordering::Relaxed);
+        if let Some(mut doc) = SharedLedgerCompactionState::load(&self.cache_dir) {
+            doc.next_due_at = 0;
+            doc.install(&self.cache_dir).unwrap();
+        }
+    }
+
+    /// Open this process's own compaction gate only, leaving the fleet's resume time as it is.
+    #[cfg(test)]
+    pub(crate) fn make_ledger_compaction_locally_due(&self) {
+        self.last_ledger_compaction_secs.store(0, Ordering::Relaxed);
+    }
+
+    /// Run a staged fold pass if the cadence permits, and record its outcome.
+    ///
+    /// Returns `None` when the pass did not run — either the interval has not elapsed
+    /// since the last **Complete_Install**, or a pass is already running in this process.
+    /// `Some(outcome)` is a pass that ran, whether it installed or retained.
+    ///
+    /// # Two behaviours this changes, both required by § 16.6.9
+    ///
+    /// **The timestamp advances on completion only.** `maybe_compact_write_ledger` above
+    /// stamps `last_ledger_compaction_secs` before doing any work, so a pass that fails
+    /// halfway consumes the whole retry interval. Here the timestamp is written *after*
+    /// [`crate::staged_fold::FoldOutcome::installed`] returns true and nowhere else, so a
+    /// retain leaves it where it was and the next consolidation cycle retries. That is the
+    /// behaviour a retain needs: the previous figure is still published and its age is
+    /// still rising, so waiting 300 s to try again is 300 s of avoidable staleness.
+    ///
+    /// **An idle fleet still folds.** The pass is claimed and spawned *before*
+    /// `run_consolidation_cycle`'s idle early return, which returns without reaching
+    /// anything at the end of the cycle. A fleet with no pending journal work and no
+    /// accumulator delta is precisely a fleet whose staged set is stable and whose fold
+    /// would therefore succeed cheaply — and under the old placement it was the one state
+    /// where the fold never ran at all, so `staged_authority_age_secs` would climb
+    /// forever on an idle deployment.
+    ///
+    /// Overlap is prevented by `staged_fold_in_progress` rather than by the timestamp, so
+    /// that "may another pass start" and "when did one last succeed" stay separate
+    /// questions. Cross-instance overlap is discouraged by § 16.2's shard claims and is not
+    /// *prevented*, which is deliberate: a claim is an efficiency mechanism (R19.2) and two
+    /// instances folding one shard concurrently each install a complete document atomically,
+    /// with the cut `max`'d against the one on disk — so the worse outcome is that one
+    /// instance's cut advance is superseded by the other's, an over-count for one interval,
+    /// cleared at the next pass, and never a lost credit.
+    ///
+    /// A pass that found every candidate shard claimed by a peer returns
+    /// `Retained(NoShardAvailable, ..)`, so it does not consume the cadence and does not
+    /// count as an incompleteness — a peer doing the work is the mechanism succeeding.
+    ///
+    /// # Test entry point only, since the passes left the cycle
+    ///
+    /// Production reaches the same gate and body through
+    /// [`Self::spawn_maintenance_passes`], which claims synchronously and runs the pass on its own
+    /// task. This awaits both in one call, so a test can drive the cadence deterministically.
+    #[cfg(test)]
+    pub(crate) async fn maybe_run_staged_fold(&self) -> Option<crate::staged_fold::FoldOutcome> {
+        self.maintenance_passes().staged_fold_if_due().await
+    }
+
+    /// The interval and per-pass wall-clock budget handed to the `st_size` pass, as the operator
+    /// configured them.
+    ///
+    /// # It reads the config, and it used to read `SharedStorageConfig::default()` instead
+    ///
+    /// `cache.shared_storage.shard_fold_interval` and `shard_fold_max_duration` are accepted and
+    /// range-validated, and this scheduler could not reach them: it holds a
+    /// [`ConsolidationConfig`], which carries the fields its construction site copies across, and
+    /// `SharedStorageConfig` was not among them. So an operator setting `shard_fold_interval: 6h`
+    /// got 1h — adverse, because the value is a floor and the reason to raise it is a volume that
+    /// cannot take the default. Both values are now carried on [`ConsolidationConfig`] and copied
+    /// across in `src/cache.rs`.
+    ///
+    /// # Why this stayed a function rather than being inlined at the call site
+    ///
+    /// FOLD-WIRE's note here said to delete it once the fields arrived. It survives as a
+    /// two-field read because it is the only seam at which the cadence the pass receives can be
+    /// asserted: its only caller, [`Self::maintenance_passes`], copies the pair into the
+    /// handles whose `st_size_fold_if_due` passes it to
+    /// [`crate::st_size_fold::maybe_run_st_size_fold`] with nothing in between, and the pass's own
+    /// interval gate is process-global state that a unit test cannot drive deterministically.
+    /// `the_fold_cadence_is_the_operators_not_the_default` asserts it against two different
+    /// configurations, so a hardcoded pair cannot satisfy it either.
+    fn st_size_fold_cadence(&self) -> (Duration, Duration) {
+        (
+            self.config.shard_fold_interval,
+            self.config.shard_fold_max_duration,
+        )
+    }
+
+    /// The handles a maintenance pass needs, cloned so it can run on its own task.
+    fn maintenance_passes(&self) -> MaintenancePasses {
+        let (shard_fold_interval, shard_fold_max_duration) = self.st_size_fold_cadence();
+        MaintenancePasses {
+            cache_dir: self.cache_dir.clone(),
+            write_ledger: Arc::clone(&self.write_ledger),
+            last_staged_fold_completed_secs: Arc::clone(&self.last_staged_fold_completed_secs),
+            last_staged_fold_attempt_secs: Arc::clone(&self.last_staged_fold_attempt_secs),
+            staged_fold_in_progress: Arc::clone(&self.staged_fold_in_progress),
+            last_ledger_repair_secs: Arc::clone(&self.last_ledger_repair_secs),
+            ledger_repair_in_progress: Arc::clone(&self.ledger_repair_in_progress),
+            readiness_memo: Arc::clone(&self.readiness_memo),
+            readiness_memo_generation: Arc::clone(&self.readiness_memo_generation),
+            fold_limiter: Arc::clone(&self.fold_limiter),
+            repair_limiter: Arc::clone(&self.repair_limiter),
+            shard_fold_interval,
+            shard_fold_max_duration,
+            incomplete_upload_ttl_secs: Arc::clone(&self.incomplete_upload_ttl_secs),
+            last_incomplete_upload_sweep_secs: Arc::clone(&self.last_incomplete_upload_sweep_secs),
+            incomplete_upload_sweep_in_progress: Arc::clone(
+                &self.incomplete_upload_sweep_in_progress,
+            ),
+            cache_manager: self.cache_manager.lock().ok().and_then(|g| g.clone()),
+        }
+    }
+
+    /// Start the staged fold, the `st_size` fold, the incomplete-upload sweep and the ledger
+    /// repair, each on its own task, without waiting for any of them.
+    ///
+    /// The incomplete-upload sweep is claimed here like the ledger repair, every
+    /// `min(incomplete_upload_ttl / 4, 1 h)`, so abandoned multipart uploads are reaped whether or
+    /// not the validation scan runs.
+    ///
+    /// # Each pass keeps its own gate, cadence and in-progress flag
+    ///
+    /// The same interval gates and in-progress compare-exchanges decide whether anything runs,
+    /// exactly as before. For the staged fold and the ledger repair they are evaluated here,
+    /// synchronously, and the task is spawned only for a pass that was claimed, so the flag is
+    /// already set when this cycle reaches `maintain_staged_authority`'s activation guard. The
+    /// `st_size` fold's gate lives in its own module and runs inside the task; the task is only
+    /// spawned while that module's flag is clear, which keeps a 30-minute fold from being asked
+    /// for again every 5 s — every such tick would count in
+    /// `st_size_folds_declined_overlap_total`, a gauge whose non-zero value is documented to mean
+    /// the configured interval is too short, and which an inline pass never moved.
+    ///
+    /// One task per pass, so the `st_size` fold's O(range files) pass cannot hold up the staged
+    /// fold's 300 s cadence. They already interleave across instances; the two same-instance
+    /// interactions are covered by the readiness-memo generation and by the activation guard in
+    /// `maintain_staged_authority`.
+    ///
+    /// Nothing is spawned once [`Self::shutdown`] has begun.
+    fn spawn_maintenance_passes(&self) {
+        if self.maintenance_stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(mut tasks) = self.maintenance_tasks.lock() else {
+            return;
+        };
+        tasks.retain(|t| !t.is_finished());
+        let passes = self.maintenance_passes();
+        // The staged fold and the ledger repair are CLAIMED here, synchronously, so their
+        // in-progress flags are already set when this cycle reaches `maintain_staged_authority`.
+        // A task is spawned only for a claimed pass, so a gated-off cycle spawns nothing.
+        if let Some((now_secs, claim)) = passes.claim_staged_fold() {
+            let p = passes.clone();
+            tasks.push(tokio::spawn(async move {
+                p.run_claimed_staged_fold(now_secs, claim).await;
+            }));
+        }
+        if !crate::st_size_fold::fold_in_progress() {
+            let p = passes.clone();
+            tasks.push(tokio::spawn(async move {
+                p.st_size_fold_if_due().await;
+            }));
+        }
+        if let Some((now_secs, claim)) = passes.claim_incomplete_upload_sweep() {
+            let p = passes.clone();
+            tasks.push(tokio::spawn(async move {
+                p.run_claimed_incomplete_upload_sweep(now_secs, claim).await;
+            }));
+        }
+        // Orphan range-file reclamation (R15): due once cache init has enabled it, and run only
+        // while every active proxy on the volume is ready (`run_scheduled_pass`).
+        // Same per-process claim pattern as the incomplete-upload sweep; units are leased
+        // per shard inside the pass, never under the global eviction lock.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(claim) = crate::orphan_reclaim::claim_pass(now_secs) {
+            let cache_dir = passes.cache_dir.clone();
+            tasks.push(tokio::spawn(async move {
+                let _claim = claim;
+                crate::orphan_reclaim::run_scheduled_pass(
+                    &cache_dir,
+                    &get_instance_id(),
+                    crate::orphan_reclaim::PassBudget::production(),
+                )
+                .await;
+            }));
+        }
+        // DR-EVICT (task 49): on every proxy, on every cycle. Neither pass is size-triggered and
+        // neither takes
+        // `global_eviction.lock`; the author is the lock winner's, inside
+        // `enforce_disk_cache_limits_internal`. Each has its own per-process claim, so an executor
+        // pass that keeps executing chunks for its whole `EXECUTOR_PASS_BUDGET` never delays the
+        // abort tick (amendment 1), and a cycle that finds the pass still running spawns no
+        // second one. Both are spawned tasks the cycle does not await, so neither delays the
+        // consolidation cycle either.
+        if let Some(manager) = passes.cache_manager.as_ref().and_then(Weak::upgrade) {
+            if let Some(claim) = crate::eviction_worklist::claim_abort_tick() {
+                let m = Arc::clone(&manager);
+                tasks.push(tokio::spawn(async move {
+                    let _claim = claim;
+                    if let Err(e) = crate::eviction_worklist::driver_abort_tick(&m, now_secs).await
+                    {
+                        warn!("[EVICTION_WORKLIST] abort tick failed: {}", e);
+                    }
+                    // Reap superseded generation directories, off every lock.
+                    crate::eviction_worklist::driver_janitor_tick(m.get_cache_dir()).await;
+                }));
+            }
+            if let Some(claim) = crate::eviction_worklist::claim_executor_pass() {
+                tasks.push(tokio::spawn(async move {
+                    let _claim = claim;
+                    let budget = crate::eviction_worklist::executor_budget(&manager.shared_storage);
+                    if let Err(e) = manager.run_eviction_executor_pass(&budget).await {
+                        warn!("[EVICTION_WORKLIST] executor pass failed: {}", e);
+                    }
+                }));
+            }
+        }
+        if let Some((now_secs, claim)) = passes.claim_ledger_repair() {
+            tasks.push(tokio::spawn(async move {
+                passes.run_claimed_ledger_repair(now_secs, claim).await;
+            }));
+        }
+    }
+
+    /// Per-generation pickup: spawn this process's executor pass on a work-list generation it
+    /// has just authored, so its share of the chunks starts now instead of at the next cycle's
+    /// [`Self::spawn_maintenance_passes`].
+    ///
+    /// Called by `CacheManager::enforce_disk_cache_limits_internal` after it has released
+    /// `global_eviction.lock`, so no chunk runs under that lock, and never awaited, so the
+    /// author's return does not wait for the pass. The pass takes the same per-process claim
+    /// (`claim_executor_pass`) and the same budget as the scheduled one, so the two never
+    /// overlap and every per-chunk and per-batch fence is the scheduled pass's own.
+    ///
+    /// A scheduled pass that holds the claim may have read the current generation before this
+    /// one was written, so the task waits for the claim, for at most one consolidation interval.
+    /// Past that the next cycle's scheduled pass picks the generation up, as it did before this
+    /// pickup existed. Tracked with the maintenance passes, so [`Self::shutdown`] aborts it, and
+    /// nothing is spawned once shutdown has begun.
+    pub(crate) fn spawn_authored_executor_pass(&self) {
+        if self.maintenance_stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(manager) = self
+            .cache_manager
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
+        else {
+            return;
+        };
+        let Ok(mut tasks) = self.maintenance_tasks.lock() else {
+            return;
+        };
+        tasks.retain(|t| !t.is_finished());
+        let claim_wait = self.config.interval;
+        tasks.push(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let claim = loop {
+                if let Some(claim) = crate::eviction_worklist::claim_executor_pass() {
+                    break claim;
+                }
+                if started.elapsed() >= claim_wait {
+                    return;
+                }
+                tokio::time::sleep(AUTHORED_PICKUP_CLAIM_POLL).await;
+            };
+            let _claim = claim;
+            let budget = crate::eviction_worklist::executor_budget(&manager.shared_storage);
+            if let Err(e) = manager.run_eviction_executor_pass(&budget).await {
+                warn!(
+                    "[EVICTION_WORKLIST] executor pass on the just-authored generation failed: {}",
+                    e
+                );
+            }
+        }));
+    }
+
+    /// Set the TTL the incomplete-upload maintenance pass reaps by (`cache.incomplete_upload_ttl`).
+    pub fn set_incomplete_upload_ttl(&self, ttl: Duration) {
+        self.incomplete_upload_ttl_secs
+            .store(ttl.as_secs(), Ordering::Relaxed);
+    }
+
+    /// Wait for every maintenance pass task spawned so far to finish.
+    ///
+    /// For tests and diagnostics: production never waits on a pass, which is the point of
+    /// running them off the cycle. A task that panicked or was aborted is reaped without error.
+    pub async fn await_maintenance_passes(&self) {
+        let tasks: Vec<_> = match self.maintenance_tasks.lock() {
+            Ok(mut t) => t.drain(..).collect(),
+            Err(_) => return,
+        };
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// Whether this instance's staged fold or ledger repair is running right now.
+    ///
+    /// The two passes whose outcome reaches this instance's `.ready` record (§ 16.6.6
+    /// preconditions 3a and 3b). The `st_size` fold is not one of them.
+    fn readiness_pass_in_flight(&self) -> bool {
+        self.staged_fold_in_progress.load(Ordering::SeqCst)
+            || self.ledger_repair_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// Drop the held readiness evidence, so the next use reads the volume.
+    fn invalidate_readiness_memo(&self) {
+        invalidate_memo(&self.readiness_memo, &self.readiness_memo_generation);
+    }
+
+    /// The readiness figures at `now`, and whether the volume was read by this call.
+    ///
+    /// Serves the held [`ReadinessMemo`] while it is younger than
+    /// [`READINESS_MEMO_MAX_AGE_SECS`], re-evaluating its ages against `now`; otherwise reads the
+    /// volume and holds the result. A poisoned lock reads the volume every time, which is the
+    /// pre-memo behaviour.
+    ///
+    /// The read is O(shards) synchronous `std::fs` and runs on the blocking pool, as `fold_shard`
+    /// does, so a multi-second read on EFS does not also hold an async worker. `None` if that
+    /// task failed: the caller publishes nothing and does not activate, which is Phase L.
+    async fn current_readiness(&self) -> Option<((bool, bool, Option<u64>), bool)> {
+        let now_nanos = nanos_since_epoch(SystemTime::now());
+        if let Ok(memo) = self.readiness_memo.lock() {
+            if let Some(held) = memo.as_ref().filter(|m| m.is_current(now_nanos)) {
+                return Some((held.evaluate(now_nanos), false));
+            }
+        }
+        // Taken BEFORE the read: an invalidation that lands during it means a pass installed
+        // after the read started, so the read may predate the install and is not held.
+        let generation = self.readiness_memo_generation.load(Ordering::SeqCst);
+        let cache_dir = self.cache_dir.clone();
+        let fresh = match tokio::task::spawn_blocking(move || ReadinessMemo::read(&cache_dir)).await
+        {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                debug!("Staged-authority readiness read did not complete: {}", e);
+                return None;
+            }
+        };
+        if let Ok(mut memo) = self.readiness_memo.lock() {
+            // Checked under the lock, which `invalidate_memo` also takes to clear, so an
+            // invalidation either precedes this check (and the read is not held) or follows the
+            // store (and clears it).
+            if self.readiness_memo_generation.load(Ordering::SeqCst) == generation {
+                *memo = Some(fresh);
+            }
+        }
+        Some((fresh.evaluate(nanos_since_epoch(SystemTime::now())), true))
+    }
+
+    /// The lightweight `.ready` publication: both rotation flags `false`, no repair age, the live
+    /// `fold_incomplete_total`. Takes no lock, so `run_consolidation_cycle` calls it on every
+    /// non-idle cycle, latched or not, above the consolidation lock's early return, and
+    /// `initialize` calls it once at startup. It keeps this proxy's record inside the DR-EVICT
+    /// capability gate's window whether or not the proxy wins the lock (task 49 amendment 2,
+    /// And it blocks no activation: `staged_authority::assess` reads a peer's
+    /// record only through `record_process_blocker` (schema, `fold_capable`,
+    /// `fold_incomplete_total`) and takes both rotations from the evaluating instance's current
+    /// read (design § 16.6.6 B10.2).
+    async fn publish_lightweight_ready_record(&self) {
+        #[cfg(test)]
+        if LATCHED_SKIPS_CAPABILITY_REPUBLISH {
+            return;
+        }
+        let instance_id = self.write_ledger.instance_id().to_string();
+        self.publish_readiness(&instance_id, (false, false, None))
+            .await;
+    }
+
+    /// Write this instance's `.ready` record from `readiness` plus the live incompleteness count.
+    ///
+    /// One small atomic write, on the blocking pool with the other `std::fs` work here.
+    ///
+    /// Returns the evaluating instance's [`crate::staged_authority::CurrentReadiness`]: the figures
+    /// just published, which the verdict reads both rotations from (design § 16.6.6 B10.2). They
+    /// are returned whether or not the write landed, because they are this call's read of the
+    /// volume either way.
+    async fn publish_readiness(
+        &self,
+        instance_id: &str,
+        readiness: (bool, bool, Option<u64>),
+    ) -> crate::staged_authority::CurrentReadiness {
+        let (rotation_complete, repair_rotation_complete, repair_stalest_age_secs) = readiness;
+        let cache_dir = self.cache_dir.clone();
+        let current = crate::staged_authority::CurrentReadiness {
+            instance_id: instance_id.to_string(),
+            rotation_complete,
+            repair_rotation_complete,
+            // Read here, at publication, and never cached: a per-process counter, not volume
+            // evidence.
+            fold_incomplete_total: crate::staged_fold::fold_incomplete_total(),
+        };
+        let fold_incomplete_total = current.fold_incomplete_total;
+        let instance_id = instance_id.to_string();
+        let published = tokio::task::spawn_blocking(move || {
+            crate::staged_authority::publish_ready_record(
+                &cache_dir,
+                &instance_id,
+                rotation_complete,
+                fold_incomplete_total,
+                repair_rotation_complete,
+                repair_stalest_age_secs,
+            )
+        })
+        .await;
+        match published {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("Could not publish the staged-authority ready record: {}", e),
+            Err(e) => debug!(
+                "Staged-authority ready record publication did not complete: {}",
+                e
+            ),
+        }
+        current
+    }
+
+    /// [`crate::staged_authority::activation_assessment_current`], on the blocking pool: it
+    /// lists `ready/`, reads every record, and may list and `stat` the ledger files, all with
+    /// `std::fs`. A failed task blocks, as an unreadable record does, and examines no holder.
+    ///
+    /// `current` is this call's read, from [`Self::publish_readiness`]: both rotations are
+    /// evaluated against it alone (design § 16.6.6 B10.2).
+    async fn activation_assessment_blocking(
+        &self,
+        ledger_instances: &std::collections::BTreeSet<String>,
+        current: &crate::staged_authority::CurrentReadiness,
+    ) -> crate::staged_authority::ActivationAssessment {
+        let cache_dir = self.cache_dir.clone();
+        let ledger_instances = ledger_instances.clone();
+        let current = current.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::staged_authority::activation_assessment_current(
+                &cache_dir,
+                &ledger_instances,
+                &current,
+            )
+        })
+        .await
+        .unwrap_or(crate::staged_authority::ActivationAssessment {
+            verdict: crate::staged_authority::ActivationVerdict::Blocked(
+                crate::staged_authority::ActivationBlocker::ReadyRecordsUnreadable,
+            ),
+            holders: None,
+        })
+    }
+
+    /// Publish this instance's readiness, run `Foreign_Write_Detection`, and activate the
+    /// staged authority epoch when the fleet's evidence permits it.
+    ///
+    /// # The caller MUST hold the global consolidation lock
+    ///
+    /// § 16.6.6 requires it for the activation write, because activation is a two-document
+    /// transaction — the epoch document, and the `Schema_Fence` bump on `size_state.json` —
+    /// and two atomic renames cannot be made one. `run_consolidation_cycle` is the only
+    /// caller and holds the lock across this call.
+    ///
+    /// # Why activation is automatic rather than an operator action
+    ///
+    /// Because the gate is **evidence** and not a judgement. § 16.6.6's preconditions are
+    /// each a statement about observable shared state, and the load-bearing one — every
+    /// instance with a ledger file has published a `.ready` record — is a check a pre-C
+    /// binary structurally cannot pass, since appending a staged credit is what creates its
+    /// ledger file. An operator asked to confirm activation would be confirming exactly the
+    /// facts this code already checks, and would be doing it from the same three documents.
+    ///
+    /// What is deliberately NOT automatic is the reverse. Once activated, rollback needs a
+    /// full fleet stop and two manual steps; see [`crate::staged_authority`]'s module doc.
+    ///
+    /// Everything here is best-effort: a failure logs and leaves the epoch where it was,
+    /// which is Phase L, which is the incumbent's behaviour.
+    async fn maintain_staged_authority(&self) {
+        use crate::staged_authority::{self, ActivationVerdict};
+
+        let instance_id = self.write_ledger.instance_id().to_string();
+
+        // `Foreign_Write_Detection`, first, because its result gates the fold and the fold
+        // may already have run this cycle. Only meaningful after activation: before it,
+        // Phase L's whole point is that pre-C and C-capable binaries share one authority, so
+        // a `size_state.json` in the legacy shape is expected rather than foreign.
+        //
+        // # Three outcomes, not one, and the fence is RE-APPLIED here
+        //
+        // A `size_state.json` without the fence has three possible causes and they used to
+        // produce one message accusing a pre-C binary:
+        //
+        //   1. the document could not be read — `get_size_state` swallowed that into
+        //      `SizeState::default()`, which carries schema 0 / epoch 0 and so *is* the pre-C
+        //      shape. `load_size_state` is used directly here so the error is visible instead;
+        //   2. **our own fence bump never landed.** The activation flip writes the epoch document
+        //      and then bumps the fence, and the bump can fail (lock timeout, I/O). The epoch is
+        //      then 1 with schema 0 forever, because this function returns below as soon as the
+        //      epoch is latched, so the bump block is never reached again. The WARN at the
+        //      activation site promised "a later cycle re-applies it" and nothing did;
+        //   3. a genuine second writer.
+        //
+        // Content cannot separate (2) from (3) — both are a document lacking the fence. Behaviour
+        // can only partly: re-apply the fence, then re-read. If it sticks, either it was ours and
+        // unapplied or a pre-C consolidation cycle rewrote it between our writes; the two look
+        // the same. If it does not stick, something is writing the document between the bump
+        // and the re-read.
+        //
+        // Re-applying unconditionally is safe: it is idempotent and it is the value this volume
+        // should carry. It does NOT expose a pre-C writer: a pre-C consolidation cycle writes
+        // under the same global lock, so the re-read below always passes and the INFO branch
+        // takes it.
+        if staged_authority::fold_authority_active_latched(&self.cache_dir) {
+            match self.load_size_state().await {
+                Err(e) => staged_authority::record_authority_block(
+                    &self.cache_dir,
+                    staged_authority::AuthorityBlockKind::SizeStateUnreadable,
+                    &format!("load failed: {e}"),
+                ),
+                Ok(state)
+                    if staged_authority::detect_foreign_size_state(
+                        state.schema,
+                        state.staged_authority_epoch,
+                    ) =>
+                {
+                    match self.bump_size_state_schema_fence().await {
+                        Ok(()) => match self.load_size_state().await {
+                            Ok(after)
+                                if !staged_authority::detect_foreign_size_state(
+                                    after.schema,
+                                    after.staged_authority_epoch,
+                                ) =>
+                            {
+                                staged_authority::clear_authority_block(&self.cache_dir);
+                                info!(
+                                    observed_schema = state.schema,
+                                    observed_epoch = state.staged_authority_epoch,
+                                    "Re-applied the size_state.json Schema_Fence: the epoch was \
+                                     active but the document did not carry the fence, and the \
+                                     re-application stuck. Either this instance's own \
+                                     activation bump had not landed, or a binary older than \
+                                     3.0.0 rewrote the document on its consolidation cycle; \
+                                     the two look the same here."
+                                );
+                            }
+                            Ok(after) => staged_authority::record_authority_block(
+                                &self.cache_dir,
+                                staged_authority::AuthorityBlockKind::ForeignPreCWrite,
+                                &format!(
+                                    "schema {} epoch {} persisted through a successful fence \
+                                     re-application",
+                                    after.schema, after.staged_authority_epoch
+                                ),
+                            ),
+                            Err(e) => staged_authority::record_authority_block(
+                                &self.cache_dir,
+                                staged_authority::AuthorityBlockKind::SizeStateUnreadable,
+                                &format!("re-read after the fence bump failed: {e}"),
+                            ),
+                        },
+                        Err(e) => staged_authority::record_authority_block(
+                            &self.cache_dir,
+                            staged_authority::AuthorityBlockKind::FenceReapplyFailed,
+                            &format!("fence re-application failed: {e}"),
+                        ),
+                    }
+                }
+                Ok(_) => staged_authority::clear_authority_block(&self.cache_dir),
+            }
+        }
+
+        // Once the epoch is latched the readiness predicates have no consumer, but the record
+        // still has one. `staged_authority::read_ready_records` has two production callers: the
+        // activation gate (`activation_assessment_current` -> `assess`), which this function no
+        // longer reaches once latched and which returns `AlreadyActive` before reading any
+        // record once the volume's epoch document says Phase Fold; and the DR-EVICT capability gate
+        // (`eviction_worklist::fleet_is_worklist_capable`), which requires every journal-bearing
+        // instance's record to be no older than `CAPABILITY_WINDOW_SECS`. So the O(shards)
+        // readiness read is still skipped, and a lightweight record is republished in its place:
+        // both rotation flags `false` and no repair age (the startup record's shape), with the
+        // live `fold_incomplete_total`. The `false` flags block nobody, because under B10.2 a
+        // peer's rotation flags are not consulted; a peer still holding a stale Phase L latch
+        // reaches `activate`, which returns `Ok(false)` on the Phase Fold document. Without the
+        // republication every record ages past the window at steady state and the gate reads
+        // `NotCapable` forever.
+        //
+        // The republication itself runs in `run_consolidation_cycle` ABOVE the consolidation
+        // lock, on every non-idle cycle whether latched or not, not here: this function runs only
+        // on cycles that win the lock.
+        if staged_authority::fold_authority_active_latched(&self.cache_dir) {
+            #[cfg(test)]
+            if LATCHED_REPUBLISH_UNDER_LOCK {
+                self.publish_lightweight_ready_record().await;
+            }
             return;
         }
 
-        let entries = match self.write_ledger.read_merged_oldest_first(0).await {
-            Ok(e) => e,
+        // Readiness. Republished every cycle rather than written once, so it always describes
+        // current state: a stale assertion of readiness from an instance that has since
+        // started failing folds would be worse than no record at all. The volume-derived
+        // figures come from a `ReadinessMemo` — see its doc for why a cached value cannot
+        // activate the epoch; `fold_incomplete_total` is a live process counter and is read
+        // fresh every time.
+        let Some((readiness, read_this_call)) = self.current_readiness().await else {
+            return;
+        };
+        let mut current = self.publish_readiness(&instance_id, readiness).await;
+
+        // `ledger_instances` is an `async fn` whose body is synchronous `std::fs` (a readdir per
+        // ledger shard directory), so it is driven on the blocking pool. `Handle::block_on` is
+        // permitted there, and keeps working if the body ever gains a real `.await`.
+        let write_ledger = Arc::clone(&self.write_ledger);
+        let listed = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(write_ledger.ledger_instances())
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(ProxyError::CacheError(format!(
+                "ledger instance listing did not complete: {e}"
+            )))
+        });
+        let ledger_instances = match listed {
+            Ok(set) => set,
             Err(e) => {
-                warn!("Write-ledger compaction: failed to read ledger: {}", e);
+                // Cannot enumerate the participants, so cannot show the correspondence holds.
+                debug!(
+                    "Activation gate: could not list ledger instances ({}), staying in Phase L",
+                    e
+                );
                 return;
             }
         };
-        if entries.is_empty() {
+        // # Never evaluate activation while this instance's own fold or repair is in flight
+        //
+        // The record just published carries this instance's LAST COMPLETED passes. When the
+        // passes ran inline, a pass that was about to retain (bumping `fold_incomplete_total`)
+        // or that was about to install always landed in the record before this instance's own
+        // verdict. Off the cycle, a pass can be mid-flight here. Peers' records already lag
+        // their in-flight passes, so this is not a new interleaving fleet-wide, but it would be
+        // a new one for this instance, and the cost of keeping it is only that activation — a
+        // one-time event — waits for the pass to land. Publication above is not held back: a
+        // peer reading this record gets what it always could. Phase L continues meanwhile,
+        // which is the incumbent's behaviour. The `st_size` fold is not checked: nothing it
+        // writes is an activation input.
+        if self.readiness_pass_in_flight() {
+            debug!(
+                "Activation gate: this instance's staged fold or ledger repair is in flight, so \
+                 the verdict waits for its outcome (Phase L continues)"
+            );
             return;
         }
-
-        let candidates = crate::write_ledger::WriteLedger::group_by_key(entries);
-        // Named as removals rather than as a retain set, so an entry appended after the
-        // read above is not deleted for the sole reason that this pass did not see it.
-        // The read here is unbounded (`cap = 0`), so this pass never had the
-        // beyond-the-cap exposure the eviction pass did — but it has the same
-        // read-then-rewrite window, and it is a long one: there is a `.meta` read per
-        // candidate between the read and the rewrite. Task 77.
-        let mut retire: HashSet<(String, u64, u64, SystemTime, String)> = HashSet::new();
-        let mut dropped_by_reason: HashMap<&'static str, u64> = HashMap::new();
-
-        for candidate in &candidates {
-            match crate::write_ledger::verify_staged_candidate(&self.cache_dir, candidate).await {
-                StagedCandidateVerdict::Evictable | StagedCandidateVerdict::Unreadable => {
-                    // Still staged, or its `.meta` could not be read — one failed read
-                    // on shared storage is not evidence an object is gone. Keep it by
-                    // not naming it.
+        // Both rotations are evaluated against `current`, this call's read, and against no other
+        // record's flags (design § 16.6.6 B10.2); the re-read below is what makes that read
+        // current when it came from the memo.
+        let mut assessment = self
+            .activation_assessment_blocking(&ledger_instances, &current)
+            .await;
+        if matches!(assessment.verdict, ActivationVerdict::Permitted) && !read_this_call {
+            // Never activate on cached evidence. Re-read the volume, republish this instance's
+            // record from the fresh read, and evaluate the verdict again: a shard that appeared,
+            // or a document that went unreadable, since the memo was read now blocks here
+            // exactly as it would have without the memo.
+            self.invalidate_readiness_memo();
+            let Some((fresh, _)) = self.current_readiness().await else {
+                return;
+            };
+            current = self.publish_readiness(&instance_id, fresh).await;
+            assessment = self
+                .activation_assessment_blocking(&ledger_instances, &current)
+                .await;
+        }
+        // INFO when the blocker's label or named instance changes and once per newly holding
+        // id, DEBUG otherwise (below), and the same figures, with the holder count, on
+        // `/metrics`. Records `Permitted` too, which clears the published blocker.
+        let blocker_logged =
+            staged_authority::record_activation_assessment(&self.cache_dir, &assessment);
+        match assessment.verdict {
+            ActivationVerdict::Permitted => {
+                // Fenced: `activation_assessment_blocking` is std::fs on the blocking pool, the
+                // stuck shape the watchdog targets. A cycle that lost the lock there must not
+                // activate on its old evidence without the lock § 16.6.6 requires.
+                if !self.lock_fence_intact() {
+                    warn!(
+                        "Staged authority activation abandoned: this cycle lost the global \
+                         consolidation lock while assessing; the next holder re-assesses"
+                    );
+                    return;
                 }
-                verdict => {
-                    retire.extend(candidate.identities.iter().cloned());
-                    *dropped_by_reason.entry(verdict.reason()).or_insert(0) += 1;
+                match staged_authority::activate(&self.cache_dir, &instance_id) {
+                    Ok(true) => {
+                        // Fenced too. Skipping is safe: the detection block at the top of
+                        // this function re-applies a missing fence on the next cycle.
+                        if !self.lock_fence_intact() {
+                            warn!(
+                                "Staged authority epoch activated but this cycle then lost the \
+                                 global consolidation lock; the Schema_Fence bump is left to \
+                                 the next cycle's re-application"
+                            );
+                            return;
+                        }
+                        // The `Schema_Fence` half of the transaction. Written second and
+                        // under the same lock hold: if it fails, the epoch is already 1 and
+                        // the next cycle's `Foreign_Write_Detection` will observe the
+                        // mismatched `size_state.json` and stall the authority visibly —
+                        // which is the correct outcome for a half-applied activation, and is
+                        // better than an epoch that silently never fenced.
+                        //
+                        // The re-application really does happen now: the detection block at the
+                        // top of this function runs BEFORE the already-latched early return, and
+                        // it re-applies the fence on any post-activation document that lacks it.
+                        // Until that block existed this WARN's promise was false — the early
+                        // return meant no later cycle ever reached this code again.
+                        if let Err(e) = self.bump_size_state_schema_fence().await {
+                            warn!(
+                                "Staged authority epoch activated but the size_state.json \
+                                 Schema_Fence bump failed: {}. The epoch is 1 and the document \
+                                 does not carry the fence, so the fold will REFUSE to install and \
+                                 the published figure will go stale visibly \
+                                 (staged_shard_authority_age_secs rises). Every subsequent \
+                                 consolidation cycle re-applies the fence and clears the refusal \
+                                 once it sticks, so a transient lock timeout or I/O error needs no \
+                                 operator action. If the refusal persists, look at \
+                                 staged_fold_incomplete_total's reason label: \
+                                 `schema_fence_unapplied` means the size_state lock or the volume \
+                                 is unavailable and this is still self-inflicted; \
+                                 `foreign_authority_write` means the fence was re-applied \
+                                 successfully and something overwrote it anyway, which is the only \
+                                 case implicating a pre-C binary and the only one for which \
+                                 docs/UPGRADING.md's fleet-stop rollback applies.",
+                                e
+                            );
+                        }
+                        info!(
+                            instance_id = %instance_id,
+                            "Activated the staged authority epoch: every activation \
+                             precondition of design § 16.6.6 was observed to hold. The \
+                             fold-derived staged figure is now the authority, Graduation \
+                             entries become cleanup-only no-ops, and ROLLBACK TO A PRE-C \
+                             BINARY IS NO LONGER SUPPORTED without a full fleet stop — see \
+                             docs/UPGRADING.md. Expect a one-time step in write_cache_size \
+                             to the fold-derived figure. It can go up or down: the difference \
+                             is the incumbent counter's accumulated error, not data loss and \
+                             not new data."
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => warn!("Failed to write the staged authority epoch: {}", e),
+                }
+            }
+            ActivationVerdict::Blocked(blocker) => {
+                if !blocker_logged {
+                    debug!(
+                        reason = blocker.label(),
+                        blocking_instance = blocker.instance().unwrap_or("none"),
+                        "Staged authority epoch not activated yet (Phase L continues, the \
+                         incumbent counter remains the authority)"
+                    );
                 }
             }
         }
+    }
 
-        match self.write_ledger.retire_identities(&retire).await {
-            Ok(stats) if stats.entries_dropped() > 0 => {
-                info!(
-                    "Write-ledger compaction: dropped {} entries across {} objects, {} retained, reasons={:?}",
-                    stats.entries_dropped(),
-                    dropped_by_reason.values().sum::<u64>(),
-                    stats.entries_after,
-                    dropped_by_reason
-                );
-            }
-            Ok(_) => {}
-            Err(e) => warn!("Write-ledger compaction failed: {}", e),
+    /// Write the `Schema_Fence` and the mirrored epoch into `size_state.json`.
+    ///
+    /// Under `size_state.lock`, like every other mutation of that file, so it cannot lose a
+    /// concurrent delta application. Reuses the existing read-modify-write rather than adding
+    /// a third writer of the document.
+    async fn bump_size_state_schema_fence(&self) -> Result<()> {
+        use crate::staged_authority::{EPOCH_FOLD, SIZE_STATE_SCHEMA_FOLD};
+
+        match self
+            .with_size_state_locked("Schema_Fence bump", SIZE_STATE_LOCK_TIMEOUT, |file| {
+                let mut state = file.load()?;
+                state.schema = SIZE_STATE_SCHEMA_FOLD;
+                state.staged_authority_epoch = EPOCH_FOLD;
+                file.persist(&state)
+            })
+            .await
+        {
+            Ok(persisted) => persisted,
+            Err(_) => Err(ProxyError::CacheError(
+                "Size state lock unavailable for the Schema_Fence bump".to_string(),
+            )),
         }
     }
 
     /// Check if eviction is needed and trigger it via CacheManager
     ///
-    /// Called at the end of each consolidation cycle.
+    /// Called by the consolidation-lock winner while its key loop runs
+    /// ([`Self::inloop_eviction_check`]) and once more after it, and by
+    /// `maybe_evict_on_idle_cycle` on an idle cycle.
     ///
     /// Returns whether an eviction pass was **spawned**, not how much it freed. The pass
     /// is a detached task (v1.1.35) precisely so the cycle does not wait for it, so no
@@ -2315,18 +7523,31 @@ impl JournalConsolidator {
     ///
     /// # Arguments
     ///
-    /// * `known_size` - Optional pre-fetched current size to avoid extra NFS read.
-    ///   If None, will read from disk.
+    /// * `known_size` - Optional pre-fetched size to avoid an extra shared-storage read. Every
+    ///   caller on a cycle that can have pending delta files passes the PROJECTED figure
+    ///   ([`Self::get_projected_size`]): `size_state.total_size` alone omits every delta flushed
+    ///   since this cycle's `collect_deltas`, which under a journal backlog is a cycle's worth
+    ///   of writes, and the trigger fired that much late. `maybe_evict_on_idle_cycle` passes
+    ///   `total_size` because an idle cycle is one with no pending delta file anywhere. `None`
+    ///   reads `size_state` from disk, and is used only where no delta can be pending.
     async fn maybe_trigger_eviction(&self, known_size: Option<u64>) -> bool {
         // Check if max_cache_size is configured (0 means disabled)
         if self.config.max_cache_size == 0 {
             return false;
         }
 
-        // Use provided size or read from disk
+        // Use provided size or read from disk.
+        //
+        // `unwrap_or(0)` flattens the UNREADABLE sentinel to the permissive value, which is
+        // the deliberate fail-open posture (R7.5) and is exactly the pre-existing behaviour:
+        // `0` is below `trigger_threshold`, so the comparison below returns false and
+        // eviction does not fire. The distinction is not acted on here — it is logged at
+        // `warn!` inside the getter, where the read actually failed. Do NOT "fix" this by
+        // making eviction fire on an unreadable read; that is a posture change, not a bug
+        // fix. See `get_current_size`.
         let current_size = match known_size {
             Some(size) => size,
-            None => self.get_current_size().await,
+            None => self.get_current_size().await.unwrap_or(0),
         };
 
         // Calculate trigger threshold using configurable percentage
@@ -2349,6 +7570,10 @@ impl JournalConsolidator {
             debug!("Eviction already in progress, skipping");
             return false;
         }
+        // Past the threshold and past the guard: this call is the one that spawns. Counted here
+        // rather than at the `tokio::spawn` below so the count is of the decision, which is what
+        // the in-loop check's cadence is measured in.
+        self.eviction_trigger_fires.fetch_add(1, Ordering::Relaxed);
 
         // Get cache manager reference — reset guard on failure paths
         let cache_manager = {
@@ -2416,6 +7641,479 @@ impl JournalConsolidator {
         true
     }
 
+    /// The idle cycle's byte and staging-byte eviction check. Returns whether a byte eviction
+    /// pass was spawned, and the `total_size` read (0 when no read was made).
+    ///
+    /// An idle cycle has no pending delta or journal anywhere, but `total_size` can still be
+    /// over the trigger: an absolute install (validation scan, census) raised it, or an
+    /// eviction pass freed nothing because the eviction lock was held. Enforcement does not
+    /// wait for traffic.
+    ///
+    /// # Cost under the trigger
+    ///
+    /// At most one size read per [`IDLE_EVICTION_MEMO_TTL`]: an under-trigger verdict is
+    /// memoised, and every non-idle cycle clears the memo because it reads the size itself. No
+    /// lock is taken. An eviction already in progress here costs nothing. The read is
+    /// [`Self::get_projected_size`]'s, so it also lists the delta directory -- which on an idle
+    /// cycle is the directory the idle predicate has just found empty.
+    ///
+    /// # The winner role
+    ///
+    /// Only the consolidation-lock winner spawns byte eviction, idle or not. An idle cycle
+    /// takes the consolidation lock only when the read says a trigger is over, so the idle
+    /// fleet's lock traffic stays zero under the trigger. Over it, one instance wins and
+    /// spawns; the others skip, as on a non-idle cycle. The pass itself takes the global
+    /// eviction lock.
+    async fn maybe_evict_on_idle_cycle(&self) -> (bool, u64) {
+        if self.config.max_cache_size == 0 && self.staging_byte_trigger().is_none() {
+            return (false, 0);
+        }
+        if self.eviction_in_progress.load(Ordering::SeqCst) {
+            return (false, 0);
+        }
+        if let Ok(memo) = self.idle_eviction_memo.lock() {
+            if memo.is_some_and(|at| at.elapsed() < IDLE_EVICTION_MEMO_TTL) {
+                return (false, 0);
+            }
+        }
+        self.idle_eviction_reads.fetch_add(1, Ordering::Relaxed);
+        // Fail open on an unreadable document (R7.5), as `maybe_trigger_eviction` does.
+        let (total_size, write_cache_size) = match self.load_size_state().await {
+            Ok(s) => (s.total_size, s.write_cache_size),
+            Err(_) => (0, 0),
+        };
+        // The PROJECTED figure decides, as at every other trigger site since the change: `size_state`
+        // omits every delta file flushed since the last consolidation-lock winner collected one,
+        // so on this path it omits a peer's debit or credit that landed in the window between
+        // the idle predicate and this read. `size_state` stays the figure reported and returned,
+        // which is what the completion line and the caller's log read. An unreadable projection
+        // falls back to the figure already read, keeping the fail-open posture.
+        let trigger_size = self.get_projected_size().await.unwrap_or(total_size);
+        let bytes_over = self.read_tier_over_trigger(trigger_size);
+        if !bytes_over {
+            // Under the trigger: clear the memo here too, since the gated call below is
+            // short-circuited away. See [`Self::clear_read_tier_barren`].
+            self.clear_read_tier_barren();
+        }
+        let staging_over = self
+            .staging_byte_trigger()
+            .is_some_and(|trigger| write_cache_size > trigger);
+        if !bytes_over && !staging_over {
+            if let Ok(mut memo) = self.idle_eviction_memo.lock() {
+                *memo = Some(std::time::Instant::now());
+            }
+            return (false, total_size);
+        }
+        let token = match self.try_acquire_cycle_lock() {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                debug!("Idle cycle over an eviction trigger; another instance holds the lock");
+                return (false, total_size);
+            }
+            Err(e) => {
+                warn!("Idle cycle: failed to acquire consolidation lock: {}", e);
+                return (false, total_size);
+            }
+        };
+        let _lock_guard = scopeguard::guard(token, |token| {
+            self.release_consolidation_lock(token);
+        });
+        let eviction_triggered =
+            bytes_over && self.maybe_trigger_eviction_gated(Some(trigger_size)).await;
+        if staging_over {
+            self.maybe_trigger_staging_eviction().await;
+        }
+        if eviction_triggered {
+            info!(
+                "Idle consolidation cycle over the byte eviction trigger: total_cache_size={}, eviction_triggered=true",
+                total_size
+            );
+        }
+        (eviction_triggered, total_size)
+    }
+
+    /// The longest a barren read-tier author tick may hold the next one off.
+    ///
+    /// [`INLOOP_TRIGGER_BARREN_INTERVALS`] consolidation intervals, the window shipped for
+    /// the in-loop site, capped at [`crate::config::EVICTION_WORKLIST_LEASE_MIN_SECS`] so a
+    /// fleet running a long interval still never waits longer than one chunk lease. That
+    /// constant is the floor every configured lease is raised to
+    /// (`eviction_worklist::executor_budget` takes `max(configured, floor)`), so the cap holds
+    /// whatever `cache.shared_storage.eviction_worklist_lease` says.
+    ///
+    /// It is a ceiling, not a cadence: the suppression normally ends on evidence, when
+    /// [`Self::read_tier_author_progress`] moves. The ceiling has to be SHORT rather than
+    /// merely finite, because that evidence is this process's own work and a generation every
+    /// chunk of which a peer claimed and closed moves none of it: a claim a live peer lease
+    /// refuses is counted as `chunks_claim_busy`, and a chunk already closed when this executor
+    /// looks returns before any done-marker publish. On a fleet where the peers drain, this
+    /// ceiling and not the drain is what ends the suppression, so at the 5 s default it holds
+    /// the next tick off for 10 s against a generation period measured at about 33 s on FSx for
+    /// NetApp ONTAP, rather than for the 760 s a lease would.
+    fn read_tier_barren_ceiling(&self) -> Duration {
+        (self.config.interval * INLOOP_TRIGGER_BARREN_INTERVALS).min(Duration::from_secs(
+            crate::config::EVICTION_WORKLIST_LEASE_MIN_SECS,
+        ))
+    }
+
+    /// What a productive read-tier author tick moves: a generation document written, a legacy
+    /// pass run because the capability gate read `NotCapable` or `Unknown`, or a chunk of the
+    /// generation the author is waiting on closed by this process's executor.
+    ///
+    /// The sum of four monotonic counters, so "differs from the last reading" is "something
+    /// happened". Each is load-bearing:
+    ///
+    /// `chunks_authored`: the productive tick counted.
+    /// - the two fallbacks: on a fleet where one proxy is older, every tick runs the legacy
+    ///   pass, which evicts but writes no generation document, so a predicate watching only
+    ///   `chunks_authored` would read every one of those passes as barren.
+    /// - `chunks_done`: the DRAIN, and the reason a tick is held off in the first place. A
+    ///   barren tick found the live generation unfinished, and nothing can make the next tick
+    ///   productive except that generation finishing -- which moves `chunks_done`,
+    ///   `items_executed` and `chunks_claimed` in the executor and none of the other three
+    ///   here. Without it the only way out of the suppression was the ceiling, which is how a
+    ///   measured 33 s generation period became one author pass per ceiling.
+    ///
+    /// It counts this process's executor, so a generation drained entirely by peers moves
+    /// nothing here; that case is bounded by [`Self::read_tier_barren_ceiling`], which is why
+    /// the ceiling is a short timer rather than a lease.
+    ///
+    /// Process-local: one `BTreeMap` lookup, no volume I/O.
+    fn read_tier_author_progress(&self) -> u64 {
+        let counters = crate::eviction_worklist::counters(&self.cache_dir);
+        counters.chunks_authored
+            + counters.author_fallback_not_capable
+            + counters.author_fallback_unknown
+            + counters.chunks_done
+    }
+
+    /// Whether a read-tier author tick is due, or is being held off after a barren one.
+    ///
+    /// Costs one process-local mutex and, while a spawn is outstanding, one
+    /// [`crate::eviction_worklist::counters`] read -- a `BTreeMap` lookup, no volume I/O. That
+    /// cheapness is the point: the thing being suppressed is the 0.4 to 3.3 s of done-marker
+    /// reads a barren tick pays.
+    ///
+    /// The clearing predicate is [`Self::read_tier_author_progress`] moving: the earlier
+    /// `chunks_authored` plus the two legacy-pass fallbacks. Deliberately not a done-marker
+    /// count -- that is the read the suppression exists to avoid, so observing it to decide
+    /// whether to skip the observation would cost what it saves.
+    ///
+    /// # The ceiling, and why there is one
+    ///
+    /// Progress is the normal way out and the earlier semantics are kept exactly: while the last
+    /// tick did nothing, the next one is held off, not merely delayed by a fixed window. What is
+    /// new is that this memo outlives the cycle, so a state that never makes progress would
+    /// suppress for the life of the process rather than until the end of the cycle.
+    /// [`Self::read_tier_barren_ceiling`] bounds it: once a tick has been held off for a whole
+    /// chunk lease, one is let through and the ceiling starts again.
+    ///
+    /// # Side effect: call this once per trigger evaluation
+    ///
+    /// A call that lets a tick through restarts the ceiling, so calling it twice for one
+    /// evaluation would suppress the tick the first call admitted. Every site calls it once.
+    fn read_tier_author_due(&self, now: tokio::time::Instant) -> bool {
+        let mut memo = self
+            .read_tier_barren
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(progress) = memo.progress_at_last_spawn else {
+            // No spawn outstanding: nothing has been observed to be barren.
+            return true;
+        };
+        if self.read_tier_author_progress() != progress {
+            // The last tick authored a generation or ran the legacy pass. The memo has nothing
+            // to say about a productive tick.
+            memo.barren_since = None;
+            return true;
+        }
+        match memo.barren_since {
+            // First observation that the last tick did nothing.
+            None => {
+                memo.barren_since = Some(now);
+                false
+            }
+            // Still inside the ceiling.
+            Some(since) if now.duration_since(since) < self.read_tier_barren_ceiling() => false,
+            // Held off for a whole lease with nothing moving. Let this tick through and start
+            // the ceiling again, so a memo can never be the reason a process stops evicting.
+            Some(_) => {
+                memo.barren_since = Some(now);
+                true
+            }
+        }
+    }
+
+    /// Record a trigger evaluation that decided to spawn a read-tier pass: the next evaluation
+    /// compares [`Self::read_tier_author_progress`] against `progress_before` to see whether the
+    /// pass did anything.
+    fn note_read_tier_spawn(&self, progress_before: u64) {
+        let mut memo = self
+            .read_tier_barren
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        memo.progress_at_last_spawn = Some(progress_before);
+        memo.barren_since = None;
+    }
+
+    /// Forget the memo: the next read-tier author tick is due whatever the last one did.
+    ///
+    /// Called wherever the byte comparison comes out UNDER the trigger. No tick is being
+    /// suppressed in that state, and a memo left set holds the first tick after the cache
+    /// re-crosses its trigger off for the remainder of [`Self::read_tier_barren_ceiling`] --
+    /// a cache that drops below its trigger and comes back has a pass to author, not to wait
+    /// for.
+    fn clear_read_tier_barren(&self) {
+        let mut memo = self
+            .read_tier_barren
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *memo = ReadTierBarrenMemo::default();
+    }
+
+    /// Whether `size` is over the byte eviction trigger: the comparison
+    /// [`Self::maybe_trigger_eviction`] makes, so a call site can tell a tick it suppressed
+    /// from one that would have decided nothing anyway. `false` when the trigger is disabled.
+    /// No I/O.
+    fn read_tier_over_trigger(&self, size: u64) -> bool {
+        self.config.max_cache_size != 0 && {
+            let trigger_threshold = (self.config.max_cache_size as f64
+                * (self.config.eviction_trigger_percent as f64 / 100.0))
+                as u64;
+            size > trigger_threshold
+        }
+    }
+
+    /// [`Self::maybe_trigger_eviction`] behind the barren memo: what every read-tier trigger
+    /// site outside the key loop calls.
+    ///
+    /// The in-loop site does NOT come through here: it consults
+    /// [`Self::read_tier_author_due`] itself, earlier, because it must decide whether to read
+    /// the projected figure at all, and that check is the one evaluation's single call.
+    ///
+    /// Keys off the DECISION rather than the return value, as the earlier gate does:
+    /// `maybe_trigger_eviction` returns `false` when no cache manager is wired even though it
+    /// passed the threshold and the guard, and the back-off is about what the spawned pass costs.
+    async fn maybe_trigger_eviction_gated(&self, trigger_size: Option<u64>) -> bool {
+        // Under the trigger: no pass would run, so this call has nothing to suppress. Clear the
+        // memo rather than consult it (see [`Self::clear_read_tier_barren`]) and return what
+        // `maybe_trigger_eviction`'s own threshold comparison would.
+        if trigger_size.is_some_and(|size| !self.read_tier_over_trigger(size)) {
+            self.clear_read_tier_barren();
+            return false;
+        }
+        if !self.read_tier_author_due(tokio::time::Instant::now()) {
+            debug!(
+                "[DISK_CACHE_EVICTION] Read-tier author tick held off: the last pass authored no \
+                 generation, and re-reading every chunk's done-marker would cost the volume the \
+                 executors are draining"
+            );
+            return false;
+        }
+        let progress_before = self.read_tier_author_progress();
+        let fires_before = self.eviction_trigger_fires.load(Ordering::Relaxed);
+        let triggered = self.maybe_trigger_eviction(trigger_size).await;
+        if self.eviction_trigger_fires.load(Ordering::Relaxed) != fires_before {
+            self.note_read_tier_spawn(progress_before);
+        }
+        triggered
+    }
+
+    /// The staging tier's byte trigger, or `None` when no cache manager is wired or the tier
+    /// has no byte bound. No I/O.
+    fn staging_byte_trigger(&self) -> Option<u64> {
+        let cm = self
+            .cache_manager
+            .lock()
+            .ok()?
+            .as_ref()
+            .and_then(|w| w.upgrade())?;
+        let (trigger, _target) = cm.get_staging_eviction_thresholds();
+        (trigger != 0).then_some(trigger)
+    }
+
+    /// Whether a staging eviction pass of this process is already running. `false` when no cache
+    /// manager is wired, which is also the answer that costs nothing: the in-loop check then
+    /// finds no trigger either. No I/O.
+    fn staging_eviction_in_flight(&self) -> bool {
+        self.cache_manager
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|w| w.upgrade()))
+            .is_some_and(|cm| cm.staging_eviction_in_progress())
+    }
+
+    /// The staging tier's cumulative freed-bytes counter, or `None` when no cache manager is
+    /// wired. In-process: one lock and one atomic load, no volume I/O.
+    async fn staging_eviction_bytes_total(&self) -> Option<u64> {
+        let cm = self
+            .cache_manager
+            .lock()
+            .ok()?
+            .as_ref()
+            .and_then(|w| w.upgrade())?;
+        Some(cm.get_write_cache_eviction_counters().await.1)
+    }
+
+    /// Trigger evaluations that decided to spawn a pass. See `eviction_trigger_fires`.
+    #[cfg(test)]
+    pub(crate) fn eviction_trigger_fires(&self) -> u64 {
+        self.eviction_trigger_fires.load(Ordering::Relaxed)
+    }
+
+    /// Projected-size reads the in-loop eviction check has made.
+    #[cfg(test)]
+    pub(crate) fn inloop_projected_reads(&self) -> u64 {
+        self.inloop_projected_reads.load(Ordering::Relaxed)
+    }
+
+    /// Staging-tier nudges this process has made. See `staging_trigger_nudges`.
+    #[cfg(test)]
+    pub(crate) fn staging_trigger_nudges(&self) -> u64 {
+        self.staging_trigger_nudges.load(Ordering::Relaxed)
+    }
+
+    /// One evaluation of all three capacity triggers, made WHILE
+    /// [`Self::run_consolidation_cycle`] is still processing keys. Returns whether a read-tier
+    /// pass was spawned, and the instant at which the next check is due.
+    ///
+    /// # Why the cycle checks more than once
+    ///
+    /// Under a journal backlog every cycle runs to `consolidation_cycle_timeout` (30 s by
+    /// default), so the end-of-cycle check put the only non-idle trigger evaluation about 31 s
+    /// apart while an eviction generation authored and drained in 5 to 11 s: the work list was
+    /// idle for about half of every window, with the cache over its trigger throughout
+    /// (measured on FSx for NetApp ONTAP). All three tiers were on that cadence: the read tier
+    /// and the staging tier at the end of the loop.
+    ///
+    /// # What the check costs the key loop, which is not nothing
+    ///
+    /// The key futures are plain async blocks in a `buffer_unordered` stream, never spawned, so
+    /// they are polled only while the loop polls the stream. This check runs on the cycle's own
+    /// task instead, so for as long as it awaits a shared-volume read **none of the in-flight
+    /// keys progress and their per-key timeouts keep running**: a key already near its 2 to 15 s
+    /// budget can be timed out by a check, and a cycle consolidates slightly fewer keys. The
+    /// deadline itself is unchanged, consolidation is off the write path, and the gates below
+    /// make a barren check free, so the cost is bounded by one projected read per interval. It
+    /// is a real cost and not a free ride.
+    ///
+    /// [`Self::maybe_trigger_eviction`], [`crate::cache::CacheManager::nudge_staging_eviction`]
+    /// spawn detached tasks, so no pass is awaited here.
+    ///
+    /// # The read tier: three gates, then the projected figure
+    ///
+    /// 1. `max_cache_size == 0`: the byte trigger is disabled.
+    /// 2. `eviction_in_progress`: a pass of this process is still running, so the
+    ///    compare-exchange in [`Self::maybe_trigger_eviction`] would refuse this one anyway.
+    /// 3. A pass this check spawned has since finished **without authoring a generation**, in
+    ///    which case the next read-tier check waits [`INLOOP_TRIGGER_BARREN_INTERVALS`]
+    ///    intervals instead of one. The gate keys on that observation and on nothing narrower,
+    ///    which is deliberate: an author that deferred behind a generation still in flight read
+    ///    every chunk's done-marker to find out (1.2 to 3.4 s for 200 to 500 chunks on FSx for
+    ///    NetApp ONTAP), and a pass that found the global eviction lock held by a peer, computed
+    ///    a zero shortfall, or ran the legacy pass because the capability gate read `NotCapable`
+    ///    has just as little to gain from being respawned an interval later. Backing off in all
+    ///    four is the behaviour, so the gate is named for the four rather than for one.
+    ///
+    /// Past the gates a check pays one `size_tracking/` listing and the `size_state.json` reads
+    /// of [`Self::projected_sizes`], at most once per interval, shared with the staging tier.
+    ///
+    /// # The staging tier: its own figure, and it lags the same way
+    ///
+    /// The staging check compares the projected `write_cache_size` against
+    /// `CacheManager::get_staging_eviction_thresholds`' trigger. The projection matters here for
+    /// the same reason it does for bytes: `size_state.write_cache_size` omits every
+    /// `write_cache_delta` flushed since this cycle's `collect_deltas`, which under a write
+    /// burst is a cycle's worth of staging. It also omits this cycle's own graduation debits,
+    /// which are applied after the loop, so the in-loop figure reads **high** by that much and
+    /// errs toward nudging a pass that then finds little to evict. Gated on the pass-in-flight
+    /// flag so a barren check costs one atomic load and no read of its own.
+    ///
+    /// # Barren passes: both other tiers back off like gate 3
+    ///
+    /// A gate makes a barren check cheap; nothing else bounds a barren pass. The staging tier
+    /// compares its cumulative freed-bytes counter at the nudge with its value once the pass has
+    /// finished, and waits [`INLOOP_TRIGGER_BARREN_INTERVALS`] intervals after a pass that freed
+    /// nothing.
+    ///
+    /// # The projected figure, not `size_state.total_size`
+    ///
+    /// Re-reading `size_state` inside the loop would re-read one number that cannot move:
+    /// `atomic_update_size_delta_fenced` runs before the loop, the graduation update after it,
+    /// and this process holds the consolidation lock throughout, so every in-loop read would see
+    /// the cycle-start figure. The projected figure adds every delta file flushed since
+    /// `collect_deltas`, which is what a cache crossing its trigger mid-cycle actually moves.
+    ///
+    /// Spec: cache-eviction-at-scale..
+    async fn inloop_eviction_check(
+        &self,
+        state: &mut InloopTriggerState,
+    ) -> (bool, tokio::time::Instant) {
+        let now = tokio::time::Instant::now();
+        let next_due = now + self.config.interval;
+
+        // Which tiers want the projected figures. Both questions are in-process.
+        let read_tier_due = self.config.max_cache_size != 0
+            && !self.eviction_in_progress.load(Ordering::SeqCst)
+            && self.read_tier_author_due(now);
+        // The staging pass this process nudged last has finished: if it freed nothing, the next
+        // nudge waits, the same shape as gate 3. A pass that freed bytes leaves no back-off.
+        if let Some(freed_at_nudge) = state.staging_freed_at_nudge {
+            if !self.staging_eviction_in_flight() {
+                state.staging_freed_at_nudge = None;
+                if self.staging_eviction_bytes_total().await == Some(freed_at_nudge) {
+                    state.staging_check_not_before =
+                        Some(now + self.config.interval * INLOOP_TRIGGER_BARREN_INTERVALS);
+                }
+            }
+        }
+        let staging_window_open = state.staging_check_not_before.is_none_or(|at| now >= at);
+        let staging_trigger = match self.staging_byte_trigger() {
+            Some(trigger) if staging_window_open && !self.staging_eviction_in_flight() => {
+                Some(trigger)
+            }
+            _ => None,
+        };
+        if !read_tier_due && staging_trigger.is_none() {
+            return (false, next_due);
+        }
+
+        // One read for both tiers: `projected_sizes` returns the pair, and reading it twice would
+        // double a check's shared-volume cost for no extra freshness.
+        self.inloop_projected_reads.fetch_add(1, Ordering::Relaxed);
+        let (projected_total, projected_write_cache) =
+            self.projected_sizes().await.unwrap_or((0, 0));
+
+        let mut triggered = false;
+        if read_tier_due {
+            // Under the trigger, as at the gated sites: clear the memo so a cache that
+            // re-crosses authors at once. `maybe_trigger_eviction` makes the same comparison
+            // below and returns false.
+            if !self.read_tier_over_trigger(projected_total) {
+                self.clear_read_tier_barren();
+            }
+            let progress_before = self.read_tier_author_progress();
+            let fires_before = self.eviction_trigger_fires.load(Ordering::Relaxed);
+            triggered = self.maybe_trigger_eviction(Some(projected_total)).await;
+            // Keys off the DECISION, not off the return value: `maybe_trigger_eviction` returns
+            // false when no cache manager is wired even though it passed the threshold and the
+            // guard, and the backoff is about what the spawned pass costs.
+            if self.eviction_trigger_fires.load(Ordering::Relaxed) != fires_before {
+                self.note_read_tier_spawn(progress_before);
+            }
+        }
+        if staging_trigger.is_some_and(|trigger| projected_write_cache > trigger) {
+            let freed_before = self.staging_eviction_bytes_total().await;
+            let nudges_before = self.staging_trigger_nudges.load(Ordering::Relaxed);
+            self.maybe_trigger_staging_eviction().await;
+            if self.staging_trigger_nudges.load(Ordering::Relaxed) != nudges_before {
+                state.staging_freed_at_nudge = freed_before;
+                state.staging_check_not_before = None;
+            }
+        }
+        (triggered, next_due)
+    }
+
     /// Run a complete consolidation cycle
     ///
     /// This method wraps the consolidation logic that was previously in main.rs:
@@ -2438,16 +8136,77 @@ impl JournalConsolidator {
         // This avoids acquiring the global consolidation lock, scanning the journal
         // directory, and reading delta files when the proxy is idle — reducing EFS
         // metadata IOPS from ~90 to near-zero during idle periods.
-        if !self.size_accumulator.has_pending_delta() && !self.has_pending_journal_files() {
+        // Refresh the staged-authority epoch latch FIRST, before anything reads it.
+        //
+        // Every gated site in this workstream reads the latch rather than the document —
+        // `apply_journal_entries` is synchronous and per-entry, and `get_cache_size_stats` is
+        // on the `/metrics` path — so this is the one place that pays the shared-storage
+        // read. Internally rate-limited and permanently latching, so on all but the first few
+        // cycles it is a single relaxed atomic load. § 16.6.6.
+        crate::staged_authority::read_epoch(&self.cache_dir);
+
+        // Convert any legacy flat write-ledger file to the per-shard layout BEFORE the fold
+        // runs, because the fold retains while one exists
+        // (`FoldRetainReason::LegacyLedgerPresent`). Ungated by an interval deliberately: it is
+        // one directory listing when there is nothing to convert, and the thing it unblocks is
+        // the figure's freshness during a rolling deploy.
+        self.write_ledger.migrate_legacy_ledgers().await;
+
+        // The three maintenance passes: the staged fold, the `st_size` fold (the latter's only
+        // production entry point), and the ledger-completeness repair. **Spawned, not awaited.**
+        // Each used to be awaited here, and each gates on a last-run timestamp that is 0 at
+        // process start, so all three ran in the first cycle, and the `st_size` fold is
+        // O(resident range files) with a 30-minute budget: no journal entry was consolidated and
+        // no size delta applied on this instance until it finished. See `MaintenancePasses` and
+        // the investigation record.
+        //
+        // # Position: after the legacy-ledger migration, above both early returns
+        //
+        // - **After `migrate_legacy_ledgers`**, because the staged fold retains while a legacy
+        //   flat ledger exists.
+        // - **Above the idle return**, deliberately: an idle fleet is the one state in which the
+        //   passes would otherwise never run, and their ages would rise forever with nothing
+        //   wrong (§ 16.6.9). The staged-authority figure, the per-shard byte aggregate, and the
+        //   repair rotation all need an idle fleet to keep folding.
+        // - **Above the lock-contention return**, so every instance runs them rather than only
+        //   the lock winner. None of the three takes the global consolidation lock; each
+        //   serialises its own writes per document.
+        //
+        // Every gate is still inside the pass, so on almost every cycle this spawns tasks that
+        // return after a load-and-compare, or spawns nothing because a pass is in flight.
+        self.spawn_maintenance_passes();
+        // This instance's in-progress multipart part bytes, published for the deciding readers on
+        // every proxy so they compose on the last full walk instead of walking themselves. Above
+        // the idle return, because the publication is also what keeps a quiet instance's document
+        // inside its lease, and an instance whose document goes stale puts every decider on the
+        // volume back onto a walk. Writes nothing on a cycle that moved neither the figure nor the
+        // document past its refresh age.
+        self.publish_in_progress_figure().await;
+        // Cheapest first, and short-circuiting: the delta-file listing runs only on a cycle that
+        // would otherwise be idle, so a non-idle cycle pays nothing new, and an idle cycle takes
+        // the global lock only when some instance's delta file is actually waiting, or when a
+        // byte trigger is over.
+        if !self.size_accumulator.has_pending_delta()
+            && !self.has_pending_journal_files()
+            && !self.has_pending_delta_files()
+        {
+            // An idle fleet over a byte trigger is enforced now, not when traffic resumes.
+            // One memoised size read when under; the lock only when over.
+            let (eviction_triggered, current_size) = self.maybe_evict_on_idle_cycle().await;
             return Ok(ConsolidationCycleResult {
                 keys_processed: 0,
                 keys_skipped: 0,
                 entries_consolidated: 0,
                 size_delta: 0,
+                write_cache_delta: 0,
                 cycle_duration: cycle_start.elapsed(),
-                eviction_triggered: false,
-                current_size: 0, // Skip size read when idle
+                eviction_triggered,
+                current_size,
             });
+        }
+        // A non-idle cycle reads the size itself, so the idle memo must not outlive it.
+        if let Ok(mut memo) = self.idle_eviction_memo.lock() {
+            *memo = None;
         }
 
         // Flush own accumulator to delta file (no lock needed)
@@ -2457,12 +8216,32 @@ impl JournalConsolidator {
             // Continue anyway - the accumulator will restore values on failure
         }
 
+        // This proxy's `.ready` record, refreshed on every non-idle cycle, latched or not. The
+        // DR-EVICT capability gate (`eviction_worklist::fleet_is_worklist_capable`) needs a
+        // record no older than `CAPABILITY_WINDOW_SECS` from every proxy with a recent journal,
+        // and the consolidation lock is a non-blocking `try_lock` with no rotation, so a proxy
+        // can lose it on every cycle. The lightweight publication takes no lock, so it runs HERE,
+        // above the lock-contention return, and a lock-losing proxy still refreshes its record:
+        // in Phase Fold and in Phase L, where `maintain_staged_authority`
+        // publishes only on cycles that win the lock. Below the idle return, so an idle cycle
+        // still writes nothing. On a cycle that wins the lock, `maintain_staged_authority` writes
+        // the full Phase L record later in this same cycle, so the full record is the one left
+        // on the volume. `publish_lightweight_ready_record` says why the lightweight record blocks
+        // no activation.
+        #[cfg(test)]
+        let republish_here = !LATCHED_REPUBLISH_UNDER_LOCK;
+        #[cfg(not(test))]
+        let republish_here = true;
+        if republish_here {
+            self.publish_lightweight_ready_record().await;
+        }
+
         // CRITICAL: Acquire global consolidation lock to prevent multiple instances
         // from running consolidation simultaneously. This eliminates race conditions
         // where multiple instances process the same journal entries due to NFS caching delays.
-        let lock_acquired = match self.try_acquire_global_consolidation_lock() {
-            Ok(true) => true,
-            Ok(false) => {
+        let lock_token = match self.try_acquire_cycle_lock() {
+            Ok(Some(token)) => token,
+            Ok(None) => {
                 // Another instance is consolidating, skip this cycle
                 debug!("Skipping consolidation cycle - another instance holds the lock");
                 return Ok(ConsolidationCycleResult {
@@ -2470,9 +8249,10 @@ impl JournalConsolidator {
                     keys_skipped: 0,
                     entries_consolidated: 0,
                     size_delta: 0,
+                    write_cache_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
                     eviction_triggered: false,
-                    current_size: self.get_current_size().await,
+                    current_size: self.get_current_size().await.unwrap_or(0),
                 });
             }
             Err(e) => {
@@ -2482,40 +8262,108 @@ impl JournalConsolidator {
                     keys_skipped: 0,
                     entries_consolidated: 0,
                     size_delta: 0,
+                    write_cache_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
                     eviction_triggered: false,
-                    current_size: self.get_current_size().await,
+                    current_size: self.get_current_size().await.unwrap_or(0),
                 });
             }
         };
 
         // Ensure lock is released when we exit (even on error)
-        let _lock_guard = scopeguard::guard(lock_acquired, |acquired| {
-            if acquired {
-                self.release_global_consolidation_lock();
-            }
+        // By token: a no-op if the watchdog took the lock and this process re-acquired it.
+        let _lock_guard = scopeguard::guard(lock_token, |token| {
+            self.release_consolidation_lock(token);
         });
+
+        #[cfg(test)]
+        {
+            let hook = self.lock_park_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook.reached.wait();
+                hook.release.wait();
+            }
+        }
+
+        // Publish readiness, detect a foreign writer, and activate if the fleet's evidence
+        // permits it. UNDER THE GLOBAL LOCK, which is § 16.6.6's requirement and not merely
+        // convenient: activation is a two-document transaction (the epoch document plus the
+        // `Schema_Fence` bump on `size_state.json`) and two atomic renames cannot be made one,
+        // so the lock is what makes the pair indivisible from the fleet's point of view.
+        //
+        // # AFTER the idle early return, and that is now a decision rather than an accident
+        //
+        // A consequence follows and is accepted: **a fleet that is idle on every cycle never
+        // publishes a `.ready` record and therefore never activates.** It was worth checking
+        // whether that should be fixed the way `maybe_run_staged_fold` was, by moving above the
+        // idle return. It should not:
+        //
+        // - the requirement is the global consolidation lock, and the idle path exists precisely
+        //   to avoid taking it. Moving this above the return would acquire it on every idle
+        //   cycle and undo the reduction from ~90 EFS metadata IOPS to near-zero that the idle
+        //   check was added for;
+        // - idleness here means no pending delta and no pending journal file anywhere, i.e. no
+        //   write activity at all. Phase L is the incumbent's behaviour, and for a fleet doing no
+        //   writes the incumbent is not drifting — activation's benefit is correcting accumulated
+        //   over-statement, and nothing is accumulating;
+        // - the observability does not go stale. The fold and the repair rotation both run above
+        //   the idle return, so the gauge set and `staged_shard_authority_age_secs` stay current
+        //   and the fold-versus-incumbent gap remains visible while Phase L continues;
+        // - any write at all makes a cycle non-idle, so the first real staged mutation reaches
+        //   this line.
+        //
+        // The direction is safe (staying in Phase L is the pre-C behaviour), the cost of
+        // "fixing" it is a permanent IOPS regression on every idle deployment, and the benefit
+        // is activation on a fleet where activation changes nothing. Pinned by
+        // `an_idle_cycle_publishes_no_ready_record_and_stays_in_phase_l`.
+        self.maintain_staged_authority().await;
 
         // Collect and apply deltas from all instances' delta files (under global lock)
         // This replaces the journal-based size tracking with accumulator-based tracking
-        let (accumulator_size_delta, accumulator_wc_delta) =
-            match self.collect_and_apply_deltas().await {
-                Ok(deltas) => deltas,
-                Err(e) => {
-                    warn!("Failed to collect and apply deltas: {}", e);
-                    (0, 0)
-                }
-            };
+        let collected = self.collect_deltas().await;
 
-        // Apply accumulator deltas to size state (with clamping to 0)
-        if accumulator_size_delta != 0 || accumulator_wc_delta != 0 {
-            if let Err(e) = self
-                .atomic_update_size_delta(accumulator_size_delta, accumulator_wc_delta)
+        // Apply accumulator deltas to size state (with clamping to 0), and delete the delta
+        // files only once that has persisted. On an apply error the files stay, so the next
+        // cycle re-applies them, and this cycle reports no delta because it applied none.
+        // A sum of zero over non-empty files (+N and -N) has nothing to apply and is deleted.
+        let (accumulator_size_delta, accumulator_wc_delta) = if collected.delta != 0
+            || collected.write_cache_delta != 0
+            || collected.cached_objects_delta != 0
+        {
+            match self
+                .atomic_update_size_delta_fenced(
+                    collected.delta,
+                    collected.write_cache_delta,
+                    collected.cached_objects_delta,
+                )
                 .await
             {
-                warn!("Failed to apply accumulator deltas to size state: {}", e);
+                Ok(_) => {
+                    #[cfg(test)]
+                    applied_delta_delete_hook::park(&self.cache_dir);
+                    // Unfenced: the fenced persist has counted these files, so they go even if
+                    // the watchdog has since taken the lock. Left in place, the next holder
+                    // would apply them a second time. Each flush writes a uniquely named file
+                    // and no writer adds to one, so the delete removes nothing uncounted.
+                    // Pinned by `a_takeover_after_the_fenced_persist_still_deletes_the_applied_deltas`.
+                    self.delete_applied_delta_files(&collected.paths).await;
+                    (collected.delta, collected.write_cache_delta)
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to apply accumulator deltas to size state: {}. Keeping {} \
+                             delta file(s) for the next cycle.",
+                        e,
+                        collected.paths.len()
+                    );
+                    (0, 0)
+                }
             }
-        }
+        } else {
+            self.delete_applied_delta_files_fenced(&collected.paths)
+                .await;
+            (0, 0)
+        };
 
         // Set deadline for the entire discovery + processing phase.
         // Discovery of 66k+ keys on NFS can take 20s+, eating into processing time.
@@ -2532,14 +8380,39 @@ impl JournalConsolidator {
             Ok(result) => result,
             Err(e) => {
                 warn!("Failed to discover pending journal entries: {}", e);
-                // Even on error, check if eviction is needed
-                let current_size = self.get_current_size().await;
-                let eviction_triggered = self.maybe_trigger_eviction(Some(current_size)).await;
+                // Even on error, check if eviction is needed. The trigger reads the
+                // projected figure (`size_state` plus every pending delta file) while
+                // `current_size` stays the `size_state` reading the result and the completion
+                // line report: discovery can run for tens of seconds, and every delta flushed
+                // in that window is missing from `size_state`. Falls back to the figure already
+                // read if the projection is unreadable, which keeps the fail-open posture.
+                let current_size = self.get_current_size().await.unwrap_or(0);
+                let trigger_size = self.get_projected_size().await.unwrap_or(current_size);
+                let eviction_triggered =
+                    self.maybe_trigger_eviction_gated(Some(trigger_size)).await;
+                // The size delta was applied above, before discovery ran, so this cycle did real
+                // work even though discovery failed. Log the same completion summary as the
+                // no-keys return below, and report the applied delta in the result, which
+                // `main.rs`'s `Consolidation cycle:` line reads. Zero-delta cycles stay silent.
+                // Pinned by `a_delta_cycle_whose_discovery_fails_logs_and_reports_the_delta` and
+                // `a_zero_delta_cycle_whose_discovery_fails_logs_no_completion`.
+                // A write-cache-only delta is real work too, and `write_cache_delta` is the
+                // last field on every completion line so the fields keep one order at every site.
+                // Pinned by `a_write_cache_only_delta_cycle_whose_discovery_fails_logs_completion`.
+                if accumulator_size_delta != 0 || accumulator_wc_delta != 0 {
+                    info!(
+                        "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, total_cache_size={}, eviction_triggered={}, write_cache_delta={:+}",
+                        0, 0, accumulator_size_delta,
+                        cycle_start.elapsed().as_millis(), current_size, eviction_triggered,
+                        accumulator_wc_delta
+                    );
+                }
                 return Ok(ConsolidationCycleResult {
                     keys_processed: 0,
                     keys_skipped: 0,
                     entries_consolidated: 0,
-                    size_delta: 0,
+                    size_delta: accumulator_size_delta,
+                    write_cache_delta: accumulator_wc_delta,
                     cycle_duration: cycle_start.elapsed(),
                     eviction_triggered,
                     current_size,
@@ -2551,16 +8424,40 @@ impl JournalConsolidator {
         let file_entry_counts = discovery.file_entry_counts;
         let cache_keys: Vec<String> = key_index.keys().cloned().collect();
 
-        // If no pending entries, still check if eviction is needed
-        // This handles the case where cache is over capacity but no new data is being added
+        // No pending journal entries (a delta-only cycle): still check if eviction is needed.
         if cache_keys.is_empty() {
-            let current_size = self.get_current_size().await;
-            let eviction_triggered = self.maybe_trigger_eviction(Some(current_size)).await;
+            // The projected figure for the trigger, `size_state` for the report. See the
+            // discovery-error path above.
+            let current_size = self.get_current_size().await.unwrap_or(0);
+            let trigger_size = self.get_projected_size().await.unwrap_or(current_size);
+            let eviction_triggered = self.maybe_trigger_eviction_gated(Some(trigger_size)).await;
+            // A cycle that won the lock and applied a size delta did real work, so it logs the
+            // same completion summary as the end of the function, with the same fields in the
+            // same order. Without this, a delta-only cycle logged `SIZE_ACCUM collect_total` and
+            // nothing else, and a gap in completion lines read as a consolidation stall when it
+            // was not one. Cycles with a zero delta stay silent, so an idle fleet's INFO volume
+            // does not grow. Pinned by `a_delta_only_cycle_with_no_journal_keys_logs_completion`
+            // and `a_zero_delta_cycle_with_no_journal_keys_logs_no_completion`. A write-cache-only
+            // delta counts as work (pinned by
+            // `a_write_cache_only_delta_cycle_with_no_journal_keys_logs_completion`).
+            if accumulator_size_delta != 0 || accumulator_wc_delta != 0 {
+                info!(
+                    "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, total_cache_size={}, eviction_triggered={}, write_cache_delta={:+}",
+                    0, 0, accumulator_size_delta,
+                    cycle_start.elapsed().as_millis(), current_size, eviction_triggered,
+                    accumulator_wc_delta
+                );
+            }
             return Ok(ConsolidationCycleResult {
                 keys_processed: 0,
                 keys_skipped: 0,
                 entries_consolidated: 0,
-                size_delta: 0,
+                // What was actually applied, as at the end of the function. This read 0, so
+                // `main.rs`'s `Consolidation cycle:` line reported `size_delta=+0` when eviction
+                // triggered on a delta-only cycle. Pinned by
+                // `a_delta_only_cycle_with_no_journal_keys_logs_completion`.
+                size_delta: accumulator_size_delta,
+                write_cache_delta: accumulator_wc_delta,
                 cycle_duration: cycle_start.elapsed(),
                 eviction_triggered,
                 current_size,
@@ -2575,7 +8472,7 @@ impl JournalConsolidator {
         // Accumulate results across all cache keys
         let mut total_entries_consolidated = 0;
         let mut _total_size_delta: i64 = 0; // Kept for debugging, not used for size tracking
-                                            // NO LONGER debug-only: `consolidate_key` now produces a real, negative
+                                            // NO LONGER debug-only: `apply_journal_entries` now produces a real, negative
                                             // write-cache delta for graduations (and nothing else). Applied to Size_State
                                             // after the key loop below. Requirements 1.1, 1.3
         let mut total_write_cache_delta: i64 = 0;
@@ -2602,6 +8499,8 @@ impl JournalConsolidator {
                 // Clone the file list for this key from the index so the async block is 'static
                 let journal_files = key_index.get(&cache_key).cloned().unwrap_or_default();
                 async move {
+                    #[cfg(test)]
+                    key_loop_park_hook::park(&self.cache_dir).await;
                     // Wrap per-key processing in a timeout so one slow key cannot
                     // consume the entire cycle budget (Req 2.2).
                     let result = tokio::time::timeout(
@@ -2619,8 +8518,23 @@ impl JournalConsolidator {
         let mut stream =
             std::pin::pin!(stream::iter(key_futures).buffer_unordered(KEY_CONCURRENCY_LIMIT));
 
+        // All three capacity triggers are evaluated every `interval` of loop time, not only
+        // around the loop. See `inloop_eviction_check`. The wake below is the earlier of the next
+        // check and the cycle deadline, so the cadence holds whatever the key stream is doing: a
+        // loop whose keys are all stalled on the volume still evicts. No wake at all when no tier
+        // could act on one.
+        let mut inloop_triggered = false;
+        let inloop_checks_enabled =
+            self.config.max_cache_size != 0 || self.staging_byte_trigger().is_some();
+        let mut next_check_at = if inloop_checks_enabled {
+            tokio::time::Instant::now() + self.config.interval
+        } else {
+            deadline
+        };
+        let mut inloop_state = InloopTriggerState::default();
+
         loop {
-            match tokio::time::timeout_at(deadline, stream.next()).await {
+            match tokio::time::timeout_at(next_check_at.min(deadline), stream.next()).await {
                 Ok(Some((cache_key, per_key_result))) => {
                     match per_key_result {
                         Ok(Ok(result)) => {
@@ -2657,6 +8571,12 @@ impl JournalConsolidator {
                 Ok(None) => {
                     // Stream exhausted — all keys processed
                     break;
+                }
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    // The trigger's own wake, inside the loop and well before the deadline.
+                    let (triggered, next) = self.inloop_eviction_check(&mut inloop_state).await;
+                    inloop_triggered |= triggered;
+                    next_check_at = next;
                 }
                 Err(_) => {
                     // Deadline reached: log and break. Completed keys are already accumulated.
@@ -2731,18 +8651,31 @@ impl JournalConsolidator {
         // This replaces per-key increment_cached_objects calls, reducing NFS lock
         // operations from N to 1 and preventing count loss when the deadline fires.
         if new_objects_count > 0 {
-            self.increment_cached_objects(new_objects_count).await;
+            self.apply_new_objects_now(new_objects_count).await;
         }
 
-        // Get current size and check if eviction is needed
-        // Always check eviction at the end of every cycle, not just when size_delta > 0
-        // This ensures eviction triggers even during idle periods when cache is over capacity
-        let current_size = self.get_current_size().await;
-        let eviction_triggered = self.maybe_trigger_eviction(Some(current_size)).await;
+        // Get current size and check if eviction is needed, whatever this cycle's size delta.
+        // Idle cycles make the same check through `maybe_evict_on_idle_cycle`.
+        //
+        // The trigger reads the PROJECTED figure, `current_size` stays the `size_state` reading
+        // the result and the completion line report. `size_state` omits every delta file flushed
+        // since this cycle's `collect_deltas`, which under a journal backlog is a cycle's worth
+        // of writes, so the trigger used to fire that much late. The author re-reads the same
+        // projected figure after its drain guard, so this changes which triggers fire, not how
+        // much a pass frees. An unreadable projection falls back to the figure already read.
+        let current_size = self.get_current_size().await.unwrap_or(0);
+        let trigger_size = self.get_projected_size().await.unwrap_or(current_size);
+        let eviction_triggered =
+            self.maybe_trigger_eviction_gated(Some(trigger_size)).await || inloop_triggered;
 
         // Staging tier, on the same schedule and for the same reason: residency falls
         // only by graduation or eviction, so a tier left over its bound by a write burst
-        // must be drained by a background pass rather than by the next upload.
+        // must be drained by a background pass rather than by the next upload. An idle
+        // cycle nudges it when `write_cache_size` is over the staging byte trigger, and the
+        // in-loop check nudges it when the projected staging figure is over it, so this call
+        // is the backstop rather than the only one. Unconditional here: it costs one
+        // compare-exchange when a pass is already in flight, and `evict_staging_tier` is
+        // where the figure is read on this path.
         // Requirements 3.1, 3.2
         self.maybe_trigger_staging_eviction().await;
 
@@ -2750,12 +8683,25 @@ impl JournalConsolidator {
         // so this is a cheap no-op on most cycles. Requirement 2.6
         self.maybe_compact_write_ledger().await;
 
+        // Keep the tail-delta proportional to what the rolling pass has not yet absorbed.
+        // Interval-gated inside on the same 300s pattern, so this is a cheap no-op on most
+        // cycles. Spec: cache-eviction-at-scale § 4.4.
+        self.maybe_compact_tail_delta().await;
+
         // Log summary if there was activity
-        if total_entries_consolidated > 0 || eviction_triggered || accumulator_size_delta != 0 {
+        // `write_cache_delta` is the accumulator's collected write-cache delta, the figure applied
+        // with `accumulator_delta` above; graduation debits from this cycle's keys are counted
+        // by `entries=`, not here..
+        if total_entries_consolidated > 0
+            || eviction_triggered
+            || accumulator_size_delta != 0
+            || accumulator_wc_delta != 0
+        {
             info!(
-                "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, total_cache_size={}, eviction_triggered={}",
+                "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, total_cache_size={}, eviction_triggered={}, write_cache_delta={:+}",
                 keys_processed, total_entries_consolidated, accumulator_size_delta,
-                cycle_duration.as_millis(), current_size, eviction_triggered
+                cycle_duration.as_millis(), current_size, eviction_triggered,
+                accumulator_wc_delta
             );
         }
 
@@ -2764,6 +8710,7 @@ impl JournalConsolidator {
             keys_skipped,
             entries_consolidated: total_entries_consolidated,
             size_delta: accumulator_size_delta, // Use accumulator delta (what was actually applied)
+            write_cache_delta: accumulator_wc_delta,
             cycle_duration,
             eviction_triggered,
             current_size,
@@ -2778,6 +8725,43 @@ impl JournalConsolidator {
     /// then both would consolidate and clean up, causing entries to be lost.
     pub async fn consolidate_object(&self, cache_key: &str) -> Result<ConsolidationResult> {
         self.consolidate_object_with_files(cache_key, &[]).await
+    }
+
+    /// Split one key's entries into those that may fold and the range-fill `Add`s whose version
+    /// witness the key's write-order marker no longer holds. Caller holds the key's slot
+    /// lock. Reads the marker once, and only when some entry carries a witness.
+    ///
+    /// While this proxy holds a pending write-order stamp for the key, every witnessed
+    /// `Add` is superseded: a write of the key was acknowledged here without moving the marker,
+    /// so a fill whose S3 request preceded it still matches the marker's token.
+    fn partition_superseded_fills(
+        &self,
+        entries: Vec<JournalEntry>,
+    ) -> (Vec<JournalEntry>, Vec<JournalEntry>) {
+        let witnessed = |e: &JournalEntry| {
+            matches!(e.operation, JournalOperation::Add) && e.fill_witness.is_some()
+        };
+        let Some(first) = entries.iter().find(|e| witnessed(e)) else {
+            return (entries, Vec::new());
+        };
+        let stamp_pending_here = self
+            .cache_manager
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|w| w.upgrade()))
+            .is_some_and(|cm| cm.pending_stamp_probe(&first.cache_key).declines());
+        let current = match self.get_metadata_file_path(&first.cache_key) {
+            Ok(_) if stamp_pending_here => None,
+            Ok(meta_path) => crate::cache::read_write_marker(&meta_path).map(|m| m.token),
+            // No path, no marker: every witness is superseded, which is a miss.
+            Err(_) => None,
+        };
+        entries.into_iter().partition(|e| {
+            !witnessed(e)
+                || e.fill_witness
+                    .as_deref()
+                    .is_some_and(|w| !w.is_empty() && current.as_deref() == Some(w))
+        })
     }
 
     /// Internal consolidation worker. When `journal_files` is non-empty it reads only those
@@ -2850,9 +8834,25 @@ impl JournalConsolidator {
         // Entries with missing range files but recent timestamps are NOT returned - they stay in
         // journal for retry on next consolidation cycle. This prevents counting size for ranges
         // that don't exist on disk yet (e.g., due to NFS caching delays).
-        let (valid_entries, stale_entries) = self
+        let (valid_entries, mut stale_entries) = self
             .validate_journal_entries_with_staleness(&all_entries)
             .await;
+        // A range fill's `Add` carrying a version witness folds only while the key's
+        // write-order marker still holds it, read here under the slot lock every stamp also
+        // holds. One whose witness was replaced fetched before a write or delete of the key was
+        // acknowledged: it must neither create a `.meta` nor be listed in one. Its journal line
+        // is removed with the stale ones; its `.bin` is left in place, because the path is
+        // version-independent and a newer version's publish may have renamed its own file
+        // there. An unlisted `.bin` is the orphan rotation's to reclaim.
+        let (valid_entries, superseded_fills) = self.partition_superseded_fills(valid_entries);
+        if !superseded_fills.is_empty() {
+            debug!(
+                "Dropping {} superseded range-fill journal entries: cache_key={}",
+                superseded_fills.len(),
+                cache_key
+            );
+        }
+        stale_entries.extend(superseded_fills);
         let stale_count = stale_entries.len();
         // Pending entries are those with missing range files but recent timestamps
         // They are NOT in valid_entries or stale_entries - they stay in journal for retry
@@ -2897,12 +8897,74 @@ impl JournalConsolidator {
 
         // Lock is already held from above - use it for the rest of the operation
 
+        #[cfg(test)]
+        if meta_unlink_seam::take(cache_key) {
+            if let Ok(p) = self.get_metadata_file_path(cache_key) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+
+        // Entries for a key with no `.meta` create one only through a range fill that
+        // carries the object's metadata. Anything else describes an object that is already
+        // gone: entry reclaim and byte eviction unlink the document and then journal a
+        // `Remove` per range, and a cache-hit `TtlRefresh` / `AccessUpdate` or a
+        // `Graduation` validated against a `.meta` a peer has since deleted. Folding them
+        // would create a default document (empty ETag, no ranges, zero TTL) for a deleted
+        // key. Clean up the journal lines and write nothing.
+        if no_document_source_for_absent_meta(&valid_entries, || {
+            self.get_metadata_file_path(cache_key)
+                .map(|p| p.exists())
+                .unwrap_or(true)
+        }) {
+            debug!(
+                "No document-creating journal entry for absent .meta, no document written: cache_key={}, entries={}",
+                cache_key,
+                valid_entries.len()
+            );
+            let mut entries_to_remove = valid_entries;
+            entries_to_remove.extend(stale_entries);
+            return Ok(ConsolidationResult {
+                cache_key: cache_key.to_string(),
+                entries_processed: all_entries.len(),
+                entries_consolidated: 0,
+                entries_removed: 0,
+                conflicts_resolved: 0,
+                invalid_entries_removed: stale_count,
+                success: true,
+                error: None,
+                consolidated_entries: entries_to_remove,
+                size_delta: 0,
+                write_cache_delta: 0,
+                is_new_object: false,
+            });
+        }
+
         // Load existing metadata or create new, using object_metadata from journal entries if available
-        let mut metadata = match self
+        let (mut metadata, healed_from, creates_document) = match self
             .load_or_create_metadata_with_journal_entries(cache_key, &valid_entries)
             .await
         {
-            Ok(metadata) => metadata,
+            Ok(LoadedMetadata::Document(metadata, healed_from, created)) => {
+                (*metadata, healed_from, created)
+            }
+            Ok(LoadedMetadata::RemovedWithoutReplacement) => {
+                let mut entries_to_remove = valid_entries;
+                entries_to_remove.extend(stale_entries);
+                return Ok(ConsolidationResult {
+                    cache_key: cache_key.to_string(),
+                    entries_processed: all_entries.len(),
+                    entries_consolidated: 0,
+                    entries_removed: 0,
+                    conflicts_resolved: 0,
+                    invalid_entries_removed: stale_count,
+                    success: true,
+                    error: None,
+                    consolidated_entries: entries_to_remove,
+                    size_delta: 0,
+                    write_cache_delta: 0,
+                    is_new_object: false,
+                });
+            }
             Err(e) => {
                 let error_msg = format!("Failed to load metadata: {}", e);
                 warn!(
@@ -2916,10 +8978,12 @@ impl JournalConsolidator {
             }
         };
 
-        // Check range count before consolidation modifies the metadata.
-        // If the object had no ranges (new or HEAD-only .meta), adding the first
-        // range means we should count it as a new cached object.
-        let had_no_ranges_before = metadata.ranges.is_empty();
+        // A range fill carries the ETag of the version its bytes came from. One whose ETag
+        // differs from this `.meta`'s must never be listed under it: that serves one version's
+        // bytes under another's headers. Drop such entries as stale.
+        let disputes = disputed_fill_extents(&valid_entries, !creates_document);
+        let (valid_entries, other_version_entries) =
+            partition_other_version_fills(&metadata, valid_entries);
 
         // Resolve conflicts between metadata and journal entries
         let _conflicts_resolved = self
@@ -2931,8 +8995,23 @@ impl JournalConsolidator {
         // only entries that affect size tracking (Add entries that weren't skipped, Remove entries)
         // NOTE: size_affecting_entries is no longer used for size tracking - size is now tracked
         // at write/eviction time via the in-memory accumulator (see SizeAccumulator).
-        let (entries_consolidated, _size_affecting_entries, graduated_bytes) =
+        let (entries_consolidated, size_affecting_entries, graduated_bytes) =
             self.apply_journal_entries(&mut metadata, &valid_entries);
+
+        // The `.bin` path is version-independent, so an other-version fill's file sits at the
+        // path any listing of that extent names, and which version it holds is unknown. Unlist
+        // the extent, unlink the file and debit what was on disk (the fill credited it). The
+        // slot lock eviction takes is held, so this cannot race a locked unlinker.
+        self.retire_other_version_fills(&mut metadata, &other_version_entries);
+        // Two fills in this batch disagree about an extent. Their ETags differ: which one's
+        // bytes the `.bin` holds is unknown, whatever `created_at` says, so unlist and unlink
+        // it. Their file identities differ: list the one whose file is at the path, or retire
+        // the extent when neither is.
+        let mut retire = disputes.retire;
+        retire.extend(self.settle_identity_disputes(&mut metadata, &disputes.by_identity));
+        self.retire_disagreeing_fills(&mut metadata, &retire);
+        // Retry the unlink of any extent an earlier pass had to keep as unservable.
+        self.retire_unservable_extents(&mut metadata);
 
         // Size tracking is handled by the accumulator at write/eviction time, not during consolidation.
         // Journal entries are processed only for metadata updates via apply_journal_entries() above.
@@ -2969,9 +9048,27 @@ impl JournalConsolidator {
                 error_msg,
             ));
         }
+        if healed_from.is_some() {
+            crate::disk_cache::note_metadata_heal_overwrite(cache_key);
+        }
 
-        // Count as new cached object if this is the first time ranges are being added.
-        // This covers both truly new objects and HEAD-only .meta files getting their first range.
+        // The key's `.meta` now exists, so this instance's fill-visibility entry for it (if any)
+        // is superseded. Lookups would drop it on sight anyway (disk wins); dropping it here
+        // keeps the entry from lingering until the next read.
+        if let Some(tracker) = self.fill_visibility_tracker.get() {
+            tracker.note_folded(cache_key);
+        }
+
+        // A newly admitted range at or above the Tail_Partition floor is appended to this
+        // instance's tail-delta, so selection can see it before its shard is next rebuilt.
+        // Same fold, same flush point as § 3.3 — and after the `.meta` write, so a record never
+        // describes a range the document does not.
+        self.append_tail_delta_for_admissions(&metadata, &size_affecting_entries);
+
+        // `cached_objects` counts one per parseable `.meta` file, so a fold credits exactly
+        // when it wrote a document where no parseable one existed (`creates_document`): the
+        // absent-key create and the corrupt-heal create. A fold onto an existing document,
+        // ranged or rangeless, changes no file count whatever its entries were.
 
         // Return the valid entries that were consolidated - these should be removed from journals
         // Stale entries (old entries with missing range files) are also included for removal
@@ -2987,6 +9084,7 @@ impl JournalConsolidator {
         // Both should be removed from the journal - valid ones are consolidated, stale ones are cleaned up
         let mut entries_to_remove = valid_entries;
         entries_to_remove.extend(stale_entries);
+        entries_to_remove.extend(other_version_entries);
 
         let result = ConsolidationResult {
             cache_key: cache_key.to_string(),
@@ -3000,7 +9098,7 @@ impl JournalConsolidator {
             consolidated_entries: entries_to_remove, // Include both valid and stale entries for journal cleanup
             size_delta,
             write_cache_delta,
-            is_new_object: had_no_ranges_before && entries_consolidated > 0,
+            is_new_object: creates_document,
         };
 
         debug!(
@@ -3014,7 +9112,7 @@ impl JournalConsolidator {
     /// Discover all cache keys that have pending journal entries
     ///
     /// Reads from per-instance journals: `metadata/_journals/{instance_id}.journal`
-    pub async fn discover_pending_cache_keys(&self) -> Result<Vec<String>> {
+    pub(crate) async fn discover_pending_cache_keys(&self) -> Result<Vec<String>> {
         let index = self.discover_pending_cache_keys_indexed().await?;
         Ok(index.into_keys().collect())
     }
@@ -3022,7 +9120,7 @@ impl JournalConsolidator {
     /// Like `discover_pending_cache_keys` but returns a map of cache_key → journal files
     /// that contain entries for that key. Built in a single pass over all journal files so
     /// callers can avoid re-scanning all files for each key during consolidation.
-    pub async fn discover_pending_cache_keys_indexed(
+    pub(crate) async fn discover_pending_cache_keys_indexed(
         &self,
     ) -> Result<HashMap<String, Vec<PathBuf>>> {
         let discovery = self.discover_pending_cache_keys_indexed_capped(0).await?;
@@ -3032,7 +9130,7 @@ impl JournalConsolidator {
     /// Discover pending cache keys with an optional cap on the number of keys returned.
     /// When `max_keys` > 0, stops reading journal files once the index reaches the cap,
     /// reducing NFS I/O when the backlog is large.
-    pub async fn discover_pending_cache_keys_indexed_capped(
+    pub(crate) async fn discover_pending_cache_keys_indexed_capped(
         &self,
         max_keys: usize,
     ) -> Result<DiscoveryResult> {
@@ -3368,6 +9466,7 @@ impl JournalConsolidator {
 
                 if entry_age > stale_timeout {
                     // Entry is stale - mark for removal
+                    JOURNAL_VALIDATION_FAILURES.fetch_add(1, Ordering::Relaxed);
                     stale_entries.push(entry.clone());
                     debug!(
                         "Removing stale journal entry: cache_key={}, range={}-{}, age={:.1}s (threshold={}s)",
@@ -3405,12 +9504,291 @@ impl JournalConsolidator {
         (valid_entries, stale_entries)
     }
 
+    /// Unlist, unlink and debit the extents named by range fills of another object version.
+    ///
+    /// See the call site in `consolidate_object_with_files`. Runs under the key's slot lock.
+    fn retire_other_version_fills(
+        &self,
+        metadata: &mut NewCacheMetadata,
+        other_version_entries: &[JournalEntry],
+    ) {
+        for entry in other_version_entries {
+            let (start, end) = (entry.range_spec.start, entry.range_spec.end);
+            // A listing written after this fill (a PUT or a newer fill of this version that
+            // published since) owns the file now: drop the entry only.
+            let listed_later = metadata.ranges.iter().any(|r| {
+                r.start == start && r.end == end && r.created_at > entry.range_spec.created_at
+            });
+            if listed_later {
+                debug!(
+                    "Dropped an older range fill of another object version: cache_key={}, \
+                     range={}-{}",
+                    metadata.cache_key, start, end
+                );
+                continue;
+            }
+            // Unlist only once the `.bin` is gone (unlinked now, or already absent). Unlisting
+            // a file that is still on the volume leaves bytes no `.meta` names, which nothing
+            // reclaims (R15.2); kept listed, the extent stays counted and evictable.
+            let path = match self.get_range_file_path(&metadata.cache_key, &entry.range_spec) {
+                Ok(path) => path,
+                Err(e) => {
+                    warn!(
+                        "Kept a range fill of another object version listed (path unresolvable): \
+                         cache_key={}, range={}-{}, error={}",
+                        metadata.cache_key, start, end, e
+                    );
+                    continue;
+                }
+            };
+            let on_disk = std::fs::metadata(&path).map(|m| m.len()).ok();
+            match crate::disk_cache::remove_range_file(&path) {
+                Ok(()) => {
+                    if let Some(bytes) = on_disk {
+                        self.size_accumulator.subtract_range(
+                            &metadata.cache_key,
+                            start,
+                            end,
+                            bytes,
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    // Kept listed so the bytes stay named and evictable, but marked
+                    // unservable: the file may hold the other version's bytes, and a
+                    // response must be self-consistent. Every listing at these offsets is
+                    // marked, since the `.bin` path names the extent, not the version.
+                    for r in metadata
+                        .ranges
+                        .iter_mut()
+                        .filter(|r| r.start == start && r.end == end)
+                    {
+                        r.unservable = true;
+                    }
+                    warn!(
+                        "Kept a range fill of another object version listed as unservable \
+                         (unlink failed): cache_key={}, range={}-{}, path={:?}, error={}",
+                        metadata.cache_key, start, end, path, e
+                    );
+                    continue;
+                }
+            }
+            metadata
+                .ranges
+                .retain(|r| !(r.start == start && r.end == end));
+            warn!(
+                "Dropped a range fill of another object version: cache_key={}, range={}-{}, \
+                 fill_etag={:?}, meta_etag={}, unlinked_bytes={:?}",
+                metadata.cache_key,
+                start,
+                end,
+                entry.object_metadata.as_ref().map(|m| m.etag.as_str()),
+                metadata.object_metadata.etag,
+                on_disk
+            );
+        }
+    }
+
+    /// For each extent whose fills record different file identities ([`FillDisputes`]), make
+    /// the listing the fill whose identity matches the file now at the path, by one `stat` of
+    /// its length and modification time ([`crate::cache_types::RangeFileIdentity::matches`]).
+    /// When more than one matches (two fills of one length inside the match window), the one
+    /// whose modification time is closest is listed. Returns the extents no fill's identity
+    /// matches (the file is gone, unreadable, or another writer's whose `Add` has not landed),
+    /// for [`Self::retire_disagreeing_fills`].
+    ///
+    /// Only the fields that describe the file are taken from the matching fill (identity,
+    /// sizes, algorithm, path); the listing's staged membership and access record are kept.
+    fn settle_identity_disputes(
+        &self,
+        metadata: &mut NewCacheMetadata,
+        disputes: &HashMap<(u64, u64), Vec<RangeSpec>>,
+    ) -> HashSet<(u64, u64)> {
+        let mut unmatched = HashSet::new();
+        for (&(start, end), candidates) in disputes {
+            let Some(listed) = metadata
+                .ranges
+                .iter_mut()
+                .find(|r| r.start == start && r.end == end)
+            else {
+                continue;
+            };
+            let found = crate::disk_cache::get_sharded_path(
+                &self.cache_dir.join("ranges"),
+                &metadata.cache_key,
+                &format!("_{}-{}.bin", start, end),
+            )
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| crate::cache_types::RangeFileIdentity::of(&m));
+            let winner = found.and_then(|f| {
+                candidates
+                    .iter()
+                    .filter_map(|c| {
+                        c.file_identity
+                            .filter(|i| i.matches(&f))
+                            .map(|i| (i.mtime_ns.abs_diff(f.mtime_ns), c))
+                    })
+                    .min_by_key(|(distance, _)| *distance)
+                    .map(|(_, c)| c)
+            });
+            match winner {
+                Some(winner) => {
+                    if listed.file_identity != winner.file_identity {
+                        listed.file_identity = winner.file_identity;
+                        listed.file_path = winner.file_path.clone();
+                        listed.compression_algorithm = winner.compression_algorithm.clone();
+                        listed.compressed_size = winner.compressed_size;
+                        listed.uncompressed_size = winner.uncompressed_size;
+                        debug!(
+                            "Listed the range fill whose file is at the path: cache_key={}, \
+                             range={}-{}, identity={:?}",
+                            metadata.cache_key, start, end, winner.file_identity
+                        );
+                    }
+                }
+                None => {
+                    unmatched.insert((start, end));
+                }
+            }
+        }
+        unmatched
+    }
+
+    /// Unlist and unlink every extent in `disagreeing` ([`disputed_fill_extents`],
+    /// [`Self::settle_identity_disputes`]), debiting what was on disk.
+    ///
+    /// Runs under the key's slot lock after `apply_journal_entries` and
+    /// `retire_other_version_fills`, whatever either decided: an extent that pass already
+    /// unlinked finds no file and is only unlisted. One whose unlink fails stays listed, marked
+    /// [`RangeSpec::unservable`], for `retire_unservable_extents` to retry.
+    fn retire_disagreeing_fills(
+        &self,
+        metadata: &mut NewCacheMetadata,
+        disagreeing: &HashSet<(u64, u64)>,
+    ) {
+        for &(start, end) in disagreeing {
+            let path = match crate::disk_cache::get_sharded_path(
+                &self.cache_dir.join("ranges"),
+                &metadata.cache_key,
+                &format!("_{}-{}.bin", start, end),
+            ) {
+                Ok(path) => path,
+                Err(e) => {
+                    for r in metadata
+                        .ranges
+                        .iter_mut()
+                        .filter(|r| r.start == start && r.end == end)
+                    {
+                        r.unservable = true;
+                    }
+                    warn!(
+                        "Kept an extent two fills disagree about listed as unservable (path \
+                         unresolvable): cache_key={}, range={}-{}, error={}",
+                        metadata.cache_key, start, end, e
+                    );
+                    continue;
+                }
+            };
+            let on_disk = std::fs::metadata(&path).map(|m| m.len()).ok();
+            match crate::disk_cache::remove_range_file(&path) {
+                Ok(()) => {
+                    if let Some(bytes) = on_disk {
+                        self.size_accumulator.subtract_range(
+                            &metadata.cache_key,
+                            start,
+                            end,
+                            bytes,
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    for r in metadata
+                        .ranges
+                        .iter_mut()
+                        .filter(|r| r.start == start && r.end == end)
+                    {
+                        r.unservable = true;
+                    }
+                    warn!(
+                        "Kept an extent two fills disagree about listed as unservable (unlink \
+                         failed): cache_key={}, range={}-{}, path={:?}, error={}",
+                        metadata.cache_key, start, end, path, e
+                    );
+                    continue;
+                }
+            }
+            metadata
+                .ranges
+                .retain(|r| !(r.start == start && r.end == end));
+            warn!(
+                "Dropped an extent two range fills disagree about (ETag or file identity): \
+                 cache_key={}, range={}-{}, unlinked_bytes={:?}",
+                metadata.cache_key, start, end, on_disk
+            );
+        }
+    }
+    /// Unlink and unlist every extent marked [`RangeSpec::unservable`], debiting what was on
+    /// disk. One whose unlink fails again stays listed and unservable for the next pass.
+    ///
+    /// Runs under the key's slot lock, after `apply_journal_entries`, so a current-version
+    /// fill of the extent consolidated in this pass has already replaced the marked listing.
+    fn retire_unservable_extents(&self, metadata: &mut NewCacheMetadata) {
+        if !metadata.ranges.iter().any(|r| r.unservable) {
+            return;
+        }
+        let marked: Vec<RangeSpec> = metadata
+            .ranges
+            .iter()
+            .filter(|r| r.unservable)
+            .cloned()
+            .collect();
+        for spec in marked {
+            let (start, end) = (spec.start, spec.end);
+            let Ok(path) = self.get_range_file_path(&metadata.cache_key, &spec) else {
+                continue;
+            };
+            let on_disk = std::fs::metadata(&path).map(|m| m.len()).ok();
+            match crate::disk_cache::remove_range_file(&path) {
+                Ok(()) => {
+                    if let Some(bytes) = on_disk {
+                        self.size_accumulator.subtract_range(
+                            &metadata.cache_key,
+                            start,
+                            end,
+                            bytes,
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    debug!(
+                        "Unservable extent still listed (unlink failed again): cache_key={}, \
+                         range={}-{}, error={}",
+                        metadata.cache_key, start, end, e
+                    );
+                    continue;
+                }
+            }
+            metadata
+                .ranges
+                .retain(|r| !(r.start == start && r.end == end && r.unservable));
+            info!(
+                "Unlisted an unservable extent after unlinking its file: cache_key={}, \
+                 range={}-{}, unlinked_bytes={:?}",
+                metadata.cache_key, start, end, on_disk
+            );
+        }
+    }
+
     /// Resolve conflicts between metadata and journal entries
     ///
     /// This only applies to Add/Update/Remove operations which carry full range data.
     /// TtlRefresh and AccessUpdate operations are incremental updates that should not
     /// replace existing range data - they only modify specific fields.
-    pub async fn resolve_conflicts(
+    pub(crate) async fn resolve_conflicts(
         &self,
         metadata: &mut NewCacheMetadata,
         journal_entries: &[JournalEntry],
@@ -3483,6 +9861,203 @@ impl JournalConsolidator {
         Ok(conflicts_resolved)
     }
 
+    /// Append a tail-delta record for every newly admitted range at or above the floor.
+    ///
+    /// # Why the delta exists at all
+    ///
+    /// Without it the feature is incomplete rather than merely unobservable. A partition is
+    /// rebuilt only when the rolling pass reaches its shard, and at the design point a full
+    /// rotation is **days** — so a large range admitted today would be invisible to eviction for
+    /// that whole rotation, which is exactly the population a byte-denominated pass most needs to
+    /// see.
+    ///
+    /// # Removals are NOT appended
+    ///
+    /// § 4.4. A removed range's record is stale, and R3.8 requires re-verification against the
+    /// `.meta` before any deletion, so a stale record costs one skipped candidate. `Remove`
+    /// entries also reach `size_affecting_entries`, so this filters on the operation rather than
+    /// taking the whole list.
+    ///
+    /// Best-effort: a failure is logged and swallowed. The bytes are already on disk and already
+    /// accounted; failing consolidation over a hint would be strictly worse than losing it, and
+    /// the shard's next rebuild recovers the record from the `.meta` itself.
+    ///
+    /// Spec: cache-eviction-at-scale § 4.4. Requirements: 3.8.
+    fn append_tail_delta_for_admissions(
+        &self,
+        metadata: &NewCacheMetadata,
+        size_affecting_entries: &[JournalEntry],
+    ) {
+        use crate::cache_size_tracker::{
+            append_tail_delta_records, shard_and_leaf_of, TailDeltaRecord, TailRecord,
+        };
+
+        let floor = self.config.tail_floor_bytes;
+        let admissions: Vec<&JournalEntry> = size_affecting_entries
+            .iter()
+            .filter(|e| {
+                matches!(e.operation, JournalOperation::Add)
+                    && e.range_spec.compressed_size >= floor
+            })
+            .collect();
+        if admissions.is_empty() {
+            return;
+        }
+
+        let Some((bucket, l1, leaf)) = shard_and_leaf_of(&metadata.cache_key) else {
+            debug!(
+                "Tail-delta: cache_key {} does not shard, so no record can name its partition",
+                metadata.cache_key
+            );
+            return;
+        };
+        let at = nanos_since_epoch(SystemTime::now());
+        let expires_at = nanos_since_epoch(metadata.expires_at);
+        let object_is_write_cached = metadata.object_metadata.is_write_cached;
+        let instance_id = self.write_ledger.instance_id().to_string();
+
+        let records: Vec<TailDeltaRecord> = admissions
+            .iter()
+            .map(|e| TailDeltaRecord {
+                bucket: bucket.clone(),
+                l1: l1.clone(),
+                at,
+                instance_id: instance_id.clone(),
+                record: TailRecord {
+                    cache_key: metadata.cache_key.clone(),
+                    range_start: e.range_spec.start,
+                    range_end: e.range_spec.end,
+                    // The compressed on-disk size, never `uncompressed_size` and never the
+                    // `.bin` filename's logical extent — see `TailRecord`'s own doc comment.
+                    compressed_size: e.range_spec.compressed_size,
+                    last_accessed: nanos_since_epoch(e.range_spec.last_accessed),
+                    // Object-level: `RangeSpec` carries no expiry (R3.6b).
+                    expires_at,
+                    access_count: e.range_spec.access_count,
+                    // Derived through the shared predicate, never from `RangeSpec::staged`.
+                    is_staged: crate::cache_types::is_staged_range_spec(
+                        &e.range_spec,
+                        object_is_write_cached,
+                    ),
+                    leaf: leaf.clone(),
+                },
+            })
+            .collect();
+
+        let count = records.len();
+        if let Err(e) = append_tail_delta_records(
+            &self.cache_dir,
+            &instance_id,
+            &records,
+            self.config.tail_delta_max_entries,
+        ) {
+            warn!(
+                "Tail-delta: failed to append {} record(s) for {}: {}. Those ranges are \
+                 invisible to eviction until their shard is next rebuilt.",
+                count, metadata.cache_key, e
+            );
+        } else {
+            debug!(
+                "Tail-delta: appended {} above-floor admission(s) for {} to shard {}/{}",
+                count, metadata.cache_key, bucket, l1
+            );
+        }
+    }
+
+    /// Drop tail-delta records whose shard has been rebuilt since the record was appended.
+    ///
+    /// # Why this exists alongside the per-shard retirement
+    ///
+    /// The rolling pass retires the records for the shards it has just rebuilt, inside its own
+    /// write phase. That covers the ordinary case. This sweep covers the rest: a record whose
+    /// retirement failed, and a record appended by an instance whose delta the rebuild could not
+    /// read. Without it, the delta grows for as long as those accumulate — and § 16.5 makes the
+    /// rotation period grow with cache size, so "until the next rebuild" is not a bound.
+    ///
+    /// # Retire-set, and nanosecond time
+    ///
+    /// Names the records to REMOVE (§ 2 trap 2). The comparison is a record's `at` against its
+    /// shard's `tail_built_at`, both nanoseconds: at second granularity a record appended in the
+    /// same second as a rebuild is indistinguishable from one appended after it, which is the
+    /// class of defect that makes a compaction identity silently match nothing.
+    ///
+    /// CAS-gated on a 300 s interval, called from the consolidation cycle with the global
+    /// consolidation lock held — the same shape as [`Self::maybe_compact_write_ledger`], and what
+    /// makes it safe for this instance to rewrite *other* instances' delta files.
+    ///
+    /// Spec: cache-eviction-at-scale § 4.4.
+    async fn maybe_compact_tail_delta(&self) {
+        use crate::cache_size_tracker::{
+            read_all_tail_delta_records, retire_tail_delta_records, tail_built_at_for,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = self.last_tail_delta_compaction_secs.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(last) < LEDGER_COMPACTION_INTERVAL_SECS {
+            return;
+        }
+        // CAS so two overlapping cycles in this process cannot both compact.
+        if self
+            .last_tail_delta_compaction_secs
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        // Not time-budgeted: its cost is bounded by `tail_delta_max_entries` per delta file and one
+        // checkpoint read per distinct shard, neither of which grows with the staged population.
+        // It is fenced: the rewrite edits other instances' delta files.
+        if !self.lock_fence_intact() {
+            return;
+        }
+        let lock_generation = self.lock_generation.clone();
+        let own_token = self.cycle_lock_token.load(Ordering::SeqCst);
+        let cache_dir = self.cache_dir.clone();
+        let dropped = tokio::task::spawn_blocking(move || {
+            let records = read_all_tail_delta_records(&cache_dir);
+            if records.is_empty() {
+                return 0;
+            }
+            // One checkpoint read per distinct shard, not per record.
+            let mut built_at: HashMap<(String, String), Option<u64>> = HashMap::new();
+            let mut retire = HashSet::new();
+            for r in &records {
+                let key = (r.bucket.clone(), r.l1.clone());
+                // `None` — no checkpoint, no recorded rebuild, or one that could not be read —
+                // retires nothing. A record kept too long costs disk and one skipped candidate;
+                // a record dropped too early is a large range eviction cannot see for a whole
+                // rotation.
+                let rebuilt = *built_at
+                    .entry(key)
+                    .or_insert_with(|| tail_built_at_for(&cache_dir, &r.bucket, &r.l1));
+                if let Some(rebuilt_at) = rebuilt {
+                    if rebuilt_at > r.at {
+                        retire.insert(r.identity());
+                    }
+                }
+            }
+            if lock_generation.load(Ordering::SeqCst) != own_token {
+                return 0;
+            }
+            retire_tail_delta_records(&cache_dir, &retire)
+        })
+        .await
+        .unwrap_or(0);
+
+        if dropped > 0 {
+            debug!(
+                "Tail-delta cross-shard sweep: retired {} record(s) whose shard has been \
+                 rebuilt since",
+                dropped
+            );
+        }
+    }
+
     /// Apply journal entries to metadata
     ///
     /// This method applies Add, Update, Remove, TtlRefresh, and AccessUpdate operations
@@ -3500,8 +10075,16 @@ impl JournalConsolidator {
         // Track entries that affect size: Add entries that were actually applied, and all Remove entries
         let mut size_affecting_entries = Vec::new();
         // Staged bytes to debit from `write_cache_size` for graduations applied here.
-        // Requirement 1.1, 1.2 — see the `Graduation` arm below.
+        // Requirement 1.1, 1.2 — see the `Graduation` arm below. Always 0 after the
+        // staged-authority epoch is activated, because the debit channel is deleted there.
         let mut graduated_bytes: u64 = 0;
+        // Graduation entries this call applied as cleanup-only no-ops, by cache key.
+        //
+        // Collected rather than counted inline so the counter is incremented once, after the
+        // loop, alongside the debug line that names the count — and so a future caller can
+        // see WHICH keys were retired as no-ops without turning on per-entry debug logging.
+        // Spec: cache-eviction-at-scale § 16.6.8.
+        let mut graduation_noop_entries: Vec<String> = Vec::new();
 
         // Note: Object-level expires_at is set to ~100 years, so no need to extend it
         // Individual range TTLs are what matter for cache validity
@@ -3514,6 +10097,11 @@ impl JournalConsolidator {
                         r.start == entry.range_spec.start && r.end == entry.range_spec.end
                     });
 
+                    // An unservable listing at these offsets counts as existing, so the Add
+                    // is skipped and the marked listing is NOT replaced: this Add may be an
+                    // older fill whose file the other version since overwrote, and the
+                    // marking time is not recorded to tell the two apart.
+                    // `retire_unservable_extents` unlists it once its file is unlinked.
                     if !range_exists {
                         metadata.ranges.push(entry.range_spec.clone());
                         entries_applied += 1;
@@ -3664,7 +10252,59 @@ impl JournalConsolidator {
                     // No range is touched and no `size_delta` is produced: the bytes are
                     // still on disk, they have only moved from the write tier to the read
                     // tier. Requirements 1.1, 1.2, 1.3
-                    if metadata.object_metadata.graduation_accounted {
+                    //
+                    // ── AFTER ACTIVATION THIS ARM IS A CLEANUP-ONLY NO-OP ──────────────
+                    //
+                    // Design § 16.6.8's ruling is option (a): the variant and the entry
+                    // type SURVIVE, and only the debit application is deleted. Under the
+                    // fold, `write_cache_size` is recomputed from the `.meta` state that
+                    // `refresh_write_cache_ttl` already published, so there is nothing for
+                    // an event to deliver and the lossy debit channel is gone — that
+                    // channel's measured 4.28x-11.17x over-statement is the defect this
+                    // whole section exists to delete.
+                    //
+                    // What the entry still does, all of which matters:
+                    //
+                    // - it PARSES. The variant is not deleted because `JournalOperation`
+                    //   derives plain `Deserialize` with no rename and no catch-all, so an
+                    //   entry written by a Phase L instance would fail to deserialize and
+                    //   be dropped by the skip-not-fatal parse policy. Making correctness
+                    //   depend on a silent drop is the shape this section removes
+                    //   everywhere else.
+                    // - it is VALIDATED against the `.meta` rather than a non-existent
+                    //   `_0-0.bin` (the `matches!` arm in
+                    //   `validate_journal_entries_with_staleness`), which is what puts it
+                    //   in `valid_entries`, which is what RETIRES it. That retirement is
+                    //   the "cleanup" in cleanup-only, and it is why (a) is not (b) with
+                    //   dead code.
+                    // - it is EXCLUDED from conflict resolution (the `continue` arm in
+                    //   `resolve_conflicts`), so its `(0, 0)` carrier `RangeSpec` cannot
+                    //   overwrite a real one-byte object's range.
+                    //
+                    // Both of those guards must stay live for as long as any Graduation
+                    // entry can be in any journal file — the whole Phase L window plus
+                    // every pre-activation journal consolidated after activation.
+                    //
+                    // `graduation_accounted` is neither read nor written here after
+                    // activation, and `entries_applied` is NOT incremented: a no-op is not
+                    // an applied entry, and `entries_consolidated` is reported as such.
+                    //
+                    // Read from the LATCH rather than from disk: this is a synchronous
+                    // per-entry hot path and the epoch document is on shared storage. The
+                    // consolidation cycle refreshes the latch once per cycle, and an
+                    // unrefreshed latch reads `EPOCH_LEGACY`, which applies the incumbent
+                    // debit — the direction that leaves the incumbent counter correct for
+                    // whatever is still reading it.
+                    //
+                    // Spec: cache-eviction-at-scale §§ 16.6.6, 16.6.8.
+                    if crate::staged_authority::fold_authority_active_latched(&self.cache_dir) {
+                        graduation_noop_entries.push(entry.cache_key.clone());
+                        debug!(
+                            "GRADUATION journal entry applied as a cleanup-only no-op (the \
+                             fold is authoritative): cache_key={}, staged_compressed_size={}",
+                            entry.cache_key, entry.range_spec.compressed_size
+                        );
+                    } else if metadata.object_metadata.graduation_accounted {
                         debug!(
                             "GRADUATION journal entry skipped (already accounted): cache_key={}, staged_compressed_size={}",
                             entry.cache_key, entry.range_spec.compressed_size
@@ -3706,15 +10346,29 @@ impl JournalConsolidator {
             }
         }
 
-        // Update object metadata if this looks like a full object
-        if metadata.ranges.len() == 1
-            && metadata.ranges[0].start == 0
-            && metadata.object_metadata.content_length == 0
-        {
-            metadata.object_metadata.content_length = metadata.ranges[0].end + 1;
+        // Update object metadata if this looks like a full object.
+        //
+        // Guarded rather than unconditional: see `derive_full_object_content_length`. This
+        // is the copy that needed it. An `Add` entry reaching here is applied against
+        // whatever `.meta` is on disk, and `load_or_create_metadata_with_journal_entries`
+        // does NOT refresh `object_metadata` from the journal when the document already
+        // exists — so a range that outlived a zero-length publish is folded into a
+        // correctly-published empty object, and deriving a length from it would describe the
+        // superseded object under the new object's ETag.
+        if crate::hybrid_metadata_writer::derive_full_object_content_length(metadata) {
             debug!(
                 "Updated object content_length from range: cache_key={}, content_length={}",
                 metadata.cache_key, metadata.object_metadata.content_length
+            );
+        }
+
+        if !graduation_noop_entries.is_empty() {
+            GRADUATION_NOOP_ENTRIES_TOTAL
+                .fetch_add(graduation_noop_entries.len() as u64, Ordering::Relaxed);
+            debug!(
+                "Retired {} Graduation journal entry/entries as cleanup-only no-ops: keys={:?}",
+                graduation_noop_entries.len(),
+                graduation_noop_entries
             );
         }
 
@@ -3739,7 +10393,7 @@ impl JournalConsolidator {
         &self,
         cache_key: &str,
         journal_entries: &[JournalEntry],
-    ) -> Result<NewCacheMetadata> {
+    ) -> Result<LoadedMetadata> {
         let metadata_path = self.get_metadata_file_path(cache_key)?;
 
         if metadata_path.exists() {
@@ -3750,17 +10404,89 @@ impl JournalConsolidator {
                     ProxyError::CacheError(format!("Failed to read metadata file: {}", e))
                 })?;
 
-            serde_json::from_str(&content).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to parse metadata file: {}", e))
-            })
+            let parse_error = match serde_json::from_str::<NewCacheMetadata>(&content) {
+                Ok(metadata) => {
+                    return Ok(LoadedMetadata::Document(Box::new(metadata), None, false))
+                }
+                Err(e) => e,
+            };
+            // Unparseable. A legacy `CacheEntry` shape or a stable parse failure is treated as
+            // absent: it is unlinked under the slot lock the caller holds, and the entries are
+            // folded as for a key with no `.meta` (only a fill carrying `object_metadata`
+            // creates a document). Leaving it would fail this key's consolidation every cycle.
+            // A transient failure (the file changing under the read) keeps the old error, and
+            // the next cycle retries.
+            match crate::disk_cache::remove_unloadable_meta_under_slot_lock(
+                &metadata_path,
+                cache_key,
+            )
+            .await
+            {
+                crate::disk_cache::MetadataReadOutcome::Parsed(metadata) => {
+                    return Ok(LoadedMetadata::Document(metadata, None, false));
+                }
+                crate::disk_cache::MetadataReadOutcome::Corrupt { reason } => {
+                    if no_document_source_for_absent_meta(journal_entries, || false) {
+                        return Ok(LoadedMetadata::RemovedWithoutReplacement);
+                    }
+                    let created =
+                        Self::new_metadata_from_journal_entries(cache_key, journal_entries);
+                    return Ok(LoadedMetadata::Document(
+                        Box::new(created),
+                        Some(reason),
+                        true,
+                    ));
+                }
+                crate::disk_cache::MetadataReadOutcome::Missing
+                | crate::disk_cache::MetadataReadOutcome::TransientMiss => {}
+            }
+            Err(ProxyError::CacheError(format!(
+                "Failed to parse metadata file: {}",
+                parse_error
+            )))
         } else {
+            Ok(LoadedMetadata::Document(
+                Box::new(Self::new_metadata_from_journal_entries(
+                    cache_key,
+                    journal_entries,
+                )),
+                None,
+                true,
+            ))
+        }
+    }
+
+    /// The create-new branch of [`Self::load_or_create_metadata_with_journal_entries`]: a
+    /// document with the first journal entry's `object_metadata` and TTL and no ranges.
+    fn new_metadata_from_journal_entries(
+        cache_key: &str,
+        journal_entries: &[JournalEntry],
+    ) -> NewCacheMetadata {
+        {
             // Create new metadata
             let now = SystemTime::now();
 
-            // Try to get object_metadata from journal entries (first one that has it)
-            let object_metadata = journal_entries
-                .iter()
-                .find_map(|entry| entry.object_metadata.clone())
+            // The new document's identity comes from the NEWEST entry that carries an ETag,
+            // falling back to the newest with any object_metadata. An ETag-less entry (an
+            // upstream response with no ETag reaching a store path) must not define the
+            // object when a sibling knows it, and an older version's fill must not either:
+            // `partition_other_version_fills` then drops every fill whose ETag differs, so
+            // picking the older entry would discard the newer version's ranges.
+            let newest_first = || {
+                let mut entries: Vec<&JournalEntry> = journal_entries.iter().collect();
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
+                entries
+            };
+            let object_metadata = newest_first()
+                .into_iter()
+                .filter_map(|entry| entry.object_metadata.as_ref())
+                .find(|metadata| !metadata.etag.is_empty())
+                .or_else(|| {
+                    newest_first()
+                        .into_iter()
+                        .find_map(|entry| entry.object_metadata.as_ref())
+                })
+                .cloned()
                 .unwrap_or_else(|| {
                     debug!(
                         "No object_metadata found in journal entries for cache_key={}, using default",
@@ -3789,7 +10515,7 @@ impl JournalConsolidator {
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::ZERO);
 
-            Ok(NewCacheMetadata {
+            NewCacheMetadata {
                 cache_key: cache_key.to_string(),
                 object_metadata,
                 ranges: Vec::new(),
@@ -3797,7 +10523,7 @@ impl JournalConsolidator {
                 expires_at: now + object_ttl,
                 compression_info: crate::cache_types::CompressionInfo::default(),
                 ..Default::default()
-            })
+            }
         }
     }
 
@@ -3826,14 +10552,9 @@ impl JournalConsolidator {
             .map_err(|e| ProxyError::CacheError(format!("Failed to serialize metadata: {}", e)))?;
 
         // Atomic write: write to temp file then rename
-        // Use instance-specific tmp file to avoid race conditions on shared storage
-        let instance_suffix = format!(
-            "{}.{}",
-            gethostname::gethostname().to_string_lossy(),
-            std::process::id()
-        );
-        let tmp_extension = format!("meta.tmp.{}", instance_suffix);
-        let temp_path = metadata_path.with_extension(&tmp_extension);
+        // Use instance-specific tmp file to avoid race conditions on shared storage; the
+        // shared producer bounds the name to NAME_MAX for long keys on long hostnames.
+        let temp_path = crate::cache::instance_scoped_meta_tmp_path(&metadata_path);
 
         // Write to temporary file
         if let Err(e) = tokio::fs::write(&temp_path, &json_content).await {
@@ -3867,6 +10588,19 @@ impl JournalConsolidator {
             "Successfully wrote metadata to disk (atomic): cache_key={}, path={:?}",
             metadata.cache_key, metadata_path
         );
+
+        // The disk record changed, so this instance's RAM snapshot of it is stale. Local
+        // hygiene only: a peer's RAM copy stays bounded by its own refresh_interval.
+        let cache_manager = self
+            .cache_manager
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()));
+        if let Some(cache_manager) = cache_manager {
+            cache_manager
+                .invalidate_metadata_cache(&metadata.cache_key)
+                .await;
+        }
 
         Ok(())
     }
@@ -3923,6 +10657,7 @@ impl JournalConsolidator {
         let mut files_truncated = 0u32;
         let mut files_rewritten = 0u32;
         let mut files_skipped = 0u32;
+        let mut retained_unparseable = 0u64;
 
         for journal_entry in journal_files {
             let journal_entry = match journal_entry {
@@ -3959,31 +10694,27 @@ impl JournalConsolidator {
             }
 
             // Acquire file-level lock to prevent races with append operations
+            // Blocking, and re-validated against an unlink by `cleanup_stale_lock_files`;
+            // held until `_lock_file` drops at the end of this iteration.
             let lock_path = journal_path.with_extension("journal.lock");
-            let lock_file = match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
+            let _lock_file = match crate::journal_manager::lock_journal_lock_file(&lock_path, true)
             {
-                Ok(f) => f,
+                Ok(Some(f)) => UnlockOnDrop(f),
+                Ok(None) => {
+                    warn!(
+                        "Journal lock file kept being unlinked, skipping cleanup: path={:?}",
+                        lock_path
+                    );
+                    continue;
+                }
                 Err(e) => {
                     warn!(
-                        "Failed to open journal lock file for cleanup: path={:?}, error={}",
+                        "Failed to acquire journal file lock for cleanup: path={:?}, error={}",
                         lock_path, e
                     );
                     continue;
                 }
             };
-
-            use fs2::FileExt;
-            if let Err(e) = lock_file.lock_exclusive() {
-                warn!(
-                    "Failed to acquire journal file lock for cleanup: path={:?}, error={}",
-                    lock_path, e
-                );
-                continue;
-            }
 
             // Read current journal content (while holding lock).
             // We must re-read because new entries may have been appended since discovery.
@@ -3998,11 +10729,20 @@ impl JournalConsolidator {
                 }
             };
 
-            // Parse entries and separate consolidated from remaining
-            let mut remaining_entries = Vec::new();
+            // Separate the lines this build parsed and applied (removed) from every other
+            // line (kept). Kept lines are carried VERBATIM, never re-serialized: a line this
+            // build cannot parse is typically a newer build's entry on a mixed-version fleet
+            // and is complete and unapplied, and a line this build parses may still carry a
+            // field it does not know, which serde ignores and a re-serialization would drop.
+            // An unterminated tail that does not parse is a torn write; it is kept too (the
+            // startup reaper owns removing a foreign file that holds nothing else) and is
+            // newline-terminated on rewrite, so the next append cannot glue onto it.
+            let mut kept_lines: Vec<&str> = Vec::new();
             let mut removed_count = 0usize;
 
-            for line in content.lines() {
+            for segment in content.split_inclusive('\n') {
+                let terminated = segment.ends_with('\n');
+                let line = segment.strip_suffix('\n').unwrap_or(segment);
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -4019,15 +10759,16 @@ impl JournalConsolidator {
                         if was_consolidated {
                             removed_count += 1;
                         } else {
-                            remaining_entries.push(entry);
+                            kept_lines.push(line);
                         }
                     }
                     Err(e) => {
                         debug!(
-                            "Failed to parse journal entry during cleanup: path={:?}, error={}",
-                            journal_path, e
+                            "Unparseable journal line kept during cleanup: path={:?}, terminated={}, error={}",
+                            journal_path, terminated, e
                         );
-                        // Keep unparseable lines to avoid data loss — force rewrite path
+                        retained_unparseable += 1;
+                        kept_lines.push(line);
                     }
                 }
             }
@@ -4038,10 +10779,9 @@ impl JournalConsolidator {
                 continue;
             }
 
-            let is_fresh_journal = file_name.contains(':');
-
-            if remaining_entries.is_empty() {
-                // All entries consolidated — delete or truncate without rewriting
+            let is_fresh_journal = crate::eviction_worklist::is_fresh_journal_name(&file_name);
+            if kept_lines.is_empty() {
+                // Every line was parsed and applied — delete or truncate without rewriting
                 if is_fresh_journal {
                     match tokio::fs::remove_file(&journal_path).await {
                         Ok(_) => {
@@ -4059,21 +10799,23 @@ impl JournalConsolidator {
                         }
                     }
                 } else {
-                    // Truncate primary journal (keep file for future appends)
-                    // Atomic: write empty to .tmp, sync_all, rename over original
-                    let tmp_path = journal_path.with_extension("journal.tmp");
+                    // Truncate the primary journal in place and keep it, so its instance stays
+                    // in the readiness roster. The journal's lock is held and appenders open by
+                    // path and write only under it, so no append lands between the read above
+                    // and this truncate. No `.journal.tmp` is created: a peer's orphan evidence
+                    // reads one as indeterminate.
                     let truncate_result: std::result::Result<(), String> = async {
-                        let f = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-                            format!("Failed to create tmp file for truncation: {}", e)
-                        })?;
-                        f.sync_all().await.map_err(|e| {
-                            format!("Failed to sync_all tmp file for truncation: {}", e)
-                        })?;
-                        tokio::fs::rename(&tmp_path, &journal_path)
+                        let f = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&journal_path)
                             .await
-                            .map_err(|e| {
-                                format!("Failed to rename tmp file for truncation: {}", e)
-                            })?;
+                            .map_err(|e| format!("Failed to open journal for truncation: {}", e))?;
+                        f.set_len(0)
+                            .await
+                            .map_err(|e| format!("Failed to truncate journal: {}", e))?;
+                        f.sync_all()
+                            .await
+                            .map_err(|e| format!("Failed to sync truncated journal: {}", e))?;
                         Ok(())
                     }
                     .await;
@@ -4091,32 +10833,16 @@ impl JournalConsolidator {
                                 "Failed to truncate journal file: path={:?}, error={}",
                                 journal_path, e
                             );
-                            // Attempt to remove .tmp file, but don't fail if removal fails
-                            if let Err(cleanup_err) = tokio::fs::remove_file(&tmp_path).await {
-                                warn!(
-                                    "Failed to remove tmp file after truncation failure: path={:?}, error={}",
-                                    tmp_path, cleanup_err
-                                );
-                            }
                         }
                     }
                 }
             } else {
-                // Partial consolidation — rewrite with remaining entries (atomic)
+                // Partial consolidation, or applied lines beside unparseable ones — rewrite
+                // with the kept lines, verbatim and in their original order (atomic)
                 let mut new_content = String::new();
-                for entry in &remaining_entries {
-                    match serde_json::to_string(entry) {
-                        Ok(json) => {
-                            new_content.push_str(&json);
-                            new_content.push('\n');
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to serialize journal entry during cleanup: error={}",
-                                e
-                            );
-                        }
-                    }
+                for line in &kept_lines {
+                    new_content.push_str(line);
+                    new_content.push('\n');
                 }
 
                 // Atomic: write to .tmp, sync_all, rename over original
@@ -4146,7 +10872,7 @@ impl JournalConsolidator {
                             "Rewritten journal file (atomic): path={:?}, removed={}, remaining={}",
                             journal_path,
                             removed_count,
-                            remaining_entries.len()
+                            kept_lines.len()
                         );
                     }
                     Err(e) => {
@@ -4172,6 +10898,8 @@ impl JournalConsolidator {
                 files_deleted, files_truncated, files_rewritten, files_skipped
             );
         }
+
+        self.record_retained_unparseable(retained_unparseable);
 
         // Clean up stale lock files (lock files for journals that no longer exist)
         self.cleanup_stale_lock_files(&journals_dir).await;
@@ -4218,27 +10946,155 @@ impl JournalConsolidator {
 
             let journal_path = journals_dir.join(journal_name);
 
-            // If the journal file doesn't exist, the lock file is stale
-            if !journal_path.exists() {
-                match std::fs::remove_file(&lock_path) {
-                    Ok(_) => {
-                        cleaned += 1;
-                        debug!("Removed stale lock file: {:?}", lock_path);
-                    }
-                    Err(e) => {
-                        // Ignore errors - another instance may have already cleaned it
-                        debug!(
-                            "Failed to remove stale lock file: {:?}, error={}",
-                            lock_path, e
-                        );
-                    }
-                }
+            // If the journal file doesn't exist, the lock file may be stale
+            if !journal_path.exists() && remove_lock_file_if_unheld(&lock_path, &journal_path) {
+                cleaned += 1;
+                debug!("Removed stale lock file: {:?}", lock_path);
             }
         }
 
         if cleaned > 0 {
             info!("Cleaned up {} stale journal lock files", cleaned);
         }
+    }
+
+    /// Remove this host's dead-process temp files under `metadata/_shard_state/`,
+    /// `metadata/_write_ledger/` and `size_tracking/`: see [`reap_dead_instance_temps`] for the
+    /// shapes and conditions. Temps only; `.ledger` and `.ledger.mark` are never matched.
+    ///
+    /// The count is published in the same place as the dead-journal count: one INFO line from
+    /// this startup pass, `Cleaned up {n} dead instance temp files`.
+    async fn cleanup_dead_instance_temps_at(cache_dir: PathBuf) {
+        let raw = gethostname::gethostname().to_string_lossy().to_string();
+        let sanitized = raw.replace(['/', '\\'], "_");
+        let mut hosts = vec![raw];
+        if !hosts.contains(&sanitized) {
+            hosts.push(sanitized);
+        }
+        let my_pid = std::process::id();
+        let temps_dir = cache_dir.clone();
+        let reaped = tokio::task::spawn_blocking(move || {
+            let temps = reap_dead_instance_temps(
+                &temps_dir,
+                &hosts,
+                my_pid,
+                DEAD_INSTANCE_TEMP_GRACE,
+                SystemTime::now(),
+            );
+            // Dead instances' `staged_pending/` files, by the same own-host / dead-pid /
+            // grace rule plus a nothing-uncut condition; see `reap_dead_instance_pending_files`.
+            let pending = reap_dead_instance_pending_files(
+                &temps_dir,
+                &hosts,
+                my_pid,
+                DEAD_INSTANCE_TEMP_GRACE,
+                FOREIGN_PENDING_REAP_GRACE,
+                SystemTime::now(),
+            );
+            (temps, pending)
+        })
+        .await;
+        match reaped {
+            Ok(((files, bytes), (pending_files, pending_bytes))) => {
+                if files > 0 {
+                    info!(
+                        "Cleaned up {} dead instance temp files ({:.1} KB) under _shard_state/, _write_ledger/ and size_tracking/",
+                        files,
+                        bytes as f64 / 1024.0
+                    );
+                }
+                if pending_files > 0 {
+                    info!(
+                        "Cleaned up {} dead instance pending-credit files ({:.1} KB) under _shard_state/staged_pending/",
+                        pending_files,
+                        pending_bytes as f64 / 1024.0
+                    );
+                }
+            }
+            Err(e) => warn!("Dead instance temp cleanup task failed: {}", e),
+        }
+
+        // Flat root files earlier builds wrote for bucket-root keys. Two directory
+        // listings, so awaited.
+        //
+        // Deliberately NOT debited. Whether these bytes are still in `total_size` depends on
+        // which absolute install ran last, and that is unknowable per range: the startup census
+        // walks every `.meta` including the roots (so it counted them), while the full and
+        // rolling validations enumerate only `{bucket}/{L1}` directories (so after one of them
+        // the bytes are already gone from the total, and a debit would subtract bytes it never
+        // held). On a cold start the census that follows resets the accumulator and would
+        // discard a debit anyway. Leaving the total alone over-counts by at most these bytes
+        // (KB-scale; bucket-root responses) until the next absolute install, which excludes the
+        // now-deleted files; an over-count is the safe direction for eviction.
+        let flat_dir = cache_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            reap_legacy_flat_root_files(&flat_dir, DEAD_INSTANCE_TEMP_GRACE, SystemTime::now())
+        })
+        .await
+        {
+            Ok((metas, flat_ranges)) => {
+                let removed_bytes: u64 = flat_ranges.iter().map(|r| r.bytes).sum();
+                if metas > 0 || !flat_ranges.is_empty() {
+                    info!(
+                        "Cleaned up {} legacy flat .meta and {} legacy flat .bin files ({} bytes, left in the cache size until the next re-grounding) at the metadata/ and ranges/ roots",
+                        metas,
+                        flat_ranges.len(),
+                        removed_bytes
+                    );
+                }
+            }
+            Err(e) => warn!("Legacy flat cache file cleanup task failed: {}", e),
+        }
+
+        // Range temps (families D and E1) under `ranges/`. That walk is O(resident range
+        // files), so it runs detached rather than holding startup; its result is one INFO line.
+        let range_dir = cache_dir.clone();
+        let raw = gethostname::gethostname().to_string_lossy().to_string();
+        let sanitized = raw.replace(['/', '\\'], "_");
+        let mut range_hosts = vec![raw];
+        if !range_hosts.contains(&sanitized) {
+            range_hosts.push(sanitized);
+        }
+        let range_hosts_for_state = range_hosts.clone();
+        tokio::task::spawn_blocking(move || {
+            let (files, bytes) = reap_dead_instance_range_temps(
+                &range_dir,
+                &range_hosts,
+                std::process::id(),
+                DEAD_INSTANCE_TEMP_GRACE,
+                SystemTime::now(),
+            );
+            if files > 0 {
+                info!(
+                    "Cleaned up {} dead instance range temp files ({:.1} KB) under ranges/",
+                    files,
+                    bytes as f64 / 1024.0
+                );
+            }
+        });
+
+        // Retired ids' header-only shard ledger files, expired reservations and lapsed
+        // scanner documents. Runs after the pending-file reap above, which it depends on, and
+        // detached, since the ledger walk stats every shard ledger file of a candidate id.
+        let state_dir = cache_dir.clone();
+        let state_hosts = range_hosts_for_state;
+        tokio::task::spawn_blocking(move || {
+            let counts = reap_dead_instance_state(
+                &state_dir,
+                &state_hosts,
+                std::process::id(),
+                DEAD_INSTANCE_TEMP_GRACE,
+                FOREIGN_PENDING_REAP_GRACE,
+                SystemTime::now(),
+            );
+            if counts != DeadInstanceStateCounts::default() {
+                info!(
+                    "Cleaned up retired instance state: {} header-only write-ledger files, {} \
+                     expired capacity reservations, {} lapsed scanner documents",
+                    counts.ledger_files, counts.reservations, counts.scanner_docs
+                );
+            }
+        });
     }
 
     /// Remove journal files (and .tmp files) belonging to dead instances.
@@ -4253,12 +11109,33 @@ impl JournalConsolidator {
     /// 1. Lists all `.journal` and `.journal.tmp` files in `_journals/`
     /// 2. Extracts the PID from the filename
     /// 3. Checks if the PID is alive on this host (via `kill(pid, 0)`)
-    /// 4. Removes files from dead PIDs
+    /// 4. For a dead PID, removes its `.journal.tmp`, and removes a `.journal` only when it holds
+    ///    nothing to apply or has been unmodified for longer than `stale_entry_timeout_secs`
+    ///    (with a WARN). A journal still holding entries is left for the consolidation cycle to
+    ///    apply.
     ///
-    /// Safe for multi-instance: only removes files whose hostname matches this host.
-    /// Files from other hosts are left alone (their PIDs are in a different PID namespace).
+    /// Pid liveness is tested only for this host's files (other hosts' pids are in a different
+    /// namespace). Another host's `.journal` is removed only when it holds nothing to apply and
+    /// has been unmodified for [`FOREIGN_JOURNAL_REAP_GRACE`], under its append lock; see
+    /// [`reap_instance_journals`].
+    ///
+    /// It first runs [`Self::cleanup_dead_instance_temps`], the same rule applied to the temp
+    /// files under `_shard_state/`, `_write_ledger/` and `size_tracking/`.
     async fn cleanup_dead_instance_journals(&self) {
-        let journals_dir = self.cache_dir.join("metadata").join("_journals");
+        // A dead journal is replayed only while its fills are as young as the fold would still
+        // retry a missing `.bin` for, which bounds how far a replay moves a fill's freshness.
+        Self::cleanup_dead_instance_journals_at(
+            self.cache_dir.clone(),
+            Duration::from_secs(self.config.stale_entry_timeout_secs),
+        )
+        .await;
+    }
+
+    /// [`Self::cleanup_dead_instance_journals`] over owned values, so `initialize` can defer the
+    /// whole pass onto a detached task without holding a reference to the consolidator.
+    async fn cleanup_dead_instance_journals_at(cache_dir: PathBuf, replay_max_age: Duration) {
+        Self::cleanup_dead_instance_temps_at(cache_dir.clone()).await;
+        let journals_dir = cache_dir.join("metadata").join("_journals");
         if !journals_dir.exists() {
             return;
         }
@@ -4266,109 +11143,36 @@ impl JournalConsolidator {
         let my_hostname = gethostname::gethostname().to_string_lossy().to_string();
         let my_pid = std::process::id();
 
-        let entries = match std::fs::read_dir(&journals_dir) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(
-                    "Failed to read journals dir for dead instance cleanup: {}",
-                    e
-                );
-                return;
-            }
-        };
+        let counts = tokio::task::spawn_blocking(move || {
+            reap_instance_journals(
+                &journals_dir,
+                &my_hostname,
+                my_pid,
+                SystemTime::now(),
+                FOREIGN_JOURNAL_REAP_GRACE,
+                replay_max_age,
+            )
+        })
+        .await
+        .unwrap_or_default();
 
-        let mut removed_count = 0u32;
-        let mut removed_bytes = 0u64;
-
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-
-            // Match patterns: {hostname}:{pid}.journal, {hostname}:{pid}.journal.tmp,
-            // {hostname}:{pid}:{timestamp}.journal (fresh journals from lock contention)
-            let is_journal = file_name.ends_with(".journal") || file_name.ends_with(".journal.tmp");
-            if !is_journal {
-                continue;
-            }
-
-            // Strip suffixes to get the instance_id part
-            let instance_part = file_name
-                .strip_suffix(".journal.tmp")
-                .or_else(|| file_name.strip_suffix(".journal"));
-            let instance_part = match instance_part {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Parse hostname:pid (or hostname:pid:timestamp for fresh journals)
-            let parts: Vec<&str> = instance_part.splitn(3, ':').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let hostname = parts[0];
-            let pid_str = parts[1];
-
-            // Only clean up files from this host
-            if hostname != my_hostname {
-                continue;
-            }
-
-            let pid: u32 = match pid_str.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Skip our own PID
-            if pid == my_pid {
-                continue;
-            }
-
-            // Check if the PID is still alive
-            #[cfg(unix)]
-            let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-            #[cfg(not(unix))]
-            let is_alive = true; // Conservative: don't remove on non-Unix
-
-            if !is_alive {
-                let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                match std::fs::remove_file(&path) {
-                    Ok(_) => {
-                        removed_count += 1;
-                        removed_bytes += file_size;
-                        debug!(
-                            "Removed dead instance journal: file={}, pid={}, size={}",
-                            file_name, pid, file_size
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to remove dead instance journal {}: {}",
-                            file_name, e
-                        );
-                    }
-                }
-
-                // Also remove associated lock file
-                let lock_path = path.with_extension("journal.lock");
-                if lock_path.exists() {
-                    let _ = std::fs::remove_file(&lock_path);
-                }
-            }
-        }
-
-        if removed_count > 0 {
+        if counts.dead_files > 0 {
             info!(
                 "Cleaned up {} dead instance journal files ({:.1} MB)",
-                removed_count,
-                removed_bytes as f64 / (1024.0 * 1024.0)
+                counts.dead_files,
+                counts.dead_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+        if counts.foreign_files > 0 {
+            info!(
+                "Cleaned up {} idle other-host journal files with nothing to apply ({} bytes)",
+                counts.foreign_files, counts.foreign_bytes
+            );
+        }
+        if counts.dead_kept_files > 0 {
+            info!(
+                "Kept {} journal files of stopped processes on this host for consolidation",
+                counts.dead_kept_files
             );
         }
     }
@@ -4381,7 +11185,10 @@ impl JournalConsolidator {
     fn get_metadata_file_path(&self, cache_key: &str) -> Result<PathBuf> {
         let base_dir = self.cache_dir.join("metadata");
 
-        // Use the same sharding logic as DiskCacheManager for consistency
+        // The sharded construction, same as `DiskCacheManager::get_new_metadata_file_path`.
+        // Name that method, not its type: `DiskCacheManager` also carries
+        // `get_legacy_flat_metadata_file_path`, which is the pre-sharding FLAT path and the
+        // only non-sharded `.meta` construction left in the tree.
         crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta")
     }
 
@@ -4407,6 +11214,55 @@ impl JournalConsolidator {
     /// **Validates: Requirements 6.1, 6.2, 6.3, 8.1, 8.2**
     pub async fn shutdown(&self) -> Result<()> {
         info!("JournalConsolidator shutdown initiated");
+
+        // Step -1: stop the maintenance passes. They run on their own tasks, so the background
+        // loop's shutdown signal does not reach them; this is their shutdown signal. Set the
+        // flag first, so the final cycle below spawns nothing new, then abort what is in
+        // flight. An abort lands at the pass's next await point, and every write these passes
+        // make is an atomic rename or a locked append designed to survive a crash between any
+        // two of them, so aborting before process exit is no worse than a crash there. Each
+        // pass's in-progress flag is cleared by its drop guard.
+        self.stop_maintenance();
+        let in_flight: Vec<_> = match self.maintenance_tasks.lock() {
+            Ok(mut t) => t.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
+        for task in &in_flight {
+            task.abort();
+        }
+        for task in in_flight {
+            let _ = task.await;
+        }
+
+        // Step 0a: drain the Write_Ledger's two append stages, so every submission still in
+        // flight receives its real outcome instead of the closed channel a dropped stage task
+        // produces. A closed channel is reported as a failed append, so `record_staged_range`
+        // returns `false` and its caller declines the write-cache credit — for an entry whose
+        // ledger line is already durable that declines a credit the staged fold counts at the
+        // next cut, which diverges the incumbent counter from the fold's figure. Design
+        // § 16.6.14.
+        //
+        // Before the accumulator flush below, so a credit a drained entry unblocks is in the
+        // delta this flush persists. Bounded: an entry still held at the bound keeps whatever it
+        // would have got without the drain.
+        let drained = self
+            .write_ledger
+            .drain_stages(crate::write_ledger::STAGE_DRAIN_BOUND)
+            .await;
+        if drained.is_drained() {
+            debug!("Write-ledger append stages drained on shutdown");
+        } else {
+            warn!(
+                "Write-ledger append stages did not drain within {:?} on shutdown: {} \
+                 submission(s) unanswered at the append stage and {} at the pending-credit \
+                 stage. Each unanswered entry's caller declines its write-cache credit, so the \
+                 incumbent write-cache counter under-states those bytes until a staged-fold pass \
+                 counts their .meta; a durable ledger line is unaffected.",
+                crate::write_ledger::STAGE_DRAIN_BOUND,
+                drained.ledger_unanswered,
+                drained.pending_unanswered
+            );
+        }
 
         // Step 0: Flush pending accumulator delta to disk
         // This ensures any in-memory size deltas are persisted before shutdown.
@@ -4475,11 +11331,56 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         }
     }
 
+    /// The incomplete-upload sweep is a maintenance pass of the consolidation cycle, so an
+    /// IDLE cycle reaps an upload idle past the TTL with no validation scan anywhere (this
+    /// consolidator has no `CacheSizeTracker`, so no validation scheduler exists). A second
+    /// cycle inside the interval does not sweep again.
+    #[tokio::test]
+    async fn an_idle_cycle_reaps_an_expired_incomplete_upload_without_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        consolidator.initialize().await.unwrap();
+        consolidator.set_incomplete_upload_ttl(Duration::from_secs(3600));
+
+        let upload = temp_dir.path().join("mpus_in_progress").join("abandoned");
+        std::fs::create_dir_all(&upload).unwrap();
+        std::fs::write(upload.join("upload.meta"), b"{}").unwrap();
+        std::fs::write(upload.join("part1.bin"), vec![1u8; 512]).unwrap();
+        let old =
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(7200));
+        filetime::set_file_mtime(upload.join("upload.meta"), old).unwrap();
+        filetime::set_file_mtime(&upload, old).unwrap();
+
+        let result = consolidator.run_consolidation_cycle().await.unwrap();
+        consolidator.await_maintenance_passes().await;
+        assert_eq!(
+            result.entries_consolidated, 0,
+            "fixture: the cycle must be idle"
+        );
+        assert!(
+            !upload.exists(),
+            "an idle consolidation cycle did not reap an upload idle past incomplete_upload_ttl"
+        );
+
+        // Inside the interval, a second cycle claims no sweep.
+        assert!(
+            consolidator
+                .maintenance_passes()
+                .claim_incomplete_upload_sweep()
+                .is_none(),
+            "the sweep must not be due again inside min(ttl/4, 1h)"
+        );
+        assert_eq!(incomplete_upload_sweep_interval_secs(3600), 900);
+        assert_eq!(incomplete_upload_sweep_interval_secs(86_400), 3600);
+    }
+
     /// Build a consolidator over a temp dir, for the graduation-accounting tests below.
-    fn graduation_test_consolidator(temp_dir: &TempDir) -> JournalConsolidator {
+    pub(super) fn graduation_test_consolidator(temp_dir: &TempDir) -> JournalConsolidator {
         JournalConsolidator::new(
             temp_dir.path().to_path_buf(),
             Arc::new(JournalManager::new(
@@ -4493,6 +11394,578 @@ mod tests {
             )),
             ConsolidationConfig::default(),
         )
+    }
+
+    /// `Remove` entries for a key whose `.meta` is already gone leave no
+    /// document behind. Both producer shapes go through the real writer,
+    /// `write_eviction_journal_entries`: an entry reclaim of a one-range object, and a byte
+    /// eviction that removed every range of a three-range object.
+    ///
+    /// The red side is the default-document creation: without the Remove-only early return,
+    /// `load_or_create_metadata_with_journal_entries` builds a stub (empty ETag, no ranges)
+    /// and the write lands it on disk.
+    #[tokio::test]
+    async fn remove_only_entries_for_a_deleted_key_leave_no_meta() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let shapes: [(&str, Vec<(u64, u64)>); 2] = [
+            ("test-bucket/scn1/reclaimed", vec![(0, 4095)]),
+            (
+                "test-bucket/scn1/byte-evicted",
+                vec![(0, 4095), (4096, 8191), (8192, 12287)],
+            ),
+        ];
+        for (key, ranges) in &shapes {
+            let meta_path = consolidator.get_metadata_file_path(key).unwrap();
+            assert!(!meta_path.exists(), "precondition: the .meta is gone");
+            let journal: Vec<_> = ranges
+                .iter()
+                .map(|(s, e)| {
+                    (
+                        key.to_string(),
+                        *s,
+                        *e,
+                        e - s + 1,
+                        format!("{}_{}-{}.bin", key, s, e),
+                    )
+                })
+                .collect();
+            consolidator.write_eviction_journal_entries(journal).await;
+
+            let result = consolidator.consolidate_object(key).await.unwrap();
+            assert!(result.success, "{key}: consolidation failed");
+            assert!(
+                !meta_path.exists(),
+                "{key}: Remove-only entries for a deleted key created a stub .meta"
+            );
+            assert_eq!(
+                result.consolidated_entries.len(),
+                ranges.len(),
+                "{key}: every Remove entry must be returned for journal cleanup"
+            );
+            assert!(!result.is_new_object, "{key}: nothing was admitted");
+        }
+    }
+
+    /// Controls: a Remove against a `.meta` that exists still strips its range
+    /// and rewrites the document, and an Add alongside a Remove for an absent `.meta` still
+    /// creates one. Only the Remove-only, document-absent case is skipped.
+    #[tokio::test]
+    async fn remove_only_skip_does_not_touch_existing_meta_or_add_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let key = "test-bucket/scn1/existing";
+        let mut meta = graduated_but_unaccounted_metadata(key, 4096);
+        meta.ranges[0].created_at = SystemTime::now() - Duration::from_secs(600);
+        seed_meta_on_disk(&consolidator, &meta).await;
+        let r = &meta.ranges[0];
+        consolidator
+            .write_eviction_journal_entries(vec![(
+                key.to_string(),
+                r.start,
+                r.end,
+                r.compressed_size,
+                r.file_path.clone(),
+            )])
+            .await;
+        consolidator.consolidate_object(key).await.unwrap();
+        let path = consolidator.get_metadata_file_path(key).unwrap();
+        let persisted: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            persisted.ranges.is_empty(),
+            "a Remove against an existing .meta must still strip its range"
+        );
+
+        let entries = [
+            remove_entry_at("test-bucket/scn1/mixed", 0, 4095, SystemTime::now()),
+            JournalEntry {
+                operation: JournalOperation::Add,
+                ..remove_entry_at("test-bucket/scn1/mixed", 0, 4095, SystemTime::now())
+            },
+        ];
+        let entries = [
+            entries[0].clone(),
+            JournalEntry {
+                object_metadata: Some(ObjectMetadata::default()),
+                ..entries[1].clone()
+            },
+        ];
+        assert!(
+            !no_document_source_for_absent_meta(&entries, || false),
+            "an Add with object_metadata alongside a Remove creates the document"
+        );
+        assert!(
+            no_document_source_for_absent_meta(&entries[..1], || false),
+            "a lone Remove for an absent .meta creates nothing"
+        );
+        assert!(
+            !no_document_source_for_absent_meta(&entries[..1], || true),
+            "a Remove for a present .meta must fold"
+        );
+        assert!(!no_document_source_for_absent_meta(&[], || false));
+    }
+
+    /// With the `.meta` gone between validation and the fold (a peer's eviction),
+    /// only an `Add` or `Update` carrying `object_metadata` creates a document. One case per
+    /// `JournalOperation`, plus an `Add` without `object_metadata` and a mixed
+    /// AccessUpdate + Remove key. Every case's valid entries are returned for journal cleanup.
+    ///
+    /// The red side is the earlier Remove-only predicate: the AccessUpdate-only key, validated
+    /// against a `.meta` that then vanished, folds into a default document and lands a stub.
+    #[tokio::test]
+    async fn only_a_range_fill_with_object_metadata_creates_an_absent_meta() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let now = SystemTime::now();
+        let with_metadata = || {
+            Some(ObjectMetadata {
+                etag: "\"scn2-etag\"".to_string(),
+                last_modified: "Mon, 05 Oct 2026 09:00:00 GMT".to_string(),
+                content_length: 4096,
+                ..Default::default()
+            })
+        };
+        // (case, entries for the key, Add/Update carries object_metadata, expect a document)
+        type Case = (&'static str, Vec<JournalOperation>, Option<bool>, bool);
+        let cases: Vec<Case> = vec![
+            (
+                "access-update",
+                vec![JournalOperation::AccessUpdate],
+                None,
+                false,
+            ),
+            (
+                "ttl-refresh",
+                vec![JournalOperation::TtlRefresh],
+                None,
+                false,
+            ),
+            (
+                "graduation",
+                vec![JournalOperation::Graduation],
+                None,
+                false,
+            ),
+            ("remove", vec![JournalOperation::Remove], None, false),
+            (
+                "access-update-and-remove",
+                vec![JournalOperation::AccessUpdate, JournalOperation::Remove],
+                None,
+                false,
+            ),
+            (
+                "add-no-metadata",
+                vec![JournalOperation::Add],
+                Some(false),
+                false,
+            ),
+            (
+                "add-with-metadata",
+                vec![JournalOperation::Add],
+                Some(true),
+                true,
+            ),
+            (
+                "update-with-metadata",
+                vec![JournalOperation::Update],
+                Some(true),
+                true,
+            ),
+        ];
+        for (case, ops, metadata_flag, expect_document) in cases {
+            let key = format!("test-bucket/scn2/{case}");
+            // A versioned document the object-level entries validate against; the seam
+            // unlinks it after validation.
+            seed_meta_on_disk(
+                &consolidator,
+                &graduated_but_unaccounted_metadata(&key, 4096),
+            )
+            .await;
+            let mut written = 0;
+            for op in ops {
+                let mut entry = JournalEntry {
+                    operation: op.clone(),
+                    instance_id: "test-instance".to_string(),
+                    ..remove_entry_at(&key, 0, 4095, now)
+                };
+                match op {
+                    JournalOperation::TtlRefresh => entry.new_ttl_secs = Some(600),
+                    JournalOperation::AccessUpdate => entry.access_increment = Some(1),
+                    JournalOperation::Graduation => {
+                        entry = graduation_entry(&key, 4096, "test-instance");
+                    }
+                    JournalOperation::Add | JournalOperation::Update => {
+                        if metadata_flag == Some(true) {
+                            entry.object_metadata = with_metadata();
+                        }
+                        entry.object_ttl_secs = Some(600);
+                        let bin = consolidator
+                            .get_range_file_path(&key, &entry.range_spec)
+                            .unwrap();
+                        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+                        std::fs::write(&bin, vec![7u8; 4096]).unwrap();
+                    }
+                    JournalOperation::Remove => {}
+                }
+                consolidator
+                    .journal_manager
+                    .append_range_entry(&key, entry)
+                    .await
+                    .unwrap();
+                written += 1;
+            }
+            meta_unlink_seam::arm(&key);
+            let result = consolidator.consolidate_object(&key).await.unwrap();
+            assert!(
+                !meta_unlink_seam::take(&key),
+                "{key}: FIXTURE: the seam never fired"
+            );
+            assert!(result.success, "{key}: consolidation failed");
+            let meta_path = consolidator.get_metadata_file_path(&key).unwrap();
+            assert_eq!(
+                meta_path.exists(),
+                expect_document,
+                "{key}: absent-.meta document created = {}, expected {}",
+                meta_path.exists(),
+                expect_document
+            );
+            assert_eq!(
+                result.consolidated_entries.len(),
+                written,
+                "{key}: every valid entry must be returned for journal cleanup"
+            );
+            if !expect_document {
+                assert!(!result.is_new_object, "{key}: nothing was admitted");
+            }
+        }
+    }
+
+    /// A legacy `CacheEntry`-shape `.meta` (int-array `body`, `is_put_cached`, no
+    /// `object_metadata`), as the fleet test plants it.
+    fn legacy_meta_json(cache_key: &str) -> String {
+        serde_json::json!({
+            "cache_key": cache_key,
+            "headers": {},
+            "body": [1, 2, 3, 4],
+            "ranges": [],
+            "metadata": { "etag": "\"scn3-legacy\"", "last_modified": "", "content_length": 4 },
+            "created_at": { "secs_since_epoch": 1_700_000_000u64, "nanos_since_epoch": 0 },
+            "expires_at": { "secs_since_epoch": 1_700_003_600u64, "nanos_since_epoch": 0 },
+            "is_put_cached": false
+        })
+        .to_string()
+    }
+
+    pub(super) fn object_metadata_b() -> ObjectMetadata {
+        ObjectMetadata {
+            etag: "\"scn3-etag\"".to_string(),
+            last_modified: "Mon, 05 Oct 2026 09:00:00 GMT".to_string(),
+            content_length: 4096,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 4096,
+            ..Default::default()
+        }
+    }
+
+    /// A planted legacy `.meta`, then a journal-mode range fill, then consolidation, ends
+    /// with a valid `NewCacheMetadata` carrying the fill's `object_metadata` and listing only
+    /// the fill's range.
+    ///
+    /// The fill itself must remove the legacy document (the first assertion): consolidation
+    /// also heals an unloadable `.meta`, so without that check a fill that skipped the heal
+    /// would still end green.
+    #[tokio::test]
+    async fn a_journal_fill_over_a_legacy_meta_heals_it_on_consolidation() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        std::fs::create_dir_all(dir.join("metadata").join("_journals")).unwrap();
+        let mut dc =
+            crate::disk_cache::DiskCacheManager::new(dir.clone(), true, 1024, false, 1_048_576);
+        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
+            dir.clone(),
+            Arc::new(MetadataLockManager::new(
+                dir.clone(),
+                Duration::from_secs(30),
+                3,
+            )),
+            Arc::new(JournalManager::new(
+                dir.clone(),
+                "scn3-instance".to_string(),
+            )),
+            Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
+                1024 * 1024,
+                100,
+            )),
+        );
+        dc.set_hybrid_metadata_writer(Arc::new(tokio::sync::Mutex::new(writer)));
+        dc.initialize().await.unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let key = "test-bucket/scn3/t28-legacy-meta.bin";
+        let meta_path = consolidator.get_metadata_file_path(key).unwrap();
+        assert_eq!(
+            meta_path,
+            dc.get_new_metadata_file_path(key),
+            "FIXTURE: one path"
+        );
+        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        let legacy = legacy_meta_json(key);
+        std::fs::write(&meta_path, &legacy).unwrap();
+
+        dc.store_range(
+            key,
+            0,
+            4095,
+            &[7u8; 4096],
+            object_metadata_b(),
+            Duration::from_secs(600),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dc.get_new_range_file_path(key, 0, 4095).exists(),
+            "FIXTURE: the fill must publish its .bin"
+        );
+        assert!(
+            std::fs::read_to_string(&meta_path).ok().as_deref() != Some(legacy.as_str()),
+            "the legacy .meta survived the journal-mode fill: the fill skipped it and only \
+             journalled"
+        );
+
+        let result = consolidator.consolidate_object(key).await.unwrap();
+        assert!(result.success, "consolidation failed: {:?}", result.error);
+        let healed: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap())
+                .expect("the healed .meta must parse as NewCacheMetadata");
+        assert_eq!(healed.object_metadata.etag, "\"scn3-etag\"");
+        assert_eq!(healed.object_metadata.content_length, 4096);
+        let extents: Vec<(u64, u64)> = healed.ranges.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(extents, vec![(0, 4095)], "only the fill's range is listed");
+    }
+
+    /// Consolidation of a key whose `.meta` cannot be loaded (legacy shape, or a stable
+    /// parse failure) and whose journal holds a valid `Add` treats the document as absent: it
+    /// succeeds, writes a fresh document, and a second cycle succeeds too. Before, every cycle
+    /// failed with "Failed to parse metadata file" and the document stayed in place.
+    #[tokio::test]
+    async fn consolidation_over_an_unloadable_meta_with_valid_adds_succeeds() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        for (case, plant) in [
+            ("legacy", legacy_meta_json("test-bucket/scn3/legacy")),
+            ("parse-failure", "{\"cache_key\": \"truncated".to_string()),
+        ] {
+            let key = format!("test-bucket/scn3/{case}");
+            let meta_path = consolidator.get_metadata_file_path(&key).unwrap();
+            std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+            std::fs::write(&meta_path, &plant).unwrap();
+            let mut entry = JournalEntry {
+                operation: JournalOperation::Add,
+                instance_id: "test-instance".to_string(),
+                object_metadata: Some(object_metadata_b()),
+                object_ttl_secs: Some(600),
+                ..remove_entry_at(&key, 0, 4095, SystemTime::now())
+            };
+            entry.range_spec.compressed_size = 4096;
+            let bin = consolidator
+                .get_range_file_path(&key, &entry.range_spec)
+                .unwrap();
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, vec![7u8; 4096]).unwrap();
+            consolidator
+                .journal_manager
+                .append_range_entry(&key, entry)
+                .await
+                .unwrap();
+
+            for cycle in 1..=2 {
+                let result = consolidator.consolidate_object(&key).await.unwrap();
+                assert!(
+                    result.success,
+                    "{key}: cycle {cycle} failed: {:?}",
+                    result.error
+                );
+            }
+            let healed: NewCacheMetadata =
+                serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap())
+                    .unwrap_or_else(|e| panic!("{key}: the .meta must now parse: {e}"));
+            assert_eq!(healed.object_metadata.etag, "\"scn3-etag\"", "{key}");
+            assert_eq!(healed.ranges.len(), 1, "{key}");
+        }
+    }
+
+    /// An unloadable `.meta` whose journal holds only entries that cannot create a
+    /// document (a `Remove`) is removed and nothing is written in its place.
+    #[tokio::test]
+    async fn consolidation_removes_an_unloadable_meta_with_no_document_source() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let key = "test-bucket/scn3/remove-only";
+        let meta_path = consolidator.get_metadata_file_path(key).unwrap();
+        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        std::fs::write(&meta_path, legacy_meta_json(key)).unwrap();
+        consolidator
+            .journal_manager
+            .append_range_entry(
+                key,
+                JournalEntry {
+                    instance_id: "test-instance".to_string(),
+                    ..remove_entry_at(key, 0, 4095, SystemTime::now())
+                },
+            )
+            .await
+            .unwrap();
+        let result = consolidator.consolidate_object(key).await.unwrap();
+        assert!(result.success, "consolidation failed: {:?}", result.error);
+        assert!(!meta_path.exists(), "the unloadable .meta must be removed");
+        assert_eq!(
+            result.consolidated_entries.len(),
+            1,
+            "the Remove is cleaned up"
+        );
+    }
+
+    /// A stub the earlier path wrote WAS counted in `cached_objects`. The fold
+    /// reported `is_new_object = had_no_ranges_before && entries_consolidated > 0` (before
+    /// Made it "the fold created the document"; a stub is a created document), a default
+    /// document has no ranges, and the `Remove` arm counts itself applied unconditionally
+    /// (as does `TtlRefresh` with a TTL). Only an AccessUpdate-only stub went uncounted. The
+    /// stub reaper therefore decrements `cached_objects` once per stub it removes.
+    #[tokio::test]
+    async fn a_stub_from_the_old_default_document_path_counted_as_a_new_object() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let key = "test-bucket/scn2/stub";
+        let base = remove_entry_at(key, 0, 4095, SystemTime::now());
+        let applied = |entry: JournalEntry| {
+            let mut stub = NewCacheMetadata {
+                cache_key: key.to_string(),
+                ..Default::default()
+            };
+            assert!(stub.ranges.is_empty(), "FIXTURE: a default document");
+            let (n, _, _) = consolidator.apply_journal_entries(&mut stub, &[entry]);
+            n
+        };
+        assert!(
+            applied(base.clone()) > 0,
+            "a Remove-only stub reported is_new_object"
+        );
+        assert!(
+            applied(JournalEntry {
+                operation: JournalOperation::TtlRefresh,
+                new_ttl_secs: Some(600),
+                ..base.clone()
+            }) > 0,
+            "a TtlRefresh-only stub reported is_new_object"
+        );
+        assert_eq!(
+            applied(JournalEntry {
+                operation: JournalOperation::AccessUpdate,
+                access_increment: Some(1),
+                ..base
+            }),
+            0,
+            "an AccessUpdate-only stub did not report is_new_object"
+        );
+    }
+
+    /// R15.2 at `retire_other_version_fills`: an other-version fill whose `.bin`
+    /// unlink fails while the file is present stays listed, so the bytes stay named and
+    /// evictable. The second call is the positive control: with the unlink succeeding the
+    /// extent is unlisted and the file is gone.
+    #[test]
+    fn retire_other_version_fills_keeps_extent_listed_when_unlink_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let key = "test-bucket/scn4/retire.bin";
+        let mut metadata = graduated_but_unaccounted_metadata(key, 100);
+        let mut entry = graduation_entry(key, 100, "peer-instance");
+        entry.operation = JournalOperation::Add;
+        entry.range_spec.start = 0;
+        entry.range_spec.end = 99;
+        entry.range_spec.created_at = metadata.ranges[0].created_at + Duration::from_secs(1);
+        let path = consolidator
+            .get_range_file_path(key, &entry.range_spec)
+            .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, [7u8; 100]).unwrap();
+
+        crate::disk_cache::unlink_fault::arm(&path);
+        consolidator.retire_other_version_fills(&mut metadata, std::slice::from_ref(&entry));
+        assert!(path.exists(), "the injected failure must leave the .bin");
+        assert_eq!(
+            metadata.ranges.len(),
+            1,
+            "an extent whose .bin unlink failed was unlisted, leaving bytes no .meta names"
+        );
+        assert!(
+            metadata.ranges[0].unservable,
+            "SCN5: the kept extent may hold the other version's bytes and must be unservable"
+        );
+
+        consolidator.retire_other_version_fills(&mut metadata, std::slice::from_ref(&entry));
+        assert!(!path.exists(), "control: the unlink should succeed");
+        assert!(
+            metadata.ranges.is_empty(),
+            "control: the extent is unlisted"
+        );
+    }
+
+    /// A later consolidation pass retries the unlink of an unservable extent. A
+    /// failure keeps it listed and marked; a success unlinks the file and drops the
+    /// listing. An unmarked extent at other offsets is untouched throughout.
+    #[test]
+    fn retire_unservable_extents_drops_listing_once_unlink_succeeds() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let key = "test-bucket/scn5/unservable.bin";
+        let mut metadata = graduated_but_unaccounted_metadata(key, 100);
+        metadata.ranges[0].start = 0;
+        metadata.ranges[0].end = 99;
+        metadata.ranges[0].unservable = true;
+        let mut healthy = metadata.ranges[0].clone();
+        healthy.start = 100;
+        healthy.end = 199;
+        healthy.unservable = false;
+        metadata.ranges.push(healthy.clone());
+        let marked_path = consolidator
+            .get_range_file_path(key, &metadata.ranges[0])
+            .unwrap();
+        let healthy_path = consolidator.get_range_file_path(key, &healthy).unwrap();
+        std::fs::create_dir_all(marked_path.parent().unwrap()).unwrap();
+        std::fs::write(&marked_path, [7u8; 100]).unwrap();
+        std::fs::write(&healthy_path, [8u8; 100]).unwrap();
+
+        crate::disk_cache::unlink_fault::arm(&marked_path);
+        consolidator.retire_unservable_extents(&mut metadata);
+        assert!(
+            marked_path.exists(),
+            "the injected failure must leave the .bin"
+        );
+        assert_eq!(
+            metadata.ranges.len(),
+            2,
+            "a failed retry must keep the listing"
+        );
+        assert!(metadata.ranges[0].unservable, "and keep it unservable");
+
+        consolidator.retire_unservable_extents(&mut metadata);
+        assert!(!marked_path.exists(), "the retry unlinks the file");
+        assert_eq!(
+            metadata
+                .ranges
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect::<Vec<_>>(),
+            vec![(100, 199)],
+            "the unservable listing is dropped; the healthy extent stays"
+        );
+        assert!(
+            healthy_path.exists(),
+            "the healthy extent's file is untouched"
+        );
     }
 
     /// A `Graduation` entry carrying `staged_compressed_size`, as
@@ -4518,6 +11991,8 @@ mod tests {
                 last_accessed: now,
                 access_count: 0,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             },
             operation: JournalOperation::Graduation,
             range_file_path: String::new(),
@@ -4526,6 +12001,7 @@ mod tests {
             object_ttl_secs: None,
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         }
     }
 
@@ -4612,11 +12088,46 @@ mod tests {
             "re-presenting the identical range must not double-credit write_cache_size (got {write_cache_after_second})"
         );
     }
+    /// Loss mode L1 at the multipart credit site (cache-eviction-at-scale § 16.6.12
+    /// point 3): when the staged range's `Write_Ledger` append fails, the write-cache
+    /// credit is declined and `total_size` is still credited. The failure is real I/O: a
+    /// regular file planted at `metadata/_write_ledger` makes the append's
+    /// `create_dir_all` fail. Credit-first ordering read `(4096, 4096)` here.
+    #[tokio::test]
+    async fn write_multipart_journal_entries_declines_write_cache_credit_on_failed_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        std::fs::create_dir_all(temp_dir.path().join("metadata")).unwrap();
+        std::fs::write(
+            temp_dir.path().join("metadata/_write_ledger"),
+            b"not a directory",
+        )
+        .unwrap();
+        consolidator
+            .write_multipart_journal_entries(
+                "test-bucket/multipart-failed-append.bin",
+                vec![create_test_range_spec(0, 4095)],
+                ObjectMetadata {
+                    is_write_cached: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            (
+                consolidator.size_accumulator().current_delta(),
+                consolidator.size_accumulator().current_write_cache_delta()
+            ),
+            (4096, 0),
+            "a failed ledger append must credit total_size and decline the write-cache credit"
+        );
+    }
 
     /// R1.1: a graduation debits `write_cache_size` by the entry's staged compressed
     /// size and leaves `total_size` alone — the bytes are still on disk, they have only
-    /// changed tier. `apply_journal_entries` reports the debit; `consolidate_key`
-    /// negates it into `write_cache_delta` while holding `size_delta` at 0.
+    /// changed tier. `apply_journal_entries`' `Graduation` arm reports the debit, negating
+    /// it into `write_cache_delta` while holding `size_delta` at 0; `run_consolidation_cycle`
+    /// applies the aggregate to Size_State.
     #[tokio::test]
     async fn graduation_entry_reports_its_staged_bytes_and_sets_the_token() {
         let temp_dir = TempDir::new().unwrap();
@@ -4805,6 +12316,7 @@ mod tests {
             object_ttl_secs: None,
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         };
 
         let (_applied, size_affecting, graduated_bytes) =
@@ -4828,7 +12340,7 @@ mod tests {
 
     /// A `Remove` entry for `(start, end)` stamped `timestamp`, as
     /// `write_eviction_journal_entries` builds it.
-    fn remove_entry_at(
+    pub(super) fn remove_entry_at(
         cache_key: &str,
         start: u64,
         end: u64,
@@ -4848,6 +12360,7 @@ mod tests {
             object_ttl_secs: None,
             access_increment: None,
             object_metadata: None,
+            fill_witness: None,
         }
     }
 
@@ -5003,6 +12516,58 @@ mod tests {
         );
     }
 
+    /// An `Add` entry whose range file is still absent after the stale timeout is discarded
+    /// and counted in `atomic_metadata.journal_validation_failures`; a recent one is kept
+    /// pending and not counted.
+    ///
+    /// The counter is process-global and other tests in this binary discard stale entries
+    /// too, so the positive assertion is a lower bound.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the `JOURNAL_VALIDATION_FAILURES.fetch_add` removed, the lower-bound assertion
+    /// fails (run this test alone).
+    #[tokio::test]
+    async fn a_stale_range_entry_is_counted_as_a_validation_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let cache_key = "test-bucket/never-landed-object";
+        let stale_timeout = Duration::from_secs(consolidator.config.stale_entry_timeout_secs);
+        let make_add = |start: u64, age: Duration| {
+            let mut entry = graduation_entry(cache_key, 1024, "instance-a");
+            entry.operation = JournalOperation::Add;
+            entry.timestamp = SystemTime::now() - age;
+            entry.range_spec.start = start;
+            entry.range_spec.end = start + 1023;
+            entry.range_spec.file_path = format!("test-bucket/never-landed-object_{start}.bin");
+            entry
+        };
+        let stale = make_add(0, stale_timeout + Duration::from_secs(60));
+        let recent = make_add(4096, Duration::ZERO);
+        for entry in [&stale, &recent] {
+            assert!(
+                !consolidator
+                    .get_range_file_path(cache_key, &entry.range_spec)
+                    .unwrap()
+                    .exists(),
+                "fixture precondition: the range file must be absent"
+            );
+        }
+
+        let before = journal_validation_failures();
+        let (valid, stale_out) = consolidator
+            .validate_journal_entries_with_staleness(&[stale, recent])
+            .await;
+        let after = journal_validation_failures();
+
+        assert!(valid.is_empty(), "neither entry has a range file");
+        assert_eq!(stale_out.len(), 1, "only the aged entry is stale");
+        assert!(
+            after > before,
+            "a discarded stale range entry must be counted ({before} -> {after})"
+        );
+    }
+
     /// The end-to-end statement of the same fix, through `consolidate_object`, asserting
     /// all three observed fleet symptoms together — which is what the fleet evidence
     /// demanded, since a partial explanation of any one of them was misleading.
@@ -5065,6 +12630,136 @@ mod tests {
             "the entry must be returned for journal cleanup, not retained for retry"
         );
         assert_eq!(result.entries_consolidated, 1);
+    }
+
+    /// **AFTER ACTIVATION**, a `Graduation` entry written by an old instance is parsed,
+    /// debits nothing, counts as a no-op, and is still retired from the journal.
+    ///
+    /// # This is the whole of § 16.6.8's ruling (a), end to end, in one fixture
+    ///
+    /// The variant survives; only the debit application is inert. Five separate properties
+    /// have to hold together, and each of them is a different failure if it does not:
+    ///
+    /// | Property | If it broke instead |
+    /// |---|---|
+    /// | the entry PARSES | the skip-not-fatal parse policy drops it silently, and correctness rests on a silent drop |
+    /// | `write_cache_delta == 0` | the deleted lossy debit channel is still live and fights the fold |
+    /// | the token is NOT set | `graduation_accounted` would be written by a mechanism that no longer reads it |
+    /// | `graduation_noop_entries_total` moves | the drain of the legacy channel is unobservable |
+    /// | the entry is RETIRED | entries accumulate in the journal forever, which is what makes (a) "cleanup-only" rather than "(b) with dead code" |
+    ///
+    /// # The pair with the Phase L test above is the experiment
+    ///
+    /// `consolidating_a_graduation_debits_the_write_tier_and_retires_the_entry` runs the
+    /// identical fixture at epoch `0` and asserts `write_cache_delta == -staged`. This one
+    /// changes exactly one thing — the epoch document — and asserts `0`. Neither test alone
+    /// establishes the gate: a build that always debited would pass the first, a build that
+    /// never debited would pass this one, and only the pair distinguishes "gated" from
+    /// "unconditional in one direction or the other".
+    ///
+    /// A failure implicates the `fold_authority_active_latched` branch of the
+    /// `JournalOperation::Graduation` arm in `apply_journal_entries`, and — for the retirement
+    /// half — the `matches!` arm in `validate_journal_entries_with_staleness` that puts the
+    /// entry in `valid_entries`. The assertions read `write_cache_delta` and
+    /// `consolidated_entries`, which are the values `run_consolidation_cycle` branches on to
+    /// apply the debit and to clean the journal — not a derived gauge downstream.
+    #[tokio::test]
+    async fn after_activation_a_graduation_entry_is_a_counted_noop_and_is_still_retired() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/graduated-object-post-activation";
+        let staged = 4096u64;
+        seed_meta_on_disk(
+            &consolidator,
+            &graduated_but_unaccounted_metadata(cache_key, staged),
+        )
+        .await;
+
+        // The entry is written by the REAL producer while still in Phase L — which is exactly
+        // the entry an old instance leaves behind, and the only entry this arm can ever see.
+        assert!(
+            consolidator
+                .write_graduation_journal_entry(cache_key, staged)
+                .await,
+            "precondition: the journal entry must be appended"
+        );
+
+        // Now activate, so the entry is consolidated on the far side of the flip.
+        assert!(
+            crate::staged_authority::activate(temp_dir.path(), "host:test").unwrap(),
+            "precondition: activation must flip the epoch"
+        );
+        assert!(
+            crate::staged_authority::fold_authority_active_latched(temp_dir.path()),
+            "precondition: the latch must read FOLD, or this exercises the Phase L arm and \
+             silently duplicates the sibling test"
+        );
+
+        let before_noops = graduation_noop_entries_total();
+        let result = consolidator.consolidate_object(cache_key).await.unwrap();
+
+        // The debit channel is gone.
+        assert_eq!(
+            result.write_cache_delta, 0,
+            "after activation a Graduation entry must debit NOTHING: the fold recomputes \
+             write_cache_size from the .meta the graduation already wrote, so a debit here \
+             would subtract bytes the fold has already excluded — the mixed-authority \
+             under-count § 16.6.6 exists to prevent"
+        );
+        assert_eq!(
+            result.size_delta, 0,
+            "total_size must not move under either derivation — the bytes are still on disk"
+        );
+
+        // The token is not touched. Read off disk, because the fleet's evidence is a file.
+        let persisted: NewCacheMetadata = serde_json::from_str(
+            &tokio::fs::read_to_string(consolidator.get_metadata_file_path(cache_key).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !persisted.object_metadata.graduation_accounted,
+            "the exactly-once token must NOT be set after activation: it is the token of a \
+             mechanism that no longer reads it, and writing it would leave a .meta asserting \
+             an accounting event that never happened"
+        );
+
+        // It is counted, so the legacy channel's drain is observable.
+        assert!(
+            graduation_noop_entries_total() > before_noops,
+            "graduation_noop_entries_total must move, or an entry stream that never stops \
+             draining is indistinguishable from one that drained immediately"
+        );
+
+        // And RETIRED. This is the "cleanup" in cleanup-only, and it is why the variant is
+        // kept rather than deleted: without it, every Graduation entry ever written stays in
+        // a journal file forever.
+        assert_eq!(
+            result.consolidated_entries.len(),
+            1,
+            "the entry must still be returned for journal cleanup after activation — a \
+             no-op that is not retired accumulates without bound"
+        );
+        assert_eq!(
+            result.consolidated_entries[0].operation,
+            JournalOperation::Graduation,
+            "the retired entry must be the Graduation entry itself"
+        );
+
+        // `entries_applied` deliberately does NOT count it: it feeds `is_new_object`, which
+        // credits `cached_objects`, and an object whose only journal entry is a graduation is
+        // not a new object.
+        assert_eq!(
+            result.entries_consolidated, 0,
+            "a no-op must not count as an applied entry: entries_consolidated feeds \
+             is_new_object, which would falsely credit cached_objects"
+        );
+        assert!(
+            !result.is_new_object,
+            "a graduation no-op must never make an object look newly cached"
+        );
     }
 
     /// A graduation must not disturb the object's ranges. The carrier `RangeSpec` is
@@ -5247,6 +12942,8 @@ mod tests {
                 last_accessed: now,
                 access_count: 1,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             };
 
             let mut metadata = NewCacheMetadata {
@@ -5278,6 +12975,7 @@ mod tests {
                     object_ttl_secs: None,
                     access_increment: None,
                     object_metadata: None,
+                    fill_witness: None,
                 });
             }
 
@@ -5367,6 +13065,8 @@ mod tests {
                 last_accessed: now,
                 access_count: 1,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             };
 
             let range2 = RangeSpec {
@@ -5380,6 +13080,8 @@ mod tests {
                 last_accessed: now,
                 access_count: 5,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             };
 
             let range3 = RangeSpec {
@@ -5393,6 +13095,8 @@ mod tests {
                 last_accessed: now,
                 access_count: 1,
                 staged: None,
+                unservable: false,
+                file_identity: None,
             };
 
             // Create metadata with range2 (for TTL refresh and access update tests)
@@ -5423,6 +13127,7 @@ mod tests {
                     object_ttl_secs: Some(3600),
                     access_increment: None,
                     object_metadata: None,
+                    fill_witness: None,
                 },
                 // TtlRefresh operation - refresh TTL for range2
                 JournalEntry {
@@ -5437,6 +13142,7 @@ mod tests {
                     object_ttl_secs: None,
                     access_increment: None,
                     object_metadata: None,
+                    fill_witness: None,
                 },
                 // AccessUpdate operation - update access count for range2
                 JournalEntry {
@@ -5451,6 +13157,7 @@ mod tests {
                     object_ttl_secs: None,
                     access_increment: Some(access_increment as u64),
                     object_metadata: None,
+                    fill_witness: None,
                 },
                 // Add operation - add range3
                 JournalEntry {
@@ -5465,6 +13172,7 @@ mod tests {
                     object_ttl_secs: Some(3600),
                     access_increment: None,
                     object_metadata: None,
+                    fill_witness: None,
                 },
             ];
 
@@ -5555,6 +13263,7 @@ mod tests {
             last_consolidation: now,
             consolidation_count: 42,
             last_updated_by: "test-host:12345".to_string(),
+            ..Default::default()
         };
 
         // Serialize to JSON
@@ -5637,6 +13346,7 @@ mod tests {
             consolidation_count: 10,
             last_updated_by: "test-host:99999".to_string(),
             last_consolidation: SystemTime::now(),
+            ..Default::default()
         };
 
         // Persist to disk
@@ -5678,7 +13388,7 @@ mod tests {
         );
 
         // Initial size should be 0 (no size_state.json file)
-        assert_eq!(consolidator.get_current_size().await, 0);
+        assert_eq!(consolidator.get_current_size().await.unwrap(), 0);
 
         // Persist a state with size
         let state = SizeState {
@@ -5688,11 +13398,15 @@ mod tests {
             consolidation_count: 0,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
+            ..Default::default()
         };
         consolidator.persist_size_state(&state).await.unwrap();
 
         // Should reflect new size from disk
-        assert_eq!(consolidator.get_current_size().await, 1024 * 1024 * 100);
+        assert_eq!(
+            consolidator.get_current_size().await.unwrap(),
+            1024 * 1024 * 100
+        );
     }
 
     /// Design tests 7 and 8: the Validation_Scan re-grounds an inflated
@@ -5700,7 +13414,7 @@ mod tests {
     ///
     /// These are the only mechanism that un-inflates a figure that is already inflated
     /// (R6). Graduation and eviction stop the leak; nothing else corrects the residue,
-    /// which is why `T42c` returning to green at checkpoint 2 was attributed here rather
+    /// which is why the fleet test returning to green at checkpoint 2 was attributed here rather
     /// than to R5.
     mod validation_regrounds_write_cache_size {
         use super::*;
@@ -5751,11 +13465,12 @@ mod tests {
                     consolidation_count: 0,
                     last_updated_by: "test".to_string(),
                     last_consolidation: SystemTime::now(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
             assert_eq!(
-                consolidator.get_write_cache_size().await,
+                consolidator.get_write_cache_size().await.unwrap(),
                 INFLATED,
                 "precondition: the inflated figure must be installed, or this test \
                  asserts re-grounding of something that was never wrong"
@@ -5766,12 +13481,12 @@ mod tests {
                 .await;
 
             assert_eq!(
-                consolidator.get_write_cache_size().await,
+                consolidator.get_write_cache_size().await.unwrap(),
                 0,
                 "R6.1: the scan's staged figure must replace the tracked one"
             );
             assert_eq!(
-                consolidator.get_current_size().await,
+                consolidator.get_current_size().await.unwrap(),
                 19_748_298_884,
                 "re-grounding the staged figure must not disturb the total"
             );
@@ -5797,11 +13512,11 @@ mod tests {
                 .await;
 
             assert_eq!(
-                consolidator.get_write_cache_size().await,
+                consolidator.get_write_cache_size().await.unwrap(),
                 1_000,
                 "R6.4: a staged figure above the total must be clamped to the total"
             );
-            assert_eq!(consolidator.get_current_size().await, 1_000);
+            assert_eq!(consolidator.get_current_size().await.unwrap(), 1_000);
         }
 
         /// The boundary, pinned separately: equal is legal. A whole cache consisting of
@@ -5818,7 +13533,7 @@ mod tests {
                 .await;
 
             assert_eq!(
-                consolidator.get_write_cache_size().await,
+                consolidator.get_write_cache_size().await.unwrap(),
                 4_096,
                 "an all-staged cache is legal: the invariant is subset, not strict subset"
             );
@@ -5842,6 +13557,7 @@ mod tests {
                     consolidation_count: 0,
                     last_updated_by: "test".to_string(),
                     last_consolidation: SystemTime::now(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -5851,7 +13567,7 @@ mod tests {
                 .await;
 
             assert_eq!(
-                consolidator.get_write_cache_size().await,
+                consolidator.get_write_cache_size().await.unwrap(),
                 4_096,
                 "None means 'not measured', not 'measured as zero'"
             );
@@ -5879,7 +13595,7 @@ mod tests {
         );
 
         // Initial write cache size should be 0 (no size_state.json file)
-        assert_eq!(consolidator.get_write_cache_size().await, 0);
+        assert_eq!(consolidator.get_write_cache_size().await.unwrap(), 0);
 
         // Persist a state with write cache size
         let state = SizeState {
@@ -5889,11 +13605,15 @@ mod tests {
             consolidation_count: 0,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
+            ..Default::default()
         };
         consolidator.persist_size_state(&state).await.unwrap();
 
         // Should reflect new size from disk
-        assert_eq!(consolidator.get_write_cache_size().await, 1024 * 1024 * 10);
+        assert_eq!(
+            consolidator.get_write_cache_size().await.unwrap(),
+            1024 * 1024 * 10
+        );
     }
 
     #[tokio::test]
@@ -5924,11 +13644,12 @@ mod tests {
             consolidation_count: 100,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
+            ..Default::default()
         };
         consolidator.persist_size_state(&state).await.unwrap();
 
         // Get state async (reads from disk)
-        let loaded_state = consolidator.get_size_state().await;
+        let loaded_state = consolidator.get_size_state().await.unwrap();
         assert_eq!(loaded_state.total_size, 1024 * 1024 * 200);
         assert_eq!(loaded_state.write_cache_size, 1024 * 1024 * 20);
         assert_eq!(loaded_state.consolidation_count, 100);
@@ -6027,7 +13748,7 @@ mod tests {
         consolidator.initialize().await.unwrap();
 
         // State should be default (zeros)
-        let state = consolidator.get_size_state().await;
+        let state = consolidator.get_size_state().await.unwrap();
         assert_eq!(state.total_size, 0);
         assert_eq!(state.write_cache_size, 0);
         assert_eq!(state.consolidation_count, 0);
@@ -6064,6 +13785,7 @@ mod tests {
             last_consolidation: SystemTime::now(),
             consolidation_count: 42,
             last_updated_by: "previous-instance:12345".to_string(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&state).unwrap();
         tokio::fs::write(consolidator.size_state_path.clone(), json)
@@ -6074,7 +13796,7 @@ mod tests {
         consolidator.initialize().await.unwrap();
 
         // State should match what we wrote
-        let loaded_state = consolidator.get_size_state().await;
+        let loaded_state = consolidator.get_size_state().await.unwrap();
         assert_eq!(loaded_state.total_size, 1024 * 1024 * 100);
         assert_eq!(loaded_state.write_cache_size, 1024 * 1024 * 10);
         assert_eq!(loaded_state.consolidation_count, 42);
@@ -6145,6 +13867,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         // Create the range file so validation passes
@@ -6176,7 +13900,9 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            // A range fill carries the response's metadata; only that may create the `.meta`.
+            object_metadata: Some(ObjectMetadata::default()),
+            fill_witness: None,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -6193,7 +13919,7 @@ mod tests {
         assert_eq!(result.current_size, 1024);
 
         // Verify size state was updated
-        let state = consolidator.get_size_state().await;
+        let state = consolidator.get_size_state().await.unwrap();
         assert_eq!(state.total_size, 1024);
         assert_eq!(state.consolidation_count, 1);
     }
@@ -6226,6 +13952,7 @@ mod tests {
             consolidation_count: 5,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
+            ..Default::default()
         };
         consolidator
             .persist_size_state(&initial_state)
@@ -6246,6 +13973,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         // Create the range file
@@ -6277,7 +14006,9 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            // A range fill carries the response's metadata; only that may create the `.meta`.
+            object_metadata: Some(ObjectMetadata::default()),
+            fill_witness: None,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -6292,7 +14023,7 @@ mod tests {
         assert_eq!(result.current_size, 1000 + 2048); // Initial + delta
 
         // Verify state was updated
-        let state = consolidator.get_size_state().await;
+        let state = consolidator.get_size_state().await.unwrap();
         assert_eq!(state.total_size, 1000 + 2048);
         assert_eq!(state.consolidation_count, 6); // Was 5, now 6
     }
@@ -6304,6 +14035,7 @@ mod tests {
             keys_skipped: 0,
             entries_consolidated: 25,
             size_delta: -1024,
+            write_cache_delta: 2048,
             cycle_duration: Duration::from_millis(150),
             eviction_triggered: true,
             current_size: 100000,
@@ -6312,6 +14044,7 @@ mod tests {
         assert_eq!(result.keys_processed, 10);
         assert_eq!(result.entries_consolidated, 25);
         assert_eq!(result.size_delta, -1024);
+        assert_eq!(result.write_cache_delta, 2048);
         assert_eq!(result.cycle_duration, Duration::from_millis(150));
         assert!(result.eviction_triggered);
         assert_eq!(result.current_size, 100000);
@@ -6345,6 +14078,7 @@ mod tests {
             consolidation_count: 42,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
+            ..Default::default()
         };
         consolidator.persist_size_state(&state).await.unwrap();
 
@@ -6401,6 +14135,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         // Create the range file
@@ -6432,7 +14168,9 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            // A range fill carries the response's metadata; only that may create the `.meta`.
+            object_metadata: Some(ObjectMetadata::default()),
+            fill_witness: None,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -6938,17 +14676,15 @@ mod tests {
                 ));
             }
 
-            // Property 3: all delta files SHALL be deleted after collection
+            // Property 3: all delta files SHALL be deleted after collection, zero-valued ones
+            // included since the change (they were skipped and left in place before the change).
             for (i, &(d, w)) in file_deltas.iter().enumerate() {
                 let path = size_tracking_dir.join(format!("delta_instance-{}.json", i));
                 if path.exists() {
-                    // Zero-delta files are skipped (not deleted), so only check non-zero ones
-                    if d != 0 || w != 0 {
-                        return TestResult::error(format!(
-                            "delta file {} still exists after collection (had non-zero delta)",
-                            i
-                        ));
-                    }
+                    return TestResult::error(format!(
+                        "delta file {} (delta={}, wc={}) still exists after collection",
+                        i, d, w
+                    ));
                 }
             }
 
@@ -7100,6 +14836,90 @@ mod tests {
         }
 
         TestResult::passed()
+    }
+
+    /// The cadence handed to the `st_size` fold must be the operator's, not
+    /// `SharedStorageConfig::default()`.
+    ///
+    /// # What this asserts, and why it cannot pass by coincidence
+    ///
+    /// [`JournalConsolidator::st_size_fold_cadence`]'s result goes, through the copied
+    /// `MaintenancePasses` handles, into `st_size_fold::maybe_run_st_size_fold` unchanged, so it
+    /// is the cadence the
+    /// pass receives. Two independent configurations are checked rather than one, because a
+    /// single configuration cannot distinguish "reads the config" from "is hardcoded to these
+    /// two numbers" — and the defect being fixed here was exactly a hardcoded read of another
+    /// struct's defaults.
+    ///
+    /// The precondition assertions are what make the rest non-vacuous: both configured values
+    /// must differ from the defaults, or the pre-fix tree satisfies the test by accident.
+    #[tokio::test]
+    async fn the_fold_cadence_is_the_operators_not_the_default() {
+        let defaults = crate::config::SharedStorageConfig::default();
+
+        // Two configurations, neither equal to the defaults and neither equal to the other. Both
+        // intervals sit inside the field's validated 5m-7d range and both budgets inside its
+        // 1m-24h range, so these are values an operator could really set.
+        let cases = [
+            (Duration::from_secs(6 * 3600), Duration::from_secs(600)),
+            (Duration::from_secs(45 * 60), Duration::from_secs(2 * 3600)),
+        ];
+        assert_ne!(
+            cases[0], cases[1],
+            "FIXTURE: the two cases must differ, or a hardcoded pair satisfies both"
+        );
+        for (interval, budget) in cases {
+            assert_ne!(
+                interval, defaults.shard_fold_interval,
+                "FIXTURE: the configured interval equals the default, so this case cannot \
+                 distinguish a config read from a default read"
+            );
+            assert_ne!(
+                budget, defaults.shard_fold_max_duration,
+                "FIXTURE: the configured budget equals the default, so this case cannot \
+                 distinguish a config read from a default read"
+            );
+        }
+
+        for (interval, budget) in cases {
+            let temp_dir = TempDir::new().unwrap();
+            let journal_manager = Arc::new(JournalManager::new(
+                temp_dir.path().to_path_buf(),
+                "fold-cadence-test".to_string(),
+            ));
+            let lock_manager = Arc::new(MetadataLockManager::new(
+                temp_dir.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            ));
+            let consolidator = JournalConsolidator::new(
+                temp_dir.path().to_path_buf(),
+                journal_manager,
+                lock_manager,
+                ConsolidationConfig {
+                    shard_fold_interval: interval,
+                    shard_fold_max_duration: budget,
+                    ..ConsolidationConfig::default()
+                },
+            );
+
+            let observed = consolidator.st_size_fold_cadence();
+            assert_eq!(
+                observed,
+                (interval, budget),
+                "the st_size fold was handed {:?} where the configuration says {:?}. The \
+                 defaults are {:?} — if the observed pair equals those, the scheduler is still \
+                 reading SharedStorageConfig::default() and \
+                 cache.shared_storage.shard_fold_interval / shard_fold_max_duration are \
+                 accepted and ignored",
+                observed,
+                (interval, budget),
+                (
+                    defaults.shard_fold_interval,
+                    defaults.shard_fold_max_duration
+                )
+            );
+        }
     }
 
     // ===== Unit tests for eviction decoupling (Task 1.4) =====
@@ -7319,6 +15139,1012 @@ mod tests {
         assert!(!triggered, "Should not trigger when max_cache_size is 0");
     }
 
+    // =====================================================================
+    // The byte trigger is evaluated while the key loop runs
+    // =====================================================================
+
+    /// The in-loop trigger's interval in these tests. Short enough that a parked key loop
+    /// spans a dozen of them inside a second, and well under the fixture's cycle deadline so
+    /// the deadline arm is never the one that fires.
+    const INLOOP_TEST_INTERVAL: Duration = Duration::from_millis(40);
+
+    /// A consolidator that checks the byte trigger every [`INLOOP_TEST_INTERVAL`] of key-loop
+    /// time: `max_cache_size` 1000 at `eviction_trigger_percent` 95, so the trigger threshold
+    /// is 950 bytes.
+    ///
+    /// No cache manager is wired, so `maybe_trigger_eviction` reaches its spawn decision,
+    /// records it in `eviction_trigger_fires`, fails the cache-manager upgrade and returns
+    /// `false`. The decision is the predicate these tests are about — whether and when the
+    /// cycle evaluates the trigger — and the upgrade that follows it is unconditional in
+    /// production. A fixture that wired a manager would assert the same decision through a
+    /// real eviction pass over a temporary directory.
+    fn inloop_trigger_consolidator(
+        tmp: &TempDir,
+    ) -> (Arc<JournalConsolidator>, Arc<JournalManager>) {
+        let cache_dir = tmp.path().to_path_buf();
+        let journal_manager = Arc::new(JournalManager::new(
+            cache_dir.clone(),
+            "scn6-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            cache_dir.clone(),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = Arc::new(JournalConsolidator::new(
+            cache_dir,
+            journal_manager.clone(),
+            lock_manager,
+            ConsolidationConfig {
+                interval: INLOOP_TEST_INTERVAL,
+                consolidation_cycle_timeout: Duration::from_secs(30),
+                max_cache_size: 1000,
+                eviction_trigger_percent: 95,
+                ..ConsolidationConfig::default()
+            },
+        ));
+        (consolidator, journal_manager)
+    }
+
+    /// One pending `Add` entry, so the cycle is not idle and its key loop has a key to park on.
+    async fn plant_one_pending_key(journal_manager: &JournalManager, cache_key: &str) {
+        let now = SystemTime::now();
+        let entry = JournalEntry {
+            timestamp: now,
+            instance_id: "scn6-instance".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec: RangeSpec {
+                start: 0,
+                end: 1023,
+                file_path: "scn6.bin".to_string(),
+                compression_algorithm: CompressionAlgorithm::None,
+                compressed_size: 1024,
+                uncompressed_size: 1024,
+                created_at: now,
+                last_accessed: now,
+                access_count: 1,
+                staged: None,
+                unservable: false,
+                file_identity: None,
+            },
+            operation: JournalOperation::Add,
+            range_file_path: "scn6.bin".to_string(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(3600),
+            access_increment: None,
+            object_metadata: Some(ObjectMetadata::default()),
+            fill_witness: None,
+        };
+        journal_manager
+            .append_range_entry(cache_key, entry)
+            .await
+            .unwrap();
+    }
+
+    /// Wait, bounded, for the trigger-decision count to reach `want`. A positive condition: an
+    /// equality test against a count that has not started moving yet cannot be told from one
+    /// that has finished.
+    async fn wait_for_trigger_fires(consolidator: &JournalConsolidator, want: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while consolidator.eviction_trigger_fires() < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trigger decided to spawn {} time(s), waiting for {}",
+                consolidator.eviction_trigger_fires(),
+                want
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// (a): a projected size that crosses the trigger WHILE the key loop is running
+    /// decides to spawn a pass before the loop ends.
+    ///
+    /// The loop is held open by [`key_loop_park_hook`] for a dozen intervals, which is what
+    /// makes this not vacuous: a loop that finished inside one interval would reach the
+    /// end-of-cycle trigger on both trees and the test would pass either way. The assertion is
+    /// taken while `cycle.is_finished()` is false, so nothing after the loop can have made it
+    /// true.
+    ///
+    /// Red side: `Err(_) if now < deadline` returning `(false, now + interval)` instead of
+    /// calling `inloop_eviction_check`, i.e. the end-of-cycle trigger alone. The count stays 0
+    /// for as long as the keys are parked.
+    #[tokio::test]
+    async fn a_projected_size_crossing_the_trigger_mid_loop_spawns_before_the_loop_ends() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, journal_manager) = inloop_trigger_consolidator(&tmp);
+        plant_one_pending_key(&journal_manager, "scn6-bucket/mid-loop").await;
+        // Under the 950 threshold on `size_state` alone, and no delta file yet.
+        write_size_state(&tmp, 500);
+
+        let park = key_loop_park_hook::arm(tmp.path());
+        let cycle = {
+            let c = Arc::clone(&consolidator);
+            tokio::spawn(async move { c.run_consolidation_cycle().await })
+        };
+        // The key loop is running and its only key is parked, so `collect_deltas` is behind us.
+        tokio::time::timeout(Duration::from_secs(10), park.reached.notified())
+            .await
+            .expect("the key loop reached the park");
+
+        // The crossing: 500 + 600 = 1100 projected, over the 950 trigger.
+        plant_delta_file(&tmp, "scn6-peer", 600);
+        wait_for_trigger_fires(&consolidator, 1).await;
+        assert!(
+            !cycle.is_finished(),
+            "the decision must be taken while the key loop is still running"
+        );
+        assert!(
+            consolidator.inloop_projected_reads() >= 1,
+            "the in-loop check reads the projected size"
+        );
+
+        park.release();
+        tokio::time::timeout(Duration::from_secs(20), cycle)
+            .await
+            .expect("the cycle finished once the keys were released")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// (b): a delta file flushed after this cycle's `collect_deltas`, which alone carries
+    /// the size over the trigger, fires it.
+    ///
+    /// `size_state` holds 900 against a 950 threshold for the whole cycle and cannot move: the
+    /// fenced apply ran before the loop and this process holds the consolidation lock. Only the
+    /// projected figure (900 + 100) is over. Planting the file after the park is what puts it
+    /// past `collect_deltas`; a file planted before the cycle started would have been collected
+    /// and applied, and the stale figure could not then be told from the projected one.
+    ///
+    /// Red side: `self.get_projected_size().await.unwrap_or(0)` in `inloop_eviction_check`
+    /// replaced by `self.get_current_size().await.unwrap_or(0)`. The count stays 0.
+    #[tokio::test]
+    async fn a_delta_flushed_after_collect_deltas_fires_the_in_loop_trigger() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, journal_manager) = inloop_trigger_consolidator(&tmp);
+        plant_one_pending_key(&journal_manager, "scn6-bucket/post-collect").await;
+        write_size_state(&tmp, 900);
+
+        let park = key_loop_park_hook::arm(tmp.path());
+        let cycle = {
+            let c = Arc::clone(&consolidator);
+            tokio::spawn(async move { c.run_consolidation_cycle().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), park.reached.notified())
+            .await
+            .expect("the key loop reached the park");
+
+        assert_eq!(
+            consolidator.get_current_size().await,
+            Some(900),
+            "`size_state` is under the 950 trigger, so only the projected figure can fire it"
+        );
+        plant_delta_file(&tmp, "scn6-peer", 100);
+        assert_eq!(consolidator.get_projected_size().await, Some(1000));
+
+        wait_for_trigger_fires(&consolidator, 1).await;
+        assert!(!cycle.is_finished(), "still inside the key loop");
+
+        park.release();
+        tokio::time::timeout(Duration::from_secs(20), cycle)
+            .await
+            .expect("the cycle finished once the keys were released")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// (c): while the work list has a generation that this process's last pass could not
+    /// supersede, repeated in-loop checks decide nothing and read nothing — and they resume as
+    /// soon as a pass does author.
+    ///
+    /// The gate reads `chunks_authored`, which advances only when an author writes a generation
+    /// document. A pass that spawned and left it where it was is the author deferring behind a
+    /// generation still in flight, and it read every chunk's done-marker to find that out. Both
+    /// directions are asserted, because a gate that simply stopped checking would pass the
+    /// first half: after `chunks_authored` moves, the next check reads and decides again.
+    ///
+    /// Red side: the `authored_at_last_spawn` block in `inloop_eviction_check` removed, so
+    /// every interval spawns. Over the twelve intervals below that is 11 further decisions and
+    /// 11 further projected-size reads instead of none.
+    #[tokio::test]
+    async fn an_undrained_generation_is_not_re_authored_on_every_interval() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, journal_manager) = inloop_trigger_consolidator(&tmp);
+        plant_one_pending_key(&journal_manager, "scn6-bucket/deferred").await;
+        // Over the 950 trigger from the start, so every check that gets past the gates fires.
+        write_size_state(&tmp, 1000);
+
+        let park = key_loop_park_hook::arm(tmp.path());
+        let cycle = {
+            let c = Arc::clone(&consolidator);
+            tokio::spawn(async move { c.run_consolidation_cycle().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), park.reached.notified())
+            .await
+            .expect("the key loop reached the park");
+
+        wait_for_trigger_fires(&consolidator, 1).await;
+        // Twelve intervals of parked key loop. Nothing has authored a generation, so every
+        // check after the first takes the backoff.
+        tokio::time::sleep(INLOOP_TEST_INTERVAL * 12).await;
+        assert!(!cycle.is_finished(), "still inside the key loop");
+        // The suppression ends at `read_tier_barren_ceiling`, two intervals, rather than
+        // lasting as long as nothing moves. It has to: a generation drained entirely by peers
+        // moves no counter in this process, so a tick is let through on a timer. Twelve parked
+        // intervals admit at most six further ticks, against the eleven a gateless loop takes.
+        const ADMITTED: u64 = 1 + 12 / INLOOP_TRIGGER_BARREN_INTERVALS as u64;
+        let fires = consolidator.eviction_trigger_fires();
+        assert!(
+            fires <= ADMITTED,
+            "a pass that authored nothing must not be re-spawned on every interval: {fires} \
+             spawns over twelve intervals, at most {ADMITTED} allowed"
+        );
+        let reads = consolidator.inloop_projected_reads();
+        assert!(
+            reads <= ADMITTED,
+            "a gated check reads nothing from the volume either: {reads} projected reads, at \
+             most {ADMITTED} allowed"
+        );
+        // The other direction: a generation gets authored, and a check spawns without waiting
+        // the ceiling out. Sharply pinned by `a_drained_generation_is_authored_on_the_next_tick`,
+        // where no timer could supply the result.
+        crate::eviction_worklist::record(tmp.path(), |c| c.chunks_authored += 1);
+        wait_for_trigger_fires(&consolidator, fires + 1).await;
+
+        park.release();
+        tokio::time::timeout(Duration::from_secs(20), cycle)
+            .await
+            .expect("the cycle finished once the keys were released")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A consolidator whose barren back-off outlives a cycle: the interval is long enough that
+    /// two sequential cycles are inside one window, and long enough that the in-loop wake never
+    /// fires, so the sites under test are the end-of-cycle one and the idle one.
+    fn barren_memo_consolidator(tmp: &TempDir) -> (Arc<JournalConsolidator>, Arc<JournalManager>) {
+        let cache_dir = tmp.path().to_path_buf();
+        let journal_manager = Arc::new(JournalManager::new(
+            cache_dir.clone(),
+            "scn6-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            cache_dir.clone(),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = Arc::new(JournalConsolidator::new(
+            cache_dir,
+            journal_manager.clone(),
+            lock_manager,
+            ConsolidationConfig {
+                interval: Duration::from_secs(30),
+                consolidation_cycle_timeout: Duration::from_secs(30),
+                max_cache_size: 1000,
+                eviction_trigger_percent: 95,
+                ..ConsolidationConfig::default()
+            },
+        ));
+        (consolidator, journal_manager)
+    }
+
+    /// A tick that authored nothing while a generation was still in flight holds
+    /// the next tick off across CYCLE boundaries, not only within one cycle.
+    ///
+    /// The earlier gate lived on `InloopTriggerState`, a local of `run_consolidation_cycle`, so the
+    /// end-of-cycle site started every cycle with no memory of the barren tick before it and
+    /// re-authored every 1 to 4 s for the length of a drain -- 23 of 34 OpenZFS ticks and 8 of
+    /// 19 ONTAP ticks in the cell, each taking the global eviction lock and reading every
+    /// chunk's done-marker (0.4 to 3.3 s).
+    ///
+    /// Not vacuous in the way the suppression tests invite: `chunks_authored` is moved by this
+    /// test and by nothing else here (no cache manager is wired, so no pass can author), so the
+    /// generation does not quietly finish between the ticks and make both trees agree. Both
+    /// directions are asserted -- the third cycle, after the counter moves, must author.
+    ///
+    /// The suppression ends on progress rather than on a timer, and the 760 s ceiling is far
+    /// beyond these three cycles, so what is being measured is the suppression itself.
+    ///
+    /// Red side: `self.maybe_trigger_eviction_gated(Some(trigger_size)).await` at the
+    /// end-of-cycle site replaced by `self.maybe_trigger_eviction(Some(trigger_size)).await`.
+    /// The second cycle authors again and the count reaches 2 where 1 is asserted.
+    #[tokio::test]
+    async fn a_barren_author_tick_holds_the_next_cycle_off_too() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, journal_manager) = barren_memo_consolidator(&tmp);
+        // Over the 950 trigger throughout, so every ungated site would decide to spawn.
+        write_size_state(&tmp, 1000);
+
+        plant_one_pending_key(&journal_manager, "scn7-bucket/cycle-one").await;
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            consolidator.run_consolidation_cycle(),
+        )
+        .await
+        .expect("the first cycle finished")
+        .unwrap();
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            1,
+            "apparatus: the first cycle must decide to spawn, or there is no barren tick to \
+             suppress"
+        );
+        assert_eq!(
+            crate::eviction_worklist::counters(tmp.path()).chunks_authored,
+            0,
+            "apparatus: nothing may author a generation but this test"
+        );
+
+        plant_one_pending_key(&journal_manager, "scn7-bucket/cycle-two").await;
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            consolidator.run_consolidation_cycle(),
+        )
+        .await
+        .expect("the second cycle finished")
+        .unwrap();
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            1,
+            "a cycle following one whose pass authored nothing must not take the eviction lock \
+             again while nothing has moved"
+        );
+
+        // The other direction: a generation gets authored, and the next cycle authors again.
+        crate::eviction_worklist::record(tmp.path(), |c| c.chunks_authored += 1);
+        plant_one_pending_key(&journal_manager, "scn7-bucket/cycle-three").await;
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            consolidator.run_consolidation_cycle(),
+        )
+        .await
+        .expect("the third cycle finished")
+        .unwrap();
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            2,
+            "a generation that finished must be followed by an author tick within one interval"
+        );
+    }
+
+    /// The two bounds on a memo that now outlives its cycle: a legacy pass counts
+    /// as progress, and even with nothing moving at all the suppression ends, after
+    /// [`INLOOP_TRIGGER_BARREN_INTERVALS`] intervals.
+    ///
+    /// Both matter because this memo is process-wide where the earlier was a cycle local. On a fleet
+    /// with one older proxy the capability gate reads `NotCapable` and every tick runs the
+    /// legacy pass, which evicts but writes no generation document: a predicate watching only
+    /// `chunks_authored` would read those passes as barren and hold read-tier eviction to one
+    /// pass per ceiling. And a peer holding the global eviction lock indefinitely moves no
+    /// counter at all, which is what the ceiling is for.
+    ///
+    /// Drives the gate directly, passing `now` forward, so the verdicts are read off the
+    /// predicate rather than off a sleep that could be short.
+    ///
+    /// Red side (a): `read_tier_author_progress` reduced to `counters.chunks_authored`. The
+    /// legacy-pass assertion then reads `false`.
+    /// Red side (b): the `Some(_) =>` arm of `read_tier_author_due`'s `match` returning `false`
+    /// instead of restarting the ceiling and returning `true`. The ceiling assertion then reads
+    /// `false`, and read-tier eviction is suppressed for the life of the process.
+    #[tokio::test]
+    async fn a_legacy_pass_is_progress_and_the_barren_ceiling_is_two_intervals() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager) = inloop_trigger_consolidator(&tmp);
+        let ceiling = consolidator.read_tier_barren_ceiling();
+        assert_eq!(
+            ceiling,
+            INLOOP_TEST_INTERVAL * INLOOP_TRIGGER_BARREN_INTERVALS,
+            "the suppression ends two consolidation intervals after a barren tick"
+        );
+        assert!(
+            ceiling < Duration::from_secs(crate::config::EVICTION_WORKLIST_LEASE_MIN_SECS),
+            "and may never outlast one chunk lease"
+        );
+
+        let now = tokio::time::Instant::now();
+        consolidator.note_read_tier_spawn(consolidator.read_tier_author_progress());
+        assert!(
+            !consolidator.read_tier_author_due(now),
+            "the tick that follows one which did nothing is held off"
+        );
+        assert!(
+            !consolidator.read_tier_author_due(now + ceiling / 2),
+            "and stays held off inside the ceiling"
+        );
+        assert!(
+            consolidator.read_tier_author_due(now + ceiling),
+            "but the ceiling ends it: a fleet where no counter ever moves must still evict"
+        );
+        assert!(
+            !consolidator.read_tier_author_due(now + ceiling),
+            "and letting one through restarts the ceiling"
+        );
+
+        // A legacy pass is progress, so the very next tick is due with no wait at all.
+        consolidator.note_read_tier_spawn(consolidator.read_tier_author_progress());
+        assert!(
+            !consolidator.read_tier_author_due(now),
+            "apparatus: held off again before the fallback is recorded"
+        );
+        crate::eviction_worklist::record(tmp.path(), |c| c.author_fallback_not_capable += 1);
+        assert!(
+            consolidator.read_tier_author_due(now),
+            "a tick that ran the legacy pass because the capability gate read NotCapable did \
+             work, and must not be treated as barren"
+        );
+    }
+
+    /// The generation a barren tick was waiting on finishes, and the next tick
+    /// authors -- the drain is in the progress predicate, so nothing has to time out.
+    ///
+    /// The drain is the ONLY thing moved between the suppressed tick and the authoring one:
+    /// `chunks_authored` and both fallback counters are asserted to stay at zero, so this
+    /// process authors nothing in between and a predicate without the drain signal has no
+    /// other way to clear. That is the vacuity trap the prompt names.
+    ///
+    /// The clock cannot supply the result either: the fixture's interval is 30 s, so the
+    /// ceiling is a minute and this test runs in milliseconds.
+    ///
+    /// Red side: `+ counters.chunks_done` removed from `read_tier_author_progress`, which is
+    /// The earlier predicate. The tick after the drain stays suppressed and the count holds at 1.
+    #[tokio::test]
+    async fn a_drained_generation_is_authored_on_the_next_tick() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager) = barren_memo_consolidator(&tmp);
+        assert!(
+            consolidator.read_tier_barren_ceiling() >= Duration::from_secs(60),
+            "apparatus: the ceiling must be far beyond this test's wall clock, or the timer \
+             and not the drain could be what ends the suppression"
+        );
+        // Over the 950 trigger throughout, so every tick that is due decides to spawn.
+        for (want, why) in [
+            (
+                1,
+                "apparatus: the first tick must decide to spawn, or there is no barren tick",
+            ),
+            (1, "apparatus: the tick after a barren one is held off"),
+        ] {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                consolidator.maybe_trigger_eviction_gated(Some(1000)),
+            )
+            .await
+            .expect("the gated trigger returned");
+            assert_eq!(consolidator.eviction_trigger_fires(), want, "{}", why);
+        }
+        let counters = crate::eviction_worklist::counters(tmp.path());
+        assert_eq!(
+            (
+                counters.chunks_authored,
+                counters.author_fallback_not_capable,
+                counters.author_fallback_unknown
+            ),
+            (0, 0, 0),
+            "apparatus: no cache manager is wired, so nothing here authors a generation and \
+             only the drain can clear the memo"
+        );
+        // The generation drains: this process's executor closes a chunk.
+        crate::eviction_worklist::record(tmp.path(), |c| c.chunks_done += 1);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            consolidator.maybe_trigger_eviction_gated(Some(1000)),
+        )
+        .await
+        .expect("the gated trigger returned");
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            2,
+            "a generation that finished must be authored on the next tick, not when a timer \
+             runs out"
+        );
+    }
+
+    /// A cache that falls below its trigger and comes back over authors at
+    /// once, because the below-trigger tick clears the memo.
+    ///
+    /// Not vacuous on the clock: the ceiling is a minute here and the three calls take
+    /// microseconds, so the only thing that can admit the fourth tick is the clear.
+    ///
+    /// Red side: `self.clear_read_tier_barren();` removed from `maybe_trigger_eviction_gated`'s
+    /// under-trigger arm. The re-crossing is then held off and the count holds at 1.
+    #[tokio::test]
+    async fn a_re_crossing_after_a_below_trigger_tick_authors() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager) = barren_memo_consolidator(&tmp);
+        for figure in [1000, 1000, 900] {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                consolidator.maybe_trigger_eviction_gated(Some(figure)),
+            )
+            .await
+            .expect("the gated trigger returned");
+        }
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            1,
+            "apparatus: one spawn, then a barren tick held off, then a figure under the 950 \
+             trigger which decides nothing"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            consolidator.maybe_trigger_eviction_gated(Some(1000)),
+        )
+        .await
+        .expect("the gated trigger returned");
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            2,
+            "a cache that re-crosses its trigger must author at once, not wait out a memo left \
+             by a tick taken before it fell below"
+        );
+    }
+
+    /// A generation drained only by a PEER's executor is authored two
+    /// consolidation intervals after the barren tick.
+    ///
+    /// None of this process's counters moves in that case, which is why the bound matters: a
+    /// peer's live lease refuses this executor's claim as `chunks_claim_busy`, and a chunk
+    /// already closed when this executor looks returns before any done-marker publish, so
+    /// `chunks_done` stays where it was. The fixture is therefore "no counter moves at all",
+    /// and what is measured is the ceiling.
+    ///
+    /// The bound is written out from the fixture's own 30 s interval rather than read back from
+    /// `read_tier_barren_ceiling`, so a lever on the ceiling cannot move the assertion with it.
+    ///
+    /// Red side: `read_tier_barren_ceiling` returning
+    /// `Duration::from_secs(crate::config::EVICTION_WORKLIST_LEASE_MIN_SECS)`, which is the earlier
+    /// bound. The tick two intervals on then reads held off, and read-tier eviction waits 760 s
+    /// against a generation period of about 33 s.
+    #[tokio::test]
+    async fn a_generation_a_peer_drains_is_authored_two_intervals_later() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager) = barren_memo_consolidator(&tmp);
+        // `barren_memo_consolidator`'s interval.
+        let bound = Duration::from_secs(30) * INLOOP_TRIGGER_BARREN_INTERVALS;
+        assert!(
+            bound < Duration::from_secs(crate::config::EVICTION_WORKLIST_LEASE_MIN_SECS),
+            "apparatus: a bound as long as a lease would make the assertions below vacuous"
+        );
+        let now = tokio::time::Instant::now();
+        consolidator.note_read_tier_spawn(consolidator.read_tier_author_progress());
+        assert!(
+            !consolidator.read_tier_author_due(now),
+            "the tick that follows one which did nothing is held off"
+        );
+        assert!(
+            !consolidator.read_tier_author_due(now + bound / 2),
+            "and stays held off inside the bound"
+        );
+        assert_eq!(
+            crate::eviction_worklist::counters(tmp.path()),
+            crate::eviction_worklist::WorklistCounters::default(),
+            "apparatus: not one counter of this process has moved, so only the bound can end \
+             the suppression"
+        );
+        assert!(
+            consolidator.read_tier_author_due(now + bound),
+            "a generation a peer's executor drained moves nothing here, so two consolidation \
+             intervals must end the wait"
+        );
+    }
+
+    /// The idle cycle's trigger reads the PROJECTED figure, as every other trigger
+    /// site has since the change.
+    ///
+    /// `size_state` holds 900 against a 950 threshold and a peer's delta file carrying +100 is
+    /// waiting, which is the state an idle cycle can find: the idle predicate lists the delta
+    /// directory before this read, and a peer's flush in that window is invisible to
+    /// `size_state`. Only the projected figure (900 + 100) is over.
+    ///
+    /// Called directly rather than through `run_consolidation_cycle`, because a cycle that can
+    /// see the delta file is by definition not idle and would take the non-idle path instead.
+    ///
+    /// Red side: `self.get_projected_size().await.unwrap_or(total_size)` in
+    /// `maybe_evict_on_idle_cycle` replaced by `total_size`. The count stays 0.
+    #[tokio::test]
+    async fn an_idle_cycle_fires_on_the_projected_figure() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager) = inloop_trigger_consolidator(&tmp);
+        write_size_state(&tmp, 900);
+        plant_delta_file(&tmp, "scn7-peer", 100);
+        assert_eq!(
+            consolidator.get_current_size().await,
+            Some(900),
+            "apparatus: `size_state` is under the 950 trigger, so only the projection can fire it"
+        );
+        assert_eq!(
+            consolidator.get_projected_size().await,
+            Some(1000),
+            "apparatus: the projection must be over it"
+        );
+
+        let (_triggered, reported) = tokio::time::timeout(
+            Duration::from_secs(20),
+            consolidator.maybe_evict_on_idle_cycle(),
+        )
+        .await
+        .expect("the idle check finished");
+
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            1,
+            "an idle cycle over the projected trigger must decide to spawn"
+        );
+        assert_eq!(
+            reported, 900,
+            "the figure reported stays the `size_state` reading, as at the other sites"
+        );
+    }
+
+    /// (d): a cycle now evaluates the trigger at two kinds of site, inside its key loop
+    /// and once after it, and a pass already in flight stops every one of them. At most one
+    /// author per process.
+    ///
+    /// The in-flight pass is modelled by `eviction_in_progress` being held, which is exactly
+    /// what a spawned pass does for its whole lifetime (the `scopeguard` in
+    /// `maybe_trigger_eviction` clears it when the task ends). The size is over the trigger
+    /// throughout, so every site would otherwise decide to spawn.
+    ///
+    /// Red side: `.is_err()` on the `compare_exchange` in `maybe_trigger_eviction` replaced by
+    /// `.is_err() && false`. The end-of-cycle site then decides to spawn a second pass while
+    /// the first is in flight and the count reaches 1.
+    #[tokio::test]
+    async fn a_pass_in_flight_stops_every_trigger_site_in_the_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, journal_manager) = inloop_trigger_consolidator(&tmp);
+        plant_one_pending_key(&journal_manager, "scn6-bucket/one-author").await;
+        write_size_state(&tmp, 1000);
+        consolidator
+            .eviction_in_progress
+            .store(true, Ordering::SeqCst);
+
+        let park = key_loop_park_hook::arm(tmp.path());
+        let cycle = {
+            let c = Arc::clone(&consolidator);
+            tokio::spawn(async move { c.run_consolidation_cycle().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), park.reached.notified())
+            .await
+            .expect("the key loop reached the park");
+
+        tokio::time::sleep(INLOOP_TEST_INTERVAL * 6).await;
+        assert!(!cycle.is_finished(), "still inside the key loop");
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            0,
+            "the in-loop checks must not spawn a second author"
+        );
+        assert_eq!(
+            consolidator.inloop_projected_reads(),
+            0,
+            "and must not pay for a size read to find that out"
+        );
+
+        park.release();
+        let result = tokio::time::timeout(Duration::from_secs(20), cycle)
+            .await
+            .expect("the cycle finished once the keys were released")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !result.eviction_triggered,
+            "no pass was spawned by this cycle"
+        );
+        assert_eq!(
+            consolidator.eviction_trigger_fires(),
+            0,
+            "nor did the end-of-cycle site spawn one"
+        );
+        assert!(
+            consolidator.eviction_in_progress.load(Ordering::SeqCst),
+            "the in-flight pass still holds the guard"
+        );
+    }
+
+    /// A consolidator whose read-tier byte trigger is disabled and whose staging tier is bound,
+    /// wired to a real `CacheManager` so `get_staging_eviction_thresholds` has an answer.
+    ///
+    /// 10,000-byte allocation at 10 % write cache is a 1,000-byte Staging_Bound, and the read
+    /// tier's 95 % trigger makes the staging trigger 950 bytes.
+    fn staging_inloop_fixture(
+        tmp: &TempDir,
+    ) -> (
+        Arc<JournalConsolidator>,
+        Arc<JournalManager>,
+        Arc<crate::cache::CacheManager>,
+    ) {
+        let cache_dir = tmp.path().to_path_buf();
+        let journal_manager = Arc::new(JournalManager::new(
+            cache_dir.clone(),
+            "scn8-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            cache_dir.clone(),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = Arc::new(JournalConsolidator::new(
+            cache_dir.clone(),
+            journal_manager.clone(),
+            lock_manager,
+            ConsolidationConfig {
+                interval: INLOOP_TEST_INTERVAL,
+                consolidation_cycle_timeout: Duration::from_secs(30),
+                // The READ tier is off, so nothing but the staging check can act on a wake.
+                max_cache_size: 0,
+                eviction_trigger_percent: 95,
+                ..ConsolidationConfig::default()
+            },
+        ));
+        let cache_manager = Arc::new(crate::cache::CacheManager::new_with_shared_storage(
+            cache_dir,
+            false,
+            0,
+            10_000,
+            crate::cache::CacheEvictionAlgorithm::TinyLFU,
+            1024,
+            false,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            Duration::from_secs(60),
+            1_048_576,
+            false,
+            Duration::from_secs(10),
+            64,
+            Duration::from_secs(5),
+        ));
+        consolidator.set_cache_manager(Arc::downgrade(&cache_manager));
+        (consolidator, journal_manager, cache_manager)
+    }
+
+    /// `size_state.json` with the three figures the in-loop checks read.
+    fn write_size_state_fields(tmp: &TempDir, total_size: u64, write_cache: u64, objects: u64) {
+        let state = SizeState {
+            total_size,
+            write_cache_size: write_cache,
+            cached_objects: objects,
+            ..SizeState::default()
+        };
+        let dir = tmp.path().join("size_tracking");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("size_state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Wait, bounded, for a counter to reach `want`. A positive condition, for the reason
+    /// `wait_for_trigger_fires` gives.
+    async fn wait_for_count(label: &str, read: impl Fn() -> u64, want: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while read() < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} reached {}, waiting for {}",
+                label,
+                read(),
+                want
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// (e): the STAGING tier's trigger is evaluated while the key loop runs, on the
+    /// projected `write_cache_size`, and nudges a pass before the loop ends.
+    ///
+    /// The read tier is disabled in the fixture, so a nudge here cannot be a side effect of the
+    /// byte check. The loop is held open for six intervals by [`key_loop_park_hook`], which is
+    /// what makes this non-vacuous: `maybe_trigger_staging_eviction` is still called after the
+    /// loop, so a loop that finished inside one interval would nudge on both trees.
+    ///
+    /// Red side: the staging block in `inloop_eviction_check` removed. The nudge count stays 0
+    /// for as long as the keys are parked and reaches 1 only once the cycle ends.
+    #[tokio::test]
+    async fn the_staging_trigger_is_evaluated_while_the_key_loop_runs() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, journal_manager, _cache_manager) = staging_inloop_fixture(&tmp);
+        plant_one_pending_key(&journal_manager, "scn8-bucket/staging-mid-loop").await;
+        // 1,000 staged bytes against the 950-byte staging trigger; the read tier is off.
+        write_size_state_fields(&tmp, 0, 1_000, 0);
+        assert_eq!(
+            consolidator.get_projected_write_cache_size().await,
+            Some(1_000),
+            "FIXTURE: the figure the staging check compares must be over its 950-byte trigger"
+        );
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            0,
+            "FIXTURE: nothing has nudged the staging tier yet"
+        );
+
+        let park = key_loop_park_hook::arm(tmp.path());
+        let cycle = {
+            let c = Arc::clone(&consolidator);
+            tokio::spawn(async move { c.run_consolidation_cycle().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), park.reached.notified())
+            .await
+            .expect("the key loop reached the park");
+
+        let c = Arc::clone(&consolidator);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_count("staging nudges", move || c.staging_trigger_nudges(), 1),
+        )
+        .await
+        .expect("the staging tier was nudged from inside the key loop");
+        assert!(
+            !cycle.is_finished(),
+            "the nudge must be taken while the key loop is still running"
+        );
+
+        park.release();
+        tokio::time::timeout(Duration::from_secs(20), cycle)
+            .await
+            .expect("the cycle finished once the keys were released")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// (g): gate 3 keys on "the pass authored nothing" and on nothing narrower.
+    ///
+    /// This is the distinction the review asked for. The gate's old doc named one cause —
+    /// an author deferring behind a generation still in flight — and the fixture here has no
+    /// generation in flight at all: `in_flight_bytes` and `chunks_authored` are both 0 and are
+    /// asserted to be, so the back-off observed below CANNOT be the undrained-generation case.
+    /// It is the cache-manager-less barren pass, which stands for the other three states the
+    /// review listed (a peer holding the global eviction lock, a zero shortfall, a `NotCapable`
+    /// capability read): none of them advances `chunks_authored` either.
+    ///
+    /// Red side: the gate narrowed to the cause it used to name, by adding
+    /// `&& crate::eviction_worklist::counters(&self.cache_dir).in_flight_bytes > 0` to its
+    /// condition. With nothing in flight the back-off never applies and the twelve parked
+    /// intervals below spawn on every one.
+    #[tokio::test]
+    async fn gate_three_backs_off_after_a_barren_pass_with_no_generation_in_flight() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, journal_manager) = inloop_trigger_consolidator(&tmp);
+        plant_one_pending_key(&journal_manager, "scn8-bucket/barren").await;
+        write_size_state_fields(&tmp, 1_000, 0, 0);
+        let counters = crate::eviction_worklist::counters(tmp.path());
+        assert_eq!(
+            (counters.chunks_authored, counters.in_flight_bytes),
+            (0, 0),
+            "FIXTURE: no generation is in flight, so a back-off cannot be the undrained case"
+        );
+
+        let park = key_loop_park_hook::arm(tmp.path());
+        let cycle = {
+            let c = Arc::clone(&consolidator);
+            tokio::spawn(async move { c.run_consolidation_cycle().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), park.reached.notified())
+            .await
+            .expect("the key loop reached the park");
+
+        wait_for_trigger_fires(&consolidator, 1).await;
+        tokio::time::sleep(INLOOP_TEST_INTERVAL * 12).await;
+        assert!(!cycle.is_finished(), "still inside the key loop");
+        assert_eq!(
+            crate::eviction_worklist::counters(tmp.path()).in_flight_bytes,
+            0,
+            "nothing authored a generation during the parked loop either"
+        );
+        // At most one further tick per `read_tier_barren_ceiling` (two intervals), where
+        // a gateless loop spawns on all twelve.
+        let fires = consolidator.eviction_trigger_fires();
+        assert!(
+            fires <= 1 + 12 / INLOOP_TRIGGER_BARREN_INTERVALS as u64,
+            "a barren pass backs off whatever made it barren: the gate is named for the \
+             observation, not for one of its causes. {fires} spawns over twelve intervals"
+        );
+
+        park.release();
+        tokio::time::timeout(Duration::from_secs(20), cycle)
+            .await
+            .expect("the cycle finished once the keys were released")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Wait, bounded, until no staging pass of this cache manager is running.
+    async fn wait_staging_idle(cache_manager: &crate::cache::CacheManager) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while cache_manager.staging_eviction_in_progress() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the staging pass never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// (c): the staging tier backs off after a pass that freed nothing, the window ends, and
+    /// a pass that freed bytes leaves no window.
+    ///
+    /// The fixture stages 1,000 bytes against a 950-byte trigger with an empty ledger, so each
+    /// pass frees 0 and `staging_eviction_bytes_total` stays 0: the barren case. Calls are driven
+    /// directly so the nudge count is the back-off and not a timing. The productive half sets
+    /// `staging_freed_at_nudge` to a value the counter is not at, which is what a counter that
+    /// moved looks like from the check's side, and expects an immediate nudge and no window.
+    ///
+    /// Red side (barren): the `staging_check_not_before` assignment after the counter comparison
+    /// removed; the three checks inside the window each nudge. Red side (reset): the comparison
+    /// `== Some(freed_at_nudge)` replaced by `.is_some()`; the productive pass sets a window.
+    #[tokio::test]
+    async fn a_barren_staging_pass_backs_off_for_a_window_and_a_productive_one_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager, cache_manager) = staging_inloop_fixture(&tmp);
+        write_size_state_fields(&tmp, 0, 1_000, 0);
+        let mut state = InloopTriggerState::default();
+
+        consolidator.inloop_eviction_check(&mut state).await;
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            1,
+            "the first nudge is free"
+        );
+        assert_eq!(
+            state.staging_freed_at_nudge,
+            Some(0),
+            "FIXTURE: the counter the next check compares against is 0"
+        );
+        wait_staging_idle(&cache_manager).await;
+
+        consolidator.inloop_eviction_check(&mut state).await;
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            1,
+            "the pass freed nothing, so this check backs off instead of nudging"
+        );
+        assert!(state.staging_check_not_before.is_some() && state.staging_freed_at_nudge.is_none());
+        for _ in 0..3 {
+            consolidator.inloop_eviction_check(&mut state).await;
+        }
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            1,
+            "three checks inside the window nudge nothing"
+        );
+
+        tokio::time::sleep(INLOOP_TEST_INTERVAL * (INLOOP_TRIGGER_BARREN_INTERVALS + 2)).await;
+        consolidator.inloop_eviction_check(&mut state).await;
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            2,
+            "the window ends: a barren pass is retried, not abandoned"
+        );
+        wait_staging_idle(&cache_manager).await;
+
+        let mut state = InloopTriggerState {
+            staging_freed_at_nudge: Some(7_777),
+            ..InloopTriggerState::default()
+        };
+        consolidator.inloop_eviction_check(&mut state).await;
+        assert!(
+            state.staging_check_not_before.is_none(),
+            "a counter that moved sets no window"
+        );
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            3,
+            "and the trigger is evaluated at once"
+        );
+        wait_staging_idle(&cache_manager).await;
+    }
+
     /// **Feature: consolidation-throughput, Property 1: All discovered keys are submitted for processing**
     /// *For any* set of discovered pending cache keys of arbitrary size (including sizes greater
     /// than 50, the previous cap), the number of key futures created for concurrent processing
@@ -7394,6 +16220,8 @@ mod tests {
                         last_accessed: base_time,
                         access_count: 1,
                         staged: None,
+                        unservable: false,
+                        file_identity: None,
                     },
                     operation: JournalOperation::Add,
                     range_file_path: format!("range_{}.bin", i),
@@ -7402,6 +16230,7 @@ mod tests {
                     object_ttl_secs: Some(3600),
                     access_increment: None,
                     object_metadata: None,
+                    fill_witness: None,
                 }
             })
             .collect();
@@ -7640,6 +16469,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         // Create range file
@@ -7668,7 +16499,9 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            // A range fill carries the response's metadata; only that may create the `.meta`.
+            object_metadata: Some(ObjectMetadata::default()),
+            fill_witness: None,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -7746,6 +16579,8 @@ mod tests {
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         };
 
         let range_file_path = consolidator
@@ -7771,7 +16606,9 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            // A range fill carries the response's metadata; only that may create the `.meta`.
+            object_metadata: Some(ObjectMetadata::default()),
+            fill_witness: None,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -7800,6 +16637,7 @@ mod tests {
             keys_skipped: 2,
             entries_consolidated: 10,
             size_delta: 0,
+            write_cache_delta: 0,
             cycle_duration: Duration::from_millis(500),
             eviction_triggered: false,
             current_size: 0,
@@ -7865,28 +16703,2331 @@ mod tests {
         let _: bool = result.eviction_triggered;
         assert!(!result.eviction_triggered);
     }
-}
 
-/// Tests for [`SizeAccumulator::subtract_range`] and the dedup asymmetry it closes.
-///
-/// `add_range` credits only when it can insert into `recent_ranges`, so a range that
-/// is already tracked is credited **nothing**. `subtract` debits unconditionally and
-/// leaves the entry in place. Delete-then-rewrite of the same range therefore debits
-/// once and re-credits zero, leaving the figure short by one copy of bytes that are
-/// still on disk.
-///
-/// This was found on 2026-08-25 while adding the re-PUT debit
-/// (`CacheManager::debit_removed_ranges`), and it is worth knowing that adding that
-/// debit *without* this method made the total read `0` for an object the disk still
-/// held — an undershoot swapped in for the overshoot it was fixing. Undershoot is the
-/// worse direction: it silently over-admits instead of refusing.
-///
-/// The field's own doc comment claimed the set was "Cleared on flush", which would
-/// have bounded the damage to one flush interval. It is not — only `reset()`, on a
-/// validation scan, empties it. That comment is now corrected, and this module is what
-/// keeps the distinction from being re-collapsed.
-///
-/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+    // =====================================================================
+    // § 16.6.9 — the staged fold's cadence gate
+    // =====================================================================
+
+    /// A failed pass does not consume the cadence; a successful one does.
+    ///
+    /// # The two branches this pins
+    ///
+    /// `maybe_run_staged_fold` gates on `now - last_staged_fold_completed_secs`, and the
+    /// only write to that timestamp is inside `if outcome.installed()`. Both halves need
+    /// asserting, and asserting only one is how the incumbent gate got this wrong: it
+    /// stamps at pass start, which passes a "the interval is respected" test perfectly
+    /// while consuming the interval on every failure.
+    ///
+    /// The assertion reads what the gate branches on — whether `maybe_run_staged_fold`
+    /// returned `Some`, i.e. whether a pass RAN — rather than the fold's outcome, which is
+    /// a different question and would be satisfied by a gate that ran every cycle.
+    ///
+    /// # The state where two normally-equal things diverge
+    ///
+    /// In the healthy case "a pass ran" and "the cadence was consumed" always coincide, so
+    /// nothing distinguishes a start-stamped gate from a completion-stamped one. The
+    /// unreadable-ledger arm is the state where they part company: a pass runs, and the
+    /// cadence must NOT have been consumed. That arm is the whole test.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_failed_staged_fold_pass_does_not_consume_the_cadence() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let ledger = consolidator.write_ledger();
+
+        // A credit, so there is a ledger file to make unreadable.
+        ledger
+            .append_staged_range("bucket/cadence.bin", 0, 4095, 4096)
+            .await
+            .unwrap();
+        // Resolved through the production path builder rather than re-derived, so a layout
+        // change cannot leave this asserting against a file nothing writes.
+        let ledger_path = ledger.shard_path_for_key("bucket/cadence.bin").unwrap();
+        let restore = std::fs::metadata(&ledger_path).unwrap().permissions();
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // ---- Arm 1: a pass runs and retains.
+        let first = consolidator.maybe_run_staged_fold().await;
+        assert_eq!(
+            first.as_ref().and_then(|o| o.retain_reason()),
+            Some(crate::staged_fold::FoldRetainReason::LedgerFileUnreadable),
+            "the fixture must produce a retain, or the arm below proves nothing: {:?}",
+            first
+        );
+
+        // --- Arm 2: the retain consumed the ATTEMPT interval but not the completion.
+        assert!(
+            consolidator.maybe_run_staged_fold().await.is_none(),
+            "a retained pass waits out the attempt interval rather than re-running every cycle"
+        );
+        assert_eq!(
+            consolidator
+                .last_staged_fold_completed_secs
+                .load(Ordering::Relaxed),
+            0,
+            "a retain must not advance the completion stamp"
+        );
+        // Once the attempt interval has elapsed (simulated), a pass must run AGAIN: the
+        // completion stamp did not move, so it does not hold the retry back.
+        consolidator
+            .last_staged_fold_attempt_secs
+            .store(0, Ordering::Relaxed);
+        let second = consolidator.maybe_run_staged_fold().await;
+        assert!(
+            second.is_some(),
+            "a retained pass must not consume the completion cadence — the completion \
+             timestamp advances on install only"
+        );
+
+        // ---- Arm 3: repair the input, install, and confirm the cadence IS then consumed.
+        // Without this the test would pass against a gate that had no interval at all.
+        std::fs::set_permissions(&ledger_path, restore).unwrap();
+        consolidator
+            .last_staged_fold_attempt_secs
+            .store(0, Ordering::Relaxed);
+        let third = consolidator.maybe_run_staged_fold().await;
+        assert!(
+            third.as_ref().is_some_and(|o| o.installed()),
+            "with the input repaired the pass must install: {:?}",
+            third
+        );
+        consolidator
+            .last_staged_fold_attempt_secs
+            .store(0, Ordering::Relaxed);
+        assert!(
+            consolidator.maybe_run_staged_fold().await.is_none(),
+            "a Complete_Install DOES consume the cadence, or the interval bounds nothing"
+        );
+    }
+
+    /// A retain CAN persist: an unparseable shard checkpoint is rewritten by neither the staged
+    /// fold (which retains before visiting) nor the `st_size` fold (whose install returns the
+    /// load error). With the attempt gate it costs one pass per interval, not one per cycle.
+    ///
+    /// # RED SIDE
+    ///
+    /// Remove the `last_attempt` check from `claim_staged_fold` and the second
+    /// `maybe_run_staged_fold` returns `Some(Retained(PreviousCheckpointUnreadable))`.
+    #[tokio::test]
+    async fn a_persistent_staged_fold_retain_runs_once_per_interval() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        // The shard checkpoint document's path, spelled out: this file may not name the
+        // checkpoint type (`the_fold_is_the_only_staged_authority_and_it_has_one_decision_surface`).
+        let doc = dir
+            .join("metadata")
+            .join("_shard_state")
+            .join("checkpoints")
+            .join("bucket")
+            .join("aa.json");
+        std::fs::create_dir_all(doc.parent().unwrap()).unwrap();
+        std::fs::write(&doc, b"{ not json").unwrap();
+        // A range in the shard, so the st_size fold has something to install into it.
+        let ranges = dir.join("ranges").join("bucket").join("aa").join("111");
+        std::fs::create_dir_all(&ranges).unwrap();
+        std::fs::write(ranges.join("k_0-9.bin"), [0u8; 10]).unwrap();
+
+        let first = consolidator.maybe_run_staged_fold().await;
+        assert_eq!(
+            first.as_ref().and_then(|o| o.retain_reason()),
+            Some(crate::staged_fold::FoldRetainReason::PreviousCheckpointUnreadable),
+            "FIXTURE: an unparseable checkpoint must retain: {first:?}"
+        );
+
+        // Persistence: an st_size pass over the shard does not repair the document either.
+        let st = crate::st_size_fold::run_st_size_fold(dir, "host:st", Duration::ZERO).await;
+        assert!(
+            st.installed.is_empty(),
+            "FIXTURE: the st_size fold must not install over an unparseable document: {st:?}"
+        );
+        assert_eq!(
+            std::fs::read(&doc).unwrap(),
+            b"{ not json",
+            "PERSISTENCE: nothing may have rewritten the document"
+        );
+
+        let second = consolidator.maybe_run_staged_fold().await;
+        assert!(
+            second.is_none(),
+            "PERSISTENT-RETAIN-EVERY-CYCLE: a retain re-ran on the next cycle: {second:?}"
+        );
+
+        // After the interval (simulated), the retain recurs: it is persistent, not transient.
+        consolidator
+            .last_staged_fold_attempt_secs
+            .store(0, Ordering::Relaxed);
+        let third = consolidator.maybe_run_staged_fold().await;
+        assert_eq!(
+            third.as_ref().and_then(|o| o.retain_reason()),
+            Some(crate::staged_fold::FoldRetainReason::PreviousCheckpointUnreadable),
+            "the retain must recur once the interval elapses: {third:?}"
+        );
+    }
+    /// `persist_size_state_internal` re-stamps the `Schema_Fence` on an activated volume, so a
+    /// load-or-default-then-persist path cannot write the pre-C shape.
+    ///
+    /// # The state this makes unreachable
+    ///
+    /// `SizeState::default()` carries `schema: 0` and `staged_authority_epoch: 0`, which after
+    /// activation is byte-for-byte what `detect_foreign_size_state` treats as a pre-C write. Several
+    /// callers load-or-default and then persist — `update_size_from_validation` is the clearest, and
+    /// the startup `cached_objects` back-fill is a second — so ONE transient read error used to
+    /// persist a document that armed the fold's refusal permanently and blamed a binary that did not
+    /// exist on the fleet.
+    ///
+    /// The fixture persists a `SizeState::default()` directly, which is exactly what those callers
+    /// hand over on their error arms, and then reads the document back off disk.
+    ///
+    /// The Phase L arm is asserted in the same test and is not decoration: § 16.6.6 requires a
+    /// C-capable binary to keep writing the legacy schema throughout Phase L so a node can still be
+    /// rolled back, so a re-stamp that fired unconditionally would break the rollback window. The
+    /// two arms use SEPARATE temp dirs because the epoch latch is per-directory and latches
+    /// permanently once it reads `EPOCH_FOLD`.
+    ///
+    /// A failure implicates the re-stamp block at the top of `persist_size_state_internal`.
+    #[tokio::test]
+    async fn persisting_size_state_restamps_the_schema_fence_once_activated() {
+        use crate::staged_authority::{
+            EPOCH_FOLD, EPOCH_LEGACY, SIZE_STATE_SCHEMA_FOLD, SIZE_STATE_SCHEMA_LEGACY,
+        };
+
+        // Phase L first, in its own directory: the legacy shape must survive untouched.
+        let legacy_dir = TempDir::new().unwrap();
+        let legacy = graduation_test_consolidator(&legacy_dir);
+        legacy
+            .persist_size_state_internal(&SizeState::default())
+            .await
+            .unwrap();
+        let written = legacy.load_size_state().await.unwrap();
+        assert_eq!(
+            (written.schema, written.staged_authority_epoch),
+            (SIZE_STATE_SCHEMA_LEGACY, EPOCH_LEGACY),
+            "during Phase L the legacy schema MUST still be written: § 16.6.6 keeps the rollback \
+             window open by having a C-capable binary write the pre-C shape until activation"
+        );
+
+        // Activated, in a fresh directory so the latch is read from this volume's own document.
+        let active_dir = TempDir::new().unwrap();
+        let active = graduation_test_consolidator(&active_dir);
+        crate::staged_authority::activate(active_dir.path(), "host:1").unwrap();
+        crate::staged_authority::expire_epoch_check_for_tests(active_dir.path());
+        assert_eq!(
+            crate::staged_authority::read_epoch(active_dir.path()),
+            EPOCH_FOLD,
+            "fixture precondition: the epoch must be latched, or the re-stamp is correctly \
+             inactive and the assertion below would pass for the wrong reason"
+        );
+
+        // Exactly what a caller's error arm hands over.
+        active
+            .persist_size_state_internal(&SizeState::default())
+            .await
+            .unwrap();
+        let written = active.load_size_state().await.unwrap();
+        assert_eq!(
+            (written.schema, written.staged_authority_epoch),
+            (SIZE_STATE_SCHEMA_FOLD, EPOCH_FOLD),
+            "on an activated volume a defaulted SizeState must be re-stamped with the fence \
+             before it reaches disk. Persisting schema 0 / epoch 0 here is indistinguishable \
+             from a pre-C write, so it arms the fold's refusal and misattributes it."
+        );
+        assert!(
+            !crate::staged_authority::detect_foreign_size_state(
+                written.schema,
+                written.staged_authority_epoch
+            ),
+            "and the document written must not satisfy Foreign_Write_Detection at all"
+        );
+    }
+
+    /// An idle consolidation cycle publishes NO `.ready` record and leaves the volume in Phase L.
+    ///
+    /// # This pins a decision, not a bug
+    ///
+    /// `maintain_staged_authority` sits after the idle early return, so a fleet that is idle on
+    /// every cycle never publishes readiness and never activates. That was noticed as possibly
+    /// accidental — `maybe_run_staged_fold` was deliberately moved ABOVE the same return for a
+    /// closely related reason — and it is kept, because activation is a two-document transaction
+    /// requiring the global consolidation lock and the idle path exists precisely to avoid
+    /// acquiring it. Moving it up would undo the reduction from ~90 EFS metadata IOPS to near-zero
+    /// on every idle deployment, to enable an activation on a fleet doing no writes, where Phase L
+    /// and Phase Fold publish the same figure because nothing is accumulating.
+    ///
+    /// The test exists so the next reader finds the decision asserted rather than inferred from a
+    /// call-site position. Its red side is a build with `maintain_staged_authority` moved above the
+    /// idle return.
+    ///
+    /// The second half is what stops it being vacuous: the fold and the repair rotation DO run on
+    /// an idle cycle, so the observability that makes staying in Phase L acceptable is present.
+    #[tokio::test]
+    async fn an_idle_cycle_publishes_no_ready_record_and_stays_in_phase_l() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+
+        // No pending delta and no journal file: the idle condition, unmodified.
+        let result = consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            (result.keys_processed, result.entries_consolidated),
+            (0, 0),
+            "fixture precondition: the cycle must actually take the idle path, or this asserts \
+             nothing about it"
+        );
+
+        let ready = crate::staged_authority::ready_dir(tmp.path());
+        let records = std::fs::read_dir(&ready)
+            .map(|d| d.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(
+            records, 0,
+            "an idle cycle publishes no readiness record, so an idle fleet stays in Phase L. \
+             This is deliberate: readiness publication shares a call site with the activation \
+             transaction, which requires the global consolidation lock that the idle path exists \
+             to avoid taking."
+        );
+        assert_eq!(
+            crate::staged_authority::read_epoch(tmp.path()),
+            crate::staged_authority::EPOCH_LEGACY,
+            "and the volume stays in Phase L, which is the incumbent's behaviour"
+        );
+
+        // Not vacuous: the two rotations DO run above the idle return, which is what keeps the
+        // gauges current and makes staying in Phase L an observable state rather than a silent one.
+        assert!(
+            crate::ledger_repair::collect_ledger_repair_gauges(tmp.path())
+                .ledger_repair_observed_shards
+                == Some(0),
+            "the repair rotation must have run and reported a readable, empty population — if it \
+             sat below the idle return too, an idle fleet would publish no rotation state at all"
+        );
+    }
+
+    /// The earliest ledger append in a process's life, the ledger-completeness repair re-append
+    /// on the first consolidation cycle, finds a `.ready` record for this instance already in
+    /// place. Design § 16.6.6 B10.3.
+    ///
+    /// The cycle is idle, so it never reaches `maintain_staged_authority`, the only other
+    /// publisher: this is the shape of a boot-time process that appended under its id and
+    /// never published.
+    ///
+    /// # RED SIDE
+    ///
+    /// Without the startup publish in `WriteLedger::append`, the ledger file named for this
+    /// instance exists and `ready/` holds no record for it.
+    #[tokio::test]
+    async fn the_first_cycles_repair_reappend_leaves_a_ready_record_for_its_instance() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = graduation_test_consolidator(&tmp);
+        let id = consolidator.write_ledger.instance_id().to_string();
+
+        // A staged object on disk that no ledger entry names: the repair's lost-append state.
+        let cache_key = "fixture-bucket/orphan.bin";
+        let meta_path =
+            crate::disk_cache::get_sharded_path(&dir.join("metadata"), cache_key, ".meta").unwrap();
+        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        let now = SystemTime::now();
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                is_write_cached: true,
+                ..Default::default()
+            },
+            ranges: vec![create_test_range_spec(0, 1023)],
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            ..Default::default()
+        };
+        std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let result = consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            (result.keys_processed, result.entries_consolidated),
+            (0, 0),
+            "fixture precondition: the cycle must be idle, so maintain_staged_authority never ran"
+        );
+        consolidator.await_maintenance_passes().await;
+
+        assert!(
+            consolidator
+                .write_ledger
+                .ledger_instances()
+                .await
+                .unwrap()
+                .contains(&id),
+            "fixture precondition: the repair must have re-appended under this instance's id"
+        );
+        let records = crate::staged_authority::read_ready_records(dir).unwrap();
+        let mine = records
+            .iter()
+            .find(|r| r.instance_id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                "a ledger file is named for {id} and ready/ holds no record for it ({} record(s)): \
+                 the id is record-less and holds activation for a day after it stops",
+                records.len()
+            )
+            });
+        assert!(
+            mine.fold_capable && !mine.rotation_complete && !mine.repair_rotation_complete,
+            "the startup record asserts C-capable code and neither rotation, got {mine:?}"
+        );
+    }
+
+    /// Keep one dispatcher registered for the life of the process, so a scoped capture is never
+    /// the only one.
+    ///
+    /// `tracing-core` takes a shortcut while exactly one dispatcher is registered: a callsite
+    /// registering then asks only the registering thread's own default whether it is enabled. A
+    /// parallel test thread with no subscriber reaching a callsite for the first time while a
+    /// capture was the only registered dispatcher cached that callsite as never enabled, and the
+    /// capturing thread then lost the event for good. That dropped `SIZE_ACCUM collect` and
+    /// `collect_total` from `a_delta_cycle_whose_discovery_fails_logs_and_reports_the_delta`
+    /// about once in 120 runs, with the cycle's other lines intact. With this dispatcher
+    /// registered, a capture makes two, and every registration consults all of them.
+    fn keep_a_second_dispatcher_registered() {
+        static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ANCHOR.get_or_init(|| {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+        });
+    }
+    /// Install a thread-local INFO subscriber writing to the returned buffer.
+    fn begin_info_capture() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buffer(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let captured = buf.0.clone();
+        let writer = buf;
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        keep_a_second_dispatcher_registered();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+    /// An event from a callsite that another thread, with no subscriber, reached first
+    /// while the capture was installed is still captured.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the `keep_a_second_dispatcher_registered();` call in `begin_info_capture` removed,
+    /// the bare thread's registration caches the callsite as never enabled and the captured log
+    /// is empty. Run alone (`-- a_callsite_first_hit_on_a_bare_thread`) so no other test's
+    /// dispatcher masks it.
+    #[test]
+    fn a_callsite_first_hit_on_a_bare_thread_is_still_captured() {
+        fn probe() {
+            tracing::info!("scn9-probe-line");
+        }
+        let (captured, guard) = begin_info_capture();
+        std::thread::spawn(probe).join().unwrap();
+        probe();
+        drop(guard);
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("scn9-probe-line"),
+            "the capture lost an event whose callsite another thread registered first: {log:?}"
+        );
+    }
+    /// Run one consolidation cycle with a thread-local subscriber and return the captured log.
+    ///
+    /// `#[tokio::test]` is a current-thread runtime, so the cycle and everything it spawns are
+    /// polled on this thread and the thread-local default sees every line. Tests running on
+    /// other threads of the libtest process log to their own defaults, not to this buffer.
+    async fn capture_one_cycle(consolidator: &JournalConsolidator) -> String {
+        let (log, result) = capture_one_cycle_with_result(consolidator).await;
+        assert_eq!(
+            (result.keys_processed, result.entries_consolidated),
+            (0, 0),
+            "FIXTURE: the cycle must find no journal keys, or it reaches the end-of-function \
+             summary and this asserts nothing about the no-keys return"
+        );
+        log
+    }
+
+    /// As `capture_one_cycle`, returning the cycle's result as well and asserting nothing.
+    async fn capture_one_cycle_with_result(
+        consolidator: &JournalConsolidator,
+    ) -> (String, ConsolidationCycleResult) {
+        let (captured, guard) = begin_info_capture();
+        let result = consolidator.run_consolidation_cycle().await.unwrap();
+        drop(guard);
+        let bytes = captured.lock().unwrap().clone();
+        (
+            String::from_utf8(bytes).expect("captured log output must be UTF-8"),
+            result,
+        )
+    }
+
+    const COMPLETION_TEXT: &str = "Consolidation cycle complete: keys=";
+
+    /// A lock-winning cycle that collects and applies a size delta but finds no journal keys
+    /// logs the completion summary, with `keys=0, entries=0` and the fields in the existing order.
+    ///
+    /// Before the change this path returned before the INFO summary, so a delta-only cycle left only
+    /// `SIZE_ACCUM collect_total` behind. On the 2026-09-25 fleet one proxy did this six times
+    /// with no completion line, and two investigations read the gaps as consolidation stalls.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the `info!` in the `cache_keys.is_empty()` branch removed, no completion line is
+    /// captured and the second assertion fails. The first assertion still passes, which is what
+    /// makes the failure attributable: the delta was collected, only the summary is missing.
+    #[tokio::test]
+    async fn a_delta_only_cycle_with_no_journal_keys_logs_completion() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator.size_accumulator.add(4096);
+
+        let (log, result) = capture_one_cycle_with_result(&consolidator).await;
+        assert_eq!(
+            (result.keys_processed, result.entries_consolidated),
+            (0, 0),
+            "FIXTURE: the cycle must find no journal keys, or it reaches the end-of-function \
+             summary and this asserts nothing about the no-keys return"
+        );
+
+        assert!(
+            log.contains("SIZE_ACCUM collect_total: files=1, total_delta=+4096"),
+            "FIXTURE: the cycle must have collected the delta, or the no-keys return was reached \
+             with a zero delta and the missing line would be correct.\n{}",
+            log
+        );
+        let completions: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(COMPLETION_TEXT))
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "a cycle that applied a size delta must log exactly one completion summary even when \
+             it found no journal keys.\n{}",
+            log
+        );
+        assert!(
+            completions[0].contains(" INFO ")
+                && completions[0].contains(
+                    "Consolidation cycle complete: keys=0, entries=0, accumulator_delta=+4096, duration="
+                )
+                && completions[0].contains("ms, total_cache_size=")
+                && completions[0].contains(", eviction_triggered=false"),
+            "the summary must be INFO and keep the existing fields in the existing order, so \
+             existing greps and parsers still match: {}",
+            completions[0]
+        );
+        // The result reports the delta the cycle applied, as the end-of-function return
+        // does. `main.rs`'s `Consolidation cycle: ... size_delta=` line reads this field.
+        // RED SIDE: with `size_delta: accumulator_size_delta` in the no-keys return set back to
+        // `size_delta: 0`, this fails with `left: 0, right: 4096`.
+        assert_eq!(
+            result.size_delta, 4096,
+            "a no-keys cycle that applied a size delta must report it in ConsolidationCycleResult"
+        );
+    }
+
+    /// Make discovery fail after the idle check and the delta application have run: replace
+    /// `metadata/_journals` with a regular FILE, so `exists()` is true and `read_dir` fails with
+    /// "not a directory" inside `discover_pending_cache_keys_indexed_capped`.
+    fn break_journal_discovery(tmp: &TempDir) {
+        let metadata = tmp.path().join("metadata");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let journals = metadata.join("_journals");
+        let _ = std::fs::remove_dir_all(&journals);
+        std::fs::write(&journals, b"not a directory").unwrap();
+    }
+
+    const DISCOVERY_WARN_TEXT: &str = "Failed to discover pending journal entries:";
+
+    /// A lock-winning cycle that applies a size delta and then fails discovery logs the
+    /// completion summary and reports the delta in its result.
+    ///
+    /// Before the change this return logged only the discovery WARN, which carries no delta, so an
+    /// applied delta was invisible at INFO, and the result said `size_delta: 0`.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the `info!` in the discovery-error branch removed, no completion line is captured
+    /// and the completion-count assertion fails while both FIXTURE assertions pass. With
+    /// `size_delta: accumulator_size_delta` in that branch set back to `size_delta: 0`, the last
+    /// assertion fails with `left: 0, right: 4096`.
+    #[tokio::test]
+    async fn a_delta_cycle_whose_discovery_fails_logs_and_reports_the_delta() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        break_journal_discovery(&tmp);
+        consolidator.size_accumulator.add(4096);
+
+        let (log, result) = capture_one_cycle_with_result(&consolidator).await;
+
+        assert!(
+            log.contains("SIZE_ACCUM collect_total: files=1, total_delta=+4096")
+                && log.contains(DISCOVERY_WARN_TEXT),
+            "FIXTURE: the cycle must have collected the delta AND reached the discovery-error \
+             return, or this asserts nothing about that return.\n{}",
+            log
+        );
+        let completions: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(COMPLETION_TEXT))
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "a cycle that applied a size delta must log exactly one completion summary even when \
+             discovery failed.\n{}",
+            log
+        );
+        assert!(
+            completions[0].contains(" INFO ")
+                && completions[0].contains(
+                    "Consolidation cycle complete: keys=0, entries=0, accumulator_delta=+4096, duration="
+                )
+                && completions[0].contains("ms, total_cache_size=")
+                && completions[0].contains(", eviction_triggered=false"),
+            "the summary must be INFO and keep the existing fields in the existing order: {}",
+            completions[0]
+        );
+        assert_eq!(
+            result.size_delta, 4096,
+            "a discovery-error cycle that applied a size delta must report it in \
+             ConsolidationCycleResult"
+        );
+    }
+
+    /// A cycle that passes the idle check, takes the lock, applies NO size delta and then fails
+    /// discovery logs the WARN and no completion summary.
+    ///
+    /// The idle check is passed by a planted zero-valued `delta_*.json`: `has_pending_delta_files`
+    /// sees it, and `collect_and_apply_deltas` collects nothing from it, so both collected deltas
+    /// are zero. A broken `_journals` cannot pass `has_pending_journal_files`.
+    ///
+    /// Until this fixture was a write-cache-only pending delta (`add_write_cache`). That cycle
+    /// applies a write-cache delta, so since the change it logs a completion line and is covered by
+    /// `a_write_cache_only_delta_cycle_whose_discovery_fails_logs_completion` instead.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the discovery-error branch's guard replaced by `true`, this captures one
+    /// `keys=0, entries=0, accumulator_delta=+0` line and fails.
+    #[tokio::test]
+    async fn a_zero_delta_cycle_whose_discovery_fails_logs_no_completion() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        break_journal_discovery(&tmp);
+        plant_zero_valued_delta_file(&tmp);
+        assert!(
+            !consolidator.size_accumulator.has_pending_delta()
+                && consolidator.has_pending_delta_files(),
+            "FIXTURE: the cycle must pass the idle check on the planted file alone, or it returns \
+             before discovery or carries a delta"
+        );
+
+        let (log, result) = capture_one_cycle_with_result(&consolidator).await;
+
+        assert!(
+            log.contains(DISCOVERY_WARN_TEXT),
+            "FIXTURE: the cycle must reach the discovery-error return.\n{}",
+            log
+        );
+        assert!(
+            !log.contains(COMPLETION_TEXT),
+            "a cycle that applied no size delta must stay silent at INFO even when discovery \
+             failed.\n{}",
+            log
+        );
+        assert_eq!(result.size_delta, 0);
+    }
+
+    /// A cycle that passes the idle check, takes the lock, applies NO size delta and finds no
+    /// journal keys logs no completion summary, so an idle-looking fleet's INFO volume does not
+    /// grow.
+    ///
+    /// The idle early return never reaches the new log call at all, so asserting on it would be
+    /// vacuous. This fixture reaches the no-keys branch itself: a non-empty `.journal` holding
+    /// only a blank line passes `has_pending_journal_files` and yields no key at discovery.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the no-keys branch's guard on the completion call removed, this captures one
+    /// `keys=0, entries=0, accumulator_delta=+0` line and fails.
+    #[tokio::test]
+    async fn a_zero_delta_cycle_with_no_journal_keys_logs_no_completion() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        let journals = tmp.path().join("metadata").join("_journals");
+        std::fs::create_dir_all(&journals).unwrap();
+        std::fs::write(journals.join("other-instance.journal"), "\n").unwrap();
+        assert!(
+            consolidator.has_pending_journal_files(),
+            "FIXTURE: the cycle must pass the idle check, or it returns before the no-keys branch"
+        );
+
+        let log = capture_one_cycle(&consolidator).await;
+
+        assert!(
+            !log.contains(COMPLETION_TEXT),
+            "a cycle that applied no size delta and found no journal keys must stay silent at \
+             INFO.\n{}",
+            log
+        );
+    }
+
+    /// Plant another instance's `delta_*.json` carrying zero in both fields, which passes
+    /// `has_pending_delta_files` and contributes nothing to `collect_and_apply_deltas`.
+    fn plant_zero_valued_delta_file(tmp: &TempDir) -> std::path::PathBuf {
+        let dir = tmp.path().join("size_tracking");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("delta_other-instance.json");
+        std::fs::write(
+            &path,
+            r#"{"delta":0,"write_cache_delta":0,"instance_id":"other-instance"}"#,
+        )
+        .unwrap();
+        path
+    }
+
+    fn global_lock_file(tmp: &TempDir) -> std::path::PathBuf {
+        tmp.path().join("locks").join("global_consolidation.lock")
+    }
+
+    /// Run one cycle that must take the global lock because of a planted delta file, then one
+    /// more that must NOT, and return the second cycle's captured log.
+    ///
+    /// Observes lock-taking directly: `try_acquire_global_consolidation_lock` opens
+    /// `locks/global_consolidation.lock` with `create(true)`, so a cycle that took the lock
+    /// leaves that file behind. The first cycle's file is removed before the second runs.
+    async fn two_cycles_second_must_stay_idle(
+        tmp: &TempDir,
+        consolidator: &JournalConsolidator,
+    ) -> String {
+        let (first_log, _) = capture_one_cycle_with_result(consolidator).await;
+        assert!(
+            global_lock_file(tmp).exists(),
+            "FIXTURE: the first cycle must pass the idle check on the planted file and take the \
+             lock, or the second cycle's idleness proves nothing.\n{}",
+            first_log
+        );
+        std::fs::remove_file(global_lock_file(tmp)).unwrap();
+        assert!(
+            !consolidator.has_pending_delta_files(),
+            "after one cycle has seen it, a delta file that carries nothing collectable must no \
+             longer match the idle check's `delta_*.json` predicate, or every idle cycle \
+             fleet-wide keeps taking the global lock until the next validation scan"
+        );
+        let (second_log, _) = capture_one_cycle_with_result(consolidator).await;
+        assert!(
+            !global_lock_file(tmp).exists(),
+            "the second cycle must take the idle return and not the global lock.\n{}",
+            second_log
+        );
+        format!("{first_log}{second_log}")
+    }
+
+    /// A zero-valued `delta_*.json` is deleted when a cycle collects it, so it does not keep
+    /// idle cycles taking the global lock. Such a file carries nothing: each flush writes a new,
+    /// uniquely-named file by temp-then-rename and never rewrites one in place.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the zero-valued arm in `collect_and_apply_deltas` back to a bare `continue`, the file
+    /// survives and the `has_pending_delta_files` assertion fails.
+    #[tokio::test]
+    async fn a_zero_valued_delta_file_is_deleted_and_idle_cycles_stop_locking() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        let planted = plant_zero_valued_delta_file(&tmp);
+
+        two_cycles_second_must_stay_idle(&tmp, &consolidator).await;
+        assert!(!planted.exists(), "the zero-valued file must be deleted");
+    }
+
+    /// Plant another instance's `delta_*.json` carrying `delta` bytes.
+    fn plant_delta_file(tmp: &TempDir, name: &str, delta: i64) -> std::path::PathBuf {
+        let dir = tmp.path().join("size_tracking");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("delta_{}.json", name));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"delta":{},"write_cache_delta":0,"instance_id":"{}"}}"#,
+                delta, name
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_size_state(tmp: &TempDir, total_size: u64) {
+        let state = SizeState {
+            total_size,
+            ..SizeState::default()
+        };
+        let dir = tmp.path().join("size_tracking");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("size_state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The projected size counts an uncollected delta file and has no side
+    /// effects. A zero-valued file and an unparseable one stay exactly where they are, which is
+    /// what lets any instance call it outside the consolidation lock.
+    #[tokio::test]
+    async fn the_projected_size_counts_pending_deltas_without_touching_them() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        write_size_state(&tmp, 1000);
+        let pending = plant_delta_file(&tmp, "peer-a", -300);
+        let zero = plant_delta_file(&tmp, "peer-zero", 0);
+        let corrupt = tmp.path().join("size_tracking").join("delta_corrupt.json");
+        std::fs::write(&corrupt, "{not json").unwrap();
+
+        assert_eq!(consolidator.get_current_size().await, Some(1000));
+        assert_eq!(
+            consolidator.get_projected_size().await,
+            Some(700),
+            "size_state 1000 plus a pending -300 delta file"
+        );
+        assert!(pending.exists() && zero.exists() && corrupt.exists());
+        assert_eq!(consolidator.get_current_size().await, Some(1000));
+
+        plant_delta_file(&tmp, "peer-b", -5000);
+        assert_eq!(
+            consolidator.get_projected_size().await,
+            Some(0),
+            "clamped at 0"
+        );
+    }
+
+    /// The ordering. A consolidation cycle's apply-then-delete lands exactly
+    /// between the projected read's two reads. Reading the delta files first sees the debit
+    /// in the file and again in `size_state` (a double count, toward smaller); reading
+    /// `size_state` first sees it in neither, and the re-read is as stale as the incumbent's.
+    #[tokio::test]
+    async fn the_projected_size_never_misses_a_delta_applied_between_its_reads() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        write_size_state(&tmp, 1000);
+        let pending = plant_delta_file(&tmp, "peer-a", -300);
+
+        let size_tracking = tmp.path().join("size_tracking");
+        projected_read_hook::arm(tmp.path(), move || {
+            // The cycle persists the applied sum, then deletes the file it collected.
+            let state = SizeState {
+                total_size: 700,
+                ..SizeState::default()
+            };
+            std::fs::write(
+                size_tracking.join("size_state.json"),
+                serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            std::fs::remove_file(&pending).unwrap();
+        });
+
+        let projected = consolidator.get_projected_size().await.unwrap();
+        assert!(
+            projected <= 700,
+            "a debit applied between the projected read's two reads was missed: projected \
+             {projected}, true post-apply size 700. The delta directory must be read before \
+             size_state."
+        );
+        assert_eq!(
+            projected, 400,
+            "the debit is counted twice, never zero times"
+        );
+    }
+
+    /// Take `size_state.lock` from a second file description, as a peer instance would.
+    fn hold_size_state_lock(tmp: &TempDir) -> std::fs::File {
+        let path = tmp.path().join("size_tracking").join("size_state.lock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        fs4::FileExt::lock(&file).unwrap();
+        file
+    }
+
+    fn total_size_on_disk(tmp: &TempDir) -> u64 {
+        let path = tmp.path().join("size_tracking").join("size_state.json");
+        let state: SizeState =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        state.total_size
+    }
+
+    /// A runtime whose blocking pool is small enough to exhaust: the fleet's 512 threads,
+    /// scaled down to 4.
+    fn small_blocking_pool_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// More concurrent locked `cached_objects` callers (`apply_new_objects_now`) than
+    /// blocking-pool threads all complete, and every increment lands.
+    ///
+    /// The holder's `load_size_state` and `persist_size_state_internal` are `tokio::fs` calls,
+    /// so the holder needs a blocking thread while it holds `size_state.lock`. Without the
+    /// in-process gate each other caller parks a pool thread in `flock` on its own descriptor,
+    /// the holder's read queues behind them, and the runtime deadlocks. That is the fleet wedge
+    /// (all 512 threads in this flock, workers idle), at 4 threads.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `gate.lock_owned().await` in `with_size_state_locked` replaced by a fresh
+    /// mutex's guard (no in-process serialisation), the join times out.
+    #[test]
+    fn concurrent_cached_object_increments_beyond_the_blocking_pool_all_complete() {
+        const CALLERS: u64 = 32;
+        let tmp = TempDir::new().unwrap();
+        let rt = small_blocking_pool_runtime();
+        let joined = rt.block_on(async {
+            let consolidator = Arc::new(graduation_test_consolidator(&tmp));
+            consolidator
+                .persist_size_state(&SizeState::default())
+                .await
+                .unwrap();
+            let tasks: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    let c = Arc::clone(&consolidator);
+                    tokio::spawn(async move { c.apply_new_objects_now(1).await })
+                })
+                .collect();
+            tokio::time::timeout(Duration::from_secs(20), futures::future::join_all(tasks)).await
+        });
+        rt.shutdown_background();
+        assert!(
+            joined.is_ok(),
+            "DEADLOCK: {} concurrent increment_cached_objects callers on a 4-thread blocking \
+             pool did not finish in 20 s",
+            CALLERS
+        );
+        let path = tmp.path().join("size_tracking").join("size_state.json");
+        let state: SizeState =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            state.cached_objects, CALLERS,
+            "every increment must land; a shortfall means callers timed out on the lock"
+        );
+    }
+
+    /// While a peer instance holds `size_state.lock` and many in-process callers wait for
+    /// it, an unrelated blocking-pool task (what `/health` and every `tokio::fs` call need)
+    /// still runs.
+    ///
+    /// # RED SIDE
+    ///
+    /// Same lever as the test above: without the gate the 32 waiters park all 4 pool threads in
+    /// `flock` and the probe's `spawn_blocking` never starts.
+    #[test]
+    fn a_blocking_task_still_runs_while_a_peer_holds_the_size_state_lock() {
+        let tmp = TempDir::new().unwrap();
+        let held = hold_size_state_lock(&tmp);
+        let rt = small_blocking_pool_runtime();
+        let probe = rt.block_on(async {
+            let consolidator = Arc::new(graduation_test_consolidator(&tmp));
+            for _ in 0..32 {
+                let c = Arc::clone(&consolidator);
+                tokio::spawn(async move { c.apply_new_objects_now(1).await });
+            }
+            // Let the callers reach the lock before probing.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(|| 42u32),
+            )
+            .await
+        });
+        drop(held);
+        rt.shutdown_background();
+        assert!(
+            matches!(probe, Ok(Ok(42))),
+            "STARVED: a blocking-pool task did not run within 2 s while 32 callers waited on \
+             size_state.lock: {:?}",
+            probe
+        );
+    }
+
+    /// A size-state holder finishes its read-modify-write while ANOTHER pool consumer
+    /// fills the blocking pool.
+    ///
+    /// The holder's thread waits in `flock` behind a peer instance. Meanwhile eight unrelated
+    /// blocking tasks (the shape of the unfixed `metadata_lock_manager` abandon, or any slow
+    /// `tokio::fs` load) occupy the other three pool threads and queue five more. When the peer
+    /// releases, the holder's thread takes the flock. If the holder then needs a second pool
+    /// thread for its read or write, that request queues behind the fillers, and the holder
+    /// stalls while holding a lock every peer instance waits on.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `with_size_state_locked` restored to the old shape (take the flock on one blocking
+    /// thread, then run the read-modify-write through a second `spawn_blocking`, which is what
+    /// the `tokio::fs` awaits did), the holder does not finish within 5 s.
+    #[test]
+    fn a_size_state_holder_completes_while_another_source_fills_the_blocking_pool() {
+        let tmp = TempDir::new().unwrap();
+        let rt = small_blocking_pool_runtime();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let outcome = rt.block_on(async {
+            let consolidator = Arc::new(graduation_test_consolidator(&tmp));
+            consolidator
+                .persist_size_state(&SizeState::default())
+                .await
+                .unwrap();
+            let peer = hold_size_state_lock(&tmp);
+            let c = Arc::clone(&consolidator);
+            let holder = tokio::spawn(async move { c.apply_new_objects_now(1).await });
+            // Let the holder's blocking thread reach the flock behind the peer.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            for _ in 0..8 {
+                let rx = Arc::clone(&release_rx);
+                tokio::task::spawn_blocking(move || {
+                    let _ = rx.lock().unwrap().recv();
+                });
+            }
+            // Let the fillers take every free pool thread before the peer releases.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(peer);
+            tokio::time::timeout(Duration::from_secs(5), holder).await
+        });
+        drop(release_tx);
+        rt.shutdown_background();
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "STALLED: a size-state holder did not finish within 5 s while another source \
+             filled the 4-thread blocking pool: {:?}",
+            outcome
+        );
+        let path = tmp.path().join("size_tracking").join("size_state.json");
+        let state: SizeState =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(state.cached_objects, 1, "the holder's increment must land");
+    }
+
+    /// Request-path `cached_objects` credits and debits take no lock. With a peer holding
+    /// `size_state.lock`, 64 concurrent credits (the shape of 64 PUTs publishing new keys)
+    /// all return at once; the next cycle applies +64 exactly, and a later debit and an
+    /// uncounted re-PUT (no call) give 63.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `increment_cached_objects` taking `size_state.lock` per call again, the credits
+    /// do not return within 1 s while the peer holds the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_path_cached_object_changes_take_no_lock_and_apply_exactly_per_cycle() {
+        const PUTS: u64 = 64;
+        let tmp = TempDir::new().unwrap();
+        let consolidator = Arc::new(graduation_test_consolidator(&tmp));
+        consolidator
+            .persist_size_state(&SizeState::default())
+            .await
+            .unwrap();
+        let peer = hold_size_state_lock(&tmp);
+        let tasks: Vec<_> = (0..PUTS)
+            .map(|_| {
+                let c = Arc::clone(&consolidator);
+                tokio::spawn(async move { c.increment_cached_objects(1).await })
+            })
+            .collect();
+        let joined =
+            tokio::time::timeout(Duration::from_secs(1), futures::future::join_all(tasks)).await;
+        drop(peer);
+        assert!(
+            joined.is_ok(),
+            "LOCKED: {} request-path cached_objects credits did not return within 1 s while a \
+             peer held size_state.lock",
+            PUTS
+        );
+        let on_disk = |tmp: &TempDir| -> u64 {
+            let path = tmp.path().join("size_tracking").join("size_state.json");
+            serde_json::from_str::<SizeState>(&std::fs::read_to_string(path).unwrap())
+                .unwrap()
+                .cached_objects
+        };
+        assert_eq!(
+            on_disk(&tmp),
+            0,
+            "the count moves at the cycle, not per request"
+        );
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(on_disk(&tmp), PUTS, "N new keys give +N after one cycle");
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            on_disk(&tmp),
+            PUTS,
+            "a cycle with no changes applies nothing twice"
+        );
+        // A re-PUT of a counted key makes no call (`credit_put_cached_object` returns early);
+        // a DELETE debits one.
+        consolidator.decrement_cached_objects(1).await;
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(on_disk(&tmp), PUTS - 1, "a delete gives -1");
+    }
+
+    /// The debit half of the test above, under the same contention. With a peer holding
+    /// `size_state.lock`, 64 concurrent debits (64 DELETEs or invalidations) all return at
+    /// once and leave the file untouched; the next cycle applies -64 exactly.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `DECREMENT_LOCKED` set, `decrement_cached_objects` takes `size_state.lock`
+    /// per call, and the debits do not return within 1 s while the peer holds the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_path_cached_object_debits_take_no_lock_while_a_peer_holds_it() {
+        const DELETES: u64 = 64;
+        let tmp = TempDir::new().unwrap();
+        let consolidator = Arc::new(graduation_test_consolidator(&tmp));
+        consolidator
+            .persist_size_state(&SizeState {
+                cached_objects: DELETES + 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let on_disk = |tmp: &TempDir| -> u64 {
+            let path = tmp.path().join("size_tracking").join("size_state.json");
+            serde_json::from_str::<SizeState>(&std::fs::read_to_string(path).unwrap())
+                .unwrap()
+                .cached_objects
+        };
+        let peer = hold_size_state_lock(&tmp);
+        let tasks: Vec<_> = (0..DELETES)
+            .map(|_| {
+                let c = Arc::clone(&consolidator);
+                tokio::spawn(async move { c.decrement_cached_objects(1).await })
+            })
+            .collect();
+        let joined =
+            tokio::time::timeout(Duration::from_secs(1), futures::future::join_all(tasks)).await;
+        let during = on_disk(&tmp);
+        drop(peer);
+        assert!(
+            joined.is_ok(),
+            "LOCKED: {} request-path cached_objects debits did not return within 1 s while a \
+             peer held size_state.lock",
+            DELETES
+        );
+        assert_eq!(
+            during,
+            DELETES + 1,
+            "the count moves at the cycle, not per request"
+        );
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(on_disk(&tmp), 1, "N debits give -N after one cycle");
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            on_disk(&tmp),
+            1,
+            "a cycle with no changes applies nothing twice"
+        );
+    }
+
+    /// The scrape accessor (`/health`, `/metrics`, the dashboard, through
+    /// `CacheManager::get_cache_size_stats`) reads no shared storage. With `size_state.json`
+    /// made unparseable after a persist, it still answers with the last in-memory figure; the
+    /// next real read records the failure and the scrape then reports UNREADABLE.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `SCRAPE_READS_DISK` set, the scrape reads the corrupted file and returns `None`.
+    #[tokio::test]
+    async fn the_scrape_size_state_answers_from_memory_when_the_file_is_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 4_321,
+                cached_objects: 7,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let path = tmp.path().join("size_tracking").join("size_state.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        let scraped = consolidator.get_size_state_for_scrape().await;
+        assert_eq!(
+            scraped.map(|s| (s.total_size, s.cached_objects)),
+            Some((4_321, 7)),
+            "the scrape read shared storage instead of the in-memory size state"
+        );
+        assert!(consolidator.get_size_state().await.is_none());
+        assert!(
+            consolidator.get_size_state_for_scrape().await.is_none(),
+            "after a failed read the scrape must report UNREADABLE, not the stale figure"
+        );
+    }
+
+    /// A caller whose budget expires while it waits for `size_state.lock` writes
+    /// nothing, even after the peer releases and its abandoned thread takes the flock.
+    ///
+    /// The delta apply keeps its delta files on `Err`, so a write landing after an `Err` would
+    /// apply that delta twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_size_state_caller_that_times_out_writes_nothing_after_the_peer_releases() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let peer = hold_size_state_lock(&tmp);
+        let applied = consolidator.atomic_update_size_delta(500, 0).await;
+        assert!(applied.is_err(), "FIXTURE: the peer held the lock past 5 s");
+        drop(peer);
+        // The abandoned thread now takes the flock; give it time to (not) write.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_000,
+            "a delta apply that returned Err was written after the peer released"
+        );
+        // And the gate came back: the next call proceeds.
+        assert_eq!(
+            consolidator.atomic_update_size_delta(500, 0).await.unwrap(),
+            1_500
+        );
+    }
+
+    /// Waits until no `with_size_state_locked` call in this process holds or waits for the
+    /// size-state gate, i.e. any orphaned blocking thread has taken the flock and released it.
+    async fn wait_for_size_state_gate(consolidator: &JournalConsolidator) {
+        let gate = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&consolidator.size_state_gate).lock_owned(),
+        )
+        .await;
+        assert!(
+            gate.is_ok(),
+            "FIXTURE: the orphaned size-state thread never released the gate"
+        );
+    }
+
+    /// A fenced delta apply whose caller is DROPPED while it waits for
+    /// `size_state.lock` writes nothing once the peer releases, even though its cycle still
+    /// holds the global lock (so the fence alone would let the write through).
+    ///
+    /// # RED SIDE
+    ///
+    /// Without the `SizeStateClaimDropGuard` in `with_size_state_locked`, the orphaned thread
+    /// claims `RUNNING` after the peer releases and writes the delta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_size_state_caller_writes_nothing_after_the_peer_releases() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(consolidator
+            .try_acquire_global_consolidation_lock()
+            .unwrap());
+        let peer = hold_size_state_lock(&tmp);
+        // Drive the apply until its thread waits in flock behind the peer, then drop it.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            consolidator.atomic_update_size_delta_fenced(500, 0, 0),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "FIXTURE: the apply finished while the peer held size_state.lock"
+        );
+        drop(peer);
+        wait_for_size_state_gate(&consolidator).await;
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_000,
+            "a delta apply whose caller was dropped was written after the peer released"
+        );
+        // The cycle still holds the lock, so the retry applies exactly once.
+        assert_eq!(
+            consolidator
+                .atomic_update_size_delta_fenced(500, 0, 0)
+                .await
+                .unwrap(),
+            1_500
+        );
+        consolidator.release_global_consolidation_lock();
+    }
+
+    /// A fenced delta apply still waiting for `size_state.lock` when its cycle releases
+    /// the global lock writes nothing. A release zeroes `lock_held_since_ms` and does not bump
+    /// `lock_generation`, so only the held term in the blocking-thread fence sees it.
+    ///
+    /// # RED SIDE
+    ///
+    /// Without the `lock_held_since_ms != 0` term in `fence_intact`, the apply returns
+    /// `Ok(1500)` and writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delta_apply_whose_cycle_released_the_lock_while_it_waited_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(consolidator
+            .try_acquire_global_consolidation_lock()
+            .unwrap());
+        let peer = hold_size_state_lock(&tmp);
+        let apply = consolidator.atomic_update_size_delta_fenced(500, 0, 0);
+        tokio::pin!(apply);
+        // Poll (not drop) the apply until its thread waits in flock behind the peer.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut apply)
+                .await
+                .is_err(),
+            "FIXTURE: the apply finished while the peer held size_state.lock"
+        );
+        consolidator.release_global_consolidation_lock();
+        drop(peer);
+        let applied = apply.await;
+        assert!(
+            applied.is_err(),
+            "the apply wrote after its cycle released the global lock: {:?}",
+            applied
+        );
+        assert_eq!(total_size_on_disk(&tmp), 1_000);
+    }
+
+    /// The shutdown path. A consolidation cycle dropped (the `timeout` around
+    /// `shutdown()`) while its delta apply waits behind a peer's `size_state.lock` releases the
+    /// global lock through its scopeguard; once the peer releases, the orphaned thread writes
+    /// nothing, the delta file survives, and the next cycle applies it exactly once.
+    ///
+    /// Either defence alone (the drop guard, or the fence's held term) keeps this green; the
+    /// two tests above pin each one separately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cycle_dropped_mid_delta_apply_leaves_its_delta_for_exactly_one_reapply() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let planted = plant_delta_file(&tmp, "peer-a_1", 800);
+        let peer = hold_size_state_lock(&tmp);
+        let dropped = tokio::time::timeout(
+            Duration::from_secs(1),
+            consolidator.run_consolidation_cycle(),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "FIXTURE: the cycle finished while the peer held size_state.lock"
+        );
+        drop(peer);
+        wait_for_size_state_gate(&consolidator).await;
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_000,
+            "the dropped cycle's delta was written after the peer released"
+        );
+        assert!(
+            planted.exists(),
+            "the dropped cycle's delta file must survive for the next cycle"
+        );
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_800,
+            "the next cycle must apply the surviving delta exactly once"
+        );
+    }
+
+    /// A delta whose apply fails because a peer holds `size_state.lock` past the 5 s
+    /// bound keeps its file, and the next cycle applies it exactly once.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the delete restored in `collect_deltas` (delete-on-read), the file is gone after
+    /// the first cycle and the survival assertion fails; `total_size` never rises.
+    #[tokio::test]
+    async fn a_delta_whose_apply_times_out_on_the_size_state_lock_survives_and_applies_once() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let planted = plant_delta_file(&tmp, "peer-a_1", 800);
+
+        let held = hold_size_state_lock(&tmp);
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert!(
+            planted.exists(),
+            "a delta file whose apply failed on the size_state lock must survive for the next \
+             cycle; deleted on read, its 800 bytes are lost"
+        );
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_000,
+            "FIXTURE: the apply must have failed while the lock was held"
+        );
+        fs4::FileExt::unlock(&held).unwrap();
+        drop(held);
+
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_800,
+            "the next cycle must apply the surviving delta"
+        );
+        assert!(
+            !planted.exists(),
+            "an applied delta file is deleted after the persist"
+        );
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_800,
+            "the delta must be applied exactly once"
+        );
+    }
+
+    /// A listing error after the first delta file applies that file once and leaves the
+    /// unlisted one for the next cycle; nothing is lost and nothing is applied twice.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the listing error propagated as `Err` after a delete-on-read, the first file is
+    /// gone and unapplied, and the first cycle's total assertion fails.
+    #[tokio::test]
+    async fn a_listing_error_after_the_first_file_applies_it_once_and_keeps_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let a = plant_delta_file(&tmp, "peer-a_1", 100);
+        let b = plant_delta_file(&tmp, "peer-b_1", 200);
+
+        delta_listing_fault::arm(tmp.path(), 1);
+        consolidator.run_consolidation_cycle().await.unwrap();
+        let after_first = total_size_on_disk(&tmp);
+        let remaining: Vec<_> = [&a, &b].into_iter().filter(|p| p.exists()).collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the file listed before the fault is applied and deleted; the other stays"
+        );
+        let expected_first = if remaining[0] == &b { 1_100 } else { 1_200 };
+        assert_eq!(
+            after_first, expected_first,
+            "the file collected before the listing error must be applied in the same cycle"
+        );
+
+        consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            1_300,
+            "the next cycle applies the remaining file, and each delta exactly once"
+        );
+        assert!(!a.exists() && !b.exists());
+    }
+
+    /// The validation install takes `size_state.lock`, so it waits for a peer holding
+    /// it rather than writing `size_state.json` underneath the peer's read-modify-write.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the lock removed from `update_size_from_validation_with_kind`, the install writes
+    /// while the peer holds the lock and the mid-hold assertion reads 500.
+    #[tokio::test]
+    async fn a_validation_install_waits_for_a_peer_holding_the_size_state_lock() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator
+            .persist_size_state(&SizeState {
+                total_size: 1_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let held = hold_size_state_lock(&tmp);
+        let peer = async {
+            tokio::time::sleep(Duration::from_millis(1_000)).await;
+            let mid = total_size_on_disk(&tmp);
+            fs4::FileExt::unlock(&held).unwrap();
+            mid
+        };
+        let ((), mid) = tokio::join!(
+            consolidator.update_size_from_validation(500, None, None),
+            peer
+        );
+        assert_eq!(
+            mid, 1_000,
+            "the validation install must not write size_state.json while a peer holds \
+             size_state.lock"
+        );
+        assert_eq!(
+            total_size_on_disk(&tmp),
+            500,
+            "once the peer releases the lock, the install proceeds"
+        );
+    }
+
+    /// An unparseable `delta_*.json` is renamed aside to `.corrupt`, keeping its bytes for
+    /// diagnosis under a name the `delta_*.json` predicate does not match, with one WARN.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the unparseable arm in `collect_and_apply_deltas` back to a bare `continue`, the file
+    /// survives under its own name and the `has_pending_delta_files` assertion fails.
+    #[tokio::test]
+    async fn an_unparseable_delta_file_is_renamed_aside_and_idle_cycles_stop_locking() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        let dir = tmp.path().join("size_tracking");
+        std::fs::create_dir_all(&dir).unwrap();
+        let planted = dir.join("delta_other-instance_7.json");
+        let bytes = b"{\"delta\": 40";
+        std::fs::write(&planted, bytes).unwrap();
+
+        let log = two_cycles_second_must_stay_idle(&tmp, &consolidator).await;
+        let aside = dir.join("delta_other-instance_7.json.corrupt");
+        assert!(
+            !planted.exists() && aside.exists(),
+            "the unparseable file must be renamed to {:?}",
+            aside
+        );
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            bytes,
+            "its bytes must survive for diagnosis"
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains(" WARN ") && l.contains("delta_other-instance_7.json"))
+                .count(),
+            1,
+            "exactly one WARN across both cycles names the file.\n{}",
+            log
+        );
+    }
+
+    /// `reset_all_delta_files` removes a stale `delta_*.json.tmp`, and only a stale one.
+    ///
+    /// `SizeAccumulator::write_delta_file` writes `delta_{instance}_{seq}.json.tmp` and renames
+    /// it to `.json` in the same call, so a temp file old enough to be stale is one whose writer
+    /// died between the two steps. A fresh one may be mid-rename and must survive, and a
+    /// `.corrupt` file is kept for diagnosis and removed by hand, so it must survive too.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the temp-file arm placed after the `ends_with(".json")` filter again, the stale temp
+    /// file survives and the first assertion fails.
+    #[tokio::test]
+    async fn reset_all_delta_files_removes_a_stale_tmp_file_and_keeps_fresh_and_corrupt_ones() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        let dir = tmp.path().join("size_tracking");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stale = dir.join("delta_dead-instance_4.json.tmp");
+        std::fs::write(&stale, br#"{"delta": 7}"#).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600))
+            .unwrap();
+        let fresh = dir.join("delta_live-instance_9.json.tmp");
+        std::fs::write(&fresh, br#"{"delta": 8}"#).unwrap();
+        let corrupt = dir.join("delta_other-instance_7.json.corrupt");
+        std::fs::write(&corrupt, b"{\"delta\": 40").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&corrupt)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600))
+            .unwrap();
+
+        consolidator.reset_all_delta_files().await;
+
+        assert!(
+            !stale.exists(),
+            "a delta temp file two hours old has no live writer and must be removed by the reset"
+        );
+        assert!(
+            fresh.exists(),
+            "a fresh delta temp file may be mid-rename by its writer and must survive the reset"
+        );
+        assert!(
+            corrupt.exists(),
+            "a .corrupt file is kept for diagnosis and removed by hand, not by the reset"
+        );
+    }
+
+    /// The fleet case, P1 06:06:38: `total_delta=+0 wc=+8388741`.
+    const WC_ONLY_DELTA: u64 = 8_388_741;
+
+    /// Assert `log` holds exactly one INFO completion line for a write-cache-only cycle with no
+    /// journal keys, carrying `write_cache_delta` as its last field.
+    fn assert_one_wc_only_completion(log: &str) {
+        assert!(
+            log.contains(
+                "SIZE_ACCUM collect_total: files=1, total_delta=+0, total_wc_delta=+8388741"
+            ),
+            "FIXTURE: the cycle must have collected a write-cache-only delta, or a missing line \
+             would be correct.\n{}",
+            log
+        );
+        let completions: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(COMPLETION_TEXT))
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "a cycle that applied a write-cache delta must log exactly one completion summary, \
+             even when its size delta is zero.\n{}",
+            log
+        );
+        assert!(
+            completions[0].contains(" INFO ")
+                && completions[0].contains(
+                    "Consolidation cycle complete: keys=0, entries=0, accumulator_delta=+0, duration="
+                )
+                && completions[0].contains("ms, total_cache_size=")
+                && completions[0]
+                    .ends_with(", eviction_triggered=false, write_cache_delta=+8388741"),
+            "the summary must be INFO, keep the existing fields in the existing order, and carry \
+             the write-cache delta as its LAST field: {}",
+            completions[0]
+        );
+    }
+
+    /// A lock-winning cycle whose only work is a non-zero WRITE-CACHE delta, with no journal
+    /// keys, logs the completion summary. The fleet case: a cycle collected and applied
+    /// `total_delta=+0 wc=+8388741` and logged no `Consolidation cycle complete` line, because
+    /// every completion condition tested `accumulator_size_delta` alone.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the no-keys branch's guard back to `accumulator_size_delta != 0`, no completion line
+    /// is captured and the completion-count assertion fails while the FIXTURE assertion passes.
+    #[tokio::test]
+    async fn a_write_cache_only_delta_cycle_with_no_journal_keys_logs_completion() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        consolidator.size_accumulator.add_write_cache(WC_ONLY_DELTA);
+
+        let (log, result) = capture_one_cycle_with_result(&consolidator).await;
+        assert_eq!(
+            (result.keys_processed, result.entries_consolidated),
+            (0, 0),
+            "FIXTURE: the cycle must find no journal keys, or it reaches the end-of-function \
+             summary and this asserts nothing about the no-keys return"
+        );
+        assert_one_wc_only_completion(&log);
+    }
+
+    /// As the test above, through the END-OF-FUNCTION summary: a cycle that finds a journal key but
+    /// consolidates none of its entries, triggers no eviction and applies no size delta, and
+    /// whose only work is a non-zero write-cache delta, logs exactly one completion line and
+    /// reports the delta in `ConsolidationCycleResult::write_cache_delta`, the field `main.rs`'s
+    /// `Consolidation cycle:` line reads.
+    ///
+    /// "A key but zero entries" is a journal `Add` whose range file is not yet visible and is
+    /// younger than `stale_entry_timeout_secs`: `validate_journal_entries` keeps it pending, so
+    /// the key is processed and nothing is consolidated.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `accumulator_wc_delta != 0` removed from the end-of-function guard, no completion line
+    /// is captured and the completion-count assertion fails while both FIXTURE assertions pass.
+    #[tokio::test]
+    async fn a_write_cache_only_delta_cycle_with_an_unconsolidated_key_logs_completion() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        let journal = JournalManager::new(tmp.path().to_path_buf(), "test-instance".to_string());
+        append_one_add(tmp.path(), &journal, 0).await;
+        let range_path = crate::disk_cache::get_sharded_path(
+            &tmp.path().join("ranges"),
+            "fixture-bucket/object-0",
+            "_0-99.bin",
+        )
+        .unwrap();
+        std::fs::remove_file(&range_path).unwrap();
+        consolidator.size_accumulator.add_write_cache(WC_ONLY_DELTA);
+
+        let (log, result) = capture_one_cycle_with_result(&consolidator).await;
+        assert_eq!(
+            (
+                result.keys_processed,
+                result.entries_consolidated,
+                result.eviction_triggered,
+                result.size_delta
+            ),
+            (1, 0, false, 0),
+            "FIXTURE: the cycle must process one key, consolidate nothing, trigger no eviction and \
+             apply no size delta, or it does not isolate the write-cache term of the \
+             end-of-function guard.\n{}",
+            log
+        );
+        assert_eq!(
+            result.write_cache_delta, WC_ONLY_DELTA as i64,
+            "the cycle result must carry the applied write-cache delta for main.rs's line"
+        );
+        let completions: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(COMPLETION_TEXT))
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "a keyed cycle whose only work is a write-cache delta must log exactly one completion \
+             summary.\n{}",
+            log
+        );
+        assert!(
+            completions[0].contains(" INFO ")
+                && completions[0].contains(
+                    "Consolidation cycle complete: keys=1, entries=0, accumulator_delta=+0, duration="
+                )
+                && completions[0]
+                    .ends_with(", eviction_triggered=false, write_cache_delta=+8388741"),
+            "the summary must carry the non-zero write-cache delta as its last field: {}",
+            completions[0]
+        );
+    }
+
+    /// As `a_write_cache_only_delta_cycle_with_no_journal_keys_logs_completion`, through the
+    /// discovery-error return.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the discovery-error branch's guard back to `accumulator_size_delta != 0`, no
+    /// completion line is captured and the completion-count assertion fails.
+    #[tokio::test]
+    async fn a_write_cache_only_delta_cycle_whose_discovery_fails_logs_completion() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&tmp);
+        break_journal_discovery(&tmp);
+        consolidator.size_accumulator.add_write_cache(WC_ONLY_DELTA);
+
+        let log = capture_one_cycle_with_result(&consolidator).await.0;
+        assert!(
+            log.contains(DISCOVERY_WARN_TEXT),
+            "FIXTURE: the cycle must reach the discovery-error return.\n{}",
+            log
+        );
+        assert_one_wc_only_completion(&log);
+    }
+
+    /// One `maintain_staged_authority` call walks `metadata/` **once** and reads the repair
+    /// documents **once**.
+    ///
+    /// Same shape as `ledger_repair`'s `one_gauge_collection_reads_the_repair_tree_once`, and for
+    /// the same reason: one read and two produce identical ready records, so only the traversal
+    /// tally can tell them apart. This call runs on every non-idle cycle under the global
+    /// consolidation lock, so each extra read of the repair documents is ~1.4 ms per shard of
+    /// fleet-wide consolidation stall on EFS.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the two repair figures read through the path-taking
+    /// `repair_rotation_complete(&self.cache_dir)` / `repair_stalest_age_secs(&self.cache_dir)`
+    /// (the earlier call site), this reports 2 document reads and 2 walks. The read now lives in
+    /// `ReadinessMemo::read`; a fresh consolidator holds no memo, so one call reads once.
+    #[tokio::test]
+    async fn maintain_staged_authority_reads_the_repair_tree_once() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = graduation_test_consolidator(&tmp);
+
+        // Four real shards, each with a completed repair sweep, so the published figures are
+        // derived from real input rather than sentinels.
+        for xx in ["0a", "1b", "2c", "3d"] {
+            std::fs::create_dir_all(dir.join("metadata").join("test-bucket").join(xx)).unwrap();
+        }
+        for _ in 0..8 {
+            if crate::ledger_repair::repair_rotation_complete(dir) {
+                break;
+            }
+            crate::ledger_repair::run_ledger_repair(
+                dir,
+                &consolidator.write_ledger,
+                consolidator.write_ledger.instance_id(),
+            )
+            .await;
+        }
+        assert!(
+            crate::ledger_repair::repair_rotation_complete(dir),
+            "fixture precondition: every seeded shard must have a completed sweep"
+        );
+
+        let docs_before = crate::ledger_repair::traversals_for_tests("repair_docs", dir);
+        let walks_before = crate::ledger_repair::traversals_for_tests("shard_walk", dir);
+
+        consolidator.maintain_staged_authority().await;
+
+        let docs = crate::ledger_repair::traversals_for_tests("repair_docs", dir) - docs_before;
+        let walks = crate::ledger_repair::traversals_for_tests("shard_walk", dir) - walks_before;
+        assert_eq!(
+            (docs, walks),
+            (1, 1),
+            "maintain_staged_authority must read the repair documents ONCE and walk metadata/ \
+             ONCE per call. Got {docs} document read(s) and {walks} walk(s): a repair figure has \
+             gone back to a path-taking helper that re-reads the tree."
+        );
+
+        // A count of 1 is also what a caller that skipped the figures would show, so the record
+        // it published must carry both figures derived from the shared read.
+        let records = crate::staged_authority::read_ready_records(dir).unwrap();
+        let mine = records
+            .iter()
+            .find(|r| r.instance_id == consolidator.write_ledger.instance_id())
+            .expect("maintain_staged_authority must publish this instance's ready record");
+        assert!(
+            mine.repair_rotation_complete,
+            "the rotation predicate must come from the shared read over a completed rotation"
+        );
+        assert!(
+            mine.repair_stalest_age_secs.is_some(),
+            "the stalest age must come from the shared read, not its null sentinel"
+        );
+    }
+
+    /// Seed `n` shards the way the earlier `consolidation_cycle_cost_scaling_test` does: an L1
+    /// directory under `metadata/`, a fold checkpoint and a completed repair document each.
+    fn seed_authority_shards(cache_dir: &std::path::Path, n: usize) {
+        use crate::ledger_repair::RepairShardCheckpoint;
+        let now_nanos = nanos_since_epoch(SystemTime::now());
+        for i in 0..n {
+            let bucket = format!("bucket{:03}", i / 256);
+            let l1 = format!("{:02x}", i % 256);
+            std::fs::create_dir_all(
+                cache_dir
+                    .join("metadata")
+                    .join(&bucket)
+                    .join(&l1)
+                    .join("000"),
+            )
+            .unwrap();
+            crate::staged_fold::seed_unfolded_checkpoint_for_tests(cache_dir, &bucket, &l1);
+            RepairShardCheckpoint {
+                schema: 1,
+                bucket,
+                l1,
+                swept_at: now_nanos,
+                swept_by: "test-instance".to_string(),
+                resume_l2: None,
+                ranges_reappended: 0,
+                metas_examined: 0,
+                dirs_read: 1,
+                other: serde_json::Map::new(),
+            }
+            .install(cache_dir)
+            .unwrap();
+        }
+    }
+
+    /// One journal `Add` for a fresh key with its range file present, so the cycle is non-idle
+    /// and consolidates exactly one entry — the fleet's `keys=1, entries=1` shape.
+    async fn append_one_add(cache_dir: &std::path::Path, journal: &JournalManager, seq: usize) {
+        let cache_key = format!("fixture-bucket/object-{seq}");
+        let range_path =
+            crate::disk_cache::get_sharded_path(&cache_dir.join("ranges"), &cache_key, "_0-99.bin")
+                .unwrap();
+        std::fs::create_dir_all(range_path.parent().unwrap()).unwrap();
+        std::fs::write(&range_path, vec![0u8; 100]).unwrap();
+        let now = SystemTime::now();
+        let entry = JournalEntry {
+            timestamp: now,
+            instance_id: "test-instance".to_string(),
+            cache_key: cache_key.clone(),
+            range_spec: RangeSpec {
+                start: 0,
+                end: 99,
+                file_path: range_path.to_string_lossy().to_string(),
+                compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+                compressed_size: 100,
+                uncompressed_size: 100,
+                created_at: now,
+                last_accessed: now,
+                access_count: 1,
+                staged: None,
+                unservable: false,
+                file_identity: None,
+            },
+            operation: JournalOperation::Add,
+            range_file_path: range_path.to_string_lossy().to_string(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: None,
+            access_increment: None,
+            // A range fill carries the response's metadata; only that may create the `.meta`.
+            object_metadata: Some(ObjectMetadata::default()),
+            fill_witness: None,
+        };
+        journal.append_range_entry(&cache_key, entry).await.unwrap();
+    }
+
+    /// A steady non-idle consolidation cycle reads **no** staged-authority documents: its
+    /// document reads are O(entries), not O(shards).
+    ///
+    /// Measured the steady cycle at 479 ms locally for 1,024 shards against 15.7 ms for
+    /// none, 97 % of it `maintain_staged_authority` reading every fold checkpoint and (twice)
+    /// every repair document. Those readiness predicates change only when a pass installs or an
+    /// age crosses an hour-scale bound, so they are now read at most once per
+    /// `READINESS_MEMO_MAX_AGE_SECS` and re-evaluated against `now` in between.
+    ///
+    /// This is the earlier `steady_state_cycle_cost_scales_with_shard_count` fixture turned into an
+    /// assertion. It lives here rather than in that integration test because the read tallies
+    /// (`staged_fold::shard_checkpoint_reads_for_tests`, `ledger_repair::traversals_for_tests`)
+    /// are `#[cfg(test)]` in the library and invisible to an integration binary, and a timing
+    /// assertion would be a flake by construction. Every traversal counted reads every one of the
+    /// `SHARDS` documents, so documents read = traversals x `SHARDS`.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `current_readiness` reading the volume every call (the memo never served), each
+    /// steady cycle reports one fold-checkpoint traversal, one repair-document traversal and one
+    /// shard walk: 2,048 documents per cycle for one consolidated entry.
+    #[tokio::test]
+    async fn a_steady_non_idle_cycle_reads_no_authority_documents() {
+        const SHARDS: usize = 1_024;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        seed_authority_shards(dir, SHARDS);
+        let journal = Arc::new(JournalManager::new(
+            dir.to_path_buf(),
+            "test-instance".to_string(),
+        ));
+        let consolidator = JournalConsolidator::new(
+            dir.to_path_buf(),
+            journal.clone(),
+            Arc::new(MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(5),
+                3,
+            )),
+            ConsolidationConfig {
+                interval: Duration::from_secs(5),
+                // 0 disables eviction, so no detached eviction pass reads the volume.
+                max_cache_size: 0,
+                consolidation_cycle_timeout: Duration::from_secs(30),
+                max_keys_per_cycle: 5000,
+                ..ConsolidationConfig::default()
+            },
+        );
+        consolidator.initialize().await.unwrap();
+
+        // The first cycle runs the fold and repair passes and reads the evidence once.
+        append_one_add(dir, &journal, 0).await;
+        let first = consolidator.run_consolidation_cycle().await.unwrap();
+        assert!(
+            first.entries_consolidated >= 1,
+            "fixture precondition: the first cycle must be non-idle"
+        );
+        assert!(
+            crate::staged_authority::read_ready_records(dir)
+                .unwrap()
+                .iter()
+                .any(|r| r.instance_id == consolidator.write_ledger.instance_id()),
+            "fixture precondition: the first cycle must reach maintain_staged_authority and \
+             publish, or the steady cycles below measure a function that never runs"
+        );
+        // The first cycle only STARTS the fold and repair passes; they run on their own tasks
+        // and invalidate the memo when they install, so the cycle after their completion reads
+        // the evidence once more. Let them land, then take that one read, so the steady cycles
+        // below are steady.
+        consolidator.await_maintenance_passes().await;
+        append_one_add(dir, &journal, 100).await;
+        consolidator.run_consolidation_cycle().await.unwrap();
+
+        for seq in 1..=3 {
+            append_one_add(dir, &journal, seq).await;
+            let fold_before = crate::staged_fold::shard_checkpoint_reads_for_tests(dir);
+            let docs_before = crate::ledger_repair::traversals_for_tests("repair_docs", dir);
+            let walks_before = crate::ledger_repair::traversals_for_tests("shard_walk", dir);
+            let written_before = crate::staged_authority::read_ready_records(dir)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.instance_id == consolidator.write_ledger.instance_id())
+                .map(|r| r.written_at);
+
+            let r = consolidator.run_consolidation_cycle().await.unwrap();
+
+            let fold = crate::staged_fold::shard_checkpoint_reads_for_tests(dir) - fold_before;
+            let docs = crate::ledger_repair::traversals_for_tests("repair_docs", dir) - docs_before;
+            let walks =
+                crate::ledger_repair::traversals_for_tests("shard_walk", dir) - walks_before;
+            assert!(
+                r.entries_consolidated >= 1,
+                "fixture precondition: steady cycle {seq} must be non-idle, or it never reaches \
+                 maintain_staged_authority and a zero read count is vacuous"
+            );
+            let documents = (fold + docs) as usize * SHARDS;
+            assert_eq!(
+                (fold, docs, walks),
+                (0, 0, 0),
+                "steady cycle {seq} consolidated {} entr(y/ies) and read {documents} authority \
+                 documents ({fold} fold-checkpoint traversal(s), {docs} repair-document \
+                 traversal(s), {walks} shard walk(s)) over {SHARDS} shards: its reads are \
+                 O(shards), not O(entries)",
+                r.entries_consolidated
+            );
+            // Not vacuous: the record is still republished every non-idle cycle.
+            let written_after = crate::staged_authority::read_ready_records(dir)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.instance_id == consolidator.write_ledger.instance_id())
+                .map(|r| r.written_at);
+            assert!(
+                written_after.is_some() && written_after >= written_before,
+                "the ready record must still be republished on a steady cycle"
+            );
+        }
+        // Not vacuous the other way either: a latched epoch also skips the reads, for a
+        // different reason. The seeded fold checkpoints are unfolded, so this volume must still
+        // be in Phase L and every steady cycle above took the memo path.
+        assert_eq!(
+            crate::staged_authority::read_epoch(dir),
+            crate::staged_authority::EPOCH_LEGACY,
+            "fixture precondition: the volume must not have activated, or zero reads is the \
+             post-latch skip rather than the memo"
+        );
+    }
+
+    /// A held readiness value ages against `now`: a cached `true` turns `false` when the
+    /// stalest document crosses its bound, exactly as a fresh read would, without a re-read.
+    #[test]
+    fn a_cached_readiness_true_expires_by_age_against_now() {
+        use crate::ledger_repair::{RepairReadinessEvidence, MAX_REPAIR_AGE_SECS};
+        use crate::staged_fold::MAX_AUTHORITY_AGE_SECS;
+        let read_at_nanos = 1_000 * 1_000_000_000;
+        let memo = ReadinessMemo {
+            read_at_nanos,
+            fold: Some(MAX_AUTHORITY_AGE_SECS - 10),
+            repair: RepairReadinessEvidence::StalestAge(MAX_REPAIR_AGE_SECS - 10),
+        };
+        let at = |secs: u64| read_at_nanos + secs * 1_000_000_000;
+        assert_eq!(
+            memo.evaluate(at(0)),
+            (true, true, Some(MAX_REPAIR_AGE_SECS - 10))
+        );
+        assert_eq!(
+            memo.evaluate(at(10)),
+            (true, true, Some(MAX_REPAIR_AGE_SECS))
+        );
+        // One nanosecond past the bound rounds UP to the next second, so it is already over.
+        assert_eq!(
+            memo.evaluate(at(10) + 1),
+            (false, false, Some(MAX_REPAIR_AGE_SECS + 1)),
+            "a cached true must not outlive the age bound a fresh read would enforce"
+        );
+        assert!(memo.is_current(at(READINESS_MEMO_MAX_AGE_SECS - 1)));
+        assert!(
+            !memo.is_current(at(READINESS_MEMO_MAX_AGE_SECS - 1) + 1),
+            "a memo is never served at or past READINESS_MEMO_MAX_AGE_SECS"
+        );
+        // Unavailable evidence never becomes complete by ageing, and an empty population stays
+        // vacuously complete with age 0, matching the uncached derivations.
+        let unavailable = ReadinessMemo {
+            read_at_nanos,
+            fold: None,
+            repair: RepairReadinessEvidence::Unavailable,
+        };
+        assert_eq!(unavailable.evaluate(at(100)), (false, false, None));
+        let empty = ReadinessMemo {
+            read_at_nanos,
+            fold: None,
+            repair: RepairReadinessEvidence::EmptyPopulation,
+        };
+        assert_eq!(empty.evaluate(at(100)), (false, true, Some(0)));
+    }
+
+    /// Activation never acts on cached evidence: a `Permitted` verdict computed from a held
+    /// memo triggers a fresh read, and a regression that fresh read sees blocks activation.
+    ///
+    /// The regression constructed is a newly observed shard with no repair sweep — invisible to
+    /// the held memo, visible to a fresh walk. The held memo is planted directly so the test
+    /// does not depend on assembling a real fold rotation.
+    #[tokio::test]
+    async fn activation_rereads_rather_than_acting_on_cached_readiness() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = graduation_test_consolidator(&tmp);
+
+        // A held memo that says "ready", read just now.
+        if let Ok(mut memo) = consolidator.readiness_memo.lock() {
+            *memo = Some(ReadinessMemo {
+                read_at_nanos: nanos_since_epoch(SystemTime::now()),
+                fold: Some(0),
+                repair: crate::ledger_repair::RepairReadinessEvidence::StalestAge(0),
+            });
+        }
+        // The volume says otherwise: a shard with no sweep and no fold checkpoint.
+        std::fs::create_dir_all(dir.join("metadata").join("test-bucket").join("0a")).unwrap();
+
+        let docs_before = crate::ledger_repair::traversals_for_tests("repair_docs", dir);
+        consolidator.maintain_staged_authority().await;
+        let docs = crate::ledger_repair::traversals_for_tests("repair_docs", dir) - docs_before;
+
+        // `fold_incomplete_total` is a process-global counter that other tests in this binary
+        // increment, and a non-zero value blocks the verdict before it is `Permitted`, in which
+        // case no re-read is owed. It only ever rises, so zero AFTER the call means it was zero
+        // throughout and the verdict from the held memo was `Permitted`. Run alone, it is zero.
+        if crate::staged_fold::fold_incomplete_total() == 0 {
+            assert_eq!(
+                docs, 1,
+                "a Permitted verdict from cached evidence must trigger exactly one fresh read"
+            );
+            let mine = crate::staged_authority::read_ready_records(dir)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.instance_id == consolidator.write_ledger.instance_id())
+                .expect("the record must be republished from the fresh read");
+            assert!(
+                !mine.repair_rotation_complete && !mine.rotation_complete,
+                "the republished record must carry the fresh read's figures, not the memo's"
+            );
+        } else {
+            eprintln!(
+                "activation_rereads_rather_than_acting_on_cached_readiness: \
+                 fold_incomplete_total is non-zero in this process, so the verdict was blocked \
+                 before Permitted and the re-read count is not asserted (docs={docs})"
+            );
+        }
+        assert_eq!(
+            crate::staged_authority::read_epoch(dir),
+            crate::staged_authority::EPOCH_LEGACY,
+            "the fresh read sees an unswept shard, so activation must not happen"
+        );
+    }
+
+    /// A volume on which § 16.6.6's verdict is `Permitted` for this instance alone: one shard
+    /// with a fresh fold checkpoint and a fresh repair document, and no ledger file.
+    fn seed_activation_ready_volume(cache_dir: &std::path::Path) {
+        use crate::ledger_repair::RepairShardCheckpoint;
+        let now_nanos = nanos_since_epoch(SystemTime::now());
+        std::fs::create_dir_all(
+            cache_dir
+                .join("metadata")
+                .join("test-bucket")
+                .join("0a")
+                .join("000"),
+        )
+        .unwrap();
+        crate::staged_fold::seed_freshly_folded_checkpoint_for_tests(
+            cache_dir,
+            "test-bucket",
+            "0a",
+        );
+        RepairShardCheckpoint {
+            schema: 1,
+            bucket: "test-bucket".to_string(),
+            l1: "0a".to_string(),
+            swept_at: now_nanos,
+            swept_by: "test-instance".to_string(),
+            resume_l2: None,
+            ranges_reappended: 0,
+            metas_examined: 0,
+            dirs_read: 1,
+            other: serde_json::Map::new(),
+        }
+        .install(cache_dir)
+        .unwrap();
+    }
+
+    /// This instance never activates the epoch while its own staged fold or ledger repair is in
+    /// flight, and does once neither is — the ordering guard added when the passes left the
+    /// consolidation cycle.
+    ///
+    /// Inline, the passes always landed their outcome (an install, or a retain that bumps
+    /// `fold_incomplete_total`) before this instance's own verdict. Off the cycle, a pass can be
+    /// mid-flight when `maintain_staged_authority` runs, and without the guard the verdict would
+    /// consume this instance's readiness before the in-flight outcome exists. The flags are set
+    /// directly: `spawn_maintenance_passes` claims them synchronously, before the cycle reaches
+    /// this function, so a set flag is exactly the state the first cycle after start is in.
+    ///
+    /// # Not vacuous, and where it could be
+    ///
+    /// The in-flight halves only discriminate when the verdict would otherwise be `Permitted`, so
+    /// the test reads the verdict directly and says which case it was in. `fold_incomplete_total`
+    /// is a process-global counter other tests in this binary increment; a non-zero value blocks
+    /// the verdict regardless of the guard, in which case the in-flight halves pass vacuously and
+    /// the final positive half is not asserted. Run alone, it is zero.
+    ///
+    /// # RED SIDE
+    ///
+    /// Remove the `readiness_pass_in_flight` early return in `maintain_staged_authority` and the
+    /// first in-flight half activates the epoch.
+    #[tokio::test]
+    async fn activation_waits_for_this_instances_in_flight_fold_or_repair() {
+        use crate::staged_authority::{
+            activation_verdict, read_epoch, ActivationVerdict, EPOCH_FOLD, EPOCH_LEGACY,
+        };
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = graduation_test_consolidator(&tmp);
+        seed_activation_ready_volume(dir);
+
+        for (name, flag) in [
+            ("staged fold", &consolidator.staged_fold_in_progress),
+            ("ledger repair", &consolidator.ledger_repair_in_progress),
+        ] {
+            flag.store(true, Ordering::SeqCst);
+            consolidator.maintain_staged_authority().await;
+            let permitted = matches!(
+                activation_verdict(dir, &std::collections::BTreeSet::new()),
+                ActivationVerdict::Permitted
+            );
+            eprintln!(
+                "activation_waits_for_this_instances_in_flight_fold_or_repair: {name} in \
+                 flight, verdict would be Permitted: {permitted}"
+            );
+            assert_eq!(
+                read_epoch(dir),
+                EPOCH_LEGACY,
+                "the epoch was activated while this instance's {name} was in flight: the \
+                 verdict consumed readiness before the pass's outcome existed"
+            );
+            assert!(
+                crate::staged_authority::read_ready_records(dir)
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.instance_id == consolidator.write_ledger.instance_id()),
+                "the ready record must still be published while a pass is in flight"
+            );
+            flag.store(false, Ordering::SeqCst);
+        }
+
+        // Under the lock, as the cycle calls it: activation is fenced.
+        assert!(consolidator
+            .try_acquire_global_consolidation_lock()
+            .unwrap());
+        consolidator.maintain_staged_authority().await;
+        consolidator.release_global_consolidation_lock();
+        if crate::staged_fold::fold_incomplete_total() == 0 {
+            assert_eq!(
+                read_epoch(dir),
+                EPOCH_FOLD,
+                "with no pass in flight the same volume must activate, or the in-flight halves \
+                 above asserted a volume that could never activate"
+            );
+        } else {
+            eprintln!(
+                "activation_waits_for_this_instances_in_flight_fold_or_repair: \
+                 fold_incomplete_total is non-zero in this process, so the positive half is \
+                 not asserted"
+            );
+        }
+    }
+
+    /// A cycle that lost the lock (a watchdog takeover, then a
+    /// re-acquisition by this process, as validation does) does not activate on a `Permitted`
+    /// verdict. The positive half activates the same volume once the cycle holds the lock.
+    ///
+    /// # RED SIDE
+    ///
+    /// Remove the `lock_fence_intact` check before `staged_authority::activate`: the first half
+    /// writes the epoch document.
+    #[tokio::test]
+    async fn a_cycle_that_lost_the_lock_does_not_activate() {
+        use crate::staged_authority::{
+            activation_verdict, read_epoch, ActivationVerdict, EPOCH_FOLD, EPOCH_LEGACY,
+        };
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = graduation_test_consolidator(&tmp);
+        seed_activation_ready_volume(dir);
+
+        assert!(consolidator
+            .try_acquire_global_consolidation_lock()
+            .unwrap());
+        assert!(consolidator.take_over_stale_lock(Duration::ZERO));
+        let token = consolidator
+            .try_acquire_consolidation_lock_token()
+            .unwrap()
+            .expect("FIXTURE: re-acquire after the takeover");
+        consolidator.maintain_staged_authority().await;
+        // Read after the call: the call publishes this instance's ready record first.
+        let permitted = matches!(
+            activation_verdict(dir, &std::collections::BTreeSet::new()),
+            ActivationVerdict::Permitted
+        );
+        assert_eq!(
+            read_epoch(dir),
+            EPOCH_LEGACY,
+            "a cycle whose lock was taken over activated the epoch (verdict Permitted: \
+             {permitted})"
+        );
+        consolidator.release_consolidation_lock(token);
+
+        assert!(consolidator
+            .try_acquire_global_consolidation_lock()
+            .unwrap());
+        consolidator.maintain_staged_authority().await;
+        consolidator.release_global_consolidation_lock();
+        if crate::staged_fold::fold_incomplete_total() == 0 {
+            assert!(permitted, "FIXTURE: the volume must be Permitted");
+            assert_eq!(
+                read_epoch(dir),
+                EPOCH_FOLD,
+                "with the lock held the same volume must activate, or the first half asserted \
+                 a volume that could never activate"
+            );
+        } else {
+            eprintln!(
+                "a_cycle_that_lost_the_lock_does_not_activate: fold_incomplete_total is non-zero \
+                 in this process, so the positive half is not asserted"
+            );
+        }
+    }
+}
 #[cfg(test)]
 mod subtract_range_tests {
     use super::*;
@@ -7992,6 +19133,3306 @@ mod subtract_range_tests {
         assert!(
             acc.add_range(KEY, 0, SIZE - 1, SIZE),
             "only the named range was released"
+        );
+    }
+}
+
+/// `reap_dead_instance_temps`: the temp families G, H2, H3 and I under `_shard_state/`,
+/// `_write_ledger/` and `size_tracking/` are reaped only when their name carries THIS host, a
+/// pid that is not this process, that pid is dead, and the file is past the grace. Everything
+/// else survives byte-exact — above all `.ledger` and `.ledger.mark`, the live sequence floor.
+#[cfg(test)]
+mod dead_instance_pending_reap_tests {
+    use super::*;
+    const MY_HOST: &str = "scna-host.us-west-2.compute.internal";
+    const OTHER_HOST: &str = "scna-peer.us-west-2.compute.internal";
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "pid {pid} must not run"
+        );
+        pid
+    }
+
+    fn pending_dir(root: &Path) -> PathBuf {
+        root.join("metadata/_shard_state/staged_pending")
+    }
+
+    /// Plant `{instance}.pending` with `lines` credits `(bucket, l1, seq)` and its lock file.
+    fn plant(root: &Path, instance: &str, credits: &[(&str, &str, u64)]) -> (PathBuf, PathBuf) {
+        let dir = pending_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{instance}.pending"));
+        let lock = dir.join(format!("{instance}.pending.lock"));
+        let mut body = String::new();
+        for (bucket, l1, seq) in credits {
+            let c = crate::staged_fold::PendingCredit {
+                seq: *seq,
+                bucket: bucket.to_string(),
+                l1: l1.to_string(),
+                bytes: 4096,
+                range: None,
+            };
+            body.push_str(&serde_json::to_string(&c).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+        std::fs::write(&lock, "").unwrap();
+        (path, lock)
+    }
+
+    fn reap(root: &Path, now: SystemTime) -> (u64, u64) {
+        reap_dead_instance_pending_files(
+            root,
+            &[MY_HOST.to_string()],
+            std::process::id(),
+            DEAD_INSTANCE_TEMP_GRACE,
+            FOREIGN_PENDING_REAP_GRACE,
+            now,
+        )
+    }
+
+    /// Dead own-host empty file: reaped with its lock. Dead own-host file with an uncut
+    /// credit: survives. Dead own-host file every credit of which the shard's cut covers:
+    /// reaped. Live own-host (this process) empty file: survives. Every lock follows its file.
+    #[test]
+    fn only_dead_own_host_pending_files_with_nothing_uncut_are_reaped() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let dead = dead_pid();
+        let me = std::process::id();
+        let dead_empty = format!("{MY_HOST}:{dead}");
+        let dead_uncut = format!("{MY_HOST}:{}", dead_pid());
+        let dead_cut = format!("{MY_HOST}:{}", dead_pid());
+        let live_empty = format!("{MY_HOST}:{me}");
+        let (p_empty, l_empty) = plant(root, &dead_empty, &[]);
+        let (p_uncut, l_uncut) = plant(root, &dead_uncut, &[("b", "0a", 7), ("b", "0a", 9)]);
+        let (p_cut, l_cut) = plant(root, &dead_cut, &[("b", "0a", 3)]);
+        let (p_live, l_live) = plant(root, &live_empty, &[]);
+        // The shard's cut covers seq <= 8 for the uncut instance (so seq 9 is uncut) and
+        // seq <= 5 for the cut instance.
+        crate::staged_fold::seed_shard_cuts_for_tests(
+            root,
+            "b",
+            "0a",
+            &[(dead_uncut.as_str(), 8), (dead_cut.as_str(), 5)],
+        );
+        let later = SystemTime::now() + DEAD_INSTANCE_TEMP_GRACE + Duration::from_secs(60);
+        let (files, _) = reap(root, later);
+        let gone = |p: &Path| !p.exists();
+        assert!(
+            gone(&p_empty) && gone(&l_empty),
+            "dead own-host empty .pending and its lock must be reaped: pending={}, lock={}",
+            p_empty.exists(),
+            l_empty.exists()
+        );
+        assert!(
+            gone(&p_cut) && gone(&l_cut),
+            "dead own-host .pending whose every credit the cut covers must be reaped"
+        );
+        assert!(
+            p_uncut.exists() && l_uncut.exists(),
+            "dead own-host .pending with an uncut credit must survive with its lock"
+        );
+        assert!(
+            p_live.exists() && l_live.exists(),
+            "this process's own .pending must survive with its lock"
+        );
+        assert_eq!(files, 2);
+    }
+
+    /// A dead own-host empty file younger than the grace survives, as the earlier temps do.
+    #[test]
+    fn a_dead_own_host_pending_file_younger_than_the_grace_survives() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let (p, l) = plant(root, &format!("{MY_HOST}:{}", dead_pid()), &[]);
+        let _ = reap(root, SystemTime::now());
+        assert!(p.exists() && l.exists());
+    }
+
+    /// Another host's file: empty and older than 24 h is reaped with its lock; empty and
+    /// younger survives; non-empty survives however old.
+    #[test]
+    fn foreign_pending_files_are_reaped_only_when_empty_and_older_than_a_day() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let (p_empty, l_empty) = plant(root, &format!("{OTHER_HOST}:41"), &[]);
+        let (p_full, l_full) = plant(root, &format!("{OTHER_HOST}:42"), &[("b", "0a", 1)]);
+        let soon = SystemTime::now() + Duration::from_secs(3600);
+        let _ = reap(root, soon);
+        assert!(
+            p_empty.exists(),
+            "a foreign empty file younger than 24 h survives"
+        );
+        let later = SystemTime::now() + FOREIGN_PENDING_REAP_GRACE + Duration::from_secs(60);
+        let _ = reap(root, later);
+        assert!(
+            !p_empty.exists() && !l_empty.exists(),
+            "a foreign empty file older than 24 h is reaped with its lock"
+        );
+        assert!(
+            p_full.exists() && l_full.exists(),
+            "a foreign non-empty file survives"
+        );
+    }
+}
+
+/// With the unique-hostname prerequisite violated, every own-host reap decision that
+/// rests on `kill(pid, 0)` falls back to the foreign-instance rule, which tests no pid.
+#[cfg(test)]
+mod own_host_shortcut_flag_tests {
+    use super::*;
+    use tempfile::TempDir;
+    const MY_HOST: &str = "scnb-host.us-west-2.compute.internal";
+    /// A pid of this machine confirmed not running.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "fixture: pid {pid} must not be running"
+        );
+        pid
+    }
+
+    /// `instance_retired` is the shared own-host/foreign decision `reap_dead_instance_state`
+    /// takes, and it is pure, so the flag's effect on it is observable with no filesystem.
+    ///
+    /// The fixture sits inside the own-host rule and outside the foreign one: quiet for longer
+    /// than `own_grace`, well short of `foreign_grace`. So the two answers differ in exactly the
+    /// input under test, and a `false` cannot come from the age instead.
+    #[test]
+    fn the_collision_flag_sends_an_own_host_reap_down_the_foreign_rule() {
+        let _guard = crate::cache::hostname_flag_test_guard_blocking();
+        crate::cache::set_hostname_not_unique_for_test(false);
+        let hosts = vec![MY_HOST.to_string()];
+        let instance = format!("{MY_HOST}:{}", dead_pid());
+        let own_grace = Duration::from_secs(60);
+        let foreign_grace = Duration::from_secs(86_400);
+        let now = SystemTime::now();
+        let quiet_since = now - Duration::from_secs(600);
+        let decide = || {
+            instance_retired(
+                &instance,
+                quiet_since,
+                &hosts,
+                std::process::id(),
+                own_grace,
+                foreign_grace,
+                now,
+            )
+        };
+        let while_unique = decide();
+        crate::cache::set_hostname_not_unique_for_test(true);
+        let after_collision = decide();
+        crate::cache::set_hostname_not_unique_for_test(false);
+        let restored = decide();
+        assert_eq!(
+            (while_unique, after_collision, restored),
+            (true, false, true),
+            "(retired while the hostname is unique, retired after a collision, retired once the \
+             flag is cleared): a dead own-host pid is evidence that the process has stopped only \
+             while this proxy is the only one on this hostname; after a collision the id must be \
+             judged by the foreign rule, which this fixture does not satisfy"
+        );
+    }
+
+    /// THE STARTUP ORDER. `initialize` must detect a collision **before** its
+    /// own-host reap pass takes a single decision, because that pass is the only production
+    /// reachability of all six own-host reap decisions and it used to run as `initialize`'s
+    /// first statement — so the flag every one of them reads was `false` by construction on
+    /// every process start, colliding fleet or not.
+    ///
+    /// Driven through `initialize` itself rather than through the halves, which is where the
+    /// ordering lives. Two fixtures, because one cannot be read on its own:
+    ///
+    /// - the **control** is an own-host temp of a dead pid older than
+    ///   `DEAD_INSTANCE_TEMP_GRACE`. The age-only rule removes it whether the flag is up or
+    ///   not, so its removal is the proof that the deferred pass ran at all. Without it a test
+    ///   that asserts only survival passes against a pass that never happened.
+    /// - the **discriminator** is a journal of a stopped process of this host, holding nothing
+    ///   to apply and freshly written. Trusting the pid test removes it; the foreign rule it
+    ///   falls back to under a detected collision needs `FOREIGN_JOURNAL_REAP_GRACE` (24 h), so
+    ///   it survives. It is deliberately fresh: a journal older than every grace would survive
+    ///   or go on both orders.
+    #[tokio::test(start_paused = true)]
+    async fn initialize_detects_a_collision_before_its_own_host_reap_pass() {
+        let _guard = crate::cache::hostname_flag_test_guard().await;
+        crate::cache::set_hostname_not_unique_for_test(false);
+        crate::signed_put_handler::reset_noted_collision_peers_for_test();
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let host = gethostname::gethostname().to_string_lossy().to_string();
+        // `process_start_secs` is read on first use, not at process start. Read it before `now`,
+        // or the first call (this test's own `initialize`) can land in a later wall-clock second
+        // than `now`, and the peer's figure then reads as written before this process started.
+        let _ = crate::cache::process_start_secs();
+        let now = SystemTime::now();
+
+        // Another live process publishing under this process's exact identity, refreshed since
+        // this process started: condition 1, which needs no second observation and so is the
+        // one a single synchronous pass can catch.
+        crate::signed_put_handler::publish_peer_in_progress_figure_for_test(
+            &dir,
+            &crate::signed_put_handler::own_in_progress_instance_id(),
+            1_000,
+            1_000,
+            now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            ConsolidationConfig::default().interval.as_secs().max(1),
+        );
+
+        let shard_state = dir.join("metadata").join("_shard_state");
+        std::fs::create_dir_all(&shard_state).unwrap();
+        let control = shard_state.join(format!("control.json.tmp.{host}.{}", dead_pid()));
+        std::fs::write(&control, b"{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&control)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(now - DEAD_INSTANCE_TEMP_GRACE - Duration::from_secs(300)),
+            )
+            .unwrap();
+
+        let journals = dir.join("metadata").join("_journals");
+        std::fs::create_dir_all(&journals).unwrap();
+        let journal = journals.join(format!("{host}:{}.journal", dead_pid()));
+        std::fs::write(&journal, b"").unwrap();
+
+        let consolidator = JournalConsolidator::new(
+            dir.clone(),
+            Arc::new(JournalManager::new(
+                dir.clone(),
+                "scnc-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                dir.clone(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        );
+        let passes = startup_own_host_reap_passes();
+        tokio::time::timeout(Duration::from_secs(600), consolidator.initialize())
+            .await
+            .expect("initialize must not hang")
+            .unwrap();
+
+        // The reap pass is deferred and detached, so startup waits on neither; this waits for
+        // it rather than racing it, and a `false` here is a pass that never arrived rather than
+        // a pass that decided differently.
+        let pass_ran = wait_for_startup_own_host_reap_pass(passes).await;
+        let control_reaped = pass_ran && !control.exists();
+        let journal_survived = journal.exists();
+        let detected = !crate::cache::hostname_uniqueness_holds();
+        crate::cache::set_hostname_not_unique_for_test(false);
+        crate::signed_put_handler::reset_noted_collision_peers_for_test();
+        assert_eq!(
+            (pass_ran, control_reaped, journal_survived, detected),
+            (true, true, true, true),
+            "(the deferred pass ran, the age-only control was reaped, this host's fresh \
+             journal survived, the collision was detected): the reap pass must run only after a \
+             detector pass has had its look, or the collision flag it reads is false on every \
+             process start and the live peer's journal goes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dead_instance_temp_reap_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const MY_HOST: &str = "scnd-host.us-west-2.compute.internal";
+    const OTHER_HOST: &str = "scnd-peer.us-west-2.compute.internal";
+
+    /// A pid confirmed not running: a child that has exited and been reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        assert_eq!(r, -1, "pid {pid} must not be running");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "pid {pid} must report ESRCH"
+        );
+        pid
+    }
+
+    /// Every temp shape the producers in the three trees construct, for host `h` and pid `p`.
+    fn temp_shapes(h: &str, p: u32) -> Vec<String> {
+        vec![
+            // G: `{XX}.json.tmp.{host}.{pid}` and `{filename}.tmp.{host}.{pid}`
+            format!("metadata/_shard_state/checkpoints/b/0a.json.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/claims/b/0a.json.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/repair/b/0a.json.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/repair_claims/b/0a.json.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/staged_fold_freshness.json.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/eviction_last_result.json.tmp.{h}.{p}"),
+            format!(
+                "metadata/_shard_state/write_cache_count_eviction_last_result.json.tmp.{h}.{p}"
+            ),
+            format!("metadata/_shard_state/staged_authority_epoch.json.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/ready/{h}:{p}.ready.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/retired_instances/{h}:9.retired.tmp.{h}.{p}"),
+            format!("metadata/_shard_state/accounting_drift_sample.json.tmp.{h}.{p}"),
+            // G: `{instance}.resv.tmp.{pid}` and `{instance}.pending.tmp`
+            format!("metadata/_shard_state/capacity_reservations/{h}:{p}.resv.tmp.{p}"),
+            format!("metadata/_shard_state/staged_pending/{h}:{p}.pending.tmp"),
+            // I1, I2
+            format!("metadata/_shard_state/{h}:{p}.tail-delta.cap.tmp"),
+            format!("metadata/_shard_state/{h}:{p}.tail-delta.tmp"),
+            // H2, H3
+            format!("metadata/_write_ledger/{h}:{p}.ledger.mark.tmp"),
+            format!("metadata/_write_ledger/b/0a/{h}:{p}.ledger.tmp"),
+            // size_state.json's temp
+            format!("size_tracking/size_state.json.tmp.{h}.{p}"),
+        ]
+    }
+
+    /// Live and non-temp files that must never be touched, whatever their pid.
+    fn never_reaped(h: &str, p: u32) -> Vec<String> {
+        vec![
+            format!("metadata/_write_ledger/{h}:{p}.ledger.mark"),
+            format!("metadata/_write_ledger/b/0a/{h}:{p}.ledger"),
+            format!("metadata/_write_ledger/b/0a/{h}:{p}.ledger.torn"),
+            format!("metadata/_write_ledger/b/0a/{h}:{p}.ledger.lock"),
+            format!("metadata/_write_ledger/{h}:{p}.ledger"),
+            format!("metadata/_shard_state/{h}:{p}.tail-delta"),
+            format!("metadata/_shard_state/{h}:{p}.tail-delta.lock"),
+            format!("metadata/_shard_state/staged_pending/{h}:{p}.pending"),
+            format!("metadata/_shard_state/capacity_reservations/{h}:{p}.resv"),
+            format!("metadata/_shard_state/ready/{h}:{p}.ready"),
+            "metadata/_shard_state/checkpoints/b/0a.json".to_string(),
+            "metadata/_shard_state/staged_authority_epoch.json".to_string(),
+            // Owned by other reapers or bounded at one: not this sweep's to take.
+            format!("size_tracking/delta_{h}:{p}_1.json.tmp"),
+            "size_tracking/schedule.json.tmp".to_string(),
+            "size_tracking/size_state.json".to_string(),
+            // A temp-looking shape under a tree this sweep does not own.
+            format!("metadata/_journals/{h}:{p}.json.tmp.{h}.{p}"),
+            format!("metadata/b/0a/0bc/obj.meta.tmp.{h}.{p}"),
+        ]
+    }
+
+    fn plant(root: &Path, rel: &str) -> Vec<u8> {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = format!("SCNd body of {rel}").into_bytes();
+        std::fs::write(&path, &body).unwrap();
+        body
+    }
+
+    #[test]
+    fn only_dead_pid_own_host_temps_are_reaped_and_every_other_file_survives_byte_exact() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dead = dead_pid();
+        let own = std::process::id();
+        let parent = std::os::unix::process::parent_id();
+        assert_eq!(
+            unsafe { libc::kill(parent as i32, 0) },
+            0,
+            "parent must be live"
+        );
+
+        let mut expect_gone: Vec<String> = temp_shapes(MY_HOST, dead);
+        let mut expect_kept: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for rel in &expect_gone {
+            plant(root, rel);
+        }
+        for p in [dead, own, parent, 1] {
+            for rel in never_reaped(MY_HOST, p) {
+                let b = plant(root, &rel);
+                expect_kept.insert(rel, b);
+            }
+            for rel in temp_shapes(OTHER_HOST, p) {
+                let b = plant(root, &rel);
+                expect_kept.insert(rel, b);
+            }
+        }
+        for p in [own, parent, 1] {
+            for rel in temp_shapes(MY_HOST, p) {
+                let b = plant(root, &rel);
+                expect_kept.insert(rel, b);
+            }
+        }
+        // A `{host}:{pid}` identity for another host, alongside, as a whole-identity decoy.
+        let decoy = format!("metadata/_write_ledger/{OTHER_HOST}:{dead}.ledger.mark.tmp");
+        expect_kept.insert(decoy.clone(), plant(root, &decoy));
+
+        let hosts = vec![MY_HOST.to_string()];
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        let (files, _bytes) =
+            reap_dead_instance_temps(root, &hosts, own, DEAD_INSTANCE_TEMP_GRACE, later);
+
+        expect_gone.sort();
+        let still_there: Vec<&String> = expect_gone
+            .iter()
+            .filter(|rel| root.join(rel).exists())
+            .collect();
+        assert!(
+            still_there.is_empty(),
+            "dead-pid own-host temps not reaped: {still_there:?}"
+        );
+        for (rel, body) in &expect_kept {
+            let got = std::fs::read(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel} must survive, but: {e}"));
+            assert_eq!(&got, body, "{rel} must survive byte-exact");
+        }
+        assert_eq!(files, expect_gone.len() as u64, "the reap count");
+    }
+
+    /// The grace: a dead-pid own-host temp younger than it survives. A same-hostname peer in
+    /// another pid namespace looks dead to `kill(pid, 0)`, and its in-flight temp is seconds old.
+    #[test]
+    fn a_dead_pid_temp_younger_than_the_grace_survives() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dead = dead_pid();
+        let mut kept = BTreeMap::new();
+        for rel in temp_shapes(MY_HOST, dead) {
+            let b = plant(root, &rel);
+            kept.insert(rel, b);
+        }
+        let hosts = vec![MY_HOST.to_string()];
+        let (files, _) = reap_dead_instance_temps(
+            root,
+            &hosts,
+            std::process::id(),
+            DEAD_INSTANCE_TEMP_GRACE,
+            SystemTime::now(),
+        );
+        assert_eq!(files, 0);
+        for (rel, body) in &kept {
+            assert_eq!(&std::fs::read(root.join(rel)).unwrap(), body, "{rel}");
+        }
+    }
+}
+
+/// Which `metadata/_journals/` files [`reap_instance_journals`] may remove.
+#[cfg(test)]
+mod journal_reap_tests {
+    use super::tests::{graduation_test_consolidator, object_metadata_b, remove_entry_at};
+    use super::unparseable_line_retention_tests::add_line;
+    use super::*;
+    use tempfile::TempDir;
+
+    const HOST: &str = "scne-host";
+
+    fn journals(root: &Path) -> PathBuf {
+        let d = root.join("metadata").join("_journals");
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A pid that `kill(pid, 0)` answers with `EPERM`: pid 1 for a non-root caller. `None` when
+    /// the test runs as root, where no such pid can be named without a seam.
+    #[cfg(unix)]
+    fn eperm_pid() -> Option<u32> {
+        let r = unsafe { libc::kill(1, 0) };
+        if r == 0 {
+            eprintln!("running as root: kill(1, 0) succeeds, no EPERM pid available");
+            return None;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM),
+            "kill(1, 0) must fail with EPERM for a non-root caller"
+        );
+        Some(1)
+    }
+
+    /// A pid that is live but not signalable (`EPERM`, another user's process) is alive, so its
+    /// own-host journal survives byte-exact. The old `kill(pid, 0) == 0` rule read it as dead.
+    #[cfg(unix)]
+    #[test]
+    fn an_own_host_journal_whose_pid_returns_eperm_survives() {
+        let Some(pid) = eperm_pid() else { return };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = journals(tmp.path());
+        let body = b"{\"not\":\"consolidated\"}\n".to_vec();
+        let name = format!("{HOST}:{pid}.journal");
+        std::fs::write(dir.join(&name), &body).unwrap();
+        let counts = reap_instance_journals(
+            &dir,
+            HOST,
+            std::process::id(),
+            SystemTime::now(),
+            FOREIGN_JOURNAL_REAP_GRACE,
+            replay_cap(),
+        );
+        assert_eq!(
+            std::fs::read(dir.join(&name)).ok(),
+            Some(body),
+            "{name} (pid {pid} is live, EPERM) must survive byte-exact; counts={counts:?}"
+        );
+        assert_eq!(counts.dead_files, 0);
+    }
+
+    fn plant(dir: &Path, name: &str, body: &[u8], age: Duration) {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        let f = std::fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    /// A foreign-host journal holding nothing to apply (empty, whitespace, or only an
+    /// unterminated torn tail) and unmodified for the grace is reaped. One that still holds a
+    /// complete line (an unapplied entry, or a line this build cannot parse), one modified
+    /// inside the grace, one whose lock is held, and an own-host journal of a live pid all
+    /// survive byte-exact.
+    #[cfg(unix)]
+    #[test]
+    fn only_old_foreign_journals_with_nothing_to_apply_are_reaped() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = journals(tmp.path());
+        let old = FOREIGN_JOURNAL_REAP_GRACE + Duration::from_secs(3600);
+        let recent = FOREIGN_JOURNAL_REAP_GRACE - Duration::from_secs(3600);
+        let parent = std::os::unix::process::parent_id();
+        assert_eq!(unsafe { libc::kill(parent as i32, 0) }, 0, "parent live");
+
+        let reaped: Vec<(&str, &[u8])> = vec![
+            ("gone-a:100.journal", b""),
+            ("gone-b:101.journal", b"\n  \n"),
+            ("gone-c:102:1700000000000000000.journal", b""),
+            ("gone-d:103.journal", b"{\"timestamp\":{\"secs_since_ep"),
+        ];
+        let entry_line: &[u8] = b"{\"cache_key\":\"b/k\",\"operation\":\"Add\"}\n";
+        let kept: Vec<(String, Vec<u8>, Duration)> = vec![
+            ("gone-e:104.journal".into(), entry_line.to_vec(), old),
+            (
+                "gone-f:105.journal".into(),
+                b"\n{\"future_schema\":1}\n".to_vec(),
+                old,
+            ),
+            (
+                "gone-g:106.journal".into(),
+                [entry_line, b"{\"torn".as_slice()].concat(),
+                old,
+            ),
+            ("gone-h:107.journal".into(), Vec::new(), recent),
+            ("gone-i:108.journal".into(), Vec::new(), old),
+            (format!("{HOST}:{parent}.journal"), Vec::new(), old),
+            ("gone-j:109.journal.tmp".into(), Vec::new(), old),
+            ("gone-k:110.journal.lock".into(), Vec::new(), old),
+        ];
+        for (name, body) in &reaped {
+            plant(&dir, name, body, old);
+        }
+        for (name, body, age) in &kept {
+            plant(&dir, name, body, *age);
+        }
+        // Hold gone-i's lock from another descriptor, as its appender would.
+        let held = std::fs::File::create(dir.join("gone-i:108.journal.lock")).unwrap();
+        fs4::FileExt::lock(&held).unwrap();
+
+        let counts = reap_instance_journals(
+            &dir,
+            HOST,
+            std::process::id(),
+            SystemTime::now(),
+            FOREIGN_JOURNAL_REAP_GRACE,
+            replay_cap(),
+        );
+
+        let not_reaped: Vec<&str> = reaped
+            .iter()
+            .filter(|(n, _)| dir.join(n).exists())
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(
+            not_reaped.is_empty(),
+            "foreign journals with nothing to apply not reaped: {not_reaped:?}; counts={counts:?}"
+        );
+        for (name, body, _) in &kept {
+            assert_eq!(
+                std::fs::read(dir.join(name)).ok().as_ref(),
+                Some(body),
+                "{name} must survive byte-exact"
+            );
+        }
+        assert_eq!(counts.foreign_files, reaped.len() as u64);
+        assert_eq!(counts.dead_files, 0);
+        drop(held);
+    }
+
+    /// The age cap the startup reap applies to a dead process's journal: the consolidator's
+    /// `stale_entry_timeout_secs` at its default.
+    fn replay_cap() -> Duration {
+        Duration::from_secs(ConsolidationConfig::default().stale_entry_timeout_secs)
+    }
+
+    /// The reap as `cleanup_dead_instance_journals` runs it, for this process on `HOST`.
+    fn reap(dir: &Path, now: SystemTime) -> JournalReapCounts {
+        reap_instance_journals(
+            dir,
+            HOST,
+            std::process::id(),
+            now,
+            FOREIGN_JOURNAL_REAP_GRACE,
+            replay_cap(),
+        )
+    }
+
+    /// A pid `kill(pid, 0)` answers with `ESRCH`: a child that has exited and been waited for.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("fixture: spawn `true`");
+        let pid = child.id();
+        child.wait().unwrap();
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            (r, errno),
+            (-1, Some(libc::ESRCH)),
+            "fixture: pid {pid} must read dead"
+        );
+        pid
+    }
+
+    /// One complete `Add` line, newline-terminated.
+    fn add_bytes(cache_key: &str, start: u64) -> Vec<u8> {
+        let (line, _) = add_line(cache_key, start);
+        format!("{line}\n").into_bytes()
+    }
+
+    /// Run `f` under a thread-local WARN subscriber and return what it logged.
+    fn capture_warn<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buffer(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        (out, String::from_utf8(bytes).unwrap())
+    }
+
+    /// A dead pid's journal holding an unapplied entry is left, byte-exact, for the
+    /// consolidation cycle to apply. The old rule unlinked it unread.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_own_host_journal_with_an_unapplied_entry_survives() {
+        let tmp = TempDir::new().unwrap();
+        let dir = journals(tmp.path());
+        let pid = dead_pid();
+        let name = format!("{HOST}:{pid}.journal");
+        let body = add_bytes("bucket/scnf/primary", 0);
+        std::fs::write(dir.join(&name), &body).unwrap();
+        let counts = reap(&dir, SystemTime::now());
+        assert_eq!(
+            std::fs::read(dir.join(&name)).ok(),
+            Some(body),
+            "{name} (dead pid, one unapplied Add) must survive byte-exact for the consolidation \
+             cycle to apply; counts={counts:?}"
+        );
+        assert_eq!(counts.dead_files, 0, "counts={counts:?}");
+    }
+
+    /// The same for a fresh journal (`{host}:{pid}:{nanos}.journal`, written when the
+    /// primary's lock was busy).
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_own_host_fresh_journal_with_an_unapplied_entry_survives() {
+        let tmp = TempDir::new().unwrap();
+        let dir = journals(tmp.path());
+        let pid = dead_pid();
+        let name = format!("{HOST}:{pid}:1700000000000000000.journal");
+        let body = add_bytes("bucket/scnf/fresh", 0);
+        std::fs::write(dir.join(&name), &body).unwrap();
+        let counts = reap(&dir, SystemTime::now());
+        assert_eq!(
+            std::fs::read(dir.join(&name)).ok(),
+            Some(body),
+            "{name} (dead pid, one unapplied Add) must survive byte-exact; counts={counts:?}"
+        );
+        assert_eq!(counts.dead_files, 0, "counts={counts:?}");
+    }
+
+    /// Pins for the unchanged part: a dead pid's journals holding nothing to apply (empty,
+    /// whitespace, a lone torn tail) and its `.journal.tmp`, whatever it holds, are reaped;
+    /// this process's own journal is kept.
+    #[cfg(unix)]
+    #[test]
+    fn dead_own_host_journals_with_nothing_to_apply_and_temps_are_reaped() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let tmp = TempDir::new().unwrap();
+        let dir = journals(tmp.path());
+        let pid = dead_pid();
+        let me = std::process::id();
+        let reaped: Vec<(String, Vec<u8>)> = vec![
+            (format!("{HOST}:{pid}.journal"), Vec::new()),
+            (
+                format!("{HOST}:{pid}:1700000000000000001.journal"),
+                b"\n  \n".to_vec(),
+            ),
+            (
+                format!("{HOST}:{pid}:1700000000000000002.journal"),
+                b"{\"timestamp\":{\"secs_since_ep".to_vec(),
+            ),
+            (
+                format!("{HOST}:{pid}.journal.tmp"),
+                add_bytes("bucket/scnf/tmp", 0),
+            ),
+        ];
+        let mine = format!("{HOST}:{me}.journal");
+        let mine_body = add_bytes("bucket/scnf/mine", 0);
+        for (name, body) in &reaped {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        std::fs::write(dir.join(&mine), &mine_body).unwrap();
+        let counts = reap(&dir, SystemTime::now());
+        let left: Vec<&String> = reaped
+            .iter()
+            .filter(|(n, _)| dir.join(n).exists())
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            left.is_empty(),
+            "dead-pid journals with nothing to apply, and its .journal.tmp, must be reaped: \
+             {left:?}; counts={counts:?}"
+        );
+        assert_eq!(counts.dead_files, reaped.len() as u64, "counts={counts:?}");
+        assert_eq!(
+            std::fs::read(dir.join(&mine)).ok(),
+            Some(mine_body),
+            "this process's own journal must survive"
+        );
+    }
+
+    /// A dead journal unmodified for longer than the replay cap is discarded with a WARN
+    /// naming the file, its bytes and its lines; one inside the cap is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_journal_older_than_the_replay_cap_is_discarded_with_a_warning() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let tmp = TempDir::new().unwrap();
+        let dir = journals(tmp.path());
+        let old = format!("{HOST}:{}.journal", dead_pid());
+        let young = format!("{HOST}:{}.journal", dead_pid());
+        let old_body = [
+            add_bytes("bucket/scnf/old", 0),
+            add_bytes("bucket/scnf/old", 100),
+        ]
+        .concat();
+        let young_body = add_bytes("bucket/scnf/young", 0);
+        plant(
+            &dir,
+            &old,
+            &old_body,
+            replay_cap() + Duration::from_secs(60),
+        );
+        plant(
+            &dir,
+            &young,
+            &young_body,
+            replay_cap() - Duration::from_secs(60),
+        );
+        let (counts, logs) = capture_warn(|| reap(&dir, SystemTime::now()));
+        assert!(
+            !dir.join(&old).exists(),
+            "{old}, unmodified for longer than the {}s cap, must be discarded; counts={counts:?}",
+            replay_cap().as_secs()
+        );
+        let bytes = format!("bytes={}", old_body.len());
+        let warned = logs.lines().any(|l| {
+            l.contains("WARN") && l.contains(&old) && l.contains(&bytes) && l.contains("lines=2")
+        });
+        assert!(
+            warned,
+            "discarding {old} must WARN naming the file, {bytes} and lines=2; logged: {logs:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(&young)).ok(),
+            Some(young_body),
+            "{young}, inside the cap, must survive byte-exact; counts={counts:?}"
+        );
+        assert_eq!(counts.dead_files, 1, "counts={counts:?}");
+    }
+
+    /// The reap leaves a kept dead journal's `.journal.lock` in place (the same inode).
+    /// Only `cleanup_stale_lock_files` removes a lock file, under its flock and only once its
+    /// journal is gone.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_file_of_a_kept_dead_journal_is_not_unlinked() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = journals(tmp.path());
+        let name = format!("{HOST}:{}.journal", dead_pid());
+        std::fs::write(dir.join(&name), add_bytes("bucket/scnf/lock", 0)).unwrap();
+        let lock = dir.join(format!("{name}.lock"));
+        std::fs::write(&lock, b"").unwrap();
+        let ino = std::fs::metadata(&lock).unwrap().ino();
+        let counts = reap(&dir, SystemTime::now());
+        assert_eq!(
+            std::fs::metadata(&lock).ok().map(|m| m.ino()),
+            Some(ino),
+            "the .journal.lock of a kept dead journal must not be unlinked (journal exists: {}); \
+             counts={counts:?}",
+            dir.join(&name).exists()
+        );
+    }
+
+    /// A range-fill `Add` of `[0, 4095]` for `key` by `instance` at `at`, carrying the object's
+    /// metadata, as `PreparedRangeFill` journals it.
+    fn fill_entry(key: &str, instance: &str, at: SystemTime) -> JournalEntry {
+        let mut entry = JournalEntry {
+            operation: JournalOperation::Add,
+            instance_id: instance.to_string(),
+            object_metadata: Some(object_metadata_b()),
+            object_ttl_secs: Some(600),
+            ..remove_entry_at(key, 0, 4095, at)
+        };
+        entry.range_spec.compressed_size = 4096;
+        entry
+    }
+
+    /// Publish `entry`'s `.bin`, then journal the `Add` through `journal`: a range fill's order.
+    async fn fill(
+        c: &JournalConsolidator,
+        journal: &JournalManager,
+        key: &str,
+        entry: JournalEntry,
+    ) {
+        let bin = c.get_range_file_path(key, &entry.range_spec).unwrap();
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, vec![7u8; 4096]).unwrap();
+        journal.append_range_entry(key, entry).await.unwrap();
+    }
+
+    /// Complete non-blank lines in `path` (0 when absent).
+    fn complete_lines(path: &Path) -> usize {
+        let Ok(content) = std::fs::read(path) else {
+            return 0;
+        };
+        let mut segments = content.split(|&b| b == b'\n');
+        segments.next_back();
+        segments.filter(|l| !l.trim_ascii().is_empty()).count()
+    }
+
+    fn document(c: &JournalConsolidator, key: &str) -> Option<NewCacheMetadata> {
+        let path = c.get_metadata_file_path(key).unwrap();
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| serde_json::from_str(&s).expect("the .meta must parse"))
+    }
+
+    fn journal_path(temp_dir: &TempDir, instance: &str) -> PathBuf {
+        journals(temp_dir.path()).join(format!("{instance}.journal"))
+    }
+
+    /// Crash recovery: process A (instance `{host}:{dead pid}`) publishes K1's `.bin` and
+    /// journals its `Add`, journals an `Add` then a later `Remove` for K2's extent, and is
+    /// killed before any cycle. Process B starts on the same host and `cache_dir`, initializes
+    /// and runs one cycle: K1 is listed, K2's extent is not, and A's journal is drained.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_after_a_kill_applies_the_dead_process_journal() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard().await;
+        let temp_dir = TempDir::new().unwrap();
+        let host = gethostname::gethostname().to_string_lossy().to_string();
+        let dead = format!("{host}:{}", dead_pid());
+        let b = graduation_test_consolidator(&temp_dir);
+        let a = JournalManager::new(temp_dir.path().to_path_buf(), dead.clone());
+        let at = SystemTime::now() - Duration::from_secs(10);
+        let (k1, k2) = ("test-bucket/scnf/k1", "test-bucket/scnf/k2");
+        fill(&b, &a, k1, fill_entry(k1, &dead, at)).await;
+        fill(&b, &a, k2, fill_entry(k2, &dead, at)).await;
+        a.append_range_entry(
+            k2,
+            JournalEntry {
+                instance_id: dead.clone(),
+                ..remove_entry_at(k2, 0, 4095, at + Duration::from_secs(1))
+            },
+        )
+        .await
+        .unwrap();
+        let journal = journal_path(&temp_dir, &dead);
+        assert_eq!(
+            complete_lines(&journal),
+            3,
+            "fixture: A journalled three entries"
+        );
+        drop(a);
+
+        let passes = startup_own_host_reap_passes();
+        b.initialize().await.unwrap();
+        // The dead-journal reap runs on `initialize`'s detached pass now, behind the detector;
+        // the replay this asserts is that pass's work, so wait for it rather than race it.
+        assert!(
+            wait_for_startup_own_host_reap_pass(passes).await,
+            "fixture: initialize's deferred own-host reap pass must run"
+        );
+        b.run_consolidation_cycle().await.unwrap();
+
+        let k1_doc = document(&b, k1);
+        let k1_extents = k1_doc.as_ref().map(|m| {
+            m.ranges
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            k1_extents,
+            Some(vec![(0, 4095)]),
+            "K1's fill, journalled by the killed process, must be listed after the restart's \
+             first cycle (dead journal exists: {}, its lock exists: {})",
+            journal.exists(),
+            journal.with_extension("journal.lock").exists()
+        );
+        assert_eq!(k1_doc.unwrap().object_metadata.etag, "\"scn3-etag\"");
+        let k1_bin = b
+            .get_range_file_path(k1, &fill_entry(k1, &dead, at).range_spec)
+            .unwrap();
+        assert!(k1_bin.exists(), "K1's .bin must still exist");
+        let k2_listed = document(&b, k2)
+            .map(|m| m.ranges.iter().any(|r| r.start == 0 && r.end == 4095))
+            .unwrap_or(false);
+        assert!(
+            !k2_listed,
+            "K2's extent was removed after its fill: it must not be listed"
+        );
+        assert_eq!(
+            complete_lines(&journal),
+            0,
+            "the dead journal must be drained by the cycle"
+        );
+    }
+
+    /// Replay freshness. Folding an `Add` into an absent `.meta` stamps `created_at` (the
+    /// GET freshness anchor) with the fold time and `expires_at` with fold time plus the
+    /// entry's TTL. (i) A dead journal inside the cap is folded: the anchor is the fold time,
+    /// at most the cap after the fill. (ii) One older than the cap is dropped before the fold,
+    /// so its fill is not replayed as fresh.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replayed_add_is_fresh_from_the_fold_only_inside_the_cap() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard().await;
+        let temp_dir = TempDir::new().unwrap();
+        let host = gethostname::gethostname().to_string_lossy().to_string();
+        let young_id = format!("{host}:{}", dead_pid());
+        let old_id = format!("{host}:{}", dead_pid());
+        let b = graduation_test_consolidator(&temp_dir);
+        let (ky, ko) = ("test-bucket/scnf/young", "test-bucket/scnf/old");
+        let filled_young = SystemTime::now() - Duration::from_secs(60);
+        let filled_old = SystemTime::now() - replay_cap() - Duration::from_secs(120);
+        let jy = JournalManager::new(temp_dir.path().to_path_buf(), young_id.clone());
+        fill(&b, &jy, ky, fill_entry(ky, &young_id, filled_young)).await;
+        let jo = JournalManager::new(temp_dir.path().to_path_buf(), old_id.clone());
+        fill(&b, &jo, ko, fill_entry(ko, &old_id, filled_old)).await;
+        let old_journal = journal_path(&temp_dir, &old_id);
+        // The old process's last append was the cap plus 60 s before this start.
+        filetime::set_file_mtime(
+            &old_journal,
+            filetime::FileTime::from_system_time(
+                SystemTime::now() - replay_cap() - Duration::from_secs(60),
+            ),
+        )
+        .unwrap();
+
+        let started = SystemTime::now();
+        let passes = startup_own_host_reap_passes();
+        b.initialize().await.unwrap();
+        // The dead-journal reap is `initialize`'s detached pass now, behind the detector.
+        assert!(
+            wait_for_startup_own_host_reap_pass(passes).await,
+            "fixture: initialize's deferred own-host reap pass must run"
+        );
+        b.run_consolidation_cycle().await.unwrap();
+        let folded = SystemTime::now();
+
+        let young = document(&b, ky)
+            .expect("(i) a dead journal inside the cap is folded: its key's .meta must exist");
+        assert!(
+            young.created_at >= started && young.created_at <= folded,
+            "(i) created_at must be the fold time: {:?} not in [{started:?}, {folded:?}]",
+            young.created_at
+        );
+        assert_eq!(
+            young
+                .expires_at
+                .duration_since(young.created_at)
+                .ok()
+                .map(|d| d.as_secs_f64().round() as u64),
+            Some(600),
+            "(i) expires_at must be created_at plus the entry's TTL"
+        );
+        let extension = young.created_at.duration_since(filled_young).unwrap();
+        assert!(
+            extension <= replay_cap(),
+            "(i) the freshness anchor moved {extension:?} past the fill, beyond the {:?} cap",
+            replay_cap()
+        );
+        assert!(
+            document(&b, ko).is_none(),
+            "(ii) a dead journal older than the cap must be dropped before the fold, not \
+             replayed with created_at = now ({:?} after its fill)",
+            folded.duration_since(filled_old).unwrap()
+        );
+        assert!(
+            !old_journal.exists(),
+            "(ii) the dead journal older than the cap must be removed"
+        );
+    }
+}
+
+/// `cleanup_consolidated_entries` removes only the lines this build parsed and applied.
+///
+/// On a rolling upgrade a newer build writes journal lines this build cannot deserialize (a
+/// new `JournalOperation` variant) or can deserialize only lossily (a new field, which serde
+/// ignores and a re-serialization would drop). Both are complete, unapplied lines. Every
+/// cleanup path (truncate, delete, partial rewrite) must leave them in the file byte-exact.
+#[cfg(test)]
+mod unparseable_line_retention_tests {
+    use super::*;
+    use crate::compression::CompressionAlgorithm;
+    use crate::metadata_lock_manager::MetadataLockManager;
+    use tempfile::TempDir;
+
+    fn consolidator(temp_dir: &TempDir) -> JournalConsolidator {
+        JournalConsolidator::new(
+            temp_dir.path().to_path_buf(),
+            Arc::new(JournalManager::new(
+                temp_dir.path().to_path_buf(),
+                "scng-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                temp_dir.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        )
+    }
+
+    /// One `Add` entry, returned as its journal line and as the entry parsed back from that
+    /// line (so the consolidated-set key matches what cleanup parses, whatever the
+    /// timestamp serialization's precision).
+    pub(super) fn add_line(cache_key: &str, start: u64) -> (String, JournalEntry) {
+        let now = SystemTime::now();
+        let entry = JournalEntry {
+            timestamp: now,
+            instance_id: "scng-instance".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec: RangeSpec {
+                start,
+                end: start + 99,
+                file_path: format!("r_{}.bin", start),
+                compression_algorithm: CompressionAlgorithm::Lz4,
+                compressed_size: 100,
+                uncompressed_size: 100,
+                created_at: now,
+                last_accessed: now,
+                access_count: 1,
+                staged: None,
+                unservable: false,
+                file_identity: None,
+            },
+            operation: JournalOperation::Add,
+            range_file_path: format!("r_{}.bin", start),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: None,
+            access_increment: None,
+            object_metadata: None,
+            fill_witness: None,
+        };
+        let line = serde_json::to_string(&entry).unwrap();
+        let parsed: JournalEntry = serde_json::from_str(&line).unwrap();
+        (line, parsed)
+    }
+
+    /// A complete line this build cannot parse: an `Add` line whose operation is a variant
+    /// no current build knows.
+    fn future_variant_line(cache_key: &str) -> String {
+        let (line, _) = add_line(cache_key, 900);
+        let future = line.replace("\"operation\":\"Add\"", "\"operation\":\"SCNgFutureOp\"");
+        assert_ne!(
+            future, line,
+            "fixture: the operation literal must be present"
+        );
+        assert!(serde_json::from_str::<JournalEntry>(&future).is_err());
+        future
+    }
+
+    /// A line this build parses but would re-serialize lossily: an unapplied `Add` line
+    /// carrying a field this build does not know.
+    fn future_field_line(cache_key: &str, start: u64) -> (String, JournalEntry) {
+        let (line, parsed) = add_line(cache_key, start);
+        let future = format!("{},\"future_field\":7}}", &line[..line.len() - 1]);
+        assert!(serde_json::from_str::<JournalEntry>(&future).is_ok());
+        (future, parsed)
+    }
+
+    fn journals_dir(temp_dir: &TempDir) -> PathBuf {
+        let dir = temp_dir.path().join("metadata").join("_journals");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn unparseable_and_unapplied_lines_survive_every_cleanup_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = journals_dir(&temp_dir);
+        let c = consolidator(&temp_dir);
+
+        // Truncate path: a primary journal whose every parseable line was applied.
+        let (t_applied, t_entry) = add_line("bucket/truncate", 0);
+        let t_future = future_variant_line("bucket/truncate");
+        let truncate_path = dir.join("scng-host-a.journal");
+        std::fs::write(&truncate_path, format!("{}\n{}\n", t_applied, t_future)).unwrap();
+
+        // Delete path: a fresh journal whose every parseable line was applied.
+        let (d_applied, d_entry) = add_line("bucket/delete", 0);
+        let d_future = future_variant_line("bucket/delete");
+        let delete_path = dir.join("scng-host-b:1:1700000000000000000.journal");
+        std::fs::write(&delete_path, format!("{}\n{}\n", d_future, d_applied)).unwrap();
+
+        // Partial-rewrite path: applied, unapplied-with-a-future-field, and unparseable.
+        let (p_applied, p_entry) = add_line("bucket/partial", 0);
+        let (p_kept, _) = future_field_line("bucket/partial", 200);
+        let p_future = future_variant_line("bucket/partial");
+        let partial_path = dir.join("scng-host-c.journal");
+        std::fs::write(
+            &partial_path,
+            format!("{}\n{}\n{}\n", p_applied, p_future, p_kept),
+        )
+        .unwrap();
+
+        c.cleanup_consolidated_entries(&[t_entry, d_entry, p_entry], &HashMap::new())
+            .await
+            .unwrap();
+
+        let truncate_after = std::fs::read_to_string(&truncate_path).unwrap_or_default();
+        let delete_after = std::fs::read_to_string(&delete_path).ok();
+        let partial_after = std::fs::read_to_string(&partial_path).unwrap_or_default();
+
+        let mut failures = Vec::new();
+        if truncate_after != format!("{}\n", t_future) {
+            failures.push(format!("truncate path left {:?}", truncate_after));
+        }
+        if delete_after.as_deref() != Some(format!("{}\n", d_future).as_str()) {
+            failures.push(format!("delete path left {:?}", delete_after));
+        }
+        if partial_after != format!("{}\n{}\n", p_future, p_kept) {
+            failures.push(format!("partial-rewrite path left {:?}", partial_after));
+        }
+        assert!(
+            failures.is_empty(),
+            "only applied lines may be removed; unparseable and unapplied lines must survive \
+             byte-exact: {:?}",
+            failures
+        );
+        assert_eq!(c.retained_unparseable_journal_lines(), 3);
+    }
+
+    fn secs_since_epoch_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Production journal names are `{host}:{pid}.journal`, so a fully applied primary must be
+    /// emptied and kept, and only `{host}:{pid}:{nanos}.journal` deleted.
+    #[tokio::test]
+    async fn a_fully_applied_host_pid_primary_is_kept_and_a_fresh_journal_deleted() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = journals_dir(&temp_dir);
+        let c = consolidator(&temp_dir);
+        let (p_line, p_entry) = add_line("bucket/kept-primary", 0);
+        let primary = dir.join("w-host:4242.journal");
+        std::fs::write(&primary, format!("{}\n", p_line)).unwrap();
+        let old = secs_since_epoch_now() - 7_200;
+        filetime::set_file_mtime(&primary, filetime::FileTime::from_unix_time(old as i64, 0))
+            .unwrap();
+        let (f_line, f_entry) = add_line("bucket/fresh", 0);
+        let fresh = dir.join("w-host:4242:1700000000000000000.journal");
+        std::fs::write(&fresh, format!("{}\n", f_line)).unwrap();
+        c.cleanup_consolidated_entries(&[p_entry, f_entry], &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&primary).ok().as_deref(),
+            Some(""),
+            "a fully applied primary journal must survive cleanup, empty"
+        );
+        assert!(
+            !fresh.exists(),
+            "a fully applied fresh journal must be deleted"
+        );
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&primary).unwrap());
+        assert!(
+            mtime.unix_seconds() as u64 > old + 3_600,
+            "truncation must advance the primary's mtime, which the readiness roster reads"
+        );
+        assert!(
+            !dir.join("w-host:4242.journal.tmp").exists(),
+            "no .journal.tmp may be left for peers' orphan evidence to read"
+        );
+        assert!(
+            !c.has_pending_journal_files(),
+            "an emptied primary must leave the next cycle idle"
+        );
+    }
+
+    /// After cleanup applies a capable proxy's every line, the readiness gate still sees it.
+    #[tokio::test]
+    async fn the_gate_reads_capable_after_cleanup_of_a_capable_proxy() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = journals_dir(&temp_dir);
+        let c = consolidator(&temp_dir);
+        let (line, entry) = add_line("bucket/gate", 0);
+        let path = dir.join("w-host:4242.journal");
+        std::fs::write(&path, format!("{}\n", line)).unwrap();
+        // Out of the roster's window before cleanup, so only the truncate can bring it back.
+        let old = secs_since_epoch_now() - 7_200;
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(old as i64, 0)).unwrap();
+        crate::eviction_worklist::test_fleet::ready(
+            temp_dir.path(),
+            "w-host:4242",
+            true,
+            secs_since_epoch_now(),
+        );
+        c.cleanup_consolidated_entries(&[entry], &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::eviction_worklist::fleet_is_worklist_capable(
+                temp_dir.path(),
+                secs_since_epoch_now()
+            ),
+            crate::eviction_worklist::Capability::Capable
+        );
+    }
+
+    /// An older proxy writes no `.ready` record; once a 3.0.0 cleanup applies its journal, the
+    /// journal must still keep it in the roster so the gate reads `NotCapable`.
+    #[tokio::test]
+    async fn an_applied_older_proxy_primary_keeps_the_gate_not_capable() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = journals_dir(&temp_dir);
+        let c = consolidator(&temp_dir);
+        std::fs::write(dir.join("w-host:4242.journal"), "").unwrap();
+        crate::eviction_worklist::test_fleet::ready(
+            temp_dir.path(),
+            "w-host:4242",
+            true,
+            secs_since_epoch_now(),
+        );
+        let (line, entry) = add_line("bucket/older", 0);
+        let older = dir.join("scnh-host:77.journal");
+        std::fs::write(&older, format!("{}\n", line)).unwrap();
+        c.cleanup_consolidated_entries(&[entry], &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&older).ok().as_deref(), Some(""));
+        assert_eq!(
+            crate::eviction_worklist::fleet_is_worklist_capable(
+                temp_dir.path(),
+                secs_since_epoch_now()
+            ),
+            crate::eviction_worklist::Capability::NotCapable {
+                instance: "scnh-host:77".to_string()
+            }
+        );
+    }
+
+    /// An unterminated tail this build cannot parse is a torn write. It is kept (the earlier
+    /// reaper owns removing it) and newline-terminated, so the next append cannot glue a
+    /// valid entry onto it.
+    #[tokio::test]
+    async fn a_torn_tail_is_kept_and_terminated() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = journals_dir(&temp_dir);
+        let c = consolidator(&temp_dir);
+
+        let (applied, entry) = add_line("bucket/torn", 0);
+        let torn = "{\"timestamp\":";
+        let path = dir.join("scng-host-d.journal");
+        std::fs::write(&path, format!("{}\n{}", applied, torn)).unwrap();
+
+        c.cleanup_consolidated_entries(&[entry], &HashMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", torn)
+        );
+    }
+}
+
+/// The `ranges/` temp reaper (families D and E1) and the legacy flat root-file reaper.
+#[cfg(test)]
+mod range_temp_and_flat_root_reap_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const MY_HOST: &str = "scni-host.us-west-2.compute.internal";
+    const OTHER_HOST: &str = "scni-peer.us-west-2.compute.internal";
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        pid
+    }
+
+    fn plant(root: &Path, rel: &str) -> Vec<u8> {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = format!("scni:{rel}").into_bytes();
+        std::fs::write(&path, &body).unwrap();
+        body
+    }
+
+    fn after_grace() -> SystemTime {
+        SystemTime::now() + DEAD_INSTANCE_TEMP_GRACE + Duration::from_secs(60)
+    }
+
+    const SHARD: &str = "ranges/scni-bucket/0a/1bc";
+
+    #[test]
+    fn only_dead_pid_own_host_new_shape_range_temps_are_reaped() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let dead = dead_pid();
+        let live = std::os::unix::process::parent_id();
+        let hosts = vec![MY_HOST.to_string()];
+
+        let reaped: Vec<String> = vec![
+            format!("{SHARD}/obj_0-1023.bin.tmp.{MY_HOST}.{dead}"),
+            format!("{SHARD}/obj_0-1023.0efa023d.tmp.{MY_HOST}.{dead}"),
+        ];
+        let kept: Vec<String> = vec![
+            format!("{SHARD}/obj_0-1023.bin.tmp.{MY_HOST}.{live}"),
+            format!("{SHARD}/obj_0-1023.0efa023d.tmp.{MY_HOST}.{live}"),
+            format!("{SHARD}/obj_0-1023.bin.tmp.{OTHER_HOST}.{dead}"),
+            format!("{SHARD}/obj_0-1023.0efa023d.tmp.{OTHER_HOST}.{dead}"),
+            format!("{SHARD}/obj_0-1023.bin"),
+            // Pre- unscoped names: no host, no pid, never judged.
+            format!("{SHARD}/obj_0-1023.bin.tmp"),
+            format!("{SHARD}/obj_0-1023.0efa023d.tmp"),
+        ];
+        let mut bodies = BTreeMap::new();
+        for rel in reaped.iter().chain(kept.iter()) {
+            bodies.insert(rel.clone(), plant(root, rel));
+        }
+        let (files, _) = reap_dead_instance_range_temps(
+            root,
+            &hosts,
+            std::process::id(),
+            DEAD_INSTANCE_TEMP_GRACE,
+            after_grace(),
+        );
+        let survivors: Vec<&String> = reaped.iter().filter(|r| root.join(r).exists()).collect();
+        assert!(
+            survivors.is_empty(),
+            "dead-pid own-host range temps not reaped: {survivors:?}"
+        );
+        assert_eq!(files, reaped.len() as u64);
+        for rel in &kept {
+            match std::fs::read(root.join(rel)) {
+                Ok(b) => assert_eq!(&b, &bodies[rel], "{rel} must survive byte-exact"),
+                Err(e) => panic!("{rel} must survive, but: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_pid_range_temp_younger_than_the_grace_survives() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rel = format!("{SHARD}/obj_0-1023.bin.tmp.{MY_HOST}.{}", dead_pid());
+        plant(dir.path(), &rel);
+        let (files, _) = reap_dead_instance_range_temps(
+            dir.path(),
+            &[MY_HOST.to_string()],
+            std::process::id(),
+            DEAD_INSTANCE_TEMP_GRACE,
+            SystemTime::now(),
+        );
+        assert_eq!(files, 0);
+        assert!(dir.path().join(&rel).exists());
+    }
+
+    #[test]
+    fn only_root_level_flat_files_for_unshardable_keys_are_reaped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        // One-segment key "bucket" written flat by an earlier build.
+        let reaped = [
+            "metadata/scni-bucket.meta",
+            "ranges/scni-bucket_0-4095.bin",
+            "ranges/scni-bucket_4096-8191.bin",
+        ];
+        let kept = [
+            // Sharded entries.
+            "metadata/scni-bucket/0a/1bc/obj.meta",
+            "ranges/scni-bucket/0a/1bc/obj_0-1023.bin",
+            // Internal files and directories at the roots.
+            "metadata/_journals/h:1.journal",
+            "metadata/_shard_state/staged_authority_epoch.json",
+            "metadata/_internal.meta",
+            "ranges/_internal_0-1.bin",
+            // Temps, other extensions, and a stem that decodes to a shardable key.
+            "metadata/scni-bucket.meta.tmp",
+            "ranges/scni-bucket_0-4095.bin.tmp",
+            "metadata/scni-bucket.lock",
+            "metadata/scni-bucket%2Fobj.meta",
+            "ranges/scni-bucket%2Fobj_0-1.bin",
+        ];
+        let mut bodies = BTreeMap::new();
+        for rel in reaped.iter().chain(kept.iter()) {
+            bodies.insert(rel.to_string(), plant(root, rel));
+        }
+        let (metas, ranges) =
+            reap_legacy_flat_root_files(root, DEAD_INSTANCE_TEMP_GRACE, after_grace());
+        let survivors: Vec<&&str> = reaped.iter().filter(|r| root.join(r).exists()).collect();
+        assert!(
+            survivors.is_empty(),
+            "legacy flat root files not reaped: {survivors:?}"
+        );
+        assert_eq!(metas, 1);
+        let mut got: Vec<(String, u64, u64, u64)> = ranges
+            .into_iter()
+            .map(|r| (r.cache_key, r.start, r.end, r.bytes))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "scni-bucket".to_string(),
+                    0,
+                    4095,
+                    bodies["ranges/scni-bucket_0-4095.bin"].len() as u64
+                ),
+                (
+                    "scni-bucket".to_string(),
+                    4096,
+                    8191,
+                    bodies["ranges/scni-bucket_4096-8191.bin"].len() as u64
+                ),
+            ],
+            "every removed range is returned for the debit, with its on-disk size"
+        );
+        for rel in kept {
+            match std::fs::read(root.join(rel)) {
+                Ok(b) => assert_eq!(b, bodies[rel], "{rel} must survive byte-exact"),
+                Err(e) => panic!("{rel} must survive, but: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_root_file_younger_than_the_grace_survives() {
+        let dir = tempfile::TempDir::new().unwrap();
+        plant(dir.path(), "ranges/scni-bucket_0-1.bin");
+        let (metas, ranges) =
+            reap_legacy_flat_root_files(dir.path(), DEAD_INSTANCE_TEMP_GRACE, SystemTime::now());
+        assert_eq!((metas, ranges.len()), (0, 0));
+        assert!(dir.path().join("ranges/scni-bucket_0-1.bin").exists());
+    }
+}
+
+/// The § 16.6.13 K3/K4 scanner gate on the staged fold and ledger repair passes.
+#[cfg(test)]
+mod scan_gate_tests {
+    use super::*;
+    use crate::scanner_registry::{self as reg, ScanKind, ScannerDocument};
+    use tempfile::TempDir;
+
+    const PEER: &str = "ip-10-9-9-9.internal:4242";
+
+    fn consolidator(temp_dir: &TempDir) -> JournalConsolidator {
+        JournalConsolidator::new(
+            temp_dir.path().to_path_buf(),
+            Arc::new(JournalManager::new(
+                temp_dir.path().to_path_buf(),
+                "test-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                temp_dir.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        )
+    }
+
+    fn own_doc(c: &JournalConsolidator, kind: ScanKind) -> Option<ScannerDocument> {
+        let path = reg::scanners_dir(&c.cache_dir).join(format!(
+            "{}.{}.scan",
+            c.write_ledger().instance_id(),
+            kind.as_str()
+        ));
+        let body = std::fs::read(path).ok()?;
+        serde_json::from_slice(&body).ok()
+    }
+
+    fn freshness_written(c: &JournalConsolidator) -> bool {
+        c.cache_dir
+            .join("metadata/_shard_state/staged_fold_freshness.json")
+            .exists()
+    }
+
+    /// Put `kind`'s limiter at `k = 1` from evidence, the state U4's sampling produces when level 1
+    /// out-performs level 2. Without evidence the gate admits every pass, because the caller is
+    /// counted in `k_max` and so `n < k` (today's behaviour).
+    fn force_k_one(p: &MaintenancePasses, kind: ScanKind) {
+        let mut lim = p.limiter(kind).lock().unwrap();
+        *lim = crate::scanner_limiter::ScannerLimiter::new(2);
+        for _ in 0..3 {
+            lim.record_visit(0, 0, 1_000, Duration::from_secs(1));
+            lim.record_visit(1, 1, 100, Duration::from_secs(1));
+        }
+        assert_eq!(lim.end_pass(0.9), 1, "fixture: evidence puts k at 1");
+    }
+
+    /// With a live peer and no limiter evidence the pass runs: the caller counts toward `k_max`,
+    /// so `k = 2 > n = 1`. This is the no-change-until-evidence property.
+    #[tokio::test]
+    async fn without_evidence_a_live_peer_does_not_defer_a_pass() {
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        reg::publish(dir.path(), PEER, ScanKind::Fold).unwrap();
+        let p = c.maintenance_passes();
+        let (now, claim) = p.claim_staged_fold().expect("first claim is due");
+        let window = crate::staged_fold::MAX_AUTHORITY_AGE_SECS;
+        let out = p
+            .run_claimed_staged_fold_given(now, claim, || Some(three_quarters(window)))
+            .await;
+        assert!(out.is_some(), "no evidence must not defer: {out:?}");
+    }
+
+    /// Three quarters of the window, exactly: NOT above it, so it does not bypass.
+    fn three_quarters(window: u64) -> u64 {
+        window / 4 * 3
+    }
+
+    /// (a) A live peer and `k = 1`: the fold pass defers and consumes nothing.
+    #[tokio::test]
+    async fn a_deferred_fold_pass_leaves_the_cadence_and_the_freshness_record_alone() {
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        reg::publish(dir.path(), PEER, ScanKind::Fold).unwrap();
+        let p = c.maintenance_passes();
+        force_k_one(&p, ScanKind::Fold);
+        let before = scan_deferred_total(ScanKind::Fold);
+        let (now, claim) = p.claim_staged_fold().expect("first claim is due");
+        let window = crate::staged_fold::MAX_AUTHORITY_AGE_SECS;
+        let out = p
+            .run_claimed_staged_fold_given(now, claim, || Some(three_quarters(window)))
+            .await;
+        assert!(
+            out.is_none(),
+            "n=1 >= k=1 with a fresh rotation must defer: {out:?}"
+        );
+        assert_eq!(c.last_staged_fold_completed_secs.load(Ordering::Relaxed), 0);
+        assert!(
+            !freshness_written(&c),
+            "a deferral must not record a fold attempt"
+        );
+        assert!(scan_deferred_total(ScanKind::Fold) > before);
+        assert!(
+            own_doc(&c, ScanKind::Fold).is_none(),
+            "a deferral publishes nothing"
+        );
+        assert!(
+            p.claim_staged_fold().is_some(),
+            "the next cycle must be able to ask again"
+        );
+    }
+
+    /// (a) The same for the ledger repair pass.
+    #[tokio::test]
+    async fn a_deferred_repair_pass_leaves_the_cadence_alone() {
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        reg::publish(dir.path(), PEER, ScanKind::Repair).unwrap();
+        let p = c.maintenance_passes();
+        force_k_one(&p, ScanKind::Repair);
+        let before = scan_deferred_total(ScanKind::Repair);
+        let (now, claim) = p.claim_ledger_repair().expect("first claim is due");
+        let out = p
+            .run_claimed_ledger_repair_given(now, claim, || Some(10))
+            .await;
+        assert!(out.is_none(), "must defer: {out:?}");
+        assert_eq!(c.last_ledger_repair_secs.load(Ordering::Relaxed), 0);
+        assert!(scan_deferred_total(ScanKind::Repair) > before);
+        assert!(p.claim_ledger_repair().is_some());
+    }
+
+    /// (b) Above three quarters of the window the pass runs under the same contention, and its
+    /// document is published then ended.
+    #[tokio::test]
+    async fn a_stale_fold_rotation_bypasses_the_gate() {
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        reg::publish(dir.path(), PEER, ScanKind::Fold).unwrap();
+        let p = c.maintenance_passes();
+        force_k_one(&p, ScanKind::Fold);
+        let (now, claim) = p.claim_staged_fold().unwrap();
+        let window = crate::staged_fold::MAX_AUTHORITY_AGE_SECS;
+        let out = p
+            .run_claimed_staged_fold_given(now, claim, || Some(three_quarters(window) + 1))
+            .await;
+        assert!(out.is_some(), "a stale rotation must bypass the gate");
+        assert!(freshness_written(&c));
+        let doc = own_doc(&c, ScanKind::Fold).expect("the pass published its document");
+        assert!(doc.ended_at.is_some(), "and ended it: {doc:?}");
+    }
+
+    /// (b) The repair bypass holds where `ledger_repair_rotation_reachable` reads true: K3 forbids
+    /// gating the bypass on reachability.
+    #[tokio::test]
+    async fn a_reachable_repair_rotation_does_not_suppress_the_bypass() {
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        assert_eq!(
+            crate::ledger_repair::collect_ledger_repair_gauges(dir.path())
+                .ledger_repair_rotation_reachable,
+            Some(true),
+            "fixture: the rotation must read reachable, or this proves nothing"
+        );
+        reg::publish(dir.path(), PEER, ScanKind::Repair).unwrap();
+        let p = c.maintenance_passes();
+        force_k_one(&p, ScanKind::Repair);
+        let (now, claim) = p.claim_ledger_repair().unwrap();
+        let window = crate::ledger_repair::MAX_REPAIR_AGE_SECS;
+        let out = p
+            .run_claimed_ledger_repair_given(now, claim, || Some(three_quarters(window) + 1))
+            .await;
+        assert!(
+            out.is_some(),
+            "reachable must not suppress the stale-age bypass"
+        );
+        let doc = own_doc(&c, ScanKind::Repair).expect("published");
+        assert!(doc.ended_at.is_some());
+    }
+
+    /// (d) An unreadable stalest age bypasses.
+    #[tokio::test]
+    async fn an_unreadable_stalest_age_bypasses() {
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        reg::publish(dir.path(), PEER, ScanKind::Fold).unwrap();
+        reg::publish(dir.path(), PEER, ScanKind::Repair).unwrap();
+        let p = c.maintenance_passes();
+        force_k_one(&p, ScanKind::Fold);
+        force_k_one(&p, ScanKind::Repair);
+        let (now, claim) = p.claim_staged_fold().unwrap();
+        assert!(p
+            .run_claimed_staged_fold_given(now, claim, || None)
+            .await
+            .is_some());
+        let (now, claim) = p.claim_ledger_repair().unwrap();
+        assert!(p
+            .run_claimed_ledger_repair_given(now, claim, || None)
+            .await
+            .is_some());
+    }
+
+    /// A lone instance's own repair pass is not a peer: its fold pass must not defer on it.
+    #[tokio::test]
+    async fn an_instances_own_other_kind_pass_does_not_defer_it() {
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        reg::publish(dir.path(), c.write_ledger().instance_id(), ScanKind::Repair).unwrap();
+        let p = c.maintenance_passes();
+        force_k_one(&p, ScanKind::Fold);
+        let (now, claim) = p.claim_staged_fold().unwrap();
+        assert!(p
+            .run_claimed_staged_fold_given(now, claim, || Some(0))
+            .await
+            .is_some());
+    }
+
+    #[test]
+    fn the_bypass_threshold_is_strictly_above_three_quarters() {
+        assert!(!scan_gate_bypass(Some(64_800), 86_400));
+        assert!(scan_gate_bypass(Some(64_801), 86_400));
+        assert!(scan_gate_bypass(None, 86_400));
+        assert!(!scan_gate_bypass(Some(0), 86_400));
+    }
+
+    /// (c) A pass that ends in a retain (the fold's error outcome) still ends its document.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_retained_fold_pass_ends_its_scanner_document() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let c = consolidator(&dir);
+        let ledger = c.write_ledger();
+        ledger
+            .append_staged_range("bucket/scan-gate.bin", 0, 4095, 4096)
+            .await
+            .unwrap();
+        let path = ledger.shard_path_for_key("bucket/scan-gate.bin").unwrap();
+        let restore = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let p = c.maintenance_passes();
+        let (now, claim) = p.claim_staged_fold().unwrap();
+        let out = p.run_claimed_staged_fold_given(now, claim, || None).await;
+        std::fs::set_permissions(&path, restore).unwrap();
+        assert_eq!(
+            out.as_ref().and_then(|o| o.retain_reason()),
+            Some(crate::staged_fold::FoldRetainReason::LedgerFileUnreadable),
+            "fixture must retain: {out:?}"
+        );
+        let doc = own_doc(&c, ScanKind::Fold).expect("published");
+        assert!(
+            doc.ended_at.is_some(),
+            "an error outcome must end the document, or peers over-count for a lease: {doc:?}"
+        );
+        assert_eq!(
+            reg::count_live_others(dir.path(), PEER, ScanKind::Fold, doc.published_at),
+            0
+        );
+    }
+
+    /// (c) A panic unwinding through the pass ends the document too.
+    #[test]
+    fn a_panicking_pass_ends_its_scanner_document() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().to_path_buf();
+        reg::publish(&cache, "me.internal:1", ScanKind::Repair).unwrap();
+        let c2 = cache.clone();
+        let r = std::panic::catch_unwind(move || {
+            let _g = ScanDocGuard {
+                cache_dir: c2,
+                instance_id: "me.internal:1".to_string(),
+                kind: ScanKind::Repair,
+            };
+            panic!("pass panicked");
+        });
+        assert!(r.is_err());
+        let body =
+            std::fs::read(reg::scanners_dir(&cache).join("me.internal:1.repair.scan")).unwrap();
+        let doc: ScannerDocument = serde_json::from_slice(&body).unwrap();
+        assert!(doc.ended_at.is_some());
+    }
+}
+
+/// The consolidation-lock watchdog, its generation fence, the `consolidation_lock_held_secs`
+/// gauge, and the Write_Ledger compaction budget.
+#[cfg(test)]
+mod lock_watchdog_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn consolidator(dir: &Path) -> Arc<JournalConsolidator> {
+        Arc::new(JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(JournalManager::new(
+                dir.to_path_buf(),
+                "test-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        ))
+    }
+
+    /// Plant a peer's `delta_*.json` carrying `delta` bytes.
+    fn plant_delta_file(dir: &Path, name: &str, delta: i64) -> PathBuf {
+        let tracking = dir.join("size_tracking");
+        std::fs::create_dir_all(&tracking).unwrap();
+        let path = tracking.join(format!("delta_{}.json", name));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"delta":{},"write_cache_delta":0,"instance_id":"{}"}}"#,
+                delta, name
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn persisted_total_size(dir: &Path) -> u64 {
+        let path = dir.join("size_tracking").join("size_state.json");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str::<serde_json::Value>(&s)
+                .ok()
+                .and_then(|v| v.get("total_size").and_then(|t| t.as_u64()))
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// A cycle parked inside the locked region keeps the lock until the watchdog takes it; a
+    /// second consolidator on the same cache_dir acquires it only after that; and the parked
+    /// cycle, once released, neither applies the planted delta nor deletes its file.
+    ///
+    /// # RED SIDES
+    ///
+    /// - Watchdog thread not calling `take_over_stale_lock`: the second consolidator never
+    ///   acquires ("never acquired the lock").
+    /// - `lock_fence_intact` returning true unconditionally: the released cycle applies the
+    ///   delta and deletes the file ("wrote after the takeover").
+    #[test]
+    fn a_stuck_cycle_loses_the_lock_to_the_watchdog_and_writes_nothing_after() {
+        let tmp = TempDir::new().unwrap();
+        let a = consolidator(tmp.path());
+        let b = consolidator(tmp.path());
+        let planted = plant_delta_file(tmp.path(), "peer-watchdog", 4096);
+
+        let hook = Arc::new(LockParkHook {
+            reached: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        a.set_lock_park_hook(hook.clone());
+        let threshold = Duration::from_millis(1500);
+        let watchdog = a.start_lock_watchdog(threshold);
+
+        let a_cycle = a.clone();
+        let cycle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(a_cycle.run_consolidation_cycle());
+        });
+
+        hook.reached.wait();
+        let parked_at = std::time::Instant::now();
+        assert!(
+            !b.try_acquire_global_consolidation_lock().unwrap(),
+            "FIXTURE: the parked cycle must hold the lock, or the takeover proves nothing"
+        );
+
+        // The gauge reads non-zero while the lock is held.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            a.consolidation_lock_held_secs() >= 1,
+            "consolidation_lock_held_secs must be non-zero while the parked cycle holds the lock"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut acquired = false;
+        while std::time::Instant::now() < deadline {
+            if b.try_acquire_global_consolidation_lock().unwrap() {
+                acquired = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let acquired_after = parked_at.elapsed();
+        if !acquired {
+            hook.release.wait();
+            let _ = cycle.join();
+            panic!(
+                "the second consolidator never acquired the lock: the watchdog did not take it \
+                 from the parked cycle within 10 s (threshold {:?})",
+                threshold
+            );
+        }
+        assert!(
+            acquired_after >= threshold,
+            "the second consolidator acquired after {:?}, before the {:?} threshold",
+            acquired_after,
+            threshold
+        );
+        assert_eq!(a.consolidation_lock_takeovers(), 1);
+        assert_eq!(
+            a.consolidation_lock_held_secs(),
+            0,
+            "the gauge must read 0 once the lock is no longer held"
+        );
+
+        hook.release.wait();
+        cycle.join().unwrap();
+        watchdog.stop();
+
+        assert!(
+            planted.exists() && persisted_total_size(tmp.path()) == 0,
+            "the released cycle wrote after the takeover: delta file present={}, persisted \
+             total_size={} (expected the file kept and 0 applied)",
+            planted.exists(),
+            persisted_total_size(tmp.path())
+        );
+        b.release_global_consolidation_lock();
+    }
+
+    /// The fence is per acquisition. A cycle parks holding the lock, the watchdog
+    /// takes it, and the SAME consolidator re-acquires it by token (the validation install and
+    /// rolling write phase shape). The released cycle must write nothing and its scopeguard
+    /// must not release the new holder's lock.
+    ///
+    /// # RED SIDE
+    ///
+    /// Process-wide fence and unconditional release (`token_is_current` comparing
+    /// `lock_generation` with `held_lock_generation` instead of the caller's token, release
+    /// skipping the token check): the parked cycle applies the delta, and a peer acquires the
+    /// lock while the re-acquirer still holds it.
+    #[test]
+    fn a_re_acquisition_after_takeover_does_not_revive_the_stuck_cycles_fence() {
+        let tmp = TempDir::new().unwrap();
+        let a = consolidator(tmp.path());
+        let peer = consolidator(tmp.path());
+        let planted = plant_delta_file(tmp.path(), "peer-reacquire", 4096);
+
+        let hook = Arc::new(LockParkHook {
+            reached: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        a.set_lock_park_hook(hook.clone());
+        let watchdog = a.start_lock_watchdog(Duration::from_millis(300));
+
+        let a_cycle = a.clone();
+        let cycle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(a_cycle.run_consolidation_cycle());
+        });
+        hook.reached.wait();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while a.consolidation_lock_takeovers() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Stopped before the re-acquisition, or it would take the new holder's lock too.
+        watchdog.stop();
+        if a.consolidation_lock_takeovers() == 0 {
+            hook.release.wait();
+            let _ = cycle.join();
+            panic!("FIXTURE: the watchdog never took the parked cycle's lock");
+        }
+
+        let token = a
+            .try_acquire_consolidation_lock_token()
+            .unwrap()
+            .expect("FIXTURE: the same process must re-acquire after the takeover");
+
+        hook.release.wait();
+        cycle.join().unwrap();
+
+        let peer_got_it = peer.try_acquire_global_consolidation_lock().unwrap();
+        if peer_got_it {
+            peer.release_global_consolidation_lock();
+        }
+        assert!(
+            planted.exists() && persisted_total_size(tmp.path()) == 0,
+            "the stuck cycle wrote after the takeover through a re-acquired lock: delta file \
+             present={}, persisted total_size={} (expected the file kept and 0 applied)",
+            planted.exists(),
+            persisted_total_size(tmp.path())
+        );
+        assert!(
+            !peer_got_it,
+            "the stuck cycle's scopeguard released the re-acquirer's lock: a peer acquired it"
+        );
+        assert!(a.lock_fence_intact_for(token));
+        a.release_consolidation_lock(token);
+        assert!(!a.lock_fence_intact_for(token));
+        assert!(peer.try_acquire_global_consolidation_lock().unwrap());
+        peer.release_global_consolidation_lock();
+    }
+
+    /// A takeover between the fenced persist and the delete of the applied
+    /// delta files. The parked cycle's persist has already counted the planted delta, so the
+    /// files must go even though the fence has since moved; the next holder's cycle must then
+    /// find nothing to apply. The delta is counted exactly once.
+    ///
+    /// # RED SIDE
+    ///
+    /// The Ok arm deleting through `delete_applied_delta_files_fenced`: the released cycle
+    /// leaves the file, the peer's cycle applies it again, and `total_size` reads 8192.
+    #[test]
+    fn a_takeover_after_the_fenced_persist_still_deletes_the_applied_deltas() {
+        let tmp = TempDir::new().unwrap();
+        let a = consolidator(tmp.path());
+        let peer = consolidator(tmp.path());
+        let planted = plant_delta_file(tmp.path(), "peer-post-persist", 4096);
+
+        let hook = Arc::new(LockParkHook {
+            reached: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        applied_delta_delete_hook::arm(tmp.path(), hook.clone());
+        let watchdog = a.start_lock_watchdog(Duration::from_millis(300));
+
+        let a_cycle = a.clone();
+        let cycle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(a_cycle.run_consolidation_cycle());
+        });
+        hook.reached.wait();
+        assert_eq!(
+            persisted_total_size(tmp.path()),
+            4096,
+            "FIXTURE: the parked cycle must have persisted the delta before the park point"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while a.consolidation_lock_takeovers() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        watchdog.stop();
+        let took_over = a.consolidation_lock_takeovers() > 0;
+        hook.release.wait();
+        cycle.join().unwrap();
+        assert!(
+            took_over,
+            "FIXTURE: the watchdog never took the parked cycle's lock"
+        );
+        assert!(
+            !a.lock_fence_intact(),
+            "FIXTURE: the fence must have moved, or the unfenced delete proves nothing"
+        );
+
+        // The next holder's cycle, after the stuck holder has finished.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), peer.run_consolidation_cycle())
+                .await
+                .expect("the peer's cycle did not finish within 30 s")
+        })
+        .unwrap();
+
+        let total = persisted_total_size(tmp.path());
+        assert!(
+            total == 4096 && !planted.exists(),
+            "the applied delta was counted {} time(s): total_size={} (expected 4096), delta \
+             file present={} (expected deleted by the stuck holder after its persist)",
+            total / 4096,
+            total,
+            planted.exists()
+        );
+    }
+
+    /// The gauge reads the hold time while the lock is held, and 0 after release.
+    #[test]
+    fn lock_held_gauge_is_nonzero_while_held_and_zero_after() {
+        let tmp = TempDir::new().unwrap();
+        let c = consolidator(tmp.path());
+        assert_eq!(c.consolidation_lock_held_secs(), 0);
+        assert!(c.try_acquire_global_consolidation_lock().unwrap());
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(c.consolidation_lock_held_secs() >= 1);
+        c.release_global_consolidation_lock();
+        assert_eq!(c.consolidation_lock_held_secs(), 0);
+    }
+
+    /// The production threshold is `max(10 × consolidation_cycle_timeout, 5 min)`.
+    #[test]
+    fn watchdog_threshold_is_ten_cycle_timeouts_with_a_five_minute_floor() {
+        let tmp = TempDir::new().unwrap();
+        let c = consolidator(tmp.path());
+        // Default cycle timeout is 30 s: 10 × 30 s = 300 s, equal to the floor.
+        assert_eq!(c.lock_watchdog_threshold(), Duration::from_secs(300));
+        let long = JournalConsolidator::new(
+            tmp.path().to_path_buf(),
+            Arc::new(JournalManager::new(tmp.path().to_path_buf(), "t".into())),
+            Arc::new(MetadataLockManager::new(
+                tmp.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig {
+                consolidation_cycle_timeout: Duration::from_secs(60),
+                ..ConsolidationConfig::default()
+            },
+        );
+        assert_eq!(long.lock_watchdog_threshold(), Duration::from_secs(600));
+        // Budget at the default: min(10 s, 30 s / 3) = 10 s.
+        assert_eq!(c.ledger_compaction_budget(), Duration::from_secs(10));
+    }
+
+    /// Compaction over a large staged set stops at its budget, is NOT due again on the next
+    /// call, and once its resume delay has elapsed resumes after the last key assessed and
+    /// finishes.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the budget check removed from the assessment loop, the first pass assesses all 40
+    /// candidates and reports complete ("ran past its budget"). With the budget-stopped pass
+    /// resetting its stamp to 0, the immediate second call runs ("ran again on the very next
+    /// call").
+    #[tokio::test]
+    async fn ledger_compaction_stops_at_its_budget_and_finishes_next_call() {
+        let tmp = TempDir::new().unwrap();
+        let c = consolidator(tmp.path());
+        const N: usize = 40;
+        for i in 0..N {
+            c.write_ledger
+                .append_staged_range(&format!("bucket/budget-{:03}.bin", i), 0, 4095, 4096)
+                .await
+                .unwrap();
+        }
+        assert!(c.try_acquire_global_consolidation_lock().unwrap());
+
+        c.set_ledger_compaction_budget(Duration::ZERO);
+        let first = c
+            .maybe_compact_write_ledger()
+            .await
+            .expect("the first pass is due");
+        assert!(
+            !first.complete && first.assessed < N,
+            "compaction ran past its budget: assessed {} of {} candidates, complete={}",
+            first.assessed,
+            N,
+            first.complete
+        );
+        assert_eq!(first.assessed, 1, "a zero budget still makes progress");
+        assert!(
+            c.maybe_compact_write_ledger().await.is_none(),
+            "a budget-stopped compaction pass ran again on the very next call"
+        );
+
+        c.set_ledger_compaction_budget(Duration::from_secs(60));
+        c.make_ledger_compaction_due();
+        let second = c
+            .maybe_compact_write_ledger()
+            .await
+            .expect("the resumed pass is due once its delay has elapsed");
+        assert!(second.complete);
+        assert_eq!(
+            first.assessed + second.assessed,
+            N,
+            "the second pass resumes after the first pass's last key"
+        );
+        assert!(
+            c.maybe_compact_write_ledger().await.is_none(),
+            "a completed pass restores the interval"
+        );
+        c.release_global_consolidation_lock();
+    }
+
+    /// Seed one staged range per key across many shards, and return how many shard ledger
+    /// files exist (one instance, so one file per shard).
+    async fn seed_ledger_across_shards(c: &JournalConsolidator, n: usize) -> usize {
+        for i in 0..n {
+            c.write_ledger
+                .append_staged_range(&format!("bucket/rotation-{:03}.bin", i), 0, 4095, 4096)
+                .await
+                .unwrap();
+        }
+        c.write_ledger.ledger_shards().await.unwrap().len()
+    }
+
+    /// A budget-stopped compaction pass reads the ledger files of the units it visited and no
+    /// others: the rewrite step is bounded by the same budget as the assessment.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the rewrite restored to the whole-volume `retire_identities`, the zero-budget pass
+    /// reads every shard's file ("read ledger files beyond the units it visited").
+    #[tokio::test]
+    async fn ledger_compaction_rewrite_reads_only_the_units_it_visited() {
+        let tmp = TempDir::new().unwrap();
+        let c = consolidator(tmp.path());
+        let shards = seed_ledger_across_shards(&c, 40).await;
+        assert!(
+            shards > 10,
+            "fixture: 40 keys must span many shards, got {shards}"
+        );
+        assert!(c.try_acquire_global_consolidation_lock().unwrap());
+
+        c.set_ledger_compaction_budget(Duration::ZERO);
+        let pass = c
+            .maybe_compact_write_ledger()
+            .await
+            .expect("the first pass is due");
+        assert!(!pass.complete);
+        assert_eq!(pass.units_visited, 1, "a zero budget visits one unit");
+        assert!(
+            pass.files_read <= pass.units_visited,
+            "compaction read ledger files beyond the units it visited: files_read={} for {} \
+             unit(s), {} shard files on the volume",
+            pass.files_read,
+            pass.units_visited,
+            shards
+        );
+
+        // The rotation still covers everything: drive it to completion and count the units.
+        c.set_ledger_compaction_budget(Duration::from_secs(60));
+        c.make_ledger_compaction_due();
+        let rest = c.maybe_compact_write_ledger().await.expect("due");
+        assert!(rest.complete);
+        // `shards` when the first pass finished its unit, `shards + 1` when it stopped inside
+        // it and the resumed pass revisited that unit.
+        let covered = pass.units_visited + rest.units_visited;
+        assert!(
+            covered == shards || covered == shards + 1,
+            "the rotation must cover every shard once: covered {covered} of {shards}"
+        );
+        c.release_global_consolidation_lock();
+    }
+
+    /// Two consecutive non-idle consolidation cycles: the first runs a compaction pass that
+    /// stops at its budget, and the second does not compact at all, so its journal discovery
+    /// and apply wait behind no compaction. Observed through the resume cursor, which any
+    /// compaction pass on this ledger would move.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the budget-stopped pass resetting its stamp to 0 (the earlier behaviour), the
+    /// second cycle compacts again and advances the cursor ("compacted again on the next
+    /// cycle").
+    #[tokio::test]
+    async fn consolidation_cycle_after_a_budget_stopped_compaction_does_not_compact() {
+        let tmp = TempDir::new().unwrap();
+        let c = consolidator(tmp.path());
+        let shards = seed_ledger_across_shards(&c, 40).await;
+        assert!(shards > 10);
+        c.set_ledger_compaction_budget(Duration::ZERO);
+
+        // A cycle reaches compaction only when it has journal keys to apply, so each cycle gets
+        // one peer journal entry, which is exactly the work compaction used to delay.
+        let plant_journal_entry = |n: u64| {
+            let now = SystemTime::now();
+            let entry = JournalEntry {
+                timestamp: now,
+                instance_id: "scnj-peer".to_string(),
+                cache_key: format!("bucket/scnj-applied-{n}"),
+                range_spec: RangeSpec {
+                    start: 0,
+                    end: 99,
+                    file_path: format!("r_{n}.bin"),
+                    compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+                    compressed_size: 100,
+                    uncompressed_size: 100,
+                    created_at: now,
+                    last_accessed: now,
+                    access_count: 1,
+                    staged: None,
+                    unservable: false,
+                    file_identity: None,
+                },
+                operation: JournalOperation::Add,
+                range_file_path: format!("r_{n}.bin"),
+                metadata_version: 1,
+                new_ttl_secs: None,
+                object_ttl_secs: None,
+                access_increment: None,
+                object_metadata: None,
+                fill_witness: None,
+            };
+            let dir = tmp.path().join("metadata").join("_journals");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("scnj-peer.journal"),
+                format!("{}\n", serde_json::to_string(&entry).unwrap()),
+            )
+            .unwrap();
+        };
+
+        plant_journal_entry(1);
+        let first = c.run_consolidation_cycle().await.unwrap();
+        assert!(
+            first.keys_processed > 0,
+            "fixture: the first cycle must apply its entry"
+        );
+        let after_first = c.ledger_compaction_resume_after.lock().unwrap().clone();
+        assert!(
+            after_first.is_some(),
+            "fixture: the first cycle's compaction must stop at its zero budget"
+        );
+
+        plant_journal_entry(2);
+        let second = c.run_consolidation_cycle().await.unwrap();
+        assert!(
+            second.keys_processed > 0,
+            "fixture: the second cycle must apply its entry"
+        );
+        let after_second = c.ledger_compaction_resume_after.lock().unwrap().clone();
+        assert_eq!(
+            after_second, after_first,
+            "a budget-stopped compaction pass compacted again on the next cycle"
+        );
+    }
+    /// A consolidator for a named instance on a shared volume.
+    fn consolidator_as(dir: &Path, instance: &str) -> Arc<JournalConsolidator> {
+        Arc::new(JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(JournalManager::new(dir.to_path_buf(), instance.to_string())),
+            Arc::new(MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        ))
+    }
+    /// Two instances on one volume, alternating as the consolidation lock holder, share one
+    /// compaction rotation and one resume time: the second continues the first's cursor rather
+    /// than restarting, and neither starts a pass before the fleet's resume time, whatever its
+    /// own process-local gate says.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the cursor read from the process-local `ledger_compaction_resume_after` again, B
+    /// starts its own rotation and assesses every candidate ("restarted the rotation").
+    #[tokio::test]
+    async fn second_lock_holder_continues_the_fleet_compaction_rotation() {
+        let tmp = TempDir::new().unwrap();
+        let a = consolidator_as(tmp.path(), "scnk-a");
+        let b = consolidator_as(tmp.path(), "scnk-b");
+        const N: usize = 40;
+        let shards = seed_ledger_across_shards(&a, N).await;
+        assert!(shards > 10, "fixture: 40 keys must span many shards");
+
+        // A holds the lock and runs one zero-budget pass: one candidate, then stops.
+        assert!(a.try_acquire_global_consolidation_lock().unwrap());
+        a.set_ledger_compaction_budget(Duration::ZERO);
+        let first = a
+            .maybe_compact_write_ledger()
+            .await
+            .expect("A's pass is due");
+        assert!(!first.complete);
+        assert_eq!(first.assessed, 1, "a zero budget still makes progress");
+        a.release_global_consolidation_lock();
+        let doc = SharedLedgerCompactionState::load(tmp.path())
+            .expect("a budget-stopped pass publishes the shared rotation");
+        assert!(doc.cursor.is_some());
+
+        // B has never compacted, so its own gate is open; the fleet's resume time is not.
+        assert!(b.try_acquire_global_consolidation_lock().unwrap());
+        b.set_ledger_compaction_budget(Duration::from_secs(60));
+        assert!(
+            b.maybe_compact_write_ledger().await.is_none(),
+            "B ran a compaction pass before the fleet's shared resume time"
+        );
+
+        // Once the fleet's pass is due, B continues A's rotation and finishes it.
+        b.make_ledger_compaction_due();
+        let second = b
+            .maybe_compact_write_ledger()
+            .await
+            .expect("B's pass is due at the shared resume time");
+        assert!(second.complete);
+        assert_eq!(
+            first.assessed + second.assessed,
+            N,
+            "the second lock holder restarted the rotation instead of continuing the first's: \
+             A assessed {}, B assessed {}, {} candidates",
+            first.assessed,
+            second.assessed,
+            N
+        );
+        b.release_global_consolidation_lock();
+
+        // B's completed pass set the fleet's full interval: A's own gate being open is not
+        // enough for A to compact.
+        let doc = SharedLedgerCompactionState::load(tmp.path()).unwrap();
+        assert!(
+            doc.cursor.is_none(),
+            "a completed rotation clears the cursor"
+        );
+        assert!(a.try_acquire_global_consolidation_lock().unwrap());
+        a.make_ledger_compaction_locally_due();
+        assert!(
+            a.maybe_compact_write_ledger().await.is_none(),
+            "A ran a compaction pass before the resume time B published"
+        );
+        a.release_global_consolidation_lock();
+    }
+    /// A corrupt shared document, one of another schema, and one whose cursor names a unit that
+    /// no longer exists each start a fresh rotation without error, and the pass leaves a valid
+    /// document behind.
+    #[tokio::test]
+    async fn unusable_shared_compaction_document_starts_a_fresh_rotation() {
+        const N: usize = 40;
+        let stale = serde_json::json!({
+            "schema": LEDGER_COMPACTION_STATE_SCHEMA,
+            "next_due_at": 0,
+            "cursor": {"unit": [0, "bucket", "gone"], "after_key": "bucket/zzz"},
+            "written_by": "scnk-old"
+        })
+        .to_string();
+        let other_schema = serde_json::json!({
+            "schema": LEDGER_COMPACTION_STATE_SCHEMA + 1,
+            "next_due_at": u64::MAX,
+            "cursor": null
+        })
+        .to_string();
+        for (label, body) in [
+            ("corrupt", "{not json".to_string()),
+            ("other schema", other_schema),
+            ("stale cursor", stale),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let a = consolidator_as(tmp.path(), "scnk-a");
+            seed_ledger_across_shards(&a, N).await;
+            // A real mid-rotation cursor first, so a fresh rotation is distinguishable.
+            assert!(a.try_acquire_global_consolidation_lock().unwrap());
+            a.set_ledger_compaction_budget(Duration::ZERO);
+            assert!(!a.maybe_compact_write_ledger().await.unwrap().complete);
+            a.release_global_consolidation_lock();
+            std::fs::write(SharedLedgerCompactionState::path(tmp.path()), body).unwrap();
+
+            let b = consolidator_as(tmp.path(), "scnk-b");
+            assert!(b.try_acquire_global_consolidation_lock().unwrap());
+            b.set_ledger_compaction_budget(Duration::from_secs(60));
+            let pass = b
+                .maybe_compact_write_ledger()
+                .await
+                .unwrap_or_else(|| panic!("{label}: an unusable document must not block a pass"));
+            assert!(pass.complete, "{label}");
+            assert_eq!(
+                pass.assessed, N,
+                "{label}: an unusable shared document must start a fresh rotation"
+            );
+            b.release_global_consolidation_lock();
+            let doc = SharedLedgerCompactionState::load(tmp.path())
+                .unwrap_or_else(|| panic!("{label}: the pass must leave a valid document"));
+            assert!(doc.cursor.is_none() && doc.next_due_at > 0, "{label}");
+        }
+    }
+}
+
+/// `cleanup_stale_lock_files` removes a `.journal.lock` with no journal only when no
+/// one holds it. An appender holds the lock before it creates the primary journal, so a
+/// held lock with no journal is a first append in progress, not a stale file.
+#[cfg(test)]
+mod stale_lock_cleanup_tests {
+    use super::*;
+    use crate::journal_manager::{lock_file_still_named, lock_journal_lock_file};
+    use tempfile::TempDir;
+
+    #[test]
+    fn stale_lock_cleanup_does_not_delete_a_held_lock() {
+        let temp = TempDir::new().unwrap();
+        let journal = temp.path().join("scnl-host:1.journal");
+        let lock_path = journal.with_extension("journal.lock");
+
+        // A first append: lock taken, journal not created yet.
+        // Unlocked explicitly when it drops: a child another test forks in the window between
+        // fork and exec holds a copy of this descriptor, and a plain close would leave the flock
+        // held, so the cleanup below would find the lock busy.
+        let held = UnlockOnDrop(
+            lock_journal_lock_file(&lock_path, false)
+                .unwrap()
+                .expect("fixture: the appender must take the lock"),
+        );
+        assert!(!journal.exists(), "fixture: the journal must not exist yet");
+        assert!(
+            !remove_lock_file_if_unheld(&lock_path, &journal),
+            "stale-lock cleanup deleted a lock an appender holds"
+        );
+        assert!(lock_path.exists(), "the held lock file must remain");
+        assert!(lock_file_still_named(&held, &lock_path));
+        drop(held);
+
+        // A task that opened the lock file before the unlink and locks it after sees the
+        // path no longer names its inode, so it cannot hold a lock no one else can see.
+        let early_open = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            remove_lock_file_if_unheld(&lock_path, &journal),
+            "an unheld lock with no journal is stale and must be removed"
+        );
+        assert!(!lock_path.exists());
+        fs4::FileExt::lock(&early_open).unwrap();
+        assert!(!lock_file_still_named(&early_open, &lock_path));
+
+        // And the reopening helper reaches a fresh, named inode.
+        let reopened = lock_journal_lock_file(&lock_path, false).unwrap().unwrap();
+        assert!(lock_file_still_named(&reopened, &lock_path));
+    }
+
+    #[test]
+    fn stale_lock_cleanup_leaves_a_lock_whose_journal_exists() {
+        let temp = TempDir::new().unwrap();
+        let journal = temp.path().join("scnl-host:2.journal");
+        std::fs::write(&journal, "").unwrap();
+        let lock_path = journal.with_extension("journal.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        assert!(!remove_lock_file_if_unheld(&lock_path, &journal));
+        assert!(lock_path.exists());
+    }
+}
+
+/// DR-EVICT task 49 amendment 2: `.ready` freshness survives the fold-authority latch.
+#[cfg(test)]
+mod latched_capability_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn consolidator_at(dir: &std::path::Path) -> JournalConsolidator {
+        JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(JournalManager::new(
+                dir.to_path_buf(),
+                "test-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        )
+    }
+
+    /// A latched fleet whose record is two hours old, where this proxy never wins
+    /// the consolidation lock: a peer holds it across the whole cycle. The cycle is non-idle and
+    /// returns at the lock, and the record must still be refreshed, because the republication
+    /// takes no lock and runs above that return.
+    ///
+    /// Red side: `LATCHED_REPUBLISH_UNDER_LOCK` puts the republication back behind the lock; the
+    /// record stays two hours old and the gate reads `NotCapable`.
+    #[tokio::test]
+    async fn a_latched_proxy_that_never_wins_the_consolidation_lock_still_reads_capable() {
+        use crate::eviction_worklist::{self as wl, test_fleet, Capability};
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = consolidator_at(dir);
+        let peer = consolidator_at(dir);
+        crate::staged_authority::activate(dir, "host:1").unwrap();
+        crate::staged_authority::expire_epoch_check_for_tests(dir);
+        assert_eq!(
+            crate::staged_authority::read_epoch(dir),
+            crate::staged_authority::EPOCH_FOLD,
+            "fixture: the epoch must be latched"
+        );
+        let me = consolidator.write_ledger.instance_id().to_string();
+        let now = test_fleet::now();
+        test_fleet::journal(dir, &me, now);
+        // Non-empty, so the cycle is not idle and reaches the lock.
+        std::fs::write(
+            dir.join("metadata/_journals").join(format!("{me}.journal")),
+            b"{}\n",
+        )
+        .unwrap();
+        test_fleet::ready(dir, &me, true, now - 7200);
+        assert_eq!(
+            wl::fleet_is_worklist_capable(dir, now),
+            Capability::NotCapable {
+                instance: me.clone()
+            },
+            "fixture: a two-hour-old record must read NotCapable before the cycle"
+        );
+        assert!(
+            peer.try_acquire_global_consolidation_lock().unwrap(),
+            "fixture: the peer holds the consolidation lock"
+        );
+
+        let cycle = consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            cycle.entries_consolidated, 0,
+            "fixture: the cycle lost the lock: {cycle:?}"
+        );
+        assert!(
+            !consolidator
+                .try_acquire_global_consolidation_lock()
+                .unwrap(),
+            "fixture: the peer still holds the lock, so the cycle cannot have won it"
+        );
+
+        assert_eq!(
+            wl::fleet_is_worklist_capable(dir, test_fleet::now()),
+            Capability::Capable,
+            "a latched proxy that never wins the consolidation lock must still refresh its record"
+        );
+    }
+
+    /// A fleet latched in Phase Fold whose last full readiness publication is two hours old still
+    /// reads `Capable` after the latched republication, which publishes a lightweight record
+    /// instead of nothing.
+    ///
+    /// Red side: `LATCHED_SKIPS_CAPABILITY_REPUBLISH` skips it; the record stays two hours old
+    /// and the gate reads `NotCapable`.
+    #[tokio::test]
+    async fn a_latched_fleet_two_hours_old_still_reads_capable() {
+        use crate::eviction_worklist::{self as wl, test_fleet, Capability};
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(JournalManager::new(
+                dir.to_path_buf(),
+                "test-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        );
+        crate::staged_authority::activate(dir, "host:1").unwrap();
+        crate::staged_authority::expire_epoch_check_for_tests(dir);
+        assert_eq!(
+            crate::staged_authority::read_epoch(dir),
+            crate::staged_authority::EPOCH_FOLD,
+            "fixture: the epoch must be latched, or the early return is not reached"
+        );
+        assert!(crate::staged_authority::fold_authority_active_latched(dir));
+        let me = consolidator.write_ledger.instance_id().to_string();
+        let now = test_fleet::now();
+        // Active (a journal written now), with a capable record from two hours ago: what every
+        // instance of a fleet latched for two hours carries without the republication.
+        test_fleet::journal(dir, &me, now);
+        test_fleet::ready(dir, &me, true, now - 7200);
+        assert_eq!(
+            wl::fleet_is_worklist_capable(dir, now),
+            Capability::NotCapable {
+                instance: me.clone()
+            },
+            "fixture: a two-hour-old record must read NotCapable before the cycle"
+        );
+
+        consolidator.publish_lightweight_ready_record().await;
+
+        let after = wl::fleet_is_worklist_capable(dir, test_fleet::now());
+        assert_eq!(
+            after,
+            Capability::Capable,
+            "a latched fleet two hours old must still read Capable after a cycle"
+        );
+        let record = crate::staged_authority::read_ready_records(dir)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.instance_id == me)
+            .expect("the latched cycle must have published this instance's record");
+        assert!(
+            record.evict_worklist_capable && !record.rotation_complete,
+            "the lightweight record asserts the capability and no readiness: {record:?}"
+        );
+    }
+}
+
+/// The `.ready` record before the fold-authority latch (Phase L): every proxy refreshes it on
+/// every non-idle cycle whether or not it wins the consolidation lock, and publishes one at
+/// startup.
+#[cfg(test)]
+mod unlatched_capability_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn consolidator_at(dir: &std::path::Path) -> JournalConsolidator {
+        JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(JournalManager::new(
+                dir.to_path_buf(),
+                "test-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        )
+    }
+
+    /// The unlatched twin of
+    /// `a_latched_proxy_that_never_wins_the_consolidation_lock_still_reads_capable`: a fresh
+    /// volume in Phase L (epoch 0, no staged write), a peer holding the consolidation lock across
+    /// the whole cycle, and a non-idle cycle on this proxy, which returns at the lock. This
+    /// proxy's journal puts it in the gate's roster, so the gate reads `Capable` only if the
+    /// cycle published its record without the lock.
+    ///
+    /// Red side: the republication gated on `fold_authority_active_latched` (as before 3.0.0's
+    /// final build), and the gate reads `NotCapable { me }`.
+    #[tokio::test]
+    async fn an_unlatched_proxy_that_never_wins_the_consolidation_lock_still_reads_capable() {
+        use crate::eviction_worklist::{self as wl, test_fleet, Capability};
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = consolidator_at(dir);
+        let peer = consolidator_at(dir);
+        assert!(
+            !crate::staged_authority::fold_authority_active_latched(dir),
+            "fixture: the volume must be unlatched (Phase L)"
+        );
+        let me = consolidator.write_ledger.instance_id().to_string();
+        let now = test_fleet::now();
+        test_fleet::journal(dir, &me, now);
+        // Non-empty, so the cycle is not idle and reaches the lock.
+        std::fs::write(
+            dir.join("metadata/_journals").join(format!("{me}.journal")),
+            b"{}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            wl::fleet_is_worklist_capable(dir, now),
+            Capability::NotCapable {
+                instance: me.clone()
+            },
+            "fixture: a journal-bearing id with no record must read NotCapable before the cycle"
+        );
+        assert!(
+            peer.try_acquire_global_consolidation_lock().unwrap(),
+            "fixture: the peer holds the consolidation lock"
+        );
+
+        let cycle = consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(
+            cycle.entries_consolidated, 0,
+            "fixture: the cycle lost the lock: {cycle:?}"
+        );
+        assert!(
+            !consolidator
+                .try_acquire_global_consolidation_lock()
+                .unwrap(),
+            "fixture: the peer still holds the lock, so the cycle cannot have won it"
+        );
+        assert!(
+            !crate::staged_authority::fold_authority_active_latched(dir),
+            "fixture: the cycle must not have latched the volume"
+        );
+
+        assert_eq!(
+            wl::fleet_is_worklist_capable(dir, test_fleet::now()),
+            Capability::Capable,
+            "an unlatched proxy that never wins the consolidation lock must still publish its record"
+        );
+    }
+
+    /// The earlier join transient. A capable peer is running and a work-list generation is live when
+    /// this proxy starts: `initialize` runs, then the proxy's first journal write puts it in the
+    /// gate's roster before any consolidation cycle has run. The abort tick any proxy runs next
+    /// must find this proxy's record and leave the generation live.
+    ///
+    /// Red side: no record published by `initialize`; the new id has a journal and no record,
+    /// the gate reads `NotCapable { me }`, and the tick aborts the generation.
+    #[tokio::test]
+    async fn a_proxy_that_starts_during_a_live_generation_does_not_abort_it() {
+        use crate::eviction_worklist::{self as wl, test_fleet, AbortTick};
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let peer = "scnm-peer-host:1";
+        let now = test_fleet::now();
+        test_fleet::journal(dir, peer, now);
+        test_fleet::ready(dir, peer, true, now);
+        let item = wl::WorkItem {
+            cache_key: "bkt/join".to_string(),
+            start: 0,
+            end: 1023,
+            identity: crate::disk_cache::ExpectedObjectIdentity::of(
+                &crate::cache_types::NewCacheMetadata::default(),
+            ),
+            staged: false,
+            is_write_cached: false,
+            compressed_size: 1024,
+            size: 1024,
+        };
+        let shard = crate::staged_fold::Shard::new("bkt", "00");
+        let at = wl::chunk_path(dir, 1, &shard).unwrap();
+        wl::publish_chunk(&at, &wl::Chunk::new(1, peer, now, vec![item]))
+            .await
+            .unwrap();
+        wl::advance_generation(&crate::cache::EvictionLockHeld::for_tests(), dir, 1)
+            .await
+            .unwrap();
+        let before = wl::abort_if_unsafe(dir, now).await.unwrap();
+        assert!(
+            matches!(before, AbortTick::Live { generation: 1, .. }),
+            "fixture: generation 1 must be live with the peer alone: {before:?}"
+        );
+
+        let consolidator = consolidator_at(dir);
+        consolidator.initialize().await.unwrap();
+        let me = consolidator.write_ledger.instance_id().to_string();
+        // The new process's first journal write, before any consolidation cycle.
+        test_fleet::journal(dir, &me, test_fleet::now());
+
+        let tick = wl::abort_if_unsafe(dir, test_fleet::now()).await.unwrap();
+        assert!(
+            matches!(tick, AbortTick::Live { generation: 1, .. }),
+            "a proxy that started during a live generation must not abort it: {tick:?}"
+        );
+        assert!(
+            !wl::read_aborted(dir, 1).await.unwrap(),
+            "no abort marker may exist for generation 1"
+        );
+    }
+
+    /// Preservation (d): on a cycle that wins the consolidation lock, the full record
+    /// `maintain_staged_authority` writes is the one left on the volume. The lightweight
+    /// republication runs first, above the lock, and the full one later in the same cycle, so
+    /// the lightweight record never overwrites it.
+    ///
+    /// Not vacuous: the fixture completes the repair rotation, so the full record carries
+    /// `repair_rotation_complete` and a stalest age, which the lightweight record never does, and
+    /// a lightweight publication after the cycle is shown to change both.
+    #[tokio::test]
+    async fn a_lock_winners_full_record_is_not_overwritten_by_the_lightweight_one() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let consolidator = consolidator_at(dir);
+        for xx in ["0a", "1b"] {
+            std::fs::create_dir_all(dir.join("metadata").join("test-bucket").join(xx)).unwrap();
+        }
+        for _ in 0..8 {
+            if crate::ledger_repair::repair_rotation_complete(dir) {
+                break;
+            }
+            crate::ledger_repair::run_ledger_repair(
+                dir,
+                &consolidator.write_ledger,
+                consolidator.write_ledger.instance_id(),
+            )
+            .await;
+        }
+        assert!(
+            crate::ledger_repair::repair_rotation_complete(dir),
+            "fixture: every seeded shard must have a completed repair sweep"
+        );
+        // A pending delta makes the cycle non-idle without a journal to parse.
+        consolidator.size_accumulator().add(4096);
+        assert!(!consolidator.cycle_would_be_idle(), "fixture: non-idle");
+
+        consolidator.run_consolidation_cycle().await.unwrap();
+        // The cycle's guard has dropped its lock file by now, but the flock lives on the open file
+        // description, not the descriptor: a sibling test spawning a child process (`dead_pid`)
+        // forks this process while the cycle holds the file, and the child keeps a copy of the
+        // descriptor, so the flock stays held until that child's exec closes it. Wait for the
+        // release (bounded) instead of reading the lock once.
+        let mut released = false;
+        for _ in 0..500 {
+            if consolidator
+                .try_acquire_global_consolidation_lock()
+                .unwrap()
+            {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(released, "fixture: the cycle released the lock it won");
+        consolidator.release_global_consolidation_lock();
+        let me = consolidator.write_ledger.instance_id().to_string();
+        let mine = |dir: &std::path::Path| {
+            crate::staged_authority::read_ready_records(dir)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.instance_id == me)
+                .expect("this instance's record")
+        };
+        let after_cycle = mine(dir);
+        assert!(
+            after_cycle.repair_rotation_complete && after_cycle.repair_stalest_age_secs.is_some(),
+            "the lock winner's full record must be the one left after the cycle: {after_cycle:?}"
+        );
+
+        consolidator.publish_lightweight_ready_record().await;
+        let lightweight = mine(dir);
+        assert!(
+            !lightweight.repair_rotation_complete && lightweight.repair_stalest_age_secs.is_none(),
+            "fixture: the lightweight record is distinguishable from the full one: {lightweight:?}"
+        );
+    }
+}
+
+/// The dead-instance reaper removes a retired id's header-only shard
+/// ledger files, expired reservations and lapsed scanner documents, and nothing a reader needs.
+#[cfg(test)]
+mod dead_instance_state_reap_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const MY_HOST: &str = "scnn-host.us-west-2.compute.internal";
+    const OTHER_HOST: &str = "scnn-peer.us-west-2.compute.internal";
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "pid {pid} must not run"
+        );
+        pid
+    }
+
+    fn hosts() -> Vec<String> {
+        vec![MY_HOST.to_string()]
+    }
+
+    fn reap(dir: &Path) -> DeadInstanceStateCounts {
+        reap_dead_instance_state(
+            dir,
+            &hosts(),
+            std::process::id(),
+            DEAD_INSTANCE_TEMP_GRACE,
+            FOREIGN_PENDING_REAP_GRACE,
+            SystemTime::now(),
+        )
+    }
+
+    fn write_aged(path: &Path, body: &[u8], age: Duration) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        filetime::set_file_mtime(
+            path,
+            filetime::FileTime::from_system_time(SystemTime::now() - age),
+        )
+        .unwrap();
+    }
+
+    fn shard_file(dir: &Path, l1: &str, instance: &str) -> PathBuf {
+        dir.join("metadata/_write_ledger/bkt")
+            .join(l1)
+            .join(format!("{instance}.ledger"))
+    }
+
+    const HEADER: &[u8] = b"{\"schema\":3,\"max_seq_ever\":7}\n";
+    const EIGHT_DAYS: Duration = Duration::from_secs(8 * 86_400);
+
+    /// Red side: `STATE_REAPER_SKIPS_LEDGER`; the retired id's file stays.
+    #[test]
+    fn a_retired_id_s_header_only_shard_ledger_file_is_reaped_and_nothing_else() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let dead = format!("{MY_HOST}:{}", dead_pid());
+        let dead_with_credit = format!("{MY_HOST}:{}", dead_pid());
+        let live = format!("{MY_HOST}:{}", std::process::id());
+        let foreign = format!("{OTHER_HOST}:42");
+
+        let reaped = shard_file(dir, "00", &dead);
+        write_aged(&reaped, HEADER, EIGHT_DAYS);
+        write_aged(
+            &reaped.with_file_name(format!("{dead}.ledger.lock")),
+            b"",
+            EIGHT_DAYS,
+        );
+        let mark = dir.join(format!("metadata/_write_ledger/{dead}.ledger.mark"));
+        write_aged(&mark, HEADER, EIGHT_DAYS);
+        // Kept: a line that is not the header.
+        let not_header_only = shard_file(dir, "01", &dead);
+        let mut body = HEADER.to_vec();
+        body.extend_from_slice(b"{\"not\":\"an entry\"}\n");
+        write_aged(&not_header_only, &body, EIGHT_DAYS);
+        // Kept: quiet for less than the activation gate's bound.
+        let recent = shard_file(dir, "02", &dead);
+        write_aged(&recent, HEADER, Duration::from_secs(3_600));
+        // Kept: the id still has a pending credit for a cut to decide.
+        let credited = shard_file(dir, "00", &dead_with_credit);
+        write_aged(&credited, HEADER, EIGHT_DAYS);
+        write_aged(
+            &dir.join(format!(
+                "metadata/_shard_state/staged_pending/{dead_with_credit}.pending"
+            )),
+            b"{\"seq\":3}\n",
+            EIGHT_DAYS,
+        );
+        // Kept: this process's own id, and another host's id quiet for one hour.
+        let own = shard_file(dir, "00", &live);
+        write_aged(&own, HEADER, EIGHT_DAYS);
+        let peer = shard_file(dir, "03", &foreign);
+        write_aged(&peer, HEADER, Duration::from_secs(3_600));
+
+        let counts = reap(dir);
+
+        assert!(
+            !reaped.exists(),
+            "a retired id's header-only shard ledger file must be reaped"
+        );
+        assert!(
+            !reaped
+                .with_file_name(format!("{dead}.ledger.lock"))
+                .exists(),
+            "with its lock file"
+        );
+        assert_eq!(counts.ledger_files, 1, "{counts:?}");
+        assert!(mark.exists(), "the sequence mark is never reaped");
+        for kept in [&not_header_only, &recent, &credited, &own, &peer] {
+            assert!(kept.exists(), "{kept:?} must be kept");
+        }
+    }
+
+    /// Red side: `STATE_REAPER_SKIPS_RESERVATIONS`; the expired document stays.
+    #[test]
+    fn a_retired_id_s_expired_reservation_is_reaped_and_a_live_one_is_kept() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let resv_dir = crate::capacity_guard::reservations_dir(dir);
+        std::fs::create_dir_all(&resv_dir).unwrap();
+        let doc = |instance: &str, updated_at: u64| {
+            format!(
+                "{{\"schema\":1,\"instance_id\":\"{instance}\",\"outstanding_bytes\":4096,\
+                 \"updated_at\":{updated_at},\"lease_secs\":120}}"
+            )
+        };
+        let expired = format!("{MY_HOST}:{}", dead_pid());
+        let live = format!("{MY_HOST}:{}", dead_pid());
+        let foreign = format!("{OTHER_HOST}:42");
+        let expired_path = resv_dir.join(format!("{expired}.resv"));
+        std::fs::write(&expired_path, doc(&expired, now - 3600)).unwrap();
+        let live_path = resv_dir.join(format!("{live}.resv"));
+        std::fs::write(&live_path, doc(&live, now)).unwrap();
+        let foreign_path = resv_dir.join(format!("{foreign}.resv"));
+        std::fs::write(&foreign_path, doc(&foreign, now - 3600)).unwrap();
+
+        let counts = reap(dir);
+
+        assert!(
+            !expired_path.exists(),
+            "a retired id's expired reservation must be reaped"
+        );
+        assert_eq!(counts.reservations, 1, "{counts:?}");
+        assert!(live_path.exists(), "a lease that still covers now is kept");
+        assert!(
+            foreign_path.exists(),
+            "another host's reservation lapsed an hour ago is inside the foreign grace"
+        );
+    }
+
+    /// Red side: `STATE_REAPER_SKIPS_SCANNERS`; the lapsed document stays.
+    #[test]
+    fn a_retired_id_s_lapsed_scanner_document_is_reaped_and_a_live_one_is_kept() {
+        let _flag_guard = crate::cache::hostname_flag_test_guard_blocking();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let scan_dir = crate::scanner_registry::scanners_dir(dir);
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        let dead = format!("{MY_HOST}:{}", dead_pid());
+        let doc = |kind: &str, published_at: u64| {
+            format!(
+                "{{\"schema\":1,\"instance_id\":\"{dead}\",\"kind\":\"{kind}\",\
+                 \"published_at\":{published_at},\"ended_at\":null,\"lease_secs\":600}}"
+            )
+        };
+        let lapsed = scan_dir.join(format!("{dead}.fold.scan"));
+        std::fs::write(&lapsed, doc("fold", now - 7200)).unwrap();
+        let live = scan_dir.join(format!("{dead}.repair.scan"));
+        std::fs::write(&live, doc("repair", now)).unwrap();
+
+        let counts = reap(dir);
+
+        assert!(
+            !lapsed.exists(),
+            "a retired id's lapsed scanner document must be reaped"
+        );
+        assert_eq!(counts.scanner_docs, 1, "{counts:?}");
+        assert!(live.exists(), "a document inside its lease is kept");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod explicit_unlock_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use tempfile::TempDir;
+
+    /// A child that holds a copy of `file`'s open file description (as its stdin) until killed.
+    /// That is what a fork leaves behind: the flock lives as long as any copy does.
+    pub(crate) fn child_holding(file: &std::fs::File) -> std::process::Child {
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::from(file.try_clone().unwrap()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("fixture: spawn the holder child")
+    }
+
+    pub(crate) fn peer_can_lock(path: &Path) -> bool {
+        let peer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let got = fs4::FileExt::try_lock(&peer).is_ok();
+        let _ = fs4::FileExt::unlock(&peer);
+        got
+    }
+
+    #[test]
+    fn release_consolidation_lock_frees_the_flock_while_a_child_holds_the_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = JournalConsolidator::new(
+            tmp.path().to_path_buf(),
+            Arc::new(JournalManager::new(
+                tmp.path().to_path_buf(),
+                "unlock-test".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                tmp.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        );
+        assert!(consolidator
+            .try_acquire_global_consolidation_lock()
+            .unwrap());
+        let lock_path = tmp.path().join("locks").join("global_consolidation.lock");
+        let mut child = {
+            let guard = consolidator.consolidation_lock_file.lock().unwrap();
+            child_holding(guard.as_ref().expect("fixture: lock held"))
+        };
+        assert!(
+            !peer_can_lock(&lock_path),
+            "fixture: the lock must be held before the release"
+        );
+        consolidator.release_global_consolidation_lock();
+        let freed = peer_can_lock(&lock_path);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            freed,
+            "the release must unlock the flock itself; a forked child's copy of the descriptor \
+             otherwise keeps it held"
+        );
+    }
+
+    #[test]
+    fn a_journal_lock_guard_frees_the_flock_while_a_child_holds_the_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("scno.journal.lock");
+        let held = UnlockOnDrop(
+            crate::journal_manager::lock_journal_lock_file(&lock_path, false)
+                .unwrap()
+                .expect("fixture: take the journal lock"),
+        );
+        let mut child = child_holding(&held);
+        assert!(!peer_can_lock(&lock_path), "fixture: lock must be held");
+        drop(held);
+        let freed = peer_can_lock(&lock_path);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            freed,
+            "dropping the guard must unlock despite the child's copy"
+        );
+    }
+    /// `SizeStateLock` frees `size_state.lock` on drop while a child holds the descriptor.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the `unlock_lock_file(&self._file, "size_state.lock")` call in `Drop for
+    /// SizeStateLock` removed, the final assertion fails.
+    #[test]
+    fn a_size_state_lock_frees_the_flock_while_a_child_holds_the_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("size_state.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::lock(&file).unwrap();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = SizeStateLock {
+            _file: file,
+            _gate: gate
+                .clone()
+                .try_lock_owned()
+                .expect("fixture: take the gate"),
+        };
+        let mut child = child_holding(&held._file);
+        assert!(!peer_can_lock(&lock_path), "fixture: lock must be held");
+        drop(held);
+        let freed = peer_can_lock(&lock_path);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            freed,
+            "dropping a SizeStateLock must unlock despite the child's copy of the descriptor"
+        );
+    }
+    /// A watchdog takeover frees the consolidation flock while a child holds the
+    /// descriptor, so a peer's `try_lock` succeeds at once.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the `unlock_lock_file(&file, "global consolidation lock")` call in
+    /// `take_over_stale_lock` removed, the final assertion fails.
+    #[test]
+    fn a_takeover_frees_the_flock_while_a_child_holds_the_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let consolidator = JournalConsolidator::new(
+            tmp.path().to_path_buf(),
+            Arc::new(JournalManager::new(
+                tmp.path().to_path_buf(),
+                "takeover-test".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                tmp.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        );
+        assert!(consolidator
+            .try_acquire_global_consolidation_lock()
+            .unwrap());
+        let lock_path = tmp.path().join("locks").join("global_consolidation.lock");
+        let mut child = {
+            let guard = consolidator.consolidation_lock_file.lock().unwrap();
+            child_holding(guard.as_ref().expect("fixture: lock held"))
+        };
+        assert!(
+            !peer_can_lock(&lock_path),
+            "fixture: the lock must be held before the takeover"
+        );
+        assert!(
+            consolidator.take_over_stale_lock(Duration::ZERO),
+            "fixture: the takeover must fire"
+        );
+        let freed = peer_can_lock(&lock_path);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            freed,
+            "a takeover must unlock the flock itself; a forked child's copy of the descriptor \
+             otherwise keeps it held"
         );
     }
 }

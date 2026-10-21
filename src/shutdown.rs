@@ -73,7 +73,10 @@ impl ShutdownCoordinator {
     /// This allows tests to verify that all expected background tasks have
     /// subscribed to the shutdown signal. The count reflects the number of
     /// active `broadcast::Receiver` instances created via `subscribe()`.
-    pub fn subscriber_count(&self) -> usize {
+    /// Test seam: the `background_recovery` and `shutdown` unit tests use it to
+    /// prove background tasks subscribe; nothing outside `#[cfg(test)]` reads it.
+    #[cfg(test)]
+    pub(crate) fn subscriber_count(&self) -> usize {
         self.shutdown_sender.receiver_count()
     }
 
@@ -105,7 +108,7 @@ impl ShutdownCoordinator {
     }
 
     /// Initiate graceful shutdown sequence
-    pub async fn initiate_shutdown(&self) -> Result<()> {
+    pub(crate) async fn initiate_shutdown(&self) -> Result<()> {
         info!("Initiating graceful shutdown sequence");
 
         // Send shutdown signal to all components
@@ -308,92 +311,26 @@ impl ShutdownCoordinator {
 
         Ok(())
     }
-
-    /// Force shutdown (used when graceful shutdown fails)
-    pub async fn force_shutdown(&self) -> Result<()> {
-        warn!("Performing force shutdown");
-
-        // Hyper manages actual TCP connections; nothing to force-close here.
-        if self.connection_pool.is_some() {
-            info!("Connection pool manager force shutdown (hyper manages TCP connections)");
-        }
-
-        // Force release cache locks
-        if let Some(cache_manager) = &self.cache_manager {
-            if let Err(e) = cache_manager.force_release_all_locks().await {
-                error!("Error during force cache lock release: {}", e);
-            }
-        }
-
-        warn!("Force shutdown completed");
-        Ok(())
-    }
-}
-
-/// Shutdown-aware component trait
-pub trait ShutdownAware {
-    /// Handle shutdown signal gracefully
-    fn handle_shutdown(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
-
-    /// Check if shutdown has been requested
-    fn is_shutdown_requested(&self) -> bool;
 }
 
 /// Shutdown signal wrapper for components
 pub struct ShutdownSignal {
     receiver: broadcast::Receiver<()>,
-    shutdown_requested: bool,
 }
 
 impl ShutdownSignal {
     /// Create new shutdown signal from receiver
     pub fn new(receiver: broadcast::Receiver<()>) -> Self {
-        Self {
-            receiver,
-            shutdown_requested: false,
-        }
+        Self { receiver }
     }
 
-    /// Check if shutdown has been requested (non-blocking)
-    pub fn is_shutdown_requested(&self) -> bool {
-        self.shutdown_requested
-    }
-
-    /// Wait for shutdown signal
+    /// Wait for shutdown signal.
+    ///
+    /// A received signal, a closed channel (the coordinator was dropped) and a
+    /// lagged receiver all mean shutdown was requested, so every outcome returns.
     pub async fn wait_for_shutdown(&mut self) -> Result<()> {
-        match self.receiver.recv().await {
-            Ok(()) => {
-                self.shutdown_requested = true;
-                Ok(())
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                self.shutdown_requested = true;
-                Ok(())
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                self.shutdown_requested = true;
-                Ok(())
-            }
-        }
-    }
-
-    /// Try to receive shutdown signal without blocking
-    pub fn try_recv_shutdown(&mut self) -> bool {
-        match self.receiver.try_recv() {
-            Ok(()) => {
-                self.shutdown_requested = true;
-                true
-            }
-            Err(broadcast::error::TryRecvError::Empty) => false,
-            Err(broadcast::error::TryRecvError::Closed) => {
-                self.shutdown_requested = true;
-                true
-            }
-            Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                self.shutdown_requested = true;
-                true
-            }
-        }
+        let _ = self.receiver.recv().await;
+        Ok(())
     }
 }
 
@@ -438,54 +375,28 @@ mod tests {
     async fn test_initiate_shutdown_broadcasts_to_subscriber() {
         let coordinator = ShutdownCoordinator::new(Duration::from_secs(5));
         let mut signal = ShutdownSignal::new(coordinator.subscribe());
-        assert!(!signal.is_shutdown_requested());
 
         coordinator.initiate_shutdown().await.unwrap();
 
-        // The broadcast should have delivered the shutdown signal.
-        assert!(signal.try_recv_shutdown());
-        assert!(signal.is_shutdown_requested());
+        // The broadcast should have delivered the shutdown signal; the coordinator
+        // is still alive, so only a delivered signal (not a closed channel) can
+        // unblock the waiter here.
+        timeout(Duration::from_secs(1), signal.wait_for_shutdown())
+            .await
+            .expect("shutdown signal was not delivered")
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn test_force_shutdown_with_no_components_succeeds() {
-        let coordinator = ShutdownCoordinator::new(Duration::from_secs(5));
-        assert!(coordinator.force_shutdown().await.is_ok());
-    }
-
-    #[test]
-    fn test_shutdown_signal_initial_state() {
-        let coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
-        let signal = ShutdownSignal::new(coordinator.subscribe());
-        assert!(!signal.is_shutdown_requested());
-    }
-
-    #[test]
-    fn test_shutdown_signal_try_recv_empty_returns_false() {
+    async fn test_shutdown_signal_waits_until_signalled() {
         let coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
         let mut signal = ShutdownSignal::new(coordinator.subscribe());
-        // No signal sent yet.
-        assert!(!signal.try_recv_shutdown());
-        assert!(!signal.is_shutdown_requested());
-    }
-
-    #[test]
-    fn test_shutdown_signal_try_recv_after_send_returns_true() {
-        let coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
-        let mut signal = ShutdownSignal::new(coordinator.subscribe());
-        coordinator.shutdown_sender.send(()).unwrap();
-        assert!(signal.try_recv_shutdown());
-        assert!(signal.is_shutdown_requested());
-    }
-
-    #[test]
-    fn test_shutdown_signal_try_recv_after_sender_dropped_returns_true() {
-        let coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
-        let mut signal = ShutdownSignal::new(coordinator.subscribe());
-        drop(coordinator);
-        // Closed channel is treated as a shutdown request.
-        assert!(signal.try_recv_shutdown());
-        assert!(signal.is_shutdown_requested());
+        // No signal sent and the coordinator is alive: the waiter must not return.
+        assert!(
+            timeout(Duration::from_millis(50), signal.wait_for_shutdown())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -494,7 +405,6 @@ mod tests {
         let mut signal = ShutdownSignal::new(coordinator.subscribe());
         coordinator.shutdown_sender.send(()).unwrap();
         signal.wait_for_shutdown().await.unwrap();
-        assert!(signal.is_shutdown_requested());
     }
 
     #[tokio::test]
@@ -503,7 +413,9 @@ mod tests {
         let mut signal = ShutdownSignal::new(coordinator.subscribe());
         drop(coordinator);
         // A closed channel must unblock the waiter rather than hang.
-        signal.wait_for_shutdown().await.unwrap();
-        assert!(signal.is_shutdown_requested());
+        timeout(Duration::from_secs(1), signal.wait_for_shutdown())
+            .await
+            .expect("closed channel did not unblock the waiter")
+            .unwrap();
     }
 }

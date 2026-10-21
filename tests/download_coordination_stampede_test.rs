@@ -1,6 +1,6 @@
 //! 100-Concurrent-Client Live Stampede Test
 //!
-//! Spec: `.kiro/specs/download-coordination-ttl-correctness/`
+//! Spec: the download coordination ttl correctness feature
 //! Task: 12.1
 //!
 //! This is the user's explicit headline validation test — 100 concurrent clients
@@ -270,7 +270,7 @@ async fn make_stampede_cache(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         false, // compression disabled for integration tests
         config.cache.get_ttl,

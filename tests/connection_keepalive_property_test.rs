@@ -7,25 +7,6 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 // Mock structures for testing
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct ConnectionEvent {
-    connection_id: String,
-    ip: IpAddr,
-    endpoint: String,
-    event_type: EventType,
-    timestamp: SystemTime,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-enum EventType {
-    Created,
-    Reused,
-    IdleTimeout,
-    MaxLifetime,
-    Error,
-}
 
 #[derive(Debug, Clone)]
 struct ConnectionPool {

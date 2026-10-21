@@ -1,6 +1,6 @@
 //! Property-based tests for download coordination correctness on FIXED code.
 //!
-//! Spec: `.kiro/specs/download-coordination-ttl-correctness/`
+//! Spec: the download coordination ttl correctness feature
 //! Task: 10
 //!
 //! These tests verify the correctness properties of the fixed download
@@ -102,7 +102,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,

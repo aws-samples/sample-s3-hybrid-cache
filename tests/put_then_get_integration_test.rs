@@ -21,7 +21,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         false, // RAM cache disabled for these tests
         0,
         1024 * 1024 * 1024, // 1GB max cache size
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600), // GET_TTL: 1 hour

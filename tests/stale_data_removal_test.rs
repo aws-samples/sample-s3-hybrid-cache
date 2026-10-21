@@ -46,6 +46,8 @@ fn create_test_metadata(cache_key: &str, range_count: usize) -> NewCacheMetadata
             last_accessed: now,
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         });
     }
 

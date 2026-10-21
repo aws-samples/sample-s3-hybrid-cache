@@ -19,7 +19,7 @@ async fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheMa
         cache_dir,
         false, // RAM cache disabled for simplicity
         0,
-        s3_proxy::cache::CacheEvictionAlgorithm::LRU,
+        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
         1024,
         true,
         Duration::from_secs(3600),

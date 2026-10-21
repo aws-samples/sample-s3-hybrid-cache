@@ -1,15 +1,17 @@
 //! Demonstration: `invalidate_all_ranges` does not clear the RAM range tier.
 //!
 //! This is the red test for the finding recorded in
-//! `.kiro/specs/page-widening-freshness/` § "The actual defect", item 2.
+//! the page widening freshness feature.
 //!
 //! **What it proves.** `range_handler.rs`'s ETag-mismatch arm responds to a changed
 //! object by calling `DiskCacheManager::invalidate_all_ranges` (`range_handler.rs:696`).
 //! That method removes the `.bin` range files and the `.meta`, but it lives on
 //! `DiskCacheManager` and has no handle on the RAM range cache, which lives on
-//! `CacheManager`. The only three functions that clear RAM ranges —
-//! `invalidate_cache_hierarchy`, `force_invalidate_cache`, `invalidate_write_cache_entry`
-//! — are all on `CacheManager` and none is reachable from that arm.
+//! `CacheManager`. The functions that clear RAM ranges —
+//! `invalidate_cache_hierarchy` and `invalidate_write_cache_entry` — are both on
+//! `CacheManager` and neither is reachable from that arm. (A third, `force_invalidate_cache`,
+//! has been deleted: it wrapped those two plus a release of the retired `locks/{key}.lock`
+//! sentinel, and had no caller outside `tests/`.)
 //!
 //! So after the proxy has detected a version change and invalidated the disk copy, a
 //! stale RAM range entry for the old version remains readable. `ShardedRamCache::get`
@@ -114,7 +116,7 @@ async fn make_infra() -> (
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,
@@ -167,8 +169,10 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
     let len = body.len() as u64;
 
     // --- Seed version A on disk (the ordinary warm state) -------------------
-    range_handler
-        .store_range_new_storage(
+    disk_cache_manager
+        .write()
+        .await
+        .store_range(
             KEY,
             RANGE_START,
             RANGE_END,
@@ -188,6 +192,7 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
         s3_proxy::compression::CompressionAlgorithm::None,
         ETAG_A.to_string(),
         String::new(),
+        1u64 << 40,
     );
     assert!(
         promoted,
@@ -196,7 +201,12 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
     );
 
     // --- Precondition: both tiers hold version A --------------------------
-    let ram_before = cache_manager.get_range_from_ram_cache(KEY, RANGE_START, RANGE_END);
+    let ram_before = cache_manager.get_range_from_ram_cache(
+        KEY,
+        RANGE_START,
+        RANGE_END,
+        std::time::Duration::from_secs(3600),
+    );
     assert_eq!(
         ram_before.as_deref(),
         Some(body.as_slice()),
@@ -234,6 +244,8 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
             last_accessed: std::time::SystemTime::now(),
             access_count: 0,
             staged: None,
+            unservable: false,
+            file_identity: None,
         }],
         ..Default::default()
     };
@@ -329,7 +341,12 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
     // the ETag-mismatch arm through `CacheManager::invalidate_cache_hierarchy`
     // (which already calls `remove_from_ram_cache_unified`) instead of calling
     // `DiskCacheManager::invalidate_all_ranges` directly.
-    let ram_after = cache_manager.get_range_from_ram_cache(KEY, RANGE_START, RANGE_END);
+    let ram_after = cache_manager.get_range_from_ram_cache(
+        KEY,
+        RANGE_START,
+        RANGE_END,
+        std::time::Duration::from_secs(3600),
+    );
     assert!(
         ram_after.is_none(),
         "DEFECT: the ETag-mismatch arm fired and every disk trace of version A is \

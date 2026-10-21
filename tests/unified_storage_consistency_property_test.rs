@@ -17,16 +17,16 @@ use walkdir::WalkDir;
 fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
     CacheManager::new_with_shared_storage(
         temp_dir.path().to_path_buf(),
-        false,                       // ram_cache_enabled
-        0,                           // max_ram_cache_size
-        1024 * 1024 * 1024,          // max_cache_size (1GB)
-        CacheEvictionAlgorithm::LRU, // eviction_algorithm
-        1024,                        // compression_threshold
-        true,                        // compression_enabled
-        Duration::from_secs(3600),   // get_ttl
-        Duration::from_secs(60),     // head_ttl
-        Duration::from_secs(86400),  // put_ttl (1 day)
-        false,                       // actively_remove_cached_data
+        false,                           // ram_cache_enabled
+        0,                               // max_ram_cache_size
+        1024 * 1024 * 1024,              // max_cache_size (1GB)
+        CacheEvictionAlgorithm::TinyLFU, // eviction_algorithm
+        1024,                            // compression_threshold
+        true,                            // compression_enabled
+        Duration::from_secs(3600),       // get_ttl
+        Duration::from_secs(60),         // head_ttl
+        Duration::from_secs(86400),      // put_ttl (1 day)
+        false,                           // actively_remove_cached_data
         SharedStorageConfig::default(),
         0.5,                       // write_cache_percent
         true,                      // write_cache_enabled - RE-ENABLED

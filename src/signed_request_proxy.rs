@@ -4,8 +4,6 @@
 //! HTTP request exactly as received, only changing the destination IP address.
 //! This prevents signature validation failures that occur when headers are modified.
 
-use crate::cache_types::ObjectMetadata;
-
 use crate::{ProxyError, Result};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -15,13 +13,39 @@ use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
+
+/// Process-wide cache-tee backpressure counters for the signed-PUT/UploadPart
+/// streaming path — the PUT-side analogue of `tee_stream::BACKPRESSURE_EVENTS_TOTAL`.
+/// Incremented directly at the point backpressure occurs, mirroring
+/// `crate::metrics::LAST_OVER_BOUND_WARN_SECS`'s process-wide-atomic pattern.
+///
+/// A non-zero value means the cache writer, not the upstream, was the
+/// bottleneck for at least one streamed PUT/UploadPart request.
+///
+/// Spec: cache-eviction-at-scale Requirement 18.4
+static TEE_BACKPRESSURE_EVENTS_TOTAL_PUT: AtomicU64 = AtomicU64::new(0);
+static TEE_BACKPRESSURE_WAIT_MS_TOTAL_PUT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of cache-tee backpressure events across all streamed
+/// PUT/UploadPart requests since process start.
+pub fn tee_backpressure_events_total_put() -> u64 {
+    TEE_BACKPRESSURE_EVENTS_TOTAL_PUT.load(Ordering::Relaxed)
+}
+
+/// Cumulative milliseconds spent applying cache-tee backpressure across all
+/// streamed PUT/UploadPart requests since process start.
+pub fn tee_backpressure_wait_ms_total_put() -> u64 {
+    TEE_BACKPRESSURE_WAIT_MS_TOTAL_PUT.load(Ordering::Relaxed)
+}
 
 /// Maximum body accepted by S3 for a single-part PUT or UploadPart.
 ///
@@ -71,7 +95,7 @@ pub struct UpstreamTransport {
 impl UpstreamTransport {
     /// The verified-TLS-on-443 default transport (Secure_Default_Behaviour). A
     /// handshake failure here stays a generic (retryable) error, exactly as before.
-    pub fn verified_tls_443(ip: IpAddr, tls_connector: Arc<TlsConnector>) -> Self {
+    pub(crate) fn verified_tls_443(ip: IpAddr, tls_connector: Arc<TlsConnector>) -> Self {
         Self {
             ip,
             port: 443,
@@ -140,7 +164,7 @@ impl AsyncWrite for UpstreamStream {
 /// the plaintext mode performs a plain TCP connect with the same retry/backoff
 /// policy. `hostname` is the SNI/Host name (used only for the TLS handshake and
 /// log lines); the connect target is `transport.ip:transport.port`.
-pub async fn connect_upstream_with_retry(
+pub(crate) async fn connect_upstream_with_retry(
     transport: &UpstreamTransport,
     hostname: &str,
     max_retries: usize,
@@ -259,7 +283,7 @@ async fn connect_tcp_with_retry(
 ///
 /// This prevents a random string containing the substring "AWS4-HMAC-SHA256"
 /// from being misclassified as a SigV4-signed request.
-pub fn is_sigv4_algorithm(auth: &str) -> bool {
+pub(crate) fn is_sigv4_algorithm(auth: &str) -> bool {
     let has_algorithm_prefix =
         auth.starts_with("AWS4-HMAC-SHA256 ") || auth.starts_with("AWS4-ECDSA-P256-SHA256 ");
 
@@ -267,6 +291,108 @@ pub fn is_sigv4_algorithm(auth: &str) -> bool {
         && auth.contains("Credential=")
         && auth.contains("SignedHeaders=")
         && auth.contains("Signature=")
+}
+
+/// Per-process `Via` token, random at process start so instances differ and a restart rotates it.
+static VIA_TOKEN: OnceLock<String> = OnceLock::new();
+
+/// The `Via` received-by pseudonym this process appends to forwarded requests
+/// (`s3-proxy-` plus 16 random hex digits). A request that comes back carrying it has
+/// passed through this process already.
+pub fn via_pseudonym() -> &'static str {
+    static PSEUDONYM: OnceLock<String> = OnceLock::new();
+    PSEUDONYM.get_or_init(|| {
+        let token =
+            VIA_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string()[..16].to_string());
+        format!("s3-proxy-{}", token)
+    })
+}
+
+/// True when any entry of a `Via` header value names `pseudonym` as its received-by.
+///
+/// Compares the whole received-by token, never a prefix, so `s3-proxy-ab` does not
+/// match `s3-proxy-abc`. Entries are `<protocol> <received-by> [comment]`, comma separated.
+pub(crate) fn via_names_pseudonym(value: &str, pseudonym: &str) -> bool {
+    value.split(',').any(|entry| {
+        let mut parts = entry.split_whitespace();
+        let _protocol = parts.next();
+        parts.next() == Some(pseudonym)
+    })
+}
+
+/// True when any inbound `Via` header line names this process. Checked at ingress.
+pub(crate) fn via_loop_detected(headers: &hyper::HeaderMap) -> bool {
+    let pseudonym = via_pseudonym();
+    headers
+        .get_all(hyper::header::VIA)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| via_names_pseudonym(v, pseudonym))
+}
+
+/// True when `name` is listed in the SigV4 `SignedHeaders` of an Authorization value.
+pub(crate) fn auth_signs_header(auth: &str, name: &str) -> bool {
+    if !is_sigv4_algorithm(auth) {
+        return false;
+    }
+    match auth.find("SignedHeaders=") {
+        Some(pos) => {
+            let after_param = &auth[pos + 14..];
+            let end = after_param
+                .find(',')
+                .or_else(|| after_param.find(' '))
+                .unwrap_or(after_param.len());
+            after_param[..end].split(';').any(|h| h == name)
+        }
+        None => false,
+    }
+}
+
+/// The `Via` value to send: any inbound value kept intact, this process appended last
+/// (RFC 9110 section 7.6.3).
+pub(crate) fn append_via(existing: Option<&str>) -> String {
+    let ours = format!("1.1 {}", via_pseudonym());
+    match existing {
+        Some(prev) if !prev.trim().is_empty() => format!("{}, {}", prev.trim(), ours),
+        _ => ours,
+    }
+}
+
+/// Append this process to the request's `Via` header, unless `via` is in the request's
+/// SigV4 `SignedHeaders` (a signed header is never modified).
+///
+/// Idempotent: a value that already names this process is left as it is, so a header set
+/// that passes through more than one egress helper gets one entry.
+pub(crate) fn maybe_add_via(headers: &mut HashMap<String, String>, auth: Option<&str>) {
+    if auth.is_some_and(|a| auth_signs_header(a, "via")) {
+        return;
+    }
+    let existing_key = headers
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case("via"))
+        .cloned();
+    if let Some(v) = existing_key.as_ref().and_then(|k| headers.get(k)) {
+        if via_names_pseudonym(v, via_pseudonym()) {
+            return;
+        }
+    }
+    let existing = existing_key.as_ref().and_then(|k| headers.remove(k));
+    headers.insert("Via".to_string(), append_via(existing.as_deref()));
+}
+
+/// Add this process's `Via` to the headers of an upstream request, for every egress
+/// that builds an `S3RequestContext`. `uri` is the client request target, so a `via`
+/// listed in a presigned URL's `X-Amz-SignedHeaders` is left alone as well as one
+/// listed in the `Authorization` header.
+pub(crate) fn add_via_for_egress(headers: &mut HashMap<String, String>, uri: &hyper::Uri) {
+    if is_header_signed_in_query(request_target(uri), "via") {
+        return;
+    }
+    let auth = headers
+        .get("authorization")
+        .or_else(|| headers.get("Authorization"))
+        .cloned();
+    maybe_add_via(headers, auth.as_deref());
 }
 
 /// Check if a request is signed with AWS Signature Version 4 (or SigV4A)
@@ -278,11 +404,12 @@ pub fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if the Range header is included in AWS SigV4 SignedHeaders
+/// Check if the Range header is included in the request's SigV4 signed headers
 ///
-/// This function parses the Authorization header to determine if the Range
-/// header was included in the signature calculation. If so, modifying the
-/// Range header would invalidate the signature.
+/// Reads both places a client records what it signed: the `Authorization`
+/// header's `SignedHeaders=` and a presigned URL's `X-Amz-SignedHeaders` query
+/// parameter. If either lists `range`, modifying the Range header would
+/// invalidate the signature.
 ///
 /// Accepts both SigV4 (`AWS4-HMAC-SHA256`) and SigV4A
 /// (`AWS4-ECDSA-P256-SHA256`); the `SignedHeaders=...` portion has identical
@@ -290,6 +417,8 @@ pub fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
 ///
 /// # Arguments
 /// * `headers` - Request headers including Authorization
+/// * `uri` - The client's request target (path and query), as the client sent
+///   it; see [`request_target`]
 ///
 /// # Returns
 /// * `true` if Range is in SignedHeaders, `false` otherwise
@@ -306,8 +435,16 @@ pub fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
 /// - Requirement 1.3: Mark request as signed range request if SignedHeaders includes "range"
 /// - Requirement 1.4: Return false if SignedHeaders does not include "range"
 /// - Requirement 1.5: Return false for malformed or absent Authorization header
-pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
-    is_header_signed(headers, "range")
+pub fn is_range_signed(headers: &HashMap<String, String>, uri: &str) -> bool {
+    is_header_signed(headers, "range") || is_header_signed_in_query(uri, "range")
+}
+
+/// The request target (path and query) of `uri`, the form
+/// [`is_header_signed_in_query`] and [`is_range_signed`] read.
+pub(crate) fn request_target(uri: &hyper::Uri) -> &str {
+    uri.path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path())
 }
 
 /// Check whether a named header is included in AWS SigV4 `SignedHeaders`.
@@ -324,7 +461,7 @@ pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
 /// a non-SigV4-family signature — in those cases there is no signature for a
 /// rewrite to invalidate. Matching is exact per semicolon-separated entry, so
 /// `x-range` and `content-range` never match `range`.
-pub fn is_header_signed(headers: &HashMap<String, String>, header_name: &str) -> bool {
+pub(crate) fn is_header_signed(headers: &HashMap<String, String>, header_name: &str) -> bool {
     // Get Authorization header (case-insensitive)
     let auth = headers
         .get("authorization")
@@ -361,123 +498,46 @@ pub fn is_header_signed(headers: &HashMap<String, String>, header_name: &str) ->
     signed_headers.split(';').any(|h| h == header_name)
 }
 
-/// Extract metadata from S3 response and request headers
+/// Whether a presigned SigV4 URL's `X-Amz-SignedHeaders` query parameter lists
+/// `header_name`.
 ///
-/// This function extracts object metadata needed for caching from both the
-/// S3 response headers and the original request headers.
+/// The query-string counterpart of [`is_header_signed`]: a presigned URL carries
+/// its signed-header list in the query, not in an `Authorization` header, so a
+/// header-only check reports "unsigned" for every presigned request. The value is
+/// matched after decoding `%3B`/`%3b` to `;`, the encoding SDKs emit.
 ///
-/// # Arguments
-///
-/// * `response_headers` - Headers from the S3 response (source of ETag, Last-Modified, Content-Type)
-/// * `request_headers` - Headers from the original client request (retained for API compatibility)
-/// * `content_length` - Content length of the object
-///
-/// # Returns
-///
-/// Returns an `ObjectMetadata` struct with extracted metadata. Missing headers
-/// are handled gracefully by using empty strings or None values.
-///
-/// # Requirements
-///
-/// - Requirement 3.1: Extract ETag from response headers
-/// - Requirement 3.2: Extract Last-Modified from response headers
-/// - Requirement 3.3: Extract Content-Type from response headers (fallback: application/octet-stream)
-/// - Requirement 3.4: Store metadata alongside cached object
-/// - Requirement 3.5: Handle missing headers gracefully
-///
-/// # Examples
-///
-/// ```ignore
-/// let response_headers = HashMap::from([
-///     ("etag".to_string(), "\"abc123\"".to_string()),
-///     ("last-modified".to_string(), "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
-///     ("content-type".to_string(), "application/octet-stream".to_string()),
-/// ]);
-/// let request_headers = HashMap::new();
-/// let metadata = extract_metadata(&response_headers, &request_headers, 1024);
-/// ```
-pub fn extract_metadata(
-    response_headers: &HashMap<String, String>,
-    _request_headers: &HashMap<String, String>,
-    content_length: u64,
-) -> ObjectMetadata {
-    // Extract ETag from response headers (Requirement 3.1)
-    // Try both lowercase and capitalized versions for case-insensitive matching
-    let etag = response_headers
-        .get("etag")
-        .or_else(|| response_headers.get("ETag"))
-        .cloned()
-        .unwrap_or_else(|| {
-            debug!("ETag not found in response headers, using empty string");
-            String::new()
-        });
-
-    // Extract Last-Modified from response headers (Requirement 3.2)
-    // Try both lowercase and capitalized versions for case-insensitive matching
-    let last_modified = response_headers
-        .get("last-modified")
-        .or_else(|| response_headers.get("Last-Modified"))
-        .cloned()
-        .unwrap_or_else(|| {
-            debug!("Last-Modified not found in response headers, using empty string");
-            String::new()
-        });
-
-    // Extract Content-Type from response headers (Requirement 16 / 3.3)
-    // Use S3 response Content-Type to avoid cache poisoning from incorrect client request headers.
-    // Fallback to application/octet-stream if absent.
-    let content_type = response_headers
-        .get("content-type")
-        .or_else(|| response_headers.get("Content-Type"))
-        .cloned()
-        .or_else(|| {
-            debug!("Content-Type not found in S3 response headers, using application/octet-stream");
-            Some("application/octet-stream".to_string())
-        });
-
-    // Log extracted metadata
-    info!(
-        "Extracted metadata: etag={}, last_modified={}, content_type={:?}, content_length={}",
-        etag, last_modified, content_type, content_length
-    );
-
-    // Create ObjectMetadata with extracted values (Requirement 3.4, 3.5)
-    ObjectMetadata::new(etag, last_modified, content_length, content_type)
+/// `header_name` must be lowercase. Returns `false` when the URI has no such
+/// parameter.
+pub(crate) fn is_header_signed_in_query(uri: &str, header_name: &str) -> bool {
+    let query = match uri.split_once('?') {
+        Some((_, q)) => q,
+        None => return false,
+    };
+    query.split('&').any(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        name.eq_ignore_ascii_case("x-amz-signedheaders")
+            && value
+                .replace("%3B", ";")
+                .replace("%3b", ";")
+                .split(';')
+                .any(|h| h.eq_ignore_ascii_case(header_name))
+    })
 }
-/// Forward a signed request by preserving the original HTTP request exactly
+
+/// Whether the proxy may ADD `header_name` to a forwarded request without
+/// invalidating its signature.
 ///
-/// This function:
-/// 1. Reads the raw HTTP request from the client
-/// 2. Establishes a TLS connection to S3
-/// 3. Forwards the raw bytes without modification
-/// 4. Returns the raw response
-///
-/// Forward a signed request without modification to preserve the client's AWS SigV4
-/// signature, with a caller-supplied body size cap.
-///
-/// This preserves AWS SigV4 signatures which would otherwise fail if headers are
-/// modified. There is deliberately no config-free convenience wrapper. One existed
-/// previously with a private 128 MiB default that every Bypass_Arm silently
-/// inherited, so a bypassed `UploadPart` above 128 MiB (and within S3's
-/// 5 GiB UploadPart maximum) was rejected with 413 purely because it took this path instead of the streaming/caching path.
-/// Requiring every caller to pass `max_body_bytes` explicitly makes that class of bug
-/// impossible to reintroduce by omission. Requirements: IMA 6.1, 6.2, 6.3, 6.4
-pub async fn forward_signed_request_bounded(
-    req: Request<hyper::body::Incoming>,
-    target_host: &str,
-    transport: &UpstreamTransport,
-    proxy_referer: Option<&str>,
-    max_body_bytes: u64,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
-    forward_signed_request_bounded_with_ledger(
-        req,
-        target_host,
-        transport,
-        proxy_referer,
-        max_body_bytes,
-        &Arc::new(crate::inflight_ledger::InflightLedger::disabled()),
-    )
-    .await
+/// Adding a header SigV4 signs breaks the signature exactly as removing one does,
+/// because the server recomputes the canonical request from what arrives. A header
+/// that appears in neither the `Authorization` header's `SignedHeaders` nor a
+/// presigned URL's `X-Amz-SignedHeaders` is outside the signature, so adding it is
+/// safe; SigV2 never signs conditional headers.
+pub(crate) fn may_add_unsigned_header(
+    headers: &HashMap<String, String>,
+    uri: &str,
+    header_name: &str,
+) -> bool {
+    !is_header_signed(headers, header_name) && !is_header_signed_in_query(uri, header_name)
 }
 
 /// Buffer and forward a request whose caller must inspect or retain its full body.
@@ -487,7 +547,7 @@ pub async fn forward_signed_request_bounded(
 /// correct only when the caller needs a complete `Bytes` body. Callers that only
 /// forward must use [`forward_signed_request_streaming_verbatim`] so they do not
 /// materialize the request body or participate in the buffered-byte ledger.
-pub async fn forward_signed_request_bounded_with_ledger(
+pub(crate) async fn forward_signed_request_bounded_with_ledger(
     req: Request<hyper::body::Incoming>,
     target_host: &str,
     transport: &UpstreamTransport,
@@ -542,7 +602,7 @@ pub async fn forward_signed_request_bounded_with_ledger(
 /// neither materializes the body nor accepts a ledger parameter. Use it for
 /// forward-only callers; callers that need to inspect or retain the complete body
 /// must use the bounded forward instead.
-pub async fn forward_signed_request_streaming_verbatim(
+pub(crate) async fn forward_signed_request_streaming_verbatim(
     req: Request<hyper::body::Incoming>,
     target_host: &str,
     transport: &UpstreamTransport,
@@ -590,7 +650,7 @@ pub async fn forward_signed_request_streaming_verbatim(
 ///
 /// Returns the S3 response on success
 #[allow(clippy::too_many_arguments)]
-pub async fn forward_signed_request_with_body(
+pub(crate) async fn forward_signed_request_with_body(
     method: hyper::Method,
     uri: hyper::Uri,
     headers: hyper::HeaderMap,
@@ -695,7 +755,7 @@ fn header_block_advertises_chunked_transfer_encoding(header_block: &[u8]) -> boo
 /// received. For every other request shape (no `Transfer-Encoding: chunked`
 /// header on the outbound side) the frame is still written raw, unchanged from
 /// before this fix. See [`header_block_advertises_chunked_transfer_encoding`] for
-/// the exact condition and R1-R2 in `.kiro/specs/chunked-request-framing/` for
+/// the exact condition and R1-R2 in the chunked request framing feature for
 /// why this is required rather than optional: a raw write of a chunked body's
 /// already-unwrapped frames produces bytes S3 cannot parse as either valid
 /// HTTP chunking or a valid Content-Length body.
@@ -819,12 +879,30 @@ where
     header_block
         .extend_from_slice(format!("{} {} {:?}\r\n", method, path_and_query, version).as_bytes());
 
-    // Headers - preserve exactly as received
+    // Loop detection: append this process to `Via` unless the client signed `via`,
+    // in the Authorization header or in a presigned URL's `X-Amz-SignedHeaders`.
+    let via_signed = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| auth_signs_header(a, "via"))
+        || is_header_signed_in_query(path_and_query, "via");
+
+    // Headers - preserve exactly as received (a `Via` is merged below, unless signed)
+    let mut inbound_via: Vec<String> = Vec::new();
     for (name, value) in headers.iter() {
         if let Ok(value_str) = value.to_str() {
+            if !via_signed && name == hyper::header::VIA {
+                inbound_via.push(value_str.to_string());
+                continue;
+            }
             header_block
                 .extend_from_slice(format!("{}: {}\r\n", name.as_str(), value_str).as_bytes());
         }
+    }
+    if !via_signed {
+        let existing = (!inbound_via.is_empty()).then(|| inbound_via.join(", "));
+        header_block
+            .extend_from_slice(format!("via: {}\r\n", append_via(existing.as_deref())).as_bytes());
     }
 
     // Inject Referer header if conditions are met
@@ -1017,7 +1095,14 @@ where
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(frame)) => {
                         tee_full_waits += 1;
-                        if sender.send(frame).await.is_err() {
+                        TEE_BACKPRESSURE_EVENTS_TOTAL_PUT.fetch_add(1, Ordering::Relaxed);
+                        let backpressure_start = Instant::now();
+                        let send_result = sender.send(frame).await;
+                        TEE_BACKPRESSURE_WAIT_MS_TOTAL_PUT.fetch_add(
+                            backpressure_start.elapsed().as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
+                        if send_result.is_err() {
                             debug!(
                                 "Cache tee channel closed during backpressure, \
                                  continuing to forward without caching"
@@ -1136,7 +1221,7 @@ pub async fn read_request_body_bounded(
 /// # Requirements
 /// - Requirement 11.1, 11.2, 11.4 (Body_Size_Cap, unchanged from the original)
 /// - Requirement IMA 1.2, 1.3, 2.1, 2.5, 3.2, 3.3, 3.5, 4.1
-pub async fn read_request_body_bounded_with_ledger(
+pub(crate) async fn read_request_body_bounded_with_ledger(
     req: Request<hyper::body::Incoming>,
     max_bytes: u64,
     ledger: &Arc<crate::inflight_ledger::InflightLedger>,
@@ -1246,10 +1331,13 @@ async fn establish_tls(
     hostname: &str,
     tls_connector: &TlsConnector,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let hostname_owned = hostname.to_string();
-    let server_name = rustls::pki_types::ServerName::try_from(hostname_owned.as_str())
-        .map_err(|e| ProxyError::TlsError(format!("Invalid server name {}: {}", hostname, e)))?
-        .to_owned();
+    // A dotted bucket's virtual-hosted name is sent and checked as its S3
+    // endpoint; the Host header in the request bytes is unchanged.
+    let server_name = rustls::pki_types::ServerName::try_from(
+        crate::https_connector::upstream_certificate_name(hostname),
+    )
+    .map_err(|e| ProxyError::TlsError(format!("Invalid server name {}: {}", hostname, e)))?
+    .to_owned();
 
     debug!("Establishing TLS connection to {}", hostname);
 
@@ -1292,7 +1380,7 @@ async fn establish_tls(
 /// - Requirement 3.1: Log warnings with attempt number and error
 /// - Requirement 3.3: Log successful recovery after failures
 /// - Requirement 3.4: Include hostname and attempt number in logs
-pub async fn establish_tls_with_retry(
+pub(crate) async fn establish_tls_with_retry(
     target_ip: IpAddr,
     port: u16,
     hostname: &str,
@@ -1880,6 +1968,186 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    const AUTH_SIGNING_VIA: &str = "AWS4-HMAC-SHA256 Credential=AKID/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;via;x-amz-date, Signature=abcdef";
+    const AUTH_NOT_SIGNING_VIA: &str = "AWS4-HMAC-SHA256 Credential=AKID/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abcdef";
+
+    #[test]
+    fn via_match_is_exact_not_prefix() {
+        assert!(via_names_pseudonym("1.1 s3-proxy-abc", "s3-proxy-abc"));
+        // A shorter token that is a prefix of another instance's token is not a loop.
+        assert!(!via_names_pseudonym("1.1 s3-proxy-abc", "s3-proxy-ab"));
+        assert!(!via_names_pseudonym("1.1 s3-proxy-ab", "s3-proxy-abc"));
+    }
+
+    #[test]
+    fn via_match_finds_entry_in_list_with_comment() {
+        assert!(via_names_pseudonym(
+            "1.0 fred, 1.1 s3-proxy-abc (chained), 1.1 other",
+            "s3-proxy-abc"
+        ));
+        assert!(!via_names_pseudonym("1.0 fred, 1.1 other", "s3-proxy-abc"));
+    }
+
+    #[test]
+    fn loop_detected_only_for_this_process_token() {
+        let mut own = hyper::HeaderMap::new();
+        own.append("via", format!("1.1 {}", via_pseudonym()).parse().unwrap());
+        assert!(via_loop_detected(&own));
+
+        let mut foreign = hyper::HeaderMap::new();
+        foreign.append("via", "1.1 s3-proxy-0000000000000000".parse().unwrap());
+        assert!(!via_loop_detected(&foreign));
+
+        // Second header line is also inspected.
+        let mut second_line = hyper::HeaderMap::new();
+        second_line.append("via", "1.1 other".parse().unwrap());
+        second_line.append("via", format!("1.1 {}", via_pseudonym()).parse().unwrap());
+        assert!(via_loop_detected(&second_line));
+    }
+
+    #[test]
+    fn maybe_add_via_appends_and_preserves_foreign_entry() {
+        let mut headers = HashMap::new();
+        headers.insert("via".to_string(), "1.1 upstream-proxy".to_string());
+        maybe_add_via(&mut headers, Some(AUTH_NOT_SIGNING_VIA));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get("Via").unwrap(),
+            &format!("1.1 upstream-proxy, 1.1 {}", via_pseudonym())
+        );
+    }
+
+    #[test]
+    fn add_via_for_egress_is_idempotent_and_respects_presigned_via() {
+        let uri: hyper::Uri = "/b/k".parse().unwrap();
+        let mut headers = HashMap::new();
+        add_via_for_egress(&mut headers, &uri);
+        add_via_for_egress(&mut headers, &uri);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.get("Via").unwrap(), &append_via(None));
+
+        let presigned: hyper::Uri = "/b/k?X-Amz-SignedHeaders=host%3Bvia&X-Amz-Signature=s"
+            .parse()
+            .unwrap();
+        let mut signed = HashMap::new();
+        signed.insert("via".to_string(), "1.1 signed-value".to_string());
+        let before = signed.clone();
+        add_via_for_egress(&mut signed, &presigned);
+        assert_eq!(signed, before);
+    }
+
+    #[test]
+    fn maybe_add_via_adds_when_absent() {
+        let mut headers = HashMap::new();
+        maybe_add_via(&mut headers, None);
+        assert_eq!(
+            headers.get("Via").unwrap(),
+            &format!("1.1 {}", via_pseudonym())
+        );
+    }
+
+    #[test]
+    fn maybe_add_via_leaves_signed_via_byte_identical() {
+        let mut headers = HashMap::new();
+        headers.insert("via".to_string(), "1.1 signed-value".to_string());
+        let before = headers.clone();
+        maybe_add_via(&mut headers, Some(AUTH_SIGNING_VIA));
+        assert_eq!(headers, before);
+
+        let mut none = HashMap::new();
+        maybe_add_via(&mut none, Some(AUTH_SIGNING_VIA));
+        assert!(none.is_empty());
+    }
+
+    const RANGE_SIGNED_HEADER_AUTH: &str = "AWS4-HMAC-SHA256 Credential=TESTACCESSKEY/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=abc123";
+    const RANGE_UNSIGNED_HEADER_AUTH: &str = "AWS4-HMAC-SHA256 Credential=TESTACCESSKEY/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123";
+    fn presigned_target(signed_headers_param: &str) -> String {
+        format!(
+            "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&{}&X-Amz-Date=20130524T000000Z&X-Amz-Expires=3600&X-Amz-Signature=abc123",
+            signed_headers_param
+        )
+    }
+    #[test]
+    fn test_is_range_signed_query_form_encodings() {
+        let none = HashMap::new();
+        for param in [
+            "X-Amz-SignedHeaders=host%3Brange",
+            "X-Amz-SignedHeaders=host%3brange",
+            "X-Amz-SignedHeaders=host;range",
+            "X-Amz-SignedHeaders=range%3Bhost",
+            "x-amz-signedheaders=host%3Brange",
+            "X-AMZ-SIGNEDHEADERS=host%3BRange",
+        ] {
+            assert!(
+                is_range_signed(&none, &presigned_target(param)),
+                "{param} signs range"
+            );
+        }
+        // An absolute-form target is read the same way.
+        assert!(is_range_signed(
+            &none,
+            "https://s3.amazonaws.com/bucket/key?X-Amz-SignedHeaders=host%3Brange"
+        ));
+    }
+    #[test]
+    fn test_is_range_signed_query_form_exact_entry_match() {
+        let none = HashMap::new();
+        for param in [
+            "X-Amz-SignedHeaders=host%3Brange-extra",
+            "X-Amz-SignedHeaders=host%3Bx-range",
+            "X-Amz-SignedHeaders=host%3Bcontent-range",
+            "X-Amz-SignedHeaders=host",
+            "X-Amz-Other=host%3Brange",
+            "range=bytes%3D0-1",
+        ] {
+            assert!(
+                !is_range_signed(&none, &presigned_target(param)),
+                "{param} does not sign range"
+            );
+        }
+        assert!(!is_range_signed(&none, "/bucket/key"));
+        assert!(!is_range_signed(&none, "/bucket/key?"));
+    }
+    #[test]
+    fn test_is_range_signed_header_form_query_form_both_and_neither() {
+        let mut header_signed = HashMap::new();
+        header_signed.insert(
+            "authorization".to_string(),
+            RANGE_SIGNED_HEADER_AUTH.to_string(),
+        );
+        let mut header_unsigned = HashMap::new();
+        header_unsigned.insert(
+            "authorization".to_string(),
+            RANGE_UNSIGNED_HEADER_AUTH.to_string(),
+        );
+        let none = HashMap::new();
+        let query_signed = presigned_target("X-Amz-SignedHeaders=host%3Brange");
+        let query_unsigned = presigned_target("X-Amz-SignedHeaders=host");
+        // Header form only.
+        assert!(is_range_signed(&header_signed, "/bucket/key"));
+        assert!(is_range_signed(&header_signed, &query_unsigned));
+        // Query form only.
+        assert!(is_range_signed(&none, &query_signed));
+        assert!(is_range_signed(&header_unsigned, &query_signed));
+        // Both.
+        assert!(is_range_signed(&header_signed, &query_signed));
+        // Neither.
+        assert!(!is_range_signed(&none, "/bucket/key"));
+        assert!(!is_range_signed(&header_unsigned, &query_unsigned));
+        assert!(!is_range_signed(&none, &query_unsigned));
+    }
+    #[test]
+    fn test_request_target_keeps_the_query() {
+        let origin: hyper::Uri = "/bucket/key?X-Amz-SignedHeaders=host%3Brange"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            request_target(&origin),
+            "/bucket/key?X-Amz-SignedHeaders=host%3Brange"
+        );
+        let absolute: hyper::Uri = "https://s3.amazonaws.com/bucket/key?a=b".parse().unwrap();
+        assert_eq!(request_target(&absolute), "/bucket/key?a=b");
+    }
     #[test]
     fn test_is_range_signed_with_range_in_signed_headers() {
         let mut headers = HashMap::new();
@@ -1887,7 +2155,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(is_range_signed(&headers));
+        assert!(is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1897,7 +2165,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(!is_range_signed(&headers));
+        assert!(!is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1907,20 +2175,20 @@ mod tests {
             "Authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(is_range_signed(&headers));
+        assert!(is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
     fn test_is_range_signed_no_authorization_header() {
         let headers = HashMap::new();
-        assert!(!is_range_signed(&headers));
+        assert!(!is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
     fn test_is_range_signed_non_sigv4_auth() {
         let mut headers = HashMap::new();
         headers.insert("authorization".to_string(), "Bearer token123".to_string());
-        assert!(!is_range_signed(&headers));
+        assert!(!is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1930,7 +2198,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(!is_range_signed(&headers));
+        assert!(!is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1940,7 +2208,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date;range, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(is_range_signed(&headers));
+        assert!(is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1950,7 +2218,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=range;host;x-amz-date, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(is_range_signed(&headers));
+        assert!(is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1960,7 +2228,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=range, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(is_range_signed(&headers));
+        assert!(is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1971,7 +2239,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-range;x-amz-date, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(!is_range_signed(&headers));
+        assert!(!is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1982,7 +2250,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;content-range;x-amz-date, Signature=abc123".to_string() // #gitleaks:allow
         );
-        assert!(!is_range_signed(&headers));
+        assert!(!is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -1993,7 +2261,7 @@ mod tests {
             "authorization".to_string(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, Signature=abc123, SignedHeaders=host;range;x-amz-date".to_string() // #gitleaks:allow
         );
-        assert!(is_range_signed(&headers));
+        assert!(is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -2071,7 +2339,7 @@ mod tests {
              Signature=abcdef1234567890" // #gitleaks:allow
                 .to_string(),
         );
-        assert!(is_range_signed(&headers));
+        assert!(is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -2084,7 +2352,7 @@ mod tests {
              Signature=abcdef1234567890" // #gitleaks:allow
                 .to_string(),
         );
-        assert!(!is_range_signed(&headers));
+        assert!(!is_range_signed(&headers, "/bucket/key"));
     }
 
     #[test]
@@ -2265,198 +2533,6 @@ mod tests {
         assert_eq!(find_crlf(b"No CRLF here"), None);
         assert_eq!(find_crlf(b"Multiple\r\nCRLF\r\nHere"), Some(8));
     }
-
-    #[test]
-    fn test_extract_metadata_all_headers_present() {
-        let mut response_headers = HashMap::new();
-        response_headers.insert("etag".to_string(), "\"abc123\"".to_string());
-        response_headers.insert(
-            "last-modified".to_string(),
-            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        );
-        response_headers.insert(
-            "content-type".to_string(),
-            "application/octet-stream".to_string(),
-        );
-
-        let request_headers = HashMap::new();
-
-        let metadata = extract_metadata(&response_headers, &request_headers, 1024);
-
-        assert_eq!(metadata.etag, "\"abc123\"");
-        assert_eq!(metadata.last_modified, "Wed, 21 Oct 2015 07:28:00 GMT");
-        assert_eq!(
-            metadata.content_type,
-            Some("application/octet-stream".to_string())
-        );
-        assert_eq!(metadata.content_length, 1024);
-    }
-
-    #[test]
-    fn test_extract_metadata_case_insensitive() {
-        // Test with capitalized header names
-        let mut response_headers = HashMap::new();
-        response_headers.insert("ETag".to_string(), "\"xyz789\"".to_string());
-        response_headers.insert(
-            "Last-Modified".to_string(),
-            "Thu, 22 Oct 2015 08:30:00 GMT".to_string(),
-        );
-        response_headers.insert("Content-Type".to_string(), "text/plain".to_string());
-
-        let request_headers = HashMap::new();
-
-        let metadata = extract_metadata(&response_headers, &request_headers, 2048);
-
-        assert_eq!(metadata.etag, "\"xyz789\"");
-        assert_eq!(metadata.last_modified, "Thu, 22 Oct 2015 08:30:00 GMT");
-        assert_eq!(metadata.content_type, Some("text/plain".to_string()));
-        assert_eq!(metadata.content_length, 2048);
-    }
-
-    #[test]
-    fn test_extract_metadata_missing_headers() {
-        // Test with all headers missing (Requirement 3.5)
-        // Content-Type should fallback to application/octet-stream per Req 16.3
-        let response_headers = HashMap::new();
-        let request_headers = HashMap::new();
-
-        let metadata = extract_metadata(&response_headers, &request_headers, 512);
-
-        // Should handle missing headers gracefully
-        assert_eq!(metadata.etag, "");
-        assert_eq!(metadata.last_modified, "");
-        assert_eq!(
-            metadata.content_type,
-            Some("application/octet-stream".to_string())
-        );
-        assert_eq!(metadata.content_length, 512);
-    }
-
-    #[test]
-    fn test_extract_metadata_partial_headers() {
-        // Test with some headers present, some missing
-        let mut response_headers = HashMap::new();
-        response_headers.insert("etag".to_string(), "\"partial123\"".to_string());
-        // last-modified missing
-        // content-type missing — should fallback to application/octet-stream
-
-        let request_headers = HashMap::new();
-
-        let metadata = extract_metadata(&response_headers, &request_headers, 4096);
-
-        assert_eq!(metadata.etag, "\"partial123\"");
-        assert_eq!(metadata.last_modified, ""); // Missing, should be empty
-        assert_eq!(
-            metadata.content_type,
-            Some("application/octet-stream".to_string())
-        ); // Missing from response, fallback to default
-        assert_eq!(metadata.content_length, 4096);
-    }
-
-    #[test]
-    fn test_extract_metadata_zero_content_length() {
-        // Test with zero content length (empty object)
-        let mut response_headers = HashMap::new();
-        response_headers.insert("etag".to_string(), "\"empty\"".to_string());
-        response_headers.insert(
-            "last-modified".to_string(),
-            "Fri, 23 Oct 2015 09:00:00 GMT".to_string(),
-        );
-
-        let request_headers = HashMap::new();
-
-        let metadata = extract_metadata(&response_headers, &request_headers, 0);
-
-        assert_eq!(metadata.etag, "\"empty\"");
-        assert_eq!(metadata.last_modified, "Fri, 23 Oct 2015 09:00:00 GMT");
-        assert_eq!(metadata.content_length, 0);
-    }
-
-    #[test]
-    fn test_extract_metadata_large_content_length() {
-        // Test with large content length
-        let mut response_headers = HashMap::new();
-        response_headers.insert("etag".to_string(), "\"large\"".to_string());
-        response_headers.insert(
-            "last-modified".to_string(),
-            "Sat, 24 Oct 2015 10:00:00 GMT".to_string(),
-        );
-        response_headers.insert("content-type".to_string(), "video/mp4".to_string());
-
-        let request_headers = HashMap::new();
-
-        let large_size = 5_000_000_000u64; // 5GB
-        let metadata = extract_metadata(&response_headers, &request_headers, large_size);
-
-        assert_eq!(metadata.content_length, large_size);
-        assert_eq!(metadata.content_type, Some("video/mp4".to_string()));
-    }
-
-    #[test]
-    fn test_extract_metadata_various_content_types() {
-        let mut response_headers = HashMap::new();
-        response_headers.insert("etag".to_string(), "\"test\"".to_string());
-        response_headers.insert(
-            "last-modified".to_string(),
-            "Sun, 25 Oct 2015 11:00:00 GMT".to_string(),
-        );
-
-        // Test various content types from S3 response
-        let content_types = vec![
-            "application/json",
-            "text/html; charset=utf-8",
-            "image/png",
-            "application/x-custom",
-        ];
-
-        for ct in content_types {
-            let mut resp_headers = response_headers.clone();
-            resp_headers.insert("content-type".to_string(), ct.to_string());
-
-            let request_headers = HashMap::new();
-
-            let metadata = extract_metadata(&resp_headers, &request_headers, 1024);
-            assert_eq!(metadata.content_type, Some(ct.to_string()));
-        }
-    }
-
-    #[test]
-    fn test_extract_metadata_content_type_from_response_not_request() {
-        // Req 16: Content-Type must come from S3 response, not client request.
-        // A client sending a wrong Content-Type on PUT should not poison the cache.
-        let mut response_headers = HashMap::new();
-        response_headers.insert("etag".to_string(), "\"resp-etag\"".to_string());
-        response_headers.insert("content-type".to_string(), "image/png".to_string());
-
-        let mut request_headers = HashMap::new();
-        request_headers.insert("content-type".to_string(), "text/plain".to_string());
-
-        let metadata = extract_metadata(&response_headers, &request_headers, 2048);
-
-        // Should use response Content-Type, not request Content-Type
-        assert_eq!(metadata.content_type, Some("image/png".to_string()));
-    }
-
-    #[test]
-    fn test_extract_metadata_content_type_fallback_when_absent() {
-        // Req 16.3: Fallback to application/octet-stream if S3 response has no Content-Type
-        let mut response_headers = HashMap::new();
-        response_headers.insert("etag".to_string(), "\"no-ct\"".to_string());
-        // No content-type in response
-
-        let mut request_headers = HashMap::new();
-        request_headers.insert("content-type".to_string(), "text/html".to_string());
-
-        let metadata = extract_metadata(&response_headers, &request_headers, 512);
-
-        // Should fallback to application/octet-stream, NOT use request's text/html
-        assert_eq!(
-            metadata.content_type,
-            Some("application/octet-stream".to_string())
-        );
-    }
-
-    // --- Body-size cap enforcement on the streaming forward (Req 8) ---
 
     #[tokio::test]
     async fn test_streaming_cap_rejects_declared_length_above_s3_limit_before_connecting() {
@@ -2838,6 +2914,118 @@ mod tests {
         );
     }
 
+    /// Forward one PUT through the streaming serializer with the given client headers and
+    /// return the lowercase header lines the mock upstream received.
+    async fn streamed_header_lines(uri: &str, client_headers: &[(&str, &str)]) -> Vec<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0, "upstream received an incomplete request");
+                request.extend_from_slice(&buffer[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.is_empty())
+                .map(|l| l.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        });
+        let transport = UpstreamTransport {
+            ip: address.ip(),
+            port: address.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+        let mut headers = hyper::HeaderMap::new();
+        for (k, v) in client_headers {
+            headers.append(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &uri.parse::<hyper::Uri>().unwrap(),
+            &headers,
+            hyper::Version::HTTP_11,
+            Full::new(Bytes::from_static(b"payload")),
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await
+        .expect("forward must succeed");
+        upstream.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_forward_via_signed_branch_leaves_signed_via_untouched() {
+        let ours = format!("1.1 {}", via_pseudonym());
+
+        // Authorization header signs `via`: forwarded byte-identical, ours not appended.
+        let lines = streamed_header_lines(
+            "/bucket/key",
+            &[
+                ("authorization", AUTH_SIGNING_VIA),
+                ("via", "1.1 signed-value"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("via:"))
+                .collect::<Vec<_>>(),
+            vec!["via: 1.1 signed-value"]
+        );
+
+        // Presigned URL signs `via` in X-Amz-SignedHeaders: same.
+        let lines = streamed_header_lines(
+            "/bucket/key?X-Amz-SignedHeaders=host%3Bvia&X-Amz-Signature=s",
+            &[("via", "1.1 signed-value")],
+        )
+        .await;
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("via:"))
+                .collect::<Vec<_>>(),
+            vec!["via: 1.1 signed-value"]
+        );
+
+        // Control: not signed, so ours is appended after the client's.
+        let lines = streamed_header_lines(
+            "/bucket/key",
+            &[
+                ("authorization", AUTH_NOT_SIGNING_VIA),
+                ("via", "1.1 client"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("via:"))
+                .collect::<Vec<_>>(),
+            vec![&format!("via: 1.1 client, {}", ours)]
+        );
+    }
+
     /// Capture the exact request bytes written to the mock upstream. The caller
     /// supplies the expected body length so this handles the request-header/body
     /// coalescing that is normal on a loopback TCP connection.
@@ -2951,6 +3139,8 @@ mod tests {
                 .flat_map(|(name, value)| {
                     format!("{}: {}\r\n", name.as_str(), value.to_str().unwrap()).into_bytes()
                 })
+                // Loop detection appends this process's `Via` after the client's headers.
+                .chain(format!("via: 1.1 {}\r\n", via_pseudonym()).into_bytes())
                 .collect();
             let expected = [
                 format!("{method} {path_and_query} HTTP/1.1\r\n").into_bytes(),
@@ -3065,9 +3255,17 @@ mod tests {
         // forward loop hits `Full` and switches to an awaited `send` (bounded
         // backpressure) rather than buffering an unbounded queue. Every forwarded
         // frame still reaches both the upstream (verbatim) and the tee (in order).
+        //
+        // Also asserts the process-wide backpressure counters (cache-eviction-at-scale
+        // Requirement 18.4): a >= delta per `testing.md` § "Never assert an exact
+        // delta on a process-global counter", since other tests in this binary can
+        // concurrently increment the same atomics.
         use futures::stream;
         use http_body_util::StreamBody;
         use hyper::body::Frame;
+
+        let events_before = tee_backpressure_events_total_put();
+        let wait_ms_before = tee_backpressure_wait_ms_total_put();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3137,6 +3335,20 @@ mod tests {
         assert_eq!(
             teed, expected,
             "the tee must receive every forwarded byte in order under backpressure"
+        );
+
+        let events_after = tee_backpressure_events_total_put();
+        let wait_ms_after = tee_backpressure_wait_ms_total_put();
+        assert!(
+            events_after > events_before,
+            "expected genuine backpressure with a 1-capacity channel and a slow \
+             consumer, but tee_backpressure_events_total_put did not move: \
+             before={events_before} after={events_after}"
+        );
+        assert!(
+            wait_ms_after >= wait_ms_before,
+            "tee_backpressure_wait_ms_total_put must be monotonic: \
+             before={wait_ms_before} after={wait_ms_after}"
         );
     }
 
@@ -3957,7 +4169,7 @@ mod property_tests {
         let mut headers = HashMap::new();
         headers.insert("authorization".to_string(), auth_value);
 
-        let result = is_range_signed(&headers);
+        let result = is_range_signed(&headers, "/bucket/key");
 
         // Result should match whether we included "range"
         TestResult::from_bool(result == include_range)
@@ -3992,7 +4204,7 @@ mod property_tests {
             headers.insert("authorization".to_string(), auth_value);
         }
 
-        let result = is_range_signed(&headers);
+        let result = is_range_signed(&headers, "/bucket/key");
 
         // Should always return false since we never include "range"
         TestResult::from_bool(!result)
@@ -4009,7 +4221,7 @@ mod property_tests {
         headers.insert("authorization".to_string(), random_auth_value);
 
         // Should not panic and should return false for malformed headers
-        let _result = is_range_signed(&headers);
+        let _result = is_range_signed(&headers, "/bucket/key");
 
         // The key property is that it doesn't panic
         TestResult::from_bool(true) // Passes as long as is_range_signed doesn't panic
@@ -4046,7 +4258,7 @@ mod property_tests {
         let mut headers = HashMap::new();
         headers.insert("authorization".to_string(), auth_value);
 
-        let result = is_range_signed(&headers);
+        let result = is_range_signed(&headers, "/bucket/key");
 
         // Should return false because the header is not exactly "range"
         TestResult::from_bool(!result)

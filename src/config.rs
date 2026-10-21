@@ -114,9 +114,9 @@ pub struct DashboardConfig {
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
-            enabled: true,                         // Enabled by default per requirements
+            enabled: true,                        // Enabled by default per requirements
             port: 8081, // Changed from 8080 to avoid conflict with health server
-            bind_address: "127.0.0.1".to_string(), // Localhost-only by default (Req 13)
+            bind_address: default_bind_address(), // Loopback only by default
             cache_stats_refresh_interval: Duration::from_secs(5),
             logs_refresh_interval: Duration::from_secs(10),
             max_log_entries: 100,
@@ -243,7 +243,7 @@ pub struct ServerConfig {
     /// Peak_Concurrent_Transfers = 71 (100-client fleet, 60s of concurrent
     /// 8 MiB range reads) with ~14x headroom — see
     /// `default_max_concurrent_requests` and
-    /// `.kiro/specs/combined-2.5.0/run-log.md`, G3. Because a permit now spans
+    /// the combined 2.5.0 feature, G3. Because a permit now spans
     /// the whole transfer, size this from measured `permits_held_peak`
     /// (`/metrics` → `request_metrics.permits_held_peak`) under representative
     /// load, not from request rate alone — see `docs/CONFIGURATION.md` →
@@ -261,7 +261,7 @@ pub struct ServerConfig {
     /// matches this field's default. Changing this field does not change that timeout.
     ///
     /// Retained rather than removed so existing config files keep parsing (see
-    /// `.kiro/steering/config-compatibility.md`). Do not reference it as the
+    /// the config compatibility rule). Do not reference it as the
     /// whole-request wall in new code or docs.
     #[serde(
         deserialize_with = "duration_serde::deserialize",
@@ -354,7 +354,7 @@ fn default_max_concurrent_requests() -> usize {
     // Setup_Phase, so a permit is held far longer than before. 1000 is derived from
     // a G3 fleet measurement of Peak_Concurrent_Transfers = 71 (100-client fleet,
     // 60s of concurrent 8 MiB range reads) with ~14x headroom — see
-    // .kiro/specs/combined-2.5.0/run-log.md, G3. Lands on this doc's own
+    // the combined 2.5.0 feature, G3. Lands on this doc's own
     // "large deployment: 300-1000+" figure rather than an arbitrary multiplier.
     1000
 }
@@ -371,9 +371,21 @@ fn default_true() -> bool {
     true
 }
 
-/// Default bind address for health/metrics servers: all interfaces (preserves pre-2.1.1 behavior).
+/// Default bind address for the health, metrics and dashboard servers: loopback only.
+/// These listeners are unauthenticated, so reaching them from another host is an explicit
+/// opt-in (`bind_address: "0.0.0.0"`).
 fn default_bind_address() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
+}
+
+/// Require `value` to be an IP address (IPv4 or IPv6, as `std::net::IpAddr` parses it).
+/// A hostname is not resolved: the listener binds an address, not a name.
+fn validate_listener_ip(field: &str, value: &str) -> Result<()> {
+    value.parse::<std::net::IpAddr>().map(|_| ()).map_err(|_| {
+        ProxyError::ConfigError(format!(
+            "{field} must be an IP address such as 127.0.0.1, 0.0.0.0 or ::1, got {value:?}"
+        ))
+    })
 }
 
 /// Default for deprecated max_log_entries field
@@ -430,9 +442,9 @@ fn default_max_inflight_buffer_bytes() -> u64 {
 impl ServerConfig {
     fn max_buffered_request_body_bytes_deprecation_warning(&self) -> Option<&'static str> {
         (self.max_buffered_request_body_bytes != default_max_buffered_request_body_bytes()).then_some(
-            "Configuration field 'server.max_buffered_request_body_bytes' is deprecated and has no effect. \
-             S3's own single-part PUT and UploadPart limits now apply. \
-             This field will be removed in a future release.",
+            "Configuration field 'server.max_buffered_request_body_bytes' is deprecated and ignored: \
+             S3's own single-part PUT and UploadPart limits apply. \
+             Delete the field to silence this warning.",
         )
     }
 
@@ -541,14 +553,6 @@ impl TlsConfig {
     }
 }
 
-/// HTTPS mode configuration
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub enum HttpsMode {
-    #[serde(rename = "passthrough")]
-    #[default]
-    Passthrough, // TCP passthrough (only mode)
-}
-
 /// Download coordination configuration for request coalescing
 ///
 /// When multiple requests arrive for the same uncached resource, the InFlightTracker
@@ -566,7 +570,9 @@ pub struct DownloadCoordinationConfig {
     pub enabled: bool,
 
     /// Maximum time a waiter will wait for the fetcher to complete (default: 30s)
-    /// If the fetcher takes longer than this, the waiter falls back to its own S3 fetch.
+    /// If the fetcher takes longer than this, the waiter re-subscribes to the in-flight fetch
+    /// (or becomes the fetcher if that fetch has gone), and returns 504 once
+    /// `max_waiter_resubscriptions` is exceeded.
     /// Valid range: 5-120 seconds (values outside this range are clamped with a warning)
     /// Requirement: 18.2, 18.3, 18.5
     #[serde(default = "default_download_coordination_wait_timeout_secs")]
@@ -648,23 +654,27 @@ impl DownloadCoordinationConfig {
 /// writes and distributed eviction locking are used unconditionally for consistency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedStorageConfig {
-    /// Maximum time to wait when acquiring a file lock before giving up (default: 60s)
-    /// Longer values handle slow storage; shorter values fail faster on contention.
-    /// Valid range: 10-300 seconds
+    /// How long an acquisition of a key's metadata slot lock waits before giving up
+    /// (default: 5s). Valid range: 1-300 seconds.
+    ///
+    /// A **wait budget**, deliberately not a timeout. Expiry means the caller stops waiting
+    /// and returns having touched nothing; it never means the holder is presumed dead and its
+    /// lock taken. The protocol does not infer liveness from elapsed time, so a lock a peer
+    /// still holds is never stolen — stealing one would remove exclusion rather than restore
+    /// it, which is the defect the retired per-key sentinel had.
+    ///
+    /// The budget bounds the *blocking* acquisition path. `MetadataLockManager::acquire_lock`
+    /// retries a non-blocking attempt instead, and its bound is `lock_max_retries`.
+    ///
+    /// Accepts `lock_timeout` as a deserialization alias so an existing configuration file
+    /// keeps parsing. That field was accepted and validated but read by nothing, so honouring
+    /// the value now is the first time it has had an effect — see `docs/UPGRADING.md`.
     #[serde(
-        default = "default_shared_storage_lock_timeout",
+        alias = "lock_timeout",
+        default = "default_slot_acquire_wait_budget",
         deserialize_with = "duration_serde::deserialize"
     )]
-    pub lock_timeout: Duration,
-
-    /// How often to refresh held locks to prevent expiration (default: 30s)
-    /// Must be less than lock_timeout to maintain lock ownership.
-    /// Valid range: 5-120 seconds
-    #[serde(
-        default = "default_shared_storage_lock_refresh_interval",
-        deserialize_with = "duration_serde::deserialize"
-    )]
-    pub lock_refresh_interval: Duration,
+    pub lock_acquire_wait_budget: Duration,
 
     /// Cache inconsistency percentage that triggers a warning log (default: 5.0)
     /// Helps identify emerging issues before they become critical.
@@ -678,12 +688,6 @@ pub struct SharedStorageConfig {
     #[serde(default = "default_validation_threshold_error")]
     pub validation_threshold_error: f64,
 
-    /// Maximum number of orphaned ranges to recover simultaneously (default: 4)
-    /// Higher values speed up recovery but increase I/O load.
-    /// Valid range: 1-16
-    #[serde(default = "default_recovery_max_concurrent")]
-    pub recovery_max_concurrent: usize,
-
     /// Journal consolidation interval (default: 5s)
     /// How often to consolidate journal entries into final metadata files.
     /// Shorter intervals improve cross-instance cache visibility but increase I/O.
@@ -694,9 +698,10 @@ pub struct SharedStorageConfig {
     )]
     pub consolidation_interval: Duration,
 
-    /// Journal size threshold for immediate consolidation (default: 1MB)
-    /// When journal file exceeds this size, trigger immediate consolidation.
-    /// Valid range: 100KB-10MB
+    /// DEPRECATED, no effect. Accepted and range-validated (100KB-10MB) so existing configs
+    /// keep loading; a config that sets it, or the `CONSOLIDATION_SIZE_THRESHOLD` environment
+    /// variable, logs one WARN at load. No release ever triggered an early consolidation from
+    /// it: journal consolidation runs on `consolidation_interval` only.
     #[serde(default = "default_consolidation_size_threshold")]
     pub consolidation_size_threshold: u64,
 
@@ -736,43 +741,46 @@ pub struct SharedStorageConfig {
     )]
     pub eviction_lock_timeout: Duration,
 
-    /// Metadata lock timeout in milliseconds (default: 30_000ms = 30s)
-    /// How long a metadata lock owned by another host must be idle before it's considered
-    /// stale and eligible for takeover. Only applies to cross-host lock evaluation;
-    /// same-host staleness uses PID checks instead.
-    /// Requirement: 3.3
-    #[serde(default = "default_metadata_lock_timeout_ms")]
-    pub metadata_lock_timeout_ms: u64,
-
-    /// Enable background orphan recovery (default: true when shared_storage is enabled)
-    /// Scans for orphaned .bin files that aren't tracked in metadata and recovers them.
-    /// Essential for shared storage where journal consolidation may lag behind writes.
+    /// Ignored. Accepted so an existing config file still loads; the orphan re-adoption sweep it
+    /// controlled no longer exists. Orphan range files are reclaimed by `crate::orphan_reclaim`,
+    /// which always runs. A non-default value logs one startup warning
+    /// ([`SharedStorageConfig::warn_retired_orphan_fields`]).
     #[serde(default = "default_orphan_recovery_enabled")]
     pub orphan_recovery_enabled: bool,
 
-    /// Interval between orphan recovery scans (default: 300s = 5 minutes)
-    /// Each scan processes one shard to spread I/O load over time.
-    /// Valid range: 60-3600 seconds
+    /// Ignored; see [`SharedStorageConfig::orphan_recovery_enabled`].
     #[serde(
         default = "default_orphan_recovery_interval",
         deserialize_with = "duration_serde::deserialize"
     )]
     pub orphan_recovery_interval: Duration,
 
-    /// Maximum time to spend scanning per cycle (default: 30s)
-    /// Prevents long scans from blocking other operations.
-    /// Valid range: 5-300 seconds
+    /// Ignored; see [`SharedStorageConfig::orphan_recovery_enabled`].
     #[serde(
         default = "default_orphan_scan_timeout",
         deserialize_with = "duration_serde::deserialize"
     )]
     pub orphan_scan_timeout: Duration,
 
-    /// Maximum orphans to process per recovery cycle (default: 100)
-    /// Limits I/O impact per cycle. Remaining orphans processed in subsequent cycles.
-    /// Valid range: 10-1000
+    /// Ignored; see [`SharedStorageConfig::orphan_recovery_enabled`].
     #[serde(default = "default_orphan_max_per_cycle")]
     pub orphan_max_per_cycle: usize,
+
+    /// Lease on one eviction work-list chunk while a proxy executes it (default: 900s).
+    ///
+    /// The proxy holding the eviction lock writes each pass's selection to a work list under
+    /// `metadata/_shard_state/eviction_worklist/`, and every proxy executes chunks of it under
+    /// this lease. A chunk whose lease has lapsed is taken over by another proxy. The lease is
+    /// not extended on progress. Valid range: 60 seconds - 24 hours.
+    ///
+    /// There is no switch for the work list, or for orphan range-file reclamation: both always
+    /// run. `orphan_reclaim_enabled` and `eviction_worklist_enabled`, which internal builds
+    /// accepted, are removed keys ([`REMOVED_SWITCH_KEYS`]).
+    #[serde(
+        default = "default_eviction_worklist_lease",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub eviction_worklist_lease: Duration,
 
     /// Maximum duration for a single validation scan cycle (default: 4h)
     /// This is the single knob for self-tuning mode selection:
@@ -785,14 +793,98 @@ pub struct SharedStorageConfig {
         deserialize_with = "duration_serde::deserialize"
     )]
     pub validation_max_duration: Duration,
+    /// Interval between `st_size` fold passes over the cache volume (default: 1h).
+    ///
+    /// The fold `readdir`s and `stat`s every range file to re-ground the per-shard byte
+    /// aggregate. It parses nothing, which is why it can run on its own cadence rather than
+    /// riding the metadata validation rotation.
+    ///
+    /// **The configured value is a floor, not the schedule.** The fold never runs more often
+    /// than twice its own last measured duration, so on a volume large enough that a pass takes
+    /// longer than half this interval the effective interval lengthens automatically — see
+    /// [`crate::st_size_fold::effective_interval_secs`]. A fold is never scheduled to overlap
+    /// itself.
+    ///
+    /// Valid range: 5 minutes - 7 days. The floor keeps a whole-volume traversal from being
+    /// configured as if it were a metric refresh; the ceiling is a sanity bound, past which the
+    /// aggregate is stale enough that nothing should be reading it.
+    #[serde(
+        default = "default_shard_fold_interval",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub shard_fold_interval: Duration,
+    /// Maximum wall-clock time one `st_size` fold pass may spend (default: 30m).
+    ///
+    /// The shard is the unit of abortability: the budget is checked before each shard is
+    /// visited, never inside one, so a pass that runs out leaves every shard it reached with a
+    /// fresh figure and every shard it did not with its previous one. That is a mixed-age but
+    /// well-defined sum, and the per-shard scan ages are what make the mix visible.
+    ///
+    /// Valid range: 1 minute - 24 hours.
+    #[serde(
+        default = "default_shard_fold_max_duration",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub shard_fold_max_duration: Duration,
+    /// A range is a Tail_Partition member only if its **compressed** size is at least this
+    /// (default: 1 MiB).
+    ///
+    /// The floor exists to keep tiny entries out of a file eviction reads a bounded prefix of;
+    /// it is not the membership boundary. Membership is a per-shard **rank** cap
+    /// ([`Self::tail_max_entries`]), which is what makes partitions from different shards
+    /// mergeable even when their smallest member differs by orders of magnitude.
+    ///
+    /// **Compressed size, not the range's logical extent.** They differ for compressible data,
+    /// and the extent is not the number of bytes an eviction frees — testing the floor against
+    /// it admits ranges whose on-disk size is below the floor.
+    ///
+    /// Valid range: 4 KiB - 1 GiB. Rejected rather than clamped, per
+    /// [`Self::shard_fold_interval`]'s precedent.
+    #[serde(default = "default_tail_floor_bytes")]
+    pub tail_floor_bytes: u64,
+    /// Per shard, how many of the **largest** above-floor ranges the Tail_Partition keeps
+    /// (default: 4096).
+    ///
+    /// A per-shard rank cap rather than a fraction of shards, which is what makes it sound: any
+    /// range in the global top-K by size is a fortiori in the top-K of its own shard, so for
+    /// `K <= tail_max_entries` a merge over every shard's prefix finds it.
+    ///
+    /// Also what bounds this mechanism's cost independently of cache size — a partition holds at
+    /// most this many records however large the shard is.
+    ///
+    /// Valid range: 1 - 1048576.
+    #[serde(default = "default_tail_max_entries")]
+    pub tail_max_entries: usize,
+    /// Per instance, how many of the **largest** recent above-floor admissions the tail-delta
+    /// keeps (default: 4096).
+    ///
+    /// The tail-delta is the between-visits record of newly admitted large ranges. Without a cap
+    /// its length is `(above-floor admission rate) × (shard revisit interval)`, and the revisit
+    /// interval grows with cache size — so selection's read of it would be proportional to the
+    /// resident population, which is exactly what a bounded prefix read of the partitions exists
+    /// to avoid.
+    ///
+    /// Capping it is sound for the same reason the per-shard rank cap is: an instance appends
+    /// only its own admissions, so per-instance sets are disjoint and each keeping its own
+    /// largest N means any range in the global top-K is still present for `K <=` this value.
+    /// **Do not set it below `tail_max_entries`** for that reason.
+    ///
+    /// The file is rewritten down to this many records when it reaches twice it, so one rewrite
+    /// is amortised over this many appends.
+    ///
+    /// Valid range: 1 - 1048576.
+    #[serde(default = "default_tail_delta_max_entries")]
+    pub tail_delta_max_entries: usize,
 }
 
-fn default_shared_storage_lock_timeout() -> Duration {
-    Duration::from_secs(60)
-}
-
-fn default_shared_storage_lock_refresh_interval() -> Duration {
-    Duration::from_secs(30)
+/// Default metadata slot-lock acquisition wait budget: 5 seconds.
+///
+/// Five, not the 60 the superseded `lock_timeout` defaulted to, because three acquisition
+/// call sites already bounded their wait at a hardcoded five seconds. Making the budget
+/// configurable at any other default would have silently changed those three, so 5s is what
+/// makes this a refactor for them rather than a behaviour change.
+fn default_slot_acquire_wait_budget() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// Default eviction lock timeout: 60 seconds
@@ -801,17 +893,38 @@ fn default_eviction_lock_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
-/// Default metadata lock timeout: 30 seconds (30_000ms)
-/// How long a metadata lock owned by another host must be idle before takeover.
-/// Requirement: 3.3
-fn default_metadata_lock_timeout_ms() -> u64 {
-    30_000
-}
-
 fn default_orphan_recovery_enabled() -> bool {
     true
 }
 
+fn default_eviction_worklist_lease() -> Duration {
+    Duration::from_secs(900)
+}
+
+/// Unlink, `.meta`, accounting and flush time allowed per work-list batch on top of its lock
+/// waits, in [`eviction_worklist_lease_floor_secs`].
+const EVICTION_BATCH_IO_MARGIN_SECS: u64 = 60;
+
+/// The shortest chunk lease under which one work-list batch fits in half the lease (fix 6,
+/// For a given `lock_acquire_wait_budget` in seconds.
+///
+/// An executor starts a batch only while half its lease remains
+/// (`eviction_worklist::batch_lease_margin_secs`), so a batch must finish inside half the lease
+/// or a peer may take the chunk over mid-batch. A batch is
+/// `eviction_worklist::EXECUTOR_BATCH_OBJECTS` (64) objects. Objects in one cache leaf run
+/// serially (`run_leaf_groups`), and each waits up to `lock_acquire_wait_budget` for its slot
+/// lock, so a batch whose objects share one leaf can spend 64 x the budget waiting; add
+/// [`EVICTION_BATCH_IO_MARGIN_SECS`] and double it. At the default 5 s budget that is
+/// 2 x (64 x 5 + 60) = 760 s, which is [`EVICTION_WORKLIST_LEASE_MIN_SECS`].
+pub(crate) const fn eviction_worklist_lease_floor_secs(lock_acquire_wait_budget_secs: u64) -> u64 {
+    2 * (crate::eviction_worklist::EXECUTOR_BATCH_OBJECTS as u64 * lock_acquire_wait_budget_secs
+        + EVICTION_BATCH_IO_MARGIN_SECS)
+}
+
+/// The shortest `eviction_worklist_lease` accepted: the floor at the default 5 s lock wait
+/// budget. A larger configured budget raises the lease executors use instead
+/// (`eviction_worklist::executor_budget`), so a config that sets only the budget still loads.
+pub(crate) const EVICTION_WORKLIST_LEASE_MIN_SECS: u64 = eviction_worklist_lease_floor_secs(5);
 fn default_orphan_recovery_interval() -> Duration {
     Duration::from_secs(300) // 5 minutes
 }
@@ -828,26 +941,65 @@ fn default_validation_max_duration() -> Duration {
     Duration::from_secs(4 * 3600) // 4 hours
 }
 
+/// Default `st_size` fold interval: one hour.
+///
+/// The constant lives beside the fold it schedules
+/// ([`crate::st_size_fold::DEFAULT_SHARD_FOLD_INTERVAL_SECS`]) rather than being written twice,
+/// and its doc comment there records why the hour is a planning figure with ±2x headroom rather
+/// than a measurement of a production cache.
+fn default_shard_fold_interval() -> Duration {
+    Duration::from_secs(crate::st_size_fold::DEFAULT_SHARD_FOLD_INTERVAL_SECS)
+}
+
+/// Default per-pass budget for the `st_size` fold: 30 minutes.
+///
+/// Half the default interval, so a volume that cannot fold inside the budget still spends at
+/// most half its time folding, and the interval scaling then takes over from the next pass.
+fn default_shard_fold_max_duration() -> Duration {
+    Duration::from_secs(1800)
+}
+
+/// Default Tail_Partition floor: 1 MiB.
+fn default_tail_floor_bytes() -> u64 {
+    1_048_576
+}
+
+/// Default Tail_Partition per-shard rank cap: 4096.
+fn default_tail_max_entries() -> usize {
+    4096
+}
+
+/// Default per-instance tail-delta cap: 4096, the same as the per-shard rank cap.
+///
+/// The same value deliberately, because the soundness condition is `K <= cap` on both files and
+/// there is no reason for one to admit a global top-K the other would miss.
+fn default_tail_delta_max_entries() -> usize {
+    4096
+}
+
 impl Default for SharedStorageConfig {
     fn default() -> Self {
         Self {
-            lock_timeout: default_shared_storage_lock_timeout(),
-            lock_refresh_interval: default_shared_storage_lock_refresh_interval(),
+            lock_acquire_wait_budget: default_slot_acquire_wait_budget(),
             validation_threshold_warn: default_validation_threshold_warn(),
             validation_threshold_error: default_validation_threshold_error(),
-            recovery_max_concurrent: default_recovery_max_concurrent(),
             consolidation_interval: default_consolidation_interval(),
             consolidation_size_threshold: default_consolidation_size_threshold(),
             consolidation_cycle_timeout: default_consolidation_cycle_timeout(),
             lock_max_retries: default_lock_max_retries(),
             validation_frequency: default_validation_frequency(),
             eviction_lock_timeout: default_eviction_lock_timeout(),
-            metadata_lock_timeout_ms: default_metadata_lock_timeout_ms(),
             orphan_recovery_enabled: default_orphan_recovery_enabled(),
             orphan_recovery_interval: default_orphan_recovery_interval(),
             orphan_scan_timeout: default_orphan_scan_timeout(),
             orphan_max_per_cycle: default_orphan_max_per_cycle(),
             validation_max_duration: default_validation_max_duration(),
+            shard_fold_interval: default_shard_fold_interval(),
+            shard_fold_max_duration: default_shard_fold_max_duration(),
+            tail_floor_bytes: default_tail_floor_bytes(),
+            tail_max_entries: default_tail_max_entries(),
+            tail_delta_max_entries: default_tail_delta_max_entries(),
+            eviction_worklist_lease: default_eviction_worklist_lease(),
         }
     }
 }
@@ -855,27 +1007,16 @@ impl Default for SharedStorageConfig {
 impl SharedStorageConfig {
     /// Validate the configuration
     pub fn validate(&self) -> std::result::Result<(), String> {
-        // Validate lock_timeout (10-300 seconds)
-        let lock_timeout_secs = self.lock_timeout.as_secs();
-        if !(10..=300).contains(&lock_timeout_secs) {
+        // Validate lock_acquire_wait_budget (1-300 seconds).
+        //
+        // The floor is 1, not the 10 the superseded `lock_timeout` enforced. Lowering a floor
+        // is the one direction that cannot reject a configuration that used to be accepted,
+        // and it has to move because the default is now 5.
+        let wait_budget_secs = self.lock_acquire_wait_budget.as_secs();
+        if !(1..=300).contains(&wait_budget_secs) {
             return Err(format!(
-                "lock_timeout must be between 10 and 300 seconds, got {}",
-                lock_timeout_secs
-            ));
-        }
-
-        // Validate lock_refresh_interval (5-120 seconds, must be less than lock_timeout)
-        let lock_refresh_secs = self.lock_refresh_interval.as_secs();
-        if !(5..=120).contains(&lock_refresh_secs) {
-            return Err(format!(
-                "lock_refresh_interval must be between 5 and 120 seconds, got {}",
-                lock_refresh_secs
-            ));
-        }
-        if lock_refresh_secs >= lock_timeout_secs {
-            return Err(format!(
-                "lock_refresh_interval ({}) must be less than lock_timeout ({})",
-                lock_refresh_secs, lock_timeout_secs
+                "lock_acquire_wait_budget must be between 1 and 300 seconds, got {}",
+                wait_budget_secs
             ));
         }
 
@@ -896,14 +1037,6 @@ impl SharedStorageConfig {
             return Err(format!(
                 "validation_threshold_warn ({}) must be less than validation_threshold_error ({})",
                 self.validation_threshold_warn, self.validation_threshold_error
-            ));
-        }
-
-        // Validate recovery_max_concurrent (1-16)
-        if self.recovery_max_concurrent < 1 || self.recovery_max_concurrent > 16 {
-            return Err(format!(
-                "recovery_max_concurrent must be between 1 and 16, got {}",
-                self.recovery_max_concurrent
             ));
         }
 
@@ -967,8 +1100,121 @@ impl SharedStorageConfig {
                 max_duration_secs
             ));
         }
+        // Validate shard_fold_interval (5 minutes - 7 days). Rejected rather than clamped
+        // because the field is new: no existing configuration file can carry a value outside
+        // the range, so rejecting cannot refuse a file that started the proxy yesterday.
+        let fold_interval_secs = self.shard_fold_interval.as_secs();
+        if !(300..=7 * 86_400).contains(&fold_interval_secs) {
+            return Err(format!(
+                "shard_fold_interval must be between 5 minutes (300 seconds) and 7 days \
+                 (604800 seconds), got {}s",
+                fold_interval_secs
+            ));
+        }
+        // Validate shard_fold_max_duration (1 minute - 24 hours).
+        let fold_budget_secs = self.shard_fold_max_duration.as_secs();
+        if !(60..=86_400).contains(&fold_budget_secs) {
+            return Err(format!(
+                "shard_fold_max_duration must be between 1 minute (60 seconds) and 24 hours \
+                 (86400 seconds), got {}s",
+                fold_budget_secs
+            ));
+        }
+        // Validate eviction_worklist_lease (760 s - 24 hours). Below the floor one 64-object batch
+        // may not fit in half the lease at the default lock wait budget, so a chunk could be taken
+        // over while a batch is still executing (`eviction_worklist_lease_floor_secs`).
+        let lease_secs = self.eviction_worklist_lease.as_secs();
+        if !(EVICTION_WORKLIST_LEASE_MIN_SECS..=86_400).contains(&lease_secs) {
+            return Err(format!(
+                "eviction_worklist_lease must be between {}s (two 64-object eviction batches at \
+                 the default 5s lock_acquire_wait_budget, plus margin) and 24 hours (86400 \
+                 seconds), got {}s",
+                EVICTION_WORKLIST_LEASE_MIN_SECS, lease_secs
+            ));
+        }
+        let floor = eviction_worklist_lease_floor_secs(wait_budget_secs);
+        if lease_secs < floor {
+            warn!(
+                "eviction_worklist_lease {}s is shorter than the {}s two eviction batches need at \
+                 lock_acquire_wait_budget {}s; executors hold chunk leases for {}s",
+                lease_secs, floor, wait_budget_secs, floor
+            );
+        }
+        // Validate tail_floor_bytes (4 KiB - 1 GiB) and tail_max_entries (1 - 1048576).
+        // Rejected rather than clamped for the same reason as the two fold fields above: both
+        // are new, so no existing configuration file can carry an out-of-range value and a
+        // rejection cannot refuse a file that started the proxy yesterday.
+        if !(4_096..=1_073_741_824).contains(&self.tail_floor_bytes) {
+            return Err(format!(
+                "tail_floor_bytes must be between 4 KiB (4096) and 1 GiB (1073741824), got {}",
+                self.tail_floor_bytes
+            ));
+        }
+        if !(1..=1_048_576).contains(&self.tail_max_entries) {
+            return Err(format!(
+                "tail_max_entries must be between 1 and 1048576, got {}",
+                self.tail_max_entries
+            ));
+        }
+        if !(1..=1_048_576).contains(&self.tail_delta_max_entries) {
+            return Err(format!(
+                "tail_delta_max_entries must be between 1 and 1048576, got {}",
+                self.tail_delta_max_entries
+            ));
+        }
+        // Cross-field: the delta's cap must admit at least as deep a global top-K as the
+        // partitions do, or a range in the global top-K could be present in a partition and
+        // discarded from the delta. Warned rather than rejected — it is a tuning mistake that
+        // costs a missed recent admission, not a startup-blocking error, and rejecting would
+        // refuse a file that lowered only one of the two.
+        if self.tail_delta_max_entries < self.tail_max_entries {
+            warn!(
+                "tail_delta_max_entries ({}) is below tail_max_entries ({}). The per-instance \
+                 tail-delta then admits a shallower global top-K than the shard partitions do, \
+                 so a newly admitted large range can be discarded from the delta while a range \
+                 of the same size would be kept in a partition. Raise it to at least \
+                 tail_max_entries.",
+                self.tail_delta_max_entries, self.tail_max_entries
+            );
+        }
 
         Ok(())
+    }
+
+    /// The retired orphan-sweep fields this config sets to a non-default value, in field order.
+    pub fn retired_orphan_fields_set(&self) -> Vec<&'static str> {
+        let mut set = Vec::new();
+        if self.orphan_recovery_enabled != default_orphan_recovery_enabled() {
+            set.push("orphan_recovery_enabled");
+        }
+        if self.orphan_recovery_interval != default_orphan_recovery_interval() {
+            set.push("orphan_recovery_interval");
+        }
+        if self.orphan_scan_timeout != default_orphan_scan_timeout() {
+            set.push("orphan_scan_timeout");
+        }
+        if self.orphan_max_per_cycle != default_orphan_max_per_cycle() {
+            set.push("orphan_max_per_cycle");
+        }
+        set
+    }
+
+    /// Log one warning when any retired orphan-sweep field carries a non-default value.
+    ///
+    /// The four fields still parse, so a config that loaded before keeps loading
+    /// (the config compatibility rule), but nothing reads them. One warning for all
+    /// four, naming each one set and the replacement, so an operator who tuned the old sweep
+    /// learns it is gone. Called once, from `Config::load`.
+    pub fn warn_retired_orphan_fields(&self) {
+        let set = self.retired_orphan_fields_set();
+        if !set.is_empty() {
+            warn!(
+                "cache.shared_storage.{} is ignored: the orphan re-adoption sweep was removed. \
+                 Orphan range files are reclaimed automatically. \
+                 Remove these fields from your config.",
+                set.join(", cache.shared_storage.")
+            );
+        }
     }
 }
 
@@ -1013,14 +1259,6 @@ fn default_ram_cache_flush_interval() -> Duration {
     Duration::from_secs(10) // 10 seconds (shortened for cross-instance access visibility, Req 19.1)
 }
 
-fn default_ram_cache_flush_threshold() -> usize {
-    100 // 100 pending updates
-}
-
-fn default_ram_cache_flush_on_eviction() -> bool {
-    false // Do not flush on eviction by default
-}
-
 fn default_ram_cache_verification_interval() -> Duration {
     Duration::from_secs(1) // 1 second
 }
@@ -1050,10 +1288,6 @@ fn default_validation_frequency() -> Duration {
     Duration::from_secs(23 * 3600) // 23 hours
 }
 
-fn default_recovery_max_concurrent() -> usize {
-    4
-}
-
 fn default_validation_threshold_warn() -> f64 {
     5.0
 }
@@ -1074,19 +1308,20 @@ fn default_progress_logging() -> bool {
     true
 }
 
-/// Cache initialization configuration
+/// Cache initialization configuration. Every field is parsed for compatibility and has no
+/// effect; `Config::unread_fields_warning` names any field set to a non-default value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializationConfig {
-    /// Enable parallel metadata processing during initialization (default: true)
+    /// Ignored (default: true)
     #[serde(default = "default_parallel_scan")]
     pub parallel_scan: bool,
-    /// Timeout for directory scanning operations (default: 30s)
+    /// Ignored (default: 30s)
     #[serde(
         default = "default_scan_timeout",
         deserialize_with = "duration_serde::deserialize"
     )]
     pub scan_timeout: Duration,
-    /// Enable detailed progress logging during initialization (default: true)
+    /// Ignored (default: true)
     #[serde(default = "default_progress_logging")]
     pub progress_logging: bool,
 }
@@ -1101,22 +1336,6 @@ impl Default for InitializationConfig {
     }
 }
 
-impl InitializationConfig {
-    /// Validate the configuration
-    pub fn validate(&self) -> std::result::Result<(), String> {
-        // Validate scan timeout (minimum 5 seconds, maximum 300 seconds)
-        let scan_timeout_secs = self.scan_timeout.as_secs();
-        if !(5..=300).contains(&scan_timeout_secs) {
-            return Err(format!(
-                "scan_timeout must be between 5 and 300 seconds, got {}",
-                scan_timeout_secs
-            ));
-        }
-
-        Ok(())
-    }
-}
-
 // Default functions for MetadataCacheConfig
 fn default_metadata_cache_enabled() -> bool {
     true
@@ -1128,10 +1347,6 @@ fn default_metadata_cache_refresh_interval() -> Duration {
 
 fn default_metadata_cache_max_entries() -> usize {
     100000
-}
-
-fn default_metadata_cache_stale_handle_max_retries() -> u32 {
-    3
 }
 
 /// RAM Metadata Cache configuration
@@ -1157,12 +1372,17 @@ pub struct MetadataCacheConfig {
     /// Valid range: 100-1000000
     #[serde(default = "default_metadata_cache_max_entries")]
     pub max_entries: usize,
-    /// Maximum retries for stale file handle errors (default: 3)
-    /// On shared storage (EFS/NFS), stale file handles can occur when files
-    /// are modified by other instances. This controls retry behavior.
-    /// Valid range: 1-10
-    #[serde(default = "default_metadata_cache_stale_handle_max_retries")]
-    pub stale_handle_max_retries: u32,
+    // REMOVED: `stale_handle_max_retries`.
+    //
+    // Validated at 1-10, logged at `MetadataCache` creation, and read by nothing. The live
+    // stale-file-handle retry is `disk_cache::read_and_parse_metadata_blocking`, which uses its
+    // own `MAX_RETRIES` constant of 3. The only function that ever read this field,
+    // `MetadataCache::load_with_stale_handle_retry`, never had a caller and was deleted in
+    // v1.6.9. Its 1-10 validation was never enforced either: `MetadataCacheConfig::validate`
+    // has no caller on the startup path.
+    //
+    // A config still setting it loads (unknown keys are ignored, whatever the value) and
+    // warns, via `warn_on_removed_cache_keys`.
 }
 
 impl Default for MetadataCacheConfig {
@@ -1171,7 +1391,6 @@ impl Default for MetadataCacheConfig {
             enabled: default_metadata_cache_enabled(),
             refresh_interval: default_metadata_cache_refresh_interval(),
             max_entries: default_metadata_cache_max_entries(),
-            stale_handle_max_retries: default_metadata_cache_stale_handle_max_retries(),
         }
     }
 }
@@ -1196,24 +1415,60 @@ impl MetadataCacheConfig {
             ));
         }
 
-        // Validate stale_handle_max_retries (1-10)
-        if self.stale_handle_max_retries < 1 || self.stale_handle_max_retries > 10 {
-            return Err(format!(
-                "metadata_cache.stale_handle_max_retries must be between 1 and 10, got {}",
-                self.stale_handle_max_retries
-            ));
-        }
-
         Ok(())
     }
 
+    /// Warn about a value outside the documented range, and USE IT AS CONFIGURED.
+    ///
+    /// Called from `Config::load`. [`MetadataCacheConfig::validate`] was never on the startup
+    /// path, so every value in an existing file booted; rejecting one now would turn an upgrade
+    /// into a startup failure, which the config compatibility rule forbids.
+    ///
+    /// **Why this warns rather than clamps**, unlike `MetricsConfig::validate_and_clamp`:
+    /// raising `refresh_interval: 0` to 1s would WIDEN a freshness bound. At zero,
+    /// `MetadataCacheEntry::is_stale` (`elapsed() >= refresh_interval`) is true for every entry,
+    /// so the RAM metadata tier never answers and each verdict is read from shared storage; a
+    /// clamp would silently give that operator up to a second of cross-instance staleness they
+    /// had configured away. And lowering a `max_entries` above 1,000,000 would shrink a cache
+    /// someone sized deliberately. So the value stands, and the warning says what it does.
+    pub(crate) fn warn_if_outside_documented_range(&self) {
+        let refresh_secs = self.refresh_interval.as_secs();
+        if self.refresh_interval.is_zero() {
+            warn!(
+                "cache.metadata_cache.refresh_interval is 0, outside the documented 1-300s range; \
+                 used as configured: every RAM metadata entry is treated as stale, so the RAM \
+                 metadata tier never serves and every lookup reads shared storage. Set \
+                 cache.metadata_cache.enabled: false to turn the tier off explicitly."
+            );
+        } else if !(1..=300).contains(&refresh_secs) {
+            warn!(
+                "cache.metadata_cache.refresh_interval ({:?}) is outside the documented 1-300s \
+                 range; used as configured. It bounds how long this proxy's RAM copy of a \
+                 .meta can lag a change made by another proxy.",
+                self.refresh_interval
+            );
+        }
+        if self.max_entries == 0 {
+            warn!(
+                "cache.metadata_cache.max_entries is 0, outside the documented 100-1000000 \
+                 range; used as configured, which holds at most one entry (each insert evicts \
+                 the one before it)."
+            );
+        } else if !(100..=1_000_000).contains(&self.max_entries) {
+            warn!(
+                "cache.metadata_cache.max_entries ({}) is outside the documented 100-1000000 \
+                 range; used as configured. Each entry is roughly 1-2 KB of RAM.",
+                self.max_entries
+            );
+        }
+    }
+
     /// Convert to the MetadataCacheConfig used by the metadata_cache module
-    pub fn to_metadata_cache_config(&self) -> crate::metadata_cache::MetadataCacheConfig {
+    pub(crate) fn to_metadata_cache_config(&self) -> crate::metadata_cache::MetadataCacheConfig {
         crate::metadata_cache::MetadataCacheConfig {
             enabled: self.enabled,
             refresh_interval: self.refresh_interval,
             max_entries: self.max_entries,
-            stale_handle_max_retries: self.stale_handle_max_retries,
         }
     }
 }
@@ -1293,10 +1548,11 @@ fn default_read_cache_enabled() -> bool {
 }
 
 fn default_evaluate_conditions_from_cache() -> bool {
-    // Enabled by default — serves If-Match requests directly from cache when the
-    // cached ETag matches (no S3 round trip needed; the client's If-Match asserts the
-    // version it wants). If-None-Match / If-Modified-Since / If-Unmodified-Since always
-    // forward to S3. Set false to forward all conditionals to S3 unconditionally.
+    // Enabled by default: a GET, range GET or HEAD whose only conditional is an If-Match
+    // or an If-Range matching the cached ETag is answered from cache (the client names
+    // the version it wants). If-None-Match,
+    // If-Modified-Since, If-Unmodified-Since and mixed conditionals always forward to S3.
+    // Set false to forward all conditionals to S3.
     true
 }
 
@@ -1325,6 +1581,22 @@ fn default_metadata_io_concurrency() -> usize {
     32
 }
 
+/// Default free-space floor on the cache volume: 1 GiB.
+///
+/// Today's hardcoded `cache::DISK_SAFETY_FREE_SPACE_FLOOR_BYTES`, promoted to
+/// configuration by `cache-eviction-at-scale` task 36 because it is the one genuinely
+/// deployment-dependent value in the capacity guard — 1 GiB is generous on a 64 GiB volume
+/// and nothing on a petabyte filer. The const's own comment already argued bytes over
+/// percent correctly; it never argued for being non-configurable.
+///
+/// **The default is sized for moderate single-instance traffic on a small volume, and
+/// deliberately not for a fleet.** See
+/// `capacity_guard::DANGER_BAND_FLOOR_MULTIPLIER` for the aggregate-writer arithmetic and
+/// the sizing rule.
+fn default_disk_safety_free_space_floor() -> u64 {
+    1024 * 1024 * 1024 // 1 GiB
+}
+
 /// Default minimum received fraction of an incomplete range to salvage as a
 /// clamped sub-range: 0.5 (50%).
 ///
@@ -1347,6 +1619,168 @@ fn default_max_complete_body_bytes() -> u64 {
     10 * 1024 * 1024 // 10 MiB
 }
 
+/// Removed `cache.*` keys, paired with what the shipped code does instead.
+///
+/// Each key is a PATH of mapping keys below `cache:`, so a key removed from a nested section is
+/// one more segment rather than a second table: `["ram_cache_flush_threshold"]` is
+/// `cache.ram_cache_flush_threshold`, and `["metadata_cache", "stale_handle_max_retries"]` is
+/// `cache.metadata_cache.stale_handle_max_retries`. A one-segment path walks exactly as the
+/// flat table did.
+///
+/// Kept beside the struct the keys were removed from so the two cannot drift apart.
+const REMOVED_CACHE_KEYS: [(&[&str], &str); 3] = [
+    (
+        &["ram_cache_flush_threshold"],
+        "Buffered cache-hit updates flush at a fixed 10000-entry ceiling.",
+    ),
+    (
+        &["ram_cache_flush_on_eviction"],
+        "RAM cache eviction never flushed buffered updates.",
+    ),
+    (
+        &["metadata_cache", "stale_handle_max_retries"],
+        "A stale file handle on a metadata read is retried a fixed 3 times, 50 ms x attempt \
+         apart, and a read that still fails is treated as a cache miss.",
+    ),
+];
+
+/// Removed `cache.*` switches for behaviour that now always runs, with what runs in their place.
+///
+/// Both were accepted by internal builds only, so no deprecation cycle is owed (Ed,
+/// 2026-10-08: new v3 behaviours get no off switch). A config naming either, at any value,
+/// still loads and runs the default behaviour, and [`warn_on_removed_cache_keys`] logs one
+/// warning per key present. Separate from [`REMOVED_CACHE_KEYS`] because that table's message
+/// says the key never had an effect, which is not true of these.
+pub(crate) const REMOVED_SWITCH_KEYS: [(&[&str], &str); 2] = [
+    (
+        &["shared_storage", "orphan_reclaim_enabled"],
+        "Orphan range files are always reclaimed.",
+    ),
+    (
+        &["shared_storage", "eviction_worklist_enabled"],
+        "Eviction always runs through the shared work list once every proxy on the cache \
+         volume supports it, and falls back to the single-proxy pass until then.",
+    ),
+];
+
+/// Removed `cache.shared_storage.*` fields, with the reason. Some were dead settings; at least
+/// `metadata_lock_timeout_ms` drove cross-host lock staleness in an earlier release
+/// (`changelog-pre-v3.md`). A config naming one still loads and the value is ignored;
+/// [`warn_on_removed_cache_keys`] logs one warning per key present.
+const REMOVED_SHARED_STORAGE_KEYS: [(&[&str], &str); 4] = [
+    (
+        &["shared_storage", "max_cached_objects"],
+        "There is no resident-object limit; `max_cache_size` bounds the cache.",
+    ),
+    (
+        &["shared_storage", "recovery_max_concurrent"],
+        "Orphan range files are reclaimed by a rotation with no settings.",
+    ),
+    (
+        &["shared_storage", "lock_refresh_interval"],
+        "Metadata locks never expire, so there is nothing to refresh.",
+    ),
+    (
+        &["shared_storage", "metadata_lock_timeout_ms"],
+        "Metadata lock acquisition waits for `lock_acquire_wait_budget`.",
+    ),
+];
+
+/// Removed top-level `server.*` fields, with what happens instead.
+const REMOVED_SERVER_KEYS: [(&str, &str); 1] = [(
+    "https_mode",
+    "The HTTPS listener always passes TCP through to S3 uncached.",
+)];
+
+/// Warn for each removed `cache.*` key a loaded config document still sets.
+///
+/// Serde ignores unknown keys, and that is what keeps an existing config file loading across
+/// an upgrade — the contract in the config compatibility rule. The cost is silence:
+/// the operator who tuned the key gets no signal that it does nothing. This restores the
+/// signal without restoring the field, the same trade the retired
+/// `cache.shared_storage.lock_refresh_interval` makes for its CLI flag and env var.
+///
+/// Keyed off the key's PRESENCE, not a deviation from its former default. Both keys shipped in
+/// `config/config.example.yaml` at their defaults, so a `!= default` check would stay quiet for
+/// exactly the operators who copied the example.
+fn warn_on_removed_cache_keys(document: &serde_yaml_ng::Value) {
+    let Some(cache) = document.get("cache") else {
+        return;
+    };
+    for (path, detail) in REMOVED_CACHE_KEYS {
+        // Descend one mapping per segment. `get` on a non-mapping (a scalar, or a null
+        // `metadata_cache:` with nothing under it) yields `None`, so a section that is present
+        // but empty is quiet rather than a false warning.
+        let mut node = Some(cache);
+        for segment in path {
+            node = node.and_then(|n| n.get(*segment));
+        }
+        if node.is_some() {
+            warn!(
+                "Configuration field 'cache.{}' has been removed and had no effect in any \
+                 release that accepted it. {} Delete the field to silence this warning.",
+                path.join("."),
+                detail
+            );
+        }
+    }
+    for (path, detail) in REMOVED_SWITCH_KEYS
+        .iter()
+        .chain(REMOVED_SHARED_STORAGE_KEYS.iter())
+    {
+        let mut node = Some(cache);
+        for segment in path.iter() {
+            node = node.and_then(|n| n.get(*segment));
+        }
+        if node.is_some() {
+            warn!(
+                "Configuration field 'cache.{}' has been removed and is ignored. {} Delete the \
+                 field to silence this warning.",
+                path.join("."),
+                detail
+            );
+        }
+    }
+}
+
+/// Warn for each removed `server.*` key a loaded config document still sets.
+fn warn_on_removed_server_keys(document: &serde_yaml_ng::Value) {
+    let Some(server) = document.get("server") else {
+        return;
+    };
+    for (key, detail) in REMOVED_SERVER_KEYS {
+        if server.get(key).is_some() {
+            warn!(
+                "Configuration field 'server.{}' has been removed and is ignored. {} Delete the \
+                 field to silence this warning.",
+                key, detail
+            );
+        }
+    }
+}
+
+/// WARN once per config load for each accepted-but-inert key present in the loaded document.
+///
+/// Keyed off PRESENCE, for the same reason as [`warn_on_removed_cache_keys`]: the example
+/// config ships these keys at their defaults, so a `!= default` check would stay quiet for the
+/// operators who copied it.
+fn warn_on_inert_cache_keys(document: &serde_yaml_ng::Value) {
+    let present = document
+        .get("cache")
+        .and_then(|c| c.get("shared_storage"))
+        .and_then(|s| s.get("consolidation_size_threshold"))
+        .is_some();
+    if present {
+        warn!("{}", CONSOLIDATION_SIZE_THRESHOLD_DEPRECATION);
+    }
+}
+
+/// The deprecation notice for `cache.shared_storage.consolidation_size_threshold`.
+const CONSOLIDATION_SIZE_THRESHOLD_DEPRECATION: &str =
+    "Configuration field 'cache.shared_storage.consolidation_size_threshold' is deprecated and \
+     has no effect: journal consolidation runs on 'cache.shared_storage.consolidation_interval' \
+     only. The value is ignored. Delete the field to silence this warning.";
+
 /// Cache configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1365,6 +1799,13 @@ pub struct CacheConfig {
     pub write_cache_max_object_size: u64,
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub put_ttl: Duration,
+    /// How long a cached GET entry is served without contacting S3 (default: 1 day).
+    ///
+    /// After it expires, the next read sends S3 a conditional request; an unchanged
+    /// object costs a 304 and no body transfer. The value therefore bounds how long an
+    /// object overwritten or deleted without passing through this proxy can still be
+    /// served from the cache. Immutable data can use up to 315,360,000 seconds
+    /// (10 years), globally or for a prefix in `cache_rules.json`.
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub get_ttl: Duration,
     /// TTL for metadata validation (HEAD requests) - typically shorter than data TTL
@@ -1406,20 +1847,31 @@ pub struct CacheConfig {
         deserialize_with = "duration_serde::deserialize"
     )]
     pub ram_cache_flush_interval: Duration,
-    /// Number of pending updates that triggers an immediate flush
-    /// Default: 100, Range: 10-10000
-    #[serde(default = "default_ram_cache_flush_threshold")]
-    pub ram_cache_flush_threshold: usize,
-    /// Whether to flush pending updates when RAM cache entries are evicted
-    /// Default: false (do not flush on eviction to avoid blocking)
-    #[serde(default = "default_ram_cache_flush_on_eviction")]
-    pub ram_cache_flush_on_eviction: bool,
-    /// DEPRECATED: has no effect. There is no RAM-versus-disk verification loop —
-    /// this field was parsed, validated and logged but never read by any logic.
-    /// RAM/disk coherency is bounded by `metadata_cache.refresh_interval` and by the
-    /// per-key `get_ttl` instead; see `docs/CACHE_FRESHNESS.md`.
-    /// Retained for one release cycle for backward-compatible config parsing.
-    /// Will be removed in a future release.
+    // REMOVED: `ram_cache_flush_threshold` and `ram_cache_flush_on_eviction`.
+    //
+    // Both described flushing buffered cache-hit updates — at a pending-update count, and on
+    // RAM eviction — and no shipped code ever read either. `CacheHitUpdateBuffer::new` passes
+    // the literal `MAX_BUFFER_ENTRIES` (10000), and the parameterised `with_config` is only
+    // ever called with literals. They arrived with the never-implemented archived
+    // `ram-disk-cache-coherency` spec and are the unimplemented remainder of it; the sibling
+    // that was properly re-specified and built is `ram_cache_verification_interval`.
+    //
+    // `ram_cache_flush_threshold` was not wired up instead: the config default was `100`
+    // against that hardcoded cap of `10000`, so honouring it would flush a hundred times more
+    // often on every default deployment — a behaviour change, not a cleanup.
+    //
+    // A config still setting either key loads (unknown keys are ignored) and warns, via
+    // `warn_on_removed_cache_keys`. `ram_cache_flush_interval` above is NOT removed: it
+    // governs no flush, but it has two real consumers.
+    /// How often a RAM range hit is re-verified against the shared `.meta`
+    /// before being served without a Shared_Storage read. `0` verifies on
+    /// every hit (opt-out). Default: 1s, Range: 0-60s.
+    ///
+    /// Un-deprecated in ram-tier-effectiveness Requirement 4 (v2.8.6). This
+    /// field shipped in an earlier release with no consumer, was deprecated
+    /// in v2.8.0, and now has a real one: `CacheManager::ram_verify` uses it
+    /// to bound RAM-served response headers/bytes to one object version
+    /// without paying a disk read on every hit. See `docs/CACHE_FRESHNESS.md`.
     #[serde(
         default = "default_ram_cache_verification_interval",
         deserialize_with = "duration_serde::deserialize"
@@ -1455,6 +1907,7 @@ pub struct CacheConfig {
     /// Requirement: 3.2
     #[serde(default = "default_eviction_target_percent")]
     pub eviction_target_percent: u8,
+
     /// Content-length threshold above which the full-object cache check is skipped
     /// for range requests (default: 64 MiB). Large files are unlikely to be cached
     /// as a single full-object range, so skipping the check avoids scanning hundreds
@@ -1481,24 +1934,21 @@ pub struct CacheConfig {
     /// This allows an "allowlist" pattern where only specific buckets have caching enabled.
     #[serde(default = "default_read_cache_enabled")]
     pub read_cache_enabled: bool,
-    /// Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since,
-    /// If-Unmodified-Since) against cached metadata instead of forwarding to S3
-    /// (default: false).
+    /// Answer a client's lone `If-Match` or lone `If-Range` from cached metadata instead
+    /// of forwarding it to S3 (default: true).
     ///
-    /// When false (default — "always forward"): every conditional GET/HEAD is forwarded
-    /// to S3 with the client's headers intact. S3 is the authoritative decider. Strict
-    /// RFC 7232 compliance and strongest consistency — the proxy cannot serve stale data
-    /// based on a stale cached ETag.
+    /// When true (default): a GET, range GET or HEAD whose only conditional header is
+    /// `If-Match`, with a non-zero `get_ttl` and an unexpired cached entry whose ETag
+    /// matches, is served from cache without contacting S3. A HEAD is answered from the
+    /// cached HEAD entry, which must also be within `head_ttl`. A GET, range GET or HEAD
+    /// whose only conditional header is `If-Range`, with a validator that strong-matches
+    /// the cached ETag, is served from cache the same way. Any
+    /// other conditional (`If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, or
+    /// a mix of headers), a mismatch, or a miss is forwarded to S3. Client bypass headers
+    /// (Cache-Control: no-cache/no-store, Pragma: no-cache) also force forward.
     ///
-    /// When true ("cache evaluates conditions"): if the cached object is unexpired
-    /// (within get_ttl/head_ttl and has ETag + Last-Modified recorded), the proxy
-    /// evaluates the client's conditional headers against cached metadata and returns
-    /// 304 / 412 / 200 locally without contacting S3. Expired cache entries and entries
-    /// lacking required validators fall back to forward-to-S3 behavior. Client bypass
-    /// headers (Cache-Control: no-cache/no-store, Pragma: no-cache) also force forward.
-    /// Reduces S3 round trips for conditional requests at the cost of strict freshness.
-    /// Not recommended with get_ttl = "0s" (every request would fall back to forward
-    /// anyway, defeating the purpose).
+    /// When false: every conditional GET/HEAD is forwarded to S3 with the client's
+    /// headers intact, so S3 decides every precondition.
     #[serde(default = "default_evaluate_conditions_from_cache")]
     pub evaluate_conditions_from_cache: bool,
     /// How long cached bucket settings are considered fresh before re-reading from disk (default: 60s)
@@ -1557,6 +2007,36 @@ pub struct CacheConfig {
     /// Spec: crt-conditional-range-caching Req 2
     #[serde(default = "default_partial_range_commit_ratio")]
     pub partial_range_commit_ratio: f64,
+
+    /// Free space kept in reserve on the cache volume, in bytes, above whatever an
+    /// incoming object needs (default: 1 GiB = 1073741824).
+    ///
+    /// Applies to **every** admission point, write-through and GET-miss fill alike: the
+    /// pre-existing write-through `disk_safety_refusal`, and the danger-band publication
+    /// guard added by `cache-eviction-at-scale` task 36. Caching is declined when the
+    /// volume has less than this free beyond the object's own size; the client request
+    /// always proceeds regardless.
+    ///
+    /// **Sizing rule, and it is aggregate across writers rather than per-instance.** The
+    /// danger band is `4 ×` this floor, and outside the band every writer sharing the
+    /// volume may admit for up to 5 s against its own cached free-space reading. So:
+    ///
+    /// ```text
+    ///   floor  ≥  ( 5 s × Σ fill rate of every writer on the volume  +  largest admitted
+    ///               body )  /  4
+    /// ```
+    ///
+    /// "Every writer" includes non-proxy neighbours on the same filer. At this project's
+    /// recorded ~2.0 GiB/s aggregate fleet cache-miss ingest and a 256 MiB largest body,
+    /// that is ~2.6 GiB — so the 1 GiB default does **not** absorb a fleet running at that
+    /// rate for five seconds. Raising the floor widens the band with it.
+    ///
+    /// `0` disables both the floor and the danger band, leaving only reactive `ENOSPC`
+    /// handling. Not recommended on a shared volume.
+    ///
+    /// Spec: cache-eviction-at-scale task 36 (A1).
+    #[serde(default = "default_disk_safety_free_space_floor")]
+    pub disk_safety_free_space_floor: u64,
 }
 
 impl Default for CacheConfig {
@@ -1574,7 +2054,7 @@ impl Default for CacheConfig {
             write_cache_percent: 10.0,
             write_cache_max_object_size: 256 * 1024 * 1024, // 256MB
             put_ttl: Duration::from_secs(3600),             // 1 hour
-            get_ttl: Duration::from_secs(315360000),        // ~10 years
+            get_ttl: Duration::from_secs(86400),            // 1 day
             head_ttl: Duration::from_secs(60),              // 1 minute
             actively_remove_cached_data: false,
             shared_storage: SharedStorageConfig::default(),
@@ -1582,8 +2062,6 @@ impl Default for CacheConfig {
             range_merge_gap_threshold: default_range_merge_gap_threshold(),
             eviction_buffer_percent: default_eviction_buffer_percent(),
             ram_cache_flush_interval: default_ram_cache_flush_interval(),
-            ram_cache_flush_threshold: default_ram_cache_flush_threshold(),
-            ram_cache_flush_on_eviction: default_ram_cache_flush_on_eviction(),
             ram_cache_verification_interval: default_ram_cache_verification_interval(),
             incomplete_upload_ttl: default_incomplete_upload_ttl(),
             initialization: InitializationConfig::default(),
@@ -1602,6 +2080,7 @@ impl Default for CacheConfig {
             max_metadata_file_bytes: default_max_metadata_file_bytes(),
             metadata_io_concurrency: default_metadata_io_concurrency(),
             partial_range_commit_ratio: default_partial_range_commit_ratio(),
+            disk_safety_free_space_floor: default_disk_safety_free_space_floor(),
         }
     }
 }
@@ -1611,6 +2090,38 @@ impl CacheConfig {
     /// TTL fields exceeding this are rejected at startup.
     /// Requirement: 8.5
     const MAX_TTL_SECONDS: u64 = 315_360_000;
+
+    /// The deprecation notice for `cache.eviction_algorithm: "lru"`, or `None` when the
+    /// configured value is not a retired spelling.
+    ///
+    /// **The behaviour this describes changed in 3.0.0 and the wording tracks it.** While
+    /// LRU was still selectable this notice said `"lru"` "still takes effect: eviction
+    /// continues to order by recency". R10.10 removed LRU as a choice, so that sentence is
+    /// now false and saying it would send an operator looking for recency-ordered eviction
+    /// that is no longer running. The notice now states the three things an operator needs:
+    /// the value is still accepted (so the upgrade did not fail), it resolves to `tinylfu`,
+    /// and the ordering they get is frequency-plus-recency rather than recency.
+    ///
+    /// **This is still not a "has no effect" deprecation.** The value is honoured to the
+    /// extent that it starts the proxy; what it no longer does is select an algorithm.
+    ///
+    /// Returned as a value rather than logged here so the text is assertable without a
+    /// tracing subscriber; `log_deprecated_fields` does the logging. The pure function and
+    /// the wiring are tested separately, because a helper that returns the right string
+    /// and is never called produces exactly the silence this exists to end.
+    ///
+    /// Requirement: cache-eviction-at-scale R10.5, R10.9, R10.10
+    pub(crate) fn eviction_algorithm_deprecation_warning(&self) -> Option<&'static str> {
+        matches!(self.eviction_algorithm, EvictionAlgorithm::DeprecatedLru).then_some(
+            "Configuration field 'cache.eviction_algorithm' is set to 'lru', which has been \
+             removed as a choice and is no longer the default. The value is still accepted \
+             so that this upgrade does not require a config edit, and it now behaves as \
+             'tinylfu': eviction orders by decayed access frequency and recency together, \
+             not by recency alone. No cached data is invalidated and no manual step is \
+             required. Set 'cache.eviction_algorithm: \"tinylfu\"' or remove the field to \
+             silence this warning.",
+        )
+    }
 
     /// Validate cache configuration values.
     ///
@@ -1678,30 +2189,56 @@ impl CacheConfig {
     }
 }
 
-/// Cache eviction algorithms
+/// Cache eviction algorithms.
+///
+/// **There is exactly one selectable algorithm as of 3.0.0.** `TinyLFU` is it. LRU was
+/// removed as a *choice* (cache-eviction-at-scale R10.5, R10.10) — no value of
+/// `cache.eviction_algorithm` selects recency-ordered eviction any more.
+///
+/// [`Self::DeprecatedLru`] is **not a second algorithm**. It is the legacy spelling
+/// `"lru"`, retained so the upgrade contract holds, and it resolves to `TinyLFU`
+/// behaviour. See its own doc comment before adding a variant or reading one as a
+/// behavioural choice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum EvictionAlgorithm {
-    #[serde(rename = "lru")]
-    #[default]
-    LRU, // Least Recently Used (default)
+    /// Decayed-frequency eviction, and the only selectable algorithm as of 3.0.0 (R10.5).
+    /// R4 makes the entry dimension a continuously-running reclaimer rather than an
+    /// occasional pressure response, so ordering quality now applies to every small entry
+    /// on every rotation — which is exactly where decayed frequency beats pure recency.
     #[serde(rename = "tinylfu")]
-    TinyLFU, // Simplified frequency-recency hybrid inspired by TinyLFU
+    #[default]
+    TinyLFU,
+    /// **The legacy spelling `"lru"`, not an algorithm.** A config carrying
+    /// `eviction_algorithm: "lru"` parses into this variant, starts, emits a deprecation
+    /// `WARN`, and evicts as `TinyLFU` — the conversion in
+    /// `From<EvictionAlgorithm> for CacheEvictionAlgorithm` below is the single place that
+    /// mapping lives.
+    ///
+    /// **Why a variant and not `#[serde(alias = "lru")]` on `TinyLFU`.** An alias is the
+    /// obvious mechanism and it cannot satisfy this requirement: it collapses `"lru"` into
+    /// `TinyLFU` during deserialization, so by the time any code can inspect the config the
+    /// fact that the operator wrote `"lru"` is gone, and the warning R10.9 mandates becomes
+    /// unimplementable. the config compatibility rule requires a retired value to
+    /// be accepted *and* to log a warning when used; only a distinguishable variant does
+    /// both. It also makes `Serialize` round-trip `"lru"` → `"lru"` rather than silently
+    /// respelling an operator's file.
+    ///
+    /// Do not use this variant in a test fixture to mean "run LRU" — it does not, and no
+    /// config value does. Retire it (and this variant) one release after 3.0.0 per R10.9.
+    ///
+    /// Requirement: cache-eviction-at-scale R10.9
+    #[serde(rename = "lru")]
+    DeprecatedLru,
 }
 
 impl From<EvictionAlgorithm> for crate::cache::CacheEvictionAlgorithm {
     fn from(algo: EvictionAlgorithm) -> Self {
         match algo {
-            EvictionAlgorithm::LRU => crate::cache::CacheEvictionAlgorithm::LRU,
             EvictionAlgorithm::TinyLFU => crate::cache::CacheEvictionAlgorithm::TinyLFU,
-        }
-    }
-}
-
-impl From<crate::cache::CacheEvictionAlgorithm> for EvictionAlgorithm {
-    fn from(algo: crate::cache::CacheEvictionAlgorithm) -> Self {
-        match algo {
-            crate::cache::CacheEvictionAlgorithm::LRU => EvictionAlgorithm::LRU,
-            crate::cache::CacheEvictionAlgorithm::TinyLFU => EvictionAlgorithm::TinyLFU,
+            // R10.9: the retired spelling behaves as the replacement, and this is the only
+            // site that decides so. `http_proxy.rs`'s startup wiring used to hand-roll a
+            // second copy of this match; it now calls this impl, so the two cannot diverge.
+            EvictionAlgorithm::DeprecatedLru => crate::cache::CacheEvictionAlgorithm::TinyLFU,
         }
     }
 }
@@ -1719,6 +2256,12 @@ fn default_access_log_buffer_size() -> usize {
 /// Default retention period for access log files (30 days)
 fn default_access_log_retention_days() -> u32 {
     30
+}
+
+/// Default node-local state directory: `/var/lib/s3-proxy`, which the shipped systemd unit's
+/// `StateDirectory=s3-proxy` creates writable under `ProtectSystem=strict`.
+fn default_local_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/s3-proxy")
 }
 
 /// Default retention period for application log files (30 days)
@@ -1744,6 +2287,16 @@ pub struct LoggingConfig {
     pub access_log_dir: PathBuf,
     #[serde(deserialize_with = "pathbuf_serde::deserialize")]
     pub app_log_dir: PathBuf,
+    /// Node-local directory for this proxy's own durable state: the pending write-order stamp
+    /// log (`crate::stamp_backlog`). Must be on the instance's own volume, never the shared
+    /// cache volume or shared log storage: a directory inside `cache_dir`, or on a file system that
+    /// is not a known local type (ext2/3/4, XFS, btrfs, tmpfs, overlayfs, ZFS or f2fs), is
+    /// refused at startup and the proxy runs in memory only. Default `/var/lib/s3-proxy`.
+    #[serde(
+        default = "default_local_state_dir",
+        deserialize_with = "pathbuf_serde::deserialize"
+    )]
+    pub local_state_dir: PathBuf,
     pub access_log_enabled: bool,
     pub access_log_mode: AccessLogMode,
     pub log_level: String,
@@ -1836,6 +2389,7 @@ impl Default for LoggingConfig {
         Self {
             access_log_dir: PathBuf::from("/logs/access"),
             app_log_dir: PathBuf::from("/logs/app"),
+            local_state_dir: default_local_state_dir(),
             access_log_enabled: true,
             access_log_mode: AccessLogMode::default(),
             log_level: "info".to_string(),
@@ -2209,8 +2763,8 @@ pub struct HealthConfig {
     pub endpoint: String,
     pub port: u16,
     /// Address to bind the health check server to.
-    /// Default "0.0.0.0" listens on all interfaces (IPv4); use "127.0.0.1" or "::1"
-    /// to restrict to loopback only.
+    /// Default "127.0.0.1" listens on loopback only; set "0.0.0.0" (or "::") to accept
+    /// connections from other hosts, e.g. a load balancer health check.
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
     #[serde(deserialize_with = "duration_serde::deserialize")]
@@ -2261,8 +2815,8 @@ pub struct MetricsConfig {
     pub endpoint: String,
     pub port: u16,
     /// Address to bind the metrics server to.
-    /// Default "0.0.0.0" listens on all interfaces (IPv4); use "127.0.0.1" or "::1"
-    /// to restrict to loopback only.
+    /// Default "127.0.0.1" listens on loopback only; set "0.0.0.0" (or "::") to allow
+    /// scraping from other hosts.
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
     #[serde(deserialize_with = "duration_serde::deserialize")]
@@ -2355,6 +2909,60 @@ impl Default for OtlpConfig {
     }
 }
 
+impl MetricsConfig {
+    /// The shortest `collection_interval` the proxy will run; a smaller value is clamped up to it
+    /// by [`MetricsConfig::validate_and_clamp`].
+    ///
+    /// # Why 10 seconds
+    ///
+    /// The field became live when the background collector was added; before that it was read by
+    /// nothing, so no deployment has ever run at any value of it. A collection's cost is dominated
+    /// by shared-volume document reads and was measured on the fleet at 6.5-10 s before the
+    /// repair-tree reads were de-duplicated. The collector never overlaps runs and skips missed
+    /// ticks, so an interval shorter than one run does not run collections faster than they
+    /// complete — it runs them back to back, permanently, which is a constant shared-volume load
+    /// and a blocking-pool thread held forever for a figure nobody reads more often than a
+    /// scraper polls. Ten seconds is the measured worst run, rounded, so a clamped deployment
+    /// still leaves the volume idle between runs on the fleet this was measured on.
+    pub const MIN_COLLECTION_INTERVAL_SECS: u64 = 10;
+    /// The longest `collection_interval` the proxy will run; a larger value is shortened to it by
+    /// [`MetricsConfig::validate_and_clamp`].
+    ///
+    /// One day. Nothing needs a ceiling for correctness, but an unbounded interval is
+    /// config-reachable all the way to `Instant + Duration` overflow inside `tokio::time::interval`,
+    /// which panics in a spawned task where the panic is swallowed and the collector silently does
+    /// not exist. Past a day the shared-volume figures would be too old to act on anyway.
+    pub const MAX_COLLECTION_INTERVAL_SECS: u64 = 86_400;
+
+    /// Bring `collection_interval` inside its range, warning rather than rejecting.
+    ///
+    /// **Why this clamps rather than rejects.** The field was accepted and ignored for its whole
+    /// life, so any value an existing file carries started the proxy yesterday. Rejecting one now
+    /// would turn a routine upgrade into a startup failure, which
+    /// the config compatibility rule forbids. The same reasoning, and the same warning
+    /// dialect, as `DownloadCoordinationConfig::validate_and_clamp`.
+    pub fn validate_and_clamp(&mut self) {
+        let secs = self.collection_interval.as_secs();
+        if secs < Self::MIN_COLLECTION_INTERVAL_SECS {
+            warn!(
+                "metrics.collection_interval ({:?}) is below minimum ({}s), clamping to {}s",
+                self.collection_interval,
+                Self::MIN_COLLECTION_INTERVAL_SECS,
+                Self::MIN_COLLECTION_INTERVAL_SECS
+            );
+            self.collection_interval = Duration::from_secs(Self::MIN_COLLECTION_INTERVAL_SECS);
+        } else if secs > Self::MAX_COLLECTION_INTERVAL_SECS {
+            warn!(
+                "metrics.collection_interval ({}s) exceeds maximum ({}s), shortening to {}s",
+                secs,
+                Self::MAX_COLLECTION_INTERVAL_SECS,
+                Self::MAX_COLLECTION_INTERVAL_SECS
+            );
+            self.collection_interval = Duration::from_secs(Self::MAX_COLLECTION_INTERVAL_SECS);
+        }
+    }
+}
+
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
@@ -2408,24 +3016,38 @@ impl Default for CallerIdConfig {
 
 /// Fleet sharing configuration for the `cap / N` fairness model.
 ///
-/// The proxy derives the live instance count `N` from the per-instance journal
-/// files written to `cache_dir/metadata/_journals/`.  Each instance periodically
-/// refreshes `N` on a cold path; the hot request path only reads a single atomic.
+/// The proxy derives the live instance count `N` from heartbeat files it writes
+/// to `cache_dir/qos/heartbeats/` — a dedicated subtree, never under `metadata/`,
+/// so liveness state is isolated from the cache-metadata sweeps.  Each instance
+/// periodically refreshes `N` on a cold path; the hot request path only reads a
+/// single atomic.
+///
+/// Because the path is derived from `cache.cache_dir`, a deployment giving each
+/// instance its own cache directory counts one instance everywhere and every
+/// proxy takes the whole aggregate ceiling.  `fallback_instance_count` is the
+/// floor that corrects this — see its own doc comment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FleetSharingConfig {
-    /// Instance count used when the live count cannot be determined from shared
-    /// storage (e.g. storage unavailable at startup).  For a fleet deployment,
+    /// **Floor** on the live instance count, not merely a fallback: the effective
+    /// `N` is `max(counted, fallback_instance_count)`, so it applies continuously
+    /// rather than only when the count cannot be read.  For a fleet deployment,
     /// set this to the fleet size so the per-instance ceiling is
     /// `cap / fallback_instance_count` under coordination loss (safe: throttles
     /// more heavily, never unlimited).  Default: `1` (correct for single-instance;
     /// fleet operators must override).
+    ///
+    /// Required on a deployment where `cache.cache_dir` is per-instance, since the
+    /// counted value is then always 1 and this is the only thing dividing the
+    /// aggregate ceiling.  See `docs/LOCAL_NVME_CACHE.md`.
     pub fallback_instance_count: u32,
-    /// Heartbeat staleness window: journal files older than this are excluded when
-    /// counting live instances `N`.  Default: 30 s.
+    /// Heartbeat staleness window: `.qos` heartbeat files older than this are
+    /// excluded when counting live instances `N`.  Default: 90 s (three refresh
+    /// intervals).  A value below twice the refresh interval is raised to three
+    /// times it, with a startup warning; see `effective_instance_staleness`.
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub instance_staleness: Duration,
-    /// Cold-path cadence for the heartbeat touch + `_journals/` readdir.
+    /// Cold-path cadence for the heartbeat touch + `qos/heartbeats/` readdir.
     /// Floor: 10 s.  Default: 30 s.
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub refresh_interval: Duration,
@@ -2435,9 +3057,61 @@ impl Default for FleetSharingConfig {
     fn default() -> Self {
         Self {
             fallback_instance_count: 1,
-            instance_staleness: Duration::from_secs(30),
+            instance_staleness: Duration::from_secs(90),
             refresh_interval: Duration::from_secs(30),
         }
+    }
+}
+
+/// Smallest staleness window, in refresh intervals, that the fleet task honours as
+/// configured. Below it a heartbeat that lands less than one interval late drops a
+/// live peer out of `N`.
+const MIN_STALENESS_REFRESH_MULTIPLE: u32 = 2;
+
+/// Staleness window, in refresh intervals, used as the default and as the value a
+/// too-small setting is raised to: a peer drops out of `N` only after missing two
+/// consecutive heartbeats.
+const STALENESS_REFRESH_MULTIPLE: u32 = 3;
+
+impl FleetSharingConfig {
+    /// The refresh interval the fleet task actually runs at (floor 10 s).
+    fn effective_refresh_interval(&self) -> Duration {
+        std::cmp::max(self.refresh_interval, Duration::from_secs(10))
+    }
+
+    /// The staleness window the fleet task counts live instances with.
+    ///
+    /// A value below `2 x` the effective refresh interval is raised to `3 x`,
+    /// because a peer's newest heartbeat is up to one full interval old whenever
+    /// this instance reads the directory, before the write, the shared file
+    /// system's mtime and clock skew between hosts add anything. Counting a live
+    /// peer as stale raises every other instance's ceiling.
+    pub(crate) fn effective_instance_staleness(&self) -> Duration {
+        let refresh = self.effective_refresh_interval();
+        if self.instance_staleness < refresh.saturating_mul(MIN_STALENESS_REFRESH_MULTIPLE) {
+            refresh.saturating_mul(STALENESS_REFRESH_MULTIPLE)
+        } else {
+            self.instance_staleness
+        }
+    }
+
+    /// The startup warning for a staleness window that was raised, if it was.
+    pub(crate) fn instance_staleness_warning(&self) -> Option<String> {
+        let effective = self.effective_instance_staleness();
+        (effective != self.instance_staleness).then(|| {
+            format!(
+                "download_bandwidth.fleet.instance_staleness ({}s) is less than twice \
+                 refresh_interval ({}s), so a live instance whose heartbeat is slightly late \
+                 would be counted as stopped and the others would raise their ceilings. \
+                 Using {}s instead. Set instance_staleness to at least {}s to silence this warning.",
+                self.instance_staleness.as_secs_f64(),
+                self.effective_refresh_interval().as_secs_f64(),
+                effective.as_secs_f64(),
+                self.effective_refresh_interval()
+                    .saturating_mul(MIN_STALENESS_REFRESH_MULTIPLE)
+                    .as_secs_f64(),
+            )
+        })
     }
 }
 
@@ -2536,12 +3210,12 @@ impl Default for Config {
                 // out of the box, preserving the pre-clamp default shard concurrency.
                 // Spec: page-aligned-range-cache Resolved Question 4.
                 max_ram_cache_size: 512 * 1024 * 1024, // 512MB
-                eviction_algorithm: EvictionAlgorithm::default(), // LRU for both RAM and disk
+                eviction_algorithm: EvictionAlgorithm::default(), // TinyLFU for both RAM and disk (R10.5)
                 write_cache_enabled: true, // Enabled by default - write caching is complete
                 write_cache_percent: 10.0,
                 write_cache_max_object_size: 256 * 1024 * 1024, // 256MB
                 put_ttl: Duration::from_secs(3600),             // 1 hour
-                get_ttl: Duration::from_secs(315360000),        // ~10 years (infinite caching)
+                get_ttl: Duration::from_secs(86400),            // 1 day
                 head_ttl: Duration::from_secs(60),              // 1 minute
                 actively_remove_cached_data: false,             // Lazy expiration by default
                 // Coordination is unconditional; this configures its parameters, including lock timeouts.
@@ -2550,19 +3224,17 @@ impl Default for Config {
                 range_merge_gap_threshold: 1024 * 1024,                       // 1MiB
                 eviction_buffer_percent: 5,                                   // 5% buffer
                 ram_cache_flush_interval: Duration::from_secs(10),            // 10 seconds (Req 19)
-                ram_cache_flush_threshold: 100,                               // 100 pending updates
-                ram_cache_flush_on_eviction: false, // Do not flush on eviction
-                ram_cache_verification_interval: Duration::from_secs(1), // 1 second
-                incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
+                ram_cache_verification_interval: Duration::from_secs(1),      // 1 second
+                incomplete_upload_ttl: Duration::from_secs(86400),            // 1 day
                 initialization: InitializationConfig::default(), // Default initialization config
-                cache_bypass_headers_enabled: true, // Enabled by default
-                metadata_cache: MetadataCacheConfig::default(), // RAM metadata cache config
-                eviction_trigger_percent: 95,       // Trigger eviction at 95% capacity
-                eviction_target_percent: 80,        // Reduce to 80% after eviction
-                full_object_check_threshold: 67_108_864, // 64 MiB
-                disk_streaming_threshold: 1_048_576, // 1 MiB
-                compression_batch_size: 1_048_576,  // 1 MiB
-                read_cache_enabled: true,           // Read caching enabled by default
+                cache_bypass_headers_enabled: true,              // Enabled by default
+                metadata_cache: MetadataCacheConfig::default(),  // RAM metadata cache config
+                eviction_trigger_percent: 95,                    // Trigger eviction at 95% capacity
+                eviction_target_percent: 80,                     // Reduce to 80% after eviction
+                full_object_check_threshold: 67_108_864,         // 64 MiB
+                disk_streaming_threshold: 1_048_576,             // 1 MiB
+                compression_batch_size: 1_048_576,               // 1 MiB
+                read_cache_enabled: true,                        // Read caching enabled by default
                 bucket_settings_staleness_threshold: Duration::from_secs(60), // 60 seconds
                 evaluate_conditions_from_cache: true, // Default: serve If-Match from cache; If-None-Match/etc still forward
                 ram_cache_shard_count: default_ram_cache_shard_count(),
@@ -2570,10 +3242,12 @@ impl Default for Config {
                 max_metadata_file_bytes: default_max_metadata_file_bytes(),
                 metadata_io_concurrency: default_metadata_io_concurrency(),
                 partial_range_commit_ratio: default_partial_range_commit_ratio(),
+                disk_safety_free_space_floor: default_disk_safety_free_space_floor(),
             },
             logging: LoggingConfig {
                 access_log_dir: PathBuf::from("/logs/access"),
                 app_log_dir: PathBuf::from("/logs/app"),
+                local_state_dir: default_local_state_dir(),
                 access_log_enabled: true,
                 access_log_mode: AccessLogMode::default(),
                 log_level: "info".to_string(),
@@ -2654,7 +3328,12 @@ impl Config {
     /// Load configuration from file, environment, and command line
     pub fn load() -> Result<Self> {
         let matches = Self::build_cli().get_matches();
+        Self::load_from_matches(&matches)
+    }
 
+    /// `load` for an already-parsed command line, so a test can drive the whole startup
+    /// path (file, environment, flags, validation) without the process arguments.
+    pub(crate) fn load_from_matches(matches: &clap::ArgMatches) -> Result<Self> {
         let mut config = Self::default();
 
         // Load from config file if specified
@@ -2666,7 +3345,7 @@ impl Config {
         config.apply_env_overrides();
 
         // Override with command line arguments
-        config.apply_cli_overrides(&matches);
+        config.apply_cli_overrides(matches);
 
         // Deprecation warning: `compression.content_aware` never had any
         // effect (verified: no production code path ever read it) and has
@@ -2682,6 +3361,9 @@ impl Config {
             );
         }
 
+        // The retired orphan-sweep fields parse and are ignored; one warning if any is set.
+        config.cache.shared_storage.warn_retired_orphan_fields();
+
         // Validate shared storage configuration
         if let Err(e) = config.cache.shared_storage.validate() {
             return Err(ProxyError::ConfigError(format!(
@@ -2689,6 +3371,15 @@ impl Config {
                 e
             )));
         }
+        // Publish the metadata slot-lock wait budget to the acquisition primitives.
+        //
+        // They are synchronous free functions, some of them running inside blocking-pool
+        // closures, with no handle to reach a `Config` through — so the value is carried in a
+        // process-wide atomic and seeded here, AFTER validation, which is the one point every
+        // startup passes through exactly once and before any cache manager is constructed.
+        crate::metadata_lock_manager::set_slot_acquire_wait_budget(
+            config.cache.shared_storage.lock_acquire_wait_budget,
+        );
 
         // Validate cache configuration (compression_batch_size, TTL bounds)
         // Requirement: 8.5
@@ -2707,14 +3398,6 @@ impl Config {
             )));
         }
 
-        // Validate initialization configuration
-        if let Err(e) = config.cache.initialization.validate() {
-            return Err(ProxyError::ConfigError(format!(
-                "Invalid initialization configuration: {}",
-                e
-            )));
-        }
-
         // Validate dashboard configuration
         if let Err(e) = config.dashboard.validate() {
             return Err(ProxyError::ConfigError(format!(
@@ -2723,6 +3406,9 @@ impl Config {
             )));
         }
 
+        // Health and metrics bind addresses must be IP addresses; a value that does not
+        // parse is refused here rather than falling back to every interface at bind time.
+        config.validate_listener_addresses()?;
         // Validate download bandwidth QoS configuration (compiles regex at startup)
         if let Err(e) = config.download_bandwidth.validate() {
             return Err(ProxyError::ConfigError(format!(
@@ -2758,6 +3444,15 @@ impl Config {
 
         // Validate and clamp download coordination configuration
         config.cache.download_coordination.validate_and_clamp();
+        // Clamp the metrics collection interval, which became live with the background collector
+        // and so must not reject a value that booted while it was ignored.
+        config.metrics.validate_and_clamp();
+        // The metadata cache's documented ranges were never enforced. Warn, never reject and
+        // never clamp: see `warn_if_outside_documented_range` for why a clamp is unsafe here.
+        config
+            .cache
+            .metadata_cache
+            .warn_if_outside_documented_range();
 
         // Disable RAM cache when get_ttl is zero (every request must validate against S3)
         // RAM cache has no TTL check on the hit path, so it would serve stale data.
@@ -2778,10 +3473,12 @@ impl Config {
 
         // Log shared storage configuration (always enabled)
         info!(
-            "Shared storage mode: lock_timeout={}s, lock_refresh={}s, recovery_max_concurrent={}",
-            config.cache.shared_storage.lock_timeout.as_secs(),
-            config.cache.shared_storage.lock_refresh_interval.as_secs(),
-            config.cache.shared_storage.recovery_max_concurrent
+            "Shared storage mode: lock_acquire_wait_budget={}s",
+            config
+                .cache
+                .shared_storage
+                .lock_acquire_wait_budget
+                .as_secs()
         );
         info!(
             "Shared storage coordination: consolidation_interval={}s, validation_frequency={}h, lock_max_retries={}",
@@ -2803,22 +3500,13 @@ impl Config {
         // Log connection pool configuration
         if config.connection_pool.keepalive_enabled {
             info!(
-                "Connection keepalive enabled (idle_timeout: {}s, max_idle_per_host: {}, max_lifetime: {}s)",
+                "Connection keepalive enabled (idle_timeout: {}s, max_idle_per_host: {})",
                 config.connection_pool.idle_timeout.as_secs(),
-                config.connection_pool.max_idle_per_host,
-                config.connection_pool.max_lifetime.as_secs()
+                config.connection_pool.max_idle_per_host
             );
         } else {
             info!("Connection keepalive disabled");
         }
-
-        // Log initialization configuration
-        info!(
-            "Cache initialization config: parallel_scan={}, scan_timeout={}s, progress_logging={}",
-            config.cache.initialization.parallel_scan,
-            config.cache.initialization.scan_timeout.as_secs(),
-            config.cache.initialization.progress_logging
-        );
 
         // Log dashboard configuration
         if config.dashboard.enabled {
@@ -2896,55 +3584,78 @@ impl Config {
         Ok(config)
     }
 
+    /// The warning for `health.check_interval` and the three `cache.initialization` fields,
+    /// or `None` when every one of them holds its default. They parse, so a config that
+    /// loaded before keeps loading, but nothing reads them. One warning names each one set.
+    fn unread_fields_warning(&self) -> Option<String> {
+        let mut set = Vec::new();
+        if self.health.check_interval != HealthConfig::default().check_interval {
+            set.push("health.check_interval");
+        }
+        let init = &self.cache.initialization;
+        if init.parallel_scan != default_parallel_scan() {
+            set.push("cache.initialization.parallel_scan");
+        }
+        if init.scan_timeout != default_scan_timeout() {
+            set.push("cache.initialization.scan_timeout");
+        }
+        if init.progress_logging != default_progress_logging() {
+            set.push("cache.initialization.progress_logging");
+        }
+        if set.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Configuration field(s) '{}' are ignored: nothing in the proxy reads them \
+             (the PARALLEL_SCAN, SCAN_TIMEOUT and PROGRESS_LOGGING environment variables and the \
+             --parallel-scan, --no-parallel-scan, --scan-timeout, --progress-logging and \
+             --no-progress-logging flags set the cache.initialization fields). Delete them to \
+             silence this warning.",
+            set.join("', '")
+        ))
+    }
+
     /// Log deprecation warnings for config fields that are no longer read by any logic.
     /// These fields are retained for one release cycle for backward-compatible config parsing.
     /// Requirement: 20.5
     fn log_deprecated_fields(&self) {
         if self.cache.eviction_buffer_percent != default_eviction_buffer_percent() {
             warn!(
-                "Configuration field 'cache.eviction_buffer_percent' is deprecated and has no effect. \
-                 Eviction behavior is controlled by 'cache.eviction_trigger_percent' (default 95%) \
-                 and 'cache.eviction_target_percent' (default 80%). This field will be removed in a future release."
-            );
-        }
-        if self.cache.ram_cache_verification_interval != default_ram_cache_verification_interval() {
-            warn!(
-                "Configuration field 'cache.ram_cache_verification_interval' is deprecated and has no effect. \
-                 There is no RAM-versus-disk verification loop; RAM staleness is bounded by \
-                 'cache.metadata_cache.refresh_interval' and by the per-key 'get_ttl'. \
-                 This field will be removed in a future release."
+                "Configuration field 'cache.eviction_buffer_percent' is deprecated and ignored: \
+                 eviction is controlled by 'cache.eviction_trigger_percent' (default 95%) \
+                 and 'cache.eviction_target_percent' (default 80%). Delete the field to silence this warning."
             );
         }
         if !self.metrics.include_cache_stats {
             warn!(
-                "Configuration field 'metrics.include_cache_stats' is deprecated and has no effect. \
-                 All cache stats are always included. This field will be removed in a future release."
+                "Configuration field 'metrics.include_cache_stats' is deprecated and ignored: \
+                 all cache stats are always included. Delete the field to silence this warning."
             );
         }
         if !self.metrics.include_compression_stats {
             warn!(
-                "Configuration field 'metrics.include_compression_stats' is deprecated and has no effect. \
-                 All compression stats are always included. This field will be removed in a future release."
+                "Configuration field 'metrics.include_compression_stats' is deprecated and ignored: \
+                 all compression stats are always included. Delete the field to silence this warning."
             );
         }
         if !self.metrics.include_connection_stats {
             warn!(
-                "Configuration field 'metrics.include_connection_stats' is deprecated and has no effect. \
-                 All connection stats are always included. This field will be removed in a future release."
+                "Configuration field 'metrics.include_connection_stats' is deprecated and ignored: \
+                 all connection stats are always included. Delete the field to silence this warning."
             );
         }
         if self.connection_pool.max_connections_per_ip != 10 {
             warn!(
-                "Configuration field 'connection_pool.max_connections_per_ip' is deprecated and has no effect. \
-                 Connection pooling is managed by 'connection_pool.max_idle_per_host' and \
-                 'connection_pool.max_idle_per_ip'. This field will be removed in a future release."
+                "Configuration field 'connection_pool.max_connections_per_ip' is deprecated and ignored: \
+                 connection pooling is managed by 'connection_pool.max_idle_per_host' and \
+                 'connection_pool.max_idle_per_ip'. Delete the field to silence this warning."
             );
         }
         if self.dashboard.max_log_entries != 100 {
             warn!(
-                "Configuration field 'dashboard.max_log_entries' is deprecated and has no effect. \
-                 Log entries displayed on the dashboard are managed internally. \
-                 This field will be removed in a future release."
+                "Configuration field 'dashboard.max_log_entries' is deprecated and ignored by the \
+                 log viewer (the value is still range-checked, 10-10000). \
+                 Delete the field to silence this warning."
             );
         }
         if let Some(message) = self
@@ -2953,6 +3664,21 @@ impl Config {
         {
             warn!("{}", message);
         }
+        // Unlike every other arm in this function, this one is not about a dead field:
+        // `"lru"` is still accepted and still starts the proxy. What it no longer does is
+        // select an algorithm — 3.0.0 moved the default away from LRU (R10.5) and then
+        // removed it as a choice (R10.10), so the value now resolves to TinyLFU. Without
+        // this arm that remapping happens in total silence. See the helper's doc comment.
+        if let Some(message) = self.cache.eviction_algorithm_deprecation_warning() {
+            warn!("{}", message);
+        }
+        if let Some(message) = self.unread_fields_warning() {
+            warn!("{}", message);
+        }
+        // `cache.ram_cache_flush_threshold` and `cache.ram_cache_flush_on_eviction` are
+        // REMOVED rather than merely dead, so there is no field left to compare against a
+        // default. They are warned about from the loaded document instead, by
+        // `warn_on_removed_cache_keys`.
     }
 
     /// Build CLI argument parser
@@ -3037,31 +3763,31 @@ impl Config {
                 Arg::new("parallel-scan")
                     .long("parallel-scan")
                     .action(clap::ArgAction::SetTrue)
-                    .help("Enable parallel metadata processing during initialization"),
+                    .help("Ignored: has no effect (sets cache.initialization.parallel_scan)"),
             )
             .arg(
                 Arg::new("no-parallel-scan")
                     .long("no-parallel-scan")
                     .action(clap::ArgAction::SetTrue)
-                    .help("Disable parallel metadata processing during initialization"),
+                    .help("Ignored: has no effect (sets cache.initialization.parallel_scan)"),
             )
             .arg(
                 Arg::new("scan-timeout")
                     .long("scan-timeout")
                     .value_name("SECONDS")
-                    .help("Timeout for directory scanning operations (default: 30)"),
+                    .help("Ignored: has no effect (sets cache.initialization.scan_timeout)"),
             )
             .arg(
                 Arg::new("progress-logging")
                     .long("progress-logging")
                     .action(clap::ArgAction::SetTrue)
-                    .help("Enable detailed progress logging during initialization"),
+                    .help("Ignored: has no effect (sets cache.initialization.progress_logging)"),
             )
             .arg(
                 Arg::new("no-progress-logging")
                     .long("no-progress-logging")
                     .action(clap::ArgAction::SetTrue)
-                    .help("Disable detailed progress logging during initialization"),
+                    .help("Ignored: has no effect (sets cache.initialization.progress_logging)"),
             )
             .arg(
                 Arg::new("dashboard-enabled")
@@ -3079,7 +3805,7 @@ impl Config {
                 Arg::new("dashboard-port")
                     .long("dashboard-port")
                     .value_name("PORT")
-                    .help("Dashboard server port (default: 8080)"),
+                    .help("Dashboard server port (default: 8081)"),
             )
             .arg(
                 Arg::new("dashboard-bind-address")
@@ -3089,16 +3815,34 @@ impl Config {
             )
             // Shared storage configuration CLI arguments
             .arg(
+                Arg::new("lock-acquire-wait-budget")
+                    .long("lock-acquire-wait-budget")
+                    .value_name("SECONDS")
+                    .help(
+                        "How long a metadata slot-lock acquisition waits before giving up \
+                         (default: 5)",
+                    ),
+            )
+            .arg(
+                // Renamed to `--lock-acquire-wait-budget`. Kept registered and hidden so an
+                // existing service unit that passes it still starts, and it still SETS the
+                // budget rather than being ignored. `apply_cli_overrides` warns when supplied.
                 Arg::new("lock-timeout")
                     .long("lock-timeout")
                     .value_name("SECONDS")
-                    .help("Lock timeout in seconds (default: 60)"),
+                    .hide(true)
+                    .help("Deprecated alias for --lock-acquire-wait-budget"),
             )
             .arg(
+                // Removed and ignored. Kept registered and hidden so an existing service unit
+                // or wrapper script that passes it still starts — clap errors on an unknown
+                // argument, so deleting it outright would turn a removed field into a failed
+                // boot. `apply_cli_overrides` warns when it is supplied.
                 Arg::new("lock-refresh-interval")
                     .long("lock-refresh-interval")
                     .value_name("SECONDS")
-                    .help("Lock refresh interval in seconds (default: 30)"),
+                    .hide(true)
+                    .help("Removed and ignored; accepted for backward compatibility"),
             )
             .arg(
                 Arg::new("validation-threshold-warn")
@@ -3116,7 +3860,8 @@ impl Config {
                 Arg::new("recovery-max-concurrent")
                     .long("recovery-max-concurrent")
                     .value_name("COUNT")
-                    .help("Maximum concurrent recovery operations (default: 4)"),
+                    .hide(true)
+                    .help("Removed and ignored; accepted for backward compatibility"),
             )
             .arg(
                 Arg::new("consolidation-interval")
@@ -3159,6 +3904,15 @@ impl Config {
         let config: Self = serde_yaml_ng::from_str(&content).map_err(|e| {
             ProxyError::ConfigError(format!("Failed to parse config file {}: {}", path, e))
         })?;
+
+        // Removed keys are silently ignored by serde, which is what keeps an existing config
+        // loading across an upgrade — but silence means an operator who set one never learns
+        // it does nothing. Re-parse as a document to warn by key name.
+        if let Ok(document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content) {
+            warn_on_removed_cache_keys(&document);
+            warn_on_removed_server_keys(&document);
+            warn_on_inert_cache_keys(&document);
+        }
 
         info!("Configuration loaded from file: {}", path);
         Ok(config)
@@ -3283,17 +4037,41 @@ impl Config {
         }
 
         // Shared storage configuration environment overrides
+        if let Ok(budget) = std::env::var("LOCK_ACQUIRE_WAIT_BUDGET") {
+            if let Ok(budget_secs) = budget.parse::<u64>() {
+                self.cache.shared_storage.lock_acquire_wait_budget =
+                    Duration::from_secs(budget_secs);
+            }
+        }
+        // `LOCK_TIMEOUT` set `cache.shared_storage.lock_timeout`, which is now
+        // `lock_acquire_wait_budget`. It still SETS the budget rather than being ignored, so an
+        // existing environment keeps the value the operator chose instead of silently reverting
+        // to the default — and it is warned about so the rename is visible. `LOCK_TIMEOUT` is
+        // read after `LOCK_ACQUIRE_WAIT_BUDGET`, so setting both leaves the deprecated one
+        // winning; that is stated rather than left to be discovered.
         if let Ok(timeout) = std::env::var("LOCK_TIMEOUT") {
+            warn!(
+                "Environment variable 'LOCK_TIMEOUT' is deprecated: it now sets \
+                 'cache.shared_storage.lock_acquire_wait_budget'. Rename it to \
+                 'LOCK_ACQUIRE_WAIT_BUDGET'. The default is 5s, so a value carried over from \
+                 the old 60s default will make a contended metadata lock wait twelve times \
+                 longer before giving up."
+            );
             if let Ok(timeout_secs) = timeout.parse::<u64>() {
-                self.cache.shared_storage.lock_timeout = Duration::from_secs(timeout_secs);
+                self.cache.shared_storage.lock_acquire_wait_budget =
+                    Duration::from_secs(timeout_secs);
             }
         }
 
-        if let Ok(interval) = std::env::var("LOCK_REFRESH_INTERVAL") {
-            if let Ok(interval_secs) = interval.parse::<u64>() {
-                self.cache.shared_storage.lock_refresh_interval =
-                    Duration::from_secs(interval_secs);
-            }
+        // `LOCK_REFRESH_INTERVAL` set the removed `cache.shared_storage.lock_refresh_interval`.
+        // It is still accepted so an existing environment does not change the exit status of a
+        // start, and warned about so the operator gets a signal rather than silence.
+        if std::env::var("LOCK_REFRESH_INTERVAL").is_ok() {
+            warn!(
+                "Environment variable 'LOCK_REFRESH_INTERVAL' is ignored: \
+                 'cache.shared_storage.lock_refresh_interval' has been removed. Metadata locks \
+                 are never refreshed because they never expire, so there was nothing to refresh."
+            );
         }
 
         if let Ok(threshold_warn) = std::env::var("VALIDATION_THRESHOLD_WARN") {
@@ -3308,10 +4086,11 @@ impl Config {
             }
         }
 
-        if let Ok(concurrent) = std::env::var("RECOVERY_MAX_CONCURRENT") {
-            if let Ok(concurrent_count) = concurrent.parse::<usize>() {
-                self.cache.shared_storage.recovery_max_concurrent = concurrent_count;
-            }
+        if std::env::var("RECOVERY_MAX_CONCURRENT").is_ok() {
+            warn!(
+                "Environment variable 'RECOVERY_MAX_CONCURRENT' is ignored: \
+                 'cache.shared_storage.recovery_max_concurrent' has been removed."
+            );
         }
 
         if let Ok(interval) = std::env::var("CONSOLIDATION_INTERVAL") {
@@ -3322,6 +4101,7 @@ impl Config {
         }
 
         if let Ok(threshold) = std::env::var("CONSOLIDATION_SIZE_THRESHOLD") {
+            warn!("{}", CONSOLIDATION_SIZE_THRESHOLD_DEPRECATION);
             if let Ok(threshold_bytes) = threshold.parse::<u64>() {
                 self.cache.shared_storage.consolidation_size_threshold = threshold_bytes;
             }
@@ -3441,17 +4221,40 @@ impl Config {
         }
 
         // Shared storage configuration CLI overrides
+        if let Some(budget) = matches.get_one::<String>("lock-acquire-wait-budget") {
+            if let Ok(budget_secs) = budget.parse::<u64>() {
+                self.cache.shared_storage.lock_acquire_wait_budget =
+                    Duration::from_secs(budget_secs);
+            }
+        }
+        // `--lock-timeout` set `cache.shared_storage.lock_timeout`, which is now
+        // `lock_acquire_wait_budget`. The argument stays registered because clap rejects an
+        // unknown argument, which would turn a rename into a failed boot for any service unit
+        // still passing it — the `--lock-refresh-interval` lesson. Unlike that one it still
+        // SETS the value, so an existing unit file keeps its operator's choice.
         if let Some(timeout) = matches.get_one::<String>("lock-timeout") {
+            warn!(
+                "'--lock-timeout' is deprecated: it now sets \
+                 'cache.shared_storage.lock_acquire_wait_budget'. Rename it to \
+                 '--lock-acquire-wait-budget'. The default is 5s, so a value carried over from \
+                 the old 60s default will make a contended metadata lock wait twelve times \
+                 longer before giving up."
+            );
             if let Ok(timeout_secs) = timeout.parse::<u64>() {
-                self.cache.shared_storage.lock_timeout = Duration::from_secs(timeout_secs);
+                self.cache.shared_storage.lock_acquire_wait_budget =
+                    Duration::from_secs(timeout_secs);
             }
         }
 
-        if let Some(interval) = matches.get_one::<String>("lock-refresh-interval") {
-            if let Ok(interval_secs) = interval.parse::<u64>() {
-                self.cache.shared_storage.lock_refresh_interval =
-                    Duration::from_secs(interval_secs);
-            }
+        // `--lock-refresh-interval` set the removed `cache.shared_storage.lock_refresh_interval`.
+        // The argument is still registered (hidden) so a service unit passing it still starts;
+        // clap rejects an unknown argument, which would turn a removed field into a failed boot.
+        if matches.get_one::<String>("lock-refresh-interval").is_some() {
+            warn!(
+                "'--lock-refresh-interval' is ignored: \
+                 'cache.shared_storage.lock_refresh_interval' has been removed. Metadata locks \
+                 are never refreshed because they never expire, so there was nothing to refresh."
+            );
         }
 
         if let Some(threshold_warn) = matches.get_one::<String>("validation-threshold-warn") {
@@ -3466,10 +4269,14 @@ impl Config {
             }
         }
 
-        if let Some(concurrent) = matches.get_one::<String>("recovery-max-concurrent") {
-            if let Ok(concurrent_count) = concurrent.parse::<usize>() {
-                self.cache.shared_storage.recovery_max_concurrent = concurrent_count;
-            }
+        if matches
+            .get_one::<String>("recovery-max-concurrent")
+            .is_some()
+        {
+            warn!(
+                "'--recovery-max-concurrent' is ignored: \
+                 'cache.shared_storage.recovery_max_concurrent' has been removed."
+            );
         }
 
         if let Some(interval) = matches.get_one::<String>("consolidation-interval") {
@@ -3508,6 +4315,20 @@ impl Config {
     /// Validate TLS proxy listener configuration.
     /// Checks TlsConfig fields and ensures tls_proxy_port does not conflict with other ports.
     /// Requirements: 6.2, 6.3, 6.5
+    /// Reject a `health.bind_address` or `metrics.bind_address` that is not an IP address.
+    ///
+    /// Only an enabled listener is checked: a disabled one never binds, so an unparseable
+    /// value there has never had an effect and must not stop an existing deployment.
+    fn validate_listener_addresses(&self) -> Result<()> {
+        if self.health.enabled {
+            validate_listener_ip("health.bind_address", &self.health.bind_address)?;
+        }
+        if self.metrics.enabled {
+            validate_listener_ip("metrics.bind_address", &self.metrics.bind_address)?;
+        }
+        Ok(())
+    }
+
     fn validate_tls_config(&self) -> Result<()> {
         if let Some(tls) = &self.server.tls {
             if let Err(e) = tls.validate() {
@@ -3607,28 +4428,28 @@ impl Config {
             self.cache.ram_cache_flush_interval = Duration::from_secs(10);
         }
 
-        // Validate flush_threshold (10-10000)
-        if self.cache.ram_cache_flush_threshold < 10 || self.cache.ram_cache_flush_threshold > 10000
-        {
-            warn!(
-                "Invalid ram_cache_flush_threshold: {} (must be 10-10000), using default 100",
-                self.cache.ram_cache_flush_threshold
-            );
-            self.cache.ram_cache_flush_threshold = 100;
-        }
+        // `ram_cache_flush_threshold`'s 10-10000 range check went with the field. Validation
+        // only ever got looser here, so no config that loaded before this release fails now.
 
-        // `ram_cache_verification_interval` is deliberately NOT range-validated here.
-        // It has no consumer, so clamping an out-of-range value to 1s corrected nothing
-        // and only made a dead field look live. A non-default value is reported once by
-        // `log_deprecated_fields()` instead.
+        // Validate ram_cache_verification_interval (0-60s). 0 is a valid opt-out
+        // (verify on every RAM hit), per ram-tier-effectiveness Requirement 4
+        // criterion 6 — this is why the range is 0-60s rather than the archived
+        // ram-disk-cache-coherency design's 1-60s.
+        if self.cache.ram_cache_verification_interval > Duration::from_secs(60) {
+            warn!(
+                "Invalid cache.ram_cache_verification_interval: {}s (must be 0-60s), using default 1s",
+                self.cache.ram_cache_verification_interval.as_secs()
+            );
+            self.cache.ram_cache_verification_interval = Duration::from_secs(1);
+        }
 
         // Log configuration
         if self.cache.ram_cache_enabled {
             info!(
-                "RAM cache flush config: interval={}s, threshold={}, flush_on_eviction={}",
-                self.cache.ram_cache_flush_interval.as_secs(),
-                self.cache.ram_cache_flush_threshold,
-                self.cache.ram_cache_flush_on_eviction
+                "RAM cache access-activity window: {}s (2 x cache.ram_cache_flush_interval={}s, \
+                 which governs no flush)",
+                self.cache.ram_cache_flush_interval.as_secs() * 2,
+                self.cache.ram_cache_flush_interval.as_secs()
             );
         }
 
@@ -3729,6 +4550,16 @@ impl Config {
 mod tests {
     use super::*;
     use tempfile;
+
+    /// a config that omits `logging.local_state_dir` gets the root-volume default.
+    #[test]
+    fn local_state_dir_defaults_when_omitted() {
+        let logging: LoggingConfig =
+            serde_yaml_ng::from_str("app_log_dir: /x/app\naccess_log_dir: /x/access\n").unwrap();
+        assert_eq!(logging.local_state_dir, PathBuf::from("/var/lib/s3-proxy"));
+        let set: LoggingConfig = serde_yaml_ng::from_str("local_state_dir: /var/lib/p\n").unwrap();
+        assert_eq!(set.local_state_dir, PathBuf::from("/var/lib/p"));
+    }
 
     #[test]
     fn test_duration_parsing_seconds() {
@@ -4302,8 +5133,15 @@ metrics:
         let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         // Should use default values when not specified
         assert_eq!(config.cache.eviction_buffer_percent, 5);
-        // shared_storage.lock_timeout defaults to 60s
-        assert_eq!(config.cache.shared_storage.lock_timeout.as_secs(), 60);
+        // shared_storage.lock_acquire_wait_budget defaults to 5s
+        assert_eq!(
+            config
+                .cache
+                .shared_storage
+                .lock_acquire_wait_budget
+                .as_secs(),
+            5
+        );
     }
 
     #[test]
@@ -4372,7 +5210,16 @@ metrics:
         let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         // Should use custom values when specified
         assert_eq!(config.cache.eviction_buffer_percent, 10);
-        assert_eq!(config.cache.shared_storage.lock_timeout.as_secs(), 120);
+        // Written as `lock_timeout` in the YAML above, read through the serde alias — so this
+        // assertion is also the whole-`Config` proof that an existing file keeps its value.
+        assert_eq!(
+            config
+                .cache
+                .shared_storage
+                .lock_acquire_wait_budget
+                .as_secs(),
+            120
+        );
     }
 
     #[test]
@@ -4451,6 +5298,50 @@ metrics:
         );
     }
 
+    /// A config that omits `cache.get_ttl` gets the 1-day default, from the YAML path
+    /// and from both `Default` impls (config-compatibility: no field the operator did
+    /// not write may change how the file parses).
+    #[test]
+    fn minimal_config_defaults_get_ttl_to_one_day() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+        assert_eq!(
+            config.cache.get_ttl,
+            Duration::from_secs(86_400),
+            "a config without cache.get_ttl must default to 1 day"
+        );
+        assert_eq!(CacheConfig::default().get_ttl, Duration::from_secs(86_400));
+        assert_eq!(Config::default().cache.get_ttl, Duration::from_secs(86_400));
+        assert!(config.cache.validate().is_ok());
+    }
+
+    /// The old default stays a valid explicit value: an operator keeping 10-year
+    /// caching for immutable data sets `get_ttl: "315360000s"`, and it parses and
+    /// validates unchanged.
+    #[test]
+    fn explicit_ten_year_get_ttl_is_still_accepted() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+  get_ttl: "315360000s"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("config must parse");
+        assert_eq!(config.cache.get_ttl, Duration::from_secs(315_360_000));
+        assert!(
+            config.cache.validate().is_ok(),
+            "get_ttl of 315360000s (the validated maximum) must be accepted"
+        );
+    }
+
     #[test]
     fn test_minimal_config_fills_struct_defaults() {
         // Regression test: a config that only specifies the essential path fields
@@ -4474,9 +5365,10 @@ logging:
         assert!(config.logging.access_log_enabled);
         assert_eq!(config.logging.log_level, "info");
         assert_eq!(config.connection_pool.max_connections_per_ip, 10);
-        // bind_address defaults preserve all-interfaces behavior (Req 15).
-        assert_eq!(config.health.bind_address, "0.0.0.0");
-        assert_eq!(config.metrics.bind_address, "0.0.0.0");
+        // Admin listeners default to loopback only.
+        assert_eq!(config.health.bind_address, "127.0.0.1");
+        assert_eq!(config.metrics.bind_address, "127.0.0.1");
+        assert_eq!(config.dashboard.bind_address, "127.0.0.1");
         // Metadata resilience defaults (cache-metadata-resilience spec).
         assert_eq!(config.cache.max_metadata_file_bytes, 4 * 1024 * 1024);
         assert_eq!(config.cache.metadata_io_concurrency, 32);
@@ -4512,7 +5404,8 @@ logging:
         assert_eq!(config.download_bandwidth.fleet.fallback_instance_count, 1);
         assert_eq!(
             config.download_bandwidth.fleet.instance_staleness,
-            Duration::from_secs(30)
+            Duration::from_secs(90),
+            "an omitted instance_staleness must default to three refresh intervals"
         );
         assert_eq!(
             config.download_bandwidth.fleet.refresh_interval,
@@ -4526,44 +5419,60 @@ logging:
     }
 
     #[test]
-    fn test_deprecated_ram_cache_verification_interval_still_parses() {
-        // Config-compat (config-compatibility.md, cache-eviction-at-scale Req 9.4):
-        // `cache.ram_cache_verification_interval` is deprecated and has no consumer,
-        // but an existing deployment's config file sets it. Such a file MUST still
-        // parse, and the value MUST still round-trip into the struct so
-        // `log_deprecated_fields()` can recognise it as non-default and warn.
+    fn test_ram_cache_verification_interval_parses_and_round_trips() {
+        // Un-deprecated in ram-tier-effectiveness Requirement 4 (v2.8.6): the field
+        // now has a real consumer (`CacheManager::ram_verify`). A config file
+        // setting it to an in-range value must parse and round-trip unchanged.
         let yaml = r#"
 cache:
   cache_dir: "./cache"
-  ram_cache_verification_interval: "600s"
+  ram_cache_verification_interval: "30s"
 logging:
   access_log_dir: "./logs/access"
   app_log_dir: "./logs/app"
 "#;
 
-        let config: Config = serde_yaml_ng::from_str(yaml)
-            .expect("a config setting the deprecated field must still parse");
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("a config setting the field must parse");
         assert_eq!(
             config.cache.ram_cache_verification_interval,
-            Duration::from_secs(600),
-            "the deprecated field must round-trip so the startup warning can detect a non-default value"
-        );
-        // 600s is outside the range the removed validator accepted (1-60s), and nothing
-        // clamps it any more: the range check went with the consumer, so the parsed
-        // value survives untouched rather than being silently rewritten to 1s. Clamping
-        // a field nothing reads corrected nothing and made a dead field look live.
-        assert_ne!(
-            config.cache.ram_cache_verification_interval,
-            default_ram_cache_verification_interval(),
-            "a set value must remain distinguishable from the default"
+            Duration::from_secs(30),
+            "an in-range value must round-trip"
         );
     }
 
     #[test]
-    fn test_deprecated_ram_cache_verification_interval_defaults_when_omitted() {
-        // The other half of the compatibility contract: a config file that omits the
-        // deprecated field must parse and apply the default, so no operator is forced
-        // to add a field that does nothing.
+    fn test_ram_cache_verification_interval_out_of_range_clamps_to_default() {
+        // Requirement 4 criterion 6: 0 is a valid opt-out (verify on every RAM
+        // hit), so the range is 0-60s. A value above 60s is out of range and
+        // gets clamped to the 1s default by `validate_ram_cache_flush_config()`.
+        let mut config = Config::default();
+        config.cache.ram_cache_verification_interval = Duration::from_secs(600);
+        config.validate_ram_cache_flush_config();
+        assert_eq!(
+            config.cache.ram_cache_verification_interval,
+            Duration::from_secs(1),
+            "an out-of-range value must be clamped to the 1s default"
+        );
+    }
+
+    #[test]
+    fn test_ram_cache_verification_interval_zero_is_a_valid_opt_out() {
+        // Requirement 4 criterion 6: 0 means "verify every RAM hit" and must
+        // NOT be clamped away by range validation.
+        let mut config = Config::default();
+        config.cache.ram_cache_verification_interval = Duration::ZERO;
+        config.validate_ram_cache_flush_config();
+        assert_eq!(
+            config.cache.ram_cache_verification_interval,
+            Duration::ZERO,
+            "zero must remain a valid opt-out, not be clamped to the default"
+        );
+    }
+
+    #[test]
+    fn test_ram_cache_verification_interval_defaults_when_omitted() {
+        // A config file that omits the field must parse and apply the 1s default.
         let yaml = r#"
 cache:
   cache_dir: "./cache"
@@ -4572,25 +5481,74 @@ logging:
   app_log_dir: "./logs/app"
 "#;
 
-        let config: Config = serde_yaml_ng::from_str(yaml)
-            .expect("a config omitting the deprecated field must parse");
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("a config omitting the field must parse");
         assert_eq!(
             config.cache.ram_cache_verification_interval,
             default_ram_cache_verification_interval(),
-            "omitting the deprecated field must apply the default, not fail validation"
+            "omitting the field must apply the default"
         );
         assert_eq!(
             config.cache.ram_cache_verification_interval,
             Duration::from_secs(1),
-            "the default is unchanged by the deprecation"
+            "the default is 1 second"
         );
     }
 
     #[test]
+    fn test_admin_bind_addresses_default_to_loopback_when_sections_omitted() {
+        // A config with no health, metrics or dashboard section at all must bind
+        // all three unauthenticated admin listeners to loopback.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("config must parse");
+        assert_eq!(
+            config.health.bind_address, "127.0.0.1",
+            "health bind_address must default to 127.0.0.1 when the section is omitted"
+        );
+        assert_eq!(
+            config.metrics.bind_address, "127.0.0.1",
+            "metrics bind_address must default to 127.0.0.1 when the section is omitted"
+        );
+        assert_eq!(
+            config.dashboard.bind_address, "127.0.0.1",
+            "dashboard bind_address must default to 127.0.0.1 when the section is omitted"
+        );
+    }
+
+    #[test]
+    fn test_admin_bind_addresses_explicit_all_interfaces_is_kept() {
+        // An operator who opens the listeners explicitly keeps that choice.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+health:
+  bind_address: "0.0.0.0"
+metrics:
+  bind_address: "0.0.0.0"
+dashboard:
+  bind_address: "0.0.0.0"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("config must parse");
+        assert_eq!(config.health.bind_address, "0.0.0.0");
+        assert_eq!(config.metrics.bind_address, "0.0.0.0");
+        assert_eq!(config.dashboard.bind_address, "0.0.0.0");
+    }
+
+    #[test]
     fn test_bind_address_defaults_when_omitted() {
-        // Config-compat regression (Req 15): health/metrics bind_address fields
-        // omitted from the config file must default to "0.0.0.0" (all-interfaces),
-        // preserving pre-2.1.1 behavior.
+        // Config-compat regression: a health/metrics section that omits
+        // bind_address must still parse and default to loopback.
         let yaml = r#"
 cache:
   cache_dir: "./cache"
@@ -4611,12 +5569,12 @@ metrics:
 
         let config: Config = serde_yaml_ng::from_str(yaml).expect("config must parse");
         assert_eq!(
-            config.health.bind_address, "0.0.0.0",
-            "health bind_address must default to 0.0.0.0 when omitted"
+            config.health.bind_address, "127.0.0.1",
+            "health bind_address must default to 127.0.0.1 when omitted"
         );
         assert_eq!(
-            config.metrics.bind_address, "0.0.0.0",
-            "metrics bind_address must default to 0.0.0.0 when omitted"
+            config.metrics.bind_address, "127.0.0.1",
+            "metrics bind_address must default to 127.0.0.1 when omitted"
         );
     }
 
@@ -4797,9 +5755,9 @@ logging:
         assert_eq!(
             config.server.max_buffered_request_body_bytes_deprecation_warning(),
             Some(
-                "Configuration field 'server.max_buffered_request_body_bytes' is deprecated and has no effect. \
-                 S3's own single-part PUT and UploadPart limits now apply. \
-                 This field will be removed in a future release."
+                "Configuration field 'server.max_buffered_request_body_bytes' is deprecated and ignored: \
+                 S3's own single-part PUT and UploadPart limits apply. \
+                 Delete the field to silence this warning."
             ),
             "a non-default deprecated value must produce the startup warning"
         );
@@ -5291,40 +6249,16 @@ tcp_recv_buffer_size: 262144
     }
 
     #[test]
-    fn test_initialization_config_validation_valid() {
-        let config = InitializationConfig {
-            parallel_scan: true,
-            scan_timeout: Duration::from_secs(30),
-            progress_logging: true,
-        };
-
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_initialization_config_validation_invalid_timeout() {
-        // Test timeout too short
-        let config = InitializationConfig {
-            scan_timeout: Duration::from_secs(4),
-            ..InitializationConfig::default()
-        };
-        assert!(config.validate().is_err());
-
-        // Test timeout too long
-        let config = InitializationConfig {
-            scan_timeout: Duration::from_secs(301),
-            ..InitializationConfig::default()
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
     fn test_shared_storage_config_defaults() {
         let config = SharedStorageConfig::default();
 
         // Note: enabled field was removed - shared storage coordination is always enabled
-        assert_eq!(config.lock_timeout, Duration::from_secs(60));
-        assert_eq!(config.lock_refresh_interval, Duration::from_secs(30));
+        assert_eq!(
+            config.lock_acquire_wait_budget,
+            Duration::from_secs(5),
+            "the default must stay 5s: three acquisition sites hardcoded a five-second bound \
+             before this field was honoured, and any other default silently changes them"
+        );
         assert_eq!(config.validation_threshold_warn, 5.0);
         assert_eq!(config.validation_threshold_error, 20.0);
         assert_eq!(
@@ -5333,10 +6267,458 @@ tcp_recv_buffer_size: 262144
         );
     }
 
+    /// `metadata_lock_timeout_ms` is REMOVED, and an existing `config.yaml` carrying it must
+    /// still parse.
+    ///
+    /// The upgrade contract is that an existing deployment's config keeps working after a
+    /// binary swap with no edits (the config compatibility rule).
+    ///
+    /// # Why the field could simply be deleted rather than kept as an ignored shim
+    ///
+    /// Because this struct does NOT carry `deny_unknown_fields`, so the deserializer ignores
+    /// keys it does not know — crate-wide, not as a property of this field. That is the actual
+    /// mechanism the upgrade contract rests on, so it is what this test pins. A first version
+    /// of this change kept the field as a renamed `Option<u64>` shim and asserted that an old
+    /// config parsed; that assertion passed identically with the field deleted, so it was
+    /// evidence about the deserializer while reading as evidence about the shim.
+    #[test]
+    fn a_config_carrying_the_removed_metadata_lock_timeout_still_parses() {
+        let yaml = r#"
+lock_timeout: 60s
+metadata_lock_timeout_ms: 45000
+validation_threshold_warn: 5.0
+"#;
+        let parsed: SharedStorageConfig =
+            serde_yaml_ng::from_str(yaml).expect("a config carrying the removed field must parse");
+        assert_eq!(parsed.lock_acquire_wait_budget, Duration::from_secs(60));
+        assert_eq!(
+            parsed.validation_threshold_warn, 5.0,
+            "fields AFTER the removed key must still be read, so the unknown key is skipped \
+             rather than terminating the mapping"
+        );
+    }
+
+    /// The mechanism above, stated directly: unknown keys are ignored.
+    ///
+    /// If this ever fails, `deny_unknown_fields` has been added somewhere above and EVERY
+    /// removed config field becomes a startup failure on upgrade — including this one, which
+    /// would then need reinstating as an ignored shim.
+    #[test]
+    fn unknown_shared_storage_keys_are_ignored_which_is_what_makes_removal_safe() {
+        let yaml = r#"
+lock_timeout: 60s
+a_key_no_version_of_this_software_has_ever_had: 45
+"#;
+        let parsed: SharedStorageConfig = serde_yaml_ng::from_str(yaml).expect(
+            "unknown keys must be ignored; if they are not, removing any config field breaks \
+             the upgrade contract",
+        );
+        assert_eq!(parsed.lock_acquire_wait_budget, Duration::from_secs(60));
+    }
+
+    /// `lock_refresh_interval` is REMOVED, and an existing config carrying it must still load.
+    ///
+    /// The field described refreshing held locks to prevent an expiration the protocol does not
+    /// have, and nothing outside this module ever read it. Removing it also removed a validation
+    /// rule (`lock_refresh_interval < lock_timeout`, plus a 5-120s range), so the value used here
+    /// is one the old rule REJECTED: it proves both that the key is skipped and that no surviving
+    /// rule rejects it. Validation only ever got looser, so no config that loaded before fails now.
+    #[test]
+    fn a_config_carrying_the_removed_lock_refresh_interval_still_loads() {
+        let yaml = r#"
+lock_timeout: 60s
+lock_refresh_interval: 999s
+validation_threshold_warn: 5.0
+"#;
+        let parsed: SharedStorageConfig = serde_yaml_ng::from_str(yaml)
+            .expect("a config carrying the removed lock_refresh_interval must parse");
+        assert_eq!(parsed.lock_acquire_wait_budget, Duration::from_secs(60));
+        assert_eq!(
+            parsed.validation_threshold_warn, 5.0,
+            "fields AFTER the removed key must still be read, so the unknown key is skipped \
+             rather than terminating the mapping"
+        );
+        assert!(
+            parsed.validate().is_ok(),
+            "999s exceeded the retired 5-120s range AND the retired 'must be less than \
+             lock_timeout' rule; with both gone it must validate"
+        );
+    }
+
+    /// `--lock-refresh-interval` is still ACCEPTED by the argument parser.
+    ///
+    /// Removing a config field is safe for YAML because unknown keys are ignored, but clap
+    /// rejects an unknown argument — so deleting the flag would turn a removed field into a
+    /// failed boot for any service unit or wrapper script that passes it. The flag is retained
+    /// hidden and `apply_cli_overrides` warns when it is supplied.
+    #[test]
+    fn the_removed_lock_refresh_interval_flag_is_still_accepted_by_the_parser() {
+        let matches = Config::build_cli()
+            .try_get_matches_from(vec!["s3-proxy", "--lock-refresh-interval", "30"])
+            .expect(
+                "the retired flag must still parse; clap errors on an unknown argument, which \
+                 would make an upgrade fail to start",
+            );
+        assert_eq!(
+            matches
+                .get_one::<String>("lock-refresh-interval")
+                .map(String::as_str),
+            Some("30"),
+            "the argument must reach ArgMatches so the ignored-field warning can fire"
+        );
+    }
+
     #[test]
     fn test_shared_storage_config_validation_valid() {
         let config = SharedStorageConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    /// A minimal-but-complete config file with `orphan_recovery_interval` set to `secs`.
+    ///
+    /// `Config` carries no struct-level `#[serde(default)]`, so a partial document does not
+    /// deserialize; this is the shape `test_initialization_config_defaults_when_missing`
+    /// already establishes as sufficient, plus the one field under test.
+    pub(super) fn yaml_with_orphan_recovery_interval(secs: &str) -> String {
+        format!(
+            r#"
+server:
+  http_port: 8000
+  https_port: 8443
+  max_concurrent_requests: 200
+  request_timeout: "30s"
+cache:
+  cache_dir: "./cache"
+  max_cache_size: 1073741824
+  ram_cache_enabled: false
+  max_ram_cache_size: 268435456
+  eviction_algorithm: "lru"
+  write_cache_enabled: false
+  write_cache_percent: 10.0
+  write_cache_max_object_size: 268435456
+  put_ttl: "1h"
+  get_ttl: "315360000s"
+  head_ttl: "1h"
+  shared_storage:
+    orphan_recovery_interval: "{}"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+  access_log_enabled: true
+  access_log_mode: "all"
+  log_level: "info"
+connection_pool:
+  max_connections_per_ip: 10
+  dns_refresh_interval: "1m"
+  connection_timeout: "30s"
+  idle_timeout: "2m"
+compression:
+  enabled: true
+  threshold: 1024
+  preferred_algorithm: "lz4"
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  check_interval: "1m"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 8080
+  collection_interval: "5m"
+  include_cache_stats: true
+  include_compression_stats: true
+  include_connection_stats: true
+  otlp:
+    enabled: false
+    endpoint: "http://localhost:4318"
+    export_interval: "1m"
+    timeout: "30s"
+    compression: "none"
+    headers: {{}}
+"#,
+            secs
+        )
+    }
+
+    /// Capture `warn!` output emitted inside `f`, so a clamp warning can be asserted as text.
+    ///
+    /// Thread-local (`with_default`), so this is safe under the parallel test harness and
+    /// cannot capture another test's logging.
+    pub(super) fn capture_warnings<F: FnOnce()>(f: F) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("captured log output must be UTF-8")
+    }
+
+    /// `metrics.collection_interval` was accepted and ignored until the background metrics
+    /// collector made it live, so every value in an existing file booted. It must still boot,
+    /// clamped into `[MIN_COLLECTION_INTERVAL_SECS, MAX_COLLECTION_INTERVAL_SECS]` with a WARN,
+    /// and `Config::load` must be the path that clamps it.
+    ///
+    /// `"0s"` is the value that matters most: an unclamped zero reaches `tokio::time::interval`,
+    /// which panics inside the spawned collector, where the panic is swallowed and the collector
+    /// silently does not exist.
+    #[test]
+    fn out_of_range_collection_interval_still_boots_clamped() {
+        for (supplied, expected_secs) in [
+            (Duration::from_secs(0), 10u64),
+            (Duration::from_millis(500), 10),
+            (Duration::from_secs(9), 10),
+            (Duration::from_secs(10), 10),
+            (Duration::from_secs(60), 60),
+            (Duration::from_secs(172_800), 86_400),
+        ] {
+            let mut metrics = MetricsConfig {
+                collection_interval: supplied,
+                ..MetricsConfig::default()
+            };
+            let logged = capture_warnings(|| metrics.validate_and_clamp());
+            assert_eq!(
+                metrics.collection_interval,
+                Duration::from_secs(expected_secs),
+                "collection_interval={:?} must clamp to {}s",
+                supplied,
+                expected_secs
+            );
+            let in_range = supplied.as_secs() >= MetricsConfig::MIN_COLLECTION_INTERVAL_SECS
+                && supplied.as_secs() <= MetricsConfig::MAX_COLLECTION_INTERVAL_SECS;
+            assert_eq!(
+                logged.contains("metrics.collection_interval"),
+                !in_range,
+                "a clamp must warn, and an in-range value must not: {:?} logged {:?}",
+                supplied,
+                logged
+            );
+        }
+
+        // Wiring: `Config::load` calls the clamp. Built with `concat!` so this test's own source
+        // does not contain the literal it searches for.
+        let needle = concat!("config.metrics.", "validate_and_clamp();");
+        let source = include_str!("config.rs");
+        let load = source
+            .find("pub fn load() -> Result<Self>")
+            .expect("Config::load");
+        assert!(
+            source[load..].contains(needle),
+            "Config::load must clamp metrics.collection_interval before the collector reads it"
+        );
+    }
+
+    /// Part D — `cache.metadata_cache`'s documented ranges (refresh_interval 1-300s,
+    /// max_entries 100-1,000,000) were never enforced, because `MetadataCacheConfig::validate`
+    /// has no startup caller. `Config::load` now WARNS for a value outside them and keeps it:
+    /// every such value booted before, and a clamp of `refresh_interval: 0` would widen a
+    /// freshness bound (see `warn_if_outside_documented_range`).
+    ///
+    /// Two halves. The behaviour: each out-of-range shape warns naming its field, and an
+    /// in-range config (the default, and both range edges) warns about nothing, so the warning
+    /// cannot become noise on a correct file. The wiring: `Config::load` builds its own CLI
+    /// matcher and cannot run under the test harness, so the call is pinned by source the way
+    /// `out_of_range_collection_interval_still_boots_clamped` pins its clamp.
+    #[test]
+    fn out_of_range_metadata_cache_values_warn_on_load_and_are_kept() {
+        let cases: [(Duration, usize, &[&str]); 8] = [
+            (Duration::from_secs(5), 100_000, &[]),
+            (Duration::from_secs(1), 100, &[]),
+            (Duration::from_secs(300), 1_000_000, &[]),
+            (
+                Duration::ZERO,
+                100_000,
+                &["refresh_interval is 0", "never serves"],
+            ),
+            (
+                Duration::from_secs(301),
+                100_000,
+                &["refresh_interval (301s)"],
+            ),
+            (
+                Duration::from_secs(5),
+                0,
+                &["max_entries is 0", "at most one entry"],
+            ),
+            (Duration::from_secs(5), 99, &["max_entries (99)"]),
+            (
+                Duration::from_secs(5),
+                1_000_001,
+                &["max_entries (1000001)"],
+            ),
+        ];
+        for (refresh_interval, max_entries, expected) in cases {
+            let cfg = MetadataCacheConfig {
+                refresh_interval,
+                max_entries,
+                ..MetadataCacheConfig::default()
+            };
+            let logged = capture_warnings(|| cfg.warn_if_outside_documented_range());
+            if expected.is_empty() {
+                assert!(
+                    logged.is_empty(),
+                    "an in-range metadata_cache ({refresh_interval:?}, {max_entries}) must not \
+                     warn; logged {logged:?}"
+                );
+            }
+            for needle in expected {
+                assert!(
+                    logged.contains(" WARN ") && logged.contains(needle),
+                    "metadata_cache ({refresh_interval:?}, {max_entries}) must WARN containing \
+                     {needle:?}; logged {logged:?}"
+                );
+            }
+        }
+        // Wiring. Built with `concat!` so this test's own source does not contain the literal.
+        // rustfmt breaks the call's receiver chain across lines, so match the method call alone;
+        // Config::load has no other receiver for it.
+        let needle = concat!(".warn_if_outside", "_documented_range();");
+        let source = include_str!("config.rs");
+        let load = source
+            .find("pub fn load() -> Result<Self>")
+            .expect("Config::load");
+        // Scoped to Config::load's own body: it ends where the next `fn` in the impl begins.
+        let load_end = load
+            + source[load..]
+                .find("\n    fn ")
+                .expect("a private fn follows Config::load in the impl");
+        assert!(
+            source[load..load_end].contains(needle),
+            "Config::load must warn for out-of-range cache.metadata_cache values; nothing else \
+             on the startup path checks them"
+        );
+    }
+
+    /// THE UPGRADE-CONTRACT ASSERTION for the retired orphan-sweep fields. A config carrying all
+    /// four, at non-default values including ones the old clamp rewrote (`"0s"`, `"48h"`), must
+    /// still load and validate, keep the values it was given (nothing clamps an ignored field),
+    /// and produce exactly one warning naming each field and the replacement.
+    #[test]
+    fn config_carrying_every_retired_orphan_field_loads_and_warns_once() {
+        use std::io::Write;
+
+        for interval in ["0s", "30s", "48h"] {
+            let base = yaml_with_orphan_recovery_interval(interval);
+            let anchor = "  shared_storage:\n";
+            assert_eq!(base.matches(anchor).count(), 1, "fixture anchor");
+            let yaml = base.replacen(
+                anchor,
+                "  shared_storage:\n    orphan_recovery_enabled: false\n    \
+                 orphan_scan_timeout: \"7s\"\n    orphan_max_per_cycle: 5\n",
+                1,
+            );
+            let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+            temp_file.write_all(yaml.as_bytes()).unwrap();
+            temp_file.flush().unwrap();
+
+            let config =
+                Config::load_from_file(temp_file.path().to_str().unwrap()).unwrap_or_else(|e| {
+                    panic!(
+                        "a config carrying the retired orphan fields must still load. \
+                         orphan_recovery_interval={:?} err={:?}",
+                        interval, e
+                    )
+                });
+            let shared = &config.cache.shared_storage;
+            assert!(shared.validate().is_ok(), "{:?}", shared.validate());
+            assert!(!shared.orphan_recovery_enabled);
+            assert_eq!(shared.orphan_scan_timeout, Duration::from_secs(7));
+            assert_eq!(shared.orphan_max_per_cycle, 5);
+            assert_eq!(
+                shared.retired_orphan_fields_set(),
+                vec![
+                    "orphan_recovery_enabled",
+                    "orphan_recovery_interval",
+                    "orphan_scan_timeout",
+                    "orphan_max_per_cycle"
+                ]
+            );
+
+            let logged = capture_warnings(|| shared.warn_retired_orphan_fields());
+            assert_eq!(
+                logged.matches("is ignored").count(),
+                1,
+                "exactly one warning for all four fields. got={:?}",
+                logged
+            );
+            for needle in [
+                "orphan_recovery_enabled",
+                "orphan_recovery_interval",
+                "orphan_scan_timeout",
+                "orphan_max_per_cycle",
+                "reclaimed automatically",
+            ] {
+                assert!(
+                    logged.contains(needle),
+                    "the warning must name {:?}. got={:?}",
+                    needle,
+                    logged
+                );
+            }
+        }
+    }
+
+    /// Positive control: a config that sets none of the retired fields, or sets them to their
+    /// defaults, warns nothing. An over-broad check reds here rather than nagging every
+    /// operator on upgrade.
+    #[test]
+    fn default_retired_orphan_fields_do_not_warn() {
+        let explicit_defaults = SharedStorageConfig {
+            orphan_recovery_enabled: true,
+            orphan_recovery_interval: Duration::from_secs(300),
+            orphan_scan_timeout: Duration::from_secs(30),
+            orphan_max_per_cycle: 100,
+            ..SharedStorageConfig::default()
+        };
+        for config in [SharedStorageConfig::default(), explicit_defaults] {
+            assert!(config.retired_orphan_fields_set().is_empty());
+            let logged = capture_warnings(|| config.warn_retired_orphan_fields());
+            assert!(
+                !logged.contains("is ignored"),
+                "default values must not warn. got={:?}",
+                logged
+            );
+        }
+    }
+
+    /// Pins the warning's CALL SITE. `Config::load` reads the real process argv, so no test can
+    /// call it; the needle is assembled with `concat!` so only the call site matches.
+    #[test]
+    fn the_retired_orphan_warning_is_wired_into_config_load() {
+        let source = include_str!("config.rs");
+        let needle = concat!("shared_storage.", "warn_retired_orphan_fields();");
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "expected exactly one {:?} call site (in Config::load)",
+            needle
+        );
     }
 
     #[test]
@@ -7140,6 +8522,883 @@ logging:
     }
 
     #[test]
+    fn test_eviction_algorithm_default_is_tinylfu() {
+        // cache-eviction-at-scale R10.5: TinyLFU is the default. R4 makes the entry
+        // dimension a continuous reclaimer, so ordering quality applies on every
+        // rotation rather than only under pressure.
+        assert_eq!(
+            CacheConfig::default().eviction_algorithm,
+            EvictionAlgorithm::TinyLFU,
+            "the default eviction algorithm must be TinyLFU"
+        );
+    }
+
+    #[test]
+    fn test_eviction_algorithm_missing_from_yaml_defaults_to_tinylfu() {
+        // R10.5 + R9.3. A YAML that omits `eviction_algorithm` gets TinyLFU, which is
+        // also what `config/config.example.yaml` ships explicitly — so the documented
+        // starting configuration and the default now agree instead of diverging.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+        assert_eq!(
+            config.cache.eviction_algorithm,
+            EvictionAlgorithm::TinyLFU,
+            "omitted eviction_algorithm must default to TinyLFU"
+        );
+    }
+
+    /// **Config-compatibility guard — read before deleting.**
+    ///
+    /// cache-eviction-at-scale R10.9 requires `"lru"` to keep parsing for at least one
+    /// release after it stops being the default, because the documented upgrade
+    /// contract in `docs/UPGRADING.md` is `cargo build` → copy binary → restart with
+    /// **no config edits**. A config that fails to parse on upgrade is a startup
+    /// failure on every host that set the field explicitly.
+    ///
+    /// This test is the executable form of that contract. When LRU is eventually
+    /// retired, this assertion MUST NOT simply be deleted — it must be changed to
+    /// assert that `"lru"` still parses and resolves to the replacement, with a
+    /// warning. Deleting it is how the contract breaks silently.
+    ///
+    /// **Retargeted in 3.0.0, following that instruction rather than deleting it.** R10.10
+    /// removed LRU as a choice, so the assertion is no longer "`\"lru\"` selects LRU" — it is
+    /// now the four things an operator's upgrade depends on: the value parses, it validates
+    /// (so the proxy starts), it resolves to `TinyLFU` behaviour, and it warns. The last two
+    /// are what make this a *compatibility* test rather than a parsing test.
+    ///
+    /// Requirement: cache-eviction-at-scale R10.9, R10.10
+    #[test]
+    fn test_eviction_algorithm_lru_still_parses_after_default_moved() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+  eviction_algorithm: "lru"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("a config selecting \"lru\" must still parse");
+
+        // 1. It parses, into the retired-spelling variant rather than being rejected.
+        assert_eq!(
+            config.cache.eviction_algorithm,
+            EvictionAlgorithm::DeprecatedLru,
+            "\"lru\" must still parse; rejecting it breaks the no-config-edit upgrade contract"
+        );
+
+        // 2. It validates, so the proxy starts.
+        assert!(
+            config.cache.validate().is_ok(),
+            "a config selecting \"lru\" must still pass validation and start"
+        );
+
+        // 3. It BEHAVES as TinyLFU. This is the assertion the removal turns on: parsing a
+        //    value that then selects nothing would satisfy the two above and still leave the
+        //    operator running an algorithm that no longer exists.
+        let effective: crate::cache::CacheEvictionAlgorithm =
+            config.cache.eviction_algorithm.clone().into();
+        assert_eq!(
+            effective,
+            crate::cache::CacheEvictionAlgorithm::TinyLFU,
+            "R10.9: the retired \"lru\" spelling must behave as the replacement"
+        );
+
+        // 4. And it warns, rather than remapping in silence.
+        assert!(
+            config
+                .cache
+                .eviction_algorithm_deprecation_warning()
+                .is_some(),
+            "a config carrying the retired \"lru\" spelling must warn"
+        );
+
+        // Control, in the same test: the surviving spelling must NOT warn, so a helper that
+        // returned Some unconditionally could not satisfy the assertion above.
+        let tinylfu_yaml = yaml.replace("\"lru\"", "\"tinylfu\"");
+        let tinylfu: Config =
+            serde_yaml_ng::from_str(&tinylfu_yaml).expect("\"tinylfu\" must parse");
+        assert_eq!(tinylfu.cache.eviction_algorithm, EvictionAlgorithm::TinyLFU);
+        assert!(
+            tinylfu
+                .cache
+                .eviction_algorithm_deprecation_warning()
+                .is_none(),
+            "the surviving spelling must not warn"
+        );
+    }
+
+    /// **`Serialize` must not silently respell an operator's config.**
+    ///
+    /// This is the property a bare `#[serde(alias = "lru")]` on `TinyLFU` would lose: it
+    /// would read `"lru"` and write back `"tinylfu"`, so anything that round-trips a config
+    /// would rewrite a field the operator set. Asserted rather than assumed, because the
+    /// alias is the mechanism a future reader is most likely to "simplify" this to.
+    ///
+    /// Requirement: cache-eviction-at-scale R10.9
+    #[test]
+    fn test_retired_lru_spelling_round_trips_without_respelling() {
+        let parsed: EvictionAlgorithm =
+            serde_yaml_ng::from_str("lru").expect("\"lru\" must deserialize");
+        assert_eq!(parsed, EvictionAlgorithm::DeprecatedLru);
+
+        let written = serde_yaml_ng::to_string(&parsed).expect("must serialize");
+        assert_eq!(
+            written.trim(),
+            "lru",
+            "the retired spelling must round-trip as written, not be rewritten as \"tinylfu\""
+        );
+
+        // An unknown value is still rejected — the alias widens what is accepted by exactly
+        // one spelling, not generally.
+        assert!(
+            serde_yaml_ng::from_str::<EvictionAlgorithm>("lfu").is_err(),
+            "an unrecognised algorithm must still be rejected"
+        );
+    }
+
+    #[test]
+    fn test_eviction_algorithm_tinylfu_parses_explicitly() {
+        // The value `config/config.example.yaml` ships. Asserted separately from the
+        // default so that a future change to either cannot make the other vacuous.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+  eviction_algorithm: "tinylfu"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("explicit tinylfu must parse");
+        assert_eq!(
+            config.cache.eviction_algorithm,
+            EvictionAlgorithm::TinyLFU,
+            "\"tinylfu\" must parse to TinyLFU"
+        );
+    }
+
+    /// Two-sided, because a deprecation warning that fires for every value is not a
+    /// warning about anything. The TinyLFU and default arms are the control: they are
+    /// what makes a positive reading on the LRU arm attributable to the *value* rather
+    /// than to the helper returning `Some` unconditionally.
+    ///
+    /// Requirement: cache-eviction-at-scale R10.5
+    #[test]
+    fn test_eviction_algorithm_deprecation_warning_fires_only_for_lru() {
+        let lru = CacheConfig {
+            eviction_algorithm: EvictionAlgorithm::DeprecatedLru,
+            ..CacheConfig::default()
+        };
+        let message = lru
+            .eviction_algorithm_deprecation_warning()
+            .expect("'lru' must produce a deprecation notice");
+
+        // Assert the parts an operator needs in order to act, not the whole string:
+        // the field name to grep their config for, the offending value, the
+        // replacement, and the fact that it is going. A whole-string assertion would
+        // break on any rewording and teach nothing.
+        for needle in [
+            "cache.eviction_algorithm",
+            "lru",
+            "tinylfu",
+            "no longer the default",
+            "silence this warning",
+            // Added in 3.0.0 with the removal. The first is what stops an operator reading
+            // the WARN as a startup failure; the second is what tells them which algorithm
+            // they are now running. Neither was needed while LRU was still selectable.
+            "still accepted",
+            "behaves as 'tinylfu'",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the deprecation notice must name {needle:?}; got: {message}"
+            );
+        }
+
+        // **The notice must not promise recency ordering, and this assertion is the reason
+        // the wording was rewritten rather than left alone.** Until R10.10 it said "eviction
+        // continues to order by recency", which was true then and is false now — LRU is not
+        // reachable from config. An operator who believed it would go looking for the cause
+        // of recency-ordered eviction that is not running.
+        assert!(
+            !message.contains("order by recency"),
+            "'lru' no longer selects recency ordering; the notice must not say it does: {message}"
+        );
+        // The notice states current behaviour only. It used to promise that "lru" would be
+        // rejected in a release after 3.0.0; no such release is scheduled, and a promise in
+        // a WARN line is one an operator plans around.
+        assert!(
+            !message.contains("scheduled for removal") && !message.contains("will be rejected"),
+            "the notice must not promise a future removal: {message}"
+        );
+        assert!(
+            !message.contains("still takes effect"),
+            "the pre-removal wording claimed the setting selected an algorithm; it no longer \
+             does, and this phrasing must not survive the removal: {message}"
+        );
+
+        let tinylfu = CacheConfig {
+            eviction_algorithm: EvictionAlgorithm::TinyLFU,
+            ..CacheConfig::default()
+        };
+        assert!(
+            tinylfu.eviction_algorithm_deprecation_warning().is_none(),
+            "'tinylfu' is the default and must not warn"
+        );
+        assert!(
+            CacheConfig::default()
+                .eviction_algorithm_deprecation_warning()
+                .is_none(),
+            "the default config must not warn"
+        );
+    }
+
+    /// **The WIRING assertion, and it is the one that matters.** The helper above can
+    /// return perfect text and never be called, which produces exactly the silence this
+    /// change exists to end — so this drives the real `log_deprecated_fields` path a
+    /// config load takes and reads the warning back off a tracing subscriber.
+    ///
+    /// Its red side is deleting the two-line `if let` in `log_deprecated_fields`: this
+    /// test goes red while the pure-function test above stays green, which is what
+    /// distinguishes "the text is wrong" from "nothing logs it".
+    ///
+    /// Requirement: cache-eviction-at-scale R10.5
+    #[test]
+    fn test_eviction_algorithm_lru_deprecation_warning_reaches_the_log() {
+        let lru_config = Config {
+            cache: CacheConfig {
+                eviction_algorithm: EvictionAlgorithm::DeprecatedLru,
+                ..CacheConfig::default()
+            },
+            ..Config::default()
+        };
+        let captured = capture_warnings(|| lru_config.log_deprecated_fields());
+        assert!(
+            captured.contains("cache.eviction_algorithm"),
+            "loading a config that selects 'lru' must emit a WARN naming the field; \
+             captured output was: {captured:?}"
+        );
+
+        // Control, in the same run and through the same subscriber: the default config
+        // must stay quiet about this field. Without it, a subscriber that captured
+        // anything at all would satisfy the assertion above.
+        let default_config = Config::default();
+        let quiet = capture_warnings(|| default_config.log_deprecated_fields());
+        assert!(
+            !quiet.contains("cache.eviction_algorithm"),
+            "a default config must not warn about eviction_algorithm; got: {quiet:?}"
+        );
+    }
+
+    /// `health.check_interval` and `cache.initialization.*` warn when set to a non-default
+    /// value and stay quiet at their defaults.
+    #[test]
+    fn test_unread_health_and_initialization_fields_warn_when_set() {
+        assert_eq!(Config::default().unread_fields_warning(), None);
+        let mut config = Config::default();
+        config.health.check_interval = Duration::from_secs(60);
+        config.cache.initialization.parallel_scan = false;
+        config.cache.initialization.scan_timeout = Duration::from_secs(300);
+        config.cache.initialization.progress_logging = false;
+        let message = config
+            .unread_fields_warning()
+            .expect("non-default values must warn");
+        for field in [
+            "health.check_interval",
+            "cache.initialization.parallel_scan",
+            "cache.initialization.scan_timeout",
+            "cache.initialization.progress_logging",
+        ] {
+            assert!(message.contains(field), "{field} missing from: {message}");
+        }
+        let captured = capture_warnings(|| config.log_deprecated_fields());
+        assert!(
+            captured.contains("health.check_interval"),
+            "the warning must reach the log; captured: {captured:?}"
+        );
+        let mut one = Config::default();
+        one.cache.initialization.scan_timeout = Duration::from_secs(300);
+        let message = one
+            .unread_fields_warning()
+            .expect("one field set must warn");
+        assert!(!message.contains("health.check_interval"), "{message}");
+    }
+
+    /// A `cache.initialization.scan_timeout` outside 5-300 s used to stop `Config::load`
+    /// ("Invalid initialization configuration"). Nothing reads the field, so it now loads and
+    /// the unread-fields warning names it and the flags that set it.
+    #[test]
+    fn out_of_range_scan_timeout_loads_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "cache:\n  initialization:\n    scan_timeout: \"10m\"\n",
+        )
+        .unwrap();
+        let matches = Config::build_cli()
+            .try_get_matches_from(vec!["s3-proxy", "-c", path.to_str().unwrap()])
+            .unwrap();
+        let mut loaded = None;
+        let logged = capture_warnings(|| loaded = Some(Config::load_from_matches(&matches)));
+        let config = loaded
+            .unwrap()
+            .expect("an out-of-range scan_timeout must no longer refuse to load");
+        assert_eq!(
+            config.cache.initialization.scan_timeout,
+            Duration::from_secs(600)
+        );
+        assert!(
+            logged.contains("cache.initialization.scan_timeout"),
+            "warning missing; captured: {logged:?}"
+        );
+        assert!(
+            logged.contains("--scan-timeout"),
+            "flags missing; captured: {logged:?}"
+        );
+    }
+
+    /// `cache.shared_storage.consolidation_size_threshold` is accepted and has no effect.
+    ///
+    /// A config carrying it (at a non-default value, and at the default the example ships)
+    /// must still load with the value parsed, and loading it must emit exactly one WARN naming
+    /// the field. A config without it must load with no such WARN.
+    #[test]
+    fn consolidation_size_threshold_loads_and_warns_once_when_present() {
+        let field = "cache.shared_storage.consolidation_size_threshold";
+        for (yaml, expected) in [
+            (
+                "cache:\n  shared_storage:\n    consolidation_size_threshold: 2097152\n",
+                2_097_152u64,
+            ),
+            (
+                "cache:\n  shared_storage:\n    consolidation_size_threshold: 1048576\n",
+                1_048_576u64,
+            ),
+        ] {
+            let config: Config =
+                serde_yaml_ng::from_str(yaml).expect("config with the field loads");
+            assert_eq!(
+                config.cache.shared_storage.consolidation_size_threshold,
+                expected
+            );
+            assert!(config.cache.shared_storage.validate().is_ok());
+            let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+            let captured = capture_warnings(|| warn_on_inert_cache_keys(&document));
+            assert_eq!(
+                captured.matches(field).count(),
+                1,
+                "a config carrying the field must WARN exactly once naming it; captured: {captured:?}"
+            );
+        }
+
+        let yaml = "cache:\n  shared_storage:\n    consolidation_interval: \"5s\"\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("config without the field loads");
+        assert_eq!(
+            config.cache.shared_storage.consolidation_size_threshold,
+            default_consolidation_size_threshold()
+        );
+        let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let quiet = capture_warnings(|| warn_on_inert_cache_keys(&document));
+        assert!(
+            !quiet.contains("consolidation_size_threshold"),
+            "a config without the field must not warn about it; got: {quiet:?}"
+        );
+    }
+
+    /// `cache.ram_cache_flush_threshold` is REMOVED, and a config carrying it must still load.
+    ///
+    /// The upgrade contract in the config compatibility rule is that an existing
+    /// config file keeps parsing across an upgrade, so removing a field must not turn a running
+    /// deployment into a failed start. The value used here is one the RETIRED 10-10000 range
+    /// check rejected — it warned and clamped to 100 — which proves both that the key is still
+    /// accepted and that no surviving rule rejects it: validation only ever got looser here, so
+    /// no config that loaded before this release fails now.
+    #[test]
+    fn a_config_carrying_the_removed_ram_cache_flush_threshold_still_loads() {
+        let yaml = r#"
+ram_cache_flush_threshold: 999999
+ram_cache_verification_interval: 5s
+"#;
+        let parsed: CacheConfig = serde_yaml_ng::from_str(yaml)
+            .expect("a config carrying the removed ram_cache_flush_threshold must parse");
+        assert_eq!(
+            parsed.ram_cache_verification_interval,
+            Duration::from_secs(5),
+            "a field AFTER the removed key must still be read, so the unknown key is skipped \
+             rather than terminating the mapping"
+        );
+        assert!(
+            parsed.validate().is_ok(),
+            "999999 exceeded the retired 10-10000 range; with that rule gone it must validate"
+        );
+    }
+
+    /// `cache.ram_cache_flush_on_eviction` is REMOVED, and a config carrying it must still load.
+    ///
+    /// Sibling of the `ram_cache_flush_threshold` test above; see it for the contract. `true` is
+    /// used because it is the non-default value, so the key is doing something observable in the
+    /// document rather than matching what the old default would have produced anyway.
+    #[test]
+    fn a_config_carrying_the_removed_ram_cache_flush_on_eviction_still_loads() {
+        let yaml = r#"
+ram_cache_flush_on_eviction: true
+ram_cache_verification_interval: 5s
+"#;
+        let parsed: CacheConfig = serde_yaml_ng::from_str(yaml)
+            .expect("a config carrying the removed ram_cache_flush_on_eviction must parse");
+        assert_eq!(
+            parsed.ram_cache_verification_interval,
+            Duration::from_secs(5),
+            "a field AFTER the removed key must still be read, so the unknown key is skipped \
+             rather than terminating the mapping"
+        );
+        assert!(parsed.validate().is_ok());
+    }
+
+    /// A document setting either removed flush key must produce a WARN naming it.
+    ///
+    /// Silence is the failure mode this change exists to fix. Before it, the startup log printed
+    /// `ram_cache_flush_threshold` back to the operator under a "flush config" label, so tuning a
+    /// dead knob looked like it had taken effect. Loading must now say the field is removed and
+    /// had no effect.
+    ///
+    /// The values here are the FORMER DEFAULTS — `100` and `false` — and that is the point: they
+    /// are what `config/config.example.yaml` shipped, so a check keyed off deviation from a
+    /// default would stay silent for precisely the operators who copied the example. This is
+    /// keyed off the key's presence instead, and these values are what demonstrate the
+    /// difference.
+    #[test]
+    fn the_removed_ram_cache_flush_keys_warn_when_a_document_sets_them() {
+        let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            r#"
+cache:
+  ram_cache_flush_threshold: 100
+  ram_cache_flush_on_eviction: false
+"#,
+        )
+        .expect("fixture must parse");
+        let captured = capture_warnings(|| warn_on_removed_cache_keys(&document));
+        assert!(
+            captured.contains("cache.ram_cache_flush_threshold"),
+            "a document setting the removed threshold must emit a WARN naming it, even at its \
+             former default of 100; captured output was: {captured:?}"
+        );
+        assert!(
+            captured.contains("cache.ram_cache_flush_on_eviction"),
+            "a document setting the removed flush-on-eviction key must emit a WARN naming it, \
+             even at its former default of false; captured output was: {captured:?}"
+        );
+
+        // Control, in the same run and through the same subscriber: a document that does not
+        // carry the keys must stay quiet. Without it, a subscriber that captured anything at all
+        // would satisfy both assertions above.
+        let without: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            r#"
+cache:
+  ram_cache_flush_interval: 10s
+"#,
+        )
+        .expect("fixture must parse");
+        let quiet = capture_warnings(|| warn_on_removed_cache_keys(&without));
+        assert!(
+            quiet.is_empty(),
+            "a document carrying neither removed key must warn about neither — and \
+             'ram_cache_flush_interval' is NOT removed, so a check matching on the shared \
+             'ram_cache_flush' prefix would wrongly fire here; got: {quiet:?}"
+        );
+    }
+
+    /// The removed `cache.metadata_cache.stale_handle_max_retries` must warn under its NESTED
+    /// path, and only there.
+    ///
+    /// The table was flat — keyed for keys directly under `cache:` — and this key sits one
+    /// section down, so the walker now descends one mapping per path segment. Two controls, in
+    /// the same run and through the same subscriber, make the positive assertion attributable to
+    /// that descent rather than to anything capturing output at all:
+    ///
+    /// - a `metadata_cache:` section that does not carry the key must stay quiet, so a walker
+    ///   that stopped at the first segment (warning on the section's mere presence) fails; and
+    /// - the same key name placed directly under `cache:` must stay quiet, so a walker that
+    ///   matched only the LAST segment against the top-level mapping fails. That key is not
+    ///   removed at that level; it never existed there.
+    #[test]
+    fn the_retired_stale_handle_max_retries_warns_under_its_nested_path_only() {
+        let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            r#"
+cache:
+  metadata_cache:
+    enabled: true
+    stale_handle_max_retries: 3
+"#,
+        )
+        .expect("fixture must parse");
+        let captured = capture_warnings(|| warn_on_removed_cache_keys(&document));
+        assert!(
+            captured.contains("cache.metadata_cache.stale_handle_max_retries"),
+            "a document setting the removed nested key must emit a WARN naming its full path, \
+             even at its former default of 3; captured output was: {captured:?}"
+        );
+        assert!(
+            captured.contains("had no effect"),
+            "the WARN must say the field never had an effect, not merely that it is removed; \
+             captured output was: {captured:?}"
+        );
+
+        let section_without_key: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            r#"
+cache:
+  metadata_cache:
+    enabled: true
+    max_entries: 100000
+"#,
+        )
+        .expect("fixture must parse");
+        let quiet = capture_warnings(|| warn_on_removed_cache_keys(&section_without_key));
+        assert!(
+            quiet.is_empty(),
+            "a metadata_cache section without the removed key must warn about nothing — a \
+             walker that stopped at the first path segment would fire here; got: {quiet:?}"
+        );
+
+        let wrong_level: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            r#"
+cache:
+  stale_handle_max_retries: 3
+"#,
+        )
+        .expect("fixture must parse");
+        let quiet = capture_warnings(|| warn_on_removed_cache_keys(&wrong_level));
+        assert!(
+            quiet.is_empty(),
+            "the key name directly under `cache:` is not the removed field — a walker matching \
+             only the last path segment at the top level would fire here; got: {quiet:?}"
+        );
+    }
+
+    /// A config file that still sets `cache.metadata_cache.stale_handle_max_retries` must LOAD
+    /// through `Config::load_from_file`, warn, and keep reading the section — AT ANY VALUE.
+    ///
+    /// The out-of-range and wrongly-typed values are the point. While the field existed as a
+    /// `u32`, `-1` and `"not-a-number"` failed to parse and so failed startup; `0` and `11`
+    /// parsed, and the 1-10 range check in `MetadataCacheConfig::validate` would have rejected
+    /// them had anything on the startup path called it (nothing did). Retiring the field must
+    /// not leave any of those behind as a hidden rejection, so each value is loaded here, the
+    /// section's validator is run anyway, and a sibling written AFTER the removed key must still
+    /// be read — proving the unknown key was skipped rather than ending the mapping.
+    ///
+    /// Also the nested key's load-path wiring pin: it writes a REAL FILE and never calls
+    /// `warn_on_removed_cache_keys` itself, so deleting that call from `load_from_file` reds it.
+    #[test]
+    fn the_retired_stale_handle_max_retries_still_loads_and_warns_at_any_value() {
+        use std::io::Write;
+
+        let base = yaml_with_orphan_recovery_interval("60s");
+        let anchor = "  cache_dir: \"./cache\"\n";
+        assert_eq!(
+            base.matches(anchor).count(),
+            1,
+            "the fixture inserts the removed key after {anchor:?}, which must appear exactly \
+             once inside `cache:`"
+        );
+        assert!(
+            !base.contains("metadata_cache:"),
+            "the base fixture must not already carry a metadata_cache section, or the insertion \
+             below would produce a duplicate key"
+        );
+
+        for value in ["3", "0", "11", "-1", "\"not-a-number\""] {
+            let with_removed_key = base.replace(
+                anchor,
+                &format!(
+                    "  cache_dir: \"./cache\"\n  metadata_cache:\n    \
+                     stale_handle_max_retries: {value}\n    max_entries: 500\n"
+                ),
+            );
+            let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+            temp_file.write_all(with_removed_key.as_bytes()).unwrap();
+            temp_file.flush().unwrap();
+            let path = temp_file.path().to_str().unwrap().to_string();
+
+            let mut loaded = None;
+            let captured = capture_warnings(|| {
+                loaded = Some(Config::load_from_file(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "a config file setting the retired stale_handle_max_retries to {value} \
+                         must still LOAD — the upgrade contract requires it; got: {e}"
+                    )
+                }));
+            });
+            let config = loaded.expect("load_from_file ran inside the capture");
+            assert_eq!(
+                config.cache.metadata_cache.max_entries, 500,
+                "max_entries follows the removed key in the fixture; if it is not read the \
+                 unknown key terminated the mapping instead of being skipped (value {value})"
+            );
+            assert!(
+                config.cache.metadata_cache.validate().is_ok(),
+                "the metadata_cache validator must not reject a config for setting the retired \
+                 field to {value}"
+            );
+            assert!(
+                config.cache.validate().is_ok(),
+                "the cache validator on the startup path must accept a config setting the \
+                 retired field to {value}"
+            );
+            assert!(
+                captured.contains("cache.metadata_cache.stale_handle_max_retries"),
+                "loading a file that sets the retired nested key to {value} must emit a WARN \
+                 naming it. Empty output means the walker is not reached from \
+                 Config::load_from_file or does not descend into metadata_cache; captured: \
+                 {captured:?}"
+            );
+        }
+    }
+
+    /// Every retired field, set in a YAML document, warns exactly once, naming the key.
+    #[test]
+    fn every_retired_field_warns_once_when_present() {
+        let cases: [(&str, &str, &str); 10] = [
+            (
+                "cache",
+                "ram_cache_flush_threshold: 5",
+                "cache.ram_cache_flush_threshold",
+            ),
+            (
+                "cache",
+                "ram_cache_flush_on_eviction: true",
+                "cache.ram_cache_flush_on_eviction",
+            ),
+            (
+                "cache",
+                "metadata_cache:\n    stale_handle_max_retries: 5",
+                "cache.metadata_cache.stale_handle_max_retries",
+            ),
+            (
+                "cache",
+                "shared_storage:\n    recovery_max_concurrent: 4",
+                "cache.shared_storage.recovery_max_concurrent",
+            ),
+            (
+                "cache",
+                "shared_storage:\n    lock_refresh_interval: 30s",
+                "cache.shared_storage.lock_refresh_interval",
+            ),
+            (
+                "cache",
+                "shared_storage:\n    metadata_lock_timeout_ms: 45000",
+                "cache.shared_storage.metadata_lock_timeout_ms",
+            ),
+            (
+                "cache",
+                "shared_storage:\n    orphan_reclaim_enabled: true",
+                "cache.shared_storage.orphan_reclaim_enabled",
+            ),
+            (
+                "cache",
+                "shared_storage:\n    eviction_worklist_enabled: true",
+                "cache.shared_storage.eviction_worklist_enabled",
+            ),
+            (
+                "cache",
+                "shared_storage:\n    consolidation_size_threshold: 1048576",
+                "consolidation_size_threshold",
+            ),
+            ("server", "https_mode: passthrough", "server.https_mode"),
+        ];
+        for (section, body, needle) in cases {
+            let yaml = format!("{section}:\n  {body}\n");
+            let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+            let captured = capture_warnings(|| {
+                warn_on_removed_cache_keys(&document);
+                warn_on_removed_server_keys(&document);
+                warn_on_inert_cache_keys(&document);
+            });
+            assert_eq!(
+                captured.matches(needle).count(),
+                1,
+                "{needle} must warn exactly once: {captured:?}"
+            );
+        }
+    }
+
+    /// The removed `recovery_max_concurrent` key still deserialises and validates, and the
+    /// cache-key walker warns once for it. This calls the walker directly; it does not go
+    /// through `Config::load_from_file` (the wiring test below pins that call site).
+    #[test]
+    fn a_config_naming_recovery_max_concurrent_loads_and_warns_once() {
+        let yaml = "cache:\n  shared_storage:\n    recovery_max_concurrent: 4\n";
+        let parsed: SharedStorageConfig =
+            serde_yaml_ng::from_str("recovery_max_concurrent: 4").unwrap();
+        assert!(parsed.validate().is_ok());
+        let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let captured = capture_warnings(|| warn_on_removed_cache_keys(&document));
+        assert_eq!(
+            captured.matches("recovery_max_concurrent").count(),
+            1,
+            "{captured:?}"
+        );
+    }
+
+    /// The removed `max_cached_objects` key still deserialises and validates, and the cache-key
+    /// walker warns once for it.
+    #[test]
+    fn a_config_naming_max_cached_objects_loads_and_warns_once() {
+        let yaml = "cache:\n  shared_storage:\n    max_cached_objects: 1000000\n";
+        let parsed: SharedStorageConfig =
+            serde_yaml_ng::from_str("max_cached_objects: 1000000").unwrap();
+        assert!(parsed.validate().is_ok());
+        let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let captured = capture_warnings(|| warn_on_removed_cache_keys(&document));
+        assert_eq!(
+            captured.matches("max_cached_objects").count(),
+            1,
+            "{captured:?}"
+        );
+    }
+    /// The shipped example config must not set any removed key.
+    ///
+    /// It set all three, at their defaults, which is why the warnings above are keyed off
+    /// presence. An example that makes every deployment copying it log a removed-field warning is
+    /// worse than no example. The check walks the whole `REMOVED_CACHE_KEYS` table, so a key
+    /// added to it later is covered here without editing this test.
+    #[test]
+    fn the_example_config_does_not_carry_any_removed_cache_key() {
+        let content = std::fs::read_to_string("config/config.example.yaml")
+            .expect("config/config.example.yaml must be readable from the crate root");
+        let document: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&content).expect("the example config must parse");
+        let captured = capture_warnings(|| warn_on_removed_cache_keys(&document));
+        assert!(
+            captured.is_empty(),
+            "config/config.example.yaml must not set a removed cache key; it warned: {captured:?}"
+        );
+    }
+
+    /// PINS THE CALL SITE, because the three tests above cannot.
+    ///
+    /// Deleting `warn_on_removed_cache_keys(&document)` from `Config::load_from_file` leaves
+    /// every other test in this module green — measured. They establish that the walker works;
+    /// none of them establishes that it runs, so the deprecation warning could stop being
+    /// emitted in production against a fully green suite.
+    ///
+    /// Two vacuity traps, and this test exists only if it avoids both. It must NOT call
+    /// `warn_on_removed_cache_keys` directly — that is precisely what the tests above do and
+    /// precisely why they miss the wiring. And it must write a REAL FILE and load it, because
+    /// handing a pre-parsed `serde_yaml_ng::Value` to the walker skips the load path the same
+    /// way, one step later.
+    ///
+    /// The control loads the same fixture WITHOUT the removed key through the same subscriber:
+    /// without it, a subscriber that captured anything at all would satisfy the assertion.
+    #[test]
+    fn the_removed_key_warning_is_wired_into_config_load_from_file() {
+        use std::io::Write;
+
+        // A minimal-but-complete document, plus one removed key inserted after a unique
+        // anchor line inside `cache:`. The count assertion is what stops the fixture from
+        // silently not carrying the key — an insertion that did not apply would leave this
+        // test passing for the wrong reason only if the warning were also absent, but it
+        // would make a red side unreadable.
+        let base = yaml_with_orphan_recovery_interval("60s");
+        let anchor = "  cache_dir: \"./cache\"\n";
+        assert_eq!(
+            base.matches(anchor).count(),
+            1,
+            "the fixture inserts the removed key after {anchor:?}, which must appear exactly \
+             once inside `cache:` or the insertion is not where this test claims it is"
+        );
+        let with_removed_key = base.replace(
+            anchor,
+            "  cache_dir: \"./cache\"\n  ram_cache_flush_threshold: 100\n",
+        );
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file.write_all(with_removed_key.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        let captured = capture_warnings(|| {
+            Config::load_from_file(&path).expect(
+                "a config file carrying a removed key must still LOAD — serde ignores it and \
+                 the upgrade contract requires the file to keep working",
+            );
+        });
+        assert!(
+            captured.contains("cache.ram_cache_flush_threshold"),
+            "loading a file that sets a removed key must emit a WARN naming it. Empty output \
+             means the walker is no longer reached from Config::load_from_file, which no \
+             direct-call test can detect; captured: {captured:?}"
+        );
+
+        let mut clean_file = tempfile::NamedTempFile::new().unwrap();
+        clean_file.write_all(base.as_bytes()).unwrap();
+        clean_file.flush().unwrap();
+        let clean_path = clean_file.path().to_str().unwrap().to_string();
+        let quiet = capture_warnings(|| {
+            Config::load_from_file(&clean_path).expect("the base fixture must load");
+        });
+        assert!(
+            quiet.is_empty(),
+            "the same fixture without the removed key must load silently, or the assertion \
+             above is satisfied by unrelated captured output; got: {quiet:?}"
+        );
+    }
+
+    /// PINS THE CALL SITE of `warn_on_removed_server_keys`, which
+    /// `every_retired_field_warns_once_when_present` calls directly and so cannot pin.
+    ///
+    /// A config FILE naming `server.https_mode` must still load (the field is gone from
+    /// `ServerConfig`, serde ignores it), and loading it must emit a WARN naming the key. The
+    /// control loads the same fixture without the key and must be silent.
+    #[test]
+    fn the_removed_https_mode_warning_is_wired_into_config_load_from_file() {
+        use std::io::Write;
+
+        let base = yaml_with_orphan_recovery_interval("60s");
+        let anchor = "  http_port: 8000\n";
+        assert_eq!(
+            base.matches(anchor).count(),
+            1,
+            "fixture anchor must match once"
+        );
+        let with_key = base.replace(anchor, "  http_port: 8000\n  https_mode: \"passthrough\"\n");
+        assert_eq!(with_key.matches("https_mode").count(), 1);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(with_key.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let captured = capture_warnings(|| {
+            Config::load_from_file(&path)
+                .expect("a config file naming server.https_mode must still load");
+        });
+        assert_eq!(
+            captured.matches("server.https_mode").count(),
+            1,
+            "loading a file that names server.https_mode must warn once; empty output means \
+             warn_on_removed_server_keys is no longer reached from load_from_file: {captured:?}"
+        );
+
+        let mut clean = tempfile::NamedTempFile::new().unwrap();
+        clean.write_all(base.as_bytes()).unwrap();
+        clean.flush().unwrap();
+        let clean_path = clean.path().to_str().unwrap().to_string();
+        let quiet = capture_warnings(|| {
+            Config::load_from_file(&clean_path).expect("the base fixture must load");
+        });
+        assert!(
+            !quiet.contains("server.https_mode"),
+            "the fixture without the key must not warn about it: {quiet:?}"
+        );
+    }
+
+    #[test]
     fn test_ram_cache_shard_count_zero_rejected() {
         // Requirement 5.3: shard count of 0 is outside the valid range (1–256)
         // and must be rejected by validate().
@@ -7284,6 +9543,93 @@ metrics:
             other_bucket_prefixes,
             &vec!["prefix-a/".to_string()],
             "other-bucket prefixes must match configured values"
+        );
+    }
+
+    // Listener bind addresses: an unparseable value must stop startup, never widen the bind.
+    fn listener_config(health: &str, metrics: &str) -> Config {
+        let mut config = Config::default();
+        config.health.bind_address = health.to_string();
+        config.metrics.bind_address = metrics.to_string();
+        config
+    }
+
+    #[test]
+    fn listener_addresses_reject_values_that_are_not_ip_addresses() {
+        for bad in [
+            "localhost",
+            "",
+            "  ",
+            "127.0.0.1:8080",
+            "[::1]",
+            "127.0.0.1 ",
+            "example.com",
+        ] {
+            let health = listener_config(bad, "127.0.0.1").validate_listener_addresses();
+            let msg = health.expect_err(bad).to_string();
+            assert!(msg.contains("health.bind_address"), "{bad:?}: {msg}");
+            assert!(msg.contains("IP address"), "{bad:?}: {msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+            let metrics = listener_config("127.0.0.1", bad).validate_listener_addresses();
+            let msg = metrics.expect_err(bad).to_string();
+            assert!(msg.contains("metrics.bind_address"), "{bad:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn listener_addresses_accept_ip_addresses() {
+        for good in ["127.0.0.1", "0.0.0.0", "::1", "::"] {
+            listener_config(good, good)
+                .validate_listener_addresses()
+                .unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    #[test]
+    fn disabled_listener_with_unparseable_address_still_loads() {
+        // A disabled listener never binds, so a value there has never had an effect.
+        let mut config = listener_config("localhost", "localhost");
+        config.health.enabled = false;
+        config.metrics.enabled = false;
+        config
+            .validate_listener_addresses()
+            .expect("disabled listeners are not checked");
+    }
+
+    #[test]
+    fn minimal_config_keeps_loopback_listener_defaults_and_validates() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+        assert_eq!(config.health.bind_address, "127.0.0.1");
+        assert_eq!(config.metrics.bind_address, "127.0.0.1");
+        config
+            .validate_listener_addresses()
+            .expect("defaults are IP addresses");
+    }
+
+    #[test]
+    fn config_load_checks_listener_addresses_before_any_listener_opens() {
+        // `Config::load` builds its own CLI matcher and cannot run here, so the call is
+        // pinned by source, and main.rs must hold no wide-bind fallback.
+        let source = include_str!("config.rs");
+        let load = source
+            .find("pub fn load() -> Result<Self>")
+            .expect("Config::load");
+        let load_end = source[load..]
+            .find("fn load_from_file")
+            .expect("end of load")
+            + load;
+        assert!(source[load..load_end].contains("config.validate_listener_addresses()?"));
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains("Ipv4Addr::UNSPECIFIED"),
+            "main.rs must not fall back to 0.0.0.0"
         );
     }
 }
@@ -7790,7 +10136,9 @@ mod rolling_validation_config_property_tests {
         // that diverges from it — see the 2.4.0 CHANGELOG entry.
         assert_eq!(config.cache.put_ttl, Duration::from_secs(3_600));
         assert_eq!(config.cache.put_ttl, CacheConfig::default().put_ttl);
-        assert_eq!(config.cache.get_ttl, Duration::from_secs(315_360_000));
+        // The example carries the built-in default (1 day).
+        assert_eq!(config.cache.get_ttl, Duration::from_secs(86_400));
+        assert_eq!(config.cache.get_ttl, CacheConfig::default().get_ttl);
         assert_eq!(config.cache.head_ttl, Duration::from_secs(60));
         assert!(!config.cache.actively_remove_cached_data);
         // The example carries the built-in default (10s), as does every other
@@ -7803,11 +10151,12 @@ mod rolling_validation_config_property_tests {
             config.cache.ram_cache_flush_interval,
             CacheConfig::default().ram_cache_flush_interval
         );
-        assert_eq!(config.cache.ram_cache_flush_threshold, 100);
-        assert!(!config.cache.ram_cache_flush_on_eviction);
-        // `ram_cache_verification_interval` is deprecated and the example no longer
-        // sets it, so this now asserts the serde default is applied rather than that a
-        // value was read from the file. Kept because the field must still parse.
+        // `ram_cache_flush_threshold` and `ram_cache_flush_on_eviction` were removed, so there
+        // is nothing left to assert here. That the example no longer SETS them is asserted by
+        // `the_example_config_does_not_carry_the_removed_ram_cache_flush_keys`, which reads the
+        // document rather than the parsed struct — the only place the keys are still visible.
+        // `ram_cache_verification_interval` is not set in the example config, so
+        // this asserts the serde default is applied.
         assert_eq!(
             config.cache.ram_cache_verification_interval,
             default_ram_cache_verification_interval()
@@ -7828,18 +10177,13 @@ mod rolling_validation_config_property_tests {
 
         // shared_storage sub-section
         assert_eq!(
-            config.cache.shared_storage.lock_timeout,
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            config.cache.shared_storage.lock_refresh_interval,
-            Duration::from_secs(30)
+            config.cache.shared_storage.lock_acquire_wait_budget,
+            Duration::from_secs(5)
         );
         assert_eq!(
             config.cache.shared_storage.eviction_lock_timeout,
             Duration::from_secs(60)
         );
-        assert_eq!(config.cache.shared_storage.recovery_max_concurrent, 4);
         assert_eq!(
             config.cache.shared_storage.consolidation_interval,
             Duration::from_secs(5)
@@ -7891,7 +10235,6 @@ mod rolling_validation_config_property_tests {
             Duration::from_secs(5)
         );
         assert_eq!(config.cache.metadata_cache.max_entries, 100_000);
-        assert_eq!(config.cache.metadata_cache.stale_handle_max_retries, 3);
 
         // --- logging section ---
         assert_eq!(
@@ -8127,13 +10470,177 @@ logging:
         );
     }
 
+    /// THE UPGRADE-CONTRACT ASSERTION for the two removed switches (Ed 2026-10-08). A
+    /// config naming `orphan_reclaim_enabled` or `eviction_worklist_enabled`, at `true` or
+    /// `false`, alone or together, must load from a real file through `load_from_file`, validate,
+    /// keep reading the sibling written after it, and log exactly one warning per key naming it.
+    /// The default behaviour is pinned by the struct no longer carrying either field (this test
+    /// does not compile against a struct that does) and by
+    /// `removed_switches_are_read_by_nothing`.
+    #[test]
+    fn config_naming_a_removed_switch_loads_runs_the_default_and_warns_once() {
+        use super::tests::{capture_warnings, yaml_with_orphan_recovery_interval};
+        use std::io::Write;
+        let base = yaml_with_orphan_recovery_interval("60s");
+        let anchor = "  shared_storage:\n";
+        assert_eq!(base.matches(anchor).count(), 1, "fixture anchor");
+        let cases: [&[(&str, &str)]; 5] = [
+            &[("orphan_reclaim_enabled", "true")],
+            &[("orphan_reclaim_enabled", "false")],
+            &[("eviction_worklist_enabled", "true")],
+            &[("eviction_worklist_enabled", "false")],
+            &[
+                ("orphan_reclaim_enabled", "false"),
+                ("eviction_worklist_enabled", "true"),
+            ],
+        ];
+        for case in cases {
+            let mut inserted = String::from(anchor);
+            for (key, value) in case {
+                inserted.push_str(&format!("    {key}: {value}\n"));
+            }
+            inserted.push_str("    eviction_worklist_lease: \"30m\"\n");
+            let yaml = base.replacen(anchor, &inserted, 1);
+            let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+            temp_file.write_all(yaml.as_bytes()).unwrap();
+            temp_file.flush().unwrap();
+            let path = temp_file.path().to_str().unwrap().to_string();
+            let mut loaded = None;
+            let logged = capture_warnings(|| {
+                loaded = Some(Config::load_from_file(&path).unwrap_or_else(|e| {
+                    panic!("a config naming a removed switch must still load: {case:?}: {e}")
+                }));
+            });
+            let config = loaded.expect("load_from_file ran inside the capture");
+            let shared = &config.cache.shared_storage;
+            shared.validate().expect("the config must validate");
+            assert_eq!(
+                shared.eviction_worklist_lease,
+                Duration::from_secs(1800),
+                "the sibling after the removed key must still be read: {case:?}"
+            );
+            for key in ["orphan_reclaim_enabled", "eviction_worklist_enabled"] {
+                let named = case.iter().any(|(k, _)| *k == key);
+                let needle = format!("'cache.shared_storage.{key}' has been removed");
+                assert_eq!(
+                    logged.matches(&needle).count(),
+                    usize::from(named),
+                    "exactly one warning for {key} when named, none otherwise: {case:?} \
+                     logged={logged:?}"
+                );
+            }
+        }
+    }
+    /// The removed switches have no reader: no production module the switches used to gate
+    /// names either field, so a config carrying one cannot change behaviour. The needles are
+    /// assembled with `concat!` so this file's own text does not match.
+    #[test]
+    fn removed_switches_are_read_by_nothing() {
+        let sources = [
+            ("cache.rs", include_str!("cache.rs")),
+            (
+                "journal_consolidator.rs",
+                include_str!("journal_consolidator.rs"),
+            ),
+            ("eviction_worklist.rs", include_str!("eviction_worklist.rs")),
+            ("orphan_reclaim.rs", include_str!("orphan_reclaim.rs")),
+            ("main.rs", include_str!("main.rs")),
+        ];
+        for needle in [
+            concat!(".orphan_reclaim", "_enabled"),
+            concat!(".eviction_worklist", "_enabled"),
+        ] {
+            for (name, source) in sources {
+                assert!(
+                    !source.contains(needle),
+                    "{name} reads the removed switch {needle:?}"
+                );
+            }
+        }
+    }
+
+    /// Config-compat (DR-EVICT task 49): a config written before `eviction_worklist_lease`
+    /// existed parses with a 900 s lease, both with no `shared_storage` section and with one
+    /// naming only older fields. An explicit value parses, and a lease outside 60 s - 24 h is
+    /// rejected by validation.
+    #[test]
+    fn config_without_the_eviction_worklist_lease_parses_with_its_default() {
+        let minimal = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let partial = r#"
+cache:
+  cache_dir: "./cache"
+  shared_storage:
+    orphan_recovery_enabled: true
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        for yaml in [minimal, partial] {
+            let config: Config = serde_yaml_ng::from_str(yaml).expect("config must parse");
+            let shared = &config.cache.shared_storage;
+            assert_eq!(shared.eviction_worklist_lease, Duration::from_secs(900));
+            shared.validate().expect("the defaults must validate");
+        }
+        let explicit = partial.replace(
+            "orphan_recovery_enabled: true",
+            "eviction_worklist_lease: \"30m\"",
+        );
+        let config: Config = serde_yaml_ng::from_str(&explicit).expect("explicit field parses");
+        assert_eq!(
+            config.cache.shared_storage.eviction_worklist_lease,
+            Duration::from_secs(1800)
+        );
+        assert_eq!(EVICTION_WORKLIST_LEASE_MIN_SECS, 760, "2 x (64 x 5 + 60)");
+        for (secs, ok) in [
+            (60, false),
+            (759, false),
+            (760, true),
+            (900, true),
+            (86_400, true),
+            (86_401, false),
+        ] {
+            let shared = SharedStorageConfig {
+                eviction_worklist_lease: Duration::from_secs(secs),
+                ..Default::default()
+            };
+            assert_eq!(shared.validate().is_ok(), ok, "lease {secs}s");
+        }
+        let err = SharedStorageConfig {
+            eviction_worklist_lease: Duration::from_secs(60),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("760s"), "the error names the floor: {err}");
+        // A config that sets only a larger lock wait budget still loads with the default lease.
+        let budget_only = SharedStorageConfig {
+            lock_acquire_wait_budget: Duration::from_secs(60),
+            ..Default::default()
+        };
+        assert!(budget_only.validate().is_ok());
+        assert_eq!(
+            crate::eviction_worklist::executor_budget(&budget_only).lease_secs,
+            eviction_worklist_lease_floor_secs(60),
+            "executors raise the lease to the floor for the configured budget"
+        );
+        assert_eq!(
+            crate::eviction_worklist::executor_budget(&SharedStorageConfig::default()).lease_secs,
+            900
+        );
+    }
     // Config-compat: a PARTIALLY specified section must parse, with the fields the
     // operator did not write falling back to their documented defaults. `Config`
     // carries field-level `#[serde(default)]` on each section, so omitting a whole
     // section always worked; before `#[serde(default)]` was added to these four
     // structs, writing the section with a single field failed startup naming a field
     // the operator never wrote (e.g. "missing field `preferred_algorithm`").
-    // See .kiro/steering/config-compatibility.md.
+    // See the config compatibility rule.
 
     #[test]
     fn partial_compression_section_fills_remaining_defaults() {
@@ -8175,7 +10682,7 @@ health:
         assert_eq!(config.health.port, 18080);
         assert!(config.health.enabled);
         assert_eq!(config.health.endpoint, "/health");
-        assert_eq!(config.health.bind_address, "0.0.0.0");
+        assert_eq!(config.health.bind_address, "127.0.0.1");
         assert_eq!(config.health.check_interval, Duration::from_secs(30));
     }
 
@@ -8196,7 +10703,7 @@ metrics:
         assert_eq!(config.metrics.port, 19090);
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.endpoint, "/metrics");
-        assert_eq!(config.metrics.bind_address, "0.0.0.0");
+        assert_eq!(config.metrics.bind_address, "127.0.0.1");
         assert_eq!(config.metrics.collection_interval, Duration::from_secs(60));
         assert_eq!(config.metrics.per_bucket.max_series, 100);
         // Nested OTLP section must also fall back wholesale.

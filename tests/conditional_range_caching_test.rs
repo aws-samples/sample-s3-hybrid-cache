@@ -1,6 +1,6 @@
 //! Integration tests for CRT conditional ranged-GET caching (Requirement 1).
 //!
-//! Spec: `.kiro/specs/crt-conditional-range-caching/`
+//! Spec: the crt conditional range caching feature
 //! Task: 3
 //!
 //! ## What these tests lock down
@@ -34,7 +34,7 @@
 //!      `Buffered` body; the `Streaming` variant wraps `hyper::body::Incoming`,
 //!      which has no public constructor. The real CRT path streams, and a buffered
 //!      `206` partial is — correctly — not stored as a full object, so no
-//!      in-process body shape caches a ranged response. T30 asserts a single CRT
+//!      in-process body shape caches a ranged response. The fleet suite asserts a single CRT
 //!      pass populates the cache (`.meta` ranges + `.bin` + byte-exact re-read).
 //!   2. **The Mode B `If-Match` cache-serve decision.** That branch lives in the
 //!      private `handle_get_head_request`, which needs a `Request<Incoming>` that
@@ -133,7 +133,7 @@ async fn make_cache_infra(
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
         config.cache.max_cache_size,
-        CacheEvictionAlgorithm::LRU,
+        CacheEvictionAlgorithm::TinyLFU,
         1024,
         config.compression.enabled,
         config.cache.get_ttl,

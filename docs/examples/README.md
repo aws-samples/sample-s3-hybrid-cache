@@ -1,112 +1,87 @@
 # Examples
 
-Two kinds of example file live here.
+This directory holds two kinds of example file: complete proxy configurations
+(`config-*.yaml`) and cache rules files (`*-rules.json`).
 
-**`config-*.yaml`** — complete proxy configurations, ready to start:
+## Configuration examples
+
+Each `config-*.yaml` file is a complete configuration you can start the proxy with:
 
 | File | Profile |
 |---|---|
 | `config-development.yaml` | Local cache, debug logging, unprivileged ports, loopback dashboard |
-| `config-production.yaml` | Standard ports, TLS-terminating listener, shared cache volume, OTLP export |
-| `config-high-performance.yaml` | 1 TiB disk / 10 GiB RAM tiers, long-lived connections, slower dashboard polling |
+| `config-production.yaml` | Standard ports, the TLS proxy listener (port 3129), a cache volume shared by the fleet, shared logs, OTLP export |
+| `config-high-performance.yaml` | A 1 TiB disk cache and a 10 GiB RAM cache, with less frequent dashboard refreshes |
 
 ```bash
 s3-proxy --config docs/examples/config-development.yaml
 ```
 
-The production and high-performance profiles use absolute paths under `/var`, and
-standard ports 80/443 which need root or `CAP_NET_BIND_SERVICE`. Adjust both for a local
-trial, or start from the development profile.
+The production and large-cache profiles assume two shared mounts: `/mnt/cache` for the cache
+volume, and `/mnt/nfs` for configuration, TLS material and logs. They also use ports 80 and 443,
+which need root or `CAP_NET_BIND_SERVICE`. The two mounts are separate because the
+consumed-bytes reading covers the whole file system, so it describes the cache only when the
+cache volume is its own file system. That is recommended, not required; see the `cache_dir`
+comment in `config-production.yaml` and [Running a fleet on one cache volume](../SHARED_STORAGE.md). For a local
+trial, adjust the paths and ports, or start from the development profile, which uses relative
+paths and unprivileged ports.
 
-**`*-rules.json`** — `cache_rules.json` files, documented below. Each overrides global
-cache settings for keys matching a glob pattern, without editing the YAML config or
-restarting the proxy.
+`config/s3-proxy.service` ships with `ReadWritePaths` and `RequiresMountsFor` set to these
+paths. On AWS the volumes are named after the services behind them; see
+[AWS deployment](../AWS_DEPLOYMENT.md) and the `userdata-*.sh` scripts here.
 
-## Cache Rules Examples
+## Cache rules examples
 
+Each `*-rules.json` file is a `cache_rules.json` that overrides the global cache settings for
+keys matching a glob pattern, without editing the YAML configuration or restarting the proxy.
 To use one, copy it to `cache_dir/cache_rules.json`:
 
 ```bash
 cp static-assets-rules.json /path/to/cache_dir/cache_rules.json
 ```
 
-The proxy reloads the file automatically when it changes (default staleness threshold: 60s). The file is optional — when absent or when its `rules` array is empty, every setting resolves to the global YAML `cache:` defaults.
+The proxy re-reads the file every `bucket_settings_staleness_threshold` (default 60s). The file
+is optional: when it is absent or its `rules` array is empty, every setting comes from the
+global `cache:` section of the YAML configuration.
 
-For the authoritative reference, see [CONFIGURATION.md — Cache Rules](../CONFIGURATION.md#cache-rules). The JSON schema is [`docs/cache-rules-schema.json`](../cache-rules-schema.json) and a fuller worked example is [`config/cache_rules.example.json`](../../config/cache_rules.example.json).
+[Cache rules](../CONFIGURATION.md#cache-rules) is the reference for the file format, the glob
+syntax, the per-rule fields and what happens when a reload fails.
+[Duration format](../CONFIGURATION.md#duration-format) lists the TTL values accepted. The JSON
+schema is [`docs/cache-rules-schema.json`](../cache-rules-schema.json), and
+[`config/cache_rules.example.json`](../../config/cache_rules.example.json) is a fuller worked
+example.
 
-## File Format
-
-Each file is a `{ "rules": [...] }` document with an optional `$schema` reference and an ordered `rules` array. Each rule has a required glob `pattern` plus an optional subset of settings fields. Omitted fields fall through (see Precedence below).
-
-```json
-{
-  "$schema": "../cache-rules-schema.json",
-  "rules": [
-    { "pattern": "my-bucket/static/**", "get_ttl": "7d", "compression_enabled": true },
-    { "pattern": "**", "get_ttl": "5m" }
-  ]
-}
-```
-
-Optional per-rule fields: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`, `hedging_enabled`, `hedge_trigger_after`, `hedge_max_per_request`.
-
-## Glob Syntax
-
-A pattern matches against the full cache key, `{bucket}/{object_key}` (no leading slash). It is anchored to the whole key and is case-sensitive.
-
-| Glob | Matches |
-|------|---------|
-| `*`  | Any run of characters except `/` — one path segment |
-| `**` | Any run of characters including `/` — crosses segments |
-| `?`  | Exactly one character except `/` |
-| any other char | A literal |
-
-Because the bucket is part of the match surface, one syntax expresses every scope:
-
-| Pattern | Meaning |
-|---------|---------|
-| `my-bucket/temp/**` | The `temp/` prefix in one bucket |
-| `**/logs/**` | A `logs/` segment anywhere, in every bucket |
-| `prod-*/static/**` | The `static/` prefix in every bucket whose name starts `prod-` |
-
-Patterns are anchored, so `my-bucket/temp` matches only that exact key. To match everything under a prefix, use `my-bucket/temp/**`.
-
-## First-Match-Per-Field Precedence
-
-Rules are an ordered list. For each field independently, the value comes from the earliest rule that both matches the key and sets that field, falling through to the global YAML default. Put specific rules above broad ones.
-
-## Examples
-
-| File | Use Case |
+| File | Use case |
 |---|---|
-| `static-assets-rules.json` | Static assets bucket with long TTL (7d) and compression enabled |
-| `frequently-updated-rules.json` | Frequently-updated data with short TTL (30s) and RAM cache disabled |
-| `zero-ttl-auth-rules.json` | Authentication bucket where every GET/HEAD revalidates with S3 (`get_ttl: "0s"`) |
-| `no-cache-prefix-rules.json` | Bucket with a `volatile/` prefix that bypasses read caching, everything else cached 1h |
-| `allowlist-pattern-rules.json` | Rule enabling caching for one bucket when global `read_cache_enabled` is `false` |
-| `path-prefix-rules.json` | Matching several path prefixes within a bucket with distinct settings each |
-| `page-aligned-parquet-rules.json` | Page-aligned range caching for a Parquet prefix, so footer and column-chunk reads that cluster within a page hit cache |
+| `static-assets-rules.json` | A static assets bucket with a long TTL (7d) and compression enabled |
+| `frequently-updated-rules.json` | Frequently updated data with a short TTL (30s) and the RAM cache disabled |
+| `zero-ttl-auth-rules.json` | An authentication bucket where every GET and HEAD revalidates with S3 (`get_ttl: "0s"`) |
+| `no-cache-prefix-rules.json` | A bucket whose `volatile/` prefix bypasses the read cache, with everything else cached for 1h |
+| `allowlist-pattern-rules.json` | A rule that enables caching for one bucket while the global `read_cache_enabled` is `false` |
+| `path-prefix-rules.json` | Several path prefixes in one bucket, each with its own settings |
+| `page-aligned-parquet-rules.json` | Page-aligned range caching for a Parquet prefix, so footer and column-chunk reads that cluster within a page hit the cache |
 
-## Allowlist Pattern
+Two rules of the format shape every example. Each field takes its value from the earliest rule
+that matches the key and sets that field, falling through to the global YAML default, so put
+specific rules above broad ones. Patterns are anchored to the whole cache key,
+`{bucket}/{object_key}`, so `my-bucket/temp` matches only that exact key and
+`my-bucket/temp/**` matches everything under the prefix.
 
-To cache only specific keys, set `read_cache_enabled: false` in the global YAML config, then add a rule with `"read_cache_enabled": true` for each pattern you want cached. See `allowlist-pattern-rules.json`.
+Two settings make a key ineligible for the RAM cache whatever `ram_cache_eligible` says:
+`get_ttl: "0s"`, because a RAM cache hit skips revalidation, and `read_cache_enabled: false`.
 
-## Automatic Behaviors
+### Allowlist pattern
 
-- `get_ttl: "0s"` forces `ram_cache_eligible` to `false` (RAM cache bypasses revalidation)
-- `read_cache_enabled: false` forces `ram_cache_eligible` to `false`
-- The rule set reloads automatically when the file changes on disk (default staleness threshold: 60s)
-- Invalid JSON or validation errors keep the last-known-good rule set
+To cache only specific keys, set `read_cache_enabled: false` in the global YAML configuration,
+then add a rule with `"read_cache_enabled": true` for each pattern to cache.
+`allowlist-pattern-rules.json` does this for one bucket.
 
-## Duration Format
+### Atomic updates
 
-TTL values accept human-readable durations: `"0s"`, `"30s"`, `"5m"`, `"1h"`, `"7d"`, `"500ms"`.
-
-## Atomic Updates
-
-On shared NFS storage, write the file atomically to avoid partial reads:
+On a cache volume shared over NFS, write the file atomically so that no proxy reads a partial
+file. Stage the copy in the same directory, so the rename stays on one file system:
 
 ```bash
-cp new-rules.json cache_rules.json.tmp
-mv cache_rules.json.tmp /path/to/cache_dir/cache_rules.json
+cp new-rules.json /path/to/cache_dir/cache_rules.json.tmp
+mv /path/to/cache_dir/cache_rules.json.tmp /path/to/cache_dir/cache_rules.json
 ```

@@ -38,6 +38,8 @@ fn create_test_metadata(
             last_accessed: SystemTime::now(),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         }],
         created_at: SystemTime::now(),
         expires_at: SystemTime::now() + Duration::from_secs(3600),
@@ -298,6 +300,8 @@ fn test_calculate_compressed_size() {
             last_accessed: SystemTime::now(),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         },
         RangeSpec {
             start: 512,
@@ -310,6 +314,8 @@ fn test_calculate_compressed_size() {
             last_accessed: SystemTime::now(),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         },
     ];
 
@@ -334,6 +340,8 @@ fn test_calculate_uncompressed_size() {
             last_accessed: SystemTime::now(),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         },
         RangeSpec {
             start: 512,
@@ -346,6 +354,8 @@ fn test_calculate_uncompressed_size() {
             last_accessed: SystemTime::now(),
             access_count: 1,
             staged: None,
+            unservable: false,
+            file_identity: None,
         },
     ];
 
@@ -369,6 +379,8 @@ fn test_calculate_compression_ratio() {
         last_accessed: SystemTime::now(),
         access_count: 1,
         staged: None,
+        unservable: false,
+        file_identity: None,
     }];
 
     let ratio = validator.calculate_compression_ratio(&ranges);
@@ -391,6 +403,8 @@ fn test_calculate_compression_ratio_zero_uncompressed() {
         last_accessed: SystemTime::now(),
         access_count: 1,
         staged: None,
+        unservable: false,
+        file_identity: None,
     }];
 
     let ratio = validator.calculate_compression_ratio(&ranges);

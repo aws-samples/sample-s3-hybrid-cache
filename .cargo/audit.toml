@@ -3,9 +3,23 @@
 # https://docs.rs/cargo-audit/latest/cargo_audit/#configuration
 #
 # This file tells `cargo audit` which advisories we have explicitly reviewed
-# and decided to defer. Every entry MUST have a comment naming the tracking
-# spec or changelog entry and the expected resolution path. Entries that are
+# and decided to defer. Every entry MUST have a comment naming why it is
+# deferred and the expected resolution path. Entries that are
 # no longer relevant MUST be removed — this file is not a permanent waiver.
 
 [advisories]
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0190: anyhow 1.0.100 unsoundness in Error::downcast_mut().
+    # Reaches s3-proxy only via build-time/dev tooling (wasip3/wit-bindgen chain
+    # pulled in transitively by prost-derive/prost, used by opentelemetry-otlp's
+    # codegen) — not a runtime dependency exercised by the shipped binary. No
+    # newer anyhow release exists as of 2026-07-20; re-check on next dependency
+    # bump. Reviewed at 2.3.0.
+    "RUSTSEC-2026-0190",
+    # RUSTSEC-2026-0097: rand 0.8.5 unsound with a custom logger using rand::rng().
+    # Reaches s3-proxy only via quickcheck (dev-dependency, property-test macros
+    # only) — never linked into the production binary. No quickcheck release
+    # drops the rand 0.8 pin as of 2026-07-20; re-check on next dependency bump.
+    # Reviewed at 2.3.0.
+    "RUSTSEC-2026-0097",
+]

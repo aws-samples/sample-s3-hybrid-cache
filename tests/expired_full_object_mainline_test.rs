@@ -1,6 +1,6 @@
 //! The FULL-OBJECT mainline entry point: `handle_get_head_request`.
 //!
-//! Spec: `.kiro/specs/expired-entry-revalidation/` Requirements 2, 4.4, 7.1, 7.3.
+//! Spec: the expired entry revalidation feature Requirements 2, 4.4, 7.1, 7.3.
 //!
 //! # Why this file is separate from the range regressions
 //!
@@ -236,9 +236,39 @@ async fn expired_full_object_mainline_get_authorization_error_does_not_serve_sta
 /// expired entries discoverable is what makes this path reachable at all — before
 /// the fix a Stored_Expired entry never entered the arm Mode B lives in.
 ///
-/// Requirements: 4.4, 4.5, 7.3.
+/// # NARROWED IN 2.8.4 — a stored-EXPIRED entry no longer qualifies (R8.10)
+///
+/// This test previously asserted the opposite: that a matching client `If-Match`
+/// served a Stored_Expired entry from cache with zero upstream requests. That was
+/// R4.4's behaviour as shipped in 2.8.0, and the AWS Security Agent flagged it
+/// (a MEDIUM security review finding). The finding is correct, and two things in this spec's own
+/// text resolve it rather than contradict it:
+///
+/// - **R4.4 says the proxy MAY serve, not SHALL.** It grants permission, so
+///   withdrawing that permission for expired entries is within the requirement's
+///   letter. This test was asserting a MAY as though it were a SHALL.
+/// - **R4.5 forbids changing a client's RFC-defined result**, and the old behaviour
+///   did exactly that. RFC 9110 §13.1.1 evaluates `If-Match` against the resource's
+///   **current** representation, so when the origin has moved on the RFC-defined
+///   answer is `412`, not `200` with superseded bytes. Mode B compared the client's
+///   validator against the cache's *own stored* ETag — a self-comparison that
+///   establishes nothing about the origin — so a client replaying a superseded ETag
+///   was served stale bytes AND had their TTL refreshed. A client using `If-Match`
+///   to detect mid-transfer version changes (which is why the CRT and Rust transfer
+///   managers send it) was defeated by the very mechanism meant to serve it.
+///
+/// So R8.10 narrows R4.4 to entries within their stored expiry. That preserves what
+/// R4.4 exists for — the warm CRT download, where the entry is fresh — and removes
+/// the case where the cache cannot vouch for what it holds. `stored expiry passed`
+/// is precisely the cache saying so.
+///
+/// The companion test below pins the un-narrowed half, so this pair is two-sided:
+/// expired revalidates, fresh still serves locally. Without the companion, a future
+/// change that disabled Mode B entirely would pass this test.
+///
+/// Requirements: 4.4 (narrowed), 4.5, 7.3, 8.10.
 #[tokio::test]
-async fn mode_b_if_match_serves_expired_entry_from_cache_without_revalidating() {
+async fn mode_b_if_match_on_expired_entry_revalidates_instead_of_serving_stale() {
     // get_ttl: 0 via CONFIG, not ResolvedSettings — the loopback path resolves
     // its own settings. See the helper's docs.
     let config = test_config_full_object_checks_with_get_ttl(OBJECT_SIZE, Duration::ZERO);
@@ -278,19 +308,24 @@ async fn mode_b_if_match_serves_expired_entry_from_cache_without_revalidating() 
     let captured = stub.captured();
 
     assert_eq!(status, StatusCode::OK);
-    assert_all_old(
+
+    // R8.10: the entry's stored expiry has passed, so Mode B must NOT answer from
+    // cache on the strength of a self-compared If-Match. It must ask the origin.
+    assert!(
+        !captured.is_empty(),
+        "R8.10: a Mode B If-Match on a STORED-EXPIRED entry must revalidate against \
+         S3 rather than serving locally — the cached ETag the client's validator was \
+         compared against is the cache's own, which proves nothing about the origin. \
+         Zero upstream requests means the pre-2.8.4 stale-serve is back"
+    );
+
+    // The stub reports the object HAS changed (v2), so the client must receive the
+    // current bytes, not the superseded cached ones.
+    assert_all_new(
         &body,
         OBJECT_SIZE as usize,
-        "R4.4: a matching client If-Match must serve the CACHED bytes despite TTL expiry \
-         — the client's precondition IS the freshness assertion, not proxy TTL \
-         revalidation. Fresh bytes here mean the request was forwarded to S3 instead",
-    );
-    assert!(
-        captured.is_empty(),
-        "R4.4: a Mode B If-Match hit must not contact S3 at all; {} upstream \
-         request(s) were made: {:#?}",
-        captured.len(),
-        captured
+        "R8.10: once revalidation reveals a newer version, the superseded cached bytes \
+         must not be served",
     );
 
     // R4.4 also says Mode B refreshes the TTL, and that is deliberately NOT
@@ -312,10 +347,210 @@ async fn mode_b_if_match_serves_expired_entry_from_cache_without_revalidating() 
     // bytes returned, zero upstream requests, despite both stored and live expiry
     // having elapsed. The TTL-refresh half needs either a consolidation wait or a
     // journal read, and belongs with task 7's persistence tests.
-    let metadata = fixture.read_meta(&key).expect(".meta must still exist");
+    // The superseded entry must not survive still claiming the old version. Kept as a
+    // presence-tolerant check because the changed-object path invalidates it.
+    let still_claims_superseded = fixture
+        .read_meta(&key)
+        .map(|m| m.object_metadata.etag == etag)
+        .unwrap_or(false);
+    assert!(
+        !still_claims_superseded,
+        "R8.10: after revalidation revealed a newer version, the entry must not remain \
+         claiming {etag}"
+    );
+}
+
+/// The un-narrowed half of R4.4, and the reason 2.8.4's narrowing is safe.
+///
+/// A stored-FRESH entry with a matching client `If-Match` still serves from cache with
+/// zero upstream requests. This is the case R4.4 exists for — the warm CRT or transfer
+/// manager download, where every ranged chunk carries `If-Match` and the entry is well
+/// within its TTL — and it is unaffected by R8.10.
+///
+/// This test is what stops the narrowing being over-applied. A change that dropped the
+/// local Mode B serve altogether would pass the expired test above and fail this one.
+///
+/// Requirements: 4.4, 8.10.
+#[tokio::test]
+async fn mode_b_if_match_on_stored_fresh_entry_still_serves_from_cache() {
+    // get_ttl is 60s, NOT zero: `get_ttl == 0` means always-revalidate, so that S3
+    // evaluates IAM on every read, and under that meaning the local serve asserted here
+    // is exactly what must NOT happen (`get-ttl-zero-enforcement` R3.1, pinned by
+    // `mode_b_if_match_with_get_ttl_zero_must_revalidate` below).
+    //
+    // The entry is seeded 1s old, so it is live-fresh under 60s. Until this test
+    // seeded it 7200s old, because Mode B then bypassed the live TTL; it no longer does
+    // (`ttl_authority_serve_paths_test::mode_b_if_match_on_a_live_expired_entry_revalidates`).
+    let config = test_config_full_object_checks_with_get_ttl(OBJECT_SIZE, Duration::from_secs(60));
+    let fixture = Fixture::new(config).await;
+    let key = format!("{}/modeb-fresh-{}", BUCKET, OBJECT);
+    let path = format!("/{}", key);
+
+    // Stored-FRESH and live-fresh. Since the change a Mode B serve also needs the live
+    // `get_ttl` verdict, so a live-expired entry revalidates
+    // (`mode_b_if_match_on_a_live_expired_entry_revalidates`); this test keeps the warm
+    // case R4.4 exists for, an entry well within its TTL.
+    let mut spec = SeedSpec::stored_fresh_live_expired(
+        vec![(0, OBJECT_SIZE - 1)],
+        OBJECT_SIZE,
+        "\"fo-modeb-fresh-v1\"",
+    );
+    spec.created_age = Duration::from_secs(1);
+    let etag = fixture.seed(&key, &spec);
+    fixture.invalidate_metadata_cache(&key).await;
+
+    assert!(
+        fixture.config.cache.evaluate_conditions_from_cache,
+        "PRECONDITION MISSING: Mode B is off in this config"
+    );
+
+    // Any upstream request at all would mean the local serve did not happen.
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::OK)
+            .with_body(Bytes::from(new_bytes()))
+            .with_header("etag", "\"fo-modeb-fresh-v2\""),
+    );
+    let server = fixture.spawn_proxy(stub.clone().into_trait_object()).await;
+    let (status, _headers, body) =
+        proxy_get(server.addr, &path, &[("if-match", etag.as_str())]).await;
+    let captured = stub.captured();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        captured.is_empty(),
+        "R4.4: a Mode B If-Match hit on a stored-FRESH entry must not contact S3 at all; \
+         {} upstream request(s) were made: {:#?}",
+        captured.len(),
+        captured
+    );
+    assert_all_old(
+        &body,
+        OBJECT_SIZE as usize,
+        "R4.4: a stored-fresh Mode B If-Match hit serves the CACHED bytes. Fresh bytes \
+         here mean 2.8.4's narrowing was over-applied and the local serve is gone",
+    );
+}
+
+/// `get-ttl-zero-enforcement` R3.1: a key resolving to `get_ttl: "0s"` must not have a
+/// Mode B `If-Match` answered from cache, because `get_ttl: 0` is an authorization
+/// boundary and not merely a freshness one.
+///
+/// # Why this is not covered by the two tests above
+///
+/// `mode_b_if_match_on_expired_entry_revalidates_instead_of_serving_stale` covers a
+/// STORED-expired entry, which 2.8.4 already forwards. This one is STORED-FRESH, which
+/// is the state an operator produces by caching under a generous `get_ttl` and then
+/// tightening the rule to `"0s"` — rules are per-glob and hot-reloaded, so that
+/// sequence is the normal case, not an edge case. A cold cache cannot reach it: an
+/// entry written while `get_ttl` was already `0` gets `expires_at = now`, is
+/// stored-expired, and takes 2.8.4's path. **So a cold-cache fixture cannot fail
+/// against the defect and would be worthless as a red side.**
+///
+/// The sibling test above is the same fixture with a 60s `get_ttl`, where the local
+/// serve is correct and must survive. The only difference between them is the resolved
+/// `get_ttl`, which is what makes a failure here attributable to the gate rather than
+/// to Mode B being broken generally.
+///
+/// # What is asserted, and why it is the upstream request rather than the body
+///
+/// The object has NOT changed in this fixture, so the bytes are identical whether the
+/// answer came from cache or from a revalidation — a body assertion would pass in both
+/// the exposed and fixed cases and prove nothing (`pre-push-checklist.md` step 8,
+/// "assert the predicate the code evaluates"). The observable is that S3 was contacted
+/// at all, since that is the request on which S3 evaluates the caller's IAM permission.
+///
+/// Requirements: `get-ttl-zero-enforcement` R1.1, R1.2, R3.1, R3.3.
+#[tokio::test]
+async fn mode_b_if_match_with_get_ttl_zero_must_revalidate() {
+    let config = test_config_full_object_checks_with_get_ttl(OBJECT_SIZE, Duration::ZERO);
+    let fixture = Fixture::new(config).await;
+    let key = format!("{}/modeb-ttl0-{}", BUCKET, OBJECT);
+    let path = format!("/{}", key);
+
+    // STORED-FRESH is the whole point: the entry was cached under a generous get_ttl
+    // before the rule was tightened. Stored-expired is 2.8.4's case, not this one.
+    let etag = fixture.seed(
+        &key,
+        &SeedSpec::stored_fresh_live_expired(
+            vec![(0, OBJECT_SIZE - 1)],
+            OBJECT_SIZE,
+            "\"fo-modeb-ttl0-v1\"",
+        ),
+    );
+    fixture.invalidate_metadata_cache(&key).await;
+
+    assert!(
+        fixture.config.cache.evaluate_conditions_from_cache,
+        "PRECONDITION MISSING: Mode B is off in this config, so the If-Match would be \
+         forwarded anyway and this test would pass without exercising the gate"
+    );
     assert_eq!(
-        metadata.object_metadata.etag, etag,
-        "the cached entry must still be the version the client's If-Match matched"
+        fixture.config.cache.get_ttl,
+        Duration::ZERO,
+        "PRECONDITION MISSING: this test's whole subject is get_ttl == 0"
+    );
+
+    // The object is UNCHANGED: same ETag, same bytes. So the response is byte-identical
+    // to a local serve and the upstream request is the ONLY thing that distinguishes the
+    // two behaviours — which is the point.
+    //
+    // 200 with the body, not 304. The client's `If-Match` is forwarded verbatim, and a
+    // *passing* `If-Match` returns 200 from S3 — 304 requires `If-None-Match` or
+    // `If-Modified-Since` (RFC 9110 §13.1.1, §15.4.5). A first version of this fixture
+    // returned 304 to the forwarded `If-Match`, which no origin would do, and the proxy
+    // correctly passed that 304 through to the client per the documented
+    // forwarded-conditional contract. That produced a `left: 304, right: 200` failure
+    // that looked like a product defect and was entirely the stub's fault.
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::OK)
+            .with_body(Bytes::from(vec![OLD_FILL; OBJECT_SIZE as usize]))
+            .with_header("etag", etag.as_str()),
+    );
+    let server = fixture.spawn_proxy(stub.clone().into_trait_object()).await;
+
+    let (status, _headers, body) =
+        proxy_get(server.addr, &path, &[("if-match", etag.as_str())]).await;
+    let captured = stub.captured();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !captured.is_empty(),
+        "R3.1: a Mode B If-Match on a key resolving to get_ttl: 0 must reach S3, so that \
+         S3 evaluates the caller's IAM permission. Zero upstream requests means the \
+         verdict was produced locally from the cache's own ETag — a self-comparison that \
+         establishes nothing about either the object version OR the caller's continued \
+         authorization. Captured: {:#?}",
+        captured
+    );
+    // The client's own `If-Match` must travel, the way `evaluate_conditions_from_cache:
+    // false` forwards it — that is what lets S3 evaluate the precondition rather than the
+    // proxy. Read from the captured request's headers directly, in both cases.
+    //
+    // NOT via the `conditional_requests` helper: it filters on `if_none_match` /
+    // `if_modified_since`, i.e. the headers the proxy INJECTS on a revalidation, and says
+    // nothing about a forwarded client `If-Match`. Using it here reported "no conditional
+    // headers" for a request that carried the client's `If-Match` correctly — the wrong
+    // predicate for the property being asserted.
+    let forwarded_if_match = captured
+        .iter()
+        .any(|r| r.headers.contains_key("if-match") || r.headers.contains_key("If-Match"));
+    assert!(
+        forwarded_if_match,
+        "R3.1: the upstream request must carry the client's If-Match intact, so S3 \
+         evaluates the precondition. Without it the request is a plain refetch that \
+         transferred a body it did not need. Body: {}. Captured: {:#?}",
+        fill_summary(&body),
+        captured
+    );
+
+    // The object did not change, so the client must still receive the correct bytes. This
+    // asserts the gate is not a correctness regression; it is NOT evidence about where the
+    // bytes came from, since both behaviours produce identical bytes here by construction.
+    assert_all_old(
+        &body,
+        OBJECT_SIZE as usize,
+        "R3.1: the gate costs a round trip, not correctness — the client must still \
+         receive the object's current bytes",
     );
 }
 
