@@ -59,7 +59,7 @@ The proxy handles three kinds of range-file damage as a miss:
 - a file whose size or modification time differs from what was recorded when the range was cached;
 - a file that cannot be checked when it is opened.
 
-The read is answered from S3, and the proxy removes the range so the next read caches it again. A read already streaming from the cache cannot switch to S3 once its response has started. It ends early with a connection error, and the bytes it sent before the check failed can be wrong. Until the range is removed, later reads of it on that proxy are fetched from S3. The counters are `range_file_corruption_detected` and `range_file_identity_mismatch_detected`; see [`atomic_metadata`](METRICS_REFERENCE.md#atomic_metadata) and [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3).
+The read is answered from S3, and the proxy removes the range so the next read caches it again. A read already streaming from the cache cannot switch to S3 once its response has started. It ends early with a connection error, and the bytes it sent before the check failed can be wrong. The check comes after a range file's last block, so a streamed response that ends before the end of its cached range can complete with damaged bytes; see [Damaged range files](../SECURITY.md#damaged-range-files). Until the range is removed, later reads of it on that proxy are fetched from S3. The counters are `range_file_corruption_detected` and `range_file_identity_mismatch_detected`; see [`atomic_metadata`](METRICS_REFERENCE.md#atomic_metadata) and [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3).
 
 ### 3. Disk space exhaustion
 

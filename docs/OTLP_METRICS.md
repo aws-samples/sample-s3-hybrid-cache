@@ -144,7 +144,7 @@ by roughly the proxy count. See [What to alarm on](LOCAL_NVME_CACHE.md#what-to-a
 | `cache.ram_cache_hits` | Gauge | RAM range cache lookups that found the key, not bytes served. The etag comparison that can reject the entry as a stale version runs afterwards, so a rejected entry counts here too. See [RAM cache fields](METRICS_REFERENCE.md#ram-tier) |
 | `cache.ram_cache_misses` | Gauge | RAM range cache misses |
 | `cache.ram_cache_evictions` | Gauge | RAM range cache evictions |
-| `cache.ram_cache_entries` | Gauge | Entries resident in the RAM cache (range plus whole-object), a level. Per-proxy |
+| `cache.ram_cache_entries` | Gauge | Entries resident in the RAM cache, one per cached extent, a level. Per-proxy |
 | `cache.ram_cache_eligibility_skips_total` | Gauge | RAM admissions declined because the key's `ram_cache_eligible` resolved `false`. Per-proxy. See [RAM cache fields](METRICS_REFERENCE.md#ram-tier) |
 
 ### Metadata cache
@@ -480,13 +480,15 @@ rotation's scheduling and outcome signals (reachability, projected rotation time
 capping, re-appended ranges) but not for `ledger_repair_observed_shards` or
 `ledger_repair_stalest_age_secs`. So a rotation-progress panel built on the exported subset can
 show that the rotation is reachable without being able to show how far through it is, or how
-stale the worst shard's sweep has become. Both of those come from `/metrics` only. Of `atomic_metadata`, the four
-`metadata_lock_*` figures, `atomic_metadata.range_file_corruption_detected`,
+stale the worst shard's sweep has become. Both of those come from `/metrics` only. Every `atomic_metadata` field is exported, each a per-proxy gauge carrying
+a count since process start: the four `metadata_lock_*` figures,
+`atomic_metadata.range_file_corruption_detected`,
 `atomic_metadata.range_file_corruption_healed`,
 `atomic_metadata.range_file_corruption_heal_suppressed`,
-`atomic_metadata.range_file_identity_mismatch_detected` and
-`atomic_metadata.journal_validation_failures` are exported, each a per-proxy gauge carrying a
-count since process start; its other 8 fields are always zero and have no instrument. The
+`atomic_metadata.range_file_identity_mismatch_detected`,
+`atomic_metadata.unverified_ranges_refused`,
+`atomic_metadata.retired_fill_files_unlinked` and
+`atomic_metadata.journal_validation_failures`. The
 orphan reclamation rotation exports under `orphan_reclaim.*`.
 
 `page_cache`, `inflight_memory`, `fill_visibility`, `consolidation`, `metrics_collection`,

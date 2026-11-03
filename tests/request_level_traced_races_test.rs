@@ -626,6 +626,30 @@ async fn item2_case(threshold: u64, what: &'static str) {
     filetime::set_file_mtime(bin_path(&peer, &a_spec), peer_mtime()).unwrap();
     std::fs::rename(bin_path(&peer, &a_spec), &path).unwrap();
     consolidate(&fixture, &key).await;
+    let meta = fixture.read_meta(&key).expect("the pass publishes a .meta");
+    let spec = meta.ranges.first().cloned().expect("an extent is listed");
+    assert_eq!(meta.object_metadata.etag, ETAG_V2, "fixture: B's version");
+    assert!(
+        spec.file_identity.is_some() && spec.file_identity != identity_at(&path),
+        "fixture: B's identity listed over A's file after the first pass (listed {:?}, at the \
+         path {:?})",
+        spec.file_identity,
+        identity_at(&path)
+    );
+    // The read, while the inversion is listed.
+    let origin = Origin::new(V2);
+    let server = fixture.spawn_proxy(origin.clone()).await;
+    let before = origin.requests();
+    let served = get(server.addr, &key, &range).await;
+    let log = origin.log();
+    let v = assert_one_labelled_version(&served, 0, LEN - 1, what, &log);
+    assert_eq!(v, V2, "({}) S3's current version", what);
+    assert!(
+        origin.requests() > before,
+        "({}) A's file was refused, so the bytes came from S3: {:?}",
+        what,
+        log
+    );
     // A's journal line reaches the shared journals; a second pass reads it.
     for entry in std::fs::read_dir(
         peer.cache_manager
@@ -648,33 +672,20 @@ async fn item2_case(threshold: u64, what: &'static str) {
         }
     }
     consolidate(&fixture, &key).await;
-    let meta = fixture.read_meta(&key).expect("the passes publish a .meta");
-    let spec = meta
-        .ranges
-        .first()
-        .cloned()
-        .expect("an extent stays listed");
-    assert_eq!(meta.object_metadata.etag, ETAG_V2, "fixture: B's version");
+    // R13.4: the second pass keeps a listing as "listed later" only if it owns the file at its
+    // path, so B's listing over A's file is retired with A's fill.
+    let listed = fixture
+        .read_meta(&key)
+        .map(|m| m.ranges)
+        .unwrap_or_default();
     assert!(
-        spec.file_identity.is_some() && spec.file_identity != identity_at(&path),
-        "fixture: B's identity listed over A's file after both passes (listed {:?}, at the path \
-         {:?})",
-        spec.file_identity,
+        listed
+            .iter()
+            .all(|r| r.file_identity.is_some() && r.file_identity == identity_at(&path)),
+        "R13.4: a listing that does not own the file at its path survived the second pass: \
+         {:?} (at the path {:?})",
+        listed,
         identity_at(&path)
-    );
-    // The read.
-    let origin = Origin::new(V2);
-    let server = fixture.spawn_proxy(origin.clone()).await;
-    let before = origin.requests();
-    let served = get(server.addr, &key, &range).await;
-    let log = origin.log();
-    let v = assert_one_labelled_version(&served, 0, LEN - 1, what, &log);
-    assert_eq!(v, V2, "({}) S3's current version", what);
-    assert!(
-        origin.requests() > before,
-        "({}) A's file was refused, so the bytes came from S3: {:?}",
-        what,
-        log
     );
 }
 

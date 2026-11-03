@@ -42,6 +42,8 @@ mod etagless_merge_and_ranged_200_test;
 mod expired_entry_revalidation_regression_test;
 #[path = "expired_full_object_mainline_test.rs"]
 mod expired_full_object_mainline_test;
+#[path = "failed_revalidation_read_lock_test.rs"]
+mod failed_revalidation_read_lock_test;
 #[path = "fill_capture_before_send_test.rs"]
 mod fill_capture_before_send_test;
 #[path = "head_expiration_property_test.rs"]

@@ -75,7 +75,9 @@ async fn append_one_entry(cache_dir: &Path, journal: &JournalManager, cache_key:
             access_count: 1,
             staged: None,
             unservable: false,
-            file_identity: None,
+            file_identity: s3_proxy::cache_types::RangeFileIdentity::of(
+                &std::fs::metadata(&range_path).unwrap(),
+            ),
         },
         operation: JournalOperation::Add,
         range_file_path: range_path.to_string_lossy().to_string(),

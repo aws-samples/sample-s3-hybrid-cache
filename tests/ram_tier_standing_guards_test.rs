@@ -504,3 +504,42 @@ async fn a_tiered_promotion_with_a_cold_metadata_cache_records_zero_and_is_decli
         "the RAM-hit serve's coverage filter must decline this entry"
     );
 }
+/// SA3-ADJ: a full-object GET of an object whose key ends in `:range:{start}:{end}` must not
+/// leave a RAM entry that answers that range of the object its key's prefix names. The RAM range
+/// key is `{cache_key}:range:{start}:{end}` (`CacheManager::generate_ram_range_key`), so a
+/// whole-object entry stored under the plain cache key `test-bucket/k:range:0:9` is the range
+/// entry for object `test-bucket/k`'s bytes 0-9. The body is a valid LZ4 frame, so the RAM
+/// lookup's decode succeeds and only the store decides the verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_whole_object_store_never_answers_another_objects_range() {
+    use std::io::Write;
+    let tmp = TempDir::new().expect("tempdir");
+    let (cm, _rh) = make_instance(tmp.path()).await;
+    let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    encoder.write_all(b"0123456789").unwrap();
+    let body = encoder.finish().unwrap();
+    cm.store_response_with_headers(
+        "test-bucket/k:range:0:9",
+        &body,
+        std::collections::HashMap::new(),
+        s3_proxy::cache_types::CacheMetadata {
+            etag: "\"sibling-etag\"".to_string(),
+            last_modified: "Tue, 23 Sep 2026 00:00:00 GMT".to_string(),
+            content_length: body.len() as u64,
+            part_number: None,
+            cache_control: None,
+            access_count: 0,
+            last_accessed: std::time::SystemTime::now(),
+        },
+    )
+    .await
+    .expect("the sibling's full-object store");
+    let hit = cm.get_range_from_ram_cache_hit("test-bucket/k", 0, 9, GENEROUS_TTL);
+    assert!(
+        hit.is_none(),
+        "SA3-ADJ: OBJECT test-bucket/k's RANGE 0-9 WAS ANSWERED FROM RAM BY THE WHOLE-OBJECT ENTRY \
+         OF test-bucket/k:range:0:9: etag={:?}, bytes={:?}",
+        hit.as_ref().map(|h| h.etag.clone()),
+        hit.as_ref().map(|h| h.data.clone())
+    );
+}

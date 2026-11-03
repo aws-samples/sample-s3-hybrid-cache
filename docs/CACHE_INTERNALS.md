@@ -400,8 +400,9 @@ How it works:
 1. **TeeStream for simultaneous streaming and caching.** S3 responses are wrapped in a
    TeeStream. Data streams to the client as it arrives and is sent at the same time to a
    background task for caching, so the whole response is never buffered in memory.
-2. **Effect.** Memory per transfer is proportional to the chunk size, not the object size, and
-   the first byte reaches the client as soon as it arrives from S3.
+2. **Effect.** Memory per transfer does not grow with the object size, and the first byte
+   reaches the client as soon as it arrives from S3. [Memory impact](CONFIGURATION.md#memory-impact)
+   gives the figures.
 
 Complete cache miss (streaming):
 
@@ -434,14 +435,15 @@ Range Request → Check RAM cache (key: {cache_key}:range:{start}:{end})
              → RAM MISS + range < streaming threshold: Buffered path
                   → Load from disk, serve, promote to RAM cache
              → RAM MISS + range >= streaming threshold: Streaming path
-                  → Stream from disk in 512 KiB chunks
-                  → Collect chunks during streaming
-                  → Promote to RAM cache after completion
+                  → Stream from disk in 512 KiB chunks through one queue of four
+                  → One whole cached range, ended cleanly: re-read its stored frame
+                    and promote it to RAM cache
                   → Skip promotion if range exceeds max_ram_cache_size
 ```
 
 - The RAM cache is checked before the streaming or buffered decision for every range request.
-- Both paths promote disk hits to the RAM cache for later requests.
+- The buffered path promotes disk hits to the RAM cache for later requests. The streaming path
+  promotes a hit that served one whole cached range, once its response has ended cleanly.
 - Dashboard statistics count RAM cache hits and misses from both paths.
 
 Configuration:
@@ -450,6 +452,20 @@ Configuration:
   Content-Length header. It governs the disk read path only; the S3 response path has no
   threshold and streams whatever the size.
 - Chunk size for disk streaming: 512 KiB (as in the flow above).
+
+### Streamed-hit queue
+
+A cache hit streamed from disk has one queue between the disk and the response body. A blocking
+reader decodes the range file into 512 KiB chunks, or into one buffer of the range's size when
+the range is smaller than a chunk, and queues up to four of them. The response body takes chunks
+from that queue directly. When the client stops reading, the hit holds the queued chunks, the
+chunk the reader is waiting to queue, the reader's buffers and hyper's write queue;
+[Memory impact](CONFIGURATION.md#memory-impact) gives the measured total. The chunk size and the
+depth are constants, not settings.
+
+A stalled stream has read five chunks ahead (the four queued and the one the reader holds),
+and hyper's write queue holds about 400 KiB more. At 1 GB/s that rides out about 3.0 ms of
+storage stall.
 
 ### Copies and allocation
 
@@ -537,8 +553,12 @@ a miss: the read is answered from S3, the range is removed and its file deleted,
 read caches it again. A frame's checksum shows that the file is intact, not that it is the file
 its metadata describes, so this check covers what the checksum cannot.
 
-The identity is optional. A range without one, such as a range cached or last rewritten by an earlier release, is served
-unchecked, except in the two shapes in
+A range without an identity, such as a range a 2.x release cached or last rewrote, is refused:
+the read is answered from S3 and the range is cached again with an identity. A pending journal
+entry without one is refused the same way, and consolidation discards it instead of listing it
+([Cache integrity](../SECURITY.md#cache-integrity)). With
+[`cache.trust_unverified_ranges`](CONFIGURATION.md#ranges-with-no-file-identity) set to `true`,
+such a range is served unchecked and such an entry is consolidated, except in the two shapes in
 which an unchecked range's bytes can be wrong:
 
 - A range that starts at the object's first byte and ends before its last is not served, because
@@ -972,17 +992,24 @@ doubling per attempt, capped at 5 seconds, with ±25% jitter, for up to
 
 ### Consolidation process
 
-1. **Discover pending cache keys**: scan all `*.journal` files for unique cache keys.
+1. **Discover pending cache keys**: read every `*.journal` file a line at a time, recording the
+   cache keys it names and where each key's lines are.
 2. **For each cache key**:
-   - Collect all entries from every proxy's journal
-   - Sort entries by timestamp, oldest first
    - Take the key's metadata slot lock
+   - Read the key's own lines from every proxy's journal, at the recorded positions
+   - Sort entries by timestamp, oldest first
    - Load the metadata from disk
-   - Apply each entry in order (see the entry types above)
+   - Apply each entry in order (see the entry types above). A range fill that records no file
+     identity is discarded unless `cache.trust_unverified_ranges` is `true`
+     ([Range file identity](#range-file-identity))
    - Write the updated metadata to disk
    - Release the lock
-3. **Clean up**: delete a journal file whose entries were all applied; rewrite a file that still
-   holds unapplied entries with only those entries.
+3. **Clean up**: under each journal's lock, read it a line at a time; delete a journal file whose
+   entries were all applied, and rewrite a file that still holds unapplied entries with only
+   those entries.
+
+Lookups for ranges whose journal entries are not consolidated yet also read each journal a line
+at a time.
 
 ### Error handling
 

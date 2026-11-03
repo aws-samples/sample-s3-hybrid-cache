@@ -448,6 +448,7 @@ async fn seed_v1_extent_with_etag(
             compressed_size: body.len() as u64,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,

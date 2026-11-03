@@ -67,16 +67,22 @@ decision above is not to compress, the proxy writes a store-mode frame: the LZ4 
 stored-block form, with the same checksum. Writing a store-mode frame never runs the block
 compressor, so a denylisted or rule-disabled key costs no compression CPU.
 
-Every read verifies the checksum as it decodes, and decodes compressed and store-mode frames the
-same way. A bit flip, a truncation or other damage to a range file shows up as a decode error:
+A read decodes compressed and store-mode frames the same way, and checks a frame's checksum when
+it reaches the frame's end, after the last block. A bit flip, a truncation or other damage to a
+range file shows up as a decode error there or sooner:
 
-- A read the proxy assembles in memory treats the range as a cache miss and fetches the bytes from
-  S3.
-- A read streamed from the cache has already sent part of its response, so it ends early with a
-  connection error. The proxy marks the file, and later reads of the range on that proxy are
+- A read the proxy assembles in memory decodes the whole file before sending anything, so it
+  treats the range as a cache miss and fetches the bytes from S3.
+- A streamed read that detects damage has already sent part of its response, so it ends short
+  with a connection error. A streamed response that runs to the end of its cached range holds its
+  last chunk until the checksum has been read, so damage anywhere in the file is detected before
+  the response completes. The proxy marks the file, and later reads of the range on that proxy are
   fetched from S3 until the range is removed or cached again, or two minutes pass with no read turned away by the mark.
   [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3)
   gives the full bound.
+- A streamed response that ends before the end of its cached range stops reading before the
+  checksum, so it can complete with damaged bytes. The next read that reaches the checksum
+  detects the damage ([Damaged range files](../SECURITY.md#damaged-range-files)).
 
 A checksum shows that a file is intact, not that it is the file its metadata describes. The proxy
 records each range file's size and modification time when it writes the range. Where a range's
@@ -99,8 +105,9 @@ decoder state; with 4 MiB blocks it would hold about 8 MiB, whatever the range l
 The proxy reads a range file through a buffer as large as the file, up to 256 KiB, so each read
 call covers several blocks. In all, a read of a file with 64 KiB blocks holds about 384 KiB. A
 range file with 4 MiB blocks, which the proxy reads but does not write, holds about 8.25 MiB per
-read. These figures are per concurrent stream, so the total grows with
-`server.max_concurrent_requests`.
+read. These figures are derived from the buffer sizes, not measured. They are per concurrent
+stream, so the total grows with `server.max_concurrent_requests`;
+[Memory impact](CONFIGURATION.md#memory-impact) gives the measured figure for a streamed hit.
 
 Smaller blocks compress slightly worse, because an LZ4 match cannot cross a block boundary. Highly
 repetitive content can take up to twice the disk space it would take with 4 MiB blocks, which is
@@ -114,7 +121,7 @@ read paths. It therefore decodes frames of either block size, and one range file
 
 When the proxy promotes a range from the disk cache to the RAM cache, it stores the disk frame
 unchanged, compressed or store-mode, and never decompresses and recompresses it. Every promotion
-path does this: full objects, write-cached objects and ranges. The RAM cache's size checks use the
+path does this. The RAM cache's size checks use the
 frame's size, so a compressible object takes its compressed size in RAM. For example, a 100 MiB log
 file that compresses to 25 MiB on disk counts as 25 MiB against `cache.max_ram_cache_size`.
 

@@ -148,10 +148,10 @@ Cached ranges from AWS CLI uploads usually sit on 8 MiB boundaries, the CLI's de
 | Metadata lists a range whose file is missing or unreadable, unsigned `Range` | Marks the range missing, fetches it from S3 and caches it again | No client impact |
 | The same, signed `Range` | Invalidates the whole key and forwards the client's own request to S3 | No client impact |
 | A cached range file holds fewer bytes than its metadata records | Invalidates the whole key and forwards the client's own request to S3 | The client gets S3's response instead of a `500`, and that response is cached again |
-| A cached range file fails decompression | A read assembled in memory is answered from S3. A read streamed from the cache has already started its response, so it stops partway with a connection error | The damaged range is removed so the next read caches it again; until then, later reads of it on that proxy are fetched from S3 |
+| A cached range file fails decompression | A read assembled in memory is answered from S3. A read streamed from the cache has already started its response, so it stops partway with a connection error. A streamed response that ends before the end of its cached range can complete with damaged bytes | The damaged range is removed so the next read caches it again; until then, later reads of it on that proxy are fetched from S3 |
 | Some segments merge and others fail | Falls back to fetching the complete range from S3 | The response is S3's bytes, and the cache is refreshed |
 
-Every scenario above except a streamed read that finds a damaged range file falls back to S3, so the client receives correct data even when the cache operation fails. A streamed read that finds a damaged file ends its response early with a connection error, and the bytes it sent before the check failed can be wrong. See [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3).
+Every scenario above except a streamed read that finds a damaged range file falls back to S3, so the client receives correct data even when the cache operation fails. A streamed read that finds a damaged file ends its response early with a connection error, and the bytes it sent before the check failed can be wrong. A streamed response that ends before the end of its cached range does not reach the frame's checksum, so it can complete with damaged bytes. See [When the proxy can return data that differs from S3](CACHE_FRESHNESS.md#when-the-proxy-can-return-data-that-differs-from-s3) and [Damaged range files](../SECURITY.md#damaged-range-files).
 
 #### Signed `Range` requests
 
@@ -212,7 +212,7 @@ The proxy caches GetObject requests that carry a `partNumber` query parameter, s
 1. **Detection**: a GET with `partNumber` is a GetObjectPart request.
 2. **Part range**: S3's `Content-Range` and `x-amz-mp-parts-count` headers give the part's exact byte range.
 3. **Storage**: the part is stored as a range, with the same storage and compression as any other range.
-4. **Lookup**: a later request for the same part number finds its byte range in the object's `part_ranges` map and is served from the cache when that range is cached.
+4. **Lookup**: a later request for the same part number finds its byte range in the object's `part_ranges` map and is served from the cache when that range is cached. A layout without the version mark that [Part range storage](#part-range-storage) describes is discarded on its first read, and each of its parts is fetched from S3 once. With `cache.trust_unverified_ranges: true` the layout is kept ([What guards against it](../SECURITY.md#what-guards-against-it)).
 
 Parts use the full object's cache key (`{bucket}/{object_key}`) and are stored as ranges at their byte offsets. Parts of different sizes are supported, and the cached response keeps S3's response headers. [Part caching](#part-caching) describes how part ranges are recorded.
 
@@ -582,11 +582,15 @@ The request-level behavior is described under [Part number cache](#part-number-c
 When a GET with a `partNumber` parameter returns from S3, the proxy:
 
 1. parses the `Content-Range` header (for example `bytes 0-8388607/5368709120`);
-2. stores the exact `(start, end)` byte range in `part_ranges` for that part number;
-3. updates `parts_count` from the `x-amz-mp-parts-count` header when present;
-4. saves the updated metadata to disk.
+2. takes the key's metadata lock and reads the object's cached metadata, and records the layout
+   only if the part response's ETag matches the cached object's;
+3. stores the exact `(start, end)` byte range in `part_ranges` for that part number;
+4. updates `parts_count` from the `x-amz-mp-parts-count` header when present;
+5. marks the layout with the version mark and saves the updated metadata to disk.
 
-Later requests for the same part number use the stored range to look it up in the cache.
+Later requests for the same part number use the stored range to look it up in the cache. A HEAD
+that finds the object changed removes the layout with the object's ranges; see
+[What guards against it](../SECURITY.md#what-guards-against-it).
 
 ### CompleteMultipartUpload handling
 

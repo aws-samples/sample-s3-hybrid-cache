@@ -7516,6 +7516,7 @@ mod tests {
                     compressed_size: 1024,
                     parts_count: None,
                     part_ranges: HashMap::new(),
+                    part_layout_verified: false,
                     upload_id: None,
                     is_write_cached: false,
                     write_cache_expires_at: None,
@@ -8054,6 +8055,7 @@ mod tests {
                 compressed_size: size,
                 parts_count: None,
                 part_ranges: HashMap::new(),
+                part_layout_verified: false,
                 upload_id: None,
                 is_write_cached: false,
                 write_cache_expires_at: None,
@@ -10323,6 +10325,7 @@ mod tail_partition_tests {
                 compressed_size: total,
                 parts_count: None,
                 part_ranges: HashMap::new(),
+                part_layout_verified: false,
                 upload_id: None,
                 is_write_cached: object_is_write_cached,
                 // No write-cache expiry, so the write-cache-expiry branch cannot fire and remove

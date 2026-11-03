@@ -1951,6 +1951,15 @@ pub struct CacheConfig {
     /// headers intact, so S3 decides every precondition.
     #[serde(default = "default_evaluate_conditions_from_cache")]
     pub evaluate_conditions_from_cache: bool,
+    /// Serve range listings and pending journal fills that record no file identity, as 3.0.0
+    /// did (default: false). Every 2.x release wrote its ranges without one, and a range with
+    /// no identity may hold another object version's bytes, so by default such a range is
+    /// refused and fetched again from S3. `true` is for deployments whose objects are never
+    /// overwritten in place outside the proxy, keeping a cache volume a 2.x release populated
+    /// warm. It never switches off the stored-error-reply check, the offset-0 rule, the RAM
+    /// tier's listing check, or the retirement of another version's fills. Global.
+    #[serde(default)]
+    pub trust_unverified_ranges: bool,
     /// How long cached bucket settings are considered fresh before re-reading from disk (default: 60s)
     #[serde(
         default = "default_bucket_settings_staleness_threshold",
@@ -2074,6 +2083,7 @@ impl Default for CacheConfig {
             compression_batch_size: default_compression_batch_size(),
             read_cache_enabled: default_read_cache_enabled(),
             evaluate_conditions_from_cache: default_evaluate_conditions_from_cache(),
+            trust_unverified_ranges: false,
             bucket_settings_staleness_threshold: default_bucket_settings_staleness_threshold(),
             ram_cache_shard_count: default_ram_cache_shard_count(),
             max_complete_body_bytes: default_max_complete_body_bytes(),
@@ -3237,6 +3247,7 @@ impl Default for Config {
                 read_cache_enabled: true,                        // Read caching enabled by default
                 bucket_settings_staleness_threshold: Duration::from_secs(60), // 60 seconds
                 evaluate_conditions_from_cache: true, // Default: serve If-Match from cache; If-None-Match/etc still forward
+                trust_unverified_ranges: false,
                 ram_cache_shard_count: default_ram_cache_shard_count(),
                 max_complete_body_bytes: default_max_complete_body_bytes(),
                 max_metadata_file_bytes: default_max_metadata_file_bytes(),
@@ -10451,6 +10462,27 @@ upstream_idle_retries: 5
         );
     }
 
+    #[test]
+    fn minimal_config_leaves_trust_unverified_ranges_off() {
+        // release 3.0.1 R13.2: an existing config, which cannot name the field, refuses
+        // identity-less ranges; naming it turns the override on.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+        assert!(!config.cache.trust_unverified_ranges);
+        assert!(!CacheConfig::default().trust_unverified_ranges);
+        let on = yaml.replace(
+            "  cache_dir: \"./cache\"\n",
+            "  cache_dir: \"./cache\"\n  trust_unverified_ranges: true\n",
+        );
+        let config: Config = serde_yaml_ng::from_str(&on).expect("the override must parse");
+        assert!(config.cache.trust_unverified_ranges);
+    }
     #[test]
     fn minimal_config_keeps_the_inflight_ledger_disabled() {
         // Validates: Requirements 4.6, 6.4

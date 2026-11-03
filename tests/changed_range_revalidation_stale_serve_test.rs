@@ -413,6 +413,7 @@ async fn seed_cached_extents(
             compressed_size: range_specs.iter().map(|r| r.compressed_size).sum(),
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,

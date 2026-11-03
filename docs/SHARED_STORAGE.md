@@ -103,9 +103,15 @@ eviction, racing consolidation and interleaved multipart publishes. Nothing logs
 the server through the NLM sideband protocol, so the proxy's locking is unaffected. Only the
 `flock` and `all` values break it.
 
-Do not add `noac` or a short `actimeo`. Coordination does not depend on attribute freshness
-(`flock` reads no attributes), so these options only add attribute requests to operations on
-the volume.
+Do not add `noac` or a short `actimeo`. Locking does not depend on attribute freshness (`flock`
+reads no attributes). A fill for an object with no cached metadata leaves a range file already at
+its path in place if that file was modified in the last 10 minutes, and discards its own copy. It
+reads that modification time from an opened descriptor, which close-to-open consistency keeps
+fresh, and relies on `lookupcache=pos` so that another proxy's new file is not read as absent.
+These options therefore only add attribute requests to operations on the volume. The age test also
+needs each proxy's clock within 10 minutes of the cache volume's file server; see
+[Before upgrading to 3.0.1](UPGRADING.md#before-upgrading-to-301) and
+[What the guards do not cover](../SECURITY.md#what-the-guards-do-not-cover).
 
 Do not use a vendor option that disables close-to-open consistency, such as VAST's `nocto`
 (`nfs(5)` documents the generic form). It replaces close-to-open cache revalidation with a

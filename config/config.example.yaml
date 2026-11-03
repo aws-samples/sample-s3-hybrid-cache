@@ -26,12 +26,14 @@ server:
   # Maximum concurrent requests (default: 1000). A request holds its permit until its
   # response body has finished streaming to the client, so long downloads hold permits
   # longer.
-  # On the streaming paths each request uses about 5-6 MiB: a cache hit about 1 MiB of
-  # chunk buffer, up to 4 MiB of channel backpressure and up to 0.4 MiB of LZ4 state.
-  # A cache miss uses about 1 MiB of tee buffer and up to 4 MiB of cache write buffer.
-  # Proxy memory is about 200 MiB + max_concurrent_requests x 6 MiB: 1,400 MiB at 200,
-  # 3,200 MiB at 500, 6,200 MiB at 1000 and 12,200 MiB at 2000. Paths that buffer a
-  # whole body or range are bounded separately, by max_inflight_buffer_bytes.
+  # A streamed cache hit whose client reads slowly holds about 3.9 MiB (measured): 512 KiB
+  # chunks in a queue of four, plus hyper's write queue. A cache miss whose client reads
+  # slowly holds about 46 KiB (measured); one whose cache write stalls can hold up to
+  # about 40 MiB (derived, not measured). See Memory impact in docs/CONFIGURATION.md.
+  # Proxy memory is about 200 MiB + max_concurrent_requests x 3.9 MiB if every request
+  # is a streamed hit with a slow client: 980 MiB at 200, 2,150 MiB at 500, 4,100 MiB at
+  # 1000 and 8,000 MiB at 2000. Paths that buffer a whole body or range are bounded
+  # separately, by max_inflight_buffer_bytes.
   # Starting points: 50-100 for fewer than 50 clients, 100-300 for 50-500 clients, and
   # 300-1000 or more above that. Confirm against permits_held_peak in /metrics.
   max_concurrent_requests: 1000
@@ -357,6 +359,14 @@ cache:
   # With false, every conditional request is forwarded, so S3 decides every
   # precondition. A cache_rules.json rule can override it per key.
   evaluate_conditions_from_cache: true
+
+  # Serve cached ranges that record no file identity (default: false). Every 2.x release
+  # wrote its ranges without one; such a range may hold another object version's bytes, so
+  # by default it is fetched again from S3 and re-cached with an identity. true also keeps
+  # part layouts recorded before 3.0.1, which by default are discarded and each part
+  # fetched again. Set true only if objects are never overwritten in place outside the
+  # proxy, to keep a cache volume a 2.x release populated warm. Global.
+  # trust_unverified_ranges: false
 
   # How long the loaded cache_rules.json is used before the proxy re-reads it (default:
   # 60s). The first lookup after this expires starts the re-read. A rule change takes

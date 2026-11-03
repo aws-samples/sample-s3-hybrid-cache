@@ -256,6 +256,7 @@ async fn part_scoped_get_emits_quoted_etag_for_bare_stored_entry() {
     // The multipart shape `lookup_part` resolves parts from.
     let mut meta = fixture.read_meta(&key).expect(".meta");
     meta.object_metadata.parts_count = Some(2);
+    meta.object_metadata.part_layout_verified = true;
     meta.object_metadata.part_ranges =
         HashMap::from([(1u32, (0u64, half - 1)), (2u32, (half, OBJECT_SIZE - 1))]);
     std::fs::write(

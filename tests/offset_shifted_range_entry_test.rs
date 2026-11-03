@@ -270,6 +270,14 @@ async fn harness_with(consolidate: bool, full_object_check_threshold: Option<u64
     config.cache.get_ttl = TTL;
     config.cache.head_ttl = TTL;
     config.cache.bucket_settings_staleness_threshold = Duration::ZERO;
+    // This file pins 3.0.0's handling of pre-3.0.0 listings: the offset-0 rule, which the
+    // override never touches, and serving every other identity-less listing, which since
+    // 3.0.1 only `cache.trust_unverified_ranges` does (R13.2). Process-wide, and the same in
+    // every test here, which all build their proxy through this harness.
+    config.cache.trust_unverified_ranges = true;
+    // Apply it as `HttpProxy::new` does: this harness serves `handle_request` directly, so
+    // nothing else copies the field into the process-global the serve paths read.
+    s3_proxy::disk_cache::set_trust_unverified_ranges(config.cache.trust_unverified_ranges);
     if let Some(threshold) = full_object_check_threshold {
         config.cache.full_object_check_threshold = threshold;
     }
@@ -1015,4 +1023,65 @@ async fn controls_are_served_from_cache() {
     let (reached, _, body) = h.ranged_probe("c/cold.bin", "bytes=0-99").await;
     assert!(!reached, "a 3.0.0 cold bytes=0-99 fill must be a cache hit");
     assert_eq!(body, d.slice(0..100));
+}
+
+/// R13.2 on the journal window: with the override on, an unfolded pending `Add` above offset 0
+/// with no file identity is coverage again and is served from the cache, as 3.0.0 served it.
+/// The `.meta` names the head and lists another extent, so the lookup falls back to the
+/// journals (`find_cached_ranges`' no-overlap branch). The default refuses it (R13.1). The
+/// listing case is `controls_are_served_from_cache`.
+#[tokio::test]
+async fn an_identity_less_pending_add_is_served_with_the_override_on() {
+    let h = harness(false).await;
+    let key = "c/journal-mid.bin";
+    let object = h.mock.put(key, TOTAL);
+    h.plant(key, 0, 99, 0, &object).await;
+    let consolidator = h
+        .cache_manager
+        .get_journal_consolidator()
+        .await
+        .expect("consolidator");
+    let until = tokio::time::Instant::now() + STEP;
+    while h.meta_doc(key, Duration::ZERO).await.is_none() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "fixture: the first fill never folded"
+        );
+        let _ = consolidator.run_consolidation_cycle().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h.plant(key, 500, 599, 500, &object).await;
+    assert!(
+        h.make_journal_pre_3_0_0(key) >= 1,
+        "fixture: the pending Add, its identity removed"
+    );
+    let doc = h.meta_doc(key, STEP).await.unwrap();
+    assert_eq!(
+        extents(&doc),
+        vec![(0, 99, true)],
+        "fixture: the .meta names the head and does not list the pending extent"
+    );
+
+    let cache_key = format!("{}/{}", BUCKET, key);
+    let pending = h
+        .disk
+        .read()
+        .await
+        .find_pending_journal_ranges(&cache_key, 500, 599)
+        .await
+        .expect("journal lookup");
+    assert_eq!(
+        pending.len(),
+        1,
+        "R13.2: WITH THE OVERRIDE ON, AN IDENTITY-LESS PENDING ADD IS NOT COVERAGE: {:?}",
+        pending
+    );
+
+    let (reached, status, body) = h.ranged_probe(key, "bytes=500-599").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, object.slice(500..600));
+    assert!(
+        !reached,
+        "R13.2: WITH THE OVERRIDE ON, AN IDENTITY-LESS PENDING ADD WAS NOT SERVED FROM THE CACHE"
+    );
 }

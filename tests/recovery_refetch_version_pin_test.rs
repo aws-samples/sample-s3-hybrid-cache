@@ -160,6 +160,7 @@ async fn seed_meta_with_missing_bin(cache_key: &str, cache_manager: &Arc<CacheMa
             compressed_size: len,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,

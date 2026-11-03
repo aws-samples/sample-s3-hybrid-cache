@@ -338,6 +338,7 @@ async fn seed_v1_extent_of(
             compressed_size: body.len() as u64,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -1143,6 +1144,16 @@ async fn bound_arm_still_forwards_the_clients_own_if_match() {
 /// as version 1. Modelled with two `store_range` calls on one extent.
 async fn shared_bin_state(key: &str, cache_manager: &Arc<CacheManager>) {
     store_journal_pending(key, cache_manager, 0, PAGE_SIZE - 1, V1_FILL, V1_ETAG).await;
+    // 700 s back stands in for a 3.0.0 peer, which renames over a pending fill on a cold key.
+    filetime::set_file_mtime(
+        cache_manager
+            .create_configured_disk_cache_manager()
+            .get_new_range_file_path(key, 0, PAGE_SIZE - 1),
+        filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(700),
+        ),
+    )
+    .expect("age page 0");
     store_journal_pending(key, cache_manager, 0, PAGE_SIZE - 1, V2_FILL, V2_ETAG).await;
     store_journal_pending(
         key,

@@ -40,10 +40,11 @@ use twox_hash::XxHash32;
 /// A frame decoder sizes its working buffers from the block size the frame
 /// header declares, not from the payload: `lz4_flex::frame::FrameDecoder`
 /// reserves one compressed-block and one decompressed-block buffer of that size
-/// for each stream. At 64 KiB blocks that is about 128 KiB per decoded stream;
-/// at the LZ4 maximum of 4 MiB it would be about 8 MiB, whatever the range
-/// length. The frame header carries the block size, so a reader decodes frames
-/// of any block size, including ones written with larger blocks.
+/// for each stream. At 64 KiB blocks that is about 128 KiB per decoded stream,
+/// and at the LZ4 maximum of 4 MiB about 8 MiB, whatever the range length. Both
+/// figures are derived from the buffer sizes, not measured. The frame header
+/// carries the block size, so a reader decodes frames of any block size,
+/// including ones written with larger blocks.
 pub(crate) const RANGE_FRAME_MAX_BLOCK_SIZE: usize = 64 * 1024;
 
 /// BD-byte block-size code for [`RANGE_FRAME_MAX_BLOCK_SIZE`] (LZ4 frame

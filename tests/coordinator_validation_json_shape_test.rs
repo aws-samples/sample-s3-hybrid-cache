@@ -90,6 +90,7 @@ fn cache_config(cache_dir: std::path::PathBuf) -> CacheConfig {
         bucket_settings_staleness_threshold: Duration::from_secs(60),
         download_coordination: s3_proxy::config::DownloadCoordinationConfig::default(),
         evaluate_conditions_from_cache: false,
+        trust_unverified_ranges: false,
         ram_cache_shard_count: 64,
         max_complete_body_bytes: 10 * 1024 * 1024,
         max_metadata_file_bytes: 4 * 1024 * 1024,

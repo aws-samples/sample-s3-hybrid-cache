@@ -150,6 +150,7 @@ async fn test_atomic_write_operations_with_sharded_paths() {
             compressed_size: 0,
             parts_count: None,
             part_ranges: std::collections::HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,

@@ -2744,11 +2744,16 @@ impl SignedPutHandler {
         // Write part file atomically using temp file + rename (inside the lock)
         let temp_part_file_path = part_file_path.with_extension("tmp");
         // Synced before the rename: this part becomes a range the completion `.meta` names.
-        let file_identity = crate::disk_cache::write_synced_identity(
+        let file_identity = crate::disk_cache::write_synced_identity_of(
             &temp_part_file_path,
             &compression_result.data,
+            Some(cache_key),
         )
         .map_err(|e| {
+            // Logged once, with the key and the path, where it was found.
+            if crate::disk_cache::is_identity_unavailable(&e) {
+                return ProxyError::CacheError(e.to_string());
+            }
             ProxyError::CacheError(format!("Failed to write temporary part file: {}", e))
         })?;
 
@@ -4381,6 +4386,8 @@ impl SignedPutHandler {
             compressed_size: range_specs.iter().map(|r| r.compressed_size).sum(),
             parts_count: Some(sorted_parts.len() as u32), // Use filtered parts count (Requirement 7.3)
             part_ranges,
+            // The completed upload's own layout, under the key's slot lock.
+            part_layout_verified: true,
             upload_id: None,
             is_write_cached: true, // Mark as write-cached
             write_cache_expires_at: Some(now + write_ttl),
@@ -5587,11 +5594,13 @@ impl SignedPutHandler {
             Err(e) => {
                 // Finalize failed (disk error, length mismatch, etc.). The writer was
                 // consumed and its `.tmp` cleaned up; the upload is unaffected
-                // (Req 7.1).
-                error!(
-                    "Streaming cache: finalize failed, object not cached (upload unaffected): cache_key={}, error={}",
-                    cache_key, e
-                );
+                // (Req 7.1). An identity failure was already logged with the key and path.
+                if !crate::disk_cache::is_identity_unavailable_error(&e) {
+                    error!(
+                        "Streaming cache: finalize failed, object not cached (upload unaffected): cache_key={}, error={}",
+                        cache_key, e
+                    );
+                }
                 if let Some(m) = &metrics {
                     m.read().await.record_put_cache_failure().await;
                     m.read().await.record_skipped_put("commit_failed").await;
@@ -6313,10 +6322,13 @@ impl SignedPutHandler {
                 // it produced a per-part flood that read like a disk fault on the
                 // shared volume; the level implied an operator action that does not
                 // exist.
-                warn!(
-                    "Streaming part cache: failed to record cached part (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
-                    cache_key, upload_id, part_number, e
-                );
+                // An identity failure was already logged with the key and path.
+                if !crate::disk_cache::is_identity_unavailable_error(&e) {
+                    warn!(
+                        "Streaming part cache: failed to record cached part (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
+                        cache_key, upload_id, part_number, e
+                    );
+                }
                 if let Some(m) = &metrics {
                     m.read().await.record_put_cache_failure().await;
                     m.read().await.record_skipped_put("commit_failed").await;
@@ -13162,6 +13174,69 @@ mod tests {
             );
         }
     }
+    /// Multipart completion records its layout as verified, so a
+    /// `?partNumber=` GET of an upload 3.0.1 completed is served from the cache, with no S3
+    /// request.
+    ///
+    /// # RED SIDE
+    ///
+    /// With completion writing `part_layout_verified: false`, `lookup_part` refuses the layout
+    /// as one 3.0.0 may have crossed, clears it, and the GET goes to S3.
+    #[tokio::test]
+    async fn a_completed_upload_serves_its_parts_from_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_key = "test-bucket/completed-parts";
+        let upload_id = "completed-upload";
+        let mut response_headers = std::collections::HashMap::new();
+        response_headers.insert(
+            "last-modified".to_string(),
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+        );
+        let part1 = vec![1u8; 1024];
+        let part2 = vec![2u8; 2048];
+        handler
+            .cache_upload_part(cache_key, upload_id, 1, &part1, "etag1")
+            .await
+            .unwrap();
+        handler
+            .cache_upload_part(cache_key, upload_id, 2, &part2, "etag2")
+            .await
+            .unwrap();
+        let requested_parts = vec![
+            RequestedPart {
+                part_number: 1,
+                etag: "etag1".to_string(),
+            },
+            RequestedPart {
+                part_number: 2,
+                etag: "etag2".to_string(),
+            },
+        ];
+        handler
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                "\"completed-2\"",
+                &response_headers,
+                &requested_parts,
+            )
+            .await
+            .expect("fixture: the completion publishes");
+        let manager = crate::cache::zero_length_arm_orphan_tests::setup(temp_dir.path()).await;
+        let part = manager
+            .lookup_part(cache_key, 2, crate::origin_identity::OriginVerdict::Matches)
+            .await
+            .expect("the part lookup must not error");
+        assert!(
+            part.as_ref()
+                .is_some_and(|p| p.start == 1024 && p.end == 3071 && p.data[..] == part2[..]),
+            "A PART OF AN UPLOAD 3.0.1 COMPLETED WAS NOT SERVED FROM CACHE (it would be \
+             fetched from S3): {:?}",
+            part.as_ref().map(|p| (p.start, p.end, p.data.len()))
+        );
+    }
+
     #[tokio::test]
     async fn test_finalize_multipart_upload_contiguous_parts() {
         let temp_dir = TempDir::new().unwrap();

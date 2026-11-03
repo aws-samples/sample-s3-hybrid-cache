@@ -495,22 +495,133 @@ pub(crate) fn write_synced(path: &Path, data: impl AsRef<[u8]>) -> std::io::Resu
     sync_written_file(&file, path)
 }
 
+/// The error [`write_synced_identity_of`] returns when the finished file's identity could not be
+/// taken (R12.2). It has already been logged, so a caller that tells it apart with
+/// [`is_identity_unavailable`] does not log it again as a failed write.
+#[derive(Debug)]
+pub(crate) struct IdentityUnavailable;
+/// The text of [`IdentityUnavailable`], and of the [`ProxyError::CacheError`] a fill returns for
+/// it, which [`is_identity_unavailable_error`] recognises.
+const IDENTITY_UNAVAILABLE: &str = "file identity could not be taken; the fill is not published";
+impl std::fmt::Display for IdentityUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(IDENTITY_UNAVAILABLE)
+    }
+}
+impl std::error::Error for IdentityUnavailable {}
+/// Whether `e` is [`IdentityUnavailable`] rather than a failed write.
+pub(crate) fn is_identity_unavailable(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<IdentityUnavailable>())
+}
+/// Whether a fill's error is an identity failure, which was logged once, with the key and the
+/// path, where it was found: a caller that logs its own failures skips it.
+pub(crate) fn is_identity_unavailable_error(e: &ProxyError) -> bool {
+    matches!(e, ProxyError::CacheError(m) if m == IDENTITY_UNAVAILABLE)
+}
 /// [`write_synced`], returning the identity of the file it wrote
 /// ([`crate::cache_types::RangeFileIdentity`]): the writing descriptor is closed after the sync
 /// and the identity taken by [`identity_after_close`]. The rename that later publishes the file
-/// keeps its length and modification time, so this is what a reader's `fstat` reports. A failed
-/// reopen or `fstat` returns `None` (the range is recorded unverified), never an error: a write
-/// is not failed for want of its identity.
-pub(crate) fn write_synced_identity(
+/// keeps its length and modification time, so this is what a reader's `fstat` reports.
+///
+/// A failed reopen or `fstat` fails the write: the temp file is unlinked here, one `warn!`
+/// naming `cache_key` and the temp file is logged, and [`IdentityUnavailable`] is returned, so
+/// no caller publishes a range it cannot verify (R12.2). `Ok` always holds
+/// `Some`. Test builds only: its last caller, `SignedPutHandler::cache_upload_part`, is
+/// `cfg(test)`; every production range writer uses [`write_synced_identity_exclusive`].
+#[cfg(test)]
+pub(crate) fn write_synced_identity_of(
     path: &Path,
     data: impl AsRef<[u8]>,
+    cache_key: Option<&str>,
 ) -> std::io::Result<Option<crate::cache_types::RangeFileIdentity>> {
+    write_synced_range_temp(path, data.as_ref(), cache_key, false).map(|w| Some(w.identity))
+}
+/// What [`write_synced_identity_exclusive`] wrote: the identity a reader's `fstat` will report,
+/// and the inode number `fstat` of the writing descriptor reported, for the publish-time re-check
+/// ([`PendingRangePublish::expecting`], R10.2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WrittenRangeTemp {
+    pub(crate) identity: crate::cache_types::RangeFileIdentity,
+    ino: u64,
+}
+/// [`write_synced_identity_of`] for a fill's own temp name (R10.1): the file is opened
+/// `create_new`, so a fill never opens or truncates a file another fill created. An
+/// `AlreadyExists` error names a file this fill did not create, which the caller must not unlink.
+pub(crate) fn write_synced_identity_exclusive(
+    path: &Path,
+    data: &[u8],
+    cache_key: &str,
+) -> std::io::Result<WrittenRangeTemp> {
+    write_synced_range_temp(path, data, Some(cache_key), true)
+}
+fn write_synced_range_temp(
+    path: &Path,
+    data: &[u8],
+    cache_key: Option<&str>,
+    exclusive: bool,
+) -> std::io::Result<WrittenRangeTemp> {
     use std::io::Write;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(data.as_ref())?;
+    let mut file = if exclusive {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?
+    } else {
+        std::fs::File::create(path)?
+    };
+    file.write_all(data)?;
     sync_written_file(&file, path)?;
+    let ino = writing_descriptor_inode(&file);
     drop(file);
-    Ok(identity_after_close(path))
+    match (identity_after_close(path), ino) {
+        (Some(identity), Some(ino)) => Ok(WrittenRangeTemp { identity, ino }),
+        _ => {
+            let _ = std::fs::remove_file(path);
+            note_unverified_ranges_refused(1);
+            warn!(
+                "Range fill not published: its file identity could not be taken (open or fstat \
+                 of the finished temp file failed), temp file removed: key={}, path={:?}",
+                cache_key.unwrap_or("-"),
+                path
+            );
+            Err(std::io::Error::other(IdentityUnavailable))
+        }
+    }
+}
+
+/// `st_ino` of the descriptor that wrote a range temp file. `None` when its `fstat` fails, which
+/// fails the write as an identity failure does.
+fn writing_descriptor_inode(file: &std::fs::File) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().ok().map(|m| m.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Some(0)
+    }
+}
+
+/// [`identity_after_close`] for a streamed fill's finished temp file: `Err` when the identity
+/// cannot be taken, after unlinking the temp file, so the fill publishes and journals nothing
+/// (R12.2).
+fn identity_or_discard(
+    tmp_path: &Path,
+    cache_key: &str,
+) -> Result<crate::cache_types::RangeFileIdentity> {
+    identity_after_close(tmp_path).ok_or_else(|| {
+        let _ = std::fs::remove_file(tmp_path);
+        note_unverified_ranges_refused(1);
+        warn!(
+            "Range fill not published: its file identity could not be taken (open or fstat of \
+             the finished temp file failed), temp file removed: key={}, path={:?}",
+            cache_key, tmp_path
+        );
+        ProxyError::CacheError(IDENTITY_UNAVAILABLE.to_string())
+    })
 }
 
 /// The identity of the finished file at `path` ([`crate::cache_types::RangeFileIdentity`]),
@@ -528,6 +639,10 @@ pub(crate) fn write_synced_identity(
 /// `None` when the open or `fstat` fails. The descriptor's close is deferred to a blocking
 /// task when a runtime is present: it is read-only, so its close has nothing to write back.
 pub(crate) fn identity_after_close(path: &Path) -> Option<crate::cache_types::RangeFileIdentity> {
+    #[cfg(test)]
+    if fstat_failure_seam::identity_fails(path) {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
     let identity = file
         .metadata()
@@ -632,6 +747,8 @@ pub(crate) struct PendingRangePublish {
     tmp_path: PathBuf,
     final_path: PathBuf,
     done: bool,
+    /// What this fill wrote at `tmp_path`, when the writer recorded it (R10.2).
+    expected: Option<WrittenRangeTemp>,
 }
 
 impl PendingRangePublish {
@@ -640,7 +757,52 @@ impl PendingRangePublish {
             tmp_path,
             final_path,
             done: false,
+            expected: None,
         }
+    }
+
+    /// Record what the fill wrote at the temp path, so the publish can re-check it (R10.2).
+    pub(crate) fn expecting(mut self, written: WrittenRangeTemp) -> Self {
+        self.expected = Some(written);
+        self
+    }
+
+    /// Whether the temp file is still the one this fill wrote (R10.2): the inode of the
+    /// descriptor that wrote it, the same length, and a modification time within
+    /// [`crate::cache_types::MTIME_MATCH_WINDOW_NS`]. Called under the key's slot lock, just
+    /// before [`Self::publish`]; a mismatch is logged here, with the key and the path, and the
+    /// caller drops the fill. `false` when the writer recorded nothing: every writer records
+    /// what it wrote, so a writer that omits it drops its fills rather than publishing unchecked.
+    pub(crate) fn still_written_by_this_fill(&self, cache_key: &str) -> bool {
+        let Some(expected) = self.expected else {
+            warn!(
+                "Range fill dropped: its writer recorded no file to re-check the temp file \
+                 against: key={}, path={:?}",
+                cache_key, self.tmp_path
+            );
+            return false;
+        };
+        let found = std::fs::symlink_metadata(&self.tmp_path).ok();
+        #[cfg(unix)]
+        let same_inode = {
+            use std::os::unix::fs::MetadataExt;
+            found.as_ref().is_some_and(|m| m.ino() == expected.ino)
+        };
+        #[cfg(not(unix))]
+        let same_inode = true;
+        let same_identity = found
+            .as_ref()
+            .and_then(crate::cache_types::RangeFileIdentity::of)
+            .is_some_and(|identity| expected.identity.matches(&identity));
+        if same_inode && same_identity {
+            return true;
+        }
+        warn!(
+            "Range fill dropped: its temp file is no longer the file it wrote (inode, length or \
+             modification time changed): key={}, path={:?}",
+            cache_key, self.tmp_path
+        );
+        false
     }
 
     /// Rename the `.tmp` to the final `.bin`. Returns whether a file already existed at the
@@ -931,6 +1093,34 @@ pub(crate) mod range_rename_pause {
             p.resume.notified().await;
         }
     }
+
+    fn before_publish_registry() -> &'static Mutex<HashMap<String, Pause>> {
+        static R: OnceLock<Mutex<HashMap<String, Pause>>> = OnceLock::new();
+        R.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm the pause a journal-only fill passes after its temp file is written and before it
+    /// takes the key's slot lock to publish. Each arming pauses one fill.
+    pub(crate) fn arm_before_publish(cache_key: &str) -> Pause {
+        let p = Pause {
+            reached: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        };
+        before_publish_registry()
+            .lock()
+            .unwrap()
+            .insert(cache_key.to_string(), p.clone());
+        p
+    }
+
+    /// Called by journal-only fills before they take the slot lock to publish.
+    pub(crate) async fn before_publish(cache_key: &str) {
+        let p = before_publish_registry().lock().unwrap().remove(cache_key);
+        if let Some(p) = p {
+            p.reached.notify_one();
+            p.resume.notified().await;
+        }
+    }
 }
 
 /// Unlink a range `.bin`. The single call through which the producers that must keep a range
@@ -1173,6 +1363,50 @@ fn decode_lz4_frames_exact(compressed: &[u8], expected: u64) -> Option<Vec<u8>> 
 /// the block body, so with 64 KiB blocks std's default 8 KiB buffer costs two `read` calls per
 /// block. A buffer of this size absorbs both reads, at most this many bytes per concurrent read.
 const LZ4_RANGE_READER_CAPACITY: usize = 256 * 1024;
+/// The buffer a streamed LZ4 read decodes the rest of a file into, and discards, once it holds
+/// the extent's last byte. It lives on the blocking task's stack, so a hit allocates nothing for
+/// it; normally the first read into it meets the frame's end mark and returns 0.
+const LZ4_SCRATCH_LEN: usize = 4 * 1024;
+
+/// The stack buffer a streamed LZ4 read discards a slice's prefix into: one LZ4 block (64 KiB),
+/// the most a decoder read returns.
+const LZ4_SKIP_SCRATCH_LEN: usize = 64 * 1024;
+
+/// Decoded chunks a cache hit streamed from disk may queue ahead of its response body, the only
+/// queue between disk and hyper (the body wraps the stream directly). A stalled stream has read
+/// ahead `(depth + 1)` chunks, because the chunk waiting in `blocking_send` is already read and
+/// decoded, and hyper's write queue (about 400 KiB) also covers a storage stall. At 512 KiB
+/// chunks ([`crate::http_proxy::STREAMED_HIT_CHUNK_SIZE`]) and 1 GB/s that rides out
+/// `((depth + 1) * 512 KiB + 400 KiB) / 1 GB/s`: about 1.5 ms of stall at depth 1, 2.0 ms at
+/// depth 2 and 3.0 ms at depth 4. The depth was chosen from streamed-hit throughput on Amazon EFS
+/// at depths 1, 2 and 4 against 3.0.0, three runs each. The rule is depth 1 only if its median is
+/// at or above 3.0.0's in every case, otherwise 2 if no loss exceeds the larger of the two builds'
+/// spreads, otherwise 4. Depth 1 fell below 3.0.0 on 32 MiB `aws s3 cp` hits (42.1 against 42.4 MB/s) and
+/// on 16 concurrent GETs of a 512 MiB object (2,708 against 2,827 MB/s). Depth 2 lost 110 MB/s on
+/// the latter, beyond its spread of 101 MB/s. Depth 4 lost 77 MB/s there (2.7%), within its
+/// spread of 238 MB/s, and was level or ahead in every other case. A build at another depth
+/// changes this constant; there is no setting.
+pub const STREAM_QUEUE_DEPTH: usize = 4;
+
+/// The depth a test set with [`set_stream_queue_depth_for_tests`]; 0 means [`STREAM_QUEUE_DEPTH`].
+static STREAM_QUEUE_DEPTH_FOR_TESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test seam, not a setting: streams opened after this call queue `depth` chunks, and 0
+/// restores [`STREAM_QUEUE_DEPTH`]. Process-global, so a test that calls it needs a test binary
+/// of its own. Nothing in the proxy calls it.
+#[doc(hidden)]
+pub fn set_stream_queue_depth_for_tests(depth: usize) {
+    STREAM_QUEUE_DEPTH_FOR_TESTS.store(depth, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The disk channel's depth for a stream opened now.
+fn stream_queue_depth() -> usize {
+    match STREAM_QUEUE_DEPTH_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => STREAM_QUEUE_DEPTH,
+        depth => depth,
+    }
+}
 
 /// std's default `BufReader` capacity, the floor for a small file.
 const LZ4_RANGE_READER_MIN_CAPACITY: usize = 8 * 1024;
@@ -1887,6 +2121,23 @@ pub(crate) mod fstat_failure_seam {
     pub(crate) fn fails(file_path: &str) -> bool {
         PATHS.lock().unwrap().iter().any(|p| p == file_path)
     }
+    static IDENTITY_PATHS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+    /// Make [`super::identity_after_close`] fail for every temp file of the range whose
+    /// published path is `final_path` (its temp names start with `final_path` less `.bin`).
+    pub(crate) fn fail_identity_for(final_path: &std::path::Path) {
+        IDENTITY_PATHS
+            .lock()
+            .unwrap()
+            .push(final_path.with_extension(""));
+    }
+    pub(crate) fn identity_fails(tmp_path: &std::path::Path) -> bool {
+        let tmp = tmp_path.to_string_lossy();
+        IDENTITY_PATHS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| tmp.starts_with(&*p.to_string_lossy()))
+    }
 }
 /// What the pending journals hold for one extent relative to a version label. See
 /// [`DiskCacheManager::pending_journal_range_for_label`].
@@ -2144,6 +2395,66 @@ fn global_range_heal_limiter() -> Arc<RangeHealLimiter> {
         .clone()
 }
 
+/// Whether a listing or pending journal `Add` with no file identity is refused for serving
+/// (release 3.0.1 R13.1). Every 2.x writer recorded none, and a 2.8 consolidator rewrites a 3.0
+/// listing without it, so the file at the path may hold another version's bytes and nothing can
+/// tell. The range is treated as a miss, fetched from S3 and re-cached with an identity.
+/// Every 3.0.x writer records one or does not publish (R12.2). Off Unix no writer can record an
+/// identity, so nothing is refused there.
+pub(crate) fn refuses_unverified_range(range_spec: &crate::cache_types::RangeSpec) -> bool {
+    #[cfg(unix)]
+    {
+        range_spec.file_identity.is_none() && !trust_unverified_ranges()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = range_spec;
+        false
+    }
+}
+/// Ranges not served or not cached for want of a file identity (R13.5): listings and pending
+/// journal fills refused for serving (R13.1, counted per refusal), journal fills retired by
+/// consolidation (R12.1), and fills not published because their identity could not be taken
+/// (R12.2). `atomic_metadata.unverified_ranges_refused`; it rises while a cache volume a 2.x
+/// release populated re-warms after the upgrade, and should then stay flat.
+static UNVERIFIED_RANGES_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Count `n` ranges in [`UNVERIFIED_RANGES_REFUSED`].
+pub(crate) fn note_unverified_ranges_refused(n: u64) {
+    UNVERIFIED_RANGES_REFUSED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+/// `atomic_metadata.unverified_ranges_refused`. See [`UNVERIFIED_RANGES_REFUSED`].
+pub(crate) fn unverified_ranges_refused() -> u64 {
+    UNVERIFIED_RANGES_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// `cache.trust_unverified_ranges` (R13.2), set once at startup by `HttpProxy::new`.
+static TRUST_UNVERIFIED_RANGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Set `cache.trust_unverified_ranges` for the process: `true` serves and folds range listings
+/// and journal fills with no file identity, as 3.0.0 did. Process-global.
+pub fn set_trust_unverified_ranges(trust: bool) {
+    TRUST_UNVERIFIED_RANGES.store(trust, std::sync::atomic::Ordering::Relaxed);
+    if trust {
+        warn!(
+            "cache.trust_unverified_ranges is on: ranges cached with no file identity (by a 2.x \
+             release) are served without a check that their file holds this object version"
+        );
+    }
+}
+/// Whether `cache.trust_unverified_ranges` is on. Read by [`refuses_unverified_range`] and the
+/// consolidator's R12.1 predicate, the only two places it applies.
+pub(crate) fn trust_unverified_ranges() -> bool {
+    TRUST_UNVERIFIED_RANGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Whether a listing or pending `Add` is never coverage for its identity: the offset-0 rule
+/// ([`crate::cache_types::RangeSpec::is_unverified_prefix`]) or R13.1
+/// ([`refuses_unverified_range`]). The one predicate every serve path applies.
+pub(crate) fn unverified_listing_refused(
+    range_spec: &crate::cache_types::RangeSpec,
+    content_length: u64,
+) -> bool {
+    range_spec.is_unverified_prefix(content_length) || refuses_unverified_range(range_spec)
+}
 /// Log, at most once a minute per key, that a pre-3.0.0 range listing is being fetched again
 /// ([`crate::cache_types::RangeSpec::is_unverified_prefix`]). The heal removes the listing on
 /// the first read, so a key normally logs once; the bound covers a heal that cannot run yet
@@ -3194,20 +3505,15 @@ impl DiskCacheManager {
             if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("journal") {
                 continue;
             }
-            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+            let Ok(entries) = crate::journal_manager::read_entries_for_key(&path, cache_key).await
+            else {
                 continue;
             };
-            for line in content.lines() {
-                let Ok(entry) = serde_json::from_str::<crate::journal_manager::JournalEntry>(line)
-                else {
-                    continue;
-                };
-                if entry.cache_key != cache_key
-                    || !matches!(
-                        entry.operation,
-                        crate::journal_manager::JournalOperation::Add
-                    )
-                {
+            for entry in entries {
+                if !matches!(
+                    entry.operation,
+                    crate::journal_manager::JournalOperation::Add
+                ) {
                     continue;
                 }
                 if let Some(m) = entry.object_metadata.as_ref() {
@@ -3338,30 +3644,21 @@ impl DiskCacheManager {
                 _ => continue,
             };
 
-            // Read and parse journal file
-            let content = match tokio::fs::read_to_string(&journal_path).await {
-                Ok(c) => c,
+            // This key's entries only, read a line at a time off the runtime's worker threads.
+            let entries = match crate::journal_manager::read_entries_for_key(
+                &journal_path,
+                cache_key,
+            )
+            .await
+            {
+                Ok(entries) => entries,
                 Err(e) => {
                     debug!("Failed to read journal file {:?}: {}", journal_path, e);
                     continue;
                 }
             };
 
-            for line in content.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let entry: crate::journal_manager::JournalEntry = match serde_json::from_str(line) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                // Check if this entry is for our cache key
-                if entry.cache_key != cache_key {
-                    continue;
-                }
-
+            for entry in entries {
                 // Check if the range overlaps with requested range
                 let range = &entry.range_spec;
                 let overlaps = requested_start <= range.end && range.start <= requested_end;
@@ -3378,8 +3675,10 @@ impl DiskCacheManager {
                     // end (`RangeSpec::is_unverified_prefix`), is never coverage. Every journal
                     // fallback reads through this scan, page widening's included, so this one
                     // check covers them all. Once folded, `find_cached_ranges` removes it.
+                    // R13.1 widens it to every pending `Add` with no file identity.
                     crate::journal_manager::JournalOperation::Add
-                        if range.is_unverified_prefix(
+                        if unverified_listing_refused(
+                            range,
                             entry
                                 .object_metadata
                                 .as_ref()
@@ -3388,6 +3687,7 @@ impl DiskCacheManager {
                         ) =>
                     {
                         note_unverified_prefix_refetch(cache_key, range.start, range.end);
+                        note_unverified_ranges_refused(1);
                         continue;
                     }
                     crate::journal_manager::JournalOperation::Add => {
@@ -4210,7 +4510,9 @@ impl DiskCacheManager {
         // ===================================================================
         // P1 — the danger-band publication guard (cache-eviction-at-scale task 36).
         //
-        // This is the boundary, not a call site: this function has nine production callers
+        // This is the boundary, not a call site: this function has six production callers
+        // (`store_range_shared_witnessed`'s five in `http_proxy.rs`, and
+        // `store_part_as_range_witnessed`)
         // and is also where `store_full_object_as_range` (P2),
         // `RangeHandler::store_range_new_storage` (P5) and page widening (P6) all land, so
         // one check here covers four of U4's nine paths and no alternate route bypasses it.
@@ -4306,9 +4608,11 @@ impl DiskCacheManager {
         // We'll rename it AFTER updating metadata to avoid race conditions
         let write_start = std::time::Instant::now();
         let range_file_path = self.get_new_range_file_path(cache_key, start, end);
-        // Instance-scoped `{key}_{s}-{e}.bin.tmp.{host}.{pid}`, so the dead-instance reaper
-        // can tell a dead process's leftover from a live peer's write in flight.
-        let range_tmp_path = crate::cache::instance_scoped_range_tmp_path(&range_file_path, None);
+        // This fill's own `{key}_{s}-{e}.{nonce:08x}.tmp.{host}.{pid}`, opened `create_new`
+        // (R10.1): two fills of one range never share a temp file, and the dead-instance
+        // reaper can still tell a dead process's leftover from a live peer's write in flight.
+        let range_tmp_path =
+            crate::cache::instance_scoped_range_tmp_path(&range_file_path, Some(fastrand::u32(..)));
 
         debug!(
             "Writing range binary file to temp: key={}, range={}-{}, path={:?}, size={} bytes",
@@ -4329,35 +4633,43 @@ impl DiskCacheManager {
         // Write to temporary file (keep it as .tmp until metadata is updated). Synced here,
         // before either arm below, because the direct arm renames the `.meta` naming this
         // file before the `.bin` itself; see `write_synced`.
-        let file_identity = match write_synced_identity(&range_tmp_path, &compressed_data) {
-            Ok(identity) => identity,
-            Err(e) => {
-                // Clean up tmp file on failure
-                let _ = std::fs::remove_file(&range_tmp_path);
+        let written =
+            match write_synced_identity_exclusive(&range_tmp_path, &compressed_data, cache_key) {
+                Ok(written) => written,
+                // Logged once, with the key and the path, where it was found (R12.2): the fill is
+                // refused, not a failed write.
+                Err(e) if is_identity_unavailable(&e) => {
+                    return Err(ProxyError::CacheError(e.to_string()));
+                }
+                Err(e) => {
+                    // Clean up tmp file on failure, unless it is not this fill's file.
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        let _ = std::fs::remove_file(&range_tmp_path);
+                    }
 
-                // Check if this is a disk space exhaustion error
-                // Requirement 8.3: Handle disk space exhaustion
-                if note_disk_full(&e, "store_range.bin_tmp") {
-                    error!(
+                    // Check if this is a disk space exhaustion error
+                    // Requirement 8.3: Handle disk space exhaustion
+                    if note_disk_full(&e, "store_range.bin_tmp") {
+                        error!(
                     "Disk space exhausted: key={}, range={}-{}, attempted_size={} bytes, error={}",
                     cache_key, start, end, compressed_size, e
                 );
-                    return Err(ProxyError::CacheError(format!(
-                        "Disk space exhausted: {}",
-                        e
-                    )));
-                } else {
-                    error!(
+                        return Err(ProxyError::CacheError(format!(
+                            "Disk space exhausted: {}",
+                            e
+                        )));
+                    } else {
+                        error!(
                         "Failed to write range tmp file: key={}, range={}-{}, path={:?}, error={}",
                         cache_key, start, end, range_tmp_path, e
                     );
-                    return Err(ProxyError::CacheError(format!(
-                        "Failed to write range tmp file: {}",
-                        e
-                    )));
+                        return Err(ProxyError::CacheError(format!(
+                            "Failed to write range tmp file: {}",
+                            e
+                        )));
+                    }
                 }
-            }
-        };
+            };
 
         let write_duration = write_start.elapsed();
         debug!(
@@ -4402,7 +4714,7 @@ impl DiskCacheManager {
         )
         // The `.tmp`'s identity; the publish renames it, which keeps its length and
         // modification time.
-        .with_file_identity(file_identity);
+        .with_file_identity(Some(written.identity));
         // Step 3: Update metadata - use hybrid writer for coordinated metadata updates
         // (always enabled in production; tests may not have it configured)
         let metadata_start = std::time::Instant::now();
@@ -4412,7 +4724,8 @@ impl DiskCacheManager {
             // `PreparedRangeFill::finish`, which needs no `&self`. A caller holding the
             // `DiskCacheManager` write guard drops it before `finish`, so the slot-lock wait
             // there does not hold the `RwLock`.
-            let pending = PendingRangePublish::new(range_tmp_path.clone(), range_file_path.clone());
+            let pending = PendingRangePublish::new(range_tmp_path.clone(), range_file_path.clone())
+                .expecting(written);
             return Ok(Some(PreparedRangeFill {
                 cache_dir: self.cache_dir.clone(),
                 meta_path: self.get_new_metadata_file_path(cache_key),
@@ -5460,8 +5773,24 @@ impl DiskCacheManager {
         // dominated ~29% of sampled CPU when the close also wrote the data back). The salvage
         // above re-paths the same file, so this is taken after its last write. The publish's
         // rename keeps the length and modification time.
+        let ino = writing_descriptor_inode(&file);
         drop(file);
-        let file_identity = identity_after_close(&writer.tmp_path);
+        let identity = identity_or_discard(&writer.tmp_path, &writer.cache_key)?;
+        // The writing descriptor's inode is what the publish re-checks the temp file against
+        // (R10.2). An `fstat` failure there is an identity failure, as in
+        // `write_synced_range_temp`.
+        let Some(ino) = ino else {
+            let _ = std::fs::remove_file(&writer.tmp_path);
+            note_unverified_ranges_refused(1);
+            warn!(
+                "Range fill not published: its file identity could not be taken (fstat of the \
+                 writing descriptor failed), temp file removed: key={}, path={:?}",
+                writer.cache_key, writer.tmp_path
+            );
+            return Err(ProxyError::CacheError(IDENTITY_UNAVAILABLE.to_string()));
+        };
+        let written = WrittenRangeTemp { identity, ino };
+        let file_identity = Some(identity);
 
         // Always tagged Lz4: whether `writer.compression_enabled` was true or
         // false, every batch was flushed as a valid, checksummed LZ4 frame
@@ -5474,7 +5803,8 @@ impl DiskCacheManager {
 
         // The `.tmp` is complete. The rename `.tmp` → `.bin` is the caller's, through
         // `PendingRangePublish::publish`; dropping the handle unpublished removes the `.tmp`.
-        let pending = PendingRangePublish::new(writer.tmp_path.clone(), writer.final_path.clone());
+        let pending = PendingRangePublish::new(writer.tmp_path.clone(), writer.final_path.clone())
+            .expecting(written);
 
         debug!(
             "Finalized incremental range (unpublished): key={}, range={}-{}, uncompressed={}, compressed={}, path={:?}",
@@ -5698,7 +6028,7 @@ impl DiskCacheManager {
         // Closed, then stamped from a new descriptor; same rationale as
         // `finalize_incremental_range_unpublished`.
         drop(file);
-        let file_identity = identity_after_close(&writer.tmp_path);
+        let file_identity = Some(identity_or_discard(&writer.tmp_path, &writer.cache_key)?);
 
         // Always tagged Lz4 — see `finalize_incremental_range`'s equivalent
         // comment; every batch was flushed as a valid, checksummed LZ4 frame
@@ -6297,6 +6627,8 @@ async fn publish_range_fill_under_slot_lock_at(
     slot_wait: SlotWait,
     fill_witness: Option<&crate::cache::FillWitness>,
 ) -> Result<Option<PublishedFill>> {
+    #[cfg(test)]
+    range_rename_pause::before_publish(cache_key).await;
     let _slot = match slot_wait {
         SlotWait::WithinBudget => {
             crate::metadata_lock_manager::acquire_slot_lock_within_budget(cache_dir, cache_key)
@@ -6357,6 +6689,64 @@ async fn publish_range_fill_under_slot_lock_at(
             published = Some(*meta);
         }
     }
+    // No parseable `.meta` and the final path already holds a
+    // file younger than the orphan rotation's publish window. That file is another fill's,
+    // most likely one whose journal `Add` consolidation has not folded yet, of this version or
+    // another. Renaming over it would let a `.meta` built from that `Add` alone list its ETag
+    // and identity over this fill's bytes, and equal lengths with mtimes in one granule pass
+    // the identity check. Every renamer to a final range path holds this lock, so the check is
+    // atomic against all of them. An older file is a leftover (a crash between the rename and
+    // the append, an unverified `Add`'s file) and this fill replaces it, so no key is left
+    // unfillable. So is a file last written before the key's write-order marker: it predates a
+    // write or delete acknowledged through the fleet, whose invalidation could not unlink it
+    // because no `.meta` listed it, and its pending `Add` is retired as superseded.
+    //
+    // Why dropping a recent file that does not predate the marker is sound: a write or
+    // delete acknowledged through the fleet replaces the marker's token, and
+    // `JournalConsolidator::partition_superseded_fills` retires every `Add` whose fill-witness
+    // token differs from the marker's. So a pending `Add` of a file written before the marker
+    // is retired as superseded, and that file may be replaced; a file written at or after the
+    // marker is taken to belong to a fill whose witness holds the current token, whose `Add`
+    // folds. A change to how the marker is rewritten or compared there changes this argument.
+    //
+    // Clock dependency: `old_enough` compares the file's mtime, stamped by the file server,
+    // with this proxy's clock. A proxy clock ahead of the server's by 600 s or more makes every
+    // file look old, so the check never drops and the cold-key race is exposed as it was before
+    // the check (the failure direction is an understatement of the check's protection, not
+    // wrong bytes from the check itself). Both mtimes are read from opened descriptors; see
+    // `open_final_file_metadata` (the final file) and `final_file_metadata_fresh` (the marker).
+    if published.is_none() {
+        // Only `NotFound` means no file. Any other error leaves the file's age unknown, so the
+        // fill is dropped (fails closed): it re-fetches on its next read.
+        match open_final_file_metadata(&pending.final_path) {
+            Ok(existing) => {
+                if !crate::orphan_reclaim::old_enough(&existing)
+                    && !predates_write_marker(meta_path, &existing)
+                {
+                    debug!(
+                        "Range fill dropped (no parseable .meta and the final path holds a \
+                         recent file, another fill's pending publish): key={}, range={}-{}",
+                        cache_key, start, end
+                    );
+                    return Ok(None);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn_final_path_read_failed_rate_limited(
+                    "range fill dropped",
+                    &pending.final_path,
+                    &e,
+                );
+                debug!(
+                    "Range fill dropped (the final path's file could not be opened or read): \
+                     path={:?}, key={}, range={}-{}, error={}",
+                    pending.final_path, cache_key, start, end, e
+                );
+                return Ok(None);
+            }
+        }
+    }
     if let Some(meta) = published {
         if !crate::revalidation::etags_equal_ignoring_quotes(&meta.object_metadata.etag, fill_etag)
         {
@@ -6380,6 +6770,10 @@ async fn publish_range_fill_under_slot_lock_at(
             return Ok(None);
         }
     }
+    // R10.2: publish only the file this fill wrote.
+    if !pending.still_written_by_this_fill(cache_key) {
+        return Ok(None);
+    }
     let final_path = pending.final_path.clone();
     let range_already_existed = pending.publish()?;
     #[cfg(test)]
@@ -6389,6 +6783,100 @@ async fn publish_range_fill_under_slot_lock_at(
         final_path,
         _slot,
     }))
+}
+
+/// `path`'s metadata taken from an opened descriptor. On NFS, `open` revalidates a cached
+/// positive dentry with a `GETATTR` (close-to-open consistency), so `fstat` on the descriptor
+/// returns fresh attributes. `std::fs::metadata(path)` is a `stat` that the client may answer
+/// from its attribute cache for up to `actimeo`, which would let a peer's just-renamed file
+/// read as its predecessor.
+///
+/// A cached NEGATIVE dentry is not revalidated by `open`: the directory's own attributes govern
+/// it. This function therefore depends on the documented `lookupcache=pos` mount option
+/// (`docs/CONFIGURATION.md`, NFS mount requirements), which is what keeps a peer's file from
+/// reading as absent. Without it a recent peer file can read as `NotFound` here.
+///
+/// The cold-key check and the retired-fill unlink treat only `ErrorKind::NotFound` as "no file";
+/// for them any other error means the file's age is unknown and they keep the file (fail
+/// closed). [`final_file_metadata_fresh`] reads every error as absent, because an unreadable
+/// write-order marker means the file does not predate it, which also keeps the file. Shared by
+/// the cold-key check in
+/// [`publish_range_fill_under_slot_lock_at`] and the retired-fill unlink in
+/// `journal_consolidator::unlink_retired_fill_files`.
+pub(crate) fn open_final_file_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    if open_failure_seam::fails(path) {
+        return Err(std::io::Error::other("seam: open failed"));
+    }
+    std::fs::File::open(path)?.metadata()
+}
+
+/// Minimum seconds between [`warn_final_path_read_failed_rate_limited`] lines.
+const FINAL_PATH_READ_WARN_INTERVAL_SECS: u64 = 60;
+static LAST_FINAL_PATH_READ_WARN_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// At most one WARN per [`FINAL_PATH_READ_WARN_INTERVAL_SECS`] when a final-path read fails with
+/// something other than `NotFound` (a descriptor limit, `EACCES`, `ESTALE`). Without it a key
+/// whose fills are all dropped, or a retired fill's file that is never unlinked, shows only at
+/// `debug!`. Same compare-exchange pattern as `cache::log_read_fill_decline_rate_limited`.
+pub(crate) fn warn_final_path_read_failed_rate_limited(
+    consequence: &str,
+    path: &Path,
+    e: &std::io::Error,
+) {
+    use std::sync::atomic::Ordering;
+    let now_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_FINAL_PATH_READ_WARN_SECS.load(Ordering::Relaxed);
+    if now_secs >= last + FINAL_PATH_READ_WARN_INTERVAL_SECS
+        && LAST_FINAL_PATH_READ_WARN_SECS
+            .compare_exchange(last, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            path = ?path,
+            error = %e,
+            "A cache file's age could not be read ({}); this line is limited to one per minute",
+            consequence
+        );
+    }
+}
+/// [`open_final_file_metadata`] with every error read as "absent", for the write-order marker
+/// read: an unreadable marker means the file does not predate it, which keeps the file.
+fn final_file_metadata_fresh(path: &Path) -> Option<std::fs::Metadata> {
+    open_final_file_metadata(path).ok()
+}
+
+/// Test seam: makes [`open_final_file_metadata`] fail with a non-`NotFound` error for a path a
+/// test registered, as `EMFILE` would.
+#[cfg(test)]
+pub(crate) mod open_failure_seam {
+    use std::sync::Mutex;
+    static PATHS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+    pub(crate) fn fail_for(path: &std::path::Path) {
+        PATHS.lock().unwrap().push(path.to_path_buf());
+    }
+    pub(crate) fn fails(path: &std::path::Path) -> bool {
+        PATHS.lock().unwrap().iter().any(|p| p == path)
+    }
+}
+
+/// Whether `existing`, a file at a key's final range path, was last written before the key's
+/// write-order marker (the file the fill witness reads, `crate::cache::write_marker_path`) was:
+/// it predates a write or delete acknowledged through the fleet, so it is superseded.
+/// `false` when the key has no marker or either time cannot be read. Caller holds the key's
+/// slot lock.
+fn predates_write_marker(meta_path: &Path, existing: &std::fs::Metadata) -> bool {
+    let Some(marker) = final_file_metadata_fresh(&crate::cache::write_marker_path(meta_path))
+    else {
+        return false;
+    };
+    match (existing.modified(), marker.modified()) {
+        (Ok(file), Ok(marker)) => file < marker,
+        _ => false,
+    }
 }
 
 /// A journal-only fill's `.bin`, renamed visible by [`publish_range_fill_under_slot_lock_at`],
@@ -7469,12 +7957,26 @@ impl DiskCacheManager {
         // switch. Removing it is what lets the refill take its place: a fill of an extent that
         // is already listed is not listed again. Every serve path that turns a `.meta` into
         // bytes resolves its extents here (the no-validator guard below lists them).
+        //
+        // R13.1 widens it to every listing with no file identity (`unverified_listing_refused`):
+        // its bytes may be another version's, so it is removed the same way and refetched.
+        //
+        // R13.1a: a document with neither an ETag nor an effective `Last-Modified` that lists a
+        // range with no file identity was built from an S3 error reply by a 2.x release.
+        // Its identity-less ranges are removed the same way, override or not; removing the last
+        // unlinks the `.meta`, so the forward's fill publishes into an absent document instead
+        // of being dropped by the publish guard on every GET.
         let content_length = metadata.object_metadata.content_length;
-        for range_spec in metadata
-            .ranges
-            .iter()
-            .filter(|r| !r.unservable && r.is_unverified_prefix(content_length))
-        {
+        let no_validators = metadata.object_metadata.etag.is_empty()
+            && metadata.object_metadata.effective_last_modified().is_none();
+        for range_spec in metadata.ranges.iter().filter(|r| {
+            !r.unservable
+                && (unverified_listing_refused(r, content_length)
+                    || (no_validators && r.file_identity.is_none()))
+        }) {
+            if range_spec.file_identity.is_none() {
+                note_unverified_ranges_refused(1);
+            }
             self.drop_unverified_prefix_listing(cache_key, range_spec)
                 .await;
         }
@@ -7529,7 +8031,7 @@ impl DiskCacheManager {
             // bytes may be another version's. It is never coverage: skipping it here makes it
             // read as missing on every lookup purpose and both metadata sources, so the
             // request refetches.
-            if range_spec.unservable || range_spec.is_unverified_prefix(content_length) {
+            if range_spec.unservable || unverified_listing_refused(range_spec, content_length) {
                 debug!(
                     "[RANGE_OVERLAP] Skipping unservable extent: cache_key={}, cached_range={}-{}",
                     cache_key, range_spec.start, range_spec.end
@@ -8086,9 +8588,10 @@ impl DiskCacheManager {
     /// `FrameDecoder` (looping over concatenated frames) and sends each decompressed chunk
     /// as it is produced. Neither mode holds the whole file in memory.
     ///
-    /// Chunks cross a 4-deep channel, so resident data is bounded by about
-    /// 4 × `chunk_size` per stream. Dropping the returned stream makes the blocking task's
-    /// next send fail, which stops the read.
+    /// Chunks cross a channel [`STREAM_QUEUE_DEPTH`] deep, so a stream whose reader has
+    /// stopped holds about `(STREAM_QUEUE_DEPTH + 1)` chunks (the queued ones and the one
+    /// waiting to be sent) plus the LZ4 reader's buffer. Dropping the returned stream makes
+    /// the blocking task's next send fail, which stops the read.
     ///
     /// Returns a stream of Bytes chunks that can be used with StreamBody.
     ///
@@ -8122,17 +8625,49 @@ impl DiskCacheManager {
         chunk_size: usize,
         start_offset: u64,
     ) -> Result<(impl futures::Stream<Item = Result<bytes::Bytes>>, u64)> {
-        self.stream_range_data_from_with_capacity(range_spec, chunk_size, start_offset, None)
+        self.stream_range_data_from_with_capacity(range_spec, chunk_size, start_offset, None, None)
             .await
     }
 
-    /// [`Self::stream_range_data_from`] with the LZ4 reader capacity given; `None` takes
-    /// [`lz4_range_reader_capacity`] of the file's length.
+    /// As [`Self::stream_range_data_from`], for a response that ends at `end_offset`
+    /// (uncompressed, relative to the extent start, exclusive). The stream yields exactly
+    /// `start_offset..end_offset`: the returned skip is `start_offset` for both encodings,
+    /// because the reader itself decodes an LZ4 file from its start and discards up to the
+    /// offset, and the read buffer is capped at the response's length rather than the
+    /// extent's (R14.1), so a small slice of a large extent allocates about its own size.
+    ///
+    /// A response that ends at the extent's end holds its last chunk until the file's clean
+    /// end, as [`Self::stream_range_data_from`] does. One that ends earlier sends its last
+    /// chunk and stops reading, without reading the rest of the frame under that byte, so
+    /// damage that only that frame's content checksum detects is not detected on that
+    /// response. That is accepted (Ed, 2026-10-31): verifying before sending would mean
+    /// decoding to the end of the frame first.
+    pub async fn stream_range_data_between(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        chunk_size: usize,
+        start_offset: u64,
+        end_offset: u64,
+    ) -> Result<(impl futures::Stream<Item = Result<bytes::Bytes>>, u64)> {
+        self.stream_range_data_from_with_capacity(
+            range_spec,
+            chunk_size,
+            start_offset,
+            Some(end_offset),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::stream_range_data_from`] with the response's end (see
+    /// [`Self::stream_range_data_between`]; `None` reads to the extent's end) and the LZ4 reader
+    /// capacity given; `None` takes [`lz4_range_reader_capacity`] of the file's length.
     async fn stream_range_data_from_with_capacity(
         &self,
         range_spec: &crate::cache_types::RangeSpec,
         chunk_size: usize,
         start_offset: u64,
+        end_offset: Option<u64>,
         reader_capacity: Option<usize>,
     ) -> Result<(impl futures::Stream<Item = Result<bytes::Bytes>>, u64)> {
         // Security (Req 10): reject file_path if it is absolute, contains ".." traversal,
@@ -8220,6 +8755,19 @@ impl DiskCacheManager {
         } else {
             0
         };
+        // Where the response ends in the extent's decoded bytes (exclusive), and whether that is
+        // the extent's end. With an end given, an LZ4 reader discards up to `start_offset`
+        // itself, so its buffer and chunks are sized by the response, not the extent.
+        let limit = end_offset.map_or(expected_size, |e| e.min(expected_size));
+        let to_eof = limit == expected_size;
+        let lz4_skip = if compression_algorithm == crate::compression::CompressionAlgorithm::Lz4
+            && end_offset.is_some()
+            && start_offset < limit
+        {
+            start_offset
+        } else {
+            0
+        };
 
         // A damaged file found mid-stream is healed from the blocking task, before the error
         // is sent, against the stamp of the file this stream opened (range-file-self-heal R1,
@@ -8247,19 +8795,32 @@ impl DiskCacheManager {
             ));
         });
 
-        // Channel capacity of 4 provides backpressure: blocking task pauses when
-        // 4 chunks are buffered, bounding memory to 4 × chunk_size per request.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes>>(4);
+        // The channel's capacity is the backpressure: the blocking task pauses when
+        // `STREAM_QUEUE_DEPTH` chunks are queued.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes>>(stream_queue_depth());
+        // The read buffer, and so every chunk, is no larger than the bytes this response has
+        // left to send, so a small range or a small slice does not allocate a whole chunk
+        // (R14.1). At least one byte, so a read into it can only return 0 at the end of the
+        // file.
+        let buf_len = usize::try_from(limit.saturating_sub(skipped + lz4_skip))
+            .unwrap_or(usize::MAX)
+            .min(chunk_size)
+            .max(1);
 
         tokio::task::spawn_blocking(move || {
             use crate::compression::CompressionAlgorithm;
             use lz4_flex::frame::FrameDecoder;
             use std::io::Read;
 
-            let mut buf = vec![0u8; chunk_size];
+            let mut buf = vec![0u8; buf_len];
             let mut total_read = skipped;
             // The read reached the file's end with no error and the receiver still there.
             let mut clean_end = false;
+            // The LZ4 chunk holding the extent's last byte, sent after the length check.
+            let mut held: Option<bytes::Bytes> = None;
+            // The response ended before the extent's end and its last byte was sent: the rest
+            // of the file was not read, so its length says nothing.
+            let mut ended = false;
 
             match compression_algorithm {
                 CompressionAlgorithm::Lz4 => {
@@ -8274,8 +8835,22 @@ impl DiskCacheManager {
                     // 64 KiB, so decoded bytes accumulate in `buf` across reads (and across
                     // frames) and are sent once `chunk_size` bytes are ready. `stopped` is
                     // set on an error or a dropped receiver, when the remainder is not sent.
+                    //
+                    // The frames carry a content checksum and no block checksums, and lz4_flex
+                    // reads the checksum only on the read after a frame's last block. So the
+                    // chunk holding the extent's last byte is never sent at fill: it waits in
+                    // `buf` while the rest of the file is decoded into `scratch` and discarded,
+                    // and goes out only after the clean end of the file and the length check
+                    // below (R15.1). Every earlier chunk is sent at fill, so damage found later
+                    // ends the response short of its length.
                     let mut filled = 0usize;
                     let mut stopped = false;
+                    let mut scratch = [0u8; LZ4_SCRATCH_LEN];
+                    // The skip phase discards into this, not into `buf`, which holds the
+                    // response's own size: a decoder read returns at most one 64 KiB block, so
+                    // an 8-byte slice would otherwise discard its prefix 8 bytes at a time. On
+                    // the stack, so the heap bound of a small slice is unchanged.
+                    let mut skip_scratch = [0u8; LZ4_SKIP_SCRATCH_LEN];
 
                     'outer: loop {
                         // Check if there's more data in the underlying reader
@@ -8297,12 +8872,40 @@ impl DiskCacheManager {
 
                         let mut decoder = FrameDecoder::new(&mut buf_reader);
                         loop {
-                            match decoder.read(&mut buf[filled..]) {
+                            // Reads into `buf` stop at the extent's last byte, so a read never
+                            // straddles it; past it, decoded bytes only count towards the length.
+                            let read = if total_read < lz4_skip {
+                                let want = usize::try_from(lz4_skip - total_read)
+                                    .unwrap_or(usize::MAX)
+                                    .min(skip_scratch.len());
+                                decoder.read(&mut skip_scratch[..want])
+                            } else if total_read < limit {
+                                let want = usize::try_from(limit - total_read)
+                                    .unwrap_or(usize::MAX)
+                                    .min(buf.len() - filled);
+                                decoder.read(&mut buf[filled..filled + want])
+                            } else {
+                                decoder.read(&mut scratch)
+                            };
+                            match read {
                                 Ok(0) => break, // End of this LZ4 frame
                                 Ok(n) => {
+                                    let before = total_read;
                                     total_read += n as u64;
+                                    if before < lz4_skip || before >= limit {
+                                        continue;
+                                    }
                                     filled += n;
-                                    if filled == buf.len() {
+                                    if total_read == limit && !to_eof {
+                                        // The response's last byte: sent now, and the read
+                                        // stops.
+                                        let chunk = bytes::Bytes::copy_from_slice(&buf[..filled]);
+                                        filled = 0;
+                                        let _ = tx.blocking_send(Ok(chunk));
+                                        ended = true;
+                                        break 'outer;
+                                    }
+                                    if filled == buf.len() && total_read < limit {
                                         let chunk = bytes::Bytes::copy_from_slice(&buf[..filled]);
                                         filled = 0;
                                         if tx.blocking_send(Ok(chunk)).is_err() {
@@ -8346,14 +8949,25 @@ impl DiskCacheManager {
                         }
                     }
                     if !stopped && filled > 0 {
-                        let _ = tx.blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..filled])));
+                        held = Some(bytes::Bytes::copy_from_slice(&buf[..filled]));
                     }
                     clean_end = !stopped;
                 }
                 CompressionAlgorithm::None => {
                     let mut reader = std::io::BufReader::new(std_file);
                     loop {
-                        match reader.read(&mut buf) {
+                        let want = if to_eof {
+                            buf.len()
+                        } else {
+                            usize::try_from(limit.saturating_sub(total_read))
+                                .unwrap_or(usize::MAX)
+                                .min(buf.len())
+                        };
+                        if want == 0 {
+                            ended = true;
+                            break;
+                        }
+                        match reader.read(&mut buf[..want]) {
                             Ok(0) => {
                                 clean_end = true;
                                 break;
@@ -8378,7 +8992,7 @@ impl DiskCacheManager {
             }
 
             // Validate total decompressed size matches expected
-            if total_read != expected_size {
+            if !ended && total_read != expected_size {
                 // The whole file was read and holds another length, so it is damaged (see
                 // `load_range_data`). A stream that stopped early, on an error or a departed
                 // client, says nothing about the file's length.
@@ -8395,10 +9009,17 @@ impl DiskCacheManager {
                     "Decompressed size mismatch: expected {} bytes, got {}",
                     expected_size, total_read
                 ))));
+            } else if let Some(last) = held {
+                // The chunk that completes the extent, sent only now: after every frame's
+                // content checksum and the length check (R15.1).
+                let _ = tx.blocking_send(Ok(last));
             }
         });
 
-        Ok((tokio_stream::wrappers::ReceiverStream::new(rx), skipped))
+        Ok((
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+            skipped + lz4_skip,
+        ))
     }
 
     /// Store full object as a range (0 to content_length-1)
@@ -8934,7 +9555,7 @@ impl DiskCacheManager {
     /// 6. If no ranges remain, deletes the metadata file
     /// 7. Releases lock
     pub async fn remove_invalidated_range(
-        &mut self,
+        &self,
         cache_key: &str,
         range_start: u64,
         range_end: u64,
@@ -9800,30 +10421,19 @@ pub(crate) async fn unfolded_journal_add_ranges(
             _ => continue,
         };
 
-        let content = match tokio::fs::read_to_string(&journal_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                debug!(
-                    "Range invalidation: failed to read journal file {:?}: {}",
-                    journal_path, e
-                );
-                continue;
-            }
-        };
-
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let entry: crate::journal_manager::JournalEntry = match serde_json::from_str(line) {
-                Ok(e) => e,
-                Err(_) => continue,
+        let entries =
+            match crate::journal_manager::read_entries_for_key(&journal_path, cache_key).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    debug!(
+                        "Range invalidation: failed to read journal file {:?}: {}",
+                        journal_path, e
+                    );
+                    continue;
+                }
             };
 
-            if entry.cache_key != cache_key {
-                continue;
-            }
+        for entry in entries {
             if entry.operation != crate::journal_manager::JournalOperation::Add {
                 continue;
             }
@@ -11263,7 +11873,9 @@ mod lz4_reader_capacity_tests {
                     assert!(got.as_deref() == Some(&data[..]), "buffered {label}");
                     for (chunk, offset) in [(1_048_576, 0u64), (262_144, 3_000_001)] {
                         let (stream, skipped) = dcm
-                            .stream_range_data_from_with_capacity(&spec, chunk, offset, capacity)
+                            .stream_range_data_from_with_capacity(
+                                &spec, chunk, offset, None, capacity,
+                            )
                             .await
                             .unwrap();
                         let mut stream = std::pin::pin!(stream);
@@ -11904,6 +12516,564 @@ mod tests {
         }
     }
 
+    /// R10.3: two fills of one range with different bytes, both prepared before either
+    /// publishes, by two managers as `create_configured_disk_cache_manager` builds them. The first
+    /// to finish must publish its own bytes. Red on a temp name shared by every fill of a range.
+    #[tokio::test]
+    async fn the_first_of_two_prepared_fills_publishes_its_own_bytes() {
+        use std::io::Read;
+        let temp_dir = TempDir::new().unwrap();
+        let mut mgr_a = hybrid_disk_cache(temp_dir.path());
+        mgr_a.initialize().await.unwrap();
+        let mut mgr_b = hybrid_disk_cache(temp_dir.path());
+        let key = "test-bucket/obj";
+        let x = vec![0xAAu8; 65536];
+        let y = vec![0xBBu8; 65536];
+        let meta = |etag: &str| crate::cache_types::ObjectMetadata {
+            etag: etag.to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 65536,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 65536,
+            ..Default::default()
+        };
+        let ttl = Duration::from_secs(3600);
+        let fill_x = mgr_a
+            .prepare_range_store(key, 0, 65535, &x, meta("\"X\""), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: fill x is prepared");
+        let fill_y = mgr_b
+            .prepare_range_store(key, 0, 65535, &y, meta("\"Y\""), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: fill y is prepared");
+        fill_x.finish().await.expect("fill x publishes");
+        let published = std::fs::read(mgr_a.get_new_range_file_path(key, 0, 65535))
+            .expect("fill x's .bin is published");
+        let mut decoded = Vec::new();
+        lz4_flex::frame::FrameDecoder::new(&published[..])
+            .read_to_end(&mut decoded)
+            .expect("the published .bin is a valid frame");
+        drop(fill_y);
+        assert!(
+            decoded == x,
+            "R10.3: THE FIRST FILL PUBLISHED THE OTHER FILL'S BYTES under its own ETag: \
+             {} bytes, first byte {:#04x} (x is 0xaa, y is 0xbb)",
+            decoded.len(),
+            decoded.first().copied().unwrap_or(0)
+        );
+    }
+
+    /// [`hybrid_disk_cache`] journalling as `instance`, so two managers on one cache directory
+    /// write separate journal files, as two proxies sharing a volume do.
+    fn hybrid_disk_cache_as(dir: &std::path::Path, instance: &str) -> DiskCacheManager {
+        std::fs::create_dir_all(dir.join("metadata").join("_journals")).unwrap();
+        let mut dc = DiskCacheManager::new(dir.to_path_buf(), true, 1024, false, 1_048_576);
+        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
+            dir.to_path_buf(),
+            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            Arc::new(crate::journal_manager::JournalManager::new(
+                dir.to_path_buf(),
+                instance.to_string(),
+            )),
+            Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
+                1024 * 1024,
+                100,
+            )),
+        );
+        dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
+        dc
+    }
+
+    /// What a checked read of a `.meta`'s 0-65535 listing gives, for the cold-key tests.
+    async fn cold_key_read_listing(dc: &DiskCacheManager, key: &str) -> String {
+        let Some(meta) = dc.get_metadata(key).await.expect("the .meta reads") else {
+            return "no .meta".to_string();
+        };
+        let etag = meta.object_metadata.etag.clone();
+        let Some(spec) = meta
+            .ranges
+            .iter()
+            .find(|r| r.start == 0 && r.end == 65535)
+            .cloned()
+        else {
+            return format!("etag={etag} lists nothing at 0-65535");
+        };
+        match dc.load_range_data(&spec).await {
+            Ok(v) => format!(
+                "etag={etag} served {} bytes of {:#04x}",
+                v.len(),
+                v.first().copied().unwrap_or(0)
+            ),
+            Err(e) => format!("etag={etag} refused: {e}"),
+        }
+    }
+
+    /// The cold-key race fixture. On a cold key, fill X (proxy p1) publishes and journals, then fill
+    /// Y (proxy p2, its own journal file) publishes the same extent. The pass that creates the
+    /// `.meta` reads only p1's journal: p2's journal file is moved out of `_journals/` for that
+    /// pass, standing in for a discovery that ran between the two publishes (the pass reads only
+    /// the files discovery saw holding a line for the key). `equalise_mtime` sets the final
+    /// `.bin`'s mtime to X's after Y's publish, standing in for "both last writes in one mtime
+    /// granule". Returns what a checked read serves after the creating pass and after a second,
+    /// full pass.
+    async fn cold_key_race_listings(equalise_mtime: bool) -> (String, String) {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut mgr_p1 = hybrid_disk_cache_as(dir, "journal-p1");
+        mgr_p1.initialize().await.unwrap();
+        let mut mgr_p2 = hybrid_disk_cache_as(dir, "journal-p2");
+        let key = "test-bucket/obj";
+        let x = vec![0xAAu8; 65536];
+        let y = vec![0xBBu8; 65536];
+        let meta = |etag: &str| crate::cache_types::ObjectMetadata {
+            etag: etag.to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 65536,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 65536,
+            ..Default::default()
+        };
+        let ttl = Duration::from_secs(3600);
+        let fill_x = mgr_p1
+            .prepare_range_store(key, 0, 65535, &x, meta("\"X\""), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: fill x is prepared");
+        // Without the seam, the two temps' mtimes are kept apart by more than the 1 ms window.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let fill_y = mgr_p2
+            .prepare_range_store(key, 0, 65535, &y, meta("\"Y\""), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: fill y is prepared");
+        fill_x.finish().await.expect("fill x publishes");
+        let bin = mgr_p1.get_new_range_file_path(key, 0, 65535);
+        let x_mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&bin).expect("fill x's .bin is published"),
+        );
+        fill_y.finish().await.expect("fill y's finish returns Ok");
+        if equalise_mtime {
+            filetime::set_file_mtime(&bin, x_mtime).unwrap();
+        }
+        let p2_journal = dir
+            .join("metadata")
+            .join("_journals")
+            .join("journal-p2.journal");
+        let aside = dir.join("journal-p2.journal.aside");
+        let p2_journalled = p2_journal.exists();
+        if p2_journalled {
+            std::fs::rename(&p2_journal, &aside).unwrap();
+        }
+        let consolidator = crate::journal_consolidator::JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(crate::journal_manager::JournalManager::new(
+                dir.to_path_buf(),
+                "journal-consolidator".to_string(),
+            )),
+            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            crate::journal_consolidator::ConsolidationConfig::default(),
+        );
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the creating pass");
+        if p2_journalled {
+            std::fs::rename(&aside, &p2_journal).unwrap();
+        }
+        let first = cold_key_read_listing(&mgr_p1, key).await;
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the full pass");
+        let second = cold_key_read_listing(&mgr_p1, key).await;
+        println!(
+            "fixture (equalise_mtime={equalise_mtime}, p2 journalled={p2_journalled}): \
+             after the creating pass: {first}; after a full pass: {second}"
+        );
+        (first, second)
+    }
+
+    /// On a cold key, a second proxy's fill of another version must not replace a
+    /// file whose journal `Add` is pending, or a `.meta` built from the first `Add` alone lists
+    /// X's ETag and identity over Y's bytes, and equal lengths with mtimes in one granule pass
+    /// the identity check. Red on 3.0.0 and before the cold-key check.
+    #[tokio::test]
+    async fn a_cold_key_fill_does_not_replace_a_pending_fill_of_another_version() {
+        let (first, second) = cold_key_race_listings(true).await;
+        for (when, read) in [("the creating pass", &first), ("a full pass", &second)] {
+            assert!(
+                !read.contains("of 0xbb"),
+                "AFTER {when} THE .meta NAMES X AND THE CHECKED READ SERVES Y'S BYTES: \
+                 {read}"
+            );
+        }
+    }
+
+    /// Control: the same race with the two files' mtimes more than 1 ms apart. The
+    /// identity check refuses the X listing over Y's file today; with the cold-key check the
+    /// second fill is dropped and X is served. Never Y's bytes.
+    #[tokio::test]
+    async fn a_cold_key_race_with_distinct_mtimes_never_serves_the_other_version() {
+        let (first, second) = cold_key_race_listings(false).await;
+        for (when, read) in [("the creating pass", &first), ("a full pass", &second)] {
+            assert!(
+                !read.contains("of 0xbb"),
+                "control: after {when} the checked read served Y's bytes: {read}"
+            );
+        }
+    }
+
+    /// A file left at the final path longer ago than the orphan rotation's
+    /// publish window, with no `.meta`, is a leftover, and a fill replaces it, so the key is not
+    /// left unfillable. Red side: the age clause removed, so any existing file drops the fill.
+    #[tokio::test]
+    async fn a_cold_key_fill_replaces_a_leftover_file_older_than_the_publish_window() {
+        use std::io::Read;
+        let temp_dir = TempDir::new().unwrap();
+        let mut dc = hybrid_disk_cache(temp_dir.path());
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/leftover";
+        let bin = dc.get_new_range_file_path(key, 0, 1023);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"a leftover").unwrap();
+        // 700 s: past `orphan_reclaim`'s 600 s publish window.
+        let old = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(700),
+        );
+        filetime::set_file_mtime(&bin, old).unwrap();
+        let fill = dc
+            .prepare_range_store(
+                key,
+                0,
+                1023,
+                &[7u8; 1024],
+                object_metadata_a(),
+                Duration::from_secs(3600),
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the fill is prepared");
+        fill.finish().await.expect("the fill's finish returns Ok");
+        let published = std::fs::read(&bin).unwrap();
+        let mut decoded = Vec::new();
+        let _ = lz4_flex::frame::FrameDecoder::new(&published[..]).read_to_end(&mut decoded);
+        assert!(
+            decoded == [7u8; 1024],
+            "A LEFTOVER OLDER THAN THE PUBLISH WINDOW BLOCKED THE FILL: the final \
+             path holds {} bytes ({:?}...)",
+            published.len(),
+            &published[..published.len().min(10)]
+        );
+    }
+
+    /// Two fills of one version on a cold key. The second finds the first's
+    /// recent file at the final path and is dropped, and the first's file is the one that
+    /// serves after consolidation. Red side: the cold-key check removed, so the second renames
+    /// over the first (another inode at the final path).
+    #[tokio::test]
+    async fn a_second_same_version_fill_on_a_cold_key_is_dropped_and_the_first_serves() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut dc = hybrid_disk_cache(dir);
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/same-version";
+        let ttl = Duration::from_secs(3600);
+        let first = dc
+            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: the first fill is prepared");
+        let second = dc
+            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: the second fill is prepared");
+        first.finish().await.expect("the first fill publishes");
+        let bin = dc.get_new_range_file_path(key, 0, 1023);
+        let first_ino = std::fs::metadata(&bin)
+            .expect("the first fill's .bin")
+            .ino();
+        second
+            .finish()
+            .await
+            .expect("the second fill's finish returns Ok");
+        let after_ino = std::fs::metadata(&bin)
+            .expect("a .bin at the final path")
+            .ino();
+        assert_eq!(
+            after_ino, first_ino,
+            "THE SECOND FILL ON A COLD KEY RENAMED OVER THE FIRST'S PENDING FILE"
+        );
+        let consolidator = crate::journal_consolidator::JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(crate::journal_manager::JournalManager::new(
+                dir.to_path_buf(),
+                "journal-consolidator".to_string(),
+            )),
+            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            crate::journal_consolidator::ConsolidationConfig::default(),
+        );
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the pass");
+        let meta = dc
+            .get_metadata(key)
+            .await
+            .expect("the .meta reads")
+            .expect("the pass wrote a .meta");
+        let spec = meta
+            .ranges
+            .iter()
+            .find(|r| r.start == 0 && r.end == 1023)
+            .cloned()
+            .expect("the .meta lists 0-1023");
+        let served = dc.load_range_data(&spec).await;
+        assert!(
+            served.as_ref().is_ok_and(|v| v[..] == [5u8; 1024][..]),
+            "the first fill's file must serve: {:?}",
+            served.as_ref().map(|v| v.len())
+        );
+    }
+
+    /// The cold-key check fails closed. A first fill's recent file sits at the final
+    /// path; the open of that path then fails with a non-`NotFound` error (as `EMFILE` would).
+    /// The second fill is dropped and the first's file is unchanged. Red side: the open error
+    /// read as "no file", so the second fill renames over the first (another inode).
+    #[tokio::test]
+    async fn a_cold_key_fill_is_dropped_when_the_final_file_cannot_be_opened() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut dc = hybrid_disk_cache(dir);
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/open-fails";
+        let ttl = Duration::from_secs(3600);
+        let first = dc
+            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: the first fill is prepared");
+        let second = dc
+            .prepare_range_store(key, 0, 1023, &[6u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: the second fill is prepared");
+        first.finish().await.expect("the first fill publishes");
+        let bin = dc.get_new_range_file_path(key, 0, 1023);
+        let first_ino = std::fs::metadata(&bin).expect("the first .bin").ino();
+        let first_bytes = std::fs::read(&bin).expect("the first .bin reads");
+        open_failure_seam::fail_for(&bin);
+        second
+            .finish()
+            .await
+            .expect("the second fill's finish returns Ok");
+        let after = std::fs::metadata(&bin).expect("a .bin at the final path");
+        assert_eq!(
+            after.ino(),
+            first_ino,
+            "A NON-NOTFOUND OPEN ERROR WAS READ AS NO FILE AND THE FILL RENAMED OVER IT"
+        );
+        assert_eq!(
+            std::fs::read(&bin).unwrap(),
+            first_bytes,
+            "the first fill's bytes must be unchanged"
+        );
+    }
+
+    /// The cold-key check's drop direction. On a cold key whose write-order marker exists and
+    /// is OLDER than the first fill's file (as a production fill's witness capture leaves it:
+    /// the marker is created before the fill's S3 request, so before its file), a second fill
+    /// finds a recent file that does not predate the marker and is dropped. Red side:
+    /// `predates_write_marker` returning `true` whenever a marker exists, so the second fill
+    /// renames over the first's pending file (another inode at the final path).
+    #[tokio::test]
+    async fn a_cold_key_fill_is_dropped_when_the_write_marker_is_older_than_the_pending_file() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut dc = hybrid_disk_cache(dir);
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/marker-older";
+        let ttl = Duration::from_secs(3600);
+        let first = dc
+            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: the first fill is prepared");
+        let second = dc
+            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: the second fill is prepared");
+        first.finish().await.expect("the first fill publishes");
+        let bin = dc.get_new_range_file_path(key, 0, 1023);
+        let first_meta = std::fs::metadata(&bin).expect("the first fill's .bin");
+        let first_ino = first_meta.ino();
+        // The marker, written 30 s before the first fill's file.
+        let marker = crate::cache::write_marker_path(&dc.get_new_metadata_file_path(key));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(
+            &marker,
+            serde_json::to_string(&crate::cache::WriteMarker {
+                token: "marker-token".to_string(),
+                cache_key: key.to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let older = filetime::FileTime::from_system_time(
+            first_meta.modified().unwrap() - Duration::from_secs(30),
+        );
+        filetime::set_file_mtime(&marker, older).unwrap();
+        second
+            .finish()
+            .await
+            .expect("the second fill's finish returns Ok");
+        let after_ino = std::fs::metadata(&bin)
+            .expect("a .bin at the final path")
+            .ino();
+        assert_eq!(
+            after_ino, first_ino,
+            "A FILL WRITTEN AFTER THE WRITE MARKER WAS TREATED AS SUPERSEDED AND \
+             RENAMED OVER THE FIRST FILL'S PENDING PUBLISH"
+        );
+    }
+
+    /// R10.1: each buffered fill stages under its own temp name, which the dead-instance reaper
+    /// reads as this process's, beside its final `.bin`.
+    #[tokio::test]
+    async fn each_buffered_fill_stages_under_its_own_name_the_reaper_parses() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut dc = hybrid_disk_cache(temp_dir.path());
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/r10-names";
+        let host = gethostname::gethostname()
+            .to_string_lossy()
+            .replace(['/', '\\'], "_");
+        let ttl = Duration::from_secs(3600);
+        let a = dc
+            .prepare_range_store(key, 0, 1023, &[1u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: fill a is prepared");
+        let b = dc
+            .prepare_range_store(key, 0, 1023, &[2u8; 1024], object_metadata_a(), ttl, false)
+            .await
+            .unwrap()
+            .expect("fixture: fill b is prepared");
+        let (ta, tb) = (a.pending.tmp_path.clone(), b.pending.tmp_path.clone());
+        assert_ne!(
+            ta, tb,
+            "R10.1: two fills of one range share the temp file {ta:?}"
+        );
+        for tmp in [&ta, &tb] {
+            assert!(tmp.is_file(), "the temp {tmp:?} is written");
+            assert_eq!(tmp.parent(), a.pending.final_path.parent());
+            let name = tmp.file_name().unwrap().to_string_lossy().to_string();
+            assert_eq!(
+                crate::journal_consolidator::dead_instance_range_temp_owner(
+                    &name,
+                    std::slice::from_ref(&host)
+                ),
+                Some(std::process::id()),
+                "the range reaper's matcher must name this process as the owner of {name:?}"
+            );
+        }
+        drop((a, b));
+        assert!(
+            !ta.exists() && !tb.exists(),
+            "dropped fills remove their temps"
+        );
+    }
+
+    /// R10.2: a fill whose temp file was replaced before the publish (the same bytes and
+    /// modification time, another inode) publishes nothing. Red side: the re-check removed.
+    #[tokio::test]
+    async fn a_fill_whose_temp_was_replaced_publishes_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut dc = hybrid_disk_cache(temp_dir.path());
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/r10-replaced";
+        let fill = dc
+            .prepare_range_store(
+                key,
+                0,
+                1023,
+                &[3u8; 1024],
+                object_metadata_a(),
+                Duration::from_secs(3600),
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the fill is prepared");
+        let tmp = fill.pending.tmp_path.clone();
+        let bytes = std::fs::read(&tmp).unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&tmp).unwrap());
+        // Written while the original still exists, so the replacement has another inode.
+        let replacement = tmp.with_extension("replacement");
+        std::fs::write(&replacement, &bytes).unwrap();
+        filetime::set_file_mtime(&replacement, mtime).unwrap();
+        std::fs::rename(&replacement, &tmp).unwrap();
+        fill.finish().await.expect("a dropped fill is not an error");
+        assert!(
+            !dc.get_new_range_file_path(key, 0, 1023).exists(),
+            "R10.2: A FILL PUBLISHED A TEMP FILE IT DID NOT WRITE (same bytes and mtime, another \
+             inode)"
+        );
+    }
+
+    /// R10.2 for the streamed fill: a temp file replaced before the publish (the same bytes and
+    /// modification time, another inode) publishes nothing.
+    #[tokio::test]
+    async fn a_streamed_fill_whose_temp_was_replaced_publishes_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let dc = hybrid_disk_cache(temp_dir.path());
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/r10-streamed-replaced";
+        let mut writer = dc
+            .begin_incremental_range_write(key, 0, 1023, true)
+            .await
+            .unwrap()
+            .expect("the capacity guard admits with an unconfigured floor");
+        DiskCacheManager::write_range_chunk(&mut writer, &[3u8; 1024]).unwrap();
+        let tmp = writer.tmp_path.clone();
+        let fill = dc
+            .prepare_incremental_commit(writer, object_metadata_a(), Duration::from_secs(3600))
+            .expect("fixture: the fill is prepared");
+        let bytes = std::fs::read(&tmp).unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&tmp).unwrap());
+        // Written while the original still exists, so the replacement has another inode.
+        let replacement = tmp.with_extension("replacement");
+        std::fs::write(&replacement, &bytes).unwrap();
+        filetime::set_file_mtime(&replacement, mtime).unwrap();
+        std::fs::rename(&replacement, &tmp).unwrap();
+        fill.finish().await.expect("a dropped fill is not an error");
+        assert!(
+            !dc.get_new_range_file_path(key, 0, 1023).exists(),
+            "R10.2: A STREAMED FILL PUBLISHED A TEMP FILE IT DID NOT WRITE (same bytes and mtime, \
+             another inode)"
+        );
+    }
     /// U2: a journal-only fill holds the key's slot lock from the `.bin` rename through
     /// its journal append. A probe taken in between (the fill paused just before the append)
     /// must fail to acquire; otherwise a slot holder can see a `.bin` that no journal line or
@@ -12718,8 +13888,10 @@ mod tests {
         let name = |e: &publish_sync_probe::SyncEvent| {
             e.path.file_name().unwrap().to_string_lossy().to_string()
         };
+        let bin_stem = bin_name.trim_end_matches(".bin");
         assert!(
-            name(&events[0]).starts_with(&format!("{bin_name}.tmp")),
+            name(&events[0]).starts_with(&format!("{bin_stem}."))
+                && name(&events[0]).contains(".tmp."),
             "the .bin temp is synced first, got {:?}",
             events[0].path
         );
@@ -20620,16 +21792,17 @@ mod range_temp_name_tests {
         assert!(final_a.is_file(), "the range must be published");
         assert!(old_a.is_dir(), "the old-name entry is untouched");
 
-        // New name occupied by a directory: the writer must be using exactly that name.
+        // The shared instance-scoped name 3.0.0's whole-buffer writers used, occupied by a
+        // directory: each fill now stages under its own per-fill name (R10.1), so it publishes.
         let key_b = "scn2-bucket/range-b";
         let final_b = dc.get_new_range_file_path(key_b, 0, 1023);
-        let new_b = crate::cache::instance_scoped_range_tmp_path(&final_b, None);
-        assert!(new_b
+        let shared_b = crate::cache::instance_scoped_range_tmp_path(&final_b, None);
+        assert!(shared_b
             .file_name()
             .unwrap()
             .to_string_lossy()
             .ends_with(&format!(".bin.tmp.{}.{}", my_host(), std::process::id())));
-        std::fs::create_dir_all(&new_b).unwrap();
+        std::fs::create_dir_all(&shared_b).unwrap();
         let result = dc
             .store_range(
                 key_b,
@@ -20641,11 +21814,9 @@ mod range_temp_name_tests {
                 false,
             )
             .await;
-        assert!(
-            result.is_err(),
-            "store_range must stage under {new_b:?}; with that name blocked it cannot succeed"
-        );
-        assert!(!final_b.exists());
+        result.expect("store_range must stage under a per-fill name, not the shared one (R10.1)");
+        assert!(final_b.is_file(), "the range must be published");
+        assert!(shared_b.is_dir(), "the shared-name entry is untouched");
     }
 }
 /// The signed-range fill's store as production runs it (moved from
@@ -20826,5 +21997,197 @@ mod streamed_fstat_failure_tests {
             path.exists(),
             "a failed fstat healed the range: it says nothing about which file it is"
         );
+    }
+}
+#[cfg(test)]
+mod identity_less_fill_publish_tests {
+    //! R12.2: a fill whose file identity cannot be taken publishes nothing and journals
+    //! nothing, so no `Add` with no `file_identity` reaches a journal from this build.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn hybrid_disk_cache(dir: &std::path::Path) -> DiskCacheManager {
+        std::fs::create_dir_all(dir.join("metadata").join("_journals")).unwrap();
+        let mut dc = DiskCacheManager::new(dir.to_path_buf(), true, 1024, false, 1_048_576);
+        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
+            dir.to_path_buf(),
+            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            Arc::new(crate::journal_manager::JournalManager::new(
+                dir.to_path_buf(),
+                "r12-instance".to_string(),
+            )),
+            Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
+                1024 * 1024,
+                100,
+            )),
+        );
+        dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
+        dc
+    }
+
+    fn object_metadata() -> crate::cache_types::ObjectMetadata {
+        crate::cache_types::ObjectMetadata {
+            etag: "\"r12\"".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 4096,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 4096,
+            ..Default::default()
+        }
+    }
+
+    fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(files_under(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    async fn assert_nothing_published(dc: &DiskCacheManager, dir: &std::path::Path, key: &str) {
+        let pending = dc.find_pending_journal_ranges(key, 0, 4095).await.unwrap();
+        let files = files_under(&dir.join("ranges"));
+        assert!(
+            pending.is_empty() && files.is_empty(),
+            "IDENTITY-LESS FILL PUBLISHED: {} journal Add(s) pending (identities {:?}), files \
+             under ranges/ {:?}",
+            pending.len(),
+            pending.iter().map(|r| r.file_identity).collect::<Vec<_>>(),
+            files
+        );
+    }
+
+    /// `PreparedRangeFill` (the buffered fill).
+    #[tokio::test]
+    async fn a_buffered_fill_whose_identity_fails_publishes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let mut dc = hybrid_disk_cache(temp.path());
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/r12-buffered";
+        fstat_failure_seam::fail_identity_for(&dc.get_new_range_file_path(key, 0, 4095));
+        let _ = dc
+            .store_range(
+                key,
+                0,
+                4095,
+                &[0x5au8; 4096],
+                object_metadata(),
+                Duration::from_secs(3600),
+                true,
+            )
+            .await;
+        assert_nothing_published(&dc, temp.path(), key).await;
+    }
+
+    /// `commit_incremental_range` (the streamed fill).
+    #[tokio::test]
+    async fn an_incremental_fill_whose_identity_fails_publishes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let dc = hybrid_disk_cache(temp.path());
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/r12-incremental";
+        fstat_failure_seam::fail_identity_for(&dc.get_new_range_file_path(key, 0, 4095));
+        let mut writer = dc
+            .begin_incremental_range_write(key, 0, 4095, true)
+            .await
+            .unwrap()
+            .expect("the capacity guard admits with an unconfigured floor");
+        DiskCacheManager::write_range_chunk(&mut writer, &[0x5au8; 4096]).unwrap();
+        let result = dc
+            .commit_incremental_range(writer, object_metadata(), Duration::from_secs(3600))
+            .await;
+        // The streamed write-through callers skip their own log line for
+        // this error, so it must reach them recognisable.
+        assert!(
+            result.as_ref().is_err_and(is_identity_unavailable_error),
+            "a streamed fill's identity failure must reach its caller as \
+             is_identity_unavailable_error, got {:?}",
+            result
+        );
+        assert_nothing_published(&dc, temp.path(), key).await;
+    }
+    /// A buffered fill whose identity fails logs it once, at `warn!`, with
+    /// the key and the temp file's path, and `store_range` does not also log a failed write.
+    /// Red side: `store_range` logging the identity error as a failed write, as before.
+    #[tokio::test]
+    async fn an_identity_failure_logs_one_warning_with_key_and_path() {
+        #[derive(Clone)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // A second dispatcher kept registered, so a callsite another thread reached first with
+        // no subscriber is not cached as never interesting (`journal_consolidator`'s capture).
+        static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ANCHOR.get_or_init(|| {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+        });
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Buffer(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let temp = TempDir::new().unwrap();
+        let mut dc = hybrid_disk_cache(temp.path());
+        dc.initialize().await.unwrap();
+        let key = "test-bucket/r12-logged-once";
+        fstat_failure_seam::fail_identity_for(&dc.get_new_range_file_path(key, 0, 4095));
+        let result = dc
+            .store_range(
+                key,
+                0,
+                4095,
+                &[0x5au8; 4096],
+                object_metadata(),
+                Duration::from_secs(3600),
+                true,
+            )
+            .await;
+        drop(guard);
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(result.is_err(), "the fill must not be published");
+        let about_identity: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("could not be taken"))
+            .collect();
+        assert!(
+            !log.contains("Failed to write range tmp file"),
+            "THE IDENTITY FAILURE WAS ALSO LOGGED AS A FAILED WRITE:\n{}",
+            log
+        );
+        assert!(
+            about_identity.len() == 1
+                && about_identity[0].contains("WARN")
+                && about_identity[0].contains(&format!("key={}", key))
+                && about_identity[0].contains("path="),
+            "an identity failure must log one warning with the key and the path:\n{}",
+            log
+        );
+        println!("{}", about_identity[0]);
     }
 }

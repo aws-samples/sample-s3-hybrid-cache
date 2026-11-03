@@ -686,7 +686,8 @@ async fn part_get_populated_entry_is_not_flagged_as_poisoned() {
         ("content-length".to_string(), "1024".to_string()),
         ("content-range".to_string(), "bytes 0-1023/4096".to_string()),
         ("x-amz-mp-parts-count".to_string(), "4".to_string()),
-        ("etag".to_string(), "\"part-etag\"".to_string()),
+        // The planted entry's version: a part of another version records no layout (R11.5).
+        ("etag".to_string(), "\"whole-object-etag-10\"".to_string()),
         (
             "content-type".to_string(),
             "application/octet-stream".to_string(),

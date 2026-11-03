@@ -491,14 +491,27 @@ async fn test_full_consolidation_cycle_with_size_tracking() {
         "test-instance",
     );
 
-    // Write journal entries
-    write_journal_entry(&cache_dir, &entry1).await;
-    write_journal_entry(&cache_dir, &entry2).await;
-
     // Create corresponding range files (required for validation)
     create_range_file(&cache_dir, cache_key, 0, 999, 1000).await;
     create_range_file(&cache_dir, cache_key, 1000, 1999, 1000).await;
-
+    // Each Add records the identity of the range file it names (R12.1: an Add with none is
+    // retired, not folded).
+    let identity_of = |start: u64, end: u64| {
+        let path = s3_proxy::disk_cache::get_sharded_path(
+            &cache_dir.join("ranges"),
+            cache_key,
+            &format!("_{}-{}.bin", start, end),
+        )
+        .unwrap();
+        s3_proxy::cache_types::RangeFileIdentity::of(&std::fs::metadata(&path).unwrap())
+    };
+    let mut entry1 = entry1;
+    entry1.range_spec.file_identity = identity_of(0, 999);
+    let mut entry2 = entry2;
+    entry2.range_spec.file_identity = identity_of(1000, 1999);
+    // Write journal entries
+    write_journal_entry(&cache_dir, &entry1).await;
+    write_journal_entry(&cache_dir, &entry2).await;
     // Run consolidation cycle - this flushes the accumulator and applies deltas
     let result = consolidator.run_consolidation_cycle().await.unwrap();
 

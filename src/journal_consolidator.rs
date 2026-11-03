@@ -8,7 +8,7 @@
 //! for cache size, calculating size deltas from journal entries during consolidation.
 
 use crate::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
-use crate::journal_manager::{JournalEntry, JournalManager, JournalOperation};
+use crate::journal_manager::{JournalEntry, JournalManager, JournalOperation, KeyLines};
 use crate::metadata_lock_manager::MetadataLockManager;
 use crate::{ProxyError, Result};
 use futures::stream::{self, StreamExt};
@@ -72,15 +72,16 @@ const LEDGER_COMPACTION_INTERVAL_SECS: u64 = 300;
 /// [`LEDGER_COMPACTION_INTERVAL_SECS`] would.
 const LEDGER_COMPACTION_RESUME_SECS: u64 = 60;
 
-/// Result of journal discovery, including per-file entry counts for optimized cleanup.
+/// Result of journal discovery: the per-key line index and the journal files discovery read.
 ///
-/// During discovery, every journal file is read and parsed to build the key index.
-/// We also count total entries per file so that cleanup can skip re-reading files
-/// where all entries were consolidated (delete/truncate without re-parsing).
+/// Discovery reads every journal file a line at a time to build the key index and counts each
+/// file's parseable entries. Cleanup uses `file_entry_counts` for membership only (which files
+/// discovery saw); no production code reads a count's value, and cleanup reads every file it
+/// processes in full whatever the count.
 #[derive(Debug, Clone)]
 pub struct DiscoveryResult {
-    /// cache_key → list of journal file paths containing entries for that key
-    pub key_index: HashMap<String, Vec<PathBuf>>,
+    /// cache_key → the files and line spans holding entries for that key
+    pub key_index: HashMap<String, KeyLines>,
     /// journal file path → total number of parseable entries in that file at discovery time
     pub file_entry_counts: HashMap<PathBuf, usize>,
 }
@@ -156,6 +157,16 @@ static JOURNAL_VALIDATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// `atomic_metadata.journal_validation_failures`. See [`JOURNAL_VALIDATION_FAILURES`].
 pub(crate) fn journal_validation_failures() -> u64 {
     JOURNAL_VALIDATION_FAILURES.load(Ordering::Relaxed)
+}
+/// Range files unlinked because the identity-less journal `Add` that wrote them was retired
+/// ([`JournalConsolidator::unlink_retired_fill_files`]). Published as
+/// `atomic_metadata.retired_fill_files_unlinked`. Per-instance, monotone since process start; it
+/// rises while a cache volume a 2.x release populated is retired.
+static RETIRED_FILL_FILES_UNLINKED: AtomicU64 = AtomicU64::new(0);
+/// `atomic_metadata.retired_fill_files_unlinked`. See [`RETIRED_FILL_FILES_UNLINKED`].
+#[doc(hidden)]
+pub fn retired_fill_files_unlinked() -> u64 {
+    RETIRED_FILL_FILES_UNLINKED.load(Ordering::Relaxed)
 }
 /// Minimum interval between WARNs about retained unparseable journal lines.
 const UNPARSEABLE_WARN_INTERVAL_SECS: u64 = 300;
@@ -2081,10 +2092,13 @@ pub(crate) fn reap_dead_instance_temps(
 
 /// `Some(pid)` if `name` is a range temp this host's `{pid}` staged under `ranges/`:
 ///
-/// - family D, `{key}_{s}-{e}.bin.tmp.{host}.{pid}` (`store_range`, multipart completion, the
-///   full-object GET store);
-/// - family E1, `{key}_{s}-{e}.{rand:08x}.tmp.{host}.{pid}` (`begin_incremental_range_write`,
-///   the streamed GET-miss fill and write-cache sink).
+/// - family D, `{key}_{s}-{e}.bin.tmp.{host}.{pid}`, the shared name 3.0.0's whole-buffer range
+///   writers used (`store_range`, multipart completion, the full-object GET store). No 3.0.1
+///   writer creates it; it is matched so a dead 3.0.0 process's leftovers are still reaped;
+/// - family E1, `{key}_{s}-{e}.{rand:08x}.tmp.{host}.{pid}`, every range writer since 3.0.1
+///   (R10.1): `begin_incremental_range_write` (the streamed GET-miss fill and write-cache sink),
+///   `prepare_range_store` (`store_range` and the part store), the full-object GET store and
+///   multipart completion.
 ///
 /// Both are built by `cache::instance_scoped_range_tmp_path`. The earlier names
 /// (`{key}_{s}-{e}.bin.tmp`, `{stem}.{rand}.tmp`) carry no host or pid and never match, so a peer
@@ -2557,14 +2571,48 @@ pub(crate) const FOREIGN_JOURNAL_REAP_GRACE: Duration = Duration::from_secs(24 *
 /// no complete (newline-terminated) non-blank line, and at most one trailing unterminated
 /// fragment that does not parse as a [`JournalEntry`], i.e. a torn tail. A complete line this
 /// build cannot parse is kept: it may be a newer build's entry.
-fn foreign_journal_is_reapable(content: &[u8]) -> bool {
-    let mut segments = content.split(|&b| b == b'\n');
-    let tail = segments.next_back().unwrap_or(&[]);
-    if segments.any(|line| !line.trim_ascii().is_empty()) {
-        return false;
+fn foreign_journal_is_reapable(mut reader: impl std::io::BufRead) -> std::io::Result<(bool, u64)> {
+    // Read a line at a time and stop at the first complete non-blank line: a journal holding
+    // anything to apply is decided by its first line, not its whole length. Returns the
+    // verdict and, when reapable, the bytes read, which is then the whole file.
+    let mut buf = Vec::new();
+    let mut bytes = 0u64;
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        bytes += read as u64;
+        if buf.last() != Some(&b'\n') {
+            // The final segment, after the last newline (empty at a newline-terminated end).
+            let tail = buf.trim_ascii();
+            return Ok((
+                tail.is_empty() || serde_json::from_slice::<JournalEntry>(tail).is_err(),
+                bytes,
+            ));
+        }
+        if !buf.trim_ascii().is_empty() {
+            return Ok((false, bytes));
+        }
     }
-    let tail = tail.trim_ascii();
-    tail.is_empty() || serde_json::from_slice::<JournalEntry>(tail).is_err()
+}
+
+/// The bytes in a journal and its complete (newline-terminated) non-blank lines, read a line at
+/// a time; a final segment without a newline is not counted.
+fn count_journal_lines(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    let mut buf = Vec::new();
+    let (mut bytes, mut lines) = (0u64, 0u64);
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            return Ok((bytes, lines));
+        }
+        bytes += read as u64;
+        if buf.last() == Some(&b'\n') && !buf.trim_ascii().is_empty() {
+            lines += 1;
+        }
+    }
 }
 
 /// Release an `flock` explicitly before the descriptor closes.
@@ -2595,6 +2643,438 @@ impl Drop for UnlockOnDrop {
     }
 }
 
+/// Discovery's pass over `journals_dir`, run on the blocking pool by
+/// [`JournalConsolidator::discover_pending_cache_keys_indexed_capped`].
+///
+/// Each journal is read a line at a time, so discovery holds one line of journal bytes where it
+/// held a whole journal. Every line is parsed as a full [`JournalEntry`], as before, so
+/// `file_entry_counts` still counts only lines this build parses (R2.5). A line that is not
+/// valid UTF-8 is skipped like an unparseable one; the whole-file read skipped the file.
+///
+/// For each indexed key it records where each of its lines is ([`KeyLines`]), so the key's read
+/// under its lock reads those lines and no others. Once `max_keys` keys are indexed it adds no
+/// more keys but reads the current file to its end, recording the indexed keys' later lines in
+/// it (the whole-file per-key read found them), and then opens no further file. That file's
+/// `file_entry_counts` is complete where it was partial; cleanup reads only whether a file is
+/// in the map, and a file in which the cap is reached was already in it.
+fn discover_journal_keys_blocking(journals_dir: &Path, max_keys: usize) -> Result<DiscoveryResult> {
+    use std::io::BufRead;
+
+    let mut index: HashMap<String, KeyLines> = HashMap::new();
+    // file path → total parseable entry count (for optimized cleanup)
+    let mut file_entry_counts: HashMap<PathBuf, usize> = HashMap::new();
+
+    let journal_entries = std::fs::read_dir(journals_dir)
+        .map_err(|e| ProxyError::CacheError(format!("Failed to read journals directory: {}", e)))?;
+
+    let mut buf = Vec::new();
+    for journal_entry in journal_entries {
+        // Early exit: stop reading more journal files once we have enough keys
+        if max_keys > 0 && index.len() >= max_keys {
+            debug!(
+                "Discovery cap reached ({} keys), skipping remaining journal files",
+                max_keys
+            );
+            break;
+        }
+
+        let journal_entry = journal_entry.map_err(|e| {
+            ProxyError::CacheError(format!("Failed to read journal directory entry: {}", e))
+        })?;
+
+        let journal_path = journal_entry.path();
+
+        if !journal_path.is_file() {
+            continue;
+        }
+
+        let file_name = match journal_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        if !file_name.ends_with(".journal") {
+            continue;
+        }
+
+        let opened =
+            std::fs::File::open(&journal_path).and_then(|f| f.metadata().map(|md| (f, md)));
+        let (file, metadata) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                debug!(
+                    "Failed to read journal file (discover_pending): file={:?}, error={}",
+                    journal_path, e
+                );
+                continue;
+            }
+        };
+        let identity = crate::journal_manager::file_identity(&metadata);
+        let len_at_discovery = metadata.len();
+        let shared_path: Arc<Path> = Arc::from(journal_path.as_path());
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+        let mut entry_count: usize = 0;
+        let mut offset: u64 = 0;
+        loop {
+            buf.clear();
+            let read = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n as u64,
+                Err(e) => {
+                    debug!(
+                        "Failed to read journal file (discover_pending): file={:?}, error={}",
+                        journal_path, e
+                    );
+                    break;
+                }
+            };
+            let span = (offset, read);
+            offset += read;
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                debug!(
+                    "Skipping journal line that is not UTF-8: file={:?}",
+                    journal_path
+                );
+                continue;
+            };
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<JournalEntry>(line) {
+                Ok(entry) => {
+                    entry_count += 1;
+                    if let Some(key_lines) = index.get_mut(&entry.cache_key) {
+                        key_lines.record(&shared_path, identity, len_at_discovery, span);
+                    } else if max_keys == 0 || index.len() < max_keys {
+                        let mut key_lines = KeyLines::default();
+                        key_lines.record(&shared_path, identity, len_at_discovery, span);
+                        index.insert(entry.cache_key, key_lines);
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to parse journal entry: file={:?}, error={}",
+                        journal_path, e
+                    );
+                }
+            }
+        }
+        if entry_count > 0 {
+            file_entry_counts.insert(journal_path, entry_count);
+        }
+    }
+
+    debug!(
+        "Discovered {} cache keys with pending journal entries across {} journal files",
+        index.len(),
+        file_entry_counts.len()
+    );
+    Ok(DiscoveryResult {
+        key_index: index,
+        file_entry_counts,
+    })
+}
+
+/// What [`cleanup_journals_blocking`] did, for the cycle's log line.
+#[derive(Debug, Default)]
+struct JournalCleanupCounts {
+    files_deleted: u32,
+    files_truncated: u32,
+    files_rewritten: u32,
+    files_skipped: u32,
+    retained_unparseable: u64,
+}
+
+/// Pass 1's result for one journal: the open file, the (offset, length without the newline)
+/// of each kept line in file order, the lines removed and the unparseable lines kept.
+struct ScannedJournal {
+    file: std::fs::File,
+    kept: Vec<(u64, u64)>,
+    removed: usize,
+    unparseable: u64,
+}
+
+/// The identity cleanup matches an applied entry by: (cache_key, range start, range end,
+/// timestamp, instance_id).
+type AppliedEntryKey = (String, u64, u64, SystemTime, String);
+
+/// The body of [`JournalConsolidator::cleanup_consolidated_entries`], on a blocking thread.
+///
+/// Each journal is read twice under its lock, a line at a time, holding only the positions of
+/// the lines it keeps: pass 1 decides each line, and pass 2, needed only for a partial rewrite,
+/// copies the kept lines' bytes into the `.journal.tmp`. The lock is held across both passes
+/// and appenders write only under it, so the file cannot change between them.
+fn cleanup_journals_blocking(
+    journals_dir: &Path,
+    consolidated_set: &HashSet<AppliedEntryKey>,
+    discovered: Option<&HashSet<PathBuf>>,
+) -> Result<JournalCleanupCounts> {
+    let journal_files = std::fs::read_dir(journals_dir)
+        .map_err(|e| ProxyError::CacheError(format!("Failed to read journals directory: {}", e)))?;
+
+    let mut counts = JournalCleanupCounts::default();
+    for journal_entry in journal_files {
+        let journal_entry = match journal_entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to read journal directory entry: {}", e);
+                continue;
+            }
+        };
+
+        let journal_path = journal_entry.path();
+
+        if !journal_path.is_file() {
+            continue;
+        }
+
+        let file_name = match journal_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if !file_name.ends_with(".journal") {
+            continue;
+        }
+
+        // Check if this file was seen during discovery. If it wasn't (e.g., created after
+        // discovery started), skip it — its entries weren't processed this cycle.
+        if discovered.is_some_and(|seen| !seen.contains(&journal_path)) {
+            counts.files_skipped += 1;
+            continue;
+        }
+
+        // Acquire file-level lock to prevent races with append operations
+        // Blocking, and re-validated against an unlink by `cleanup_stale_lock_files`;
+        // held until `_lock_file` drops at the end of this iteration.
+        let lock_path = journal_path.with_extension("journal.lock");
+        let _lock_file = match crate::journal_manager::lock_journal_lock_file(&lock_path, true) {
+            Ok(Some(f)) => UnlockOnDrop(f),
+            Ok(None) => {
+                warn!(
+                    "Journal lock file kept being unlinked, skipping cleanup: path={:?}",
+                    lock_path
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to acquire journal file lock for cleanup: path={:?}, error={}",
+                    lock_path, e
+                );
+                continue;
+            }
+        };
+
+        // Pass 1, while holding the lock. We must re-read because new entries may have been
+        // appended since discovery.
+        //
+        // Separate the lines this build parsed and applied (removed) from every other line
+        // (kept). Kept lines are carried VERBATIM, never re-serialized: a line this build cannot
+        // parse is typically a newer build's entry on a mixed-version fleet and is complete and
+        // unapplied, and a line this build parses may still carry a field it does not know,
+        // which serde ignores and a re-serialization would drop. An unterminated tail that does
+        // not parse is a torn write; it is kept too (the startup reaper owns removing a foreign
+        // file that holds nothing else) and is newline-terminated on rewrite, so the next append
+        // cannot glue onto it. A line that is not UTF-8 is kept like an unparseable one.
+        let scanned = (|| -> std::io::Result<ScannedJournal> {
+            use std::io::BufRead;
+            let file = std::fs::File::open(&journal_path)?;
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            let mut buf = Vec::new();
+            // (offset, length without the newline) of each kept line, in file order
+            let mut kept: Vec<(u64, u64)> = Vec::new();
+            let mut removed = 0usize;
+            let mut unparseable = 0u64;
+            let mut offset = 0u64;
+            loop {
+                buf.clear();
+                let read = reader.read_until(b'\n', &mut buf)?;
+                if read == 0 {
+                    break;
+                }
+                let start = offset;
+                offset += read as u64;
+                let terminated = buf.last() == Some(&b'\n');
+                let line = if terminated {
+                    &buf[..buf.len() - 1]
+                } else {
+                    &buf[..]
+                };
+                let parsed = match std::str::from_utf8(line) {
+                    Ok(text) if text.trim().is_empty() => continue,
+                    Ok(text) => {
+                        serde_json::from_str::<JournalEntry>(text).map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                match parsed {
+                    Ok(entry) => {
+                        let was_consolidated = consolidated_set.contains(&(
+                            entry.cache_key,
+                            entry.range_spec.start,
+                            entry.range_spec.end,
+                            entry.timestamp,
+                            entry.instance_id,
+                        ));
+                        if was_consolidated {
+                            removed += 1;
+                        } else {
+                            kept.push((start, line.len() as u64));
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Unparseable journal line kept during cleanup: path={:?}, terminated={}, error={}",
+                            journal_path, terminated, e
+                        );
+                        unparseable += 1;
+                        kept.push((start, line.len() as u64));
+                    }
+                }
+            }
+            Ok(ScannedJournal {
+                file: reader.into_inner(),
+                kept,
+                removed,
+                unparseable,
+            })
+        })();
+        let ScannedJournal {
+            file,
+            kept: kept_lines,
+            removed: removed_count,
+            unparseable,
+        } = match scanned {
+            Ok(scanned) => scanned,
+            Err(e) => {
+                info!(
+                    "Failed to read journal file for cleanup (likely already deleted): path={:?}, error={}",
+                    journal_path, e
+                );
+                continue;
+            }
+        };
+        counts.retained_unparseable += unparseable;
+
+        if removed_count == 0 {
+            // No entries to remove from this file — skip write
+            counts.files_skipped += 1;
+            continue;
+        }
+
+        let is_fresh_journal = crate::eviction_worklist::is_fresh_journal_name(&file_name);
+        if kept_lines.is_empty() {
+            // Every line was parsed and applied — delete or truncate without rewriting
+            if is_fresh_journal {
+                match std::fs::remove_file(&journal_path) {
+                    Ok(_) => {
+                        counts.files_deleted += 1;
+                        debug!(
+                            "Deleted fully-consolidated fresh journal: path={:?}, removed={}",
+                            journal_path, removed_count
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to delete fresh journal file: path={:?}, error={}",
+                            journal_path, e
+                        );
+                    }
+                }
+            } else {
+                // Truncate the primary journal in place and keep it, so its instance stays
+                // in the readiness roster. The journal's lock is held and appenders open by
+                // path and write only under it, so no append lands between the read above
+                // and this truncate. No `.journal.tmp` is created: a peer's orphan evidence
+                // reads one as indeterminate.
+                let truncate_result = (|| -> std::result::Result<(), String> {
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&journal_path)
+                        .map_err(|e| format!("Failed to open journal for truncation: {}", e))?;
+                    f.set_len(0)
+                        .map_err(|e| format!("Failed to truncate journal: {}", e))?;
+                    f.sync_all()
+                        .map_err(|e| format!("Failed to sync truncated journal: {}", e))?;
+                    Ok(())
+                })();
+
+                match truncate_result {
+                    Ok(()) => {
+                        counts.files_truncated += 1;
+                        debug!(
+                            "Truncated fully-consolidated primary journal (atomic): path={:?}, removed={}",
+                            journal_path, removed_count
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to truncate journal file: path={:?}, error={}",
+                            journal_path, e
+                        );
+                    }
+                }
+            }
+        } else {
+            // Partial consolidation, or applied lines beside unparseable ones — rewrite with
+            // the kept lines, byte for byte and in their original order, each newline-terminated
+            // (atomic). Pass 2 copies them from the file pass 1 read.
+            let tmp_path = journal_path.with_extension("journal.tmp");
+            let rewrite_result = (|| -> std::result::Result<(), String> {
+                use std::io::Write;
+                let tmp = std::fs::File::create(&tmp_path)
+                    .map_err(|e| format!("Failed to create tmp file for rewrite: {}", e))?;
+                let mut out = std::io::BufWriter::with_capacity(64 * 1024, tmp);
+                let mut line = Vec::new();
+                for &(offset, len) in &kept_lines {
+                    line.resize(len as usize, 0);
+                    crate::journal_manager::read_exact_at(&file, &mut line, offset)
+                        .map_err(|e| format!("Failed to read kept line for rewrite: {}", e))?;
+                    out.write_all(&line)
+                        .and_then(|()| out.write_all(b"\n"))
+                        .map_err(|e| format!("Failed to write tmp file for rewrite: {}", e))?;
+                }
+                let tmp = out
+                    .into_inner()
+                    .map_err(|e| format!("Failed to write tmp file for rewrite: {}", e))?;
+                tmp.sync_all()
+                    .map_err(|e| format!("Failed to sync_all tmp file for rewrite: {}", e))?;
+                std::fs::rename(&tmp_path, &journal_path)
+                    .map_err(|e| format!("Failed to rename tmp file for rewrite: {}", e))?;
+                Ok(())
+            })();
+
+            match rewrite_result {
+                Ok(()) => {
+                    counts.files_rewritten += 1;
+                    debug!(
+                        "Rewritten journal file (atomic): path={:?}, removed={}, remaining={}",
+                        journal_path,
+                        removed_count,
+                        kept_lines.len()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to write updated journal file: path={:?}, error={}",
+                        journal_path, e
+                    );
+                    // Attempt to remove .tmp file, but don't fail if removal fails
+                    if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+                        warn!(
+                            "Failed to remove tmp file after rewrite failure: path={:?}, error={}",
+                            tmp_path, cleanup_err
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(counts)
+}
+
 /// Reap one foreign-host journal if it is reapable, holding its append lock so no appender can
 /// write between the check and the unlink. Returns the bytes removed.
 fn reap_foreign_journal(path: &Path, now: SystemTime, grace: Duration) -> Option<u64> {
@@ -2611,14 +3091,16 @@ fn reap_foreign_journal(path: &Path, now: SystemTime, grace: Duration) -> Option
     if !idle {
         return None;
     }
-    let content = std::fs::read(path).ok()?;
-    if !foreign_journal_is_reapable(&content) {
+    let file = std::fs::File::open(path).ok()?;
+    let (reapable, bytes) =
+        foreign_journal_is_reapable(std::io::BufReader::with_capacity(64 * 1024, file)).ok()?;
+    if !reapable {
         return None;
     }
     // The lock file is left for `cleanup_stale_lock_files`: unlinking a lock another host may
     // be about to open would split the mutual exclusion across two inodes.
     match std::fs::remove_file(path) {
-        Ok(()) => Some(content.len() as u64),
+        Ok(()) => Some(bytes),
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!("Failed to remove foreign journal {:?}: {}", path, e);
@@ -2717,11 +3199,13 @@ fn reap_dead_own_host_journal(
     else {
         return DeadJournalReap::Kept;
     };
-    let Ok(content) = std::fs::read(path) else {
+    let reapability = std::fs::File::open(path).and_then(|file| {
+        foreign_journal_is_reapable(std::io::BufReader::with_capacity(64 * 1024, file))
+    });
+    let Ok((reapable, bytes)) = reapability else {
         return DeadJournalReap::Kept;
     };
-    let bytes = content.len() as u64;
-    let verdict = if foreign_journal_is_reapable(&content) {
+    let verdict = if reapable {
         DeadJournalReap::Empty(bytes)
     } else {
         // An mtime that cannot be read, or one in the future, reads as young: keep.
@@ -2731,9 +3215,10 @@ fn reap_dead_own_host_journal(
             .and_then(|m| now.duration_since(m).ok());
         match age {
             Some(age) if age > replay_max_age => {
-                let mut segments = content.split(|&b| b == b'\n');
-                segments.next_back();
-                let lines = segments.filter(|l| !l.trim_ascii().is_empty()).count() as u64;
+                // Counted only here: the second pass reads the whole journal.
+                let Ok((bytes, lines)) = count_journal_lines(path) else {
+                    return DeadJournalReap::Kept;
+                };
                 DeadJournalReap::Expired { bytes, lines, age }
             }
             _ => return DeadJournalReap::Kept,
@@ -2899,6 +3384,28 @@ fn nanos_since_epoch(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Whether folding `entry` would list a range whose file nothing can verify: a range fill
+/// (`Add` or `Update`, the only operations that put a `RangeSpec` into a `.meta`'s `ranges`;
+/// `Add` appends one, `Update` replaces the listing at the same offsets) that records no
+/// `file_identity`.
+///
+/// Every 2.x writer journals its fills with no identity, and so did a 3.0.0 writer whose
+/// `identity_after_close` failed. A listing with no identity is read unverified, so when another
+/// version's file has been renamed over the extent's path and that fill's own `Add` is not in
+/// the batch, folding this one serves the other version's bytes under this entry's ETag.
+/// Such an entry is retired: it neither creates a `.meta` nor lists a range into one, and is
+/// removed from the journal like an applied entry. The range is fetched again on its next read.
+///
+/// This is the one place the decision is made (R12.1). `cache.trust_unverified_ranges`
+/// (R13.2) turns it off: such an entry is folded, as 3.0.0 folded it.
+fn entry_lists_unverified_range(entry: &JournalEntry) -> bool {
+    matches!(
+        entry.operation,
+        JournalOperation::Add | JournalOperation::Update
+    ) && entry.range_spec.file_identity.is_none()
+        && !crate::disk_cache::trust_unverified_ranges()
 }
 
 /// Whether `entry` can be the source of a new `.meta` when none exists: an `Add` or `Update`
@@ -8496,8 +9003,8 @@ impl JournalConsolidator {
             .iter()
             .map(|cache_key| {
                 let cache_key = cache_key.clone();
-                // Clone the file list for this key from the index so the async block is 'static
-                let journal_files = key_index.get(&cache_key).cloned().unwrap_or_default();
+                // The lines discovery recorded for this key, borrowed from the index
+                let key_lines = key_index.get(&cache_key);
                 async move {
                     #[cfg(test)]
                     key_loop_park_hook::park(&self.cache_dir).await;
@@ -8505,7 +9012,7 @@ impl JournalConsolidator {
                     // consume the entire cycle budget (Req 2.2).
                     let result = tokio::time::timeout(
                         per_key_budget,
-                        self.consolidate_object_with_files(&cache_key, &journal_files),
+                        self.consolidate_object_with_files(&cache_key, key_lines),
                     )
                     .await;
                     (cache_key, result)
@@ -8724,7 +9231,7 @@ impl JournalConsolidator {
     /// Without this, Instance A could read entries, Instance B could read the same entries,
     /// then both would consolidate and clean up, causing entries to be lost.
     pub async fn consolidate_object(&self, cache_key: &str) -> Result<ConsolidationResult> {
-        self.consolidate_object_with_files(cache_key, &[]).await
+        self.consolidate_object_with_files(cache_key, None).await
     }
 
     /// Split one key's entries into those that may fold and the range-fill `Add`s whose version
@@ -8764,13 +9271,14 @@ impl JournalConsolidator {
         })
     }
 
-    /// Internal consolidation worker. When `journal_files` is non-empty it reads only those
-    /// files (pre-built index from `discover_pending_cache_keys_indexed`). When empty it falls
-    /// back to a full directory scan via `journal_manager.get_all_entries_for_cache_key`.
+    /// Internal consolidation worker. With `key_lines` (the lines discovery recorded for the
+    /// key) it reads only those lines, via `journal_manager.get_entries_at_offsets`. Without
+    /// them it falls back to a full directory scan via
+    /// `journal_manager.get_all_entries_for_cache_key`.
     async fn consolidate_object_with_files(
         &self,
         cache_key: &str,
-        journal_files: &[PathBuf],
+        key_lines: Option<&KeyLines>,
     ) -> Result<ConsolidationResult> {
         debug!("Starting consolidation for cache key: {}", cache_key);
 
@@ -8793,14 +9301,17 @@ impl JournalConsolidator {
 
         // Now that we hold the lock, read journal entries.
         // Use the pre-built index when available (avoids re-scanning all journal files).
-        let all_entries = match if journal_files.is_empty() {
-            self.journal_manager
-                .get_all_entries_for_cache_key(cache_key)
-                .await
-        } else {
-            self.journal_manager
-                .get_entries_from_files(cache_key, journal_files)
-                .await
+        let all_entries = match match key_lines {
+            Some(key_lines) if !key_lines.files.is_empty() => {
+                self.journal_manager
+                    .get_entries_at_offsets(cache_key, key_lines)
+                    .await
+            }
+            _ => {
+                self.journal_manager
+                    .get_all_entries_for_cache_key(cache_key)
+                    .await
+            }
         } {
             Ok(entries) => entries,
             Err(e) => {
@@ -8853,6 +9364,25 @@ impl JournalConsolidator {
             );
         }
         stale_entries.extend(superseded_fills);
+        // A range fill with no file identity is never folded (R12.1,
+        // [`entry_lists_unverified_range`]). Its line is removed with the stale ones. Its `.bin`
+        // is unlinked when it can only be that fill's own file
+        // ([`Self::unlink_retired_fill_files`]); otherwise it is left in place for the same
+        // reason a superseded fill's is: the path is version-independent, and another fill may
+        // have renamed its own file there.
+        let (valid_entries, unverified_fills): (Vec<_>, Vec<_>) = valid_entries
+            .into_iter()
+            .partition(|e| !entry_lists_unverified_range(e));
+        if !unverified_fills.is_empty() {
+            crate::disk_cache::note_unverified_ranges_refused(unverified_fills.len() as u64);
+            debug!(
+                "Retiring {} range-fill journal entries with no file identity: cache_key={}",
+                unverified_fills.len(),
+                cache_key
+            );
+            self.unlink_retired_fill_files(cache_key, &unverified_fills, &all_entries);
+        }
+        stale_entries.extend(unverified_fills);
         let stale_count = stale_entries.len();
         // Pending entries are those with missing range files but recent timestamps
         // They are NOT in valid_entries or stale_entries - they stay in journal for retry
@@ -9124,7 +9654,14 @@ impl JournalConsolidator {
         &self,
     ) -> Result<HashMap<String, Vec<PathBuf>>> {
         let discovery = self.discover_pending_cache_keys_indexed_capped(0).await?;
-        Ok(discovery.key_index)
+        Ok(discovery
+            .key_index
+            .into_iter()
+            .map(|(key, lines)| {
+                let files = lines.files.iter().map(|f| f.path.to_path_buf()).collect();
+                (key, files)
+            })
+            .collect())
     }
 
     /// Discover pending cache keys with an optional cap on the number of keys returned.
@@ -9143,99 +9680,9 @@ impl JournalConsolidator {
             });
         }
 
-        // key → set of journal file paths that contain at least one entry for that key
-        let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        // file path → total parseable entry count (for optimized cleanup)
-        let mut file_entry_counts: HashMap<PathBuf, usize> = HashMap::new();
-
-        let journal_entries = std::fs::read_dir(&journals_dir).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to read journals directory: {}", e))
-        })?;
-
-        for journal_entry in journal_entries {
-            // Early exit: stop reading more journal files once we have enough keys
-            if max_keys > 0 && index.len() >= max_keys {
-                debug!(
-                    "Discovery cap reached ({} keys), skipping remaining journal files",
-                    max_keys
-                );
-                break;
-            }
-
-            let journal_entry = journal_entry.map_err(|e| {
-                ProxyError::CacheError(format!("Failed to read journal directory entry: {}", e))
-            })?;
-
-            let journal_path = journal_entry.path();
-
-            if !journal_path.is_file() {
-                continue;
-            }
-
-            let file_name = match journal_path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name,
-                None => continue,
-            };
-
-            if !file_name.ends_with(".journal") {
-                continue;
-            }
-
-            match tokio::fs::read_to_string(&journal_path).await {
-                Ok(content) => {
-                    // Track which keys appear in this file (avoid duplicate path entries)
-                    let mut keys_in_file: HashSet<String> = HashSet::new();
-                    let mut entry_count: usize = 0;
-                    for line in content.lines() {
-                        // Inner-loop cap: stop parsing this file once we have enough keys.
-                        // Entry count will be incomplete for capped files, but that's fine —
-                        // cleanup will fall through to entry-by-entry matching for those files.
-                        if max_keys > 0 && index.len() >= max_keys {
-                            break;
-                        }
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<JournalEntry>(line) {
-                            Ok(entry) => {
-                                entry_count += 1;
-                                if keys_in_file.insert(entry.cache_key.clone()) {
-                                    index
-                                        .entry(entry.cache_key)
-                                        .or_default()
-                                        .push(journal_path.clone());
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Failed to parse journal entry: file={:?}, error={}",
-                                    journal_path, e
-                                );
-                            }
-                        }
-                    }
-                    if entry_count > 0 {
-                        file_entry_counts.insert(journal_path.clone(), entry_count);
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "Failed to read journal file (discover_pending): file={:?}, error={}",
-                        journal_path, e
-                    );
-                }
-            }
-        }
-
-        debug!(
-            "Discovered {} cache keys with pending journal entries across {} journal files",
-            index.len(),
-            file_entry_counts.len()
-        );
-        Ok(DiscoveryResult {
-            key_index: index,
-            file_entry_counts,
-        })
+        tokio::task::spawn_blocking(move || discover_journal_keys_blocking(&journals_dir, max_keys))
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("Journal discovery task failed: {}", e)))?
     }
     /// Get all journal entries for a cache key from all instance journal files
     pub async fn get_all_entries_for_cache_key(
@@ -9504,6 +9951,20 @@ impl JournalConsolidator {
         (valid_entries, stale_entries)
     }
 
+    /// Whether the file at `listing`'s path is the file `listing` describes: its recorded
+    /// identity matches the file's. A listing with no identity, or with no file, owns nothing.
+    fn listing_owns_file(&self, cache_key: &str, listing: &crate::cache_types::RangeSpec) -> bool {
+        let Some(listed) = listing.file_identity else {
+            return false;
+        };
+        let Ok(path) = self.get_range_file_path(cache_key, listing) else {
+            return false;
+        };
+        std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| crate::cache_types::RangeFileIdentity::of(&m))
+            .is_some_and(|found| listed.matches(&found))
+    }
     /// Unlist, unlink and debit the extents named by range fills of another object version.
     ///
     /// See the call site in `consolidate_object_with_files`. Runs under the key's slot lock.
@@ -9516,8 +9977,12 @@ impl JournalConsolidator {
             let (start, end) = (entry.range_spec.start, entry.range_spec.end);
             // A listing written after this fill (a PUT or a newer fill of this version that
             // published since) owns the file now: drop the entry only.
+            //
+            // R13.4: judged by file identity, not `created_at`. Stamp order and rename order can
+            // differ, so only a listing whose recorded identity matches the file at the path
+            // owns it; any other listing is retired with the fill.
             let listed_later = metadata.ranges.iter().any(|r| {
-                r.start == start && r.end == end && r.created_at > entry.range_spec.created_at
+                r.start == start && r.end == end && self.listing_owns_file(&metadata.cache_key, r)
             });
             if listed_later {
                 debug!(
@@ -10607,11 +11072,10 @@ impl JournalConsolidator {
 
     /// Clean up journal files after a consolidation cycle.
     ///
-    /// Uses file-level optimization: if all entries in a journal file were consolidated
-    /// (determined by comparing consolidated entry count against the total entry count
-    /// recorded during discovery), the file is deleted/truncated without re-reading.
-    /// Only files with a mix of consolidated and unconsolidated entries are re-read
-    /// and rewritten.
+    /// `file_entry_counts` is used for membership only: cleanup processes the files discovery
+    /// saw (every journal file when it is empty); no production code reads a count's value.
+    /// Each processed file is read in full: pass 1 finds the lines to keep, and a file with applied lines is
+    /// then deleted or truncated when nothing is kept, or rewritten from the kept lines' bytes.
     ///
     /// Uses file-level locking (flock) to prevent races with append operations
     /// from other instances.
@@ -10649,248 +11113,27 @@ impl JournalConsolidator {
                 })
                 .collect();
 
-        let journal_files = std::fs::read_dir(&journals_dir).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to read journals directory: {}", e))
-        })?;
-
-        let mut files_deleted = 0u32;
-        let mut files_truncated = 0u32;
-        let mut files_rewritten = 0u32;
-        let mut files_skipped = 0u32;
-        let mut retained_unparseable = 0u64;
-
-        for journal_entry in journal_files {
-            let journal_entry = match journal_entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!("Failed to read journal directory entry: {}", e);
-                    continue;
-                }
-            };
-
-            let journal_path = journal_entry.path();
-
-            if !journal_path.is_file() {
-                continue;
-            }
-
-            let file_name = match journal_path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-
-            if !file_name.ends_with(".journal") {
-                continue;
-            }
-
-            // Check if this file was seen during discovery and has a known entry count.
-            // If the file wasn't in discovery (e.g., created after discovery started),
-            // skip it — its entries weren't processed this cycle.
-            // When file_entry_counts is empty (e.g., called from tests or outside the
-            // discovery flow), process all journal files (fallback to old behavior).
-            if !file_entry_counts.is_empty() && !file_entry_counts.contains_key(&journal_path) {
-                files_skipped += 1;
-                continue;
-            }
-
-            // Acquire file-level lock to prevent races with append operations
-            // Blocking, and re-validated against an unlink by `cleanup_stale_lock_files`;
-            // held until `_lock_file` drops at the end of this iteration.
-            let lock_path = journal_path.with_extension("journal.lock");
-            let _lock_file = match crate::journal_manager::lock_journal_lock_file(&lock_path, true)
-            {
-                Ok(Some(f)) => UnlockOnDrop(f),
-                Ok(None) => {
-                    warn!(
-                        "Journal lock file kept being unlinked, skipping cleanup: path={:?}",
-                        lock_path
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to acquire journal file lock for cleanup: path={:?}, error={}",
-                        lock_path, e
-                    );
-                    continue;
-                }
-            };
-
-            // Read current journal content (while holding lock).
-            // We must re-read because new entries may have been appended since discovery.
-            let content = match tokio::fs::read_to_string(&journal_path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    info!(
-                        "Failed to read journal file for cleanup (likely already deleted): path={:?}, error={}",
-                        journal_path, e
-                    );
-                    continue;
-                }
-            };
-
-            // Separate the lines this build parsed and applied (removed) from every other
-            // line (kept). Kept lines are carried VERBATIM, never re-serialized: a line this
-            // build cannot parse is typically a newer build's entry on a mixed-version fleet
-            // and is complete and unapplied, and a line this build parses may still carry a
-            // field it does not know, which serde ignores and a re-serialization would drop.
-            // An unterminated tail that does not parse is a torn write; it is kept too (the
-            // startup reaper owns removing a foreign file that holds nothing else) and is
-            // newline-terminated on rewrite, so the next append cannot glue onto it.
-            let mut kept_lines: Vec<&str> = Vec::new();
-            let mut removed_count = 0usize;
-
-            for segment in content.split_inclusive('\n') {
-                let terminated = segment.ends_with('\n');
-                let line = segment.strip_suffix('\n').unwrap_or(segment);
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<JournalEntry>(line) {
-                    Ok(entry) => {
-                        let was_consolidated = consolidated_set.contains(&(
-                            entry.cache_key.clone(),
-                            entry.range_spec.start,
-                            entry.range_spec.end,
-                            entry.timestamp,
-                            entry.instance_id.clone(),
-                        ));
-
-                        if was_consolidated {
-                            removed_count += 1;
-                        } else {
-                            kept_lines.push(line);
-                        }
-                    }
-                    Err(e) => {
-                        debug!(
-                            "Unparseable journal line kept during cleanup: path={:?}, terminated={}, error={}",
-                            journal_path, terminated, e
-                        );
-                        retained_unparseable += 1;
-                        kept_lines.push(line);
-                    }
-                }
-            }
-
-            if removed_count == 0 {
-                // No entries to remove from this file — skip write
-                files_skipped += 1;
-                continue;
-            }
-
-            let is_fresh_journal = crate::eviction_worklist::is_fresh_journal_name(&file_name);
-            if kept_lines.is_empty() {
-                // Every line was parsed and applied — delete or truncate without rewriting
-                if is_fresh_journal {
-                    match tokio::fs::remove_file(&journal_path).await {
-                        Ok(_) => {
-                            files_deleted += 1;
-                            debug!(
-                                "Deleted fully-consolidated fresh journal: path={:?}, removed={}",
-                                journal_path, removed_count
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to delete fresh journal file: path={:?}, error={}",
-                                journal_path, e
-                            );
-                        }
-                    }
-                } else {
-                    // Truncate the primary journal in place and keep it, so its instance stays
-                    // in the readiness roster. The journal's lock is held and appenders open by
-                    // path and write only under it, so no append lands between the read above
-                    // and this truncate. No `.journal.tmp` is created: a peer's orphan evidence
-                    // reads one as indeterminate.
-                    let truncate_result: std::result::Result<(), String> = async {
-                        let f = tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&journal_path)
-                            .await
-                            .map_err(|e| format!("Failed to open journal for truncation: {}", e))?;
-                        f.set_len(0)
-                            .await
-                            .map_err(|e| format!("Failed to truncate journal: {}", e))?;
-                        f.sync_all()
-                            .await
-                            .map_err(|e| format!("Failed to sync truncated journal: {}", e))?;
-                        Ok(())
-                    }
-                    .await;
-
-                    match truncate_result {
-                        Ok(()) => {
-                            files_truncated += 1;
-                            debug!(
-                                "Truncated fully-consolidated primary journal (atomic): path={:?}, removed={}",
-                                journal_path, removed_count
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to truncate journal file: path={:?}, error={}",
-                                journal_path, e
-                            );
-                        }
-                    }
-                }
-            } else {
-                // Partial consolidation, or applied lines beside unparseable ones — rewrite
-                // with the kept lines, verbatim and in their original order (atomic)
-                let mut new_content = String::new();
-                for line in &kept_lines {
-                    new_content.push_str(line);
-                    new_content.push('\n');
-                }
-
-                // Atomic: write to .tmp, sync_all, rename over original
-                let tmp_path = journal_path.with_extension("journal.tmp");
-                let rewrite_result: std::result::Result<(), String> = async {
-                    use tokio::io::AsyncWriteExt;
-                    let mut f = tokio::fs::File::create(&tmp_path)
-                        .await
-                        .map_err(|e| format!("Failed to create tmp file for rewrite: {}", e))?;
-                    f.write_all(new_content.as_bytes())
-                        .await
-                        .map_err(|e| format!("Failed to write tmp file for rewrite: {}", e))?;
-                    f.sync_all()
-                        .await
-                        .map_err(|e| format!("Failed to sync_all tmp file for rewrite: {}", e))?;
-                    tokio::fs::rename(&tmp_path, &journal_path)
-                        .await
-                        .map_err(|e| format!("Failed to rename tmp file for rewrite: {}", e))?;
-                    Ok(())
-                }
-                .await;
-
-                match rewrite_result {
-                    Ok(()) => {
-                        files_rewritten += 1;
-                        debug!(
-                            "Rewritten journal file (atomic): path={:?}, removed={}, remaining={}",
-                            journal_path,
-                            removed_count,
-                            kept_lines.len()
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to write updated journal file: path={:?}, error={}",
-                            journal_path, e
-                        );
-                        // Attempt to remove .tmp file, but don't fail if removal fails
-                        if let Err(cleanup_err) = tokio::fs::remove_file(&tmp_path).await {
-                            warn!(
-                                "Failed to remove tmp file after rewrite failure: path={:?}, error={}",
-                                tmp_path, cleanup_err
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // Which files discovery saw. When file_entry_counts is empty (e.g., called from tests or
+        // outside the discovery flow), every journal file is processed (the old behavior).
+        let discovered: Option<HashSet<PathBuf>> = if file_entry_counts.is_empty() {
+            None
+        } else {
+            Some(file_entry_counts.keys().cloned().collect())
+        };
+        // The journal flock, both passes over each file and its rewrite run on the blocking
+        // pool: the flock blocks while an appender or an NFS lock recovery holds it.
+        let dir = journals_dir.clone();
+        let JournalCleanupCounts {
+            files_deleted,
+            files_truncated,
+            files_rewritten,
+            files_skipped,
+            retained_unparseable,
+        } = tokio::task::spawn_blocking(move || {
+            cleanup_journals_blocking(&dir, &consolidated_set, discovered.as_ref())
+        })
+        .await
+        .map_err(|e| ProxyError::CacheError(format!("Journal cleanup task failed: {}", e)))??;
 
         if files_deleted > 0 || files_truncated > 0 || files_rewritten > 0 {
             info!(
@@ -11202,6 +11445,112 @@ impl JournalConsolidator {
         let suffix = format!("_{}-{}.bin", range_spec.start, range_spec.end);
 
         crate::disk_cache::get_sharded_path(&base_dir, cache_key, &suffix)
+    }
+    /// Unlink the `.bin` of each retired identity-less `Add` (R12.1) that can only be that fill's
+    /// own file, and return how many were unlinked.
+    ///
+    /// Retiring a 2.x journal backlog leaves one unlisted `.bin` per `Add`. Those files count
+    /// toward the cache's size, eviction cannot reach them, and the orphan rotation visits at most
+    /// one `(bucket, L1)` shard per instance per [`crate::orphan_reclaim::PASS_INTERVAL_SECS`],
+    /// so a bucket's 256 shards take at least 21.3 hours on one proxy, longer when the pass's
+    /// time budget cuts a shard short. The file is unlinked here, under the key's lock this
+    /// cycle holds, only when all of these hold:
+    ///
+    /// - every other entry of the key this cycle read that names the path is itself a retired
+    ///   identity-less `Add`;
+    /// - the key's `.meta` does not exist, or parses and does not list the path;
+    /// - the file's modification time is more than [`crate::orphan_reclaim::MIN_CANDIDATE_AGE_SECS`]
+    ///   (600 s) before `SystemTime::now()`, the test [`crate::orphan_reclaim`] applies to its
+    ///   candidates (`old_enough`). The age is measured against now, not against the `Add`'s
+    ///   timestamp: a writer publishes its file a moment before it stamps its `Add`, so a rule
+    ///   relative to the `Add` never let a real fill's file go, and the retired line is dropped
+    ///   in the same cycle, so nothing would retry. A file modified in the last 600 s is kept
+    ///   and left to the orphan rotation. That covers a peer's fill renamed over the path in the
+    ///   rename-before-journal window, and a 2.x fill on a mixed fleet. A modification time in
+    ///   the future (clock skew) or one that cannot be read counts as young.
+    ///
+    /// An unlink cannot make any proxy serve other bytes; it can only remove a file. What it can
+    /// cost is a miss: a reader that would have used the file finds it gone and fetches the range
+    /// from S3, and a read in progress on another NFS client may fail and cut its response
+    /// short. The worst case is a 3.0.x peer's older fill whose `Add` is outside this batch and
+    /// whose `.meta` does not list it yet: its file is unlinked, and its `Add`, finding no file,
+    /// is kept and retried until it is older than `stale_entry_timeout_secs`, then removed from
+    /// the journal without being folded. The next read of the range misses and fetches it from
+    /// S3. That is an extra miss and never wrong bytes.
+    fn unlink_retired_fill_files(
+        &self,
+        cache_key: &str,
+        retired: &[JournalEntry],
+        batch: &[JournalEntry],
+    ) -> usize {
+        let is_retired_add = |e: &JournalEntry| {
+            matches!(e.operation, JournalOperation::Add) && entry_lists_unverified_range(e)
+        };
+        let listed: std::collections::HashSet<String> = match self
+            .get_metadata_file_path(cache_key)
+            .map(std::fs::read_to_string)
+        {
+            Ok(Ok(text)) => match serde_json::from_str::<NewCacheMetadata>(&text) {
+                Ok(meta) => meta.ranges.into_iter().map(|r| r.file_path).collect(),
+                Err(_) => return 0,
+            },
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            _ => return 0,
+        };
+        let ranges_dir = self.cache_dir.join("ranges");
+        let mut unlinked = 0;
+        for entry in retired.iter().filter(|e| is_retired_add(e)) {
+            let file_path = &entry.range_spec.file_path;
+            if listed.contains(file_path)
+                || batch
+                    .iter()
+                    .any(|e| &e.range_spec.file_path == file_path && !is_retired_add(e))
+            {
+                continue;
+            }
+            let path = ranges_dir.join(file_path);
+            if !self
+                .get_range_file_path(cache_key, &entry.range_spec)
+                .is_ok_and(|p| p == path)
+            {
+                continue;
+            }
+            // The age is read from an opened descriptor (fresh on NFS). Any error keeps the file.
+            match crate::disk_cache::open_final_file_metadata(&path) {
+                Ok(m) if crate::orphan_reclaim::old_enough(&m) => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        crate::disk_cache::warn_final_path_read_failed_rate_limited(
+                            "retired fill's file kept",
+                            &path,
+                            &e,
+                        );
+                        debug!(
+                            "Retired fill's range file kept (age unreadable): cache_key={}, \
+                             path={:?}, error={}",
+                            cache_key, path, e
+                        );
+                    }
+                    continue;
+                }
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => unlinked += 1,
+                Err(e) => debug!(
+                    "Retired fill's range file not unlinked: cache_key={}, path={:?}, error={}",
+                    cache_key, path, e
+                ),
+            }
+        }
+        if unlinked > 0 {
+            RETIRED_FILL_FILES_UNLINKED.fetch_add(unlinked as u64, Ordering::Relaxed);
+            debug!(
+                "Unlinked {} retired identity-less fills' range files: cache_key={}",
+                unlinked, cache_key
+            );
+        }
+        unlinked
     }
     /// Graceful shutdown of the journal consolidator
     ///
@@ -11605,6 +11954,9 @@ mod tests {
                             .unwrap();
                         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
                         std::fs::write(&bin, vec![7u8; 4096]).unwrap();
+                        entry.range_spec.file_identity = crate::cache_types::RangeFileIdentity::of(
+                            &std::fs::metadata(&bin).unwrap(),
+                        );
                     }
                     JournalOperation::Remove => {}
                 }
@@ -11774,6 +12126,8 @@ mod tests {
                 .unwrap();
             std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
             std::fs::write(&bin, vec![7u8; 4096]).unwrap();
+            entry.range_spec.file_identity =
+                crate::cache_types::RangeFileIdentity::of(&std::fs::metadata(&bin).unwrap());
             consolidator
                 .journal_manager
                 .append_range_entry(&key, entry)
@@ -11911,6 +12265,57 @@ mod tests {
             metadata.ranges.is_empty(),
             "control: the extent is unlisted"
         );
+    }
+
+    /// R13.4: a listing stamped later than another version's fill keeps the
+    /// extent only when the file at the path is the listing's file. Stamp order and rename
+    /// order can differ, so the listing here is stamped later while the file is the fill's:
+    /// it must be retired. The control's listing records the file's identity and is kept.
+    #[test]
+    fn retire_other_version_fills_keeps_a_later_listing_only_if_it_owns_the_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let key = "test-bucket/listed-later.bin";
+        let mut metadata = graduated_but_unaccounted_metadata(key, 100);
+        metadata.ranges[0].start = 0;
+        metadata.ranges[0].end = 99;
+        let mut entry = graduation_entry(key, 100, "peer-instance");
+        entry.operation = JournalOperation::Add;
+        entry.range_spec.start = 0;
+        entry.range_spec.end = 99;
+        entry.range_spec.created_at = metadata.ranges[0].created_at - Duration::from_secs(1);
+        let path = consolidator
+            .get_range_file_path(key, &entry.range_spec)
+            .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, [7u8; 100]).unwrap();
+        let found = crate::cache_types::RangeFileIdentity::of(&std::fs::metadata(&path).unwrap())
+            .expect("an identity");
+        entry.range_spec.file_identity = Some(found);
+        let mut listed = found;
+        listed.mtime_ns += 5_000_000_000;
+        metadata.ranges[0].file_identity = Some(listed);
+        let mut control = metadata.clone();
+
+        consolidator.retire_other_version_fills(&mut metadata, std::slice::from_ref(&entry));
+        assert!(
+            metadata.ranges.is_empty() && !path.exists(),
+            "R13.4: A LATER-STAMPED LISTING WAS KEPT OVER THE OTHER VERSION'S FILE \
+             (listed {} ranges, file present {})",
+            metadata.ranges.len(),
+            path.exists()
+        );
+
+        std::fs::write(&path, [8u8; 100]).unwrap();
+        control.ranges[0].file_identity =
+            crate::cache_types::RangeFileIdentity::of(&std::fs::metadata(&path).unwrap());
+        consolidator.retire_other_version_fills(&mut control, std::slice::from_ref(&entry));
+        assert_eq!(
+            control.ranges.len(),
+            1,
+            "control: a listing that owns the file is kept"
+        );
+        assert!(path.exists(), "control: its file is kept");
     }
 
     /// A later consolidation pass retries the unlink of an unservable extent. A
@@ -12336,6 +12741,46 @@ mod tests {
             "a Remove IS size-affecting, unlike a graduation"
         );
         assert!(metadata.ranges.is_empty(), "the Remove pruned the range");
+    }
+
+    /// The retired-fill unlink reads the file's age from a descriptor and keeps the
+    /// file when that read fails. Two old files, each the sole subject of a retired identity-less
+    /// `Add`: the control is unlinked; the one whose open is made to fail (non-`NotFound`) is
+    /// kept. Red side: the age read by `std::fs::metadata(path)`, which the open seam does not
+    /// reach, so the second file is unlinked too.
+    #[test]
+    fn a_retired_fill_file_whose_open_fails_is_kept() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let key = "test-bucket/retired";
+        let ranges_dir = temp_dir.path().join("ranges");
+        let old =
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(7200));
+        let mut entries = Vec::new();
+        let mut paths = Vec::new();
+        for (start, end) in [(0u64, 4095u64), (4096, 8191)] {
+            let mut entry = remove_entry_at(key, start, end, SystemTime::now());
+            entry.operation = JournalOperation::Add;
+            let path = consolidator
+                .get_range_file_path(key, &entry.range_spec)
+                .unwrap();
+            let rel = path.strip_prefix(&ranges_dir).unwrap().to_string_lossy();
+            entry.range_spec.file_path = rel.to_string();
+            entry.range_file_path = rel.to_string();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![1u8; 64]).unwrap();
+            filetime::set_file_mtime(&path, old).unwrap();
+            entries.push(entry);
+            paths.push(path);
+        }
+        crate::disk_cache::open_failure_seam::fail_for(&paths[1]);
+        let unlinked = consolidator.unlink_retired_fill_files(key, &entries, &entries);
+        assert!(
+            !paths[0].exists(),
+            "control: an old file with a good open is unlinked"
+        );
+        assert!(paths[1].exists(), "A FILE WHOSE OPEN FAILED WAS UNLINKED");
+        assert_eq!(unlinked, 1);
     }
 
     /// A `Remove` entry for `(start, end)` stamped `timestamp`, as
@@ -13856,7 +14301,7 @@ mod tests {
         // Create a journal entry
         let cache_key = "test-bucket/test-object";
         let now = SystemTime::now();
-        let range_spec = RangeSpec {
+        let mut range_spec = RangeSpec {
             start: 0,
             end: 1023,
             file_path: "test_range.bin".to_string(),
@@ -13881,6 +14326,9 @@ mod tests {
         tokio::fs::write(&range_file_path, vec![0u8; 1024])
             .await
             .unwrap();
+        range_spec.file_identity = crate::cache_types::RangeFileIdentity::of(
+            &std::fs::metadata(&range_file_path).unwrap(),
+        );
 
         // Simulate what store_range() does: add size to accumulator
         // In the real code path, store_range() calls accumulator.add() after writing the range file
@@ -16458,7 +16906,7 @@ mod tests {
         // Create a normal key that will process fast
         let cache_key = "test-bucket/normal-object";
         let now = SystemTime::now();
-        let range_spec = RangeSpec {
+        let mut range_spec = RangeSpec {
             start: 0,
             end: 1023,
             file_path: "normal_range.bin".to_string(),
@@ -16483,6 +16931,9 @@ mod tests {
         tokio::fs::write(&range_file_path, vec![0u8; 1024])
             .await
             .unwrap();
+        range_spec.file_identity = crate::cache_types::RangeFileIdentity::of(
+            &std::fs::metadata(&range_file_path).unwrap(),
+        );
 
         // Add size to accumulator to trigger cycle
         consolidator.size_accumulator().add(1024);
@@ -16568,7 +17019,7 @@ mod tests {
         // Create a key with journal entry
         let cache_key = "test-bucket/cleanup-test-object";
         let now = SystemTime::now();
-        let range_spec = RangeSpec {
+        let mut range_spec = RangeSpec {
             start: 0,
             end: 1023,
             file_path: "cleanup_range.bin".to_string(),
@@ -16592,6 +17043,9 @@ mod tests {
         tokio::fs::write(&range_file_path, vec![0u8; 1024])
             .await
             .unwrap();
+        range_spec.file_identity = crate::cache_types::RangeFileIdentity::of(
+            &std::fs::metadata(&range_file_path).unwrap(),
+        );
 
         consolidator.size_accumulator().add(1024);
 
@@ -18599,7 +19053,9 @@ mod tests {
                 access_count: 1,
                 staged: None,
                 unservable: false,
-                file_identity: None,
+                file_identity: crate::cache_types::RangeFileIdentity::of(
+                    &std::fs::metadata(&range_path).unwrap(),
+                ),
             },
             operation: JournalOperation::Add,
             range_file_path: range_path.to_string_lossy().to_string(),
@@ -20028,6 +20484,9 @@ mod journal_reap_tests {
         let bin = c.get_range_file_path(key, &entry.range_spec).unwrap();
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, vec![7u8; 4096]).unwrap();
+        let mut entry = entry;
+        entry.range_spec.file_identity =
+            crate::cache_types::RangeFileIdentity::of(&std::fs::metadata(&bin).unwrap());
         journal.append_range_entry(key, entry).await.unwrap();
     }
 

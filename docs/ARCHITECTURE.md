@@ -216,7 +216,7 @@ where
 - The client does not wait for a whole large object to buffer, so SDK throughput timeouts do not apply
 - The first byte reaches the client as soon as S3 sends it
 
-**RAM Cache Integration**: Both streaming and buffered paths check RAM cache before disk I/O. On a RAM hit, the streaming path serves data directly from memory as a buffered response. On a RAM miss, the streaming path collects chunks during disk streaming and promotes the range to RAM cache after completion. Promotion is bounded by **per-shard** capacity (`max_ram_cache_size / effective_shard_count`, 64 MiB at defaults), not by `max_ram_cache_size` as a whole; see [RAM sizing and the admission ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling).
+**RAM Cache Integration**: Both streaming and buffered paths check RAM cache before disk I/O. On a RAM hit, the streaming path serves data directly from memory as a buffered response. On a RAM miss, the streaming path reads from disk through one fixed-size queue of chunks and keeps no copy of the range ([Memory impact](CONFIGURATION.md#memory-impact)). When a response that served one whole cached range ends cleanly, the proxy reads the range's stored frame from disk again and promotes it to RAM cache. Promotion is bounded by **per-shard** capacity (`max_ram_cache_size / effective_shard_count`, 64 MiB at defaults), not by `max_ram_cache_size` as a whole; see [RAM sizing and the admission ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling).
 
 ### 2. Bucket-first hash-based sharding
 
@@ -292,7 +292,7 @@ point, what actually happens.
 | Entry point | Consults RAM? | Promotes to RAM? | RAM key | Reserves against the in-flight ledger? |
 |---|---|---|---|---|
 | `serve_range_from_cache` → RAM pre-check hit (`http_proxy.rs`) | Yes, an exact-key lookup before the streaming decision | n/a (already resident) | `generate_ram_range_key` (colon grammar) | **No** |
-| `serve_range_from_cache` (streaming, `http_proxy.rs`) | Only via the buffered/RAM pre-check before the streaming decision | On disk-hit collection during streaming, via the frame-verbatim path | `generate_ram_range_key` (colon grammar) | **No**; bounded by its 4-slot frame channel instead |
+| `serve_range_from_cache` (streaming, `http_proxy.rs`) | Only via the buffered/RAM pre-check before the streaming decision | Yes, for one whole cached range once its response ends cleanly, by reading the stored frame from disk again | `generate_ram_range_key` (colon grammar) | **No**; its memory is a fixed cost per hit instead ([Memory impact](CONFIGURATION.md#memory-impact)) |
 | `serve_range_from_cache_buffered` (`http_proxy.rs`) | Yes: `get_cached_range_data` → single-range branch checks RAM directly | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | **Yes**: the requested range length, held by `PermitBody` until the client drains or disconnects |
 | `serve_full_object_from_cache` (`http_proxy.rs`) | Yes, via `get_cached_range_data` | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | **Yes**: the full object length, held by `PermitBody` |
 | `get_cached_range_data` → single-range branch | Yes | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | Only its own recovery fetch, scoped to that fetch |
@@ -612,7 +612,7 @@ Separate from the access-control model above, the proxy's **data integrity model
 
 **What the proxy trusts**:
 - **S3 validates bytes on ingress.** Every PUT and UploadPart is forwarded unmodified to S3. If S3 returns 200, its stored bytes match what the client sent, and S3 records its own checksum (CRC64NVME by default since December 2024).
-- **LZ4 frame content checksums catch disk corruption.** All cached bytes, compressed or stored in an uncompressed frame, carry an xxhash32 frame checksum (see [Compression](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame)). Bit-flips surface as decode errors and are handled as cache misses.
+- **LZ4 frame content checksums catch disk corruption.** All cached bytes, compressed or stored in an uncompressed frame, carry an xxhash32 frame checksum (see [Compression](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame)). A bit flip surfaces as a decode error by the time a read reaches the checksum, after the frame's last block. A read assembled in memory handles it as a cache miss, and a streamed response that runs to the end of its cached range ends short. A streamed response that ends before the end of its cached range does not reach the checksum and can complete with damaged bytes ([Damaged range files](../SECURITY.md#damaged-range-files)).
 - **The storage layer catches lower-level corruption.** File system and block-device integrity (EFS, ext4, XFS) cover everything below the frame checksum.
 
 **What the proxy verifies**:

@@ -10,11 +10,11 @@ see different memory use, connection counts, network exposure, or on-disk layout
 binary swap. The tables below list the releases that do one of those things, so you can
 read only the ones between your current version and your target.
 
-For 3.0.0, [Upgrading to 3.0.0](#upgrading-to-300) and the guides it links carry the detail, and
+For 3.0.0 and 3.0.1, [Upgrading to 3.0.0](#upgrading-to-300), [Upgrading to 3.0.1](#upgrading-to-301) and the guides they link carry the detail, and
 the [changelog](../CHANGELOG.md) summarizes each release. For every release up to 2.8.4,
 the detail is in the [pre-3.0.0 changelog](../changelog-pre-v3.md).
 
-3.0.0 upgrades in place from any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) before upgrading a fleet one proxy at a time.
+3.0.0 upgrades in place from any 2.8 release, and 3.0.1 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
 After 3.0.0, restart a fleet one proxy at a time. Clients that fail over, such as CRT-based ones, retry on another proxy while one restarts, and the cache volume survives restarts.
 Releases from before 1.0.0 are not covered. Upgrading from a pre-1.0.0 build is not a
 supported path; start from a fresh cache directory and a config derived from the
@@ -27,6 +27,7 @@ cannot be read.
 
 | Version | Action |
 |---|---|
+| 3.0.1 | Fleets where objects are overwritten in place, and proxies whose clocks may differ from the cache volume's file server by 10 minutes or more, have a step to take; see [Upgrading to 3.0.1](#upgrading-to-301). |
 | 3.0.0 | Operators with their own hardened systemd unit, Docker, health or metrics checks from another host, `cache_rules.json` patterns with special characters, several proxies on one cache volume, or an S3-compatible origin that omits the `Range` total have a step to take; see [Upgrading to 3.0.0](#upgrading-to-300). |
 | 2.6.0 | To keep log files older than the configured retention, copy them off or raise `logging.access_log_retention_days` / `logging.app_log_retention_days` before upgrading; the first cleanup pass now enforces retention across the whole of `access_log_dir` and `app_log_dir`, including on a deployment running with `access_log_enabled: false`, where neither sweep previously ran. |
 | 2.5.0 | If you set `server.max_concurrent_requests` explicitly, review the value; a permit is now held for the whole transfer, not just request setup, so the same number admits far fewer concurrent large transfers than before. Remove `server.max_buffered_request_body_bytes` if you set it; it is deprecated, has no effect, and logs a startup warning; if you had lowered it to reject large uploads, S3's own limits apply instead. On FSx for OpenZFS, add `nconnect=16` to the mount and remount, or disk-cache reads stay capped near 625 MB/s; EFS needs no change. |
@@ -46,6 +47,7 @@ corrupted.
 
 | Version | Change on a binary-only upgrade |
 |---|---|
+| 3.0.1 | Ranges a 2.x release cached, and part layouts recorded before 3.0.1, are fetched from S3 once, on first read; see [Upgrading to 3.0.1](#upgrading-to-301). |
 | public 2.8.2 | The first GET of an object cached by a PUT or multipart upload now makes one extra round trip to S3 (a conditional request) before serving, where previously it was served straight from cache with no S3 contact. Subsequent reads of the same object are unaffected. |
 | 2.8.0 | Expired GETs, including byte-range reads, revalidate with a conditional S3 request and serve cached bytes on `304`, so body transfers fall and `ttl_revalidations_total` rises; a lowered `get_ttl` applies to ranged reads of cached objects; orphan range files are no longer swept at startup; four log lines change fields. |
 | 2.7.0 | `write_cache.resident_bytes`, `cache.write_cache_size`, `cache.total_cache_size` and `cache.read_cache_size` on `/metrics` change meaning (`total = read + write_cache`), so rebaseline thresholds and panels on all four; `cache.write_cache_percent` becomes a background reclamation target rather than an admission limit; write-through caching is declined on a cache near `cache.max_cache_size`; `/health` can report the cache `Degraded` above 95% usage. No manual step; an inflated write-cache figure recovers on its own ([Eviction](EVICTION.md#recovery-from-an-inflated-write-cache-figure)). |
@@ -82,6 +84,33 @@ Releases not listed above require no action and change no defaults: internal fix
 performance work, additive opt-in features that stay disabled until configured, and
 dependency bumps.
 
+## Upgrading to 3.0.1
+
+3.0.1 upgrades in place from 3.0.0 or any 2.8 release, and needs no configuration change. It refuses cached ranges that record no file identity, and every range a 2.x release cached is one, so a cache volume that a 2.x release populated re-warms from S3 after the upgrade. When upgrading from 2.8, read [Upgrading to 3.0.0](#upgrading-to-300) as well. [Cache integrity](../SECURITY.md#cache-integrity) describes what these changes guard against.
+
+### Before upgrading to 3.0.1
+
+- **Clocks**: keep each proxy's clock within 10 minutes (600 seconds) of the cache volume's file server, for example with NTP. A proxy whose clock runs 10 minutes or more ahead can replace a range file that another proxy has just written for an object with no cached metadata, and nothing reports it. Where objects are overwritten in place outside the proxy, that can let a read return one version's bytes under another version's ETag ([What the guards do not cover](../SECURITY.md#what-the-guards-do-not-cover)).
+- **Ranges a 2.x release cached**: by default each is fetched from S3 again on its first read. Where every object is written once and never overwritten in place outside the proxy, you can keep them by setting `cache.trust_unverified_ranges: true` ([Ranges with no file identity](CONFIGURATION.md#ranges-with-no-file-identity)).
+
+### Upgrading a fleet to 3.0.1
+
+- From a 2.x release, upgrade every proxy on a cache volume in one pass, as [During a rolling upgrade](#during-a-rolling-upgrade) describes. A 2.x proxy that is still running keeps caching ranges with no file identity, which 3.0.1 proxies refuse and fetch from S3 again.
+- A 3.0.1 proxy discards the journal entries that 2.x proxies write for their fills, so those ranges are fetched from S3 again. It deletes the range file such an entry wrote if the file is already 10 minutes old when the entry is discarded and no cached metadata or other pending entry names it. A running 2.x proxy's entries are discarded at the next consolidation (every 5 seconds by default), so their files are left to [orphan recovery](SHARED_STORAGE.md#orphan-recovery), which starts about an hour after the last 2.x proxy stops, or after the first 3.0.1 proxy starts if that is later.
+- From 3.0.0, where objects are overwritten in place, upgrade every proxy in one pass too. Until every proxy runs 3.0.1, a 3.0.0 proxy can replace a range file that a 3.0.1 proxy has just written for an object with no cached metadata, and keeps its other 3.0.0 behavior ([Cache integrity](../SECURITY.md#cache-integrity)). Where each object is written once, one proxy at a time is safe.
+
+### What you will see after upgrading to 3.0.1
+
+- On a cache volume that a 2.x release wrote to, the first read of each range 2.x cached goes to S3, whatever the range's size, and the range is cached again. These reads count as misses, and `atomic_metadata.unverified_ranges_refused` rises while they happen, then stays flat ([Metrics reference](METRICS_REFERENCE.md#atomic_metadata)).
+- Journal entries that a 2.x release left on the cache volume are discarded instead of consolidated, and each range file they wrote that is already 10 minutes old is deleted, counted in `atomic_metadata.retired_fill_files_unlinked`.
+- A part layout recorded before 3.0.1 is discarded on its first read, and each of its parts is fetched from S3 once and recorded again. No counter records this; each discard logs one `info` line, `Cleared a part layout recorded before 3.0.1`.
+- A fill whose file identity cannot be read is not cached, and logs one warning naming the key and the file.
+- A streamed cache hit whose client reads slowly holds about 3.9 MiB ([Memory impact](CONFIGURATION.md#memory-impact)).
+
+## Rolling back from 3.0.1
+
+Rolling back to 3.0.0 needs no step. 3.0.1 adds one field to an object's cached metadata, which 3.0.0 ignores, so 3.0.0 reads the cache volume as 3.0.1 left it. The 3.0.0 behavior listed in [Cache integrity](../SECURITY.md#cache-integrity) returns. A part layout that 3.0.0 rewrites loses the mark 3.0.1 adds, so after upgrading again each of its parts is fetched from S3 once. To roll back to a 2.8 release, follow [Rolling back from 3.0.0](#rolling-back-from-300).
+
 ## Upgrading to 3.0.0
 
 3.0.0 upgrades in place from any 2.8 release, and most deployments need no configuration change. Where objects are overwritten in place, upgrade every proxy on a cache volume in one pass. Until every proxy runs 3.0.0, a proxy still on 2.8 can keep serving the previous version of an overwritten object, whichever proxy took the write. Where each object is written once, you can upgrade one proxy at a time. A few deployment types have a step to take first, some defaults change, and some metric names, log lines and configuration keys change. At least a day after the last 2.8 proxy stops writing, provided the volume still serves GETs from the cache or takes uploads, misses or deletes that change the cache's size, the volume switches to 3.0.0's write-cache accounting, and from then it cannot go back to an earlier release in place; see [Rolling back from 3.0.0](#rolling-back-from-300).
@@ -97,7 +126,7 @@ dependency bumps.
 
 ### During a rolling upgrade
 
-- Where objects are overwritten in place, upgrade every proxy on a cache volume in one pass: stop every proxy on the volume, replace the binary on each, then start them. This way no 2.8 proxy serves requests once a 3.0.0 proxy is running. Requests fail while every proxy is stopped. Until every proxy runs 3.0.0, a proxy still on 2.8 can keep serving the previous version of an overwritten or deleted object, whichever proxy took the write. Proxies on 3.0.0 serve the new version as they do in a fleet that runs only 3.0.0. Where each object is written once, one proxy at a time is safe. Until every proxy runs 3.0.0, the eviction-lock holder evicts alone, orphan cleanup waits, and an older proxy can serve a cached range that 3.0.0 would fetch from S3. Fleet-wide eviction and orphan cleanup start about an hour after the last older proxy stops. The write-order record (the `.wtok` file) and a bucket's binding to its origin take effect only once every proxy runs 3.0.0.
+- Where objects are overwritten in place, upgrade every proxy on a cache volume in one pass: stop every proxy on the volume, replace the binary on each, then start them. This way no 2.8 proxy serves requests once a 3.0.0 proxy is running. Requests fail while every proxy is stopped. Until every proxy runs 3.0.0, a proxy still on 2.8 can keep serving the previous version of an overwritten or deleted object, whichever proxy took the write. Until every proxy runs 3.0.0, a proxy on 3.0.0 can return part of an object that was overwritten in place with one version's bytes under another version's ETag and headers. It can continue afterwards for ranges cached from updates the 2.8 proxies left on the cache volume, so a one-pass upgrade shortens this window without closing it. 3.0.1 closes it ([Upgrading to 3.0.1](#upgrading-to-301)). Where each object is written once, one proxy at a time is safe. Until every proxy runs 3.0.0, the eviction-lock holder evicts alone, orphan cleanup waits, and an older proxy can serve a cached range that 3.0.0 would fetch from S3. Fleet-wide eviction and orphan cleanup start about an hour after the last older proxy stops. The write-order record (the `.wtok` file) and a bucket's binding to its origin take effect only once every proxy runs 3.0.0.
 - A multipart upload in progress at the upgrade completes on S3 and is not cached.
 - At least a day after the last 2.8 proxy stops writing, provided the volume still serves GETs from the cache or takes uploads, misses or deletes that change the cache's size, the cache volume switches to a write-cache size figure recomputed from the cache's metadata: `write_cache.staged_authority_epoch` reads `1`, and `cache.write_cache_size` steps once, up or down. Until then the fleet keeps 2.8's write-cache accounting, which the daily validation scan corrects, and a proxy can be rolled back in place. After the switch, rolling back needs a fresh cache volume ([Rolling back from 3.0.0](#rolling-back-from-300)). A 2.8 proxy that is still running does not reliably hold the switch back, so upgrade every proxy on the volume within a day; a 2.8 proxy still running after the switch miscounts its own write cache.
 
@@ -115,7 +144,7 @@ dependency bumps.
 ### Cache contents and background work
 
 - Cache keys hold the object key in the spelling AWS SDKs send, so entries cached under another spelling (`+` for a space, lower-case hex, `%2F`) become misses and age out.
-- Apart from the ranges in the next item, a range cached or last rewritten by an earlier release records no file identity and is served unchecked ([Cache internals](CACHE_INTERNALS.md#range-file-identity)).
+- A range cached or last rewritten by an earlier release records no file identity ([Cache internals](CACHE_INTERNALS.md#range-file-identity)). 3.0.0 served such a range unchecked, apart from the ranges in the next item. From 3.0.1 it is fetched from S3 once, on its first read, and cached again, unless `cache.trust_unverified_ranges` is `true` ([Upgrading to 3.0.1](#upgrading-to-301)).
 - A few ranges cached by an earlier release are fetched from S3 once, on their first read, and cached again. These are a range that starts at an object's first byte and ends before its last, and a range stored from an S3 error reply. Those reads count as misses in the access log and on `/metrics`.
 - The reported cache size can fall after the upgrade. Orphan cleanup removes range files no metadata references, startup removes stale temporary files and the journals of hosts gone for 24 hours, and the validation scan removes expired write-cache entries ([Shared storage](SHARED_STORAGE.md#orphan-recovery)).
 - New range files use 64 KiB LZ4 blocks, so highly compressible content takes more disk space and `cache.total_cache_size` rises for the same data ([Compression](COMPRESSION.md#block-size)).

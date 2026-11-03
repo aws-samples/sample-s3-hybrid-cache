@@ -54,6 +54,8 @@ mod get_miss_fill_same_instance_visibility_test;
 mod heal_content_length_guard_test;
 #[path = "http_proxy_handlers_test.rs"]
 mod http_proxy_handlers_test;
+#[path = "identity_less_journal_add_test.rs"]
+mod identity_less_journal_add_test;
 #[path = "integration_test.rs"]
 mod integration_test;
 #[path = "legacy_error_body_range_test.rs"]
@@ -84,6 +86,10 @@ mod s3_integration_test;
 mod signed_range_integrity_test;
 #[path = "spurious_error_status_test.rs"]
 mod spurious_error_status_test;
+#[path = "streamed_damage_never_completes_test.rs"]
+mod streamed_damage_never_completes_test;
+#[path = "streamed_hit_promotion_test.rs"]
+mod streamed_hit_promotion_test;
 #[path = "streaming_decompression_property_test.rs"]
 mod streaming_decompression_property_test;
 #[path = "unified_cache_test.rs"]

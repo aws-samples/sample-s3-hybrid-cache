@@ -620,6 +620,7 @@ async fn part_scoped_read_of_write_cached_entry_with_no_last_modified_reports_a_
         let meta_path = fixture.meta_path(cache_key);
         let mut metadata = fixture.read_meta(cache_key).expect(".meta");
         metadata.object_metadata.parts_count = Some(1);
+        metadata.object_metadata.part_layout_verified = true;
         metadata.object_metadata.part_ranges.insert(1, (0, 1023));
         std::fs::write(
             &meta_path,

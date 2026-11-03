@@ -161,7 +161,7 @@ async fn test_refresh_object_ttl_nonexistent_key() {
 
 #[tokio::test]
 async fn test_remove_invalidated_range() {
-    let (mut manager, _temp_dir) = create_test_cache_manager().await;
+    let (manager, _temp_dir) = create_test_cache_manager().await;
     let cache_key = "test-bucket/test-object";
 
     // Create metadata with an expired range
@@ -214,7 +214,7 @@ async fn test_remove_invalidated_range() {
 
 #[tokio::test]
 async fn test_remove_invalidated_range_with_remaining_ranges() {
-    let (mut manager, _temp_dir) = create_test_cache_manager().await;
+    let (manager, _temp_dir) = create_test_cache_manager().await;
     let cache_key = "test-bucket/test-object";
 
     // Create metadata with two ranges, one expired
@@ -279,7 +279,7 @@ async fn test_remove_invalidated_range_with_remaining_ranges() {
 
 #[tokio::test]
 async fn test_remove_invalidated_range_nonexpired() {
-    let (mut manager, _temp_dir) = create_test_cache_manager().await;
+    let (manager, _temp_dir) = create_test_cache_manager().await;
     let cache_key = "test-bucket/test-object";
 
     // Create metadata with a non-expired range

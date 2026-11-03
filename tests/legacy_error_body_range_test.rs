@@ -572,6 +572,120 @@ fn assert_not_error_body(body: &Bytes) {
     );
 }
 
+impl Harness {
+    /// A GET with no `Range`, and whether it reached the mock (a miss).
+    async fn whole_probe(&self, key: &str) -> (bool, StatusCode, Bytes) {
+        let raw = format!("/{}/{}", BUCKET, key);
+        let before = self.mock.hits(&raw);
+        let fut = async {
+            let stream = TcpStream::connect(self.proxy).await.expect("connect");
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .expect("handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let req = Request::builder()
+                .method("GET")
+                .uri(raw.as_str())
+                .header("host", self.mock_host.as_str())
+                .header("content-length", "0")
+                .header("authorization", AUTH)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = sender.send_request(req).await.expect("proxy request");
+            let status = resp.status();
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            (status, body)
+        };
+        let (status, body) = tokio::time::timeout(STEP, fut)
+            .await
+            .unwrap_or_else(|_| panic!("GET {} timed out", raw));
+        (self.mock.hits(&raw) > before, status, body)
+    }
+}
+
+// ── A document built from an error reply (R13.1a) ─────────────────────
+
+/// A 2.x release could build a key's whole document from an S3 error reply: no ETag, no
+/// `Last-Modified`, the error body's length, and one listing `(0, L-1)` with no file identity
+/// over a file holding the error body. 3.0.0 refuses to serve it (no validator) and forwards,
+/// but the publish guard then drops every refill (empty ETag against the real one), so the
+/// key goes to S3 on every GET. The document must be removed so the refill replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_document_built_from_an_error_reply_is_replaced_by_the_refill() {
+    let h = harness(false).await;
+    let key = "e6/error-reply-document.bin";
+    let object = h.mock.put(key, 1024 * 1024);
+    let l = error_body().len();
+    h.plant(key, 0, error_body()).await;
+    h.wait_for_doc(key, "fixture: the planted extent is listed", |d| {
+        extents(d)
+            .iter()
+            .any(|(s, e, _)| *s == 0 && *e == (l - 1) as u64)
+    })
+    .await;
+    let path = h.meta_path_now(key).expect("planted .meta");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    {
+        let om = doc["object_metadata"]
+            .as_object_mut()
+            .expect("object_metadata");
+        om.insert("etag".into(), serde_json::json!(""));
+        om.insert("last_modified".into(), serde_json::json!(""));
+        om.insert("content_length".into(), serde_json::json!(l));
+        om.insert("cumulative_size".into(), serde_json::json!(l));
+        om.insert("content_type".into(), serde_json::json!("application/xml"));
+        om.insert(
+            "response_headers".into(),
+            serde_json::json!({"content-type": "application/xml"}),
+        );
+    }
+    if let Some(obj) = doc.as_object_mut() {
+        if obj.contains_key("head_expires_at") {
+            obj.insert("head_expires_at".into(), serde_json::Value::Null);
+        }
+    }
+    for range in doc["ranges"].as_array_mut().expect("ranges") {
+        range.as_object_mut().unwrap().remove("file_identity");
+    }
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    h.cache_manager
+        .invalidate_metadata_cache(&format!("{}/{}", BUCKET, key))
+        .await;
+    let doc = h.meta_doc_now(key).expect("the document");
+    assert_eq!(
+        extents(&doc),
+        vec![(0, (l - 1) as u64, false)],
+        "fixture: one whole-object listing with no identity"
+    );
+    assert_eq!(
+        doc.pointer("/object_metadata/etag"),
+        Some(&serde_json::json!(""))
+    );
+    assert_eq!(
+        doc.pointer("/object_metadata/last_modified"),
+        Some(&serde_json::json!(""))
+    );
+
+    let (reached, status, body) = h.whole_probe(key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_not_error_body(&body);
+    assert_eq!(body, object, "the client must receive the object's bytes");
+    assert!(reached, "the error-reply document is not served");
+    h.wait_for_doc(
+        key,
+        "R13.1a CONVERGENCE: the refill never replaced the error-reply document",
+        |d| d.pointer("/object_metadata/etag") == Some(&serde_json::json!(etag_of(key))),
+    )
+    .await;
+    let (reached, status, body) = h.whole_probe(key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, object);
+    assert!(!reached, "R13.1a: the second GET reached S3");
+}
+
 // ── The buffered serve ──────────────────────────────────────────────────────
 
 /// A read inside the extent: the client gets the object's bytes, the listing is removed, and

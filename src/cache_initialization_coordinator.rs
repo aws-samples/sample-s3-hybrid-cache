@@ -2446,6 +2446,7 @@ mod tests {
             read_cache_enabled: true,
             bucket_settings_staleness_threshold: Duration::from_secs(60),
             evaluate_conditions_from_cache: true,
+            trust_unverified_ranges: false,
             ram_cache_shard_count: 8,
             max_complete_body_bytes: 10 * 1024 * 1024, // 10 MiB
             max_metadata_file_bytes: 4 * 1024 * 1024,  // 4 MiB

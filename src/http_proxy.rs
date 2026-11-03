@@ -1063,10 +1063,11 @@ pub(crate) fn reread_extent_spec(
             .find(|r| r.start == start && r.end == end)
             .map(|spec| (spec, meta.object_metadata.content_length))
     }) {
-        // A listing written before 3.0.0 at offset 0, short of the object's end, is refetched
-        // like a marked one (`RangeSpec::is_unverified_prefix`).
+        // A listing written before 3.0.0 at offset 0, short of the object's end, or any listing
+        // with no file identity (R13.1), is refetched like a marked one.
         Some((spec, content_length))
-            if spec.unservable || spec.is_unverified_prefix(content_length) =>
+            if spec.unservable
+                || crate::disk_cache::unverified_listing_refused(spec, content_length) =>
         {
             ExtentSpecReread::Unservable
         }
@@ -1239,6 +1240,175 @@ where
     })
 }
 
+/// Bytes per chunk for every cache hit streamed from disk: the exact-extent, slice and chained
+/// arms. 512 KiB is the smallest of 256 KiB, 512 KiB and 1 MiB whose local hit throughput was
+/// not below 3.0.0's at depth 4. With one arm per process, 32 clients each reading a 2.4 MB
+/// object ran at 8,354, 7,825 and 8,415 MB/s against 3.0.0's 8,279, 7,772 and 8,216, and 4
+/// clients each reading a 64 MiB object at 6,666 against 6,580: level, not ahead. At 256 KiB
+/// the small load ran below 3.0.0 for about the same CPU per byte: the runtime's workers
+/// parked about twice as often per byte, waiting on the disk reader's hand-offs. Public, and
+/// hidden from the docs, so the stalled-hit memory test can derive its bound from it.
+#[doc(hidden)]
+pub const STREAMED_HIT_CHUNK_SIZE: usize = 512 * 1024;
+
+/// What a streamed hit runs once its disk stream has ended clean (the exact arm's RAM promotion).
+pub(crate) type StreamedHitCompletion = Box<dyn FnOnce() + Send>;
+
+/// The response body of a cache hit streamed from disk. It wraps the disk stream directly, so
+/// the disk reader's channel is the only queue between disk and hyper.
+///
+/// - `Ok(bytes)` becomes a data frame.
+/// - An `Err` is logged and ends the stream, so the body ends short of its `Content-Length`
+///   and hyper closes the connection (Requirement 5.7).
+/// - Once the stream has yielded `expected` bytes, the adapter holds that last chunk and polls
+///   the disk stream once more before handing it over. hyper drops a body whose
+///   `Content-Length` is met without polling it for its end, so the end must be seen first. A
+///   clean end runs `on_complete` and then yields the chunk. An error there, or bytes past
+///   `expected` (a further chunk, or a chunk longer than the bytes remaining, which is never
+///   held), drops the bytes without running `on_complete`, so the body ends short of its
+///   `Content-Length` and hyper closes the connection: a response is never completed from a
+///   stream that failed (R15.3). A stream that ends clean short of `expected` ends the body
+///   the same way, without running `on_complete`.
+/// - Dropping the adapter (hyper drops the body when the client goes) drops the disk stream,
+///   so the blocking reader's next send fails and the read stops; `on_complete` never runs.
+///
+/// The two fields that are not `Sync` sit in a `std::sync::Mutex` so the body is `Sync` for
+/// `BoxBody`. `poll_next` reaches them through `Mutex::get_mut`, which takes no lock. The
+/// adapter is `Unpin`, so `PermitBody` takes it without a `Box::pin`.
+pub(crate) struct StreamedHitFrames {
+    inner: std::sync::Mutex<
+        std::pin::Pin<Box<dyn futures::Stream<Item = crate::Result<Bytes>> + Send>>,
+    >,
+    on_complete: std::sync::Mutex<Option<StreamedHitCompletion>>,
+    remaining: u64,
+    held: Option<Bytes>,
+    done: bool,
+    label: &'static str,
+}
+
+impl StreamedHitFrames {
+    /// `expected` is the body's `Content-Length`; `label` follows "Mid-stream disk read
+    /// error" in the log line an error writes.
+    pub(crate) fn new<S>(
+        inner: S,
+        expected: u64,
+        label: &'static str,
+        on_complete: Option<StreamedHitCompletion>,
+    ) -> Self
+    where
+        S: futures::Stream<Item = crate::Result<Bytes>> + Send + 'static,
+    {
+        Self {
+            inner: std::sync::Mutex::new(Box::pin(inner)),
+            on_complete: std::sync::Mutex::new(on_complete),
+            remaining: expected,
+            held: None,
+            done: false,
+            label,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.done = true;
+        let slot = self
+            .on_complete
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(on_complete) = slot.take() {
+            on_complete();
+        }
+    }
+
+    fn fail(&mut self, e: &crate::ProxyError) {
+        error!(
+            "Mid-stream disk read error{}, terminating connection: {}",
+            self.label, e
+        );
+        self.done = true;
+        *self
+            .on_complete
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+impl futures::Stream for StreamedHitFrames {
+    type Item = std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            if this.done {
+                return Poll::Ready(None);
+            }
+            let polled = this
+                .inner
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .poll_next(cx);
+            let frame = |bytes| Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes))));
+            match (this.held.take(), polled) {
+                (held, Poll::Pending) => {
+                    this.held = held;
+                    return Poll::Pending;
+                }
+                (None, Poll::Ready(Some(Ok(bytes)))) => {
+                    let len = bytes.len() as u64;
+                    if len > this.remaining {
+                        let e = crate::ProxyError::CacheError(
+                            "disk stream yielded more bytes than the response length".to_string(),
+                        );
+                        this.fail(&e);
+                        return Poll::Ready(None);
+                    }
+                    if len == this.remaining {
+                        this.remaining = 0;
+                        this.held = Some(bytes);
+                        continue;
+                    }
+                    this.remaining -= len;
+                    return frame(bytes);
+                }
+                (None, Poll::Ready(Some(Err(e)))) => {
+                    this.fail(&e);
+                    return Poll::Ready(None);
+                }
+                (None, Poll::Ready(None)) => {
+                    if this.remaining > 0 {
+                        let e = crate::ProxyError::CacheError(
+                            "disk stream ended short of the response length".to_string(),
+                        );
+                        this.fail(&e);
+                    } else {
+                        this.complete();
+                    }
+                    return Poll::Ready(None);
+                }
+                (Some(last), Poll::Ready(None)) => {
+                    this.complete();
+                    return frame(last);
+                }
+                (Some(_), Poll::Ready(Some(Err(e)))) => {
+                    this.fail(&e);
+                    return Poll::Ready(None);
+                }
+                (Some(_), Poll::Ready(Some(Ok(_)))) => {
+                    let e = crate::ProxyError::CacheError(
+                        "disk stream yielded more bytes than the response length".to_string(),
+                    );
+                    this.fail(&e);
+                    return Poll::Ready(None);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod slice_chunk_stream_tests {
     use super::slice_chunk_stream;
@@ -1391,6 +1561,7 @@ pub struct HttpProxy {
 impl HttpProxy {
     /// Create a new HTTP proxy instance
     pub fn new(listen_addr: SocketAddr, config: Arc<Config>) -> Result<Self> {
+        crate::disk_cache::set_trust_unverified_ranges(config.cache.trust_unverified_ranges);
         // Convert EvictionAlgorithm to CacheEvictionAlgorithm. This used to be a match
         // written out here, which made it a second copy of the mapping that
         // `From<EvictionAlgorithm>` already owns — and a place the retired-`"lru"`-resolves-
@@ -5548,8 +5719,7 @@ impl HttpProxy {
                                                     response.status, cache_key, cached_range.start, cached_range.end
                                                 );
 
-                                                    let mut disk_cache_guard =
-                                                        disk_cache.write().await;
+                                                    let disk_cache_guard = disk_cache.read().await;
                                                     if let Err(e) = disk_cache_guard
                                                         .remove_invalidated_range(
                                                             &cache_key,
@@ -5585,7 +5755,7 @@ impl HttpProxy {
                                                 e, cache_key, cached_range.start, cached_range.end
                                             );
 
-                                                let mut disk_cache_guard = disk_cache.write().await;
+                                                let disk_cache_guard = disk_cache.read().await;
                                                 if let Err(e) = disk_cache_guard
                                                     .remove_invalidated_range(
                                                         &cache_key,
@@ -7625,7 +7795,7 @@ impl HttpProxy {
                                 "Incremental cache write incomplete for range {}-{}: {}",
                                 start, end, e
                             );
-                        } else {
+                        } else if !crate::disk_cache::is_identity_unavailable_error(&e) {
                             warn!(
                                 "Failed to commit incremental cache write for range {}-{}: {}",
                                 start, end, e
@@ -11139,7 +11309,7 @@ impl HttpProxy {
                                             );
 
                                                 // Remove the expired range since we couldn't validate it
-                                                let mut disk_cache_guard = disk_cache.write().await;
+                                                let disk_cache_guard = disk_cache.read().await;
                                                 if let Err(e) = disk_cache_guard
                                                     .remove_invalidated_range(
                                                         &cache_key,
@@ -11207,7 +11377,7 @@ impl HttpProxy {
                                         );
 
                                             // Remove the expired range since we couldn't validate it
-                                            let mut disk_cache_guard = disk_cache.write().await;
+                                            let disk_cache_guard = disk_cache.read().await;
                                             if let Err(err) = disk_cache_guard
                                                 .remove_invalidated_range(
                                                     &cache_key,
@@ -12410,11 +12580,10 @@ impl HttpProxy {
                 }
             };
 
-            // Stream range data from disk in 1 MiB chunks (was 512 KiB)
-            const DEFAULT_CHUNK_SIZE: usize = 1_048_576; // 1 MiB
+            // Stream range data from disk in `STREAMED_HIT_CHUNK_SIZE` chunks.
             let disk_open_start = Instant::now();
             match disk_cache
-                .stream_range_data(&disk_range_spec, DEFAULT_CHUNK_SIZE)
+                .stream_range_data(&disk_range_spec, STREAMED_HIT_CHUNK_SIZE)
                 .await
             {
                 Ok(data_stream) => {
@@ -12470,13 +12639,10 @@ impl HttpProxy {
                         .await;
                     }
 
-                    // Bridge the disk stream to a channel-based stream that is Send + Sync.
-                    // Spawn a task to read chunks and send Frame<Bytes> through the channel.
-                    // Mid-stream errors cause the sender to drop, terminating the connection (Requirement 5.7).
-                    let (frame_tx, frame_rx) = mpsc::channel::<
-                        std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>,
-                    >(4);
-
+                    // The body wraps the disk stream directly (`StreamedHitFrames`), so the
+                    // disk reader's channel is the only queue between disk and hyper. A
+                    // mid-stream error ends the body short of its Content-Length, terminating
+                    // the connection (Requirement 5.7).
                     // Prepare RAM cache promotion context (Requirements 2.2, 5.1, 5.2)
                     let max_ram_cache_size = config.cache.max_ram_cache_size;
                     let promotion_cache_manager = cache_manager.clone();
@@ -12491,43 +12657,18 @@ impl HttpProxy {
                     let promotion_ram_eligible = resolved.ram_cache_eligible;
                     let promotion_source = resolved.source.clone();
                     let promotion_range_handler = range_handler.clone();
-
-                    tokio::spawn(async move {
-                        use futures::StreamExt;
-                        let mut stream = std::pin::pin!(data_stream);
-
-                        // Only used to decide range_size eligibility for promotion; the
-                        // RAM entry itself is built from the on-disk frame, not these bytes
-                        // (compression-content-aware-fix Requirement 9).
-                        let promotion_eligible_by_size = range_size <= max_ram_cache_size;
-                        let mut stream_completed = true;
-
-                        while let Some(result) = stream.next().await {
-                            match result {
-                                Ok(bytes) => {
-                                    if frame_tx
-                                        .send(Ok(hyper::body::Frame::data(bytes)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        debug!("Stream receiver dropped, stopping disk read");
-                                        stream_completed = false;
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Mid-stream disk read error, terminating connection: {}",
-                                        e
-                                    );
-                                    stream_completed = false;
-                                    break; // Drop sender, which ends the stream (Requirement 5.7)
-                                }
-                            }
-                        }
-
+                    // Only used to decide range_size eligibility for promotion; the
+                    // RAM entry itself is built from the on-disk frame, not these bytes
+                    // (compression-content-aware-fix Requirement 9).
+                    let promotion_eligible_by_size = range_size <= max_ram_cache_size;
+                    // Run by the body once the disk stream has ended without an error, and
+                    // never after an error or a client that leaves.
+                    let promote: StreamedHitCompletion = Box::new(move || {
                         // Promote to RAM cache after successful streaming (Requirements 2.2, 5.1, 5.2, 6.1, 6.5)
-                        if stream_completed && promotion_eligible_by_size {
+                        if !promotion_eligible_by_size {
+                            return;
+                        }
+                        tokio::spawn(async move {
                             // RAM cache eligibility was resolved once per request
                             // and threaded in (Requirement 8.2).
                             if !promotion_ram_eligible {
@@ -12536,61 +12677,57 @@ impl HttpProxy {
                                     promotion_cache_key, promotion_source
                                 );
                                 promotion_cache_manager.record_ram_eligibility_skip();
-                            } else {
-                                // Read the on-disk frame verbatim (compressed or store-mode)
-                                // rather than re-using the decompressed streamed bytes, so the
-                                // RAM entry mirrors the full-object/write-cache promotion paths
-                                // (compression-content-aware-fix Requirement 9). The client
-                                // stream above already carries the decompressed bytes and is
-                                // unaffected.
-                                let promotion_range = crate::cache::Range {
-                                    start: promotion_start,
-                                    end: promotion_end,
-                                    data: Vec::new(),
-                                    etag: promotion_etag.clone(),
-                                    last_modified: promotion_last_modified.clone(),
-                                    compression_algorithm:
-                                        crate::compression::CompressionAlgorithm::Lz4,
-                                };
-                                match promotion_range_handler
-                                    .load_range_frame_from_new_storage(
+                                return;
+                            }
+                            // Read the on-disk frame verbatim (compressed or store-mode)
+                            // rather than re-using the decompressed streamed bytes, so the
+                            // RAM entry mirrors the full-object/write-cache promotion paths
+                            // (compression-content-aware-fix Requirement 9). The client
+                            // stream already carries the decompressed bytes and is
+                            // unaffected.
+                            let promotion_range = crate::cache::Range {
+                                start: promotion_start,
+                                end: promotion_end,
+                                data: Vec::new(),
+                                etag: promotion_etag.clone(),
+                                last_modified: promotion_last_modified.clone(),
+                                compression_algorithm:
+                                    crate::compression::CompressionAlgorithm::Lz4,
+                            };
+                            match promotion_range_handler
+                                .load_range_frame_from_new_storage(
+                                    &promotion_cache_key,
+                                    &promotion_range,
+                                )
+                                .await
+                            {
+                                Ok((frame_data, algorithm)) => {
+                                    promotion_cache_manager.promote_range_to_ram_cache_frame(
                                         &promotion_cache_key,
-                                        &promotion_range,
-                                    )
-                                    .await
-                                {
-                                    Ok((frame_data, algorithm)) => {
-                                        promotion_cache_manager.promote_range_to_ram_cache_frame(
-                                            &promotion_cache_key,
-                                            (promotion_start, promotion_end),
-                                            frame_data,
-                                            algorithm,
-                                            promotion_etag,
-                                            promotion_last_modified,
-                                            promotion_object_size,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        debug!(
-                                            "Skipping RAM cache promotion for {}: failed to load on-disk frame: {}",
-                                            promotion_cache_key, e
-                                        );
-                                    }
+                                        (promotion_start, promotion_end),
+                                        frame_data,
+                                        algorithm,
+                                        promotion_etag,
+                                        promotion_last_modified,
+                                        promotion_object_size,
+                                    );
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        "Skipping RAM cache promotion for {}: failed to load on-disk frame: {}",
+                                        promotion_cache_key, e
+                                    );
                                 }
                             }
-                        }
+                        });
                     });
-
-                    // Create a stream from the channel receiver
-                    let frame_stream = futures::stream::unfold(frame_rx, |mut rx| async move {
-                        rx.recv().await.map(|item| (item, rx))
-                    });
-
-                    // `PermitBody` requires `B: Unpin`; the `futures::stream::unfold`
-                    // future captured inside `frame_stream` is not `Unpin`, so box-pin
-                    // it first (`Pin<Box<S>>` is always `Unpin`) before wrapping.
                     let body = crate::permit_body::PermitBody::new(
-                        StreamBody::new(Box::pin(frame_stream)),
+                        StreamBody::new(StreamedHitFrames::new(
+                            data_stream,
+                            range_size,
+                            "",
+                            Some(promote),
+                        )),
                         permit,
                     )
                     .boxed();
@@ -13015,7 +13152,6 @@ impl HttpProxy {
         full_object: bool,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, BufferedServeDegradeReason>
     {
-        const SLICE_CHUNK_SIZE: usize = 256 * 1024;
         let range_size = range_spec.end - range_spec.start + 1;
         // The head and every extent's listing come from this one document, and an
         // extent taken from a pending journal `Add` is one of the version the head names.
@@ -13074,7 +13210,12 @@ impl HttpProxy {
             specs.push((spec, skip, take));
         }
         let first_stream = match disk_cache
-            .stream_range_data_from(&specs[0].0, SLICE_CHUNK_SIZE, specs[0].1)
+            .stream_range_data_between(
+                &specs[0].0,
+                STREAMED_HIT_CHUNK_SIZE,
+                specs[0].1,
+                specs[0].1 + specs[0].2,
+            )
             .await
         {
             Ok(opened) => opened,
@@ -13115,65 +13256,57 @@ impl HttpProxy {
             });
         }
 
-        let (frame_tx, frame_rx) =
-            mpsc::channel::<std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>>(4);
-        tokio::spawn(async move {
-            use futures::StreamExt;
-            let mut first = Some(first_stream);
-            'extents: for (spec, skip, take) in specs {
-                let (stream, skipped) = match first.take() {
-                    Some(opened) => opened,
-                    None => {
-                        let dc = disk_cache_manager.read().await;
-                        match dc
-                            .stream_range_data_from(&spec, SLICE_CHUNK_SIZE, skip)
-                            .await
-                        {
-                            Ok(opened) => opened,
-                            Err(e) => {
-                                error!(
-                                    "Chained stream: extent {}-{} failed to open after the head was sent, terminating connection: {}",
-                                    spec.start, spec.end, e
-                                );
-                                break 'extents;
-                            }
-                        }
-                    }
-                };
-                // An uncompressed extent was opened at `skip` already (seek).
-                let sliced = slice_chunk_stream(stream, skip - skipped, take);
-                let mut sliced = std::pin::pin!(sliced);
-                while let Some(result) = sliced.next().await {
-                    match result {
-                        Ok(bytes) => {
-                            if frame_tx
-                                .send(Ok(hyper::body::Frame::data(bytes)))
+        // Each extent after the first opens when the one before it has ended. The body wraps
+        // the chain directly (`StreamedHitFrames`): an extent that fails to open, or a read
+        // error, ends the body short of its Content-Length, and the adapter never polls the
+        // chain again, so no later extent is sent after a gap.
+        use futures::StreamExt;
+        let mut first = Some(first_stream);
+        let extents = futures::stream::iter(specs)
+            .then(move |(spec, skip, take)| {
+                let opened = first.take();
+                let dcm = disk_cache_manager.clone();
+                async move {
+                    let (stream, skipped) = match opened {
+                        Some(opened) => opened,
+                        None => {
+                            let dc = dcm.read().await;
+                            match dc
+                                .stream_range_data_between(
+                                    &spec,
+                                    STREAMED_HIT_CHUNK_SIZE,
+                                    skip,
+                                    skip + take,
+                                )
                                 .await
-                                .is_err()
                             {
-                                debug!("Chained stream receiver dropped, stopping disk read");
-                                break 'extents;
+                                Ok(opened) => opened,
+                                Err(e) => {
+                                    let err = crate::ProxyError::CacheError(format!(
+                                        "extent {}-{} failed to open after the head was sent: {}",
+                                        spec.start, spec.end, e
+                                    ));
+                                    return futures::stream::once(async move { Err(err) }).boxed();
+                                }
                             }
                         }
-                        Err(e) => {
-                            error!(
-                                "Mid-stream disk read error on chained stream, terminating connection: {}",
-                                e
-                            );
-                            break 'extents;
-                        }
-                    }
+                    };
+                    // Every extent opens at `skip` already: an uncompressed one seeks, an LZ4
+                    // one is decoded and discarded up to it by the reader.
+                    slice_chunk_stream(stream, skip - skipped, take).boxed()
                 }
-            }
-        });
-
-        let frame_stream = futures::stream::unfold(frame_rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-        let body =
-            crate::permit_body::PermitBody::new(StreamBody::new(Box::pin(frame_stream)), permit)
-                .boxed();
-
+            })
+            .flatten();
+        let body = crate::permit_body::PermitBody::new(
+            StreamBody::new(StreamedHitFrames::new(
+                extents,
+                range_size,
+                " on chained stream",
+                None,
+            )),
+            permit,
+        )
+        .boxed();
         if full_object && plan.len() == 1 {
             BUFFERED_SERVE_SLICED_STREAMS_TOTAL.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -13276,15 +13409,20 @@ impl HttpProxy {
             }
         };
 
-        // Smaller than the exact-match arm's 1 MiB: the disk stream reads ahead up to its
-        // 4-deep channel plus one chunk in hand plus its read buffer, and the bridge below
-        // holds 4 more frames, so resident bytes scale with ~10 x the chunk size. 256 KiB
-        // keeps a slice well inside BUFFERED_OPERATION_BOUND; measured with 1 MiB chunks, a
-        // 4 KiB slice grew the heap by 10.6-11.6 MB.
-        const SLICE_CHUNK_SIZE: usize = 256 * 1024;
+        // A stalled slice holds the disk channel's queued chunks plus the one waiting in
+        // `blocking_send` (both already read and decoded), the LZ4 reader's buffer, and
+        // hyper's write queue (about 400 KiB). The body wraps the disk stream directly, so
+        // there is no second queue. At `STREAMED_HIT_CHUNK_SIZE` that keeps a slice well
+        // inside BUFFERED_OPERATION_BOUND; with 1 MiB chunks and the relay channel 3.0.0
+        // had, a 4 KiB slice grew the heap by 10.6-11.6 MB.
         let data_stream = match disk_range_spec {
             Some(spec) => match disk_cache
-                .stream_range_data_from(&spec, SLICE_CHUNK_SIZE, range_spec.start - extent.start)
+                .stream_range_data_between(
+                    &spec,
+                    STREAMED_HIT_CHUNK_SIZE,
+                    range_spec.start - extent.start,
+                    range_spec.start - extent.start + range_size,
+                )
                 .await
             {
                 Ok(opened) => Ok(opened),
@@ -13389,49 +13527,23 @@ impl HttpProxy {
             });
         }
 
-        // An uncompressed extent was opened at the offset already (seek), so only an
-        // LZ4 extent is read and discarded up to it.
+        // The extent opens at the slice's offset already: an uncompressed one seeks, an LZ4
+        // one is decoded and discarded up to it by the reader.
         let skip = range_spec.start - extent.start - skipped;
         let sliced = slice_chunk_stream(data_stream, skip, range_size);
 
-        // Same mpsc bridge as the exact-match arm. Dropping `sliced` at the end of the
-        // task (after the last byte, a send failure, or an error) drops the disk stream,
-        // which stops its blocking reader.
-        let (frame_tx, frame_rx) =
-            mpsc::channel::<std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>>(4);
-        tokio::spawn(async move {
-            use futures::StreamExt;
-            let mut stream = std::pin::pin!(sliced);
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(bytes) => {
-                        if frame_tx
-                            .send(Ok(hyper::body::Frame::data(bytes)))
-                            .await
-                            .is_err()
-                        {
-                            debug!("Slice stream receiver dropped, stopping disk read");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Mid-stream disk read error on slice stream, terminating connection: {}",
-                            e
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-
-        let frame_stream = futures::stream::unfold(frame_rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-        let body =
-            crate::permit_body::PermitBody::new(StreamBody::new(Box::pin(frame_stream)), permit)
-                .boxed();
-
+        // The body wraps `sliced` directly. Dropping the body (after the last byte, an error,
+        // or a client that leaves) drops the disk stream, which stops its blocking reader.
+        let body = crate::permit_body::PermitBody::new(
+            StreamBody::new(StreamedHitFrames::new(
+                sliced,
+                range_size,
+                " on slice stream",
+                None,
+            )),
+            permit,
+        )
+        .boxed();
         BUFFERED_SERVE_SLICED_STREAMS_TOTAL.fetch_add(1, Ordering::Relaxed);
         debug!(
             "GET Disk (slice streaming) range cache HIT for {} range {}-{} from extent {}-{}",
@@ -14930,6 +15042,15 @@ impl HttpProxy {
         Ok(())
     }
 
+    /// Whether an error from [`Self::cache_response_appropriately`] is a fill whose file identity
+    /// could not be taken. That failure was logged once, with the key and the path, where it was
+    /// found, so a caller does not log it again.
+    fn identity_failure_already_logged(e: &str) -> bool {
+        e == crate::error::ProxyError::CacheError(
+            crate::disk_cache::IdentityUnavailable.to_string(),
+        )
+        .to_string()
+    }
     /// Forward GET/HEAD request to S3 with download coordination (InFlightTracker).
     ///
     /// When download coordination is enabled, this method coordinates concurrent requests
@@ -18312,7 +18433,9 @@ impl HttpProxy {
                                                 "Incremental cache write incomplete for GET response: cache_key={}, error={}",
                                                 cache_key_clone, e
                                             );
-                                        } else {
+                                        } else if !crate::disk_cache::is_identity_unavailable_error(
+                                            &e,
+                                        ) {
                                             warn!(
                                                 "Failed to commit incremental cache write for GET response: cache_key={}, error={}",
                                                 cache_key_clone, e
@@ -18439,10 +18562,12 @@ impl HttpProxy {
                                             )
                                             .await
                                             {
-                                                warn!(
-                                                    "Failed to cache streamed response: cache_key={}, error={}",
-                                                    cache_key_clone, e
-                                                );
+                                                if !Self::identity_failure_already_logged(&e) {
+                                                    warn!(
+                                                        "Failed to cache streamed response: cache_key={}, error={}",
+                                                        cache_key_clone, e
+                                                    );
+                                                }
                                                 if let Some(guard) = spawn_guard {
                                                     guard.complete_error(format!(
                                                         "fallback cache write failed: {}",
@@ -18561,10 +18686,12 @@ impl HttpProxy {
                             )
                             .await
                             {
-                                warn!(
-                                    "Failed to cache buffered response: cache_key={}, error={}",
-                                    cache_key, e
-                                );
+                                if !Self::identity_failure_already_logged(&e) {
+                                    warn!(
+                                        "Failed to cache buffered response: cache_key={}, error={}",
+                                        cache_key, e
+                                    );
+                                }
                                 if let Some(guard) = coordination_guard {
                                     guard.complete_error(format!(
                                         "buffered cache write failed: {}",
@@ -19087,7 +19214,7 @@ impl HttpProxy {
                                          response: cache_key={}, range={}-{}, error={}",
                                         cache_key_clone, start, end, e
                                     );
-                                } else {
+                                } else if !crate::disk_cache::is_identity_unavailable_error(&e) {
                                     warn!(
                                         "Failed to commit incremental cache write for signed \
                                          range response: cache_key={}, range={}-{}, error={}",
@@ -23689,8 +23816,10 @@ mod unservable_reread_tests {
     }
 
     /// A listing written before 3.0.0 (no file identity) at offset 0, ending before the
-    /// object's last byte, is refetched like a marked one; the whole-object listing beside it,
-    /// one byte longer, is served.
+    /// object's last byte, is refetched like a marked one. The whole-object listing beside it,
+    /// one byte longer, is outside the offset-0 rule, and since 3.0.1 is refused by default for
+    /// having no identity (R13.1); `cache.trust_unverified_ranges` serves it, which this
+    /// process-wide lib binary cannot switch on, so the rule's exemption is asserted directly.
     #[test]
     fn a_reread_refuses_a_pre_3_0_0_listing_at_zero_short_of_the_end() {
         let mut meta = NewCacheMetadata {
@@ -23707,9 +23836,14 @@ mod unservable_reread_tests {
             ExtentSpecReread::Unservable,
             "a re-read resolved a pre-3.0.0 listing at offset 0 short of the object's end"
         );
+        assert!(
+            !meta.ranges[1].is_unverified_prefix(1024),
+            "the offset-0 rule refused the whole-object listing"
+        );
         assert_eq!(
             reread_extent_spec(Some(&meta), 0, 1023),
-            ExtentSpecReread::Listed(meta.ranges[1].clone())
+            ExtentSpecReread::Unservable,
+            "R13.1: a re-read resolved a whole-object listing with no file identity"
         );
     }
 }
@@ -24673,6 +24807,184 @@ mod head_listing_one_read_tests {
         d(Arm::Chained, "test-bucket/case31/d-chained.bin").await;
     }
 
+    /// Remove `file_identity` from every range in every journal line under `dir`, as a 2.x
+    /// writer journals its fills. Returns the rewritten text of the journals.
+    fn strip_journal_identities(dir: &Path) -> String {
+        let mut all = String::new();
+        for entry in std::fs::read_dir(dir.join("metadata/_journals")).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.to_string_lossy().ends_with(".journal") {
+                continue;
+            }
+            let mut out = String::new();
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(mut v) => {
+                        if let Some(spec) = v.get_mut("range_spec").and_then(|s| s.as_object_mut())
+                        {
+                            spec.remove("file_identity");
+                        }
+                        out.push_str(&serde_json::to_string(&v).unwrap());
+                    }
+                    Err(_) => out.push_str(line),
+                }
+                out.push('\n');
+            }
+            std::fs::write(&path, &out).unwrap();
+            all.push_str(&out);
+        }
+        all
+    }
+
+    /// v1's `.meta` lists `[0, LEN)`; a peer's journal holds a pending `Add` of v1
+    /// for `[LEN, 2 LEN)` with no file identity (a 2.x writer's line); v2's file is at the
+    /// path and no journal names it.
+    async fn identity_less_pending_fixture(
+        key: &str,
+    ) -> (Vec<TempDir>, Arc<CacheManager>, Arc<RangeHandler>) {
+        let local = TempDir::new().unwrap();
+        let (manager, rh) = setup(local.path());
+        fill(&manager, key, 0, V1, ETAG_V1).await;
+        consolidate(&manager, key).await;
+        let peer = TempDir::new().unwrap();
+        let (peer_manager, _) = setup(peer.path());
+        fill(&peer_manager, key, LEN, V1, ETAG_V1).await;
+        let journals = strip_journal_identities(peer.path());
+        assert!(
+            journals.contains("range_spec") && !journals.contains("file_identity"),
+            "fixture: the peer's Add records no file identity"
+        );
+        for entry in std::fs::read_dir(peer.path().join("metadata/_journals")).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".journal") {
+                std::fs::copy(
+                    entry.path(),
+                    local
+                        .path()
+                        .join("metadata/_journals")
+                        .join(format!("peer-{}", name)),
+                )
+                .unwrap();
+            }
+        }
+        let other = TempDir::new().unwrap();
+        let (other_manager, _) = setup(other.path());
+        fill(&other_manager, key, LEN, V2, ETAG_V2).await;
+        let v2 = other_manager
+            .create_configured_disk_cache_manager()
+            .find_pending_journal_ranges(key, LEN, 2 * LEN - 1)
+            .await
+            .expect("v2 pending lookup");
+        assert_eq!(v2.len(), 1, "fixture: v2's fill is journal-pending");
+        let local_bin = local.path().join("ranges").join(&v2[0].file_path);
+        std::fs::create_dir_all(local_bin.parent().unwrap()).unwrap();
+        std::fs::rename(
+            other.path().join("ranges").join(&v2[0].file_path),
+            &local_bin,
+        )
+        .expect("v2's .bin at the path");
+        let meta = read_meta(&manager.get_new_metadata_file_path(key));
+        assert_eq!(
+            meta.object_metadata.etag, ETAG_V1,
+            "fixture: the head is v1"
+        );
+        assert!(
+            meta.ranges.iter().all(|r| r.start != LEN),
+            "fixture: the .meta does not list the extent"
+        );
+        (vec![local, peer, other], manager, rh)
+    }
+
+    /// The journal-window lookup does not count an identity-less pending
+    /// `Add` as coverage, so v2's bytes are never sent under v1's head.
+    #[tokio::test]
+    async fn journal_window_refuses_an_identity_less_pending_add() {
+        for (arm, key) in [
+            (Arm::Exact, "test-bucket/q1-exact.bin"),
+            (Arm::Slice, "test-bucket/q1-slice.bin"),
+            (Arm::Chained, "test-bucket/q1-chained.bin"),
+        ] {
+            let (_dirs, manager, rh) = identity_less_pending_fixture(key).await;
+            let served = serve(arm, key, &manager, &rh, LEN, ETAG_V1).await;
+            assert_head_names_the_bytes(&format!("identity-less pending Add {:?}", arm), &served);
+            assert!(
+                !served.status.is_success(),
+                "identity-less pending Add {:?}: an identity-less pending Add was served (status {}, {} bytes)",
+                arm,
+                served.status,
+                served.body.len()
+            );
+        }
+    }
+
+    /// What a 2.8 consolidator leaves. v1's `.meta` lists `[LEN, 2 LEN)` with no
+    /// file identity, and v2's file is at the path. Above offset 0, so the offset-0 rule
+    /// (`RangeSpec::is_unverified_prefix`) does not refuse it.
+    async fn identity_less_listing_fixture(key: &str) -> Overwrite {
+        let local = TempDir::new().unwrap();
+        let (manager, rh) = setup(local.path());
+        fill(&manager, key, LEN, V1, ETAG_V1).await;
+        consolidate(&manager, key).await;
+        let foreign = TempDir::new().unwrap();
+        let (foreign_manager, _) = setup(foreign.path());
+        fill(&foreign_manager, key, LEN, V2, ETAG_V2).await;
+        consolidate(&foreign_manager, key).await;
+        let local_meta = manager.get_new_metadata_file_path(key);
+        let foreign_meta = foreign_manager.get_new_metadata_file_path(key);
+        let l = read_meta(&local_meta);
+        let f = read_meta(&foreign_meta);
+        assert_eq!(l.ranges.len(), 1, "fixture: v1 lists one extent");
+        assert_eq!(l.ranges[0].start, LEN, "fixture: v1's extent starts at LEN");
+        assert_eq!(
+            l.ranges[0].file_path, f.ranges[0].file_path,
+            "fixture: one path"
+        );
+        let local_bin = local.path().join("ranges").join(&l.ranges[0].file_path);
+        let foreign_bin = foreign.path().join("ranges").join(&f.ranges[0].file_path);
+        let fx = Overwrite {
+            _local: local,
+            _foreign: foreign,
+            manager,
+            rh,
+            local_meta,
+            foreign_meta,
+            local_bin,
+            foreign_bin,
+        };
+        let mut meta = read_meta(&fx.local_meta);
+        meta.ranges[0].file_identity = None;
+        std::fs::write(&fx.local_meta, serde_json::to_vec(&meta).unwrap()).expect("v1 .meta");
+        std::fs::rename(&fx.foreign_bin, &fx.local_bin).expect("v2 .bin over the path");
+        fx.manager.invalidate_metadata_cache(key).await;
+        assert!(
+            read_meta(&fx.local_meta).ranges[0].file_identity.is_none(),
+            "fixture: the listing records no identity"
+        );
+        fx
+    }
+
+    /// A listing with no file identity is not served.
+    #[tokio::test]
+    async fn an_identity_less_listing_is_not_served() {
+        for (arm, key) in [
+            (Arm::Exact, "test-bucket/q3-exact.bin"),
+            (Arm::Slice, "test-bucket/q3-slice.bin"),
+            (Arm::Chained, "test-bucket/q3-chained.bin"),
+        ] {
+            let fx = identity_less_listing_fixture(key).await;
+            let served = serve(arm, key, &fx.manager, &fx.rh, LEN, ETAG_V1).await;
+            assert_head_names_the_bytes(&format!("identity-less listing {:?}", arm), &served);
+            assert!(
+                !served.status.is_success(),
+                "identity-less listing {:?}: an identity-less listing was served (status {}, {} bytes)",
+                arm,
+                served.status,
+                served.body.len()
+            );
+        }
+    }
+
     /// The schedule after the eviction: the extent is evicted (its `.bin` unlinked,
     /// then the `.meta`, which listed nothing else) and a fill of v2 publishes a new file at the
     /// path (no `.meta`, so the publish guard has no version to compare). The fill's file carries
@@ -24833,9 +25145,23 @@ mod head_listing_one_read_tests {
             ),
             "precondition: the page is in RAM"
         );
+        // R13.3: a RAM copy is served only while the `.meta` lists a servable extent covering
+        // it, so the document lists the page's extent with an identity, as a 3.0.x writer does.
         let meta = crate::cache_types::NewCacheMetadata {
             cache_key: key.to_string(),
             object_metadata: object_metadata(if overwritten { ETAG_V2 } else { ETAG_V1 }),
+            ranges: vec![crate::cache_types::RangeSpec::new(
+                0,
+                1023,
+                format!("{}_0-1023.bin", key),
+                crate::compression::CompressionAlgorithm::None,
+                1024,
+                1024,
+            )
+            .with_file_identity(Some(crate::cache_types::RangeFileIdentity {
+                size: 1024,
+                mtime_ns: 1,
+            }))],
             ..Default::default()
         };
         let path = manager.get_new_metadata_file_path(key);
@@ -24876,6 +25202,147 @@ mod head_listing_one_read_tests {
         )
         .await;
         (result.ok().map(|(data, _, _)| data), served_from_cache)
+    }
+
+    /// A page in RAM under `label`, its bytes (`b'Z'`) standing for another
+    /// version's; the shared `.meta` names `label` and lists `listing` at the page's extent
+    /// (`None`: nothing listed, as after a retire). `revalidate` records a `304` first, which
+    /// re-anchors the live TTL. Returns what `fill_page` served past the verification interval.
+    async fn ram_retire_case(
+        key: &str,
+        label: &str,
+        listing: Option<Option<crate::cache_types::RangeFileIdentity>>,
+        revalidate: bool,
+    ) -> (Option<Bytes>, bool) {
+        let dir = TempDir::new().unwrap();
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        let mut manager = CacheManager::new_with_eviction_algorithm(
+            dir.path().to_path_buf(),
+            true,
+            64 * 1024 * 1024,
+            CacheEvictionAlgorithm::TinyLFU,
+        );
+        manager.set_ram_cache_verification_interval(Duration::from_millis(50));
+        let manager = Arc::new(manager);
+        let dcm = Arc::new(tokio::sync::RwLock::new(
+            manager.create_configured_disk_cache_manager(),
+        ));
+        let rh = Arc::new(RangeHandler::new(manager.clone(), dcm));
+        assert!(
+            manager.promote_range_to_ram_cache_frame(
+                key,
+                (0, 1023),
+                vec![b'Z'; 1024],
+                crate::compression::CompressionAlgorithm::None,
+                label.to_string(),
+                String::new(),
+                1u64 << 40,
+            ),
+            "precondition: the page is in RAM"
+        );
+        let ranges = listing
+            .map(|identity| {
+                vec![crate::cache_types::RangeSpec::new(
+                    0,
+                    1023,
+                    format!("{}_0-1023.bin", key),
+                    crate::compression::CompressionAlgorithm::None,
+                    1024,
+                    1024,
+                )
+                .with_file_identity(identity)]
+            })
+            .unwrap_or_default();
+        let meta = crate::cache_types::NewCacheMetadata {
+            cache_key: key.to_string(),
+            object_metadata: object_metadata(label),
+            ranges,
+            ..Default::default()
+        };
+        let path = manager.get_new_metadata_file_path(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        if revalidate {
+            manager
+                .create_configured_disk_cache_manager()
+                .record_origin_validation(key, Duration::from_secs(3600))
+                .await
+                .expect("the 304 re-anchors the live TTL");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let resolved = crate::bucket_settings::ResolvedSettings {
+            page_widening: true,
+            page_size: 1024,
+            get_ttl: Duration::from_secs(3600),
+            ram_cache_eligible: true,
+            ..Default::default()
+        };
+        let s3: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(NoS3);
+        let uri: hyper::Uri = format!("/{}", key).parse().unwrap();
+        let mut served_from_cache = false;
+        let result = HttpProxy::fill_page(
+            key,
+            0,
+            1023,
+            &HashMap::new(),
+            None,
+            &manager,
+            &rh,
+            &s3,
+            "s3.us-west-2.amazonaws.com",
+            &uri,
+            &resolved,
+            &Arc::new(InFlightTracker::new()),
+            &None,
+            &None,
+            Duration::from_secs(1),
+            None,
+            1.0,
+            false,
+            None,
+            &mut served_from_cache,
+        )
+        .await;
+        (result.ok().map(|(data, _, _)| data), served_from_cache)
+    }
+
+    fn served_the_ram_page(served: &Option<Bytes>) -> bool {
+        served
+            .as_ref()
+            .is_some_and(|d| !d.is_empty() && d.iter().all(|b| *b == b'Z'))
+    }
+
+    /// The retire unlisted the extent and kept the ETag; the RAM copy must
+    /// not outlive it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ram_page_is_not_served_once_the_meta_unlists_its_extent() {
+        let (served, from_cache) =
+            ram_retire_case("test-bucket/q2-retired.bin", ETAG_V1, None, false).await;
+        assert!(
+            !served_the_ram_page(&served),
+            "RAM PAGE OUTLIVED THE RETIRE: served from RAM (served_from_cache={}) \
+             under {} after the .meta stopped listing its extent",
+            from_cache,
+            ETAG_V1
+        );
+    }
+
+    /// The inverted orientation: the `.meta` names the current version (v2) and
+    /// lists the extent with no identity over v1's bytes; a `304` re-anchors the live TTL. The
+    /// RAM copy must not be served (R13.1, R13.3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ram_page_under_an_identity_less_listing_is_not_served_after_a_304() {
+        let (served, from_cache) =
+            ram_retire_case("test-bucket/q2-inverted.bin", ETAG_V2, Some(None), true).await;
+        assert!(
+            !served_the_ram_page(&served),
+            "RAM PAGE SERVED (inverted orientation) UNDER AN IDENTITY-LESS LISTING after a 304 \
+             (served_from_cache={}) under {}",
+            from_cache,
+            ETAG_V2
+        );
     }
 
     // Multi-threaded: RAM promotion uses `block_in_place`.
@@ -26771,6 +27238,167 @@ mod metadata_io_limits_wiring_tests {
                 .await
                 .metadata_io_limits_for_tests(),
             (8_388_608, 7)
+        );
+    }
+}
+
+#[cfg(test)]
+mod streamed_hit_frames_tests {
+    //! `StreamedHitFrames`, the body of a cache hit streamed from disk: how it ends on an
+    //! error, stops the read when dropped, and when it runs RAM promotion.
+    use super::{StreamedHitCompletion, StreamedHitFrames};
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn completion() -> (Arc<AtomicBool>, StreamedHitCompletion) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        (ran, Box::new(move || flag.store(true, Ordering::SeqCst)))
+    }
+
+    fn data(item: Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>) -> Bytes {
+        item.expect("a frame")
+            .expect("not an error")
+            .into_data()
+            .expect("a data frame")
+    }
+
+    fn read_error() -> crate::ProxyError {
+        crate::ProxyError::CacheError("injected read error".to_string())
+    }
+
+    /// A mid-stream read error ends the body after the bytes before it, short of its length,
+    /// and promotion does not run.
+    #[tokio::test]
+    async fn a_mid_stream_error_ends_the_body_short_and_skips_promotion() {
+        let (ran, on_complete) = completion();
+        let inner = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"abcd")),
+            Err(read_error()),
+            Ok(Bytes::from_static(b"efgh")),
+        ]);
+        let mut body = StreamedHitFrames::new(inner, 8, "", Some(on_complete));
+        assert_eq!(data(body.next().await), Bytes::from_static(b"abcd"));
+        assert!(
+            body.next().await.is_none(),
+            "the body must end at the error"
+        );
+        assert!(body.next().await.is_none(), "and stay ended");
+        assert!(!ran.load(Ordering::SeqCst), "no promotion after an error");
+    }
+
+    /// Dropping the body, as hyper does when the client goes, stops the disk read: the
+    /// reader's next send fails. Promotion does not run.
+    #[tokio::test]
+    async fn dropping_the_body_stops_the_disk_read_and_skips_promotion() {
+        let (ran, on_complete) = completion();
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::Result<Bytes>>(1);
+        let mut body = StreamedHitFrames::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+            8,
+            "",
+            Some(on_complete),
+        );
+        tx.send(Ok(Bytes::from_static(b"abcd"))).await.unwrap();
+        assert_eq!(data(body.next().await).len(), 4);
+        drop(body);
+        assert!(
+            tx.send(Ok(Bytes::from_static(b"efgh"))).await.is_err(),
+            "the reader's next send must fail once the body is dropped"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "no promotion after a disconnect"
+        );
+    }
+
+    /// Promotion runs once the disk stream has ended clean, and before the frame that
+    /// completes the length is handed over: hyper drops a body whose `Content-Length` is met
+    /// without polling it again, so a promotion run only at the stream's end would never run.
+    #[tokio::test]
+    async fn promotion_runs_before_the_last_frame_of_a_complete_stream() {
+        let (ran, on_complete) = completion();
+        let inner = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"abcd")),
+            Ok(Bytes::from_static(b"efgh")),
+        ]);
+        let mut body = StreamedHitFrames::new(inner, 8, "", Some(on_complete));
+        assert_eq!(data(body.next().await).len(), 4);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "no promotion before the stream completes"
+        );
+        assert_eq!(data(body.next().await), Bytes::from_static(b"efgh"));
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "promotion must have run by the time the last frame is handed over"
+        );
+        assert!(body.next().await.is_none());
+    }
+
+    /// An error after the last byte drops the held chunk, so the body ends short of its
+    /// `Content-Length` and the response is never completed (R15.3), and promotion does not
+    /// run.
+    #[tokio::test]
+    async fn an_error_after_the_last_byte_drops_it_and_skips_promotion() {
+        let (ran, on_complete) = completion();
+        let inner = futures::stream::iter(vec![Ok(Bytes::from_static(b"abcd")), Err(read_error())]);
+        let mut body = StreamedHitFrames::new(inner, 4, "", Some(on_complete));
+        assert!(
+            body.next().await.is_none(),
+            "the chunk held when the stream failed must not be delivered"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "no promotion after an error");
+    }
+    /// A disk stream that yields bytes past the response's length (a file that decodes longer
+    /// than its listing) drops the held chunk the same way (R15.3).
+    #[tokio::test]
+    async fn bytes_past_the_length_drop_the_last_chunk_and_skips_promotion() {
+        let (ran, on_complete) = completion();
+        let inner = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"abcd")),
+            Ok(Bytes::from_static(b"e")),
+        ]);
+        let mut body = StreamedHitFrames::new(inner, 4, "", Some(on_complete));
+        assert!(
+            body.next().await.is_none(),
+            "the chunk held when the stream overran must not be delivered"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "no promotion after an overrun");
+    }
+    /// A chunk longer than the bytes remaining (a file that decodes longer than its listing,
+    /// in one read) is never held or delivered, and promotion does not run (R15.3).
+    #[tokio::test]
+    async fn an_over_long_last_chunk_is_not_delivered_and_skips_promotion() {
+        let (ran, on_complete) = completion();
+        let inner = futures::stream::iter(vec![Ok(Bytes::from_static(b"abcde"))]);
+        let mut body = StreamedHitFrames::new(inner, 4, "", Some(on_complete));
+        assert!(
+            body.next().await.is_none(),
+            "SA1: A CHUNK LONGER THAN THE BYTES REMAINING WAS DELIVERED"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "SA1: PROMOTION RAN AFTER AN OVER-LONG CHUNK"
+        );
+    }
+    /// A stream that ends clean short of the response's length (a file that decodes shorter
+    /// than its listing) ends the body short, and promotion does not run.
+    #[tokio::test]
+    async fn a_stream_that_ends_short_skips_promotion() {
+        let (ran, on_complete) = completion();
+        let inner = futures::stream::iter(vec![Ok(Bytes::from_static(b"abc"))]);
+        let mut body = StreamedHitFrames::new(inner, 4, "", Some(on_complete));
+        assert_eq!(data(body.next().await), Bytes::from_static(b"abc"));
+        assert!(
+            body.next().await.is_none(),
+            "the body must end at the stream's end"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "SA1: PROMOTION RAN AFTER A STREAM THAT ENDED SHORT OF ITS LENGTH"
         );
     }
 }

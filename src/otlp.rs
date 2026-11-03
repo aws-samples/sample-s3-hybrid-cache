@@ -481,6 +481,8 @@ struct Instruments {
     atomic_metadata_range_file_corruption_healed: Gauge<u64>,
     atomic_metadata_range_file_corruption_heal_suppressed: Gauge<u64>,
     atomic_metadata_range_file_identity_mismatch_detected: Gauge<u64>,
+    atomic_metadata_unverified_ranges_refused: Gauge<u64>,
+    atomic_metadata_retired_fill_files_unlinked: Gauge<u64>,
     atomic_metadata_journal_validation_failures: Gauge<u64>,
     // -- consolidation: the shared size state the consolidator last wrote --
     //
@@ -1207,6 +1209,12 @@ impl OtlpExporter {
             atomic_metadata_range_file_identity_mismatch_detected: g_u64!(
                 "atomic_metadata.range_file_identity_mismatch_detected"
             ),
+            atomic_metadata_unverified_ranges_refused: g_u64!(
+                "atomic_metadata.unverified_ranges_refused"
+            ),
+            atomic_metadata_retired_fill_files_unlinked: g_u64!(
+                "atomic_metadata.retired_fill_files_unlinked"
+            ),
             atomic_metadata_journal_validation_failures: g_u64!(
                 "atomic_metadata.journal_validation_failures"
             ),
@@ -1836,6 +1844,10 @@ impl OtlpExporter {
                 .record(am.range_file_corruption_heal_suppressed, a);
             i.atomic_metadata_range_file_identity_mismatch_detected
                 .record(am.range_file_identity_mismatch_detected, a);
+            i.atomic_metadata_unverified_ranges_refused
+                .record(am.unverified_ranges_refused, a);
+            i.atomic_metadata_retired_fill_files_unlinked
+                .record(am.retired_fill_files_unlinked, a);
             i.atomic_metadata_journal_validation_failures
                 .record(am.journal_validation_failures, a);
         }

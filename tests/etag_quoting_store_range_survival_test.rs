@@ -62,6 +62,7 @@ fn object_metadata(etag: &str, len: u64) -> s3_proxy::cache_types::ObjectMetadat
         compressed_size: 0,
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
+        part_layout_verified: false,
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,

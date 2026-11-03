@@ -315,6 +315,14 @@ async fn prepare_order_inverting_rename_order_never_lists_an_extent_over_the_oth
         .expect("prepare B")
         .expect("B admitted");
     b.finish().await.expect("B publishes");
+    // 700 s back stands in for a 3.0.0 peer, which renames over a pending fill on a cold key.
+    filetime::set_file_mtime(
+        dcm_b.get_new_range_file_path(KEY, 0, EXTENT - 1),
+        filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(700),
+        ),
+    )
+    .expect("age page 0");
     // A renames last (t4): the page-0 `.bin` now holds v1.
     a.finish().await.expect("A publishes");
     // B fills page 1 as v2 (t5): the newest entry, so the new `.meta` is v2.

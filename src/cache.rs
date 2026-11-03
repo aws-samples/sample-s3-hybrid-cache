@@ -5193,8 +5193,10 @@ struct PriorDocument {
 /// Instance-scoped temp path for a range file under `ranges/`, the sibling of
 /// [`instance_scoped_meta_tmp_path`].
 ///
-/// - `nonce: None` (family D, the whole-buffer range writers): `{key}_{s}-{e}.bin.tmp.{host}.{pid}`.
-/// - `nonce: Some(r)` (family E1, the streamed incremental writer): `{key}_{s}-{e}.{r:08x}.tmp.{host}.{pid}`.
+/// - `nonce: None` (family D, the shared name 3.0.0's whole-buffer range writers used, which
+///   still matches their leftovers): `{key}_{s}-{e}.bin.tmp.{host}.{pid}`.
+/// - `nonce: Some(r)` (family E1, every range writer since 3.0.1, R10.1):
+///   `{key}_{s}-{e}.{r:08x}.tmp.{host}.{pid}`.
 ///
 /// Both end in `.tmp.{host}.{pid}`, the anchored shape
 /// `journal_consolidator::dead_instance_temp_owner` matches, so the startup reaper can tell a
@@ -7297,8 +7299,17 @@ pub struct CacheManager {
 /// Spec: ram-tier-effectiveness Requirement 4, criteria 2a-2d.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RamVerifyDiskCheck {
-    /// The `.meta` exists and parsed; carries its current etag.
+    /// The `.meta` exists and parsed; carries its current etag. The extents it lists are not
+    /// known, so only the etag is compared.
     Found(String),
+    /// The `.meta` exists and parsed: its etag, its object's length, and the extents a read may
+    /// serve from it. A RAM copy is served only while its extent is covered (R13.3). What
+    /// [`CacheManager::get_metadata_etag_for_ram_verify`] returns.
+    Listed {
+        etag: String,
+        content_length: u64,
+        servable: Vec<(u64, u64)>,
+    },
     /// The `.meta` does not exist. Not a match — treated as a miss
     /// (criterion 2c): another instance may have deleted the object.
     Absent,
@@ -7308,6 +7319,38 @@ pub enum RamVerifyDiskCheck {
     IoError,
 }
 
+/// Whether `servable` (a `.meta`'s servable extents) covers the RAM entry `range_cache_key`:
+/// `{key}:range:{start}:{end}` names its extent; any other key is a whole-object copy.
+fn ram_hit_covered(range_cache_key: &str, content_length: u64, servable: &[(u64, u64)]) -> bool {
+    let extent = match range_cache_key.rsplit_once(":range:") {
+        Some((_, tail)) => {
+            let Some((s, e)) = tail.split_once(':') else {
+                return false;
+            };
+            match (s.parse::<u64>(), e.parse::<u64>()) {
+                (Ok(s), Ok(e)) if s <= e => (s, e),
+                _ => return false,
+            }
+        }
+        None if content_length == 0 => return true,
+        None => (0, content_length - 1),
+    };
+    let mut sorted = servable.to_vec();
+    sorted.sort_unstable();
+    let mut next = extent.0;
+    for (s, e) in sorted {
+        if s > next {
+            break;
+        }
+        if e >= next {
+            if e >= extent.1 {
+                return true;
+            }
+            next = e + 1;
+        }
+    }
+    false
+}
 /// Smallest `ram_verify_locks` size at which a reap of stale states runs.
 const RAM_VERIFY_LOCKS_PRUNE_FLOOR: usize = 1_024;
 
@@ -8775,7 +8818,8 @@ impl CacheManager {
             read_cache_enabled: true,     // Default enabled
             bucket_settings_staleness_threshold: std::time::Duration::from_secs(60), // Default 60s
             evaluate_conditions_from_cache: true, // Default: serve If-Match from cache when ETag matches
-            ram_cache_shard_count: 8,             // Default shard count
+            trust_unverified_ranges: false,
+            ram_cache_shard_count: 8,                  // Default shard count
             max_complete_body_bytes: 10 * 1024 * 1024, // 10 MiB default
             disk_safety_free_space_floor: DISK_SAFETY_FREE_SPACE_FLOOR_BYTES,
             max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default
@@ -9392,6 +9436,7 @@ impl CacheManager {
             compressed_size: 0,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -11099,8 +11144,9 @@ impl CacheManager {
 
             // Write range data to .tmp file then atomically rename
             let range_file_path = self.get_new_range_file_path(&cache_key, start, end);
-            // Instance-scoped `{key}_{s}-{e}.bin.tmp.{host}.{pid}`.
-            let range_tmp_path = instance_scoped_range_tmp_path(&range_file_path, None);
+            // This fill's own temp name, opened `create_new` (R10.1).
+            let range_tmp_path =
+                instance_scoped_range_tmp_path(&range_file_path, Some(fastrand::u32(..)));
 
             // Ensure ranges directory exists
             if let Some(parent) = range_file_path.parent() {
@@ -11110,17 +11156,26 @@ impl CacheManager {
             }
 
             // Write to temporary file
-            let file_identity =
-                crate::disk_cache::write_synced_identity(&range_tmp_path, &compressed_data)
-                    .map_err(|e| {
-                        crate::disk_cache::note_disk_full(&e, "complete_multipart_upload.bin_tmp");
-                        // Best-effort cleanup of temp file on write failure
-                        let _ = std::fs::remove_file(&range_tmp_path);
-                        ProxyError::CacheError(format!(
-                            "Failed to write range tmp file for part {}: {}",
-                            part.part_number, e
-                        ))
-                    })?;
+            let written = crate::disk_cache::write_synced_identity_exclusive(
+                &range_tmp_path,
+                &compressed_data,
+                &cache_key,
+            )
+            .map_err(|e| {
+                // Logged once, with the key and the path, where it was found.
+                if crate::disk_cache::is_identity_unavailable(&e) {
+                    return ProxyError::CacheError(e.to_string());
+                }
+                crate::disk_cache::note_disk_full(&e, "complete_multipart_upload.bin_tmp");
+                // Best-effort cleanup of temp file on write failure, unless it is not ours.
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    let _ = std::fs::remove_file(&range_tmp_path);
+                }
+                ProxyError::CacheError(format!(
+                    "Failed to write range tmp file for part {}: {}",
+                    part.part_number, e
+                ))
+            })?;
 
             // Atomic rename
             std::fs::rename(&range_tmp_path, &range_file_path).map_err(|e| {
@@ -11165,7 +11220,7 @@ impl CacheManager {
                 uncompressed_size,
                 counts_as_staged,
             )
-            .with_file_identity(file_identity);
+            .with_file_identity(Some(written.identity));
             range_specs.push(range_spec);
             current_position += part.size;
 
@@ -11208,6 +11263,7 @@ impl CacheManager {
 
         object_metadata.parts_count = None;
         object_metadata.part_ranges.clear();
+        object_metadata.part_layout_verified = false;
         object_metadata.upload_id = None;
 
         if had_parts_count || had_part_ranges || had_upload_id {
@@ -18375,11 +18431,25 @@ impl CacheManager {
                 _ => continue,
             }
 
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(file) = std::fs::File::open(&path) else {
                 continue;
             };
             EVICTION_ACTIVE_KEY_JOURNAL_READS.fetch_add(1, AtomicOrdering::Relaxed);
-            for line in content.lines() {
+            // A line at a time, so the pass holds one line of journal bytes rather than the
+            // largest journal. A line that is not UTF-8 is skipped like an unparseable one (the
+            // whole-file read skipped the file); a read error ends the file.
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let Ok(line) = std::str::from_utf8(&buf) else {
+                    continue;
+                };
+                let line = line.trim_end_matches(['\n', '\r']);
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -18847,11 +18917,6 @@ impl CacheManager {
         Ok(cleaned_count)
     }
 
-    /// Calculate expiration time based on cache headers - Requirements 5.1, 5.2, 5.3, 5.4, 5.5
-    fn calculate_expiration_time(&self, headers: &HashMap<String, String>) -> SystemTime {
-        self.calculate_expiration_time_with_get_ttl(headers, self.get_ttl)
-    }
-
     /// Calculate expiration time with path for TTL overrides
     async fn calculate_expiration_time_with_context(
         &self,
@@ -19109,6 +19174,68 @@ impl CacheManager {
             .await
     }
 
+    /// Clear a part layout no 3.0.1 gate recorded, under the key's slot
+    /// lock. The `.meta` is re-read there, so a layout recorded, or a document replaced, since
+    /// the caller's read is left alone. Best effort: on failure the layout stays, and the next
+    /// lookup refuses it again.
+    async fn clear_unverified_part_layout(&self, cache_key: &str) {
+        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
+        let _meta_lock = match crate::metadata_lock_manager::acquire_slot_lock_within_budget(
+            &self.cache_dir,
+            cache_key,
+        )
+        .await
+        {
+            Ok(lock) => lock,
+            Err(e) => {
+                debug!(
+                    "Unverified part layout not cleared (slot lock): key={}, error={}",
+                    cache_key, e
+                );
+                return;
+            }
+        };
+        let Ok(Some(mut metadata)) = self.read_metadata_file(cache_key).await else {
+            return;
+        };
+        let layout = &mut metadata.object_metadata;
+        if layout.part_layout_verified
+            || (layout.part_ranges.is_empty() && layout.parts_count.is_none())
+        {
+            return;
+        }
+        let (parts, parts_count) = (layout.part_ranges.len(), layout.parts_count);
+        layout.part_ranges.clear();
+        layout.parts_count = None;
+        let written = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| e.to_string())
+            .and_then(|metadata_json| {
+                let metadata_tmp_path = instance_scoped_meta_tmp_path(&metadata_file_path);
+                crate::disk_cache::write_synced(&metadata_tmp_path, &metadata_json).map_err(
+                    |e| {
+                        crate::disk_cache::note_disk_full(&e, "clear_unverified_part_layout");
+                        e.to_string()
+                    },
+                )?;
+                std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
+                    let _ = std::fs::remove_file(&metadata_tmp_path);
+                    e.to_string()
+                })
+            });
+        match written {
+            Ok(()) => info!(
+                "Cleared a part layout recorded before 3.0.1, which may describe another \
+                 object version; each part is fetched from S3 once and recorded again: \
+                 key={}, parts={}, parts_count={:?}",
+                cache_key, parts, parts_count
+            ),
+            Err(e) => warn!(
+                "Failed to clear an unverified part layout: key={}, error={}",
+                cache_key, e
+            ),
+        }
+    }
+
     async fn lookup_part_inner(
         &self,
         cache_key: &str,
@@ -19228,6 +19355,25 @@ impl CacheManager {
                 "Part lookup: live get_ttl verdict is expired, forwarding to S3: cache_key={}, part_number={}, get_ttl={:?}, age={:?}",
                 cache_key, part_number, get_ttl, age
             );
+            return Ok(None);
+        }
+
+        // A layout no 3.0.1 gate recorded: clear it rather than keep another version's layout.
+        // 3.0.0 wrote a part's boundaries into a document of another version and kept them
+        // across a HEAD-detected change, and revalidation answers `304` for the current ETag,
+        // so nothing time-based ends such a serve. The part is a miss: it is fetched from S3
+        // once and recorded under the populate's ETag gate. `cache.trust_unverified_ranges`
+        // keeps the layout, as it keeps ranges with no file identity.
+        if !metadata.object_metadata.part_layout_verified
+            && !metadata.object_metadata.part_ranges.is_empty()
+            && !crate::disk_cache::trust_unverified_ranges()
+        {
+            debug!(
+                "Part lookup: the part layout was recorded before 3.0.1 and may be another \
+                 version's; clearing it and forwarding to S3: cache_key={}, part_number={}",
+                cache_key, part_number
+            );
+            self.clear_unverified_part_layout(cache_key).await;
             return Ok(None);
         }
 
@@ -19565,7 +19711,8 @@ impl CacheManager {
     /// [`Self::store_part_as_range`] guarded by the `?partNumber=` GET's version witness:
     /// the range publishes, its journal `Add` is folded and the part's entry is added to the
     /// `.meta`'s `part_ranges` only while the key's write-order marker still holds the witness,
-    /// each checked under the key's slot lock.
+    /// each checked under the key's slot lock. The layout is recorded only in a `.meta` of the
+    /// part's own version (R11.5): see [`Self::populate_metadata_on_first_part`].
     pub(crate) async fn store_part_as_range_witnessed(
         &self,
         cache_key: &str,
@@ -19675,6 +19822,13 @@ impl CacheManager {
 
                 // Populate metadata on first part if needed - Handle metadata update failures (Requirement 11.4)
                 // Pass part_number and (start, end) to store in part_ranges (Requirements 3.1, 3.2, 3.3, 3.4)
+                //
+                // `stored` is `Ok` also when the publish dropped the part's bytes: for a version
+                // mismatch with the `.meta` (`publish_range_fill_under_slot_lock_at`), a superseded
+                // witness, or a capacity decline. The populate does not rely on that verdict. It
+                // re-reads the `.meta` under the slot lock and records the layout only when the
+                // part's ETag equals the document's, so a part dropped for its version records
+                // nothing unless the document has since become that version (R11.5).
                 if let Err(metadata_err) = self
                     .populate_metadata_on_first_part(
                         cache_key,
@@ -19711,7 +19865,11 @@ impl CacheManager {
             }
             Err(e) => {
                 // Handle part storage failures - log and continue serving response (Requirement 11.2)
-                error!("Failed to store part {}: {}", part_number, e);
+                // An identity failure was logged once, with the key and the path, where it was found.
+                let already_logged = crate::disk_cache::is_identity_unavailable_error(&e);
+                if !already_logged {
+                    error!("Failed to store part {}: {}", part_number, e);
+                }
 
                 // Record part cache error metric - Requirement 8.5
                 if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
@@ -19729,7 +19887,9 @@ impl CacheManager {
 
                 // For storage failures, we should continue serving the response to the client
                 // The error is logged and metrics are recorded, but we don't fail the request
-                warn!("Part caching failed but continuing to serve response to client: cache_key={}, part_number={}", cache_key, part_number);
+                if !already_logged {
+                    warn!("Part caching failed but continuing to serve response to client: cache_key={}, part_number={}", cache_key, part_number);
+                }
 
                 // Return Ok to indicate the response should continue to be served
                 // The part just won't be cached for future requests
@@ -19750,6 +19910,12 @@ impl CacheManager {
     ///
     /// With `fill_witness`, the `.meta` rewrite is skipped under the key's slot lock
     /// when the witness no longer holds.
+    ///
+    /// The layout is recorded only in a document of the part's own version (R11.5):
+    /// the `.meta` is read, compared and rewritten in one hold of the key's slot lock, and
+    /// nothing is written unless the part response's ETag equals the document's
+    /// (quote-insensitive). A part of a newer version therefore records its layout once the
+    /// document carries that version, after that version's fill or a HEAD has replaced it.
     pub(crate) async fn populate_metadata_on_first_part(
         &self,
         cache_key: &str,
@@ -19764,6 +19930,22 @@ impl CacheManager {
             cache_key, part_number, part_range
         );
 
+        // The read, the version check and the rewrite are one hold of the key's slot lock, the
+        // lock and wait every `.meta` writer takes, so a HEAD relabel or a fold that replaced
+        // the document between the read and the rename cannot be overwritten with the old one.
+        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
+        let _meta_lock = crate::metadata_lock_manager::acquire_slot_lock_within_budget(
+            &self.cache_dir,
+            cache_key,
+        )
+        .await?;
+        if fill_witness.is_some_and(|w| !w.holds(&metadata_file_path)) {
+            debug!(
+                "Part layout not recorded (superseded by an acknowledged write): key={}",
+                cache_key
+            );
+            return Ok(());
+        }
         // Load existing ObjectMetadata - Handle metadata read failures (Requirement 11.4)
         let mut metadata = match self.read_metadata_file(cache_key).await {
             Ok(Some(metadata)) => metadata,
@@ -19781,7 +19963,36 @@ impl CacheManager {
             }
         };
 
+        // Another version's part boundaries and part count do not describe this document.
+        let part_etag = headers.get("etag").map(String::as_str).unwrap_or("");
+        if !crate::revalidation::etags_equal_ignoring_quotes(
+            &metadata.object_metadata.etag,
+            part_etag,
+        ) {
+            debug!(
+                "Part layout not recorded (the part's version differs from the document's): \
+                 key={}, part_number={:?}, meta_etag={}, part_etag={}",
+                cache_key, part_number, metadata.object_metadata.etag, part_etag
+            );
+            return Ok(());
+        }
+
         let mut metadata_updated = false;
+
+        // A layout no 3.0.1 gate recorded may be another version's. Drop
+        // it before recording this part, so the marker set below vouches only for parts this
+        // gate saw. With `cache.trust_unverified_ranges` it is kept and left unmarked, as 3.0.0
+        // kept it.
+        let trust_unmarked = crate::disk_cache::trust_unverified_ranges();
+        if !metadata.object_metadata.part_layout_verified
+            && !trust_unmarked
+            && (!metadata.object_metadata.part_ranges.is_empty()
+                || metadata.object_metadata.parts_count.is_some())
+        {
+            metadata.object_metadata.part_ranges.clear();
+            metadata.object_metadata.parts_count = None;
+            metadata_updated = true;
+        }
 
         // Store part byte range in part_ranges map (Requirements 3.1, 3.2)
         if let (Some(pn), Some((start, end))) = (part_number, part_range) {
@@ -19815,6 +20026,16 @@ impl CacheManager {
             }
         }
 
+        // Recorded under the ETag gate above, over a layout that was empty or already marked.
+        if !trust_unmarked
+            && !metadata.object_metadata.part_layout_verified
+            && (!metadata.object_metadata.part_ranges.is_empty()
+                || metadata.object_metadata.parts_count.is_some())
+        {
+            metadata.object_metadata.part_layout_verified = true;
+            metadata_updated = true;
+        }
+
         // Drop response-scoped headers an earlier release may have stored on this
         // entry, so a part GET landing on a pre-fix entry leaves it clean instead
         // of preserving the fingerprint `is_part_scoped_entry` looks for.
@@ -19833,10 +20054,28 @@ impl CacheManager {
 
         // Persist updated metadata to disk if any changes were made (Requirement 3.4, 6.3, 11.4)
         if metadata_updated {
-            match self
-                .write_metadata_to_disk_witnessed(&metadata, fill_witness)
-                .await
-            {
+            let written = serde_json::to_string_pretty(&metadata)
+                .map_err(|e| ProxyError::CacheError(format!("Failed to serialize metadata: {}", e)))
+                .and_then(|metadata_json| {
+                    let metadata_tmp_path = instance_scoped_meta_tmp_path(&metadata_file_path);
+                    crate::disk_cache::write_synced(&metadata_tmp_path, &metadata_json).map_err(
+                        |e| {
+                            crate::disk_cache::note_disk_full(
+                                &e,
+                                "write_metadata_to_disk.meta_tmp",
+                            );
+                            ProxyError::CacheError(format!(
+                                "Failed to write metadata tmp file: {}",
+                                e
+                            ))
+                        },
+                    )?;
+                    std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
+                        let _ = std::fs::remove_file(&metadata_tmp_path);
+                        ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
+                    })
+                });
+            match written {
                 Ok(()) => {
                     info!(
                         "Updated multipart metadata: cache_key={}, parts_count={:?}, part_ranges_count={}",
@@ -20977,6 +21216,10 @@ impl CacheManager {
             ));
             // Clear cached ranges — they belong to the old object version
             metadata.ranges.clear();
+            // And the old version's part layout: a HEAD carries no `x-amz-mp-parts-count`, so
+            // nothing else replaces `part_ranges` or `parts_count`, and `?partNumber=` would serve
+            // the new version's bytes at the old version's part boundaries (R11.5).
+            Self::clear_multipart_metadata_fields(&mut metadata.object_metadata);
             // Expire immediately so the next GET fetches fresh data
             metadata.expires_at = std::time::SystemTime::now();
         }
@@ -21329,9 +21572,9 @@ impl CacheManager {
 
     /// [`Self::store_response_with_headers`] for a full-object GET-miss fill, guarded by the
     /// version witness captured before its S3 request. The disk publish checks it under
-    /// the key's slot lock; the RAM copy is stored only after that publish, and removed again if
-    /// a re-read of the marker shows a stamp ran meanwhile (a stamp's own RAM removal runs after
-    /// its marker write, so one of the two removes it).
+    /// the key's slot lock. This function stores no RAM copy. After the publish it re-reads the
+    /// marker and, if a stamp ran meanwhile, invalidates the key's RAM range entries (a stamp's
+    /// own RAM removal runs after its marker write, so one of the two removes them).
     pub(crate) async fn store_response_with_headers_witnessed(
         &self,
         cache_key: &str,
@@ -21342,27 +21585,10 @@ impl CacheManager {
     ) -> Result<()> {
         debug!("Storing cache entry with headers for key: {}", cache_key);
 
-        // Create cache entry for RAM cache
-        let now = SystemTime::now();
-        let cache_entry = CacheEntry {
-            cache_key: cache_key.to_string(),
-            headers: headers.clone(),
-            body: Some(response.to_vec()),
-            ranges: Vec::new(),
-            metadata: metadata.clone(),
-            created_at: now,
-            expires_at: self.calculate_expiration_time(&headers),
-            metadata_expires_at: safe_expiry(now, self.head_ttl),
-            compression_info: CompressionInfo::default(),
-            is_put_cached: false, // This is a GET response
-        };
-
-        // Store in RAM cache if enabled
-        if self.ram_cache_enabled && fill_witness.is_none() {
-            // RAM cache store is best-effort; failure only means the next read
-            // will serve from disk — no data loss or inconsistency.
-            let _ = self.store_in_ram_cache(&cache_entry).await;
-        }
+        // No whole-object RAM entry is stored: the RAM tier is keyed
+        // `{cache_key}:range:{start}:{end}`, so an entry under a plain cache key such as
+        // `b/k:range:0:9` would answer object `b/k`'s range 0-9. A later disk hit promotes the
+        // range it serves.
 
         // Store full object using range format
         let content_length = response.len() as u64;
@@ -21380,6 +21606,7 @@ impl CacheManager {
             compressed_size: 0,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -21399,7 +21626,6 @@ impl CacheManager {
             .await?;
         if let Some(witness) = &fill_witness {
             if published && self.ram_cache_enabled {
-                let _ = self.store_in_ram_cache(&cache_entry).await;
                 let meta_path = self.get_new_metadata_file_path(cache_key);
                 let witness = witness.clone();
                 let still_current = tokio::task::spawn_blocking(move || witness.holds(&meta_path))
@@ -21758,8 +21984,36 @@ impl CacheManager {
                 (result, false)
             };
         drop(state);
-
+        // A listing whose etag differs is a mismatch, judged as `Found` is.
+        let result = match result {
+            RamVerifyDiskCheck::Listed { etag, .. }
+                if !crate::revalidation::etags_equal_ignoring_quotes(&etag, &hit.etag) =>
+            {
+                RamVerifyDiskCheck::Found(etag)
+            }
+            other => other,
+        };
         match result {
+            // R13.3: the shared `.meta` must still list a servable extent covering the copy. A
+            // retire or heal that unlisted it, or a listing refused for serving, ends the RAM
+            // serve too; the read goes to disk, where the same listing decides.
+            RamVerifyDiskCheck::Listed {
+                content_length,
+                ref servable,
+                ..
+            } => {
+                if ram_hit_covered(&hit.range_cache_key, content_length, servable) {
+                    self.ram_touch_verified(&hit.range_cache_key).await;
+                    true
+                } else {
+                    debug!(
+                        "RAM verify: the shared .meta for {} lists no servable extent covering {}, \
+                         not served from RAM",
+                        cache_key, hit.range_cache_key
+                    );
+                    false
+                }
+            }
             // Quote-insensitive via the shared helper.
             RamVerifyDiskCheck::Found(ref current_etag)
                 if crate::revalidation::etags_equal_ignoring_quotes(current_etag, &hit.etag) =>
@@ -22197,6 +22451,7 @@ impl CacheManager {
                 compressed_size: 0,
                 parts_count: None,
                 part_ranges: HashMap::new(),
+                part_layout_verified: false,
                 upload_id: None,
                 is_write_cached: true,
                 write_cache_expires_at: Some(now + effective_put_ttl),
@@ -22358,6 +22613,7 @@ impl CacheManager {
             compressed_size,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             // Write cache tracking fields (Requirement 1.3)
             is_write_cached: true,
@@ -22405,6 +22661,8 @@ impl CacheManager {
         // deleted one copy of the bytes and then credited another, so each overwrite of a key
         // added a phantom copy to `write_cache_size`. See `debit_removed_ranges`.
         // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2, 8.2, 8.3
+        #[cfg(test)]
+        crate::disk_cache::range_rename_pause::before_publish(cache_key).await;
         let meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
         // The write-order check comes before the `.bin` rename: the range path is
         // version-independent, so renaming first would overwrite a newer version's bytes.
@@ -22422,6 +22680,11 @@ impl CacheManager {
         // Publish the `.bin` inside this hold, not before it. The path is version-independent,
         // so a rename before the lock let an eviction holding it read the previous `.meta`,
         // pass its identity re-check and unlink this `.bin`.
+        if !pending_publish.still_written_by_this_fill(cache_key) {
+            drop(pending_publish);
+            crate::metadata_lock_manager::release_off_worker(meta_lock).await;
+            return Ok(PublishOutcome::Superseded);
+        }
         let range_already_existed = pending_publish.publish()?;
         #[cfg(test)]
         crate::disk_cache::range_rename_pause::after_rename(cache_key).await;
@@ -23150,6 +23413,11 @@ impl CacheManager {
                 // The `.bin` rename runs inside this hold: before it, an eviction holding
                 // the lock could read the previous `.meta`, pass its identity re-check and
                 // unlink this version's `.bin`, which shares the version-independent path.
+                if !pending_publish.still_written_by_this_fill(cache_key) {
+                    drop(pending_publish);
+                    drop(meta_lock);
+                    return Ok(None);
+                }
                 let range_already_existed = pending_publish.publish()?;
                 // A `Notify` pair, so any executor can drive it.
                 #[cfg(test)]
@@ -23506,8 +23774,10 @@ impl CacheManager {
 
         // Write range data to .tmp file then atomically rename
         let range_file_path = self.get_new_range_file_path(cache_key, start, end);
-        // Instance-scoped `{key}_{s}-{e}.bin.tmp.{host}.{pid}`.
-        let range_tmp_path = instance_scoped_range_tmp_path(&range_file_path, None);
+        // This fill's own `{key}_{s}-{e}.{nonce:08x}.tmp.{host}.{pid}`, opened `create_new`
+        // (R10.1): no other fill of the extent opens or truncates it.
+        let range_tmp_path =
+            instance_scoped_range_tmp_path(&range_file_path, Some(fastrand::u32(..)));
 
         // Ensure ranges directory exists
         if let Some(parent) = range_file_path.parent() {
@@ -23524,25 +23794,35 @@ impl CacheManager {
         // an artefact of the sentinel being taken before the object write.
         // Synced before the `.meta` publish below can name it; see
         // `disk_cache::write_synced`.
-        let file_identity =
-            match crate::disk_cache::write_synced_identity(&range_tmp_path, &compressed_data) {
-                Ok(identity) => identity,
-                Err(e) => {
-                    crate::disk_cache::note_disk_full(&e, "store_full_object.bin_tmp");
-                    // Best-effort cleanup of temp file
+        let written = match crate::disk_cache::write_synced_identity_exclusive(
+            &range_tmp_path,
+            &compressed_data,
+            cache_key,
+        ) {
+            Ok(written) => written,
+            // Logged once, with the key and the path, where it was found.
+            Err(e) if crate::disk_cache::is_identity_unavailable(&e) => {
+                return Err(ProxyError::CacheError(e.to_string()));
+            }
+            Err(e) => {
+                crate::disk_cache::note_disk_full(&e, "store_full_object.bin_tmp");
+                // Best-effort cleanup of temp file, unless it is not this fill's file.
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
                     let _ = std::fs::remove_file(&range_tmp_path);
-                    return Err(ProxyError::CacheError(format!(
-                        "Failed to write range tmp file: {}",
-                        e
-                    )));
                 }
-            };
+                return Err(ProxyError::CacheError(format!(
+                    "Failed to write range tmp file: {}",
+                    e
+                )));
+            }
+        };
 
         // The rename to the final `.bin` happens under the slot lock below, in the same hold as
         // the `.meta` publish. Dropped unpublished on any early return, which removes
         // the `.tmp`.
         let pending_publish =
-            crate::disk_cache::PendingRangePublish::new(range_tmp_path, range_file_path.clone());
+            crate::disk_cache::PendingRangePublish::new(range_tmp_path, range_file_path.clone())
+                .expecting(written);
 
         // Create range spec with relative path from ranges directory
         // Must use full relative path (bucket/XX/YYY/object_0-1023.bin), not just filename
@@ -23573,7 +23853,7 @@ impl CacheManager {
                 object_metadata.is_write_cached,
             ),
         )
-        .with_file_identity(file_identity);
+        .with_file_identity(Some(written.identity));
         // Create metadata
         let now = SystemTime::now();
         let object_metadata_clone = object_metadata.clone();
@@ -23598,6 +23878,8 @@ impl CacheManager {
         // effect was to make `is_cache_entry_active` report the key busy for the span, and
         // it cost up to 5 s of client-visible latency here whenever a crash had left an
         // unparseable lock file for the key. The namespace is retired.
+        #[cfg(test)]
+        crate::disk_cache::range_rename_pause::before_publish(cache_key).await;
         let meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
         // The version witness, before the version-independent `.bin` is renamed.
         // Dropping `pending_publish` unpublished removes the `.tmp`.
@@ -23608,7 +23890,13 @@ impl CacheManager {
         }
         // Publish the `.bin` inside this hold. The path does not depend on the version, so a
         // rename before the lock let an eviction holding it read the previous `.meta`, pass
-        // its identity re-check, and unlink this version's `.bin`.
+        // its identity re-check, and unlink this version's `.bin`. R10.2: only the file this fill
+        // wrote.
+        if !pending_publish.still_written_by_this_fill(cache_key) {
+            drop(pending_publish);
+            crate::metadata_lock_manager::release_off_worker(meta_lock).await;
+            return Ok(false);
+        }
         pending_publish
             .publish()
             .map_err(|e| ProxyError::CacheError(format!("Failed to rename range file: {}", e)))?;
@@ -25547,23 +25835,21 @@ impl CacheManager {
                             self.cache_dir.join("ranges").join(&range_spec.file_path);
 
                         if range_file_path.exists() {
-                            match std::fs::read(&range_file_path) {
-                                Ok(compressed_data) => {
-                                    // Decompress frame-encoded data
-                                    let body = {
-                                        let inner = self.inner.lock().unwrap();
-                                        match inner
-                                            .compression_handler
-                                            .decompress_data(&compressed_data)
-                                        {
-                                            Ok(decompressed) => decompressed,
-                                            Err(e) => {
-                                                warn!("Failed to decompress cached data for key {}: {}", cache_key, e);
-                                                return Ok(None);
-                                            }
-                                        }
-                                    };
-
+                            // R13.1b: through `load_range_data`, so the read takes the content,
+                            // length and identity checks every serve path takes, and a listing
+                            // with no file identity is refused like everywhere else.
+                            if crate::disk_cache::unverified_listing_refused(
+                                range_spec,
+                                content_length,
+                            ) {
+                                return Ok(None);
+                            }
+                            match self
+                                .create_configured_disk_cache_manager()
+                                .load_range_data(range_spec)
+                                .await
+                            {
+                                Ok(body) => {
                                     // Convert to CacheEntry
                                     let cache_entry = CacheEntry {
                                         cache_key: cache_key.to_string(),
@@ -25697,6 +25983,7 @@ impl CacheManager {
             compressed_size: 0,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -26188,7 +26475,23 @@ impl CacheManager {
         };
 
         match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content) {
-            Ok(meta) => RamVerifyDiskCheck::Found(meta.object_metadata.etag),
+            Ok(meta) => {
+                let content_length = meta.object_metadata.content_length;
+                let servable = meta
+                    .ranges
+                    .iter()
+                    .filter(|r| {
+                        !r.unservable
+                            && !crate::disk_cache::unverified_listing_refused(r, content_length)
+                    })
+                    .map(|r| (r.start, r.end))
+                    .collect();
+                RamVerifyDiskCheck::Listed {
+                    etag: meta.object_metadata.etag,
+                    content_length,
+                    servable,
+                }
+            }
             Err(e) => {
                 debug!(
                     "RAM verify: failed to parse metadata for key {}: {}",
@@ -28090,6 +28393,7 @@ mod cache_key_sanitization_tests {
             compressed_size: 0,
             parts_count: Some(2), // 2 parts
             part_ranges,
+            part_layout_verified: true,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -28279,6 +28583,7 @@ mod cache_key_sanitization_tests {
                 compressed_size: 0,
                 parts_count: Some(parts_count),
                 part_ranges: part_ranges_map.clone(),
+                part_layout_verified: true,
                 upload_id: None,
                 is_write_cached: false,
                 write_cache_expires_at: None,
@@ -28524,6 +28829,7 @@ mod cache_key_sanitization_tests {
                 compressed_size: 0,
                 parts_count: Some(parts_count),
                 part_ranges: part_ranges_map.clone(),
+                part_layout_verified: true,
                 upload_id: None,
                 is_write_cached: false,
                 write_cache_expires_at: None,
@@ -42506,7 +42812,18 @@ mod metadata_lock_discipline_tests {
         // The object bytes are written outside the section, to the instance-scoped `.tmp`; only
         // the rename to the final `.bin` is inside it (renamed before the slot, an
         // eviction holding the slot could unlink the new `.bin` under the old `.meta`).
-        let tmp_path = instance_scoped_range_tmp_path(&bin_path, None);
+        // The fill's own temp beside the `.bin`, `{stem}.{nonce:08x}.tmp.{host}.{pid}` (R10.1).
+        let stem = format!("{}.", bin_path.file_stem().unwrap().to_string_lossy());
+        let tmp_path = std::fs::read_dir(bin_path.parent().unwrap())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(&stem) && name.contains(".tmp.")
+            })
+            .unwrap_or_else(|| bin_path.with_extension("no-temp-found"));
         let tmp_len = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
         assert!(
             tmp_len > 0,
@@ -47504,6 +47821,112 @@ mod eviction_delete_identity_tests {
         assert_v2_intact(temp.path(), &out);
     }
 
+    fn range_files(cache_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        walkdir::WalkDir::new(cache_dir.join("ranges"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path())
+            .collect()
+    }
+    fn range_bins(cache_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        range_files(cache_dir)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "bin"))
+            .collect()
+    }
+    /// Replace the one staged range temp with a file of the same bytes and modification time
+    /// and another inode.
+    fn replace_the_one_temp(cache_dir: &std::path::Path) {
+        let temps: Vec<_> = range_files(cache_dir)
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert_eq!(temps.len(), 1, "fixture: one temp is staged: {temps:?}");
+        let tmp = &temps[0];
+        let bytes = std::fs::read(tmp).unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(tmp).unwrap());
+        let replacement = tmp.with_extension("replacement");
+        std::fs::write(&replacement, &bytes).unwrap();
+        filetime::set_file_mtime(&replacement, mtime).unwrap();
+        std::fs::rename(&replacement, tmp).unwrap();
+    }
+    /// R10.2 at the buffered PUT write-cache publish (`store_put_as_write_cached_range_inner`):
+    /// a temp replaced before the publish (the same bytes and modification time, another
+    /// inode) publishes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_whose_temp_was_replaced_publishes_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = std::sync::Arc::new(setup(temp.path()).await);
+        let key = "test-bucket/put-recheck.bin";
+        let pause = crate::disk_cache::range_rename_pause::arm_before_publish(key);
+        let store = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                let body = vec![0x44u8; RANGE_BYTES as usize];
+                manager
+                    .store_put_as_write_cached_range_with_ttl(
+                        key,
+                        &body,
+                        "\"v2\"".to_string(),
+                        "Thu, 22 Oct 2015 07:28:00 GMT".to_string(),
+                        None,
+                        HashMap::new(),
+                        Duration::from_secs(3600),
+                    )
+                    .await
+                    .map(|_| ())
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+            .await
+            .expect("the PUT must reach the publish seam");
+        replace_the_one_temp(temp.path());
+        pause.resume.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(30), store)
+            .await
+            .expect("the PUT must finish")
+            .unwrap();
+        let bins = range_bins(temp.path());
+        assert!(
+            bins.is_empty(),
+            "R10.2: THE PUT WRITE-CACHE STORE PUBLISHED A TEMP IT DID NOT WRITE: .bin files={bins:?}"
+        );
+    }
+    /// R10.2 at the streamed PUT write-cache publish (`store_streamed_write_cache_metadata`):
+    /// a temp replaced before the publish publishes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_put_whose_temp_was_replaced_publishes_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "test-bucket/streamed-put-recheck.bin";
+        let mut sink = manager
+            .open_write_cache_sink(key, RANGE_BYTES)
+            .await
+            .unwrap()
+            .expect("capacity must admit the sink");
+        sink.write(&vec![0x55u8; RANGE_BYTES as usize]).unwrap();
+        let (range_spec, pending) = sink.finalize_unpublished().unwrap();
+        replace_the_one_temp(temp.path());
+        let _ = manager
+            .store_streamed_write_cache_metadata(
+                key,
+                range_spec,
+                v2_object_metadata(true),
+                Duration::from_secs(3600),
+                pending,
+                None,
+            )
+            .await;
+        drop(sink);
+        let bins = range_bins(temp.path());
+        assert!(
+            bins.is_empty(),
+            "R10.2: THE STREAMED PUT WRITE-CACHE STORE PUBLISHED A TEMP IT DID NOT WRITE: \
+             .bin files={bins:?}"
+        );
+    }
     /// Full-object GET fill (`store_full_object_as_range_new`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_object_fill_rename_is_inside_the_slot_lock_hold() {
@@ -49228,6 +49651,66 @@ mod fill_reorder_tests {
             meta.object_metadata.part_ranges
         );
     }
+    /// R10.3, the part path: two `?partNumber=1` fills of one part with different
+    /// bytes, both written before either publishes (each held at the publish pause in turn). The
+    /// first to publish must publish its own bytes. Red on a temp name shared by every fill of a
+    /// range.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_of_two_part_fills_publishes_its_own_bytes() {
+        use std::io::Read;
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = std::sync::Arc::new(setup(dir.path()).await);
+        let key = "test-bucket/r10-part-pair";
+        let x = incompressible_body(21);
+        let y = incompressible_body(22);
+        assert_ne!(x, y, "fixture: the two fills differ");
+        let content_range = format!("bytes 0-{}/{}", BODY_LEN - 1, BODY_LEN);
+        let mut headers_y = part_headers_v1();
+        headers_y.insert("etag".to_string(), "\"v2\"".to_string());
+        let spawn_fill = |body: Vec<u8>, headers: HashMap<String, String>| {
+            let manager = std::sync::Arc::clone(&manager);
+            let content_range = content_range.clone();
+            tokio::spawn(async move {
+                manager
+                    .store_part_as_range_witnessed(key, 1, &content_range, &headers, &body, None)
+                    .await
+            })
+        };
+        let wait = std::time::Duration::from_secs(10);
+        let pause_x = crate::disk_cache::range_rename_pause::arm_before_publish(key);
+        let fill_x = spawn_fill(x.clone(), part_headers_v1());
+        tokio::time::timeout(wait, pause_x.reached.notified())
+            .await
+            .expect("fill x never reached its publish");
+        let pause_y = crate::disk_cache::range_rename_pause::arm_before_publish(key);
+        let fill_y = spawn_fill(y.clone(), headers_y);
+        tokio::time::timeout(wait, pause_y.reached.notified())
+            .await
+            .expect("fill y never reached its publish");
+        pause_x.resume.notify_one();
+        fill_x
+            .await
+            .unwrap()
+            .expect("a part store reports success to its caller");
+        let published = std::fs::read(manager.get_new_range_file_path(key, 0, BODY_LEN as u64 - 1))
+            .expect("fill x's .bin is published");
+        pause_y.resume.notify_one();
+        fill_y
+            .await
+            .unwrap()
+            .expect("a part store reports success to its caller");
+        let mut decoded = Vec::new();
+        lz4_flex::frame::FrameDecoder::new(&published[..])
+            .read_to_end(&mut decoded)
+            .expect("the published .bin is a valid frame");
+        assert!(
+            decoded == x,
+            "R10.3: THE FIRST PART FILL PUBLISHED THE OTHER FILL'S BYTES under its own \
+             ETag: {} bytes, decoded == x: false, decoded == y: {}",
+            decoded.len(),
+            decoded == y
+        );
+    }
     /// The streamed GET-miss fill (`IncrementalRangeWriter` with
     /// `set_fill_witness`, committed through `prepare_incremental_commit`).
     #[tokio::test]
@@ -49347,6 +49830,49 @@ mod stamp_retry_clear_tests {
             .await
             .expect("fixture: initialize() must wire the hybrid metadata writer");
         Arc::new(manager)
+    }
+
+    /// A witnessed full-object GET fill (the only form production runs) of an object whose key
+    /// ends in `:range:0:9` must not leave a RAM entry that answers object `b/k`'s range 0-9.
+    /// The body is a valid LZ4 frame, so the RAM lookup's decode succeeds and only the store
+    /// decides the verdict.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_witnessed_full_object_fill_never_answers_another_objects_range() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = setup_with_ram(dir.path()).await;
+        let sibling = "test-bucket/k:range:0:9";
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        encoder.write_all(b"0123456789").unwrap();
+        let body = encoder.finish().unwrap();
+        let witness = manager.capture_fill_witness(sibling).await;
+        manager
+            .store_response_with_headers_witnessed(
+                sibling,
+                &body,
+                HashMap::new(),
+                CacheMetadata {
+                    etag: "\"sibling-etag\"".to_string(),
+                    last_modified: "Tue, 23 Sep 2026 00:00:00 GMT".to_string(),
+                    content_length: body.len() as u64,
+                    part_number: None,
+                    cache_control: None,
+                    access_count: 0,
+                    last_accessed: SystemTime::now(),
+                },
+                Some(witness),
+            )
+            .await
+            .expect("the sibling's witnessed full-object store");
+        let hit =
+            manager.get_range_from_ram_cache_hit("test-bucket/k", 0, 9, Duration::from_secs(3600));
+        assert!(
+            hit.is_none(),
+            "SA3-ADJ: OBJECT test-bucket/k's RANGE 0-9 WAS ANSWERED FROM RAM BY THE WITNESSED \
+             WHOLE-OBJECT FILL OF test-bucket/k:range:0:9: etag={:?}, bytes={:?}",
+            hit.as_ref().map(|h| h.etag.clone()),
+            hit.as_ref().map(|h| h.data.clone())
+        );
     }
 
     /// What a streamed full-object fill leaves on this proxy when it publishes: a committed
@@ -53825,6 +54351,555 @@ mod ram_page_extent_memo_tests {
             "VERSION MISMATCH IGNORED: a Page hit beside a HEAD-only `.meta` of another version \
              than the tracked fill recorded {recorded:?} besides the sentinel, expected nothing \
              (disk wins)"
+        );
+    }
+}
+
+// =============================================================================
+// R11.5: a part's layout stays with its version.
+// =============================================================================
+#[cfg(test)]
+mod part_layout_version_tests {
+    use super::zero_length_arm_orphan_tests::{
+        incompressible_body, object_metadata, read_meta, seed_full_object, setup, BODY_LEN,
+    };
+    use super::*;
+    use std::collections::HashMap;
+    /// Four parts of 64 KiB over the 256 KiB fixture body.
+    const PARTS: u32 = 4;
+    const PART_LEN: u64 = (BODY_LEN as u64) / PARTS as u64;
+    /// The headers of a `?partNumber=` response from S3: the part's version, and the
+    /// object's part count.
+    fn part_headers(etag: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        headers.insert("etag".to_string(), etag.to_string());
+        headers.insert(
+            "last-modified".to_string(),
+            "Thu, 22 Oct 2015 07:28:00 GMT".to_string(),
+        );
+        headers.insert(
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        );
+        headers.insert("x-amz-mp-parts-count".to_string(), PARTS.to_string());
+        headers
+    }
+    /// A HEAD response for the overwritten object: same length, new ETag.
+    fn head_response(etag: &str) -> CacheMetadata {
+        CacheMetadata {
+            etag: etag.to_string(),
+            last_modified: "Thu, 22 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: BODY_LEN as u64,
+            part_number: None,
+            cache_control: None,
+            access_count: 0,
+            last_accessed: SystemTime::now(),
+        }
+    }
+    /// What a part lookup handed back, for the failure message.
+    fn describe(
+        part: &Option<CachedPartResponse>,
+    ) -> Option<(u64, u64, Option<String>, Option<String>)> {
+        part.as_ref().map(|p| {
+            (
+                p.start,
+                p.end,
+                p.headers
+                    .get("etag")
+                    .or_else(|| p.headers.get("ETag"))
+                    .cloned(),
+                p.headers.get("x-amz-mp-parts-count").cloned(),
+            )
+        })
+    }
+    /// The document is `"v1"`, cached whole; S3 now holds a multipart `"v2"`,
+    /// and a `?partNumber=2` miss stores `"v2"`'s part 2.
+    ///
+    /// # RED SIDE
+    ///
+    /// The publish guard drops the part's bytes (the ETags differ), but
+    /// `populate_metadata_on_first_part` compared no ETag and wrote `part_ranges[2]` and
+    /// `parts_count` into the `"v1"` document. `lookup_part` then serves `"v1"`'s bytes at
+    /// `"v2"`'s part-2 boundaries, labelled `"v1"`, part 2 of 4.
+    #[tokio::test]
+    async fn a_part_of_another_version_records_no_layout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "layout-bucket/part-layout-a.bin";
+        let len = BODY_LEN as u64;
+        let v1 = incompressible_body(71);
+        let v2 = incompressible_body(72);
+        seed_full_object(&manager, key, &v1, object_metadata(len, "\"v1\"")).await;
+        let seeded = read_meta(&manager, key);
+        assert!(
+            seeded.object_metadata.etag == "\"v1\""
+                && seeded.object_metadata.part_ranges.is_empty()
+                && seeded.object_metadata.parts_count.is_none()
+                && seeded
+                    .ranges
+                    .iter()
+                    .any(|r| r.start == 0 && r.end == len - 1),
+            "PRECONDITION: v1 must be cached whole with no part layout: etag={}, \
+             part_ranges={:?}, parts_count={:?}, ranges={}",
+            seeded.object_metadata.etag,
+            seeded.object_metadata.part_ranges,
+            seeded.object_metadata.parts_count,
+            seeded.ranges.len()
+        );
+        let (start, end) = (PART_LEN, 2 * PART_LEN - 1);
+        manager
+            .store_part_as_range_witnessed(
+                key,
+                2,
+                &format!("bytes {}-{}/{}", start, end, len),
+                &part_headers("\"v2\""),
+                &v2[start as usize..=end as usize],
+                None,
+            )
+            .await
+            .expect("the part store returns Ok whether or not it caches");
+        let after = read_meta(&manager, key);
+        let served = manager
+            .lookup_part(key, 2, crate::origin_identity::OriginVerdict::Matches)
+            .await
+            .expect("the part lookup must not error");
+        println!(
+            "Part-A: etag={}, part_ranges={:?}, parts_count={:?}, served={:?}",
+            after.object_metadata.etag,
+            after.object_metadata.part_ranges,
+            after.object_metadata.parts_count,
+            describe(&served)
+        );
+        assert!(
+            !after.object_metadata.part_ranges.contains_key(&2)
+                && after.object_metadata.parts_count.is_none(),
+            "R11.5 Part-A: A \"v2\" PART RECORDED ITS LAYOUT IN THE \"v1\" DOCUMENT: \
+             part_ranges={:?}, parts_count={:?}",
+            after.object_metadata.part_ranges,
+            after.object_metadata.parts_count
+        );
+        assert!(
+            served.is_none(),
+            "R11.5 Part-A: lookup_part SERVED PART 2 OF \"v1\" AT \"v2\"'S BOUNDARIES: \
+             (start, end, etag, parts-count)={:?}",
+            describe(&served)
+        );
+    }
+    /// The document is `"v1"` with a 4-part layout; a HEAD reports `"v2"`, and
+    /// `"v2"` is then cached whole and folded.
+    ///
+    /// # RED SIDE
+    ///
+    /// The HEAD object-changed arm cleared `ranges` and kept `part_ranges` and `parts_count`,
+    /// so `?partNumber=2` serves `"v2"`'s bytes at `"v1"`'s part-2 extent, labelled `"v2"`
+    /// with `"v1"`'s part count. The revalidation lookup is what serves after S3's `304`.
+    #[tokio::test]
+    async fn a_head_detected_change_drops_the_part_layout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "layout-bucket/part-layout-b.bin";
+        let len = BODY_LEN as u64;
+        let v1 = incompressible_body(73);
+        let v2 = incompressible_body(74);
+        seed_full_object(&manager, key, &v1, object_metadata(len, "\"v1\"")).await;
+        let mut doc = read_meta(&manager, key);
+        doc.object_metadata.parts_count = Some(PARTS);
+        doc.object_metadata.part_layout_verified = true;
+        doc.object_metadata.part_ranges = (1..=PARTS)
+            .map(|n| (n, ((n as u64 - 1) * PART_LEN, n as u64 * PART_LEN - 1)))
+            .collect();
+        std::fs::write(
+            manager.get_new_metadata_file_path(key),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        let (start, end) = (PART_LEN, 2 * PART_LEN - 1);
+        let before = manager
+            .lookup_part(key, 2, crate::origin_identity::OriginVerdict::Matches)
+            .await
+            .expect("the part lookup must not error");
+        assert!(
+            before.as_ref().is_some_and(|p| p.start == start
+                && p.end == end
+                && p.data[..] == v1[start as usize..=end as usize]),
+            "PRECONDITION: v1's layout must serve v1's part 2 before the HEAD: {:?}",
+            describe(&before)
+        );
+        manager
+            .store_head_cache_entry_unified(key, HashMap::new(), head_response("\"v2\""))
+            .await
+            .expect("fixture: the v2 HEAD store must succeed");
+        let relabelled = read_meta(&manager, key);
+        assert_eq!(
+            relabelled.object_metadata.etag, "\"v2\"",
+            "PRECONDITION: the HEAD must have merged the new ETag"
+        );
+        let mut disk_cache = manager.create_configured_disk_cache_manager();
+        disk_cache
+            .store_range(
+                key,
+                0,
+                len - 1,
+                &v2,
+                object_metadata(len, "\"v2\""),
+                std::time::Duration::from_secs(315_360_000),
+                true,
+            )
+            .await
+            .expect("fixture: the v2 fill must publish");
+        manager
+            .get_journal_consolidator()
+            .await
+            .expect("fixture: the consolidator must be wired")
+            .consolidate_object(key)
+            .await
+            .expect("consolidation must not error");
+        let folded = read_meta(&manager, key);
+        let served = manager
+            .lookup_part_for_revalidation(key, 2, crate::origin_identity::OriginVerdict::Matches)
+            .await
+            .expect("the part lookup must not error");
+        println!(
+            "Part-B: after HEAD part_ranges={:?} parts_count={:?}; after fold etag={} \
+             ranges={} served={:?}",
+            relabelled.object_metadata.part_ranges,
+            relabelled.object_metadata.parts_count,
+            folded.object_metadata.etag,
+            folded.ranges.len(),
+            describe(&served)
+        );
+        assert!(
+            relabelled.object_metadata.part_ranges.is_empty()
+                && relabelled.object_metadata.parts_count.is_none(),
+            "R11.5 Part-B: THE HEAD KEPT \"v1\"'S PART LAYOUT UNDER \"v2\": \
+             part_ranges={:?}, parts_count={:?}",
+            relabelled.object_metadata.part_ranges,
+            relabelled.object_metadata.parts_count
+        );
+        assert!(
+            !served
+                .as_ref()
+                .is_some_and(|p| p.start == start && p.end == end),
+            "R11.5 Part-B: PART 2 SERVED UNDER \"v2\" AT \"v1\"'S EXTENT: \
+             (start, end, etag, parts-count)={:?}",
+            describe(&served)
+        );
+    }
+
+    /// Write `doc` as 3.0.0 wrote it: no part-layout marker at either level.
+    pub(super) fn write_as_3_0_0(
+        manager: &CacheManager,
+        key: &str,
+        doc: &crate::cache_types::NewCacheMetadata,
+    ) {
+        let mut value = serde_json::to_value(doc).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("part_layout_verified");
+        value["object_metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("part_layout_verified");
+        std::fs::write(
+            manager.get_new_metadata_file_path(key),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+    /// A document as an upgraded 3.0.0 volume can hold it: the current
+    /// version `"v2"` cached whole, under `"v1"`'s part layout (two parts of 128 KiB; `"v2"`'s
+    /// own is four of 64 KiB), which 3.0.0's HEAD arm kept across the change.
+    pub(super) async fn seed_crossed_layout(
+        manager: &CacheManager,
+        key: &str,
+        seed: u8,
+    ) -> crate::cache_types::NewCacheMetadata {
+        let len = BODY_LEN as u64;
+        let v2 = incompressible_body(seed);
+        seed_full_object(manager, key, &v2, object_metadata(len, "\"v2\"")).await;
+        let mut doc = read_meta(manager, key);
+        doc.object_metadata.parts_count = Some(2);
+        doc.object_metadata.part_ranges = [(1, (0, len / 2 - 1)), (2, (len / 2, len - 1))]
+            .into_iter()
+            .collect();
+        doc
+    }
+    /// A layout 3.0.0 recorded carries no
+    /// marker, so 3.0.1 does not serve it: the part is a miss, fetched from S3 once and recorded
+    /// under the ETag gate, and the unmarked layout is cleared.
+    ///
+    /// # RED SIDE
+    ///
+    /// Before the heal, `lookup_part` serves `"v2"`'s bytes at `"v1"`'s part-2 boundaries,
+    /// labelled part 2 of 2, with no time limit, since revalidation answers `304`.
+    #[tokio::test]
+    async fn a_crossed_layout_left_by_3_0_0_is_not_served() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "layout-bucket/crossed-layout.bin";
+        let doc = seed_crossed_layout(&manager, key, 75).await;
+        write_as_3_0_0(&manager, key, &doc);
+        let served = manager
+            .lookup_part(key, 2, crate::origin_identity::OriginVerdict::Matches)
+            .await
+            .expect("the part lookup must not error");
+        let revalidation = manager
+            .lookup_part_for_revalidation(key, 2, crate::origin_identity::OriginVerdict::Matches)
+            .await
+            .expect("the revalidation part lookup must not error");
+        let after = read_meta(&manager, key);
+        println!(
+            "crossed layout: served={:?}, revalidation={:?}, after part_ranges={:?} \
+             parts_count={:?}",
+            describe(&served),
+            describe(&revalidation),
+            after.object_metadata.part_ranges,
+            after.object_metadata.parts_count
+        );
+        assert!(
+            served.is_none() && revalidation.is_none(),
+            "A PART LAYOUT 3.0.0 RECORDED WITH NO MARKER WAS SERVED: \
+             lookup_part={:?}, lookup_part_for_revalidation={:?}",
+            describe(&served),
+            describe(&revalidation)
+        );
+        assert!(
+            after.object_metadata.part_ranges.is_empty()
+                && after.object_metadata.parts_count.is_none(),
+            "the unmarked layout must be cleared from the .meta: part_ranges={:?}, \
+             parts_count={:?}",
+            after.object_metadata.part_ranges,
+            after.object_metadata.parts_count
+        );
+        assert!(
+            after.ranges.iter().any(|r| r.start == 0),
+            "the heal must keep the document's ranges: {}",
+            after.ranges.len()
+        );
+    }
+    /// An acknowledged write of a key whose fill is still
+    /// pending (no `.meta`) stamps the write-order marker but cannot unlink that fill's `.bin`,
+    /// which no `.meta` lists. A refill after the write replaces it, because the file predates
+    /// the marker. Drives `invalidate_for_write`, the call an acknowledged PUT, copy or delete
+    /// makes before its response.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `predates_write_marker` removed from the check, the refill is dropped and the key
+    /// misses for up to 600 s.
+    #[tokio::test]
+    async fn a_refill_after_an_acknowledged_write_replaces_a_pending_fill() {
+        use std::io::Read;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "layout-bucket/refill-after-write.bin";
+        let ttl = std::time::Duration::from_secs(3600);
+        let mut dcm = manager.create_configured_disk_cache_manager();
+        let old = dcm
+            .prepare_range_store(
+                key,
+                0,
+                4095,
+                &[1u8; 4096],
+                object_metadata(4096, "\"v1\""),
+                ttl,
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the v1 fill is prepared");
+        old.finish().await.expect("the v1 fill publishes");
+        let bin = dcm.get_new_range_file_path(key, 0, 4095);
+        assert!(
+            bin.exists(),
+            "fixture: v1's pending fill is at the final path"
+        );
+        assert!(
+            !manager.get_new_metadata_file_path(key).exists(),
+            "fixture: no .meta yet"
+        );
+        // Past the file's mtime granule, so the marker is strictly newer.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        manager
+            .invalidate_for_write(key)
+            .await
+            .expect("the acknowledged write's invalidation");
+        let refill = dcm
+            .prepare_range_store(
+                key,
+                0,
+                4095,
+                &[2u8; 4096],
+                object_metadata(4096, "\"v2\""),
+                ttl,
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the v2 refill is prepared");
+        refill
+            .finish()
+            .await
+            .expect("the refill's finish returns Ok");
+        let published = std::fs::read(&bin).expect("a .bin at the final path");
+        let mut decoded = Vec::new();
+        let _ = lz4_flex::frame::FrameDecoder::new(&published[..]).read_to_end(&mut decoded);
+        assert!(
+            decoded == [2u8; 4096],
+            "A FILL PENDING BEFORE AN ACKNOWLEDGED WRITE BLOCKED THE REFILL: the \
+             final path decodes to {} bytes of {:#04x}",
+            decoded.len(),
+            decoded.first().copied().unwrap_or(0)
+        );
+    }
+    /// A layout carrying the marker (recorded by 3.0.1's populate under its ETag gate, or
+    /// by multipart completion) is served and kept.
+    #[tokio::test]
+    async fn a_marked_layout_is_served() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "layout-bucket/marked-layout.bin";
+        let len = BODY_LEN as u64;
+        let mut doc = seed_crossed_layout(&manager, key, 77).await;
+        doc.object_metadata.part_layout_verified = true;
+        std::fs::write(
+            manager.get_new_metadata_file_path(key),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        let served = manager
+            .lookup_part(key, 2, crate::origin_identity::OriginVerdict::Matches)
+            .await
+            .expect("the part lookup must not error");
+        assert!(
+            served
+                .as_ref()
+                .is_some_and(|p| p.start == len / 2 && p.end == len - 1),
+            "A MARKED PART LAYOUT WAS NOT SERVED: {:?}",
+            describe(&served)
+        );
+        let after = read_meta(&manager, key);
+        assert!(
+            after.object_metadata.part_layout_verified
+                && after.object_metadata.part_ranges.len() == 2,
+            "a marked layout is kept: verified={}, part_ranges={:?}",
+            after.object_metadata.part_layout_verified,
+            after.object_metadata.part_ranges
+        );
+    }
+    /// A part of the document's own version, recorded over an unmarked 3.0.0 layout,
+    /// replaces that layout rather than joining it, and marks the result.
+    #[tokio::test]
+    async fn a_part_recorded_over_an_unmarked_layout_replaces_it_and_marks_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "layout-bucket/populate-over-unmarked.bin";
+        let len = BODY_LEN as u64;
+        let doc = seed_crossed_layout(&manager, key, 78).await;
+        write_as_3_0_0(&manager, key, &doc);
+        let v2 = incompressible_body(78);
+        manager
+            .store_part_as_range_witnessed(
+                key,
+                1,
+                &format!("bytes 0-{}/{}", PART_LEN - 1, len),
+                &part_headers("\"v2\""),
+                &v2[..PART_LEN as usize],
+                None,
+            )
+            .await
+            .expect("the part store returns Ok");
+        let after = read_meta(&manager, key);
+        let expected: HashMap<u32, (u64, u64)> = [(1, (0, PART_LEN - 1))].into_iter().collect();
+        assert!(
+            after.object_metadata.part_layout_verified
+                && after.object_metadata.part_ranges == expected
+                && after.object_metadata.parts_count == Some(PARTS),
+            "THE POPULATE KEPT OR VOUCHED FOR 3.0.0'S LAYOUT: verified={}, \
+             part_ranges={:?}, parts_count={:?}",
+            after.object_metadata.part_layout_verified,
+            after.object_metadata.part_ranges,
+            after.object_metadata.parts_count
+        );
+    }
+}
+
+// =============================================================================
+// The full-object store's R10.2 re-check.
+// =============================================================================
+#[cfg(test)]
+mod full_object_recheck_tests {
+    use super::zero_length_arm_orphan_tests::{
+        incompressible_body, object_metadata, setup, BODY_LEN,
+    };
+    use super::*;
+    /// R10.2 at the full-object GET store: a temp replaced between its
+    /// write and the publish (the same bytes and modification time, another inode) publishes
+    /// nothing, and no `.bin` is left under `ranges/`.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `still_written_by_this_fill` removed from `store_full_object_as_range_witnessed`,
+    /// the replacement is renamed visible and the `.meta` lists it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_object_store_whose_temp_was_replaced_publishes_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(setup(temp.path()).await);
+        let key = "layout-bucket/full-object-recheck.bin";
+        let body = incompressible_body(76);
+        let pause = crate::disk_cache::range_rename_pause::arm_before_publish(key);
+        let store = {
+            let manager = manager.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                manager
+                    .store_full_object_as_range_witnessed(
+                        key,
+                        &body,
+                        object_metadata(BODY_LEN as u64, "\"v1\""),
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+            .await
+            .expect("the store must reach the publish seam");
+        let files = |suffix: &str| -> Vec<std::path::PathBuf> {
+            walkdir::WalkDir::new(temp.path().join("ranges"))
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.into_path())
+                .filter(|p| p.to_string_lossy().contains(suffix))
+                .collect()
+        };
+        let temps = files(".tmp.");
+        assert_eq!(temps.len(), 1, "fixture: one temp is staged: {temps:?}");
+        let tmp = &temps[0];
+        let bytes = std::fs::read(tmp).unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(tmp).unwrap());
+        let replacement = tmp.with_extension("replacement");
+        std::fs::write(&replacement, &bytes).unwrap();
+        filetime::set_file_mtime(&replacement, mtime).unwrap();
+        std::fs::rename(&replacement, tmp).unwrap();
+        pause.resume.notify_one();
+        let published = tokio::time::timeout(std::time::Duration::from_secs(30), store)
+            .await
+            .expect("the store must finish")
+            .unwrap()
+            .expect("the store returns Ok whether or not it publishes");
+        let bins = files(".bin");
+        let bins: Vec<_> = bins
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "bin"))
+            .collect();
+        assert!(
+            !published && bins.is_empty(),
+            "R10.2: THE FULL-OBJECT STORE PUBLISHED A TEMP IT DID NOT WRITE: \
+             published={published}, .bin files={bins:?}"
         );
     }
 }

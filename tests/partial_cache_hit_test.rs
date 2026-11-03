@@ -84,6 +84,7 @@ async fn test_partial_cache_hit_scenario() {
         compressed_size: total_size as u64,
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
+        part_layout_verified: false,
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,

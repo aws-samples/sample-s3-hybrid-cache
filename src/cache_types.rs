@@ -477,6 +477,17 @@ pub struct ObjectMetadata {
     /// Example: {1: (0, 10485759), 2: (10485760, 15728639)}
     #[serde(default)]
     pub part_ranges: HashMap<u32, (u64, u64)>,
+    /// Whether `part_ranges` and `parts_count` are this document's version's: recorded by
+    /// `populate_metadata_on_first_part` under its ETag gate, or by multipart completion, which
+    /// writes the layout of the upload it completed. `false` for every document a
+    /// release before 3.0.1 wrote (`#[serde(default)]`): 3.0.0 recorded a part's layout into a
+    /// document of another version and kept it across a HEAD-detected change,
+    /// so the part lookup treats such a layout as absent and clears it, unless
+    /// `cache.trust_unverified_ranges` is on. Beside the layout so that anything replacing one
+    /// replaces the other. A release that does not know the field drops it on rewrite, which
+    /// leaves the document unmarked.
+    #[serde(default)]
+    pub part_layout_verified: bool,
 
     // For multipart upload tracking
     #[serde(default)]
@@ -540,6 +551,7 @@ impl Default for ObjectMetadata {
             compressed_size: 0,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -616,6 +628,7 @@ impl ObjectMetadata {
             compressed_size: content_length,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -646,6 +659,7 @@ impl ObjectMetadata {
             compressed_size: content_length,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -854,8 +868,9 @@ pub struct RangeSpec {
     /// `None` for every listing written before 3.0.0, for a writer whose `fstat` failed, and
     /// for carriers that name an extent without describing a file (`Remove`, `Graduation`,
     /// cache-hit updates). A `None` listing that starts at offset 0 and stops short of the object is
-    /// refetched once on its first read (see `is_unverified_prefix`); every other `None` listing is
-    /// served unverified, as every listing was before.
+    /// refetched once on its first read (see `is_unverified_prefix`). Every other `None` listing is
+    /// refused, so the read fetches from S3, unless `cache.trust_unverified_ranges` is `true`; then
+    /// it is served unverified, as every listing was before.
     ///
     /// Additive: omitted from the document when `None`, and no struct that parses a `.meta`
     /// or a journal line rejects unknown fields, so a pre-3.0 proxy parses a listing carrying
@@ -1893,6 +1908,7 @@ mod tests {
             compressed_size: content_length,
             parts_count,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: upload_id.clone(),
             is_write_cached: false,
             write_cache_expires_at: None,
@@ -1964,6 +1980,7 @@ mod tests {
             compressed_size: content_length,
             parts_count: None,
             part_ranges: HashMap::new(),
+            part_layout_verified: false,
             upload_id: None,
             is_write_cached,
             write_cache_expires_at: if is_write_cached {

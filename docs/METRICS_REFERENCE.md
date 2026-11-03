@@ -718,13 +718,13 @@ Counters: `cache_part_hits`, `cache_part_misses`, `cache_part_stores`,
 `ram_cache_hits`, `ram_cache_misses`, `ram_cache_evictions` (counters);
 `ram_cache_max_size` (config).
 `ram_cache_eligibility_skips_total` (counter) counts RAM admissions this proxy declined because
-the key's resolved `ram_cache_eligible` was `false`: a disk-hit promotion, a full-object store, a
-write-cache store, or a streamed disk-serve promotion. Page-widening promotions are counted
+the key's resolved `ram_cache_eligible` was `false`: a disk-hit promotion or a streamed
+disk-serve promotion. Page-widening promotions are counted
 separately, by `page_cache.ram_page_promotion_skipped`. The RAM lookup itself is not gated on
 eligibility, so a closed gate still records misses and produces a low `ram_cache_hit_rate_percent`.
 A rising skip count tells that case apart from a RAM cache that admits entries and still misses.
 `ram_cache_entries` (gauge) is the number of entries resident in this proxy's RAM cache now,
-summed across shards: range entries (one per cached extent) plus whole-object entries. Divide
+summed across shards, one per cached extent. Divide
 `ram_cache_size` by it for the mean entry size. Invalidation removes entries without moving
 `ram_cache_evictions`; this gauge falls when it does.
 
@@ -1665,12 +1665,12 @@ files and parts of uploads in progress are kept by design. A journal that cannot
 
 ## `atomic_metadata`
 
-Nullable in type, always present in practice. Journal and lock internals: 17 fields,
+Nullable in type, always present in practice. Journal and lock internals: 11 fields,
 all counters, per-proxy and monotone since process start. Mostly useful when diagnosing
 coordination on the cache volume; see
 [Running a fleet on one cache volume](SHARED_STORAGE.md). The four
 `metadata_lock_*` figures, the three `range_file_corruption_*` counters,
-`range_file_identity_mismatch_detected` and `journal_validation_failures` are exported over OTLP, which is every field in the section.
+`range_file_identity_mismatch_detected`, `unverified_ranges_refused`, `retired_fill_files_unlinked` and `journal_validation_failures` are exported over OTLP, which is every field in the section.
 
 - **Metadata slot locks**: `metadata_lock_acquisitions_successful`,
   `metadata_lock_acquisitions_failed`, `metadata_lock_hold_time_ms_total`,
@@ -1744,7 +1744,22 @@ coordination on the cache volume; see
   a response already streaming earlier ranges from the cache ends early with a connection
   error. The range is then removed and counted in `range_file_corruption_healed`, outside the
   heal limit, so the next read caches it again. A range whose metadata records no file identity
-  is not checked
+  is refused and counted in `unverified_ranges_refused` instead
+- **Ranges with no file identity**: `unverified_ranges_refused`
+  Ranges not served or not cached because their cached metadata or pending journal entry
+  records no file identity, so the file may hold another object version's bytes. It counts each
+  refusal by a read, so a range read twice before it is cached again counts twice. It also
+  counts each such journal entry that consolidation discards, and each fill not cached because
+  its file identity could not be read. It rises while a cache volume that a 2.x release populated re-warms after
+  the upgrade, then stays flat. A count that keeps rising most likely means a 2.x proxy is still
+  writing to the cache volume. See [Cache integrity](../SECURITY.md#cache-integrity) and
+  [`cache.trust_unverified_ranges`](CONFIGURATION.md#ranges-with-no-file-identity)
+- **Retired fill files**: `retired_fill_files_unlinked`
+  Range files that consolidation deleted after discarding the journal entry with no file
+  identity that wrote them. A file is deleted only if it is already 10 minutes old when its entry
+  is discarded and no cached metadata or other pending journal entry names it. A younger file is
+  left to [orphan recovery](SHARED_STORAGE.md#orphan-recovery) and not counted. It rises while journal entries that a 2.x
+  release left on the cache volume are discarded
 - **Journal**: `journal_validation_failures`
   Range journal entries the consolidator discarded because their range file had still not
   appeared five minutes after the entry was written, so the

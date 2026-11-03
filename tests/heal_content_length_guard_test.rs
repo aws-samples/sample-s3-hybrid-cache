@@ -195,13 +195,12 @@ async fn consolidation_does_not_derive_a_length_for_a_published_empty_object() {
     let cache_key = "guard-bucket/consolidator-empty-object";
 
     let meta_path = write_meta(cache_dir, &published_empty_object(cache_key)).await;
-    seed_range_file(cache_dir, cache_key).await;
-
+    let bin = seed_range_file(cache_dir, cache_key).await;
     let journal = JournalManager::new(cache_dir.to_path_buf(), "guard-test-instance".to_string());
-    journal
-        .append_range_entry(cache_key, add_entry(cache_dir, cache_key, None))
-        .await
-        .unwrap();
+    let mut entry = add_entry(cache_dir, cache_key, None);
+    entry.range_spec.file_identity =
+        s3_proxy::cache_types::RangeFileIdentity::of(&std::fs::metadata(&bin).unwrap());
+    journal.append_range_entry(cache_key, entry).await.unwrap();
 
     let before = read_meta(&meta_path).await;
     assert_eq!(
@@ -271,13 +270,12 @@ async fn unpublished_document_still_derives_its_length_from_its_range() {
     let mut unpublished = published_empty_object(cache_key);
     unpublished.object_metadata = ObjectMetadata::default();
     let meta_path = write_meta(cache_dir, &unpublished).await;
-    seed_range_file(cache_dir, cache_key).await;
-
+    let bin = seed_range_file(cache_dir, cache_key).await;
     let journal = JournalManager::new(cache_dir.to_path_buf(), "guard-test-instance".to_string());
-    journal
-        .append_range_entry(cache_key, add_entry(cache_dir, cache_key, None))
-        .await
-        .unwrap();
+    let mut entry = add_entry(cache_dir, cache_key, None);
+    entry.range_spec.file_identity =
+        s3_proxy::cache_types::RangeFileIdentity::of(&std::fs::metadata(&bin).unwrap());
+    journal.append_range_entry(cache_key, entry).await.unwrap();
 
     let before = read_meta(&meta_path).await;
     assert!(

@@ -78,6 +78,9 @@ pub struct JournalEvidenceReader {
     listing_failed: bool,
     /// The last refresh saw a `.journal.tmp`.
     tmp_present: bool,
+    /// Keep only this `Add` from each journal: set by the one-shot [`journal_evidence`],
+    /// which asks about one extent, so a leaf holds at most one triple, not every `Add`.
+    only: Option<(String, u64, u64)>,
 }
 
 impl JournalEvidenceReader {
@@ -89,6 +92,7 @@ impl JournalEvidenceReader {
             leaves: BTreeMap::new(),
             listing_failed: true,
             tmp_present: false,
+            only: None,
         }
     }
 
@@ -165,7 +169,7 @@ impl JournalEvidenceReader {
                 continue;
             }
             reread += 1;
-            match read_leaf(&path) {
+            match read_leaf(&path, self.only.as_ref()) {
                 Some(state) => {
                     seen.insert(name.clone());
                     self.leaves.insert(name, Leaf { snapshot, state });
@@ -225,27 +229,41 @@ pub fn journal_evidence(
     end: u64,
 ) -> JournalEvidence {
     let mut reader = JournalEvidenceReader::new(cache_dir);
+    reader.only = Some((cache_key.to_string(), start, end));
     reader.refresh();
     reader.evidence(cache_key, start, end)
 }
 
-/// Read one journal in full. `None` means it vanished (NotFound) and holds nothing.
-fn read_leaf(path: &Path) -> Option<LeafState> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+/// Read one journal, a line at a time. `None` means it vanished (NotFound) and holds nothing.
+///
+/// Fail-closed as the whole-file read was: a read error is `Unavailable`, and a line that is
+/// torn (a final segment without a newline), not UTF-8 or unparseable makes the whole leaf
+/// `Indeterminate`, whatever `Add`s came before it. With `only`, the `Add`s kept are that one.
+fn read_leaf(path: &Path, only: Option<&(String, u64, u64)>) -> Option<LeafState> {
+    use std::io::BufRead;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => return Some(LeafState::Unavailable),
     };
-    let Ok(content) = String::from_utf8(bytes) else {
-        return Some(LeafState::Indeterminate);
-    };
-    // Every append ends with a newline, so a final segment without one is a torn
-    // (in-progress or interrupted) write, whatever it parses as.
-    if !content.is_empty() && !content.ends_with('\n') {
-        return Some(LeafState::Indeterminate);
-    }
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut buf = Vec::new();
     let mut adds = HashSet::new();
-    for line in content.lines() {
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => return Some(LeafState::Unavailable),
+        }
+        // Every append ends with a newline, so a final segment without one is a torn
+        // (in-progress or interrupted) write, whatever it parses as.
+        if buf.last() != Some(&b'\n') {
+            return Some(LeafState::Indeterminate);
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            return Some(LeafState::Indeterminate);
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -256,11 +274,14 @@ fn read_leaf(path: &Path) -> Option<LeafState> {
             Err(_) => return Some(LeafState::Indeterminate),
         };
         if entry.operation == JournalOperation::Add {
-            adds.insert((
+            let add = (
                 entry.cache_key,
                 entry.range_spec.start,
                 entry.range_spec.end,
-            ));
+            );
+            if only.is_none_or(|wanted| *wanted == add) {
+                adds.insert(add);
+            }
         }
     }
     Some(LeafState::Parsed(adds))

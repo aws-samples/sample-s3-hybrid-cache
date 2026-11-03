@@ -993,6 +993,7 @@ async fn part_scoped_lookup_remains_fresh_only_for_expired_entries() {
     let meta_path = fixture.meta_path(cache_key);
     let mut metadata = fixture.read_meta(cache_key).expect(".meta");
     metadata.object_metadata.parts_count = Some(1);
+    metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (start, end));
     std::fs::write(
         &meta_path,

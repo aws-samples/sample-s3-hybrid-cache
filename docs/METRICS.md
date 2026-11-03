@@ -175,8 +175,9 @@ ceiling from the `peak_reserved_bytes` you observe under representative load, in
 slowest clients and largest objects.
 
 **It does not cover the streaming paths.** A range at or above `cache.disk_streaming_threshold`
-streams from disk through a small bounded frame channel, so its memory is a fixed cost per
-request rather than the range size, and it reserves nothing. The same holds for a RAM cache hit,
+streams from disk through one fixed-size queue of chunks, so its memory is a fixed cost per
+request rather than the range size ([Memory impact](CONFIGURATION.md#memory-impact)), and it
+reserves nothing. The same holds for a RAM cache hit,
 whose bytes are already resident and counted against `cache.max_ram_cache_size` (reported beside
 it as `ram_cache_max_bytes`, so the two budgets can be read together). A workload served mostly
 from RAM or by disk streaming can therefore show a low `reserved_bytes` while using a lot of

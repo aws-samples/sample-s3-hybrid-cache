@@ -373,8 +373,8 @@ pub struct CacheMetrics {
     pub ram_cache_misses: u64,
     pub ram_cache_evictions: u64,
     pub ram_cache_max_size: u64,
-    /// Entries resident in this instance's RAM tier right now: range entries plus whole-object
-    /// entries, summed across shards. A level, per-instance. Read with `ram_cache_size` for the
+    /// Entries resident in this instance's RAM tier right now, one per cached extent, summed
+    /// across shards. A level, per-instance. Read with `ram_cache_size` for the
     /// mean entry size; an invalidation drops entries without moving `ram_cache_evictions`, and
     /// this figure shows it.
     #[serde(default)]
@@ -859,6 +859,14 @@ pub struct AtomicMetadataMetrics {
     /// describes (inode or length differ), on a read for a client or for RAM promotion. Healed
     /// outside the heal limit. See `disk_cache::range_file_identity_mismatch_detected`.
     pub range_file_identity_mismatch_detected: u64,
+    /// Ranges not served or not cached for want of a file identity: listings and pending
+    /// journal fills refused for serving (per refusal), journal fills retired by consolidation,
+    /// and fills not published because their identity could not be taken. Rises while a cache
+    /// volume a 2.x release populated re-warms. See `disk_cache::unverified_ranges_refused`.
+    pub unverified_ranges_refused: u64,
+    /// Range files unlinked because the identity-less journal `Add` that wrote them was retired.
+    /// See `journal_consolidator::retired_fill_files_unlinked`.
+    pub retired_fill_files_unlinked: u64,
 
     /// Range journal entries discarded because their range file never appeared within
     /// `stale_entry_timeout_secs`. See `journal_consolidator::journal_validation_failures`.
@@ -5407,6 +5415,8 @@ impl MetricsManager {
                 crate::disk_cache::range_file_corruption_heal_suppressed(),
             range_file_identity_mismatch_detected:
                 crate::disk_cache::range_file_identity_mismatch_detected(),
+            unverified_ranges_refused: crate::disk_cache::unverified_ranges_refused(),
+            retired_fill_files_unlinked: crate::journal_consolidator::retired_fill_files_unlinked(),
             journal_validation_failures: crate::journal_consolidator::journal_validation_failures(),
         })
     }

@@ -202,7 +202,7 @@ An upload being completed is never reaped. `CompleteMultipartUpload` holds the u
 
 ## Compression and integrity
 
-Each `part{N}.bin` goes through the standard compression path, which decides per part whether to compress. Parts of compressible content types are LZ4-compressed, and parts of incompressible content are stored in an uncompressed LZ4 frame. Either way the frame carries an xxHash32 content checksum, so a flipped bit on disk produces a decode error, which a read handles as a cache miss. See [Integrity: every write is a checksummed LZ4 frame](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame).
+Each `part{N}.bin` goes through the standard compression path, which decides per part whether to compress. Parts of compressible content types are LZ4-compressed, and parts of incompressible content are stored in an uncompressed LZ4 frame. Either way the frame carries an xxHash32 content checksum, which a read checks when it reaches the end of the frame. A damaged part is handled like any other damaged range file; see [Integrity: every write is a checksummed LZ4 frame](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame) and [Damaged range files](../SECURITY.md#damaged-range-files).
 
 Each part's compression algorithm is recorded in its `part{N}.json` and carried into the final range metadata, so a read uses the right decoder.
 

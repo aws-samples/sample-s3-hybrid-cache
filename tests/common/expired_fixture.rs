@@ -449,6 +449,7 @@ impl Fixture {
                 compressed_size: range_specs.iter().map(|r| r.compressed_size).sum(),
                 parts_count: None,
                 part_ranges: HashMap::new(),
+                part_layout_verified: false,
                 upload_id: None,
                 is_write_cached,
                 write_cache_expires_at: write_cache_anchor.map(|t| t + Duration::from_secs(86400)),

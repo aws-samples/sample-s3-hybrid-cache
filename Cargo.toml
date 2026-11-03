@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2021"
 # MSRV. `time` and `hickory-{resolver,proto,net}` declare rust-version = "1.88", so the floor
 # cannot go below 1.88 whatever this crate does. 1.89 is retained rather than lowered to 1.88:
@@ -271,6 +271,16 @@ path = "tests/connection_keepalive_benchmark.rs"
 name = "consolidation_cycle_cost_scaling_test"
 path = "tests/consolidation_cycle_cost_scaling_test.rs"
 
+# consolidation_journal_read_memory_test: #[global_allocator] (one per binary) measuring one consolidation cycle's peak heap
+[[test]]
+name = "consolidation_journal_read_memory_test"
+path = "tests/consolidation_journal_read_memory_test.rs"
+
+# consolidation_journal_offset_index_cost_test: #[global_allocator] (one per binary) and the process-wide /proc/self/io rchar counter, measuring one consolidation cycle's bytes read
+[[test]]
+name = "consolidation_journal_offset_index_cost_test"
+path = "tests/consolidation_journal_offset_index_cost_test.rs"
+
 # eviction_activity_set_traversal_test: FAILED 2/3 grouped and passed 3/3 filtered to its own tests in the same binary: asserts a journal-set read count against a ceiling of 2, and the group's neighbours push it to 3
 [[test]]
 name = "eviction_activity_set_traversal_test"
@@ -285,6 +295,16 @@ path = "tests/eviction_lock_performance_test.rs"
 [[test]]
 name = "hedged_fetch_wiring_test"
 path = "tests/hedged_fetch_wiring_test.rs"
+
+# hit_stream_memory_test: #[global_allocator] (one per binary) measuring the live heap of stalled cache hits
+[[test]]
+name = "hit_stream_memory_test"
+path = "tests/hit_stream_memory_test.rs"
+
+# hit_stream_throughput_test: cache-hit MB/s and CPU per GB for streamed-hit arms (chunk size, disk queue depth) on process-global seams; a second test in the binary would perturb the timing
+[[test]]
+name = "hit_stream_throughput_test"
+path = "tests/hit_stream_throughput_test.rs"
 
 # invalidate_meta_slot_lock_test: mutates the same process-global slot acquire wait budget (set_slot_acquire_wait_budget)
 [[test]]
@@ -310,6 +330,16 @@ path = "tests/multipart_write_cache_signed_range_race_e2e.rs"
 [[test]]
 name = "origin_marker_test"
 path = "tests/origin_marker_test.rs"
+
+# pending_journal_lookup_cost_test: #[global_allocator] (one per binary) measuring one journal lookup's peak heap
+[[test]]
+name = "pending_journal_lookup_cost_test"
+path = "tests/pending_journal_lookup_cost_test.rs"
+
+# pending_journal_lookup_throughput_test: compares journal-lookup rates; a second test in the binary would perturb the timing
+[[test]]
+name = "pending_journal_lookup_throughput_test"
+path = "tests/pending_journal_lookup_throughput_test.rs"
 
 # permit_lifetime_integration_test: reads the process-global monotonic permits_held_peak() high-water mark (its own doc comment at :632)
 [[test]]
@@ -397,3 +427,11 @@ path = "tests/offset_shifted_range_entry_test.rs"
 [[test]]
 name = "download_coordination_bug_condition_property_test"
 path = "tests/download_coordination_bug_condition_property_test.rs"
+# part_layout_trust_unverified_test: sets cache.trust_unverified_ranges, process-global (as trust_unverified_ranges_test below)
+[[test]]
+name = "part_layout_trust_unverified_test"
+path = "tests/part_layout_trust_unverified_test.rs"
+# trust_unverified_ranges_test: sets cache.trust_unverified_ranges, a process-global read by every serve path and the consolidator, so it cannot share a process with tests that run under the default
+[[test]]
+name = "trust_unverified_ranges_test"
+path = "tests/trust_unverified_ranges_test.rs"

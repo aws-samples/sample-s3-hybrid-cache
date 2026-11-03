@@ -950,7 +950,7 @@ fn scan_leaf(
 /// Whether a range file is old enough to be past every writer's publish window: its mtime is at
 /// least [`MIN_CANDIDATE_AGE_SECS`] in the past. A modification time in the future (clock skew)
 /// or one that cannot be read is young, so the file is kept.
-fn old_enough(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn old_enough(meta: &std::fs::Metadata) -> bool {
     let Ok(modified) = meta.modified() else {
         return false;
     };

@@ -5,7 +5,7 @@ security model the software assumes, the risks that model leaves with you, and t
 yourself against this repository.
 
 
-**Applies to release 3.0.0. Last reviewed 2026-10-21.**
+**Applies to release 3.0.1. Last reviewed 2026-11-03.**
 
 Confirm the release you are reading with `grep '^version' Cargo.toml`. If it does not match the release
 named above, this document was written against a different release than the code in front of you.
@@ -191,6 +191,171 @@ on for the HTTP paths as well. Restrict which clients can reach the proxy, as fo
 
 ---
 
+## Cache integrity
+
+A cache that serves the wrong bytes gives a client data that does not belong to the object version
+or byte range its response headers name. This section describes how that could happen, what guards
+against it, what the guards do not cover, which releases were affected, and what to do.
+
+### How a client could receive the wrong bytes
+
+The proxy stores each cached range as a file on the cache volume, at a path that names the object
+and the range but not the object version. The object's ETag and headers are recorded in its cached
+metadata. When an object is overwritten in place by a client that does not go through the proxies,
+two versions of one key exist, and a range file of one version can end up listed under the other
+version's ETag. A read then returns one version's bytes under the other version's headers.
+
+Every known case needs an object overwritten in place outside the proxy, except an error reply that
+a 2.x release cached as object data, described under [Affected releases](#affected-releases). Most
+cases also need concurrent fills of one range, a rolling upgrade, or a cache volume that a 2.x
+release wrote to. A deployment whose objects are each written once is exposed to none of the others.
+
+### What guards against it
+
+- **File identity.** When the proxy caches a range, it records the range file's length and
+  modification time, and every read compares them with the file it opens before sending anything
+  from it. A mismatch is refused, counted in
+  `atomic_metadata.range_file_identity_mismatch_detected`, and the range is fetched from S3 and
+  cached again. Two files of equal length modified less than 1 ms apart have the same identity.
+- **No identity, no serve.** A range whose cached metadata or pending journal entry records no file
+  identity is refused and fetched from S3 again, counted in
+  `atomic_metadata.unverified_ranges_refused`. Every range a 2.x release cached is such a range.
+  Consolidation discards journal entries that list a range but record no file identity, instead of
+  listing them. It deletes
+  the range file the entry wrote if the file is already 10 minutes old when the entry is discarded
+  and no cached metadata or other pending entry names it, counted in
+  `atomic_metadata.retired_fill_files_unlinked`. A younger file is left to
+  [orphan recovery](docs/SHARED_STORAGE.md#orphan-recovery). A fill whose file identity cannot be
+  read is not cached.
+- **One temporary file per fill.** Each fill writes its own temporary file, created only if no file
+  of that name exists. Under the key's metadata lock, the fill publishes that file only if it is
+  still the file the fill wrote.
+- **Versions compared.** A fill whose ETag differs from the cached metadata's is dropped instead of
+  published, and consolidation never lists a fill of another version. A HEAD that finds the object
+  changed removes the old version's ranges and part layout. Consolidation keeps a listing over a
+  range file only when the file is the one the listing names, so a revalidation that S3 answers
+  `304` renews only a listing that matches its file.
+- **Objects with no cached metadata.** A fill for an object with no cached metadata leaves a range
+  file already at its path in place if that file was modified in the last 10 minutes, and discards
+  its own copy. The client is still answered from S3. A file that recent may come from another
+  fill, of the same version or another, that consolidation has not yet listed, and replacing it
+  could leave this fill's bytes listed under that fill's ETag. The fill replaces a file that is at
+  least 10 minutes old, or that was last modified before the object's write-order file (`.wtok`)
+  was last written ([Directory hierarchy](docs/CACHE_INTERNALS.md#directory-hierarchy) says what
+  writes it). The age compares the file's
+  modification time, set by the file server, with the proxy's clock.
+- **The RAM cache.** A range copied into the RAM cache is served only while the cache volume's
+  metadata still lists a range covering it, under the same ETag.
+- **Part layouts.** A part's layout is recorded only when the part's ETag matches the cached
+  object's, under the key's metadata lock, and is marked as checked. A layout without the mark,
+  which every release before 3.0.1 wrote, is discarded on its first read and each of its parts is
+  fetched from S3 once. Each discard logs one `info` line, `Cleared a part layout recorded before
+  3.0.1`, and no counter records it.
+- **Error replies.** A range with no file identity whose bytes are an S3 XML error reply is refused
+  whatever `cache.trust_unverified_ranges` is set to. Cached metadata with neither an ETag nor a
+  `Last-Modified`, such as metadata built from an error reply, is never served. When it lists a
+  range with no file identity, the first read removes it, so the object is cached again.
+
+### What the guards do not cover
+
+- **`cache.trust_unverified_ranges: true` where objects are overwritten in place outside the
+  proxy.** Ranges and pending journal entries with no file identity are then served and consolidated
+  unchecked, as 3.0.0 did, including another version's bytes and non-XML error bodies that a 2.x
+  release cached. Unmarked part layouts are kept. No time limit ends such a serve: while the cached
+  metadata names the version S3 holds now, every revalidation gets `304` and renews the entry.
+- **A 2.x proxy on the same cache volume.** A 2.x proxy compares no versions when it fills,
+  consolidates or reads, so it keeps creating and serving listings of another version's bytes. It
+  also locks different files from 3.x proxies, so their metadata writes are not ordered against each
+  other. 3.0.1 proxies refuse the ranges it caches, so the fleet keeps fetching them from S3 until
+  it stops.
+- **A 3.0.0 proxy on the same cache volume.** A 3.0.0 proxy keeps the 3.0.0 behavior listed under
+  [Affected releases](#affected-releases). In particular, for an object with no cached metadata it
+  can replace a range file that a 3.0.1 proxy has just written, so that case stays open until every
+  proxy runs 3.0.1.
+- **Origins that send no ETag.** The version checks compare ETags, so they cannot tell apart two
+  versions of an object that an S3-compatible origin served without an ETag. Amazon S3 always sends
+  one.
+- **Proxy clocks ahead of the file server.** A proxy whose clock runs 10 minutes or more ahead of
+  the cache volume's file server sees every range file as at least 10 minutes old. Its fills for
+  objects with no cached metadata then replace any range file at their path, and nothing reports
+  this.
+
+### Damaged range files
+
+Damage to the storage under the cache volume, such as a flipped bit, is outside the version guards,
+and keeping that storage undamaged is your responsibility. Range files are LZ4 frames with a content
+checksum, which the proxy reads after a frame's last block.
+
+- A buffered response decodes the whole file before sending anything, so it never sends damaged
+  bytes.
+- A streamed response that runs to the end of a cached range holds its last chunk until the checksum
+  has been read, and ends short if the check fails, so the client receives an incomplete response.
+- A streamed response that ends before the end of its cached range can complete with damaged bytes,
+  because the checksum comes after its last byte. A small range read from a large cached range is
+  the common case.
+
+The next read that reaches the checksum detects the damage, counts it in
+`atomic_metadata.range_file_corruption_detected`, and removes the range so it is cached again. A
+count that keeps rising means the cache volume is returning damaged bytes; check the storage.
+
+### Affected releases
+
+The guards above close each case in 3.0.1, except as described under [What the guards do not
+cover](#what-the-guards-do-not-cover) and [Damaged range files](#damaged-range-files).
+
+- **Concurrent fills sharing one temporary file**: 3.0.0, between fills in one proxy, for example
+  concurrent `?partNumber=` GETs of one part. Public 1.6.7 to 2.8.4 shared one temporary file
+  between every proxy on the cache volume.
+- **A fill replacing a range file that another proxy had just written, for an object with no cached
+  metadata**: 3.0.0.
+- **Part layouts recorded across versions**: public 1.6.7 to 3.0.0, including public 2.8.1 and
+  public 2.8.2. Before 3.0.0 the other version's part bytes could be served as well. From public
+  2.2.0 to 2.8.4, a conditional `?partNumber=` GET was also answered from the cache without S3
+  evaluating its condition.
+- **Journal entries with no file identity consolidated over another version's file**: 3.0.0.
+  Every 2.x release writes such entries, so the case could arise during a rolling upgrade from 2.x
+  or until the entries 2.x left on the cache volume were consolidated. 3.0.0 also writes one when
+  it cannot read the identity of a range file it has just written.
+- **Ranges and pending journal entries with no file identity served unchecked**: 3.0.0. Public 1.6.7
+  to 2.8.4 compared no versions when filling, consolidating or reading, so after an overwrite
+  outside the proxy a single proxy could cache another version's bytes under the cached ETag and
+  serve them.
+- **RAM copies served after the cache volume's copy was corrected**: 3.0.0, for up to
+  `cache.metadata_cache.refresh_interval` or, on page-widened reads, until `get_ttl` passed. Public
+  1.6.7 to 2.8.4 compared no versions in the RAM cache at all, which 3.0.0 fixed.
+- **A whole-object RAM copy answering another object's range**: public 1.6.7 to 3.0.0, with the
+  RAM cache enabled. A client that uploaded an LZ4 frame as `{key}:range:{start}:{end}` and read it
+  back through one proxy made that proxy answer those bytes of object `{key}` with the frame's
+  decoded content. Public 1.6.7 to 2.8.4 kept the entry until RAM eviction. 3.0.0 checked it against
+  the object's ETag within `cache.ram_cache_verification_interval`, so only an upload of the exact
+  bytes of an LZ4 `{key}` lasted until eviction. The RAM cache now holds ranges only.
+- **A `304` renewing a wrong entry**: every public release from 1.6.7 to 3.0.0. Such an entry lasted
+  until eviction, a write through the proxy or another overwrite. Before 3.0.0 the default `get_ttl`
+  was about 10 years, so a wrong entry was rarely revalidated.
+- **Error replies cached as object data**: public 1.9.7 to 2.8.4 could cache an error reply to a
+  refetch, such as an S3 `403` after a range file was evicted, as range data and serve it as object
+  bytes. Where eviction had removed the object's whole cached metadata, a client that sent GET
+  without a HEAD first could receive the reply as the entire object, with status `200` and type
+  `application/xml`. 3.0.0 refused S3 XML error replies left on the cache volume and served other
+  error bodies, such as an intermediary's HTML error page.
+- **Damaged range files streamed as complete responses**: public 1.8.2 to 3.0.0.
+
+### What to do
+
+- Upgrade a fleet from 2.x in one pass: stop every proxy on the cache volume, replace the binary on
+  each, then start them. Upgrade from 3.0.0 the same way where objects are overwritten in place. See
+  [Upgrading to 3.0.1](docs/UPGRADING.md#upgrading-to-301).
+- Leave `cache.trust_unverified_ranges` at `false` unless every object is written once and never
+  overwritten in place outside the proxy.
+- After upgrading a cache volume that a 2.x release wrote to, watch
+  `atomic_metadata.unverified_ranges_refused`. It rises while the ranges 2.x cached are fetched
+  again, then stays flat. A count that keeps rising most likely means a 2.x proxy is still writing
+  to the cache volume.
+- Keep each proxy's clock within 10 minutes of the cache volume's file server, for example with NTP.
+- Watch `atomic_metadata.range_file_corruption_detected` for damaged storage.
+
+---
+
 ## What you can verify yourself
 
 Every check here runs against this repository with public tooling. Figures that change between
@@ -312,7 +477,8 @@ key in a configuration file is accepted and ignored, with a warning at startup. 
 limits its number of files, size that limit for the number of objects you expect to cache.
 
 **Upgrades.** Upgrading replaces the binary and restarts the proxy; existing configuration keeps
-working. Before upgrading a fleet to 3.0.0, read [Upgrading to 3.0.0](docs/UPGRADING.md#upgrading-to-300).
+working. Before upgrading a fleet, read [Upgrading to 3.0.1](docs/UPGRADING.md#upgrading-to-301),
+and [Upgrading to 3.0.0](docs/UPGRADING.md#upgrading-to-300) as well when upgrading from 2.x.
 
 ## Listening surface
 

@@ -117,6 +117,7 @@ async fn seed_part(fixture: &Fixture, cache_key: &str, etag: &str) -> String {
     let etag = fixture.seed(cache_key, &spec);
     let mut metadata = fixture.read_meta(cache_key).expect(".meta");
     metadata.object_metadata.parts_count = Some(4);
+    metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
     std::fs::write(
         fixture.meta_path(cache_key),
@@ -403,6 +404,7 @@ async fn expired_part_revalidates_and_a_304_starts_a_new_window() {
     let etag = fixture.seed(key, &spec);
     let mut metadata = fixture.read_meta(key).expect(".meta");
     metadata.object_metadata.parts_count = Some(4);
+    metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
     std::fs::write(
         fixture.meta_path(key),
@@ -500,6 +502,7 @@ async fn zero_ttl_waiters_get_the_5xx_and_non_zero_keep_stale_if_error() {
     spec.created_age = Duration::from_secs(1);
     fixture.seed(key, &spec);
     let mut metadata = fixture.read_meta(key).expect(".meta");
+    metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
     std::fs::write(
         fixture.meta_path(key),
@@ -1307,6 +1310,7 @@ async fn write_cached_part_with_no_last_modified_is_fetched_not_revalidated() {
     let etag = fixture.seed(key, &spec);
     let mut metadata = fixture.read_meta(key).expect(".meta");
     metadata.object_metadata.parts_count = Some(4);
+    metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
     std::fs::write(
         fixture.meta_path(key),
