@@ -326,6 +326,11 @@ path = "tests/put_pre_body_awaits_bounded_test.rs"
 name = "ram_verify_ioerror_logging_test"
 path = "tests/ram_verify_ioerror_logging_test.rs"
 
+# revalidated_hit_throughput_test: compares revalidated-hit rates; a second test in the binary would perturb the timing
+[[test]]
+name = "revalidated_hit_throughput_test"
+path = "tests/revalidated_hit_throughput_test.rs"
+
 # slot_lock_guard_conversion_test: reads metadata_lock_*_total() globals and sets the process-global slot acquire wait budget
 [[test]]
 name = "slot_lock_guard_conversion_test"

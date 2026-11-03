@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [Unreleased]
+
+### Fixed
+
+- Previously, every cache hit that revalidated with S3 (every hit at `get_ttl: 0`) took the disk cache manager's write lock to record the origin `304` on the object's `.meta`, so the process completed those hits one at a time, and, the lock being fair, every reader of the manager queued behind each waiting hit. The `.meta` write is ordered by the key's metadata slot lock, the same lock that orders it against peer processes, so the hit now takes the read lock. In a load test against a local S3-compatible store with 200 ms added to each upstream request, cache-hit throughput rose 1.8 times at 64 concurrent clients and 1.9 times at 256, and the median time to response headers at 64 clients fell from 411 ms to 214 ms.
+
 ## [3.0.0] - 2026-10-21
 
 3.0.0 lets a fleet of proxies share one large cache on Amazon EFS, Amazon FSx or NFS and keeps that cache correct and within its size limit:

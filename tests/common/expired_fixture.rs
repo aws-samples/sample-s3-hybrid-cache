@@ -49,6 +49,7 @@ use s3_proxy::cache_types::{
 };
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::config::Config;
+use s3_proxy::disk_cache::DiskCacheManager;
 use s3_proxy::http_proxy::HttpProxy;
 use s3_proxy::inflight_tracker::InFlightTracker;
 use s3_proxy::range_handler::RangeHandler;
@@ -67,6 +68,8 @@ pub struct Fixture {
     pub config: Arc<Config>,
     pub cache_manager: Arc<CacheManager>,
     pub range_handler: Arc<RangeHandler>,
+    /// The disk cache manager `range_handler` holds, so a test can take its lock.
+    pub disk_cache_manager: Arc<tokio::sync::RwLock<DiskCacheManager>>,
     pub inflight_tracker: Arc<InFlightTracker>,
 }
 
@@ -326,6 +329,7 @@ impl Fixture {
             config,
             cache_manager,
             range_handler,
+            disk_cache_manager,
             inflight_tracker: Arc::new(InFlightTracker::new()),
         }
     }

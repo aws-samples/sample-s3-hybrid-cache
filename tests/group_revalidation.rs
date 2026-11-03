@@ -66,6 +66,8 @@ mod recovery_refetch_version_pin_test;
 mod refresh_cache_ttl_metadata_format_test;
 #[path = "refresh_object_ttl_property_test.rs"]
 mod refresh_object_ttl_property_test;
+#[path = "revalidated_hit_read_lock_test.rs"]
+mod revalidated_hit_read_lock_test;
 #[path = "revalidation_304_reanchor_test.rs"]
 mod revalidation_304_reanchor_test;
 #[path = "revalidation_etag_authority_test.rs"]

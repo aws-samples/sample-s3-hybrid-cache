@@ -5387,8 +5387,7 @@ impl HttpProxy {
                                                         .await;
                                                     }
 
-                                                    let mut disk_cache_guard =
-                                                        disk_cache.write().await;
+                                                    let disk_cache_guard = disk_cache.read().await;
                                                     // An origin `304`: re-anchor the live GET age,
                                                     // not only stored expiry, or every later read
                                                     // revalidates again.
@@ -10815,7 +10814,7 @@ impl HttpProxy {
                                                     };
                                                 }
 
-                                                let mut disk_cache_guard = disk_cache.write().await;
+                                                let disk_cache_guard = disk_cache.read().await;
                                                 // An origin `304`: re-anchor the live GET age too
                                                 // (`record_origin_validation`).
                                                 if let Err(e) = disk_cache_guard
@@ -17664,7 +17663,7 @@ impl HttpProxy {
                 );
                 {
                     let disk_cache = range_handler.get_disk_cache_manager();
-                    let mut disk_cache_guard = disk_cache.write().await;
+                    let disk_cache_guard = disk_cache.read().await;
                     // An origin `304`: re-anchor the live GET age, not only stored expiry.
                     if let Err(e) = disk_cache_guard
                         .record_origin_validation(&cache_key, resolved.get_ttl)

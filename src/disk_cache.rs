@@ -8757,8 +8757,13 @@ impl DiskCacheManager {
     /// a `304` from a Mode B hit. The write is a single non-blocking lock attempt; a
     /// contended slot or an absent `.meta` skips it, which costs one extra revalidation on
     /// the next read and never extends freshness.
+    ///
+    /// Takes `&self`: the key's metadata slot lock, not exclusive access to this manager,
+    /// orders the write against every other `.meta` writer, in this process and in its peers,
+    /// so callers hold the manager's read lock. Under the write lock every revalidated hit in
+    /// the process queued behind every reader, journal scans included (the lock is fair).
     pub async fn record_origin_validation(
-        &mut self,
+        &self,
         cache_key: &str,
         new_ttl: std::time::Duration,
     ) -> Result<()> {
@@ -8791,7 +8796,7 @@ impl DiskCacheManager {
     /// [`Self::record_origin_validation`]. `origin_validated` selects whether the live GET
     /// age re-anchors as well as stored expiry.
     async fn write_object_ttl_locked(
-        &mut self,
+        &self,
         cache_key: &str,
         new_ttl: std::time::Duration,
         origin_validated: bool,
