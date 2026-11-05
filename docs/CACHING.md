@@ -121,8 +121,8 @@ stored response headers, and no S3 request.
 
 If every read must reach S3 so that S3 evaluates IAM authorization, a HEAD served from cache is a
 read S3 never sees. For such a prefix, set both fields. The example also sets
-`evaluate_conditions_from_cache: false`, so that a client's `If-Match` is forwarded instead of
-compared with the cached ETag, as a zero `get_ttl` already does:
+`evaluate_conditions_from_cache: false`, so that a client's `If-Match` is forwarded as the client
+sent it instead of compared with the cached ETag:
 
 ```json
 {
@@ -139,7 +139,7 @@ Each field governs a different set of requests:
 |---|---|
 | `get_ttl: "0s"` | GET, ranged GET, `?partNumber=` GET, and a GET whose only conditional header is `If-Match` or `If-Range`: every request reaches S3 |
 | `head_ttl: "0s"` | HEAD, including a HEAD that carries a `Range` header or a lone `If-Match`: every request is forwarded to S3 |
-| `evaluate_conditions_from_cache: false` | A GET or HEAD whose only conditional header is `If-Match` or `If-Range`. With the default `true`, the proxy answers it from cache without contacting S3 while the entry is within `get_ttl`, and for a HEAD also within `head_ttl`. At `get_ttl: "0s"` those requests are forwarded whatever this field says |
+| `evaluate_conditions_from_cache: false` | A GET or HEAD whose only conditional header is `If-Match` or `If-Range`. With the default `true`, the proxy answers it from cache without contacting S3 while the entry is within `get_ttl`, and for a HEAD also within `head_ttl`. At `get_ttl: "0s"` those requests reach S3 whatever this field says: with `false` as the client sent them, and with `true` a lone `If-Match` naming the cached ETag is revalidated with the proxy's `If-None-Match` added, so an unchanged object is served from cache after a bodyless `304` |
 
 The proxy does not derive one field from the other: `head_ttl` is not clamped to `get_ttl`, and a
 rule that sets only one of them is accepted as written. A long `get_ttl` with a short `head_ttl`

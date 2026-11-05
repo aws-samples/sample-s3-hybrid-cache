@@ -84,3 +84,5 @@ mod ttl_authority_serve_paths_test;
 mod uncacheable_miss_marker_test;
 #[path = "validator_less_revalidation_test.rs"]
 mod validator_less_revalidation_test;
+#[path = "zero_ttl_if_match_revalidation_test.rs"]
+mod zero_ttl_if_match_revalidation_test;

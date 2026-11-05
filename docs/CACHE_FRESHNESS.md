@@ -209,6 +209,16 @@ bytes. Entries within `get_ttl` still serve locally, so warm CRT downloads are u
 is one upstream request for an `If-Match` read of an expired key. With `get_ttl: "0s"` every entry
 is past `get_ttl`, so a GET with a lone `If-Match` always reaches S3.
 
+**At `get_ttl: "0s"`, an `If-Match` naming the cached ETag is revalidated, not relayed.** The proxy
+sends S3 the client's request, with its `If-Match` and signature intact, and adds its own
+`If-None-Match` for the cached ETag, as it does for a request with no precondition. S3 judges the
+client's `If-Match` and the caller's permission, and answers an unchanged object with a bodyless
+`304`, so the response is served from cache. A changed object gets S3's `412`. Transfer managers
+such as boto3's s3transfer and the CRT put `If-Match` on every ranged part of a split download, so
+each part of a cached object costs one bodyless request instead of a transfer from S3. An
+`If-Match` naming any other ETag is forwarded as the client sent it, as is every `If-Match` with
+`evaluate_conditions_from_cache: false`.
+
 ### Proxy-internal conditional injection (independent of the above)
 
 Whatever `evaluate_conditions_from_cache` says, the proxy adds conditional headers to its own S3
@@ -312,8 +322,10 @@ only conditional header is `If-Match` or `If-Range`. `head_ttl` covers HEAD, inc
 carries a `Range` header or a lone `If-Match`. Neither implies the other. The YAML above sets both
 globally. The same applies per prefix in `cache_rules.json`, where a rule naming only `get_ttl`
 leaves HEAD requests answerable from cache for `head_ttl` (default `60s`).
-`evaluate_conditions_from_cache: false` adds nothing at `get_ttl: "0s"`, where a GET with a lone
-`If-Match` or `If-Range` is forwarded whatever it says.
+At `get_ttl: "0s"` a GET with a lone `If-Match` or `If-Range` reaches S3 whatever
+`evaluate_conditions_from_cache` says. With `false` it is forwarded as the client sent it; with
+the default `true`, a lone `If-Match` naming the cached ETag is revalidated, so an unchanged
+object is served from cache after a bodyless `304`.
 [Zero TTL revalidation](CACHING.md#zero-ttl-revalidation) shows the per-rule form.
 
 If S3 must evaluate IAM on every read, and not only check freshness, both settings are needed: a

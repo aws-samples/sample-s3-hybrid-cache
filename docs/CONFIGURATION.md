@@ -617,7 +617,7 @@ The file holds an optional `$schema` reference plus an ordered `rules` array. Ea
 
 **Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`, `hedging_enabled`, `hedge_trigger_after`, `hedge_max_per_request`
 
-**`get_ttl` and `head_ttl` are independent per rule.** Neither is derived from or clamped to the other. A rule setting `get_ttl: "0s"` without `head_ttl` leaves HEAD requests for matching keys answerable from cache for the resolved `head_ttl` (default 60s). A prefix that must reach S3 on every read, so that S3 evaluates IAM for each request, needs both `get_ttl` and `head_ttl` at `"0s"`, because each covers a different request class. The example also sets `evaluate_conditions_from_cache: false`, which a zero `get_ttl` already implies for a lone `If-Match` or `If-Range` GET:
+**`get_ttl` and `head_ttl` are independent per rule.** Neither is derived from or clamped to the other. A rule setting `get_ttl: "0s"` without `head_ttl` leaves HEAD requests for matching keys answerable from cache for the resolved `head_ttl` (default 60s). A prefix that must reach S3 on every read, so that S3 evaluates IAM for each request, needs both `get_ttl` and `head_ttl` at `"0s"`, because each covers a different request class. The example also sets `evaluate_conditions_from_cache: false`, so that a lone `If-Match` or `If-Range` GET is forwarded as the client sent it:
 
 ```json
 { "pattern": "**/restricted/**", "get_ttl": "0s", "head_ttl": "0s", "evaluate_conditions_from_cache": false }

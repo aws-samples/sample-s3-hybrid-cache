@@ -3280,6 +3280,31 @@ impl HttpProxy {
         mode_b && has_if_match && !other_conditional && !get_ttl.is_zero()
     }
 
+    /// Whether a pure-`If-Match` request on a `get_ttl: 0` key may revalidate the
+    /// cached copy instead of being relayed to S3. The caller also requires the
+    /// client's `If-Match` to strong-match the cached ETag; one naming any other
+    /// version is left for S3 alone to judge.
+    ///
+    /// `mode_b_if_match_eligible` never allows a local serve at a zero `get_ttl`,
+    /// but relaying the request is more than that rule needs. A passing `If-Match`
+    /// makes S3 return the body, so every ranged part of a transfer manager's split
+    /// download (s3transfer and the CRT put `If-Match` on each) crossed from S3
+    /// however often the cache had served it. The ordinary revalidation sends S3 the
+    /// client's own request, `If-Match` and signature intact, plus the proxy's
+    /// `If-None-Match` for the cached ETag. S3 still judges the client's
+    /// precondition and permission, and answers an unchanged object with a bodyless
+    /// `304`. Measured against real S3, a request signed over `Range` and `If-Match`,
+    /// with an unsigned `If-None-Match` added, gets `304` for the current ETag,
+    /// `412` for a stale `If-Match`, and `403` without credentials.
+    fn zero_ttl_if_match_revalidates(
+        mode_b: bool,
+        has_if_match: bool,
+        other_conditional: bool,
+        get_ttl: Duration,
+    ) -> bool {
+        mode_b && has_if_match && !other_conditional && get_ttl.is_zero()
+    }
+
     /// Detect the conditional headers relevant to a Range request: `If-Range`,
     /// `If-Match`, `If-None-Match` (Requirement 2.6). Used by the page-widening
     /// path to force a conditional round-trip to S3 rather than serving a
@@ -4488,13 +4513,42 @@ impl HttpProxy {
                     "Mode B: pure If-Range, cached_etag={:?}, forward_to_s3={}: cache_key={}",
                     cached_etag, forward_to_s3, cache_key
                 );
+            } else if Self::zero_ttl_if_match_revalidates(
+                mode_b,
+                if_match_header.is_some(),
+                other_conditional,
+                resolved_settings.get_ttl,
+            ) && {
+                let cached_etag = cache_manager
+                    .get_metadata_cached(&cache_key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|meta| meta.object_metadata.etag);
+                match (if_match_header.as_deref(), cached_etag.as_deref()) {
+                    (Some(if_match), Some(etag)) if !etag.is_empty() => {
+                        etag_list_strong_match(if_match, etag)
+                    }
+                    _ => false,
+                }
+            } {
+                // Zero get_ttl + pure If-Match naming the cached ETag: the ordinary cache
+                // path, which at a zero get_ttl revalidates every read with the client's
+                // request plus the proxy's If-None-Match (`zero_ttl_if_match_revalidates`).
+                debug!(
+                    "Zero get_ttl: If-Match names the cached ETag; revalidating rather than relaying: cache_key={}",
+                    cache_key
+                );
+                forward_to_s3 = false;
+                mode_b_if_match_serve = false;
             } else {
                 // Mode A (default) OR Mode B with If-None-Match / If-Modified-Since /
                 // If-Unmodified-Since OR mixed conditional (If-Match + other) OR a pure
-                // If-Match on a key whose resolved `get_ttl` is 0 (see
-                // `mode_b_if_match_eligible`): always forward to S3 so S3 evaluates the
-                // precondition — and, for the zero-TTL case, the caller's authorization
-                // (fixes T6/T8).
+                // If-Match on a key whose resolved `get_ttl` is 0 that names another
+                // version than the cached one (see `mode_b_if_match_eligible` and
+                // `zero_ttl_if_match_revalidates`): always forward to S3 so S3 evaluates
+                // the precondition — and, for the zero-TTL case, the caller's
+                // authorization (fixes T6/T8).
                 debug!(
                     "Conditional request: forwarding to S3 for evaluation: cache_key={} mode_b={} has_if_match={} other_conditional={}",
                     cache_key,

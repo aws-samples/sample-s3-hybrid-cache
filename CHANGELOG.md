@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [Unreleased]
+
+### Fixed
+
+- At `get_ttl: "0s"`, a GET whose only conditional header was an `If-Match` naming the cached ETag was relayed to S3 as sent, so S3 returned the body and the cached copy was never served (public 3.0.0 to 3.0.1). Transfer managers such as boto3's s3transfer and the CRT put `If-Match` on every ranged part of a split download, so every part of a cached object of 8 MiB or more came from S3 on every read. With `evaluate_conditions_from_cache: true` (the default), the proxy now adds its own `If-None-Match` for the cached ETag to the client's request, as it does for a request with no precondition. S3 still judges the client's `If-Match` and the caller's permission on every read, and answers an unchanged object with a bodyless `304`, so the part is served from cache. Against Amazon S3, a GET signed over `Range` and `If-Match`, with an unsigned `If-None-Match` added, got `304` for the current ETag, `412` for a stale `If-Match`, and `403` without credentials. See [Cache freshness](docs/CACHE_FRESHNESS.md#default-serve-if-match-hits-from-cache-evaluate_conditions_from_cache--true), by [@samirotiv-polybee](https://github.com/samirotiv-polybee).
+
 ## [3.0.1] - 2026-11-03
 
 3.0.1 lowers the memory that consolidation and streamed cache hits hold, and lets cache hits that revalidate with S3 run concurrently. It also closes cases where a read could return one object version's bytes under another version's ETag and headers. 3.0.0's line "Range, part and conditional reads never mix bytes of two versions" did not hold in those cases. Each needed an object overwritten in place outside the proxy, except an error reply that a 2.x release cached as object data. By default, 3.0.1 fetches from S3 again any cached range that records no file identity, which includes every range a 2.x release cached.
