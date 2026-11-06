@@ -344,42 +344,6 @@ fn test_virtual_hosted_cache_key_preservation() {
 }
 
 // ============================================================================
-// Property 2c: Range/part cache keys for non-AP hosts — range and part suffixes
-// are appended to normalize_cache_key(path) without any prefix.
-//
-// **Validates: Requirements 3.3, 3.4**
-// ============================================================================
-
-fn prop_range_part_preservation(
-    region: AwsRegion,
-    bucket: BucketName,
-    path: ObjectPath,
-) -> TestResult {
-    let host = format!("s3.{}.amazonaws.com", region.0);
-
-    let object_part = path.0.strip_prefix('/').unwrap_or(&path.0);
-    let full_path = format!("/{}/{}", bucket.0, object_part);
-    let normalized = normalize_cache_key(&full_path);
-
-    // Part cache key should be "{normalized}:part:{n}"
-    let part_key = CacheManager::generate_part_cache_key(&full_path, 1, Some(&host));
-    let expected_part = format!("{}:part:1", normalized);
-
-    // Range cache key should be "{normalized}:range:{start}-{end}"
-    let range_key = CacheManager::generate_range_cache_key(&full_path, 0, 1024, Some(&host));
-    let expected_range = format!("{}:range:0-1024", normalized);
-
-    TestResult::from_bool(part_key == expected_part && range_key == expected_range)
-}
-
-#[test]
-fn test_range_part_cache_key_preservation() {
-    QuickCheck::new().tests(200).quickcheck(
-        prop_range_part_preservation as fn(AwsRegion, BucketName, ObjectPath) -> TestResult,
-    );
-}
-
-// ============================================================================
 // Unit tests for `extract_access_point_prefix`
 //
 // **Validates: Requirements 2.1, 2.4, 3.1, 3.2**

@@ -41,7 +41,7 @@ static LAST_UNDERFLOW_WARN: AtomicU64 = AtomicU64::new(0);
 /// one it finds under the slot lock and declines on a mismatch
 /// (`WriteCacheManager::evict_write_cached_object_if_unchanged`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedObjectIdentity {
+pub(crate) struct StagedObjectIdentity {
     /// `object_metadata.etag`.
     pub etag: String,
     /// `object_metadata.write_cache_created_at`.
@@ -679,8 +679,8 @@ impl WriteCacheManager {
     ///   counts in `total_size` *and* in
     ///   `write_cache_size`; a graduated one counts only in `total_size`. Both use
     ///   `compressed_size`, for symmetry with the add sites
-    ///   (`DiskCacheManager::store_range` and
-    ///   `JournalConsolidator::write_multipart_journal_entries` both credit
+    ///   (`PreparedRangeFill::finish` and
+    ///   `JournalConsolidator::write_multipart_journal_entries_witnessed` both credit
     ///   `compressed_size`); debiting an on-disk `len()` instead would drift silently.
     /// - **R5.4** — debit only for range files that **existed and deleted cleanly**.
     ///   The accumulator debits and the journal entries are both built from
@@ -1004,26 +1004,11 @@ impl WriteCacheManager {
             ))
         })
     }
-
-    /// Reap incomplete multipart uploads idle for longer than `incomplete_upload_ttl`.
-    ///
-    /// A thin wrapper over [`sweep_incomplete_uploads`], the one implementation, for callers that
-    /// hold a manager. Returns the bytes the reaped directories held. Nothing is released from
-    /// this manager's reservation counter: parts take no write-cache reservation and are not
-    /// credited to the size figures while staged (credit happens at Complete), so there is
-    /// nothing to debit.
-    pub async fn evict_incomplete_uploads(&self) -> Result<u64> {
-        Ok(
-            sweep_incomplete_uploads(self.cache_dir.clone(), self.incomplete_upload_ttl)
-                .await
-                .bytes_freed,
-        )
-    }
 }
 
 /// What one [`sweep_incomplete_uploads`] pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct IncompleteUploadSweep {
+pub(crate) struct IncompleteUploadSweep {
     /// Upload directories reaped.
     pub evicted: u64,
     /// Bytes those directories held (logged; nothing is debited, see the sweep's docs).
@@ -1032,8 +1017,9 @@ pub struct IncompleteUploadSweep {
     pub skipped_locked: u64,
 }
 
-/// Prefix of a directory under `mpus_in_progress/` that a sweep has renamed aside for removal.
-const REAPING_PREFIX: &str = ".reaping-";
+/// Prefix of a directory under `mpus_in_progress/` that a sweep or an Abort has renamed aside for
+/// removal.
+pub(crate) const REAPING_PREFIX: &str = ".reaping-";
 
 /// Reap every upload directory under `mpus_in_progress/` idle for longer than `ttl`.
 ///
@@ -1068,9 +1054,12 @@ const REAPING_PREFIX: &str = ".reaping-";
 /// a directory removes its bytes from that figure at its next read. `bytes_freed` is reported
 /// for logging only.
 ///
-/// Leftover `.reaping-*` directories (a reaper that died between rename and removal) are removed
-/// unconditionally: nothing names them once renamed.
-pub async fn sweep_incomplete_uploads(cache_dir: PathBuf, ttl: Duration) -> IncompleteUploadSweep {
+/// Leftover `.reaping-*` directories (a reaper or an Abort that died between rename and removal)
+/// are removed unconditionally: nothing names them once renamed.
+pub(crate) async fn sweep_incomplete_uploads(
+    cache_dir: PathBuf,
+    ttl: Duration,
+) -> IncompleteUploadSweep {
     match tokio::task::spawn_blocking(move || sweep_incomplete_uploads_blocking(&cache_dir, ttl))
         .await
     {
@@ -1084,7 +1073,7 @@ pub async fn sweep_incomplete_uploads(cache_dir: PathBuf, ttl: Duration) -> Inco
 
 /// [`sweep_incomplete_uploads`] on the calling thread. `std::fs` throughout; call it from the
 /// blocking pool.
-pub fn sweep_incomplete_uploads_blocking(
+fn sweep_incomplete_uploads_blocking(
     cache_dir: &std::path::Path,
     ttl: Duration,
 ) -> IncompleteUploadSweep {
@@ -1900,7 +1889,12 @@ mod tests {
         // Establish a known non-zero starting point, so a subtraction would be visible
         // as a change rather than being indistinguishable from the default of 0.
         consolidator
-            .update_size_from_validation(100_000, Some(50_000), Some(7))
+            .update_size_from_validation_with_kind(
+                100_000,
+                Some(50_000),
+                Some(7),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         let before = consolidator.get_size_state().await.unwrap();
         assert_eq!(before.total_size, 100_000, "precondition");
@@ -2482,124 +2476,6 @@ mod property_tests {
             drop(active_reservations);
             let final_usage = manager.current_usage();
             if final_usage != 0 {
-                return TestResult::failed();
-            }
-
-            TestResult::passed()
-        })
-    }
-
-    /// **Feature: write-through-cache-finalization, Property 8: Incomplete upload eviction**
-    /// *For any* multipart upload that exceeds the incomplete upload TTL without completion,
-    /// all cached parts and tracking metadata SHALL be actively removed.
-    /// **Validates: Requirements 4.2, 4.3**
-    #[quickcheck]
-    fn prop_incomplete_upload_eviction(part_count: u8, ttl_seconds: u8) -> TestResult {
-        // Filter out invalid inputs
-        let part_count = (part_count % 5) + 1; // 1-5 parts
-        let ttl_seconds = (ttl_seconds % 5) + 1; // 1-5 seconds TTL for testing
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let temp_dir = tempfile::TempDir::new().unwrap();
-
-            // Create manager with short TTL for testing
-            let manager = WriteCacheManager::new(
-                temp_dir.path().to_path_buf(),
-                100 * 1024 * 1024,                       // 100MB total
-                10.0,                                    // 10% write cache
-                Duration::from_secs(86400),              // 1 day write TTL
-                Duration::from_secs(ttl_seconds as u64), // Short incomplete upload TTL
-                crate::cache::CacheEvictionAlgorithm::TinyLFU,
-                256 * 1024 * 1024, // 256MB max object
-            );
-
-            let upload_id = "test-upload-eviction";
-            let cache_key = "test-bucket/test-object-eviction";
-
-            // Create multipart upload directory and tracker
-            let mpus_dir = crate::signed_put_handler::mpu_upload_dir(temp_dir.path(), upload_id);
-            tokio::fs::create_dir_all(&mpus_dir).await.unwrap();
-
-            // Create part files in the upload directory and tracker
-            let mut parts = Vec::new();
-            for part_num in 1..=part_count {
-                let part_data: Vec<u8> = (0..1024).map(|i| (i + part_num as usize) as u8).collect();
-                let part_path = mpus_dir.join(format!("part{}.bin", part_num));
-
-                tokio::fs::write(&part_path, &part_data).await.unwrap();
-
-                parts.push(crate::cache_types::CachedPartInfo {
-                    part_number: part_num as u32,
-                    size: 1024,
-                    // The fixture writes the part uncompressed, so the on-disk length
-                    // matches `size` here. That coincidence is fine for this test,
-                    // which is about TTL eviction rather than byte accounting.
-                    compressed_size: part_data.len() as u64,
-                    etag: format!("\"etag-{}\"", part_num),
-                    compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
-                    file_identity: None,
-                });
-            }
-
-            // Create tracker with old started_at time
-            let tracker = crate::cache_types::MultipartUploadTracker {
-                upload_id: upload_id.to_string(),
-                cache_key: cache_key.to_string(),
-                started_at: std::time::SystemTime::now() - Duration::from_secs(3600), // 1 hour ago
-                parts,
-                total_size: (part_count as u64) * 1024,
-                content_type: None,
-            };
-
-            let tracker_json = serde_json::to_string_pretty(&tracker).unwrap();
-            let upload_meta_path = mpus_dir.join("upload.meta");
-            tokio::fs::write(&upload_meta_path, &tracker_json)
-                .await
-                .unwrap();
-
-            // Set file mtime to be older than TTL
-            // We need to wait for the TTL to expire based on file mtime
-            // For testing, we'll use filetime crate to set mtime in the past
-            let old_time =
-                std::time::SystemTime::now() - Duration::from_secs((ttl_seconds as u64) + 10);
-            let old_filetime = filetime::FileTime::from_system_time(old_time);
-            filetime::set_file_mtime(&upload_meta_path, old_filetime).unwrap();
-            // Backdate the DIRECTORY too, not just `upload.meta`.
-            //
-            // The sweep judges an upload abandoned from the newest of the two, because
-            // `upload.meta` is written once at CreateMultipartUpload and is therefore
-            // the upload's START time — parts write their own records rather than
-            // rewriting it. Backdating only the file would leave the directory looking
-            // freshly active, which is what a live long-running upload looks like and
-            // is exactly the case the sweep must NOT evict. A genuinely abandoned
-            // upload has no recent activity in its directory either, so backdating
-            // both is the faithful fixture.
-            filetime::set_file_mtime(&mpus_dir, old_filetime).unwrap();
-
-            // Verify parts exist before eviction
-            for part in &tracker.parts {
-                let part_path = mpus_dir.join(format!("part{}.bin", part.part_number));
-                if !part_path.exists() {
-                    return TestResult::failed();
-                }
-            }
-
-            // Verify tracker exists
-            if !upload_meta_path.exists() {
-                return TestResult::failed();
-            }
-
-            // Run eviction
-            let freed = manager.evict_incomplete_uploads().await.unwrap();
-
-            // Verify bytes were freed
-            if freed == 0 {
-                return TestResult::failed();
-            }
-
-            // Verify tracking metadata and all parts are deleted (directory removed)
-            if mpus_dir.exists() {
                 return TestResult::failed();
             }
 

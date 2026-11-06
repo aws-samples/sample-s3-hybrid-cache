@@ -251,7 +251,7 @@ struct UpstreamCall {
 
 /// An `S3ClientApi` whose answers stream (`S3ResponseBody::Streaming`), which the shared
 /// `StubS3Client` cannot: `Incoming` has no public constructor. The shape is copied from
-/// `tests/get_miss_fill_same_instance_visibility_test.rs`, narrowed to one range: each
+/// `src/cache/moved_fill_tests/get_miss_fill_same_instance_visibility_test.rs`, narrowed to one range: each
 /// `forward_request` makes a real loopback HTTP/1 request to a tiny origin that answers `206`
 /// with `content-range` and an ETag, and hands back that response's `Incoming`. The client
 /// connection task lives until the body is drained, so the body keeps yielding

@@ -63,6 +63,47 @@ pub struct S3Client {
     /// (`connection_pool.max_lifetime`). Enforced at checkout, never mid-request
     /// — see `https_connector::retire_if_over_max_lifetime`.
     max_lifetime: Duration,
+    /// Bounds on the signed-write path's waits on the upstream:
+    /// `connection_timeout`, `upstream_write_idle_timeout` and the socket settings.
+    upstream_timeouts: crate::signed_request_proxy::UpstreamTimeouts,
+}
+
+tokio::task_local! {
+    /// Set by [`S3Client::forward_request`] when an attempt got as far as sending the
+    /// request, inside a [`forward_noting_sent`] scope.
+    static REQUEST_SENT: std::cell::Cell<bool>;
+}
+
+/// Whether `error` was raised after the request head went out (a timeout, a reset or
+/// close while waiting, a failed body read). One raised before anything was sent (a
+/// connect or resolve failure) did not reach S3.
+pub(crate) fn request_may_have_reached_s3(error: &ProxyError) -> bool {
+    matches!(
+        error,
+        ProxyError::TimeoutError(_)
+            | ProxyError::HttpError(_)
+            | ProxyError::UpstreamSendFailed {
+                kind: crate::error::UpstreamSendFailureKind::ConnectionLost
+                    | crate::error::UpstreamSendFailureKind::Other,
+                ..
+            }
+    )
+}
+
+/// Forward `context` through `client` and report whether any attempt, retries included,
+/// got as far as sending the request. The final result alone cannot say: a timed-out
+/// attempt followed by a retry that could not connect returns the connect error.
+pub(crate) async fn forward_noting_sent(
+    client: &(dyn S3ClientApi + Send + Sync),
+    context: S3RequestContext,
+) -> (Result<S3Response>, bool) {
+    REQUEST_SENT
+        .scope(std::cell::Cell::new(false), async {
+            let result = client.forward_request(context).await;
+            let sent = REQUEST_SENT.with(|sent| sent.get());
+            (result, sent)
+        })
+        .await
 }
 
 /// S3 request context for forwarding
@@ -121,7 +162,7 @@ pub struct S3Response {
 
 /// Request retry configuration
 #[derive(Debug, Clone)]
-pub struct RetryConfig {
+struct RetryConfig {
     pub max_retries: usize,
     pub initial_delay: Duration,
     pub max_delay: Duration,
@@ -211,6 +252,11 @@ pub trait S3ClientApi: Send + Sync {
     fn get_inflight_ledger(&self) -> Arc<crate::inflight_ledger::InflightLedger> {
         Arc::new(crate::inflight_ledger::InflightLedger::disabled())
     }
+    /// The bounds a signed-write attempt places on its waits on the upstream.
+    /// Defaults to the configuration defaults, which is what test stubs want.
+    fn upstream_timeouts(&self) -> crate::signed_request_proxy::UpstreamTimeouts {
+        crate::signed_request_proxy::UpstreamTimeouts::default()
+    }
 
     /// True when the client was built with endpoint overrides (PrivateLink
     /// destinations). Consumers use this to decide whether to lock outbound
@@ -280,6 +326,9 @@ impl S3ClientApi for S3Client {
     fn get_inflight_ledger(&self) -> Arc<crate::inflight_ledger::InflightLedger> {
         Arc::clone(&self.inflight_ledger)
     }
+    fn upstream_timeouts(&self) -> crate::signed_request_proxy::UpstreamTimeouts {
+        self.upstream_timeouts.clone()
+    }
 
     fn has_endpoint_overrides(&self) -> bool {
         S3Client::has_endpoint_overrides(self)
@@ -305,14 +354,45 @@ impl S3ClientApi for S3Client {
     }
 }
 
+/// Register `endpoint` with the pool: decide under a read guard, resolve with no guard
+/// held, and take the write guard only to store the result.
+async fn register_endpoint_in(
+    pool_manager: &tokio::sync::RwLock<ConnectionPoolManager>,
+    endpoint: &str,
+) {
+    let lookup = {
+        let pool_manager = pool_manager.read().await;
+        match pool_manager.begin_registration(endpoint) {
+            Some(lookup) => lookup,
+            None => return,
+        }
+    };
+    let result = lookup.resolve(endpoint).await;
+    pool_manager
+        .write()
+        .await
+        .finish_registration(endpoint, result);
+}
+
 impl S3Client {
     /// Create a new S3 client with Hyper connection pooling
     pub fn new(
         config: &ConnectionPoolConfig,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
     ) -> Result<Self> {
+        Self::new_with_dial_policy(config, metrics_manager, None)
+    }
+
+    /// Like [`new`](Self::new), with the HTTP-path destination policy the pool
+    /// filters every DNS answer through, so a connection only dials addresses the
+    /// policy accepts. `None` leaves resolution unfiltered.
+    pub(crate) fn new_with_dial_policy(
+        config: &ConnectionPoolConfig,
+        metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        dial_policy: Option<Arc<crate::destination_policy::DestinationPolicy>>,
+    ) -> Result<Self> {
         let pool_manager = Arc::new(tokio::sync::RwLock::new(
-            ConnectionPoolManager::new_with_config(config.clone())?,
+            ConnectionPoolManager::new_with_config(config.clone())?.with_dial_policy(dial_policy),
         ));
 
         let health_tracker = Arc::new(IpHealthTracker::new_with_cooldown(
@@ -410,6 +490,11 @@ impl S3Client {
             probe_connector,
             probe_timeout: config.connection_timeout,
             max_lifetime: config.max_lifetime,
+            upstream_timeouts: crate::signed_request_proxy::UpstreamTimeouts {
+                connect: config.connection_timeout,
+                idle: config.upstream_write_idle_timeout,
+                socket: Arc::new(config.clone()),
+            },
         })
     }
 
@@ -425,6 +510,13 @@ impl S3Client {
         self
     }
 
+    /// Replace the 30 s bound on one upstream request. For tests that stall the
+    /// upstream and would otherwise wait the full 30 s.
+    #[doc(hidden)]
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
     /// Retire the connection this request used if it has reached
     /// `connection_pool.max_lifetime`, and count the retirement.
     ///
@@ -532,6 +624,9 @@ impl S3Client {
                         });
                     }
 
+                    if request_may_have_reached_s3(&e) {
+                        let _ = REQUEST_SENT.try_with(|sent| sent.set(true));
+                    }
                     last_error = Some(e.clone());
 
                     // Check if this is a connection error and track it
@@ -963,7 +1058,7 @@ impl S3Client {
                     let pool_manager = Arc::clone(&self.pool_manager);
                     let host = context.host.clone();
                     tokio::spawn(async move {
-                        pool_manager.write().await.register_endpoint(&host).await;
+                        register_endpoint_in(&pool_manager, &host).await;
                     });
                     (context.uri.clone(), None)
                 }
@@ -1252,8 +1347,7 @@ impl S3Client {
 
     /// Register an endpoint for DNS-based IP distribution and perform an immediate resolve.
     pub async fn register_endpoint(&self, endpoint: &str) {
-        let mut pool_manager = self.pool_manager.write().await;
-        pool_manager.register_endpoint(endpoint).await;
+        register_endpoint_in(&self.pool_manager, endpoint).await;
     }
 
     /// Refresh DNS for all registered endpoints, preserving health exclusions.
@@ -1265,8 +1359,27 @@ impl S3Client {
     /// exponential backoff never accumulated. Recovery is now the recovery probe's
     /// job — see [`probe_unhealthy_ips`](Self::probe_unhealthy_ips).
     pub async fn refresh_dns(&self) -> Result<()> {
-        let mut pool_manager = self.pool_manager.write().await;
-        pool_manager.refresh_dns(Some(&self.health_tracker)).await?;
+        // Resolve with no guard held; take the write guard per endpoint only to store
+        // the result, so a slow or failing lookup never blocks readers of the pool.
+        let (lookup, due) = {
+            let pool_manager = self.pool_manager.read().await;
+            (
+                pool_manager.lookup(),
+                pool_manager.endpoints_due_for_refresh(),
+            )
+        };
+        for endpoint in due {
+            match lookup.resolve(&endpoint).await {
+                Ok(ips) => {
+                    self.pool_manager.write().await.apply_resolution(
+                        &endpoint,
+                        ips,
+                        Some(&self.health_tracker),
+                    );
+                }
+                Err(e) => warn!("Failed to refresh DNS for endpoint {}: {}", endpoint, e),
+            }
+        }
         Ok(())
     }
 
@@ -1498,7 +1611,7 @@ impl S3Client {
 }
 
 /// URL parameter parsing utilities for S3 requests
-pub struct S3UrlParams {
+pub(crate) struct S3UrlParams {
     pub part_number: Option<u32>,
     pub upload_id: Option<String>,
     pub uploads: bool,
@@ -3193,6 +3306,253 @@ mod lost_connection_tests {
         );
     }
 
+    fn dial_policy_for(host: &str) -> Arc<crate::destination_policy::DestinationPolicy> {
+        Arc::new(crate::destination_policy::DestinationPolicy::new(
+            80,
+            Some(vec![host.to_string()]),
+            std::collections::HashSet::new(),
+        ))
+    }
+
+    /// Send one GET for `host` through the hostname-resolving connector, with the
+    /// seam answering `[127.0.0.1, 192.0.2.10]`, and return how many connections a
+    /// loopback listener on the request's port accepted.
+    async fn loopback_connections_for_a_mixed_answer(
+        policy: Option<Arc<crate::destination_policy::DestinationPolicy>>,
+    ) -> usize {
+        let host = "allowlisted.example.test";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let mut config = ConnectionPoolConfig {
+            ip_distribution_enabled: false,
+            ..Default::default()
+        };
+        config.upstream_overrides.insert(
+            format!("{host}:{port}"),
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: false,
+            },
+        );
+        let client = S3Client::new_with_dial_policy(&config, None, policy).expect("client builds");
+        client.pool_manager.read().await.seed_dns_answer_for_test(
+            host,
+            vec!["127.0.0.1".parse().unwrap(), "192.0.2.10".parse().unwrap()],
+        );
+        let context = S3RequestContext {
+            method: Method::GET,
+            uri: format!("http://{host}:{port}/bucket/key").parse().unwrap(),
+            headers: HashMap::new(),
+            body: None,
+            host: host.into(),
+            request_size: None,
+            operation_type: None,
+            allow_streaming: false,
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.forward_request(context)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        accepts.load(Ordering::SeqCst)
+    }
+
+    /// With an allowlist the pooled path never dials an address the policy refuses.
+    #[tokio::test]
+    async fn pooled_dial_skips_an_address_the_policy_refuses() {
+        let accepted = loopback_connections_for_a_mixed_answer(Some(dial_policy_for(
+            "allowlisted.example.test",
+        )))
+        .await;
+        assert_eq!(accepted, 0, "the loopback address must never be dialled");
+    }
+
+    /// Control: with no policy the same answer dials its first address, loopback.
+    #[tokio::test]
+    async fn pooled_dial_without_a_policy_still_dials_loopback() {
+        let accepted = loopback_connections_for_a_mixed_answer(None).await;
+        assert!(
+            accepted >= 1,
+            "fixture: unfiltered, the first address is dialled"
+        );
+    }
+
+    /// A lookup that is stuck must not stall reads of the pool for another host.
+    #[tokio::test]
+    async fn a_blocked_lookup_does_not_stall_reads_for_another_host() {
+        let (known, slow) = ("known.example.test", "slow.example.test");
+        let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let client =
+            Arc::new(S3Client::new(&ConnectionPoolConfig::default(), None).expect("client builds"));
+        let (gate, started) = {
+            let pm = client.pool_manager.read().await;
+            pm.seed_dns_answer_for_test(known, vec![ip]);
+            pm.seed_dns_answer_for_test(slow, vec!["192.0.2.11".parse().unwrap()]);
+            (
+                pm.gate_dns_lookups_for_test(slow),
+                pm.dns_lookups_counter_for_test(slow),
+            )
+        };
+        client.register_endpoint(known).await;
+        let blocked = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.register_endpoint(slow).await })
+        };
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let read = tokio::time::timeout(Duration::from_secs(1), async {
+            client.pool_manager.read().await.get_distributed_ip(known)
+        })
+        .await;
+
+        gate.add_permits(1);
+        blocked.await.unwrap();
+        assert_eq!(
+            read.expect("a read of the pool waited on another host's lookup"),
+            Some(ip)
+        );
+    }
+
+    /// A host that does not resolve is looked up once within `dns_refresh_interval`.
+    #[tokio::test]
+    async fn a_failing_host_is_resolved_once_not_once_per_request() {
+        let host = "missing.example.test";
+        let client = S3Client::new(&ConnectionPoolConfig::default(), None).expect("client builds");
+        client
+            .pool_manager
+            .read()
+            .await
+            .seed_dns_failure_for_test(host);
+
+        for _ in 0..5 {
+            client.register_endpoint(host).await;
+        }
+
+        assert_eq!(
+            client
+                .pool_manager
+                .read()
+                .await
+                .dns_lookups_started_for_test(host),
+            1
+        );
+    }
+
+    /// With an allowlist and IP distribution on, a request dials only the approved address
+    /// of a mixed answer, and the refused one is never counted against the health tracker.
+    #[tokio::test]
+    async fn a_refused_address_is_never_dialled_or_counted_by_the_distributor_path() {
+        let host = "allowlisted.example.test";
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let public: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let config = ConnectionPoolConfig {
+            ip_distribution_enabled: true,
+            ip_failure_threshold: 1,
+            ..Default::default()
+        };
+        let client = S3Client::new_with_dial_policy(&config, None, Some(dial_policy_for(host)))
+            .expect("client builds");
+        client
+            .pool_manager
+            .read()
+            .await
+            .seed_dns_answer_for_test(host, vec![loopback, public]);
+        client.register_endpoint(host).await;
+        let context = S3RequestContext {
+            method: Method::GET,
+            uri: format!("http://{host}:{port}/bucket/key").parse().unwrap(),
+            headers: HashMap::new(),
+            body: None,
+            host: host.into(),
+            request_size: None,
+            operation_type: None,
+            allow_streaming: false,
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.forward_request(context)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "the loopback address must never be dialled"
+        );
+        assert!(
+            !client
+                .health_tracker
+                .tracked_unhealthy_ips()
+                .contains(&loopback),
+            "a filtered address must never be counted as a failure"
+        );
+    }
+    /// A refresh whose lookup is stuck must not stall reads of the pool: the lookup runs
+    /// with no guard held.
+    #[tokio::test]
+    async fn a_blocked_refresh_lookup_does_not_stall_reads_of_the_pool() {
+        let host = "refreshing.example.test";
+        let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let config = ConnectionPoolConfig {
+            dns_refresh_interval: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let client = Arc::new(S3Client::new(&config, None).expect("client builds"));
+        let (gate, started) = {
+            let pm = client.pool_manager.read().await;
+            pm.seed_dns_answer_for_test(host, vec![ip]);
+            (
+                pm.gate_dns_lookups_for_test(host),
+                pm.dns_lookups_counter_for_test(host),
+            )
+        };
+        gate.add_permits(1);
+        client.register_endpoint(host).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let refreshing = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.refresh_dns().await })
+        };
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "fixture: the refresh looked up"
+        );
+        let read = tokio::time::timeout(Duration::from_secs(1), async {
+            client.pool_manager.read().await.get_distributed_ip(host)
+        })
+        .await;
+        gate.add_permits(1);
+        refreshing.await.unwrap().unwrap();
+        assert_eq!(
+            read.expect("a read of the pool waited on a refresh's lookup"),
+            Some(ip)
+        );
+    }
     /// The hedge arms send through `forward_request_pinned`. A bodiless GET whose pooled
     /// connection to the pinned IP is lost is retried once, on a new connection to the
     /// same IP, and that loss is not held against the IP (the failure threshold is 1, so

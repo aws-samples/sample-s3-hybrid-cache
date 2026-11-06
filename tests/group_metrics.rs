@@ -11,7 +11,7 @@
 //!
 //! In this group a stem is the tail of another file's stem, so selecting it alone also runs
 //! the other file's tests unless they are skipped:
-//!   cargo test --test <this target> -- logging_test:: --skip access_logging_test:: --skip conditional_request_logging_test::
+//!   cargo test --test <this target> -- logging_test:: --skip conditional_request_logging_test::
 //!
 //! Several of the files below declare `mod common;`, so tests/common/mod.rs and the
 //! fixtures it declares are loaded as a module more than once in this one crate.
@@ -20,8 +20,6 @@
 //! 58 test files that declare it.
 #![allow(clippy::duplicate_mod)]
 
-#[path = "access_logging_test.rs"]
-mod access_logging_test;
 #[path = "bench_metadata_cli_test.rs"]
 mod bench_metadata_cli_test;
 #[path = "cache_hit_buffer_metrics_test.rs"]
@@ -34,6 +32,10 @@ mod conditional_request_logging_test;
 mod dashboard_error_handling_unit_test;
 #[path = "dashboard_integration_test.rs"]
 mod dashboard_integration_test;
+#[path = "dashboard_log_query_param_escape_test.rs"]
+mod dashboard_log_query_param_escape_test;
+#[path = "dashboard_log_viewer_masking_test.rs"]
+mod dashboard_log_viewer_masking_test;
 #[path = "dashboard_property_test.rs"]
 mod dashboard_property_test;
 #[path = "logging_test.rs"]

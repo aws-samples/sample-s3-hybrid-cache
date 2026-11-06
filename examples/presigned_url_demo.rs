@@ -84,7 +84,7 @@ fn main() {
             info.expires_in_seconds
         );
 
-        if let Some(time_remaining) = info.time_until_expiration() {
+        if let Ok(time_remaining) = info.expires_at.duration_since(std::time::SystemTime::now()) {
             println!("Time remaining: {} seconds", time_remaining.as_secs());
             println!("\nProxy behavior:");
             println!("  - Expired URLs: Rejected with 403 Forbidden (before cache lookup)");
@@ -114,7 +114,7 @@ fn print_presigned_url_info(info: &PresignedUrlInfo) {
         }
     } else {
         println!("  Status: ✅ VALID");
-        if let Some(time_until) = info.time_until_expiration() {
+        if let Ok(time_until) = info.expires_at.duration_since(std::time::SystemTime::now()) {
             println!("  Expires in {} seconds", time_until.as_secs());
         }
     }

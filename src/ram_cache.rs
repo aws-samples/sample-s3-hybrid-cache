@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 /// caching is enabled for any key.
 ///
 /// Spec: page-aligned-range-cache Requirement 7.7.
-pub const RAM_CACHE_ADMISSION_CEILING: usize = 64 * 1024 * 1024;
+pub(crate) const RAM_CACHE_ADMISSION_CEILING: usize = 64 * 1024 * 1024;
 
 /// Compute the shard index for a cache key.
 ///
@@ -1492,7 +1492,7 @@ mod sharded_tests {
     // shard clamp — the page-widening-specific composition of the Task 1
     // admission-ceiling guarantee (`test_64mib_entry_admitted_at_256mib_and_512mib`
     // above) with page-keyed RAM lookup semantics (`fill_page` /
-    // `get_range_from_ram_cache`).
+    // `get_range_from_ram_cache_hit`).
     // Validates: Requirements 3.4 (Page as RAM unit), 7.1, 7.2, 7.7
     // -----------------------------------------------------------------
     #[tokio::test]
@@ -1500,7 +1500,7 @@ mod sharded_tests {
         const MIB: usize = 1024 * 1024;
         const PAGE_SIZE: usize = 64 * MIB;
 
-        // A page-shaped RAM key, exactly as `fill_page`/`get_range_from_ram_cache`
+        // A page-shaped RAM key, exactly as `fill_page`/`get_range_from_ram_cache_hit`
         // construct it: "{cache_key}:range:{page_start}:{page_end}".
         let page_key = "bucket/parquet-object:range:0:67108863";
         // The entry's total tracked size includes struct/key/metadata overhead

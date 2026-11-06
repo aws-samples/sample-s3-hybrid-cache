@@ -47,30 +47,6 @@ impl RangeSpec {
         self.start > self.end
     }
 
-    /// Calculate the slice offset within a containing range
-    ///
-    /// This method calculates where to start reading within a cached range
-    /// to extract the bytes for this range.
-    ///
-    /// # Arguments
-    /// * `container` - The larger range that contains this range
-    ///
-    /// # Returns
-    /// The byte offset within the container where this range starts
-    ///
-    /// # Example
-    /// ```
-    /// # use s3_proxy::range_handler::RangeSpec;
-    /// # let requested = RangeSpec { start: 100, end: 200 };
-    /// # let cached = RangeSpec { start: 0, end: 500 };
-    /// # assert_eq!(requested.slice_offset_in(&cached), 100);
-    /// ```
-    ///
-    /// Requirements: 1.2, 3.2, 3.3, 3.4
-    pub fn slice_offset_in(&self, container: &RangeSpec) -> u64 {
-        self.start - container.start
-    }
-
     /// Calculate the slice length to extract from a containing range
     ///
     /// This method calculates how many bytes to read from a cached range
@@ -90,81 +66,13 @@ impl RangeSpec {
     pub fn slice_length(&self) -> usize {
         (self.end - self.start + 1) as usize
     }
-
-    /// Validate that this range can be sliced from a container range
-    ///
-    /// Checks that:
-    /// 1. This range is fully contained within the container range
-    /// 2. The slice offset and length don't exceed the container's data length
-    ///
-    /// # Arguments
-    /// * `container` - The larger range that should contain this range
-    /// * `container_data_len` - The actual length of data available in the container
-    ///
-    /// # Returns
-    /// Ok(()) if the slice is valid, Err with details if invalid
-    ///
-    /// # Example
-    /// ```
-    /// # use s3_proxy::range_handler::RangeSpec;
-    /// # let requested = RangeSpec { start: 100, end: 200 };
-    /// # let cached = RangeSpec { start: 0, end: 500 };
-    /// # assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
-    /// # assert!(requested.validate_slice_bounds(&cached, 100).is_err());
-    /// ```
-    ///
-    /// Requirements: 1.2, 3.2, 3.3, 3.4
-    pub fn validate_slice_bounds(
-        &self,
-        container: &RangeSpec,
-        container_data_len: usize,
-    ) -> Result<()> {
-        // Ensure requested range is within container range
-        if self.start < container.start {
-            return Err(ProxyError::InvalidRange(format!(
-                "Requested range start {} is before container range start {}",
-                self.start, container.start
-            )));
-        }
-
-        if self.end > container.end {
-            return Err(ProxyError::InvalidRange(format!(
-                "Requested range end {} is after container range end {}",
-                self.end, container.end
-            )));
-        }
-
-        // Calculate slice parameters
-        let slice_offset = self.slice_offset_in(container);
-        let slice_length = self.slice_length();
-
-        // Ensure slice doesn't exceed container data length
-        let slice_end = slice_offset as usize + slice_length;
-        if slice_end > container_data_len {
-            return Err(ProxyError::InvalidRange(format!(
-                "Slice end {} exceeds container data length {}",
-                slice_end, container_data_len
-            )));
-        }
-
-        // Ensure the container data length matches the container range size
-        let expected_container_len = (container.end - container.start + 1) as usize;
-        if container_data_len != expected_container_len {
-            return Err(ProxyError::InvalidRange(format!(
-                "Container data length {} does not match container range size {}",
-                container_data_len, expected_container_len
-            )));
-        }
-
-        Ok(())
-    }
 }
 
 /// Sentinel returned by [`suffix_page_target`] when the object size is not yet
 /// known and the caller must fall back to issuing `bytes=-P` upstream (a
 /// size-free, end-anchored widening — Requirement 3.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SuffixPageTarget {
+pub(crate) enum SuffixPageTarget {
     /// Size is known; these are the overlapping grid page(s) (1 or 2) that
     /// cover the absolutized suffix range `[size - n, size - 1]`.
     Pages(SmallVec<[(u64, u64); 2]>),
@@ -313,15 +221,13 @@ pub(crate) fn suffix_page_target(n: u64, page_size: u64, size: Option<u64>) -> S
 
 /// Range request parsing result
 #[derive(Debug, Clone)]
-pub enum RangeParseResult {
+pub(crate) enum RangeParseResult {
     /// Valid single range request
     SingleRange(RangeSpec),
     /// Multiple ranges (not supported yet)
-    MultipleRanges(Vec<RangeSpec>),
+    MultipleRanges,
     /// Invalid range specification
     Invalid(String),
-    /// No range header present
-    None,
 }
 
 /// Range overlap detection result
@@ -369,7 +275,7 @@ impl RangeOverlap {
     /// must use [`RangeOverlap::has_complete_coverage`] and name that authority
     /// at the call site. That asymmetry is the point: serving expired bytes
     /// requires writing down why it is allowed.
-    pub fn is_serveable_unvalidated(&self) -> bool {
+    pub(crate) fn is_serveable_unvalidated(&self) -> bool {
         self.can_serve_from_cache && self.stored_freshness == StoredFreshness::Fresh
     }
 
@@ -386,7 +292,7 @@ impl RangeOverlap {
 /// Represents a segment of data to be merged
 /// Used in range merging operations to track data sources and positions
 #[derive(Debug, Clone)]
-pub struct RangeMergeSegment {
+struct RangeMergeSegment {
     /// Absolute start position in the final merged output
     pub output_start: u64,
     /// Absolute end position in the final merged output
@@ -397,7 +303,7 @@ pub struct RangeMergeSegment {
 
 /// Source of data for a merge segment
 #[derive(Debug, Clone)]
-pub enum RangeMergeSource {
+enum RangeMergeSource {
     /// Data from cache with range metadata
     Cached {
         /// The cached range containing the data
@@ -423,7 +329,7 @@ pub enum RangeMergeSource {
 /// [`RangeHandler::merge_ranges_with_fallback`] returns when its complete refetch
 /// shows the object changed (a `412` on the proxy-added `If-Match`, or a different
 /// ETag). Recognise it with [`is_merge_refetch_version_change`].
-pub const MERGE_REFETCH_VERSION_CHANGED: &str =
+pub(crate) const MERGE_REFETCH_VERSION_CHANGED: &str =
     "merge fallback refetch returned another version of the object";
 
 /// Whether `error` is the merge fallback's version-change refusal. A caller must
@@ -571,7 +477,7 @@ impl RangeHandler {
         if parsed_ranges.len() == 1 {
             RangeParseResult::SingleRange(parsed_ranges.into_iter().next().unwrap())
         } else {
-            RangeParseResult::MultipleRanges(parsed_ranges)
+            RangeParseResult::MultipleRanges
         }
     }
     /// Parse a single range specification
@@ -681,28 +587,6 @@ impl RangeHandler {
         }
     }
 
-    /// Validate range request against object constraints
-    pub fn validate_range_request(&self, range: &RangeSpec, content_length: u64) -> Result<()> {
-        if range.start >= content_length {
-            return Err(ProxyError::InvalidRange(
-                "Range start exceeds content length".to_string(),
-            ));
-        }
-
-        if range.end >= content_length {
-            return Err(ProxyError::InvalidRange(
-                "Range end exceeds content length".to_string(),
-            ));
-        }
-
-        if range.start > range.end {
-            return Err(ProxyError::InvalidRange(
-                "Range start cannot be greater than end".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
     /// Convert range specification to HTTP Content-Range header value
     pub(crate) fn build_content_range_header(
         &self,
@@ -1476,7 +1360,7 @@ impl RangeHandler {
     }
 
     /// Build conditional headers for uncached range portions - Requirements 3.6, 3.8
-    pub fn build_conditional_headers_for_range(
+    pub(crate) fn build_conditional_headers_for_range(
         &self,
         client_headers: &HashMap<String, String>,
         cached_ranges: &[Range],
@@ -1539,62 +1423,7 @@ impl RangeHandler {
     // Range Merging Helper Functions
     // ============================================================================
 
-    /// Extract bytes from a cached range that overlap with requested range
-    ///
-    /// Handles three cases:
-    /// 1. Full containment: cached range fully contains requested range
-    /// 2. Partial overlap: cached range partially overlaps requested range
-    /// 3. Boundary cases: start/end alignment
-    ///
-    /// Requirements: 2.2, 2.3
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key for the object
-    /// * `cached_range` - The cached range metadata
-    /// * `requested_start` - Start offset of the requested range
-    /// * `requested_end` - End offset of the requested range
-    ///
-    /// # Returns
-    /// The extracted bytes from the cached range that overlap with the requested range
-    ///
-    /// # Errors
-    /// Returns error if:
-    /// - Cached range doesn't overlap with requested range
-    /// - Failed to load cached range data
-    /// - Offset or length parameters are invalid
-    ///
-    /// Returns (data, ram_hit) where ram_hit indicates if data came from RAM cache
-    ///
-    /// **This is the RAM cache entry point for merged reads.** Despite the
-    /// "extract bytes" name suggesting pure in-memory byte slicing, this
-    /// method calls `CacheManager::load_range_data_with_cache` below, which
-    /// checks RAM first, falls back to disk on a miss, and promotes disk hits
-    /// to RAM — the same tiered lookup any other range read gets. Every
-    /// segment `merge_range_segments` assembles from a cached range goes
-    /// through here, so a merged/multi-range read participates in the RAM
-    /// tier per segment, keyed on that segment's stored-range bounds. A plain
-    /// `grep ram_cache src/range_handler.rs` finds nothing in this file
-    /// because the RAM access happens one level down, inside
-    /// `CacheManager` — see the steering note on tracing call chains instead
-    /// of grepping for tier participation (page-aligned-range-cache Task 10).
-    pub async fn extract_bytes_from_cached_range(
-        &self,
-        cache_key: &str,
-        cached_range: &Range,
-        requested_start: u64,
-        requested_end: u64,
-    ) -> Result<(Bytes, bool)> {
-        self.extract_bytes_from_cached_range_tiered(
-            cache_key,
-            cached_range,
-            requested_start,
-            requested_end,
-            true,
-        )
-        .await
-    }
-
-    /// `extract_bytes_from_cached_range`, with the disk-hit RAM promotion chosen by
+    /// Extracts the bytes of a cached range, with the disk-hit RAM promotion chosen by
     /// `promote`. `false` still consults RAM; it only declines to store the extent under
     /// its own RAM key, for a caller that stores the assembled bytes itself.
     async fn extract_bytes_from_cached_range_tiered(
@@ -1910,7 +1739,7 @@ impl RangeHandler {
     /// RangeMergeResult containing merged data and efficiency metrics
     ///
     /// **Every cached segment consults the RAM cache tier.** Each entry in
-    /// `cached_ranges` is loaded through [`Self::extract_bytes_from_cached_range`],
+    /// `cached_ranges` is loaded through [`Self::extract_bytes_from_cached_range_tiered`],
     /// which calls `CacheManager::load_range_data_with_cache` — checking RAM,
     /// falling back to disk on a miss, and promoting disk hits to RAM. So a
     /// merged/multi-range read is not disk-only: it consults RAM, may promote
@@ -3143,18 +2972,6 @@ mod tests {
     }
 
     #[test]
-    fn test_range_validation() {
-        let handler = create_test_range_handler();
-        let range = RangeSpec { start: 0, end: 499 };
-
-        // Valid range
-        assert!(handler.validate_range_request(&range, 1000).is_ok());
-
-        // Invalid range - exceeds content length
-        assert!(handler.validate_range_request(&range, 400).is_err());
-    }
-
-    #[test]
     fn test_range_merging() {
         let handler = create_test_range_handler();
         let ranges = vec![
@@ -3197,41 +3014,6 @@ mod tests {
     }
 
     #[test]
-    fn test_slice_offset_in() {
-        // Test at start of cached range
-        let requested = RangeSpec { start: 0, end: 100 };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert_eq!(requested.slice_offset_in(&cached), 0);
-
-        // Test in middle of cached range
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert_eq!(requested.slice_offset_in(&cached), 100);
-
-        // Test at end of cached range
-        let requested = RangeSpec {
-            start: 400,
-            end: 500,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert_eq!(requested.slice_offset_in(&cached), 400);
-
-        // Test with non-zero cached start
-        let requested = RangeSpec {
-            start: 8388608,
-            end: 16777215,
-        };
-        let cached = RangeSpec {
-            start: 8388608,
-            end: 16777269,
-        };
-        assert_eq!(requested.slice_offset_in(&cached), 0);
-    }
-
-    #[test]
     fn test_slice_length() {
         let range = RangeSpec { start: 0, end: 99 };
         assert_eq!(range.slice_length(), 100);
@@ -3247,95 +3029,6 @@ mod tests {
             end: 8388607,
         };
         assert_eq!(range.slice_length(), 8388608);
-    }
-
-    #[test]
-    fn test_validate_slice_bounds_valid() {
-        // Test exact match
-        let requested = RangeSpec { start: 0, end: 99 };
-        let cached = RangeSpec { start: 0, end: 99 };
-        assert!(requested.validate_slice_bounds(&cached, 100).is_ok());
-
-        // Test at start of cached range
-        let requested = RangeSpec { start: 0, end: 99 };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
-
-        // Test in middle of cached range
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
-
-        // Test at end of cached range
-        let requested = RangeSpec {
-            start: 400,
-            end: 500,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
-    }
-
-    #[test]
-    fn test_validate_slice_bounds_invalid() {
-        // Test requested range starts before container
-        let requested = RangeSpec { start: 0, end: 100 };
-        let cached = RangeSpec {
-            start: 50,
-            end: 500,
-        };
-        assert!(requested.validate_slice_bounds(&cached, 451).is_err());
-
-        // Test requested range ends after container
-        let requested = RangeSpec {
-            start: 100,
-            end: 600,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_err());
-
-        // Test slice exceeds container data length
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 150).is_err());
-
-        // Test container data length mismatch
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 400).is_err());
-    }
-
-    #[test]
-    fn test_slice_bounds_multipart_scenario() {
-        // Test the specific bug scenario: requested 0-8388607, cached 0-8388661
-        let requested = RangeSpec {
-            start: 0,
-            end: 8388607,
-        };
-        let cached = RangeSpec {
-            start: 0,
-            end: 8388661,
-        };
-
-        // With correct cached data length (8388662 bytes)
-        assert!(requested.validate_slice_bounds(&cached, 8388662).is_ok());
-        assert_eq!(requested.slice_offset_in(&cached), 0);
-        assert_eq!(requested.slice_length(), 8388608);
-
-        // Verify we can extract the correct slice
-        let offset = requested.slice_offset_in(&cached) as usize;
-        let length = requested.slice_length();
-        assert_eq!(offset, 0);
-        assert_eq!(length, 8388608);
-        assert_eq!(offset + length, 8388608);
     }
 }
 

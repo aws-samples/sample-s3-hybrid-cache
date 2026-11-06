@@ -121,8 +121,8 @@ stored response headers, and no S3 request.
 
 If every read must reach S3 so that S3 evaluates IAM authorization, a HEAD served from cache is a
 read S3 never sees. For such a prefix, set both fields. The example also sets
-`evaluate_conditions_from_cache: false`, so that a client's `If-Match` is forwarded instead of
-compared with the cached ETag, as a zero `get_ttl` already does:
+`evaluate_conditions_from_cache: false`, so that a client's `If-Match` is forwarded as the client
+sent it instead of compared with the cached ETag:
 
 ```json
 {
@@ -139,7 +139,7 @@ Each field governs a different set of requests:
 |---|---|
 | `get_ttl: "0s"` | GET, ranged GET, `?partNumber=` GET, and a GET whose only conditional header is `If-Match` or `If-Range`: every request reaches S3 |
 | `head_ttl: "0s"` | HEAD, including a HEAD that carries a `Range` header or a lone `If-Match`: every request is forwarded to S3 |
-| `evaluate_conditions_from_cache: false` | A GET or HEAD whose only conditional header is `If-Match` or `If-Range`. With the default `true`, the proxy answers it from cache without contacting S3 while the entry is within `get_ttl`, and for a HEAD also within `head_ttl`. At `get_ttl: "0s"` those requests are forwarded whatever this field says |
+| `evaluate_conditions_from_cache: false` | A GET or HEAD whose only conditional header is `If-Match` or `If-Range`. With the default `true`, the proxy answers it from cache without contacting S3 while the entry is within `get_ttl`, and for a HEAD also within `head_ttl`. At `get_ttl: "0s"` such a GET reaches S3 whatever this field says. With `false` it goes as the client sent it. With `true`, a lone `If-Match` that names the cached ETag, is `*`, or lists the cached ETag is revalidated with the proxy's own validators added. An unchanged object is then served from cache after a bodyless `304`. A HEAD whose lone `If-Match` names the cached ETag is forwarded as the client sent it at `get_ttl: "0s"` |
 
 The proxy does not derive one field from the other: `head_ttl` is not clamped to `get_ttl`, and a
 rule that sets only one of them is accepted as written. A long `get_ttl` with a short `head_ttl`
@@ -268,6 +268,11 @@ normal range storage. It writes a real range and takes the object's length from 
 `partNumber` that is not an integer from 1 to 10,000 is forwarded uncached under the bypass reason
 `invalid_part_number`, so S3 returns its own error.
 
+**SelectObjectContent is refused.** A POST that names the `select` subresource is answered
+`501 NotImplemented` and never reaches S3 or the cache. Send S3 Select requests to S3 directly.
+A `CONNECT` tunnel and the HTTPS passthrough (port 443) do not read requests, so a Select request
+sent through either reaches S3 unchanged.
+
 ### Cached operations
 
 - **GetObject**: a GET, with or without a `Range` header, whose query parameters are all on the
@@ -336,9 +341,9 @@ debug, to test, or to read data that must come from S3:
 
 | Header | Cache lookup | Response cached | Use |
 |--------|--------------|-----------------|-----|
-| `Cache-Control: no-cache` | Skipped | Yes | Fresh data, and later requests benefit |
+| `Cache-Control: no-cache` | Skipped | Yes, unless read caching is off for the key | Fresh data, and later requests benefit |
 | `Cache-Control: no-store` | Skipped | No | Fresh data, nothing cached |
-| `Pragma: no-cache` | Skipped | Yes | The HTTP/1.0 form of `no-cache` |
+| `Pragma: no-cache` | Skipped | Yes, unless read caching is off for the key | The HTTP/1.0 form of `no-cache` |
 
 When both `Cache-Control` and `Pragma` are present, `Cache-Control` decides. When `Cache-Control`
 carries both directives, `no-store` wins. Header names and directives are matched
@@ -408,8 +413,8 @@ Bypass headers change only the cache lookup. Requests the proxy never caches sta
 
 | Operation | Normal | With `no-cache` | With `no-store` |
 |-----------|--------|-----------------|-----------------|
-| GetObject | Cached | Lookup skipped, response cached | Lookup skipped, not cached |
-| HeadObject | Cached | Lookup skipped, response cached | Lookup skipped, not cached |
+| GetObject | Cached | Lookup skipped, response cached unless read caching is off for the key | Lookup skipped, not cached |
+| HeadObject | Cached | Lookup skipped, response cached unless read caching is off for the key | Lookup skipped, not cached |
 | ListObjects | Not cached | Not cached | Not cached |
 | GetObjectAcl | Not cached | Not cached | Not cached |
 
@@ -695,6 +700,12 @@ The proxy invalidates a key's cached entry when:
 5. A DeleteObjects request or a browser form POST upload names the key (see
    [Writes that name keys in the body](#writes-that-name-keys-in-the-body)).
 6. S3 answers a conditional request with `200 OK`, which shows the cached data is stale.
+7. A write's outcome is unknown: a PUT, copy, CompleteMultipartUpload, DELETE or DeleteObjects
+   was sent in full, then timed out, lost its connection, or got an answer cut short or over
+   its 8 MiB bound. S3 may have applied it, so the proxy drops its copy before it answers. A GET
+   that reaches S3 before S3 finishes applying the write can still cache the previous version,
+   until `get_ttl` expires (see
+   [Writes the origin stops answering](ERROR_HANDLING.md#10-writes-the-origin-stops-answering)).
 
 Multipart uploads that stay idle for longer than `incomplete_upload_ttl` (default `1d`) are also
 removed, with their staged parts.
@@ -722,8 +733,8 @@ response when it fits within the write's cache budget (see
   result document is larger than 4 MiB or cannot be read, or S3 answers `5xx` or not at all, every
   requested key is invalidated. A `4xx` invalidates nothing.
 - **Form POST.** The proxy forwards the body as it streams and reads the `key` field on the way
-  past; it does not keep the file content. A `2xx`, a `3xx` redirect, a `5xx` or a failed forward
-  invalidates the key, and a `4xx` does not. When the `key` field cannot be read, the proxy
+  past; it does not keep the file content. A `2xx`, a `3xx` redirect, a `5xx` or a forward that
+  failed after the request was sent invalidates the key, and a `4xx` does not. When the `key` field cannot be read, the proxy
   invalidates the object named in S3's `Location` header instead. Form POST uploads are not
   write-cached.
 

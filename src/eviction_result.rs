@@ -303,18 +303,18 @@ impl EvictionPassResult {
 const WRITE_CACHE_COUNT_LAST_RESULT: &str = "write_cache_count_eviction_last_result.json";
 
 /// `shortfall_reason`: the target was met, and this is not a repeat reclaim.
-pub const COUNT_REASON_TARGET_REACHED: &str = "target_reached";
+const COUNT_REASON_TARGET_REACHED: &str = "target_reached";
 /// `shortfall_reason`: the ordered candidate list held nothing that assessed `Evictable`.
 /// State (a) — informational, the decline backstop is working as designed.
-pub const COUNT_REASON_NO_RECLAIMABLE_CANDIDATES: &str = "no_reclaimable_candidates";
+const COUNT_REASON_NO_RECLAIMABLE_CANDIDATES: &str = "no_reclaimable_candidates";
 /// `shortfall_reason`: this pass reclaimed, and so did an earlier one, yet the count was back
 /// at the trigger. State (b) — actionable: the hysteresis gap or the budget is wrong.
-pub const COUNT_REASON_RECLAIMED_AND_REFILLED: &str = "reclaimed_and_refilled";
+const COUNT_REASON_RECLAIMED_AND_REFILLED: &str = "reclaimed_and_refilled";
 /// `shortfall_reason`: candidates were reclaimable and the list ran out before the target.
-pub const COUNT_REASON_CANDIDATES_EXHAUSTED: &str = "candidates_exhausted";
+pub(crate) const COUNT_REASON_CANDIDATES_EXHAUSTED: &str = "candidates_exhausted";
 /// `shortfall_reason`: the shortfall is wholly attributable to candidates whose `.meta` could
 /// not be read, which this pass refuses to act on.
-pub const COUNT_REASON_UNREADABLE_CANDIDATE_METADATA: &str = "unreadable_candidate_metadata";
+const COUNT_REASON_UNREADABLE_CANDIDATE_METADATA: &str = "unreadable_candidate_metadata";
 
 /// One **count**-driven write-cache eviction pass's outcome, with its shortfall decomposed.
 ///

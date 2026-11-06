@@ -7,6 +7,7 @@
 //! see write_cache_unit_test.rs
 
 mod common;
+use common::StoredObjectRead;
 
 use s3_proxy::{
     cache::CacheManager, cache_types::CacheMetadata, config::SharedStorageConfig, Result,
@@ -59,47 +60,6 @@ fn create_test_metadata(etag: &str, content_length: u64) -> CacheMetadata {
         access_count: 0,
         last_accessed: std::time::SystemTime::now(),
     }
-}
-
-#[tokio::test]
-async fn test_write_cache_basic_operations() -> Result<()> {
-    let temp_dir = TempDir::new().unwrap();
-    let cache_manager = create_test_cache_manager(&temp_dir);
-
-    // Test data
-    let cache_key = "test-bucket/test-object";
-    let test_data = b"Test data for write-through caching";
-    let metadata = create_test_metadata("test-etag", test_data.len() as u64);
-
-    // Store write cache entry
-    common::put_through_write_cache(
-        &cache_manager,
-        cache_key,
-        test_data,
-        HashMap::new(),
-        metadata.clone(),
-        HashMap::new(),
-    )
-    .await?;
-
-    // Retrieve and verify
-    let retrieved = cache_manager.get_write_cache_entry(cache_key).await?;
-    assert!(retrieved.is_some());
-    let entry = retrieved.unwrap();
-    assert_eq!(entry.cache_key, cache_key);
-    assert_eq!(entry.body, test_data);
-    assert_eq!(entry.metadata.etag, metadata.etag);
-
-    // Invalidate and verify removal
-    cache_manager
-        .invalidate_write_cache_entry(cache_key)
-        .await?;
-    assert!(cache_manager
-        .get_write_cache_entry(cache_key)
-        .await?
-        .is_none());
-
-    Ok(())
 }
 
 /// Test multipart upload detection logic
@@ -172,45 +132,12 @@ async fn test_write_cache_ttl_expiration() -> Result<()> {
     .await?;
 
     // Should exist and not be expired yet
-    assert!(cache_manager
-        .get_write_cache_entry(cache_key)
+    assert!(cache_manager.read_stored_object(cache_key).await?.is_some());
+    let entry = cache_manager
+        .read_stored_object(cache_key)
         .await?
-        .is_some());
-    assert!(
-        !cache_manager
-            .is_write_cache_entry_expired(cache_key)
-            .await?
-    );
-
-    Ok(())
-}
-
-/// Test cleanup of failed PUT operations
-#[tokio::test]
-async fn test_write_cache_cleanup() -> Result<()> {
-    let temp_dir = TempDir::new().unwrap();
-    let cache_manager = create_test_cache_manager(&temp_dir);
-
-    let cache_key = "test-bucket/cleanup-test";
-    let test_data = b"Data to be cleaned up";
-    let metadata = create_test_metadata("cleanup-etag", test_data.len() as u64);
-
-    common::put_through_write_cache(
-        &cache_manager,
-        cache_key,
-        test_data,
-        HashMap::new(),
-        metadata,
-        HashMap::new(),
-    )
-    .await?;
-
-    // Cleanup should remove the entry
-    cache_manager.cleanup_failed_put(cache_key).await?;
-    assert!(cache_manager
-        .get_write_cache_entry(cache_key)
-        .await?
-        .is_none());
+        .expect("the staged entry must be readable before its TTL");
+    assert!(entry.expires_at > std::time::SystemTime::now());
 
     Ok(())
 }
@@ -229,10 +156,7 @@ async fn test_write_cache_statistics() -> Result<()> {
     let metadata = create_test_metadata("stats-etag", test_data.len() as u64);
 
     // Verify no entry exists before store
-    assert!(cache_manager
-        .get_write_cache_entry(cache_key)
-        .await?
-        .is_none());
+    assert!(cache_manager.read_stored_object(cache_key).await?.is_none());
 
     common::put_through_write_cache(
         &cache_manager,
@@ -246,10 +170,10 @@ async fn test_write_cache_statistics() -> Result<()> {
 
     // Verify the entry was stored (write cache size tracking is async via JournalConsolidator,
     // so we verify the entry exists on disk rather than checking in-memory tracker stats)
-    let stored = cache_manager.get_write_cache_entry(cache_key).await?;
+    let stored = cache_manager.read_stored_object(cache_key).await?;
     assert!(stored.is_some(), "Write cache entry should be stored");
     let entry = stored.unwrap();
-    assert_eq!(entry.body, test_data);
+    assert_eq!(entry.body.as_deref(), Some(&test_data[..]));
     assert_eq!(entry.metadata.etag, "stats-etag");
 
     Ok(())

@@ -39,7 +39,7 @@ pub const DEFAULT_MAX_RULES: usize = 1024;
 /// Used when a rule enables `page_widening` without specifying `page_size`.
 ///
 /// Spec: page-aligned-range-cache Requirement 1.4.
-pub const DEFAULT_PAGE_SIZE: u64 = 16 * 1024 * 1024;
+const DEFAULT_PAGE_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Largest Page a resolved setting may carry: the fixed 64 MiB RAM admission
 /// ceiling. [`CacheRules::validate`] rejects a larger explicit `page_size` on a
@@ -48,7 +48,7 @@ pub const DEFAULT_PAGE_SIZE: u64 = 16 * 1024 * 1024;
 /// resolution and was never checked. Resolution therefore clamps to this value,
 /// and validation WARNs about such rules, so one widened request never holds
 /// more than one bounded Page in memory (spec buffered-serve-memory-bound R1.3).
-pub const MAX_PAGE_SIZE: u64 = crate::ram_cache::RAM_CACHE_ADMISSION_CEILING as u64;
+const MAX_PAGE_SIZE: u64 = crate::ram_cache::RAM_CACHE_ADMISSION_CEILING as u64;
 
 /// Default TTFB threshold after which a hedge is issued: 250ms.
 /// Used when a rule enables `hedging_enabled` without specifying
@@ -56,7 +56,7 @@ pub const MAX_PAGE_SIZE: u64 = crate::ram_cache::RAM_CACHE_ADMISSION_CEILING as 
 /// default so both the constant and the ceiling are valid out of the box.
 ///
 /// Spec: hedged-upstream-requests Requirement 3.1.
-pub const DEFAULT_HEDGE_TRIGGER_AFTER: Duration = Duration::from_millis(250);
+const DEFAULT_HEDGE_TRIGGER_AFTER: Duration = Duration::from_millis(250);
 
 /// Default per-request hedge budget: 1.
 /// Used when a rule enables `hedging_enabled` without specifying
@@ -64,7 +64,7 @@ pub const DEFAULT_HEDGE_TRIGGER_AFTER: Duration = Duration::from_millis(250);
 /// sub-fetches this budget is shared across all N — at most one hedge fires.
 ///
 /// Spec: hedged-upstream-requests Requirement 6.1.
-pub const DEFAULT_HEDGE_MAX_PER_REQUEST: usize = 1;
+const DEFAULT_HEDGE_MAX_PER_REQUEST: usize = 1;
 
 /// Custom deserializer for optional Duration fields in rule JSON.
 /// Handles both string values ("30s", "5m") and null/missing fields.
@@ -602,7 +602,7 @@ struct CachedRules {
 /// milliseconds, so the request that finds the rules stale still sees an edited file; on a
 /// stalled volume the read keeps running in the background and is applied by the first
 /// request after it completes.
-pub const RULES_RELOAD_WAIT_BOUND: Duration = Duration::from_millis(100);
+const RULES_RELOAD_WAIT_BOUND: Duration = Duration::from_millis(100);
 
 /// A rules-file read running on the blocking pool.
 struct InflightRead {

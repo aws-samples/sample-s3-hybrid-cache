@@ -113,7 +113,7 @@ type PendingSendFuture =
 /// When `idle_timeout` is set, the stream acts as a mid-stream watchdog: if
 /// no upstream chunk arrives within the timeout, the stream terminates with an
 /// error, aborting the client connection and preventing partial cache commits.
-pub struct TeeStream<S> {
+pub(crate) struct TeeStream<S> {
     inner: S,
     sender: mpsc::Sender<Bytes>,
     bytes_sent: usize,
@@ -137,23 +137,6 @@ impl<S> TeeStream<S>
 where
     S: Stream<Item = Result<Frame<Bytes>, hyper::Error>>,
 {
-    /// Create a new tee stream with a channel sender
-    pub fn new(inner: S, sender: mpsc::Sender<Bytes>) -> Self {
-        Self {
-            inner,
-            sender,
-            bytes_sent: 0,
-            pending_send: None,
-            pending_frame: None,
-            backpressure_wait: Duration::ZERO,
-            backpressure_start: None,
-            backpressure_events: 0,
-            channel_closed: false,
-            idle_timeout: None,
-            idle_sleep: None,
-        }
-    }
-
     /// Create a new tee stream with an idle timeout watchdog.
     ///
     /// If the upstream produces no bytes within `idle_timeout`, the stream
@@ -284,7 +267,7 @@ where
                 // Return None to signal stream end. The hyper body will be incomplete,
                 // which causes the client connection to be aborted (RST or incomplete
                 // chunked encoding). The cache channel is dropped without all bytes,
-                // so commit_incremental_range will fail with "size mismatch" and the
+                // so commit_incremental_range_shared will fail with "size mismatch" and the
                 // partial .bin/.tmp will be cleaned up.
                 return Poll::Ready(None);
             }
@@ -405,7 +388,7 @@ mod tests {
         ];
         let stream = stream::iter(data);
 
-        let mut tee = TeeStream::new(stream, tx);
+        let mut tee = TeeStream::with_idle_timeout(stream, tx, Duration::from_secs(3600));
 
         let mut collected = Vec::new();
         while let Some(Ok(frame)) = tee.next().await {
@@ -440,7 +423,7 @@ mod tests {
         ];
         let stream = stream::iter(data);
 
-        let mut tee = TeeStream::new(stream, tx);
+        let mut tee = TeeStream::with_idle_timeout(stream, tx, Duration::from_secs(3600));
 
         // Consume from both sides concurrently
         let consumer = tokio::spawn(async move {
@@ -504,7 +487,7 @@ mod tests {
             Ok(Frame::data(Bytes::from("chunk3"))),
         ];
         let stream = stream::iter(data);
-        let mut tee = TeeStream::new(stream, tx);
+        let mut tee = TeeStream::with_idle_timeout(stream, tx, Duration::from_secs(3600));
 
         // Drain the client side and the cache side concurrently, with a small
         // delay on the cache side so the channel genuinely fills at least once.
@@ -570,7 +553,7 @@ mod tests {
         ];
         let stream = stream::iter(data);
 
-        let mut tee = TeeStream::new(stream, tx);
+        let mut tee = TeeStream::with_idle_timeout(stream, tx, Duration::from_secs(3600));
 
         // Client should still receive all data even though cache channel is closed
         let mut collected = Vec::new();

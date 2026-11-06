@@ -322,7 +322,9 @@ pub struct ServerConfig {
     /// Size this alongside `cache.max_ram_cache_size` and instance memory: the
     /// two budgets are independent and both count against RSS. A request
     /// rejected by this ceiling receives HTTP 503 `SlowDown` with
-    /// `Retry-After`, which AWS SDKs retry automatically.
+    /// `Retry-After`, which AWS SDKs retry automatically. S3's answer to a signed
+    /// write already sent is accounted but never refused, so the reserved total can
+    /// exceed this ceiling while such answers are held.
     ///
     /// Validated at startup: a non-zero value below the internal one-MiB
     /// buffered-request bound is rejected, since such a config guarantees every
@@ -514,8 +516,10 @@ pub struct TlsConfig {
     #[serde(default)]
     pub key_path: String,
     /// Optional hostname allowlist for CONNECT and SNI passthrough destinations.
-    /// When present, only hostnames matching a pattern in this list are permitted.
-    /// When absent (None), no hostname filtering is applied — only IP-range checks apply.
+    /// When present, only hostnames matching a pattern in this list are permitted, and
+    /// the destination policy also gates the HTTP forwarding paths, whose connections
+    /// then go only to addresses the policy accepts. When absent (None), no hostname
+    /// filtering is applied and only the tunnels' IP-range checks apply.
     /// No hardcoded default patterns are shipped; operators add their own patterns.
     #[serde(default)]
     pub connect_allowlist: Option<Vec<String>>,
@@ -571,19 +575,21 @@ pub struct DownloadCoordinationConfig {
 
     /// Maximum time a waiter will wait for the fetcher to complete (default: 30s)
     /// If the fetcher takes longer than this, the waiter re-subscribes to the in-flight fetch
-    /// (or becomes the fetcher if that fetch has gone), and returns 504 once
-    /// `max_waiter_resubscriptions` is exceeded.
+    /// (or becomes the fetcher if that fetch has gone). Once `max_waiter_resubscriptions`
+    /// is exceeded, a full-object GET or HEAD waiter fetches from S3 itself, as an
+    /// uncoalesced request does, and a part or range waiter returns 504.
     /// Valid range: 5-120 seconds (values outside this range are clamped with a warning)
     /// Requirement: 18.2, 18.3, 18.5
     #[serde(default = "default_download_coordination_wait_timeout_secs")]
     pub wait_timeout_secs: u64,
 
-    /// Maximum number of times a waiter will re-subscribe after timeout before
-    /// returning a gateway timeout error (default: 3).
+    /// Maximum number of times a waiter will re-subscribe after timeout before it
+    /// stops waiting on the in-flight fetch (default: 3).
     /// When a waiter's timeout fires and the FetchGuard is still present, the waiter
     /// re-subscribes to the in-flight fetch rather than launching a duplicate S3 request.
-    /// After this many re-subscriptions without receiving a result, the waiter fails
-    /// with HTTP 504 Gateway Timeout.
+    /// After this many re-subscriptions without receiving a result, a full-object waiter
+    /// fetches from S3 itself and a part or range waiter fails with HTTP 504 Gateway
+    /// Timeout.
     /// Requirement: 7.5
     #[serde(default = "default_max_waiter_resubscriptions")]
     pub max_waiter_resubscriptions: u32,
@@ -1476,6 +1482,11 @@ impl MetadataCacheConfig {
 impl ConnectionPoolConfig {
     /// Validate the configuration
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.upstream_write_idle_timeout.is_zero() {
+            return Err(
+                "connection_pool.upstream_write_idle_timeout must be greater than 0s".to_string(),
+            );
+        }
         // Validate idle_timeout (1-300 seconds). The floor is low enough to sit
         // under S3's own idle close, which was about 5 to 6 s when measured
         // against us-east-1 and varies.
@@ -2570,6 +2581,17 @@ pub struct ConnectionPoolConfig {
     /// fetch when first-byte timeout fires before any bytes are sent to the client.
     #[serde(default = "default_upstream_idle_retries")]
     pub upstream_idle_retries: usize,
+    /// Upload idle timeout (default: 120s). Bounds each wait on the upstream while
+    /// the proxy forwards an upload, multipart operation or copy: sending the
+    /// request, waiting for the response head after the last request byte, and
+    /// reading the response. Any byte moved re-arms it, so a moving transfer is
+    /// never cut off, and it never runs while the proxy waits on the client's body.
+    /// Expiry answers `504 GatewayTimeout`. Must be greater than zero.
+    #[serde(
+        default = "default_upstream_write_idle_timeout",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub upstream_write_idle_timeout: Duration,
     /// Per-instance hedged-request governor. Hedging is enabled per key pattern in
     /// `cache_rules.json` — see `hedging_enabled`, `hedge_trigger_after`, and
     /// `hedge_max_per_request` in the rules schema. This section holds only the
@@ -2652,6 +2674,10 @@ fn default_upstream_idle_timeout() -> Duration {
 fn default_upstream_idle_retries() -> usize {
     2
 }
+fn default_upstream_write_idle_timeout() -> Duration {
+    // Twice botocore's 60 s per-read timeout.
+    Duration::from_secs(120)
+}
 
 impl Default for ConnectionPoolConfig {
     fn default() -> Self {
@@ -2680,6 +2706,7 @@ impl Default for ConnectionPoolConfig {
             upstream_first_byte_timeout: default_upstream_first_byte_timeout(),
             upstream_idle_timeout: default_upstream_idle_timeout(),
             upstream_idle_retries: default_upstream_idle_retries(),
+            upstream_write_idle_timeout: default_upstream_write_idle_timeout(),
             hedged_requests: HedgedRequestsConfig::default(),
         }
     }
@@ -2719,13 +2746,9 @@ pub struct UpstreamOverrideConfig {
 pub struct CompressionConfig {
     pub enabled: bool,
     pub threshold: usize,
-    /// Preferred compression algorithm. FUTURE USE — intentionally retained,
-    /// not dead code. Production currently always uses Lz4 (handlers are built
-    /// via `CompressionHandler::new`); this field is the forward-looking config
-    /// surface for planned multi-algorithm support (e.g. zstd), consumed via
-    /// `CompressionHandler::new_with_algorithm`/`get_preferred_algorithm`. Do
-    /// not remove in dead-code sweeps.
-    /// Spec: compression-followup-fixes Requirement 5.
+    /// Accepted for configuration compatibility and ignored: nothing in the proxy
+    /// reads it. Every compression handler uses Lz4. Kept so existing config files
+    /// that set it continue to parse.
     pub preferred_algorithm: CompressionAlgorithm,
     /// Deprecated, ignored. Content-aware filtering (the built-in extension
     /// denylist) is always applied by default when no `cache_rules.json`
@@ -3294,6 +3317,7 @@ impl Default for Config {
                 upstream_first_byte_timeout: default_upstream_first_byte_timeout(),
                 upstream_idle_timeout: default_upstream_idle_timeout(),
                 upstream_idle_retries: default_upstream_idle_retries(),
+                upstream_write_idle_timeout: default_upstream_write_idle_timeout(),
                 hedged_requests: HedgedRequestsConfig::default(),
             },
             compression: CompressionConfig {
@@ -10415,6 +10439,21 @@ connection_pool:
         assert_eq!(config.upstream_first_byte_timeout, Duration::from_secs(5));
         assert_eq!(config.upstream_idle_timeout, Duration::from_secs(5));
         assert_eq!(config.upstream_idle_retries, 2);
+        assert_eq!(config.upstream_write_idle_timeout, Duration::from_secs(120));
+    }
+    #[test]
+    fn upstream_write_idle_timeout_parses_and_zero_is_rejected_by_name() {
+        let config: ConnectionPoolConfig =
+            serde_yaml_ng::from_str("upstream_write_idle_timeout: \"45s\"\n").unwrap();
+        assert_eq!(config.upstream_write_idle_timeout, Duration::from_secs(45));
+        assert!(config.validate().is_ok(), "control: 45s is valid");
+        let zero: ConnectionPoolConfig =
+            serde_yaml_ng::from_str("upstream_write_idle_timeout: \"0s\"\n").unwrap();
+        let err = zero.validate().expect_err("0s must be rejected");
+        assert!(
+            err.contains("connection_pool.upstream_write_idle_timeout"),
+            "{err}"
+        );
     }
 
     #[test]

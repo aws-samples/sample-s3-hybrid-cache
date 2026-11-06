@@ -4,8 +4,10 @@
 //!
 //! # What this measures
 //!
-//! The shipped eviction path against the shipped admission path,
-//! `DiskCacheManager::store_range`, the method every cache-miss GET and write-cache PUT calls.
+//! The shipped eviction path against the shipped admission path, the read fill a cache-miss
+//! GET makes: each admission is a GET of an uncached object through a real `HttpProxy` over
+//! this process's cache, in front of a loopback origin, so the fill is the one a proxy makes,
+//! witness capture and publish included.
 //! Nothing in `src/` exists for this measurement. `--eviction-mode` chooses which deleting
 //! process runs (next section): the eviction work list's executors (`worklist`), or the
 //! single-holder pass, `CacheManager::enforce_disk_cache_limits` →
@@ -51,12 +53,12 @@
 //! `CacheManager::start_put_usage_refresher()`, the call `HttpProxy::start` makes before its
 //! accept loop. That call publishes the `max_cache_size` bound that read fills consult, so an
 //! admission that would take the cache past `max_cache_size` on the 5 s usage snapshot is
-//! declined, as a GET-miss fill is on a proxy. Admission goes through
-//! `DiskCacheManager::prepare_range_store` and `PreparedRangeFill::finish`, the two halves of
-//! `store_range`; a `None` from the first is a declined fill. The binary counts attempted and
+//! declined, as a GET-miss fill is on a proxy. Admission is a GET miss through the proxy; a
+//! fill whose `.bin` is not published within four times the smoothed admitted-fill time of the
+//! response (0.5 s to 30 s) is counted declined. The binary counts attempted and
 //! declined fills, by bytes and by count, and prints them in the results and in the
 //! `EVICTION_MODE_SUMMARY` line. `fill_bytes_per_sec` is the bytes actually admitted. A decline
-//! here includes any reason `prepare_range_store` declines for (the danger-band guard as well
+//! here includes any reason the read-fill begin declines for (the danger-band guard as well
 //! as the `max_cache_size` bound); on a volume with free space only the `max_cache_size` bound
 //! can fire. A declined fill returns at once, so a worker waits the smoothed time of its
 //! admitted fills before the next attempt; the attempted rate is then the rate the workers
@@ -81,7 +83,7 @@
 //!
 //! # Making admission visible to eviction: manual consolidation cycles
 //!
-//! `store_range` writes the `.bin` immediately, defers the `.meta` write to the journal, and
+//! The fill writes the `.bin` immediately, defers the `.meta` write to the journal, and
 //! bumps an in-memory `SizeAccumulator` delta, none of which
 //! `enforce_disk_cache_limits_internal` reads. That function reads
 //! `consolidator.get_current_size()`, which is `size_state.json` on disk, updated only when
@@ -108,9 +110,11 @@
 //! Reports admitted and evicted bytes/s and entries/s over the run, and the minimum mean
 //! evicted object size derived from them (see the final printed section).
 
+use bytes::Bytes;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
-use s3_proxy::cache_types::ObjectMetadata;
-use s3_proxy::config::{MetadataCacheConfig, SharedStorageConfig};
+use s3_proxy::config::{
+    Config, MetadataCacheConfig, SharedStorageConfig, UpstreamOverrideConfig, UpstreamScheme,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -1032,6 +1036,213 @@ fn print_mode_summary(input: &ModeSummaryInput<'_>) {
     println!("EVICTION_MODE_SUMMARY {summary}");
 }
 
+/// A real `HttpProxy` over this process's cache, in front of a loopback origin, and the client
+/// that makes cache-miss GETs through it. The origin answers any `GET` with a body of the size
+/// the path names (`/s<size>/`); every admission this binary makes is the fill such a GET
+/// causes.
+struct AdmissionProxy {
+    proxy: std::net::SocketAddr,
+    origin_host: String,
+    _origin_shutdown: tokio::sync::oneshot::Sender<()>,
+    _proxy_shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+impl AdmissionProxy {
+    const AUTH: &'static str = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000"; // gitleaks:allow
+
+    async fn start(args: &Args, cache_manager: &Arc<CacheManager>) -> Self {
+        use http_body_util::Full;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // The origin.
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind origin");
+        let origin_host = format!("127.0.0.1:{}", origin.local_addr().unwrap().port());
+        let (origin_shutdown, mut origin_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accept = origin.accept() => {
+                        let Ok((stream, _)) = accept else { break };
+                        tokio::spawn(async move {
+                            let service = service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                                let size = req
+                                    .uri()
+                                    .path()
+                                    .split('/')
+                                    .find_map(|seg| seg.strip_prefix('s')?.parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                let body = Bytes::from(vec![0xABu8; size]);
+                                Ok::<_, hyper::Error>(
+                                    hyper::Response::builder()
+                                        .status(200)
+                                        .header("content-length", size.to_string())
+                                        .header("etag", "\"admission\"")
+                                        .header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+                                        .header("content-type", "application/octet-stream")
+                                        .body(Full::new(body))
+                                        .unwrap(),
+                                )
+                            });
+                            let _ = http1::Builder::new()
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
+                        });
+                    }
+                    _ = &mut origin_rx => break,
+                }
+            }
+        });
+        // The proxy, over the cache this binary measures.
+        let mut config = Config::default();
+        config.cache.cache_dir = args.cache_dir.clone();
+        config.cache.ram_cache_enabled = false;
+        config.cache.read_cache_enabled = true;
+        config.cache.download_coordination.enabled = false;
+        config.cache.get_ttl = Duration::from_secs(315_360_000);
+        config.cache.head_ttl = Duration::from_secs(315_360_000);
+        config.cache.bucket_settings_staleness_threshold = Duration::from_secs(60);
+        config.connection_pool.upstream_overrides.insert(
+            origin_host.clone(),
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: true,
+            },
+        );
+        let config = Arc::new(config);
+        let ledger = Arc::new(s3_proxy::inflight_ledger::InflightLedger::new(
+            config.server.max_inflight_buffer_bytes,
+        ));
+        let s3_client: Arc<dyn s3_proxy::S3ClientApi + Send + Sync> = Arc::new(
+            s3_proxy::s3_client::S3Client::new(&config.connection_pool, None)
+                .expect("s3 client")
+                .with_inflight_ledger(ledger),
+        );
+        let disk = Arc::new(tokio::sync::RwLock::new(
+            cache_manager.create_configured_disk_cache_manager(),
+        ));
+        let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
+            Arc::clone(cache_manager),
+            disk,
+        ));
+        let inflight_tracker = Arc::new(s3_proxy::inflight_tracker::InFlightTracker::new());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            config.server.max_concurrent_requests,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let proxy = listener.local_addr().unwrap();
+        let (proxy_shutdown, mut proxy_rx) = tokio::sync::oneshot::channel::<()>();
+        let cache_manager = Arc::clone(cache_manager);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accept = listener.accept() => {
+                        let Ok((stream, peer)) = accept else { break };
+                        let config = Arc::clone(&config);
+                        let cache_manager = Arc::clone(&cache_manager);
+                        let range_handler = Arc::clone(&range_handler);
+                        let s3_client = Arc::clone(&s3_client);
+                        let inflight_tracker = Arc::clone(&inflight_tracker);
+                        let semaphore = Arc::clone(&semaphore);
+                        tokio::spawn(async move {
+                            let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                                let config = Arc::clone(&config);
+                                let cache_manager = Arc::clone(&cache_manager);
+                                let range_handler = Arc::clone(&range_handler);
+                                let s3_client = Arc::clone(&s3_client);
+                                let inflight_tracker = Arc::clone(&inflight_tracker);
+                                let semaphore = Arc::clone(&semaphore);
+                                let inflight_ledger = s3_client.get_inflight_ledger();
+                                async move {
+                                    s3_proxy::http_proxy::HttpProxy::handle_request(
+                                        req, peer, config, cache_manager, s3_client, range_handler,
+                                        semaphore, None, None, inflight_tracker, None, None, None,
+                                        inflight_ledger,
+                                    )
+                                    .await
+                                }
+                            });
+                            let _ = http1::Builder::new()
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
+                        });
+                    }
+                    _ = &mut proxy_rx => break,
+                }
+            }
+        });
+        Self {
+            proxy,
+            origin_host,
+            _origin_shutdown: origin_shutdown,
+            _proxy_shutdown: proxy_shutdown,
+        }
+    }
+
+    /// One cache-miss GET of `raw_path` through the proxy, read to the end, then wait up to
+    /// `publish_bound` for the fill's `.bin` to be published. `Ok(true)` is a stored fill and
+    /// `Ok(false)` one the proxy declined (or that did not publish within the bound).
+    async fn get_miss(
+        &self,
+        raw_path: &str,
+        disk_cache: &s3_proxy::disk_cache::DiskCacheManager,
+        cache_key: &str,
+        size: u64,
+        publish_bound: Duration,
+    ) -> s3_proxy::Result<bool> {
+        use http_body_util::{BodyExt, Full};
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+        let request = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("http://{}{}", self.proxy, raw_path))
+            .header("host", self.origin_host.as_str())
+            .header("authorization", Self::AUTH)
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| s3_proxy::ProxyError::CacheError(e.to_string()))?;
+        let response = client
+            .request(request)
+            .await
+            .map_err(|e| s3_proxy::ProxyError::CacheError(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(s3_proxy::ProxyError::CacheError(format!(
+                "admission GET answered {}",
+                response.status()
+            )));
+        }
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| s3_proxy::ProxyError::CacheError(e.to_string()))?
+            .to_bytes();
+        if body.len() as u64 != size {
+            return Err(s3_proxy::ProxyError::CacheError(format!(
+                "admission GET returned {} of {} bytes",
+                body.len(),
+                size
+            )));
+        }
+        let bin = disk_cache.get_new_range_file_path(cache_key, 0, size - 1);
+        let until = Instant::now() + publish_bound;
+        loop {
+            if bin.exists() {
+                return Ok(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
@@ -1124,7 +1335,7 @@ async fn main() {
 
     // Populates journal_consolidator / hybrid_metadata_writer / cache_hit_update_buffer
     // via the OnceLock in build_journal_components(). The returned DiskCacheManager is
-    // NOT what admission uses below — a fresh one is created per store_range call, the
+    // NOT what admission uses below — a fresh one is created per admission task, the
     // same pattern every real call site in src/ uses (see src/cache.rs:7901).
     let _ = cache_manager.create_configured_disk_cache_manager();
 
@@ -1280,7 +1491,7 @@ async fn main() {
     // reports nothing itself (it is plumbing, not a measured direction).
     let admitted_bytes = Arc::new(AtomicU64::new(0));
     let admitted_entries = Arc::new(AtomicU64::new(0));
-    // Every attempt, and the attempts `prepare_range_store` declined (it returned `None`).
+    // Every attempt, and the attempts the read-fill begin declined (it returned `None`).
     let attempted_bytes = Arc::new(AtomicU64::new(0));
     let attempted_entries = Arc::new(AtomicU64::new(0));
     let declined_bytes = Arc::new(AtomicU64::new(0));
@@ -1304,24 +1515,25 @@ async fn main() {
     tracing::info!("{MEASUREMENT_WINDOW_MARKER}");
     let run_start = Instant::now();
 
-    // --- Admission workers: one DiskCacheManager per task (store_range takes &mut
-    // self), all writing under distinct cache_key prefixes so they cannot collide on
+    // --- Admission workers: one DiskCacheManager per task, all writing under distinct
+    // cache_key prefixes so they cannot collide on
     // the same .meta and serialise on its per-object lock. ---
     // Per-run key namespace. `testing.md`'s "run-unique key" rule applies here exactly:
     // reusing a fixed prefix across invocations against the SAME fixture directory makes
     // every subsequent run overwrite the previous run's objects rather than genuinely
-    // admitting new bytes. `store_range` credits only the net size delta on an overwrite
+    // admitting new bytes. The fill credits only the net size delta on an overwrite
     // (near-zero when the new write is the same size as the old), so a re-run's
     // admitted_bytes counter — which counts every attempted write regardless of whether
     // it was new or an overwrite — read far higher than what the consolidator's
     // accumulator actually accumulated. Measured directly: one run counted 29.25 GiB
-    // admitted by store_range call count, but the accumulator only accumulated 10.34 GiB,
+    // admitted by fill count, but the accumulator only accumulated 10.34 GiB,
     // a ~19 GiB gap matching a PRIOR run's overwritten key space almost exactly.
     let run_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     println!("run_id (key namespace): {run_id}");
+    let admission = Arc::new(AdmissionProxy::start(&args, &cache_manager).await);
     let mut admission_handles = Vec::new();
     for worker_id in 0..args.admission_threads {
         let cache_manager = cache_manager.clone();
@@ -1333,8 +1545,9 @@ async fn main() {
         let declined_entries = declined_entries.clone();
         let stop = stop.clone();
         let sizes = args.admission_sizes.clone();
+        let admission = admission.clone();
         admission_handles.push(tokio::spawn(async move {
-            let mut disk_cache = cache_manager.create_configured_disk_cache_manager();
+            let disk_cache = cache_manager.create_configured_disk_cache_manager();
             let mut counter: u64 = 0;
             let mut size_idx = 0usize;
             // Seconds a worker spends on one admitted fill, smoothed. A declined fill returns without
@@ -1346,38 +1559,27 @@ async fn main() {
             while !stop.load(Ordering::Relaxed) {
                 let size = sizes[size_idx % sizes.len()];
                 size_idx = size_idx.wrapping_add(1);
-                let data = vec![0xABu8; size as usize]; // incompressible-ish content is
-                                                        // irrelevant since compression_enabled=false above; content is inert.
-                                                        // run_id makes this key genuinely new admission rather than an overwrite
-                                                        // of a previous invocation's object at the same key (see the run_id
-                                                        // comment above main's admission loop for the incident this fixes).
-                let cache_key = format!("task13-admission/r{run_id}/w{worker_id}/obj{counter:012}");
-                let object_metadata = ObjectMetadata::new(
-                    format!("etag-{worker_id}-{counter}"),
-                    "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                    size,
-                    Some("application/octet-stream".to_string()),
-                );
+                // The object size rides in the path, for the origin to answer with. The run_id
+                // makes this key genuinely new admission rather than an overwrite of a previous
+                // invocation's object at the same key (see the run_id comment above main's
+                // admission loop for the incident this fixes).
+                let raw_path =
+                    format!("/task13-admission/r{run_id}/w{worker_id}/s{size}/obj{counter:012}");
+                let cache_key = CacheManager::generate_cache_key(&raw_path, None);
                 attempted_bytes.fetch_add(size, Ordering::Relaxed);
                 attempted_entries.fetch_add(1, Ordering::Relaxed);
                 let fill_started = Instant::now();
-                // `store_range` is these two calls; `None` is a declined fill.
-                let prepared = disk_cache
-                    .prepare_range_store(
-                        &cache_key,
-                        0,
-                        size - 1,
-                        &data,
-                        object_metadata,
-                        Duration::from_secs(315_360_000),
-                        false,
-                    )
+                // How long after the response a fill may take to publish before it is counted
+                // declined: four times the smoothed admitted-fill time, within 0.5 s to 30 s.
+                let publish_bound =
+                    Duration::from_secs_f64((fill_secs_ewma * 4.0).clamp(0.5, 30.0));
+                // A GET miss through a real `HttpProxy` over this process's cache: the proxy
+                // streams the origin's response to the client and fills the cache from it, and the
+                // fill is stored or declined by the same guards a proxy applies. `Ok(false)` is a
+                // declined fill.
+                let stored = admission
+                    .get_miss(&raw_path, &disk_cache, &cache_key, size, publish_bound)
                     .await;
-                let stored = match prepared {
-                    Ok(Some(fill)) => fill.finish().await.map(|()| true),
-                    Ok(None) => Ok(false),
-                    Err(e) => Err(e),
-                };
                 match stored {
                     Ok(true) => {
                         admitted_bytes.fetch_add(size, Ordering::Relaxed);
@@ -1555,7 +1757,7 @@ async fn main() {
 
     // One final consolidation cycle so admitted-but-not-yet-consolidated bytes are
     // counted in the closing size_state.json read, though not in the throughput
-    // figures above (which are measured directly from store_range/enforce_disk_cache_limits
+    // figures above (which are measured directly from the fill/enforce_disk_cache_limits
     // return values, not from size_state.json deltas).
     // The cycle spawns maintenance passes, the work-list executor among them; a process that
     // exits mid-chunk stops between an unlink and its `.meta` update. Wait for them first.

@@ -164,11 +164,11 @@ pub const DANGER_BAND_FLOOR_MULTIPLIER: u64 = 4;
 /// questions: that one is "would this upload take the cache past `max_cache_size` or
 /// under the floor", this one is "would this fill, plus every fill the fleet already has
 /// outstanding, take the volume under the floor".
-pub const DANGER_BAND_SKIP_REASON: &str = "disk_danger_band";
+pub(crate) const DANGER_BAND_SKIP_REASON: &str = "disk_danger_band";
 
 /// Reason label when the guard declines because the fleet's outstanding total could not be
 /// read. See the module doc for why this arm fails closed while `statvfs` fails open.
-pub const DANGER_BAND_UNREADABLE_SKIP_REASON: &str = "disk_danger_band_unreadable";
+const DANGER_BAND_UNREADABLE_SKIP_REASON: &str = "disk_danger_band_unreadable";
 
 /// The **enumerated** set of publication boundaries this guard is wired at.
 ///
@@ -181,35 +181,34 @@ pub const DANGER_BAND_UNREADABLE_SKIP_REASON: &str = "disk_danger_band_unreadabl
 ///
 /// | # | Path | Entry point | Guarded here? |
 /// |---|---|---|---|
-/// | P1 | buffered range/part publication | `DiskCacheManager::store_range` | **yes** — [`PublicationPath::P1BufferedRange`] |
-/// | P2 | full-object wrapper over P1 (test-only callers) | `DiskCacheManager::store_full_object_as_range` | **yes, transitively** — it delegates to `store_range` and does no write of its own, so P1's check covers it for free. Test-only reachability does not change that, and leaving a delegating wrapper unguarded would be a second entry point to the same bytes |
+/// | P1 | buffered range/part publication | `DiskCacheManager::prepare_range_store` | **yes** — [`PublicationPath::P1BufferedRange`] |
+/// | P2 | none | none | **not a path.** The full-object store, `CacheManager::store_full_object_as_range_witnessed`, does not delegate to P1: it writes its own `.bin` and `.meta` and is guarded as P4. The number is kept so P3 to P9a keep theirs |
 /// | P3a | GET-response incremental tee | `DiskCacheManager::begin_incremental_range_write` | **yes** — [`PublicationPath::P3aGetResponseTee`] |
 /// | P3b | write-cache PUT sink | `CacheManager::open_write_cache_sink` | pre-existing `disk_safety_refusal`; **also** covered here, because the sink's range write goes through P3a |
 /// | P3c | multipart part sink | `CacheManager::open_multipart_part_sink` → `begin_incremental_part_write` | **yes** — [`PublicationPath::P3cMultipartPartSink`] |
-/// | P4 | production full-object GET publication | `CacheManager::store_full_object_as_range_new` | **yes** — [`PublicationPath::P4FullObjectStore`] |
-/// | P5 | range GET-miss fill, incl. gap-repair partial fill | `RangeHandler::store_range_new_storage` | **yes, transitively** via P1; it is a thin delegate with no write of its own |
-/// | P6 | page-widened publication | `handle_widened_suffix_response`, `fetch_and_cache_page_missing_ranges` | **yes, transitively** via P5 → P1 |
+/// | P4 | production full-object GET publication | `CacheManager::store_full_object_as_range_witnessed` | **yes** — [`PublicationPath::P4FullObjectStore`] |
+/// | P5 | range GET-miss fill, incl. gap-repair partial fill | `DiskCacheManager::store_range_shared_witnessed` | **yes, transitively** via P1; it calls `prepare_range_store` and then publishes, with no write of its own |
+/// | P6 | page-widened publication | `handle_widened_suffix_response`, `fetch_and_cache_page_missing_ranges` | **yes, transitively** via P5, so P1 |
 /// | P7 | write-through PUT, buffered + streaming | `store_put_as_write_cached_range_with_ttl`, `open_write_cache_sink` | pre-existing `disk_safety_refusal`; the streaming half also passes through P3a |
 /// | P8 | `UploadPart` streaming | `finalize_and_record_cached_part` → `begin_incremental_part_write` | **yes** — same boundary as P3c |
 /// | P9a | `CompleteMultipartUpload`, production | `SignedPutHandler::finalize_multipart_upload` | **no, and nothing to guard.** It renames already-published part files into `ranges/` and writes a `.meta`; it publishes no new data bytes, so there is no incoming figure to admit. The bytes were admitted at P8 |
-/// | P9b | test-only completion twin | `CacheManager::complete_multipart_upload` | **no, deliberately.** Zero `src/` callers (only five integration-test files), and it performs its own `std::fs::write` rather than routing through a shared helper — so guarding it would mean adding a live capacity decision to code production never reaches, and would let a declining guard silently change what those five fixtures build. P2 is guarded for free because it delegates; this one is not free, and buys nothing |
 ///
 /// So the boundaries that carry a check are the four variants below, and between them they
-/// cover P1, P2, P3a, P3b, P3c, P4, P5, P6, P7 and P8. Deliberately uncovered: P9a
-/// (publishes no new bytes) and P9b (test-only, would need its own check).
+/// cover P1, P3a, P3b, P3c, P4, P5, P6, P7 and P8 (P2 is not a path). Deliberately uncovered: P9a
+/// (publishes no new bytes).
 ///
 /// **Boundary, not caller.** Each check sits inside the function that creates or publishes
-/// the bytes, not at its call sites — P5 has four call sites and P1 has nine, and a
+/// the bytes, not at its call sites — P5 has five production call sites and P1 has two, and a
 /// caller-only check leaves every alternate path open. The mixed spawn/await shape at P5's
-/// call sites (three `tokio::spawn`, one awaited synchronously for page assembly) is
+/// call sites (most `tokio::spawn`ed, one awaited synchronously for page assembly) is
 /// exactly why: a decline has a different local effect at each, and the awaited one is
 /// safe only because it assembles the Page in memory from the fetched buffers rather than
 /// re-reading what it just stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationPath {
-    /// **P1** — `DiskCacheManager::store_range`, the buffered range/part publication.
-    /// Also covers **P2** (delegating wrapper), **P5** (`store_range_new_storage`) and
-    /// **P6** (page widening, which routes through P5).
+    /// **P1** — `DiskCacheManager::prepare_range_store`, the buffered range/part publication.
+    /// Also covers **P5** (`store_range_shared_witnessed`) and **P6** (page widening, which
+    /// routes through P5).
     P1BufferedRange,
     /// **P3a** — `DiskCacheManager::begin_incremental_range_write`, the GET-response
     /// incremental tee. Also the range write underneath **P3b**/**P7**'s streaming sink.
@@ -218,7 +217,7 @@ pub enum PublicationPath {
     /// `UploadPart` staging sink, which `u4` records as applying none of the write-cache
     /// sink's gates.
     P3cMultipartPartSink,
-    /// **P4** — `CacheManager::store_full_object_as_range_new`, the production
+    /// **P4** — `CacheManager::store_full_object_as_range_witnessed`, the production
     /// full-object GET publication.
     P4FullObjectStore,
 }
@@ -481,7 +480,7 @@ fn fold_gauges<'a>(
 /// The process's capacity-guard figures for a metrics scrape. Reads the registry without
 /// creating a guard, so a scrape before the first fill reports zero declines and a `null`
 /// reading rather than taking a `statvfs` of its own.
-pub fn collect_capacity_guard_gauges(configured_floor: u64) -> CapacityGuardGauges {
+pub(crate) fn collect_capacity_guard_gauges(configured_floor: u64) -> CapacityGuardGauges {
     let guards = match GUARDS.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -598,7 +597,7 @@ impl DangerBandGuard {
 
     /// The most recent free-space figure this guard read, or `None` before its first
     /// successful `statvfs`.
-    pub fn last_available_bytes(&self) -> Option<u64> {
+    fn last_available_bytes(&self) -> Option<u64> {
         match self.last_available.load(Ordering::Relaxed) {
             NO_READING => None,
             available => Some(available),

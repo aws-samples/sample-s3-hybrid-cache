@@ -16,23 +16,15 @@
 //! 58 test files that declare it.
 #![allow(clippy::duplicate_mod)]
 
-#[path = "aws_chunked_overflow_integration_test.rs"]
-mod aws_chunked_overflow_integration_test;
+#[path = "incomplete_upload_sweep_wiring_test.rs"]
+mod incomplete_upload_sweep_wiring_test;
 #[path = "mpu_upload_dir_test.rs"]
 mod mpu_upload_dir_test;
-#[path = "multipart_completion_test.rs"]
-mod multipart_completion_test;
-#[path = "multipart_etag_quote_mismatch_test.rs"]
-mod multipart_etag_quote_mismatch_test;
-#[path = "multipart_get_integration_test.rs"]
-mod multipart_get_integration_test;
-#[path = "multipart_initiation_test.rs"]
-mod multipart_initiation_test;
-#[path = "multipart_part_storage_test.rs"]
-mod multipart_part_storage_test;
-#[path = "part_number_caching_integration_test.rs"]
-mod part_number_caching_integration_test;
 #[path = "part_number_caching_property_test.rs"]
 mod part_number_caching_property_test;
-#[path = "part_scoped_head_cache_test.rs"]
-mod part_scoped_head_cache_test;
+#[path = "select_refusal_test.rs"]
+mod select_refusal_test;
+#[path = "signed_write_upstream_timeout_test.rs"]
+mod signed_write_upstream_timeout_test;
+#[path = "write_unknown_outcome_test.rs"]
+mod write_unknown_outcome_test;

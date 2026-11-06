@@ -54,14 +54,14 @@ use tracing::{debug, warn};
 ///
 /// Value: 1 MiB ≈ chunk/8 for 8 MiB range GETs — enough amortisation with
 /// smooth sub-quantum interleaving under contention.
-pub const LEASE_QUANTUM: u64 = 1 << 20; // 1 MiB
+pub(crate) const LEASE_QUANTUM: u64 = 1 << 20; // 1 MiB
 
 /// Token-bucket burst window for smoothing.
 ///
 /// The bucket capacity is `ceiling_bps × BURST_WINDOW`, so the bucket can hold
 /// at most 100 ms worth of tokens.  This bounds overshoot at low ceilings and
 /// keeps TTFB low (tokens are almost always available for the first frame).
-pub const BURST_WINDOW: Duration = Duration::from_millis(100);
+const BURST_WINDOW: Duration = Duration::from_millis(100);
 
 // ─── Fairness key ─────────────────────────────────────────────────────────────
 
@@ -70,7 +70,7 @@ pub const BURST_WINDOW: Duration = Duration::from_millis(100);
 /// The enum variant provides the namespace: a `Caller("x")` and a `Bucket("x")`
 /// with the same string value are distinct classes and never collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum FairnessKey {
+pub(crate) enum FairnessKey {
     /// Caller identity extracted from the User-Agent `app/<value>` token.
     Caller(String),
     /// S3 bucket name (fallback when caller identity is absent or invalid).
@@ -194,7 +194,7 @@ impl ClassState {
 ///
 /// Cloned cheaply (`Arc` internals).  Pass to every [`ThrottleStream`].
 #[derive(Clone)]
-pub struct BandwidthLimiter {
+pub(crate) struct BandwidthLimiter {
     /// Layer 0: 0 = disabled. Written by fleet task, read by every poll_next.
     ceiling_bps: Arc<AtomicU64>,
     /// Layer 1: available token count (bytes). Refilled by the background task.
@@ -295,11 +295,6 @@ impl BandwidthLimiter {
         self.ceiling_bps.store(bps, Ordering::Relaxed);
     }
 
-    /// Cumulative fail-open events.
-    pub fn failopen_total(&self) -> u64 {
-        self.failopen_total.load(Ordering::Relaxed)
-    }
-
     /// Resolve the per-request fairness key from headers.
     pub(crate) fn resolve_key(
         &self,
@@ -320,7 +315,7 @@ impl BandwidthLimiter {
     /// `[min_bytes, min(desired, available)]`, or `None` if fewer than
     /// `min_bytes` tokens are available.
     #[inline]
-    pub fn try_acquire(&self, min_bytes: u64, desired: u64) -> Option<u64> {
+    pub(crate) fn try_acquire(&self, min_bytes: u64, desired: u64) -> Option<u64> {
         if self.ceiling_bps.load(Ordering::Relaxed) == 0 {
             // Layer 0 bypass — disabled.
             return Some(desired);
@@ -443,7 +438,7 @@ pub struct BandwidthLimiterSnapshot {
 ///   over-count — bounds error by `min_count`).
 ///
 /// Classes evicted to residual continue to accumulate via the `residual` counter.
-pub struct TopKTracker {
+pub(crate) struct TopKTracker {
     cap: usize,
     /// Per-class byte counts for retained top-K classes.
     classes: dashmap::DashMap<String, u64>,
@@ -502,21 +497,6 @@ impl TopKTracker {
             .collect();
         let residual = self.residual.load(Ordering::Relaxed);
         (entries, residual)
-    }
-
-    /// Current number of tracked classes (≤ cap).
-    pub fn len(&self) -> usize {
-        self.classes.len()
-    }
-
-    /// Whether there are no tracked classes.
-    pub fn is_empty(&self) -> bool {
-        self.classes.is_empty()
-    }
-
-    /// Residual byte count.
-    pub fn residual(&self) -> u64 {
-        self.residual.load(Ordering::Relaxed)
     }
 }
 
@@ -1063,8 +1043,8 @@ mod tests {
         tracker.record("a", 100);
         tracker.record("b", 200);
         tracker.record("c", 300);
-        assert_eq!(tracker.len(), 3);
-        assert_eq!(tracker.residual(), 0);
+        assert_eq!(tracker.snapshot().0.len(), 3);
+        assert_eq!(tracker.snapshot().1, 0);
     }
 
     #[test]
@@ -1075,7 +1055,11 @@ mod tests {
         // Third class triggers eviction.
         tracker.record("c", 3000);
         // At most cap + 1 distinct series should exist (including residual).
-        assert!(tracker.len() <= 2, "tracker.len()={}", tracker.len());
+        assert!(
+            tracker.snapshot().0.len() <= 2,
+            "tracker.snapshot().0.len()={}",
+            tracker.snapshot().0.len()
+        );
         // Total bytes must be conserved (top-K bytes + residual).
         let (entries, residual) = tracker.snapshot();
         let total: u64 = entries.iter().map(|(_, b)| b).sum::<u64>() + residual;
@@ -1090,7 +1074,11 @@ mod tests {
         for i in 0..100 {
             tracker.record(&format!("class-{}", i), (i + 1) as u64 * 100);
         }
-        assert!(tracker.len() <= cap, "too many classes: {}", tracker.len());
+        assert!(
+            tracker.snapshot().0.len() <= cap,
+            "too many classes: {}",
+            tracker.snapshot().0.len()
+        );
         // All bytes must be accounted for (sum ≤ total with Space-Saving over-count).
         let (entries, residual) = tracker.snapshot();
         let tracked: u64 = entries.iter().map(|(_, b)| b).sum();

@@ -26,11 +26,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Schema of a scanner document. Any other value reads as absent.
-pub const SCANNER_DOC_SCHEMA: u32 = 1;
+pub(crate) const SCANNER_DOC_SCHEMA: u32 = 1;
 
 /// Lease on a scanner document: two staged-fold intervals, so a live instance that publishes at
 /// the start of every pass never lapses, and a dead one stops counting within two passes.
-pub const SCANNER_LEASE_SECS: u64 = 2 * crate::staged_fold::STAGED_FOLD_INTERVAL_SECS;
+const SCANNER_LEASE_SECS: u64 = 2 * crate::staged_fold::STAGED_FOLD_INTERVAL_SECS;
 const _: () = assert!(SCANNER_LEASE_SECS == 600);
 
 const SCANNER_DOC_SUFFIX: &str = ".scan";
@@ -57,7 +57,7 @@ impl ScanKind {
 
 /// One scanner's published state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScannerDocument {
+pub(crate) struct ScannerDocument {
     pub schema: u32,
     pub instance_id: String,
     pub kind: ScanKind,
@@ -73,7 +73,7 @@ impl ScannerDocument {
 }
 
 /// `{cache_dir}/metadata/_shard_state/scanners`.
-pub fn scanners_dir(cache_dir: &Path) -> PathBuf {
+pub(crate) fn scanners_dir(cache_dir: &Path) -> PathBuf {
     cache_dir
         .join("metadata")
         .join("_shard_state")
@@ -205,7 +205,12 @@ fn read_all(cache_dir: &Path) -> Vec<ScannerDocument> {
 
 /// Live scanners other than the caller's own `(instance_id, kind)`: not ended and inside their
 /// lease at `now`. Absent, torn and unreadable documents do not count.
-pub fn count_live_others(cache_dir: &Path, instance_id: &str, kind: ScanKind, now: u64) -> u32 {
+pub(crate) fn count_live_others(
+    cache_dir: &Path,
+    instance_id: &str,
+    kind: ScanKind,
+    now: u64,
+) -> u32 {
     read_all(cache_dir)
         .iter()
         .filter(|d| !(d.instance_id == instance_id && d.kind == kind))
@@ -214,18 +219,12 @@ pub fn count_live_others(cache_dir: &Path, instance_id: &str, kind: ScanKind, no
         .count() as u32
 }
 
-/// Distinct instances with any document published inside one lease of `now`, ended or not.
-/// Never below 1, since the caller is itself a scanner.
-pub fn k_max(cache_dir: &Path, now: u64) -> u32 {
-    k_max_including(cache_dir, None, now)
-}
-
 /// [`k_max`], counting `instance_id` whether or not its own document is inside the lease.
 ///
 /// The caller is about to scan, so it is one of the instances the ceiling must admit. Without
 /// this, an instance whose document has lapsed sees one live peer as `k_max = 1` and defers,
 /// which serialises a fleet that today scans concurrently.
-pub fn k_max_including(cache_dir: &Path, instance_id: Option<&str>, now: u64) -> u32 {
+pub(crate) fn k_max_including(cache_dir: &Path, instance_id: Option<&str>, now: u64) -> u32 {
     let mut ids: std::collections::HashSet<String> = read_all(cache_dir)
         .into_iter()
         .filter(|d| d.lease_covers(now))
@@ -323,7 +322,7 @@ mod tests {
             count_live_others(cache, A, ScanKind::Fold, T0 + SCANNER_LEASE_SECS),
             0
         );
-        assert_eq!(k_max(cache, T0 + SCANNER_LEASE_SECS), 1);
+        assert_eq!(k_max_including(cache, None, T0 + SCANNER_LEASE_SECS), 1);
     }
 
     #[test]
@@ -348,7 +347,7 @@ mod tests {
         let doc = read_doc(&doc_path(cache, B, ScanKind::Fold).unwrap()).unwrap();
         assert_eq!(doc.published_at, T0);
         assert_eq!(doc.ended_at, Some(T0 + 10));
-        assert_eq!(k_max(cache, T0 + 11), 2);
+        assert_eq!(k_max_including(cache, None, T0 + 11), 2);
     }
 
     /// A caller whose own document has lapsed still counts toward the ceiling, so one live peer
@@ -358,7 +357,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = dir.path();
         publish_at(cache, B, ScanKind::Fold, T0).unwrap();
-        assert_eq!(k_max(cache, T0 + 1), 1);
+        assert_eq!(k_max_including(cache, None, T0 + 1), 1);
         assert_eq!(k_max_including(cache, Some(A), T0 + 1), 2);
         assert_eq!(k_max_including(cache, Some(B), T0 + 1), 1);
     }
@@ -367,11 +366,11 @@ mod tests {
     fn k_max_floor_and_distinct_instances() {
         let dir = TempDir::new().unwrap();
         let cache = dir.path();
-        assert_eq!(k_max(cache, T0), 1);
+        assert_eq!(k_max_including(cache, None, T0), 1);
         publish_at(cache, A, ScanKind::Fold, T0).unwrap();
         publish_at(cache, A, ScanKind::Repair, T0).unwrap();
         publish_at(cache, B, ScanKind::Validation, T0).unwrap();
-        assert_eq!(k_max(cache, T0 + 1), 2);
+        assert_eq!(k_max_including(cache, None, T0 + 1), 2);
     }
 
     #[test]

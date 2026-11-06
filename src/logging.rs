@@ -75,6 +75,8 @@ pub struct AccessLogBuffer {
     last_flush: Arc<RwLock<Instant>>,
     /// Flag to prevent concurrent flushes
     flush_in_progress: AtomicBool,
+    /// Set at shutdown; the flush timer exits when it sees it
+    timer_stopped: AtomicBool,
     /// Current log file being appended to (per rotation window)
     current_file: Arc<RwLock<Option<CurrentLogFile>>>,
     /// Rotation interval for access log files
@@ -275,10 +277,39 @@ impl AccessLogBuffer {
             max_buffer_size: max_buffer_size.unwrap_or_else(default_access_log_buffer_size),
             last_flush: Arc::new(RwLock::new(Instant::now())),
             flush_in_progress: AtomicBool::new(false),
+            timer_stopped: AtomicBool::new(false),
             current_file: Arc::new(RwLock::new(None)),
             file_rotation_interval: file_rotation_interval
                 .unwrap_or_else(default_access_log_file_rotation_interval),
         }
+    }
+
+    /// Flush the buffer every `flush_interval` on a background task, so a record logged just
+    /// before traffic stops reaches disk without waiting for another request. The task holds
+    /// only a weak reference, so it also ends when the buffer is dropped. Does nothing outside
+    /// a tokio runtime.
+    pub(crate) fn spawn_flush_timer(self: &Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let period = self.flush_interval.max(Duration::from_millis(10));
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(buffer) = weak.upgrade() else {
+                    break;
+                };
+                if buffer.timer_stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                // A failed flush keeps its entries for the next tick.
+                let _ = buffer.flush().await;
+            }
+        });
     }
 
     /// Add entry to buffer (non-blocking)
@@ -541,17 +572,22 @@ impl AccessLogBuffer {
     /// This is the same format as the existing `AccessLogWriter::format_entry()`
     fn format_entry(entry: &AccessLogEntry) -> String {
         // Mask presigned URL credentials before writing to log
-        let masked_uri = mask_presigned_params(&entry.request_uri);
+        let masked_uri = sanitize_log_field(&mask_presigned_params(&entry.request_uri));
 
         // Sanitize free-text fields to prevent log injection (CR/LF/quote escaping)
         let referer = sanitize_log_field(entry.referer.as_deref().unwrap_or("-"));
         let user_agent = sanitize_log_field(entry.user_agent.as_deref().unwrap_or("-"));
+        // The bucket fields come from the request path, which may hold a `"`; the host header
+        // is validated at the front door, and is escaped here as well in case that changes.
+        let bucket_owner = sanitize_log_field(&entry.bucket_owner);
+        let bucket = sanitize_log_field(&entry.bucket);
+        let host_header = sanitize_log_field(entry.host_header.as_deref().unwrap_or("-"));
 
         // S3 Server Access Log format (version_id field removed)
         format!(
             "{} {} [{}] {} {} {} {} \"{}\" {} {} {} {} {} {} \"{}\" \"{}\" {} {} {} {} {} {} {} {} {}",
-            entry.bucket_owner,
-            entry.bucket,
+            bucket_owner,
+            bucket,
             entry.time.format("%d/%b/%Y:%H:%M:%S %z"),
             entry.remote_ip,
             entry.requester,
@@ -570,7 +606,7 @@ impl AccessLogBuffer {
             entry.signature_version.as_deref().unwrap_or("-"),
             entry.cipher_suite.as_deref().unwrap_or("-"),
             entry.authentication_type.as_deref().unwrap_or("-"),
-            entry.host_header.as_deref().unwrap_or("-"),
+            host_header,
             entry.tls_version.as_deref().unwrap_or("-"),
             entry.access_point_arn.as_deref().unwrap_or("-"),
             entry.acl_required.as_deref().unwrap_or("-"),
@@ -645,12 +681,12 @@ pub struct LoggerManager {
 
 /// How long an access-log record whose request found the logger busy waits for it, on a
 /// detached task, before it is counted in [`access_log_records_dropped_total`] instead.
-pub const ACCESS_LOG_HANDOFF_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const ACCESS_LOG_HANDOFF_WAIT: Duration = Duration::from_secs(30);
 
 /// At most this many records wait for a busy logger at once. Past it a record is counted as
 /// dropped straight away, so a long hold (the retention sweep runs under the logger) cannot
 /// queue one task per request without bound.
-pub const ACCESS_LOG_HANDOFF_LIMIT: usize = 10_000;
+const ACCESS_LOG_HANDOFF_LIMIT: usize = 10_000;
 
 /// Access-log records that could not be written: the logger stayed busy for
 /// [`ACCESS_LOG_HANDOFF_WAIT`], or [`ACCESS_LOG_HANDOFF_LIMIT`] records were already waiting
@@ -674,7 +710,7 @@ fn note_access_log_drop(wait: Duration) {
 }
 
 /// Access-log records dropped since process start (`request_metrics.access_log_records_dropped`).
-pub fn access_log_records_dropped_total() -> u64 {
+pub(crate) fn access_log_records_dropped_total() -> u64 {
     ACCESS_LOG_RECORDS_DROPPED.load(Ordering::Relaxed)
 }
 
@@ -760,13 +796,15 @@ impl LoggerManager {
         // Initialize access logging if enabled
         if self.config.access_log_enabled {
             // Task 4.3: Pass config values to AccessLogBuffer::new()
-            self.access_log_buffer = Some(Arc::new(AccessLogBuffer::new(
+            let buffer = Arc::new(AccessLogBuffer::new(
                 self.config.access_log_dir.clone(),
                 self.config.hostname.clone(),
                 Some(self.config.access_log_flush_interval),
                 Some(self.config.access_log_buffer_size),
                 Some(self.config.access_log_file_rotation_interval),
-            )));
+            ));
+            buffer.spawn_flush_timer();
+            self.access_log_buffer = Some(buffer);
         }
 
         info!("Logging system initialized");
@@ -788,7 +826,7 @@ impl LoggerManager {
         // Setup tracing subscriber with both console and file output
         // Use .compact() for consistent formatting across all log levels
         let file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(file_appender)
+            .with_writer(MaskingMakeWriter::new(file_appender))
             .with_ansi(false)
             .with_target(true)
             .with_thread_ids(true)
@@ -799,7 +837,7 @@ impl LoggerManager {
             .compact(); // Use compact format for consistency
 
         let console_layer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stdout)
+            .with_writer(MaskingMakeWriter::new(std::io::stdout))
             .with_ansi(true)
             .with_target(false)
             .with_level(true)
@@ -990,28 +1028,13 @@ impl LoggerManager {
         }
     }
 
-    /// Log an access entry
-    pub async fn log_access(&self, entry: AccessLogEntry, served_from_cache: bool) -> Result<()> {
-        if let Some(buffer) = &self.access_log_buffer {
-            // Check if we should log this entry based on mode
-            let should_log = match self.config.access_log_mode {
-                AccessLogMode::All => true,
-                AccessLogMode::CachedOnly => served_from_cache,
-            };
-
-            if should_log {
-                buffer.log(entry).await?;
-            }
-        }
-        Ok(())
-    }
-
     /// Force flush the access log buffer (for shutdown)
     ///
     /// This method should be called during graceful shutdown to ensure
-    /// all buffered access log entries are written to disk.
+    /// all buffered access log entries are written to disk. It also stops the flush timer.
     pub async fn force_flush(&self) -> Result<AccessLogFlushResult> {
         if let Some(buffer) = &self.access_log_buffer {
+            buffer.timer_stopped.store(true, Ordering::SeqCst);
             buffer.force_flush().await
         } else {
             Ok(AccessLogFlushResult {
@@ -1123,19 +1146,177 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "awsaccesskeyid",
 ];
 
+/// Does `b` end a query string inside a log line? Whitespace and control bytes (the console
+/// layer's ANSI escape is one), the closing quote of a `{:?}` value, an apostrophe, and the
+/// backslash of an escaped quote inside a `{:?}` of a `{:?}`.
+fn ends_logged_query(b: u8) -> bool {
+    b <= b' ' || b == b'"' || b == b'\'' || b == b'\\' || b == 0x7f
+}
+
+/// Is `b` a quote, apostrophe or backslash? These end a query (see [`ends_logged_query`]) but can
+/// also sit raw inside a parameter value, so what follows one may still be the same URL's query.
+fn is_quote_like(b: u8) -> bool {
+    matches!(b, b'"' | b'\'' | b'\\')
+}
+
+/// Mask the sensitive parameters in `text[from..to]` and append the result to `out`.
+/// `from` is the `?` that starts a query, or, for `has_question == false`, the first byte after
+/// a quote-like byte that interrupted one. Trailing `,` `;` `)` `]` `}` `>` punctuate the
+/// sentence rather than the value and stay out of the span.
+fn mask_span(
+    text: &str,
+    from: usize,
+    to: usize,
+    has_question: bool,
+    out: &mut Option<String>,
+    copied: &mut usize,
+) {
+    let bytes = text.as_bytes();
+    let floor = from + usize::from(has_question);
+    let mut stop = to;
+    while stop > floor && matches!(bytes[stop - 1], b',' | b';' | b')' | b']' | b'}' | b'>') {
+        stop -= 1;
+    }
+    let span = &text[from..stop];
+    if has_question {
+        let masked = mask_presigned_params(span);
+        if masked != span {
+            let o = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            o.push_str(&text[*copied..from]);
+            o.push_str(&masked);
+            *copied = stop;
+        }
+    } else if span.contains('=') {
+        let query = format!("?{span}");
+        let masked = mask_presigned_params(&query);
+        if masked != query {
+            let o = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            o.push_str(&text[*copied..from]);
+            o.push_str(&masked[1..]);
+            *copied = stop;
+        }
+    }
+}
+
+/// Mask presigned-URL credentials in free text such as an application-log line.
+///
+/// Every `?` starts a query that runs to the next byte for which [`ends_logged_query`] holds,
+/// less any trailing `,` `;` `)` `]` `}` `>` that punctuates the sentence rather than the
+/// value. That query goes through [`mask_presigned_params`], so the same parameters are masked
+/// in the same way as in an access-log record. A quote, apostrophe or backslash ends the query
+/// because it usually closes a `{:?}` value, but a raw one can also sit inside a parameter
+/// value, so the text after it, up to the next whitespace, is masked as a continuation of the
+/// same query. Text without a `?` is returned as it is.
+pub(crate) fn mask_log_line(text: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let Some(first) = text.find('?') else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut q = first;
+    loop {
+        let mut end = q + 1;
+        while end < bytes.len() && !ends_logged_query(bytes[end]) {
+            end += 1;
+        }
+        mask_span(text, q, end, true, &mut out, &mut copied);
+        while end < bytes.len() && is_quote_like(bytes[end]) {
+            let mut from = end;
+            while from < bytes.len() && is_quote_like(bytes[from]) {
+                from += 1;
+            }
+            let mut to = from;
+            while to < bytes.len() && !ends_logged_query(bytes[to]) && bytes[to] != b'?' {
+                to += 1;
+            }
+            mask_span(text, from, to, false, &mut out, &mut copied);
+            end = to;
+        }
+        match text[end..].find('?') {
+            Some(offset) => q = end + offset,
+            None => break,
+        }
+    }
+    match out {
+        Some(mut masked) => {
+            masked.push_str(&text[copied..]);
+            std::borrow::Cow::Owned(masked)
+        }
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// A `MakeWriter` that masks presigned-URL credentials in everything written through the
+/// writer it wraps. `tracing-subscriber`'s fmt layer formats one event into a buffer and
+/// writes it with a single `write_all`, so a URL never straddles two writes.
+#[derive(Clone)]
+pub(crate) struct MaskingMakeWriter<M> {
+    inner: M,
+}
+
+impl<M> MaskingMakeWriter<M> {
+    pub(crate) fn new(inner: M) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a, M> tracing_subscriber::fmt::MakeWriter<'a> for MaskingMakeWriter<M>
+where
+    M: tracing_subscriber::fmt::MakeWriter<'a>,
+{
+    type Writer = MaskingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        MaskingWriter {
+            inner: self.inner.make_writer(),
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        MaskingWriter {
+            inner: self.inner.make_writer_for(meta),
+        }
+    }
+}
+
+/// The writer [`MaskingMakeWriter`] hands out: masks each buffer, then writes it whole.
+pub(crate) struct MaskingWriter<W> {
+    inner: W,
+}
+
+impl<W: std::io::Write> std::io::Write for MaskingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Bytes that are not UTF-8 pass through unmasked; the fmt layer writes UTF-8.
+        match std::str::from_utf8(buf).map(mask_log_line) {
+            Ok(std::borrow::Cow::Owned(masked)) => self.inner.write_all(masked.as_bytes())?,
+            _ => self.inner.write_all(buf)?,
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Sanitize a free-text field for safe inclusion in access log lines.
 ///
 /// Replaces characters that could break log line structure or enable log
 /// injection attacks:
 /// - `\r` (CR) → `\r` literal backslash-r
 /// - `\n` (LF) → `\n` literal backslash-n
+/// - `\` → `\\` doubled, so a backslash before a quote cannot cancel the quote's escape
 /// - `"` → `\"` backslash-escaped quote
 ///
 /// Fields that contain none of these characters are returned as-is (fast path,
 /// no allocation).
 pub(crate) fn sanitize_log_field(field: &str) -> String {
     // Fast path: if no dangerous characters present, avoid allocation
-    if !field.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'"') {
+    if !field
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == b'"' || b == b'\\')
+    {
         return field.to_string();
     }
 
@@ -1145,6 +1326,7 @@ pub(crate) fn sanitize_log_field(field: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\n' => out.push_str("\\n"),
             '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
             other => out.push(other),
         }
     }
@@ -3180,6 +3362,12 @@ mod sanitize_log_field_tests {
     }
 
     #[test]
+    fn backslash_is_doubled_before_a_quote_is_escaped() {
+        assert_eq!(sanitize_log_field("a\\b"), "a\\\\b");
+        assert_eq!(sanitize_log_field("a\\\"b"), "a\\\\\\\"b");
+    }
+
+    #[test]
     fn format_entry_user_agent_with_newline_quote_does_not_break_line() {
         // A user agent containing \n and " must not produce multiple log lines
         let entry = AccessLogEntry {
@@ -3282,6 +3470,413 @@ mod sanitize_log_field_tests {
     }
 }
 
+#[cfg(test)]
+mod format_entry_escape_tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Split a record into its fields: spaces separate them except inside `"..."` or
+    /// `[...]`, and a backslash keeps the next character from closing either.
+    fn record_fields(line: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut cur = String::new();
+        let (mut quoted, mut bracketed, mut escaped) = (false, false, false);
+        for c in line.chars() {
+            if escaped {
+                escaped = false;
+                cur.push(c);
+                continue;
+            }
+            match c {
+                '\\' => {
+                    escaped = true;
+                    cur.push(c);
+                }
+                '"' => {
+                    quoted = !quoted;
+                    cur.push(c);
+                }
+                '[' if !quoted => {
+                    bracketed = true;
+                    cur.push(c);
+                }
+                ']' if !quoted => {
+                    bracketed = false;
+                    cur.push(c);
+                }
+                ' ' if !quoted && !bracketed => fields.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+        }
+        fields.push(cur);
+        fields
+    }
+
+    #[test]
+    fn format_entry_quote_in_path_keeps_the_field_count_and_is_escaped() {
+        let entry = AccessLogEntry {
+            bucket_owner: "a\"b".to_string(),
+            bucket: "a\"b".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-3".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "k\"ey".to_string(),
+            request_uri: "/a\"b/k\"ey".to_string(),
+            http_status: 404,
+            error_code: None,
+            bytes_sent: 0,
+            object_size: None,
+            total_time: 1,
+            turn_around_time: 1,
+            referer: None,
+            user_agent: None,
+            host_id: "host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: None,
+            host_header: Some("h\"x".to_string()),
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        };
+        let formatted = AccessLogBuffer::format_entry(&entry);
+        let fields = record_fields(&formatted);
+        assert_eq!(fields.len(), 25, "record: {formatted}");
+        assert_eq!(fields[0], "a\\\"b", "record: {formatted}");
+        assert_eq!(fields[1], "a\\\"b", "record: {formatted}");
+        assert_eq!(fields[7], "\"/a\\\"b/k\\\"ey\"", "record: {formatted}");
+        assert_eq!(fields[20], "h\\\"x", "record: {formatted}");
+    }
+}
+#[cfg(test)]
+mod log_masking_tests {
+    use super::*;
+    use std::io::Write;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    const URI: &str = "/bucket/object.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDFIXTURE%2F20260101&X-Amz-Signature=needle0123abc&X-Amz-Expires=60";
+
+    /// A sink that records every `write` call it receives, one entry per call.
+    #[derive(Clone, Default)]
+    struct Calls(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    struct CallsWriter(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl Write for CallsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Calls {
+        type Writer = CallsWriter;
+        fn make_writer(&'a self) -> CallsWriter {
+            CallsWriter(Arc::clone(&self.0))
+        }
+    }
+
+    /// Run `emit` under a debug-level fmt subscriber writing through `make_writer`.
+    fn run<M>(make_writer: M, ansi: bool, emit: impl FnOnce())
+    where
+        M: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+    {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(make_writer)
+            .with_ansi(ansi)
+            .with_target(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+    }
+
+    /// Output of `emit` through the masking writer, and through the bare one.
+    fn both(ansi: bool, emit: impl Fn() + Copy) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let masked = Calls::default();
+        run(MaskingMakeWriter::new(masked.clone()), ansi, emit);
+        let bare = Calls::default();
+        run(bare.clone(), ansi, emit);
+        let masked_calls = masked.0.lock().unwrap().clone();
+        let bare_calls = bare.0.lock().unwrap().clone();
+        (masked_calls, bare_calls)
+    }
+
+    fn text(calls: &[Vec<u8>]) -> String {
+        String::from_utf8(calls.concat()).unwrap()
+    }
+
+    #[test]
+    fn debug_line_with_a_presigned_uri_is_masked_by_the_wrapped_writer_only() {
+        let (masked, bare) = both(false, || tracing::debug!("GET cache HIT for {}", URI));
+        assert!(text(&bare).contains("needle0123abc"), "{}", text(&bare));
+        let masked = text(&masked);
+        assert!(!masked.contains("needle0123abc"), "{masked}");
+        assert!(masked.contains("X-Amz-Signature=REDACTED"), "{masked}");
+        assert!(masked.contains("X-Amz-Expires=60"), "{masked}");
+    }
+
+    #[test]
+    fn one_event_reaches_the_inner_writer_in_one_write() {
+        let (masked, _) = both(false, || {
+            tracing::debug!("first {}", URI);
+            tracing::debug!("second {}", "/plain/key");
+            tracing::debug!("third {}", URI);
+        });
+        assert_eq!(masked.len(), 3, "{:?}", masked);
+        assert!(masked.iter().all(|call| call.ends_with(b"\n")));
+    }
+
+    #[test]
+    fn debug_quoted_uri_is_masked_and_keeps_its_closing_quote() {
+        let (masked, bare) = both(false, || tracing::debug!(uri = ?URI, "served"));
+        assert!(text(&bare).contains("needle0123abc"));
+        let masked = text(&masked);
+        assert!(!masked.contains("needle0123abc"), "{masked}");
+        assert!(masked.contains("X-Amz-Expires=60\""), "{masked}");
+    }
+
+    #[test]
+    fn debug_of_a_debug_string_is_masked() {
+        let (masked, bare) = both(false, || {
+            tracing::debug!("{:?}", format!("{:?}", URI));
+        });
+        assert!(text(&bare).contains("needle0123abc"));
+        let masked = text(&masked);
+        assert!(!masked.contains("needle0123abc"), "{masked}");
+        assert!(masked.contains("X-Amz-Expires=60\\\""), "{masked}");
+    }
+
+    #[test]
+    fn key_value_field_ends_at_a_space_and_at_a_comma() {
+        let (masked, bare) = both(false, || {
+            tracing::debug!("uri={} status=200", URI);
+            tracing::debug!("uri={}, status=200", URI);
+        });
+        assert!(text(&bare).contains("needle0123abc"));
+        let masked = text(&masked);
+        assert!(!masked.contains("needle0123abc"), "{masked}");
+        assert!(masked.contains("X-Amz-Expires=60 status=200"), "{masked}");
+        assert!(masked.contains("X-Amz-Expires=60, status=200"), "{masked}");
+    }
+
+    #[test]
+    fn console_ansi_escapes_around_a_field_do_not_hide_the_uri() {
+        let (masked, bare) = both(true, || tracing::debug!(uri = %URI, "served"));
+        assert!(
+            text(&bare).contains("\u{1b}["),
+            "the bare output has no ANSI escape"
+        );
+        assert!(text(&bare).contains("needle0123abc"));
+        let masked = text(&masked);
+        assert!(!masked.contains("needle0123abc"), "{masked}");
+        assert!(masked.contains("\u{1b}["), "{masked}");
+        assert!(masked.contains("X-Amz-Expires=60"), "{masked}");
+    }
+
+    #[test]
+    fn unrelated_question_marks_and_queries_pass_unchanged() {
+        let (masked, bare) = both(false, || {
+            tracing::debug!("what? still fine");
+            tracing::debug!("uri=/bucket/key?versionId=3 status=200");
+        });
+        assert_eq!(text(&masked), text(&bare));
+    }
+
+    #[test]
+    fn mask_log_line_masks_each_url_in_one_line() {
+        let line = format!("a {URI} b {URI}.");
+        let masked = mask_log_line(&line);
+        assert!(!masked.contains("needle0123abc"), "{masked}");
+        assert_eq!(masked.matches("X-Amz-Signature=REDACTED").count(), 2);
+        assert!(masked.ends_with("X-Amz-Expires=60."), "{masked}");
+    }
+
+    #[test]
+    fn a_sensitive_parameter_after_a_raw_quote_is_masked() {
+        for line in [
+            r#"GET /b/k?a=x"y&X-Amz-Signature=needle"#,
+            "GET /b/k?a=x'y&X-Amz-Signature=needle",
+            r"GET /b/k?a=x\y&X-Amz-Signature=needle",
+            r#"uri="/b/k?a=x"y&X-Amz-Signature=needle&X-Amz-Expires=60" ok"#,
+            r#"GET /b/k?a=x"y?X-Amz-Signature=needle"#,
+            r#"GET /b/k?a="x"&b='y'&X-Amz-Credential=needle&Signature=needle"#,
+        ] {
+            let masked = mask_log_line(line);
+            assert!(!masked.contains("needle"), "{line} -> {masked}");
+        }
+        let kept = mask_log_line(r#"uri="/b/k?a=1&X-Amz-Signature=needle" ok"#);
+        assert_eq!(kept, r#"uri="/b/k?a=1&X-Amz-Signature=REDACTED" ok"#);
+    }
+
+    #[test]
+    fn the_writer_masks_a_sensitive_parameter_after_a_raw_quote() {
+        let (masked, bare) = both(false, || {
+            tracing::debug!("GET {}", r#"/b/k?a=x"y&X-Amz-Signature=needle"#)
+        });
+        assert!(text(&bare).contains("needle"));
+        let masked = text(&masked);
+        assert!(!masked.contains("needle"), "{masked}");
+    }
+
+    /// Wall-time measurement for the per-line cost of the wrapper. Run with
+    /// `cargo test --release --lib masking_writer_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "wall-time measurement"]
+    fn masking_writer_cost_per_line() {
+        struct Null;
+        impl Write for Null {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let prefix = "2026-11-03T00:00:00.000000Z DEBUG ThreadId(05) src/http_proxy.rs:1234: GET cache HIT for ";
+        let plain = format!("{prefix}/bucket/object.bin range 0-1048575\n");
+        let other_query = format!("{prefix}/bucket/object.bin?versionId=3 range 0-1048575\n");
+        let sensitive = format!("{prefix}{URI} range 0-1048575\n");
+        const N: u32 = 1_000_000;
+        for (label, line) in [
+            ("no question mark", &plain),
+            ("query, nothing sensitive", &other_query),
+            ("presigned URL", &sensitive),
+        ] {
+            let mut bare = Null;
+            let start = Instant::now();
+            for _ in 0..N {
+                bare.write_all(std::hint::black_box(line.as_bytes()))
+                    .unwrap();
+            }
+            let bare_ns = start.elapsed().as_nanos() as f64 / f64::from(N);
+            let mut wrapped = MaskingWriter { inner: Null };
+            let start = Instant::now();
+            for _ in 0..N {
+                wrapped
+                    .write_all(std::hint::black_box(line.as_bytes()))
+                    .unwrap();
+            }
+            let wrapped_ns = start.elapsed().as_nanos() as f64 / f64::from(N);
+            println!("{label}: bare {bare_ns:.1} ns/line, wrapped {wrapped_ns:.1} ns/line");
+        }
+    }
+}
+#[cfg(test)]
+mod access_log_timer_flush_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn files_under(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|e| {
+                if e.path().is_dir() {
+                    files_under(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    fn entry() -> AccessLogEntry {
+        AccessLogEntry {
+            bucket_owner: "bucket".to_string(),
+            bucket: "bucket".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-timer".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "key".to_string(),
+            request_uri: "/bucket/key".to_string(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 1,
+            object_size: Some(1),
+            total_time: 1,
+            turn_around_time: 1,
+            referer: None,
+            user_agent: None,
+            host_id: "host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: None,
+            host_header: None,
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        }
+    }
+
+    fn manager(dir: &std::path::Path, interval: Duration) -> LoggerManager {
+        let mut manager = LoggerManager::new(LoggingConfig {
+            access_log_dir: dir.join("access"),
+            app_log_dir: dir.join("app"),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: "fixture-host".to_string(),
+            log_level: "info".to_string(),
+            access_log_flush_interval: interval,
+            access_log_buffer_size: 1000,
+            access_log_retention_days: 30,
+            app_log_retention_days: 30,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        });
+        manager.initialize().expect("initialize");
+        manager
+    }
+
+    /// One buffered record and no later request reaches disk within the flush interval.
+    #[tokio::test]
+    async fn a_buffered_record_is_flushed_by_the_timer_without_another_request() {
+        let dir = TempDir::new().unwrap();
+        let manager = manager(dir.path(), Duration::from_millis(200));
+        let buffer = manager.access_log_buffer.clone().expect("access buffer");
+        buffer.log(entry()).await.expect("log");
+        assert_eq!(buffer.pending_entries_count(), 1);
+        let on_disk = tokio::time::timeout(Duration::from_millis(1500), async {
+            while files_under(&dir.path().join("access")) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            on_disk.is_ok(),
+            "the record was still buffered {} ms after the flush interval",
+            1500
+        );
+        assert_eq!(buffer.pending_entries_count(), 0);
+    }
+
+    /// The shutdown flush stops the timer, so no task outlives the flush that empties the buffer.
+    #[tokio::test]
+    async fn the_shutdown_flush_stops_the_timer() {
+        let dir = TempDir::new().unwrap();
+        let manager = manager(dir.path(), Duration::from_millis(100));
+        let buffer = manager.access_log_buffer.clone().expect("access buffer");
+        manager.force_flush().await.expect("shutdown flush");
+        buffer.log(entry()).await.expect("log");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            buffer.pending_entries_count(),
+            1,
+            "the timer flushed after the shutdown flush"
+        );
+    }
+}
 /// Retention-sweep scoping tests.
 ///
 /// Retention is a property of the **directory**, enforced in two tiers: the
@@ -3785,10 +4380,6 @@ pub struct StartupEvents {
 }
 
 impl StartupEvents {
-    /// The held events in emission order: level and text.
-    pub fn events(&self) -> &[(tracing::Level, String)] {
-        &self.events
-    }
     /// Emit every held event through the current subscriber, in order.
     pub fn replay(self) {
         for (level, text) in self.events {
@@ -3864,23 +4455,15 @@ mod startup_event_tests {
             7
         });
         assert_eq!(value, 7);
+        // What `replay` emits is what a reader of the log sees: capture it with the same
+        // layer the holding subscriber uses.
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(StartupEventLayer(sink.clone()));
+        tracing::subscriber::with_default(subscriber, || held.replay());
+        let replayed = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(
-            held.events(),
-            &[
-                (
-                    tracing::Level::WARN,
-                    "Configuration field 'cache.x' has been removed".to_string()
-                ),
-                (
-                    tracing::Level::INFO,
-                    "Configuration loaded from file: /etc/c.yaml".to_string()
-                ),
-            ]
-        );
-        let (_, replayed) = collect_startup_events(|| held.replay());
-        assert_eq!(
-            replayed.events(),
-            &[
+            replayed,
+            vec![
                 (
                     tracing::Level::WARN,
                     "Configuration field 'cache.x' has been removed".to_string()

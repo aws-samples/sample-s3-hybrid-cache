@@ -58,18 +58,6 @@ fn test_cache_key_generation() {
 
     let key2 = CacheManager::generate_cache_key("/my-bucket/my-object", None);
     assert_eq!(key2, "my-bucket/my-object");
-
-    // Test cache key generation with part number and range
-    let key3 = CacheManager::generate_cache_key_with_params("/bucket/object", None, None, None);
-    assert_eq!(key3, "bucket/object");
-
-    let key4 = CacheManager::generate_cache_key_with_params(
-        "/bucket/object",
-        Some(1),
-        Some((0, 1023)),
-        None,
-    );
-    assert_eq!(key4, "bucket/object:part:1:range:0-1023");
 }
 
 #[test]

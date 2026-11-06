@@ -193,7 +193,7 @@ struct StageCounters {
 /// outcome, so no caller saw a closed channel and declined a credit whose ledger line is
 /// durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StageDrainOutcome {
+pub(crate) struct StageDrainOutcome {
     /// Submissions the append stage had not answered or handed over at the bound.
     pub ledger_unanswered: u64,
     /// Credits the pending stage had not answered at the bound.
@@ -202,7 +202,7 @@ pub struct StageDrainOutcome {
 
 impl StageDrainOutcome {
     /// Whether both stages answered everything they had accepted.
-    pub fn is_drained(&self) -> bool {
+    pub(crate) fn is_drained(&self) -> bool {
         self.ledger_unanswered == 0 && self.pending_unanswered == 0
     }
 }
@@ -666,7 +666,7 @@ mod ledger_time {
 /// almost all skips is a compaction problem, and that is only visible if the reasons are
 /// counted separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StagedCandidateVerdict {
+pub(crate) enum StagedCandidateVerdict {
     /// Still staged, still the current copy: evict it.
     Evictable,
     /// No `.meta` on disk. Already evicted, or never landed.
@@ -695,7 +695,7 @@ impl StagedCandidateVerdict {
 
 /// Outcome of a compaction pass, for logging and the `ledger_entries` gauge.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LedgerCompactionStats {
+pub(crate) struct LedgerCompactionStats {
     /// Entries read across every instance file before compaction.
     pub entries_before: u64,
     /// Entries retained.
@@ -1338,7 +1338,7 @@ impl WriteLedger {
     /// not shared can re-append the range, but a pass refused on a shared identity keeps its
     /// claim on the shard, so the entry can stay unindexed until the hostnames are made
     /// distinct.
-    pub async fn append_staged_range(
+    pub(crate) async fn append_staged_range(
         &self,
         cache_key: &str,
         range_start: u64,
@@ -1523,7 +1523,7 @@ impl WriteLedger {
     /// This ledger's batching counters, for `/metrics` and the OTLP export.
     ///
     /// Plain atomic loads; no file is read and no lock is taken, so a scrape costs nothing.
-    pub fn stage_metrics(&self) -> WriteLedgerMetrics {
+    pub(crate) fn stage_metrics(&self) -> WriteLedgerMetrics {
         let s = &self.core.stages;
         WriteLedgerMetrics {
             append_batches_total: s.append_batches.load(AtomicOrdering::Relaxed),
@@ -1581,7 +1581,7 @@ impl WriteLedger {
     ///
     /// It also means the drain can run for the whole bound under sustained load, which is why
     /// the bound is a bound and not a deadline on an idle queue.
-    pub async fn drain_stages(&self, bound: std::time::Duration) -> StageDrainOutcome {
+    pub(crate) async fn drain_stages(&self, bound: std::time::Duration) -> StageDrainOutcome {
         let deadline = tokio::time::Instant::now() + bound;
         loop {
             for counter in [&self.core.stages.ledger, &self.core.stages.pending] {
@@ -2002,7 +2002,7 @@ impl WriteLedger {
     ///
     /// Best-effort throughout. A failure is logged and leaves the legacy file in place, which
     /// keeps the fold retaining — visible, and in the over-stating direction.
-    pub async fn migrate_legacy_ledgers(&self) {
+    pub(crate) async fn migrate_legacy_ledgers(&self) {
         let legacy = match self.legacy_ledger_files().await {
             Ok(f) => f,
             Err(e) => {
@@ -2439,7 +2439,7 @@ impl WriteLedger {
     /// omission. A legacy flat `{instance}.ledger` sits at the ledger root and names no shard,
     /// so it cannot be attributed to this shard or to any other — there is no shard-scoped
     /// answer to give. Its presence is a property of the volume and the caller checks it once
-    /// per pass; see `staged_fold::run_staged_fold_with_cap`.
+    /// per pass; see `staged_fold::run_staged_fold_scoped`.
     ///
     /// `cap` behaves as it does for the whole-volume reader, applied to **this shard's**
     /// entries.
@@ -2582,7 +2582,7 @@ impl WriteLedger {
     /// O(staged)-per-PUT shape this module exists to avoid.
     ///
     /// Spec: cache-eviction-at-scale § 16.6.3.
-    pub async fn count_entries(&self) -> Option<u64> {
+    pub(crate) async fn count_entries(&self) -> Option<u64> {
         let mut slot = self.entry_count.lock().await;
         if let Some(observation) = *slot {
             if observation.observed_at.elapsed().as_secs() < LEDGER_COUNT_MAX_AGE_SECS {
@@ -2779,7 +2779,7 @@ impl WriteLedger {
     /// The retire-set inversion is what makes that one safe, and it genuinely does.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 2.6, 3.1
-    pub async fn retire_identities(
+    pub(crate) async fn retire_identities(
         &self,
         retire: &HashSet<(String, u64, u64, SystemTime, String)>,
     ) -> Result<LedgerCompactionStats> {
@@ -3233,7 +3233,7 @@ impl WriteLedger {
     /// entry per part. Collapsing them here means one verification and one eviction per
     /// object instead of one per part, and it keeps the oldest-first order intact
     /// because a key's position is its earliest entry.
-    pub fn group_by_key(entries: Vec<WriteLedgerEntry>) -> Vec<StagedCandidate> {
+    pub(crate) fn group_by_key(entries: Vec<WriteLedgerEntry>) -> Vec<StagedCandidate> {
         let mut order: Vec<String> = Vec::new();
         let mut grouped: HashMap<String, StagedCandidate> = HashMap::new();
 
@@ -3312,7 +3312,7 @@ impl WriteLedger {
 /// changes nothing; it earns its keep when per-key `put_ttl` rules make the two differ.
 ///
 /// Spec: write-cache-accounting-and-eviction. Requirements: 2.4
-pub fn order_staging_candidates(
+pub(crate) fn order_staging_candidates(
     mut candidates: Vec<StagedCandidate>,
     watermark: SystemTime,
 ) -> Vec<StagedCandidate> {
@@ -3325,7 +3325,7 @@ pub fn order_staging_candidates(
 
 /// One object's worth of ledger entries, the unit staging eviction acts on.
 #[derive(Debug, Clone)]
-pub struct StagedCandidate {
+pub(crate) struct StagedCandidate {
     pub cache_key: String,
     /// Earliest entry for this key. The eviction sort key, and what the
     /// expired-versus-fresh watermark is compared against.
@@ -3348,7 +3348,7 @@ pub struct StagedCandidate {
 ///
 /// Spec: cache-eviction-at-scale §§ 16.6.1, 16.6.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StagedCandidateFold {
+pub(crate) struct StagedCandidateFold {
     /// The verdict, identical to what [`assess_staged_candidate`] returns.
     pub verdict: StagedCandidateVerdict,
     /// `staged_compressed_size()` over this object's `.meta`. Zero unless the verdict is
@@ -3394,7 +3394,7 @@ pub struct StagedCandidateFold {
 /// lost extent whether or not its siblings survived. The two repairs are not interchangeable, and
 /// the design already records the cache-key one as strictly weaker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedCandidateAssessment {
+pub(crate) struct StagedCandidateAssessment {
     /// The object-level verdict. **Unchanged in meaning and in derivation** — eviction's decision
     /// about whether to act on this object is exactly what it was.
     pub verdict: StagedCandidateVerdict,
@@ -3441,7 +3441,7 @@ pub(crate) async fn fold_staged_candidate(
 /// Lazy verification is what makes ledger entries safe to treat as hints, and it is one
 /// decision covering every staleness case (R2.2). Free function rather than a method so
 /// it can be unit-tested against a seeded cache directory without a `WriteLedger`.
-pub async fn assess_staged_candidate(
+pub(crate) async fn assess_staged_candidate(
     cache_dir: &Path,
     candidate: &StagedCandidate,
 ) -> StagedCandidateAssessment {
@@ -6488,7 +6488,7 @@ mod tests {
     // The per-`(shard, instance)` layout, its migration, and the sequence floor.
     //
     // The tests that assert the fold's INSTALLED figures live in
-    // `tests/write_ledger_shard_layout_test.rs`, not here: `staged_fold.rs`'s
+    // `src/cache/moved_fill_tests/write_ledger_shard_layout_test.rs`, not here: `staged_fold.rs`'s
     // `the_fold_is_the_only_staged_authority_and_it_has_one_decision_surface` greps `src/*.rs`
     // for the gauge symbols and permits exactly two files to name them, and that containment is
     // worth more than the convenience of a private path helper. What stays here is what needs

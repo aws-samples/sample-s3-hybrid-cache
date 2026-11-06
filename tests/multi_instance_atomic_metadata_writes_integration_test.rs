@@ -15,10 +15,9 @@ use tokio::time::sleep;
 use s3_proxy::cache_initialization_coordinator::CacheInitializationCoordinator;
 use s3_proxy::cache_size_tracker::{CacheSizeConfig, CacheSizeTracker};
 use s3_proxy::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
-use s3_proxy::cache_validator::CacheValidator;
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::config::{CacheConfig, EvictionAlgorithm, InitializationConfig, SharedStorageConfig};
-use s3_proxy::hybrid_metadata_writer::{ConsolidationTrigger, HybridMetadataWriter, WriteMode};
+use s3_proxy::hybrid_metadata_writer::{HybridMetadataWriter, WriteMode};
 use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::{JournalEntry, JournalManager};
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
@@ -34,7 +33,6 @@ struct TestProxyInstance {
     journal_manager: Arc<JournalManager>,
     hybrid_writer: HybridMetadataWriter,
     consolidator: JournalConsolidator,
-    cache_validator: CacheValidator,
 }
 
 impl TestProxyInstance {
@@ -47,13 +45,10 @@ impl TestProxyInstance {
 
         let journal_manager = Arc::new(JournalManager::new(cache_dir.clone(), instance_id.clone()));
 
-        let consolidation_trigger = Arc::new(ConsolidationTrigger::new(1024, 5));
-
         let hybrid_writer = HybridMetadataWriter::new(
             cache_dir.clone(),
             lock_manager.clone(),
             journal_manager.clone(),
-            consolidation_trigger,
         );
 
         let consolidator = JournalConsolidator::new(
@@ -74,8 +69,6 @@ impl TestProxyInstance {
             },
         );
 
-        let cache_validator = CacheValidator::new(cache_dir.clone());
-
         Self {
             instance_id,
             cache_dir,
@@ -83,7 +76,6 @@ impl TestProxyInstance {
             journal_manager,
             hybrid_writer,
             consolidator,
-            cache_validator,
         }
     }
 
@@ -110,12 +102,13 @@ impl TestProxyInstance {
 
         // Write metadata
         self.hybrid_writer
-            .write_range_metadata(
+            .write_range_metadata_witnessed(
                 cache_key,
                 range_spec,
                 write_mode,
                 None,
                 std::time::Duration::from_secs(3600),
+                None,
             )
             .await?;
 
@@ -134,44 +127,33 @@ impl TestProxyInstance {
         Ok(())
     }
 
-    /// Simulate multipart upload cleanup
-    async fn cleanup_multipart_upload(
-        &self,
-        cache_key: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.journal_manager
-            .cleanup_for_multipart(cache_key)
-            .await?;
-        Ok(())
-    }
-
     /// Get pending journal entries
     async fn get_pending_entries(
         &self,
         cache_key: &str,
     ) -> Result<Vec<JournalEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.journal_manager.get_pending_entries(cache_key).await?)
+        Ok(self
+            .journal_manager
+            .get_all_entries_for_cache_key(cache_key)
+            .await?)
     }
 
-    /// Validate metadata file
+    /// Read the object's metadata back through the production disk-cache reader.
+    ///
+    /// `true` when `DiskCacheManager::get_metadata` finds a parseable, unexpired document
+    /// for the key at its production (sharded) path.
     async fn validate_metadata(
         &self,
         cache_key: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let metadata_path = self
-            .cache_dir
-            .join("metadata")
-            .join(format!("{}.meta", cache_key.replace('/', "%2F")));
-
-        if !metadata_path.exists() {
-            return Ok(false);
-        }
-
-        let validation_result = self
-            .cache_validator
-            .validate_metadata_file(&metadata_path)
-            .await?;
-        Ok(validation_result.is_valid)
+        let disk_cache = s3_proxy::disk_cache::DiskCacheManager::new(
+            self.cache_dir.clone(),
+            false,
+            0,
+            false,
+            1_048_576,
+        );
+        Ok(disk_cache.get_metadata(cache_key).await?.is_some())
     }
 }
 
@@ -341,165 +323,12 @@ async fn test_concurrent_writes_from_multiple_instances() {
 
     // Verify final metadata is valid
     let metadata_valid = instance1.validate_metadata(cache_key).await.unwrap();
-    if !metadata_valid {
-        // Debug: Check what files exist
-        let metadata_dir = temp_dir.path().join("metadata");
-        if metadata_dir.exists() {
-            println!("Files in metadata directory:");
-            if let Ok(entries) = std::fs::read_dir(&metadata_dir) {
-                for entry in entries.flatten() {
-                    println!("  {:?}", entry.path());
-                }
-            }
-        }
-
-        // Check if metadata file exists with different naming
-        let metadata_path_variants = [
-            temp_dir
-                .path()
-                .join("metadata")
-                .join(format!("{}.meta", cache_key.replace('/', "%2F"))),
-            temp_dir
-                .path()
-                .join("metadata")
-                .join(format!("{}.meta", cache_key)),
-            temp_dir
-                .path()
-                .join("metadata")
-                .join("test-bucket")
-                .join("concurrent-multi-instance-object.meta"),
-        ];
-
-        for path in &metadata_path_variants {
-            if path.exists() {
-                println!("Found metadata file at: {:?}", path);
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    println!("Metadata content: {}", content);
-                }
-                break;
-            }
-        }
-
-        println!("Metadata validation failed - this may be due to path structure differences");
-        return; // Skip assertion for now
-    }
     assert!(
         metadata_valid,
         "Final metadata should be valid after consolidation"
     );
 
     println!("✅ Concurrent writes from multiple instances test passed");
-}
-
-#[tokio::test]
-async fn test_journal_cleanup_during_multipart_upload_timeouts() {
-    let temp_dir = TempDir::new().unwrap();
-
-    // Create 2 proxy instances
-    let mut instance1 = TestProxyInstance::new(
-        temp_dir.path().to_path_buf(),
-        "multipart-instance-1".to_string(),
-    );
-    let mut instance2 = TestProxyInstance::new(
-        temp_dir.path().to_path_buf(),
-        "multipart-instance-2".to_string(),
-    );
-
-    let cache_key = "test-bucket/multipart-upload-object";
-
-    // Simulate multipart upload parts being written by different instances
-    let part1_range = create_test_range_spec(0, 5242879); // 5MB part 1
-    let part2_range = create_test_range_spec(5242880, 10485759); // 5MB part 2
-    let part3_range = create_test_range_spec(10485760, 15728639); // 5MB part 3
-
-    // Write parts using journal-only mode (simulating high contention during multipart upload)
-    instance1
-        .write_range(cache_key, part1_range, WriteMode::JournalOnly)
-        .await
-        .unwrap();
-    instance1
-        .write_range(cache_key, part2_range, WriteMode::JournalOnly)
-        .await
-        .unwrap();
-    instance2
-        .write_range(cache_key, part3_range, WriteMode::JournalOnly)
-        .await
-        .unwrap();
-
-    // Verify journal entries exist
-    let entries1_before = instance1.get_pending_entries(cache_key).await.unwrap();
-    let entries2_before = instance2.get_pending_entries(cache_key).await.unwrap();
-
-    let total_entries_before = entries1_before.len() + entries2_before.len();
-    assert!(
-        total_entries_before >= 3,
-        "Should have journal entries for multipart upload parts"
-    );
-
-    println!(
-        "Journal entries before cleanup: Instance1={}, Instance2={}",
-        entries1_before.len(),
-        entries2_before.len()
-    );
-
-    // Simulate multipart upload timeout - cleanup from both instances
-    let cleanup_task1 = instance1.cleanup_multipart_upload(cache_key);
-    let cleanup_task2 = instance2.cleanup_multipart_upload(cache_key);
-
-    let (cleanup_result1, cleanup_result2) = tokio::join!(cleanup_task1, cleanup_task2);
-
-    // Both cleanups should succeed
-    assert!(
-        cleanup_result1.is_ok(),
-        "Instance 1 cleanup should succeed: {:?}",
-        cleanup_result1
-    );
-    assert!(
-        cleanup_result2.is_ok(),
-        "Instance 2 cleanup should succeed: {:?}",
-        cleanup_result2
-    );
-
-    // Give time for cleanup to complete
-    sleep(Duration::from_millis(100)).await;
-
-    // Verify journal entries are cleaned up
-    let entries1_after = instance1.get_pending_entries(cache_key).await.unwrap();
-    let entries2_after = instance2.get_pending_entries(cache_key).await.unwrap();
-
-    let total_entries_after = entries1_after.len() + entries2_after.len();
-
-    println!(
-        "Journal entries after cleanup: Instance1={}, Instance2={}",
-        entries1_after.len(),
-        entries2_after.len()
-    );
-
-    // Journal entries should be reduced or eliminated
-    assert!(
-        total_entries_after < total_entries_before,
-        "Journal entries should be reduced after multipart cleanup"
-    );
-
-    // Verify that range files are also cleaned up (if they were created)
-    let ranges_dir = temp_dir.path().join("ranges");
-    if ranges_dir.exists() {
-        let range_files: Vec<_> = std::fs::read_dir(&ranges_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(&cache_key.replace('/', "%2F"))
-            })
-            .collect();
-
-        println!("Range files remaining after cleanup: {}", range_files.len());
-        // Range files should be cleaned up as part of multipart upload timeout
-    }
-
-    println!("✅ Journal cleanup during multipart upload timeouts test passed");
 }
 
 #[tokio::test]
@@ -813,24 +642,10 @@ async fn test_high_concurrent_write_load_performance() {
             .validate_metadata(cache_key)
             .await
             .unwrap();
-        if !metadata_valid {
-            println!("Metadata validation failed - checking for metadata files...");
-            let metadata_dir = temp_dir.path().join("metadata");
-            if metadata_dir.exists() {
-                println!("Files in metadata directory:");
-                if let Ok(entries) = std::fs::read_dir(&metadata_dir) {
-                    for entry in entries.flatten() {
-                        println!("  {:?}", entry.path());
-                    }
-                }
-            }
-            println!("Skipping metadata validation assertion for high load test");
-        } else {
-            assert!(
-                metadata_valid,
-                "Final metadata should be valid after high load test"
-            );
-        }
+        assert!(
+            metadata_valid,
+            "Final metadata should be valid after high load test"
+        );
     }
 
     println!("✅ High concurrent write load performance test passed");

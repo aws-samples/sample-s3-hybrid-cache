@@ -162,10 +162,12 @@ responses are not cache hits.
 
 `inflight_memory.reserved_bytes` counts bytes claimed by paths that hold a whole range or object
 in memory rather than streaming it. Those are almost all response paths: range merge, page
-widening, buffered range serving and the recovery fallbacks. Every upload path streams, so a
-request body appears here only for the small non-GET, non-PUT requests such as a
-`DeleteObjects` POST, which an internal 1 MiB bound covers. A ceiling sized from this figure is
-in practice a read-path ceiling; a write-heavy workload shows it near zero.
+widening, buffered range serving, the recovery fallbacks, and S3's answers to uploads and other
+writes. Every upload path streams, so a request body appears here only for the small non-GET,
+non-PUT requests such as a `DeleteObjects` POST, which an internal 1 MiB bound covers. S3's
+answer to a write the proxy has already sent is counted but never refused, so `reserved_bytes`
+can exceed `ceiling_bytes` while such answers are held. A ceiling sized from this figure is in
+practice a read-path ceiling; a write-heavy workload shows it near zero.
 
 Three properties matter when sizing a ceiling from it.
 

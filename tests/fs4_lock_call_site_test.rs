@@ -21,10 +21,8 @@ use s3_proxy::config::CacheConfig;
 use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::JournalManager;
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
-use s3_proxy::write_cache_manager::WriteCacheManager;
 use s3_proxy::ProxyError;
 
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,20 +39,6 @@ fn create_test_cache_config(cache_dir: PathBuf) -> CacheConfig {
         cache_dir,
         ..Default::default()
     }
-}
-
-/// Open the same lock-file path on a *separate* file handle (a fresh `open()`
-/// call, not a `dup()` / `clone()`), so it contends exactly as a second
-/// process would. See design.md "The same-process versus separate-process
-/// question": `flock(2)` associates a lock with the open file description,
-/// not the process or descriptor.
-fn open_second_handle(path: &std::path::Path) -> std::fs::File {
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .expect("failed to open second handle on lock file")
 }
 
 // ============================================================================
@@ -193,178 +177,6 @@ async fn create_test_size_tracker() -> (Arc<CacheSizeTracker>, Arc<JournalConsol
 // Each test asserts the observable return for both the acquired and
 // contended states.
 // ============================================================================
-
-/// Site: `journal_consolidator.rs` (~line 1586),
-/// `try_acquire_global_consolidation_lock`.
-///
-/// Three-way exemplar: `Ok(())` -> `Ok(true)`; `WouldBlock` -> `Ok(false)`;
-/// other `Err` -> `warn!` + `Ok(false)`.
-#[test]
-fn test_journal_consolidator_try_acquire_global_consolidation_lock_acquired_and_contended() {
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async {
-        let temp_dir = TempDir::new().unwrap();
-        let cache_dir = temp_dir.path().to_path_buf();
-        std::fs::create_dir_all(cache_dir.join("metadata/_journals")).unwrap();
-        std::fs::create_dir_all(cache_dir.join("locks")).unwrap();
-
-        let journal_manager = Arc::new(JournalManager::new(
-            cache_dir.clone(),
-            "test-instance-a".to_string(),
-        ));
-        let lock_manager = Arc::new(MetadataLockManager::new(
-            cache_dir.join("locks"),
-            Duration::from_secs(30),
-            3,
-        ));
-        let consolidator_a = Arc::new(JournalConsolidator::new(
-            cache_dir.clone(),
-            journal_manager,
-            lock_manager,
-            ConsolidationConfig::default(),
-        ));
-        consolidator_a.initialize().await.unwrap();
-
-        // Acquired state: no competing holder.
-        let acquired = consolidator_a
-            .try_acquire_global_consolidation_lock()
-            .expect("try_acquire_global_consolidation_lock should not error");
-        assert!(acquired, "expected the lock to be acquired");
-
-        // Contended state: a second consolidator instance (representing a
-        // second proxy process) pointed at the same cache_dir must observe
-        // Ok(false) while consolidator_a still holds the lock.
-        let journal_manager_b = Arc::new(JournalManager::new(
-            cache_dir.clone(),
-            "test-instance-b".to_string(),
-        ));
-        let lock_manager_b = Arc::new(MetadataLockManager::new(
-            cache_dir.join("locks"),
-            Duration::from_secs(30),
-            3,
-        ));
-        let consolidator_b = Arc::new(JournalConsolidator::new(
-            cache_dir.clone(),
-            journal_manager_b,
-            lock_manager_b,
-            ConsolidationConfig::default(),
-        ));
-        consolidator_b.initialize().await.unwrap();
-
-        let contended = consolidator_b
-            .try_acquire_global_consolidation_lock()
-            .expect("try_acquire_global_consolidation_lock should not error on contention");
-        assert!(
-            !contended,
-            "expected Ok(false) while another instance holds the lock"
-        );
-
-        consolidator_a.release_global_consolidation_lock();
-    });
-}
-
-/// Site: `write_cache_manager.rs` (~line 1117),
-/// `evict_incomplete_upload_with_tracker`'s per-upload eviction lock.
-///
-/// Three-way exemplar: `Ok(())` -> proceeds with eviction; `WouldBlock` ->
-/// skip and return `Ok(0)`; other `Err` -> `warn!` and proceed unlocked.
-/// Exercised at the level of the observable eviction outcome (bytes freed),
-/// via the public `evict_incomplete_uploads` entry point, since the
-/// per-upload lock helper itself is private.
-#[test]
-fn test_write_cache_manager_incomplete_upload_eviction_lock_acquired_and_contended() {
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async {
-        let temp_dir = TempDir::new().unwrap();
-        let cache_dir = temp_dir.path().to_path_buf();
-
-        let manager = WriteCacheManager::new(
-            cache_dir.clone(),
-            100 * 1024 * 1024, // 100MB total
-            10.0,              // 10% write cache
-            Duration::from_secs(86400),
-            Duration::from_secs(1), // short incomplete-upload TTL
-            s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
-            256 * 1024 * 1024,
-        );
-
-        let upload_id = "test-upload-lock-site";
-        let cache_key = "test-bucket/test-object-lock-site";
-        let mpus_dir = cache_dir.join("mpus_in_progress").join(upload_id);
-        tokio::fs::create_dir_all(&mpus_dir).await.unwrap();
-
-        let part_path = mpus_dir.join("part1.bin");
-        tokio::fs::write(&part_path, vec![0u8; 1024]).await.unwrap();
-
-        let tracker = s3_proxy::cache_types::MultipartUploadTracker {
-            upload_id: upload_id.to_string(),
-            cache_key: cache_key.to_string(),
-            started_at: std::time::SystemTime::now() - Duration::from_secs(3600),
-            parts: vec![s3_proxy::cache_types::CachedPartInfo {
-                part_number: 1,
-                size: 1024,
-                // Fixture writes the part uncompressed, so the on-disk length equals
-                // `size` here. This test is about lock call sites, not byte accounting.
-                compressed_size: 1024,
-                etag: "\"etag-1\"".to_string(),
-                compression_algorithm: s3_proxy::compression::CompressionAlgorithm::Lz4,
-                file_identity: None,
-            }],
-            total_size: 1024,
-            content_type: None,
-        };
-        let upload_meta_path = mpus_dir.join("upload.meta");
-        tokio::fs::write(
-            &upload_meta_path,
-            serde_json::to_string_pretty(&tracker).unwrap(),
-        )
-        .await
-        .unwrap();
-
-        // Create (and lock) the per-upload lock file BEFORE backdating
-        // mtimes. Creating a new entry inside mpus_dir bumps the directory's
-        // mtime, which would undo the backdating below if done afterward and
-        // make the eviction sweep's age check skip this upload for being
-        // "too fresh" rather than for the lock contention this test targets.
-        let lock_file_path = mpus_dir.join("upload.lock");
-        let held_handle = open_second_handle(&lock_file_path);
-        fs4::FileExt::try_lock(&held_handle).expect("failed to pre-hold per-upload lock");
-
-        let old_time = std::time::SystemTime::now() - Duration::from_secs(30);
-        let old_filetime = filetime::FileTime::from_system_time(old_time);
-        filetime::set_file_mtime(&upload_meta_path, old_filetime).unwrap();
-        filetime::set_file_mtime(&mpus_dir, old_filetime).unwrap();
-
-        let freed_while_contended = manager.evict_incomplete_uploads().await.unwrap();
-        assert_eq!(
-            freed_while_contended, 0,
-            "eviction must skip (free 0 bytes) while the per-upload lock is held by another handle"
-        );
-        assert!(
-            mpus_dir.exists(),
-            "upload directory must survive while its lock is contended"
-        );
-        assert!(
-            part_path.exists(),
-            "part file must survive while its lock is contended"
-        );
-
-        // Release the contending handle, then re-run: acquired state, the
-        // eviction must now proceed and free the bytes.
-        fs4::FileExt::unlock(&held_handle).ok();
-        drop(held_handle);
-
-        let freed_when_acquired = manager.evict_incomplete_uploads().await.unwrap();
-        assert!(
-            freed_when_acquired > 0,
-            "eviction must free bytes once the per-upload lock is acquirable"
-        );
-        assert!(
-            !mpus_dir.exists(),
-            "upload directory must be removed once eviction proceeds"
-        );
-    });
-}
 
 // ============================================================================
 // 9.3 -- the I/O-error branch (Requirement 4.3)

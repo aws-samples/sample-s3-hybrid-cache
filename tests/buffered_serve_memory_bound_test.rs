@@ -17,6 +17,8 @@
 //! Requirement coverage: R1.1, R1.3, R1.4 (single contained extent), R3.1.
 
 mod common;
+#[path = "common/proxy_rig.rs"]
+mod proxy_rig;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::SocketAddr;
@@ -35,7 +37,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
-use s3_proxy::config::Config;
+use s3_proxy::config::{Config, UpstreamOverrideConfig, UpstreamScheme};
 use s3_proxy::http_proxy::HttpProxy;
 use s3_proxy::inflight_tracker::InFlightTracker;
 use s3_proxy::range_handler::RangeHandler;
@@ -293,6 +295,16 @@ async fn proxy_request(
     path: &str,
     range: Option<&str>,
 ) -> ProxyResponse {
+    proxy_request_for_host(addr, None, method, path, range).await
+}
+/// [`proxy_request`] with the `Host` the proxy forwards to; `None` is the proxy's own address.
+async fn proxy_request_for_host(
+    addr: SocketAddr,
+    host: Option<&str>,
+    method: &str,
+    path: &str,
+    range: Option<&str>,
+) -> ProxyResponse {
     use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
 
@@ -306,7 +318,9 @@ async fn proxy_request(
     if let Some(range) = range {
         builder = builder.header("range", range);
     }
-
+    if let Some(host) = host {
+        builder = builder.header("host", host);
+    }
     let response = tokio::time::timeout(
         Duration::from_secs(60),
         client.request(
@@ -700,6 +714,118 @@ impl MultiFixture {
     }
 }
 
+/// Bytes covered by the union of inclusive `(start, end)` ranges.
+fn covered_bytes(mut ranges: Vec<(u64, u64)>) -> u64 {
+    ranges.sort_unstable();
+    let mut total = 0u64;
+    let mut next = 0u64;
+    for (start, end) in ranges {
+        let from = start.max(next);
+        if end >= from {
+            total += end - from + 1;
+            next = end + 1;
+        }
+    }
+    total
+}
+/// Make each extent of `path` resident the way production does: a ranged GET that misses,
+/// forwarded over HTTP to an origin, so the streamed range fill the request path makes
+/// publishes it. A stub that answers in process hands the proxy a buffered body, which a ranged
+/// miss does not cache, so the origin is a real HTTP server; it answers with the ETag and
+/// headers `stub_for` does, so the serve phase's stub describes the same object version. The
+/// proxy and the origin are dropped when this returns; a consolidation loop then folds every
+/// fill into the key's `.meta`, which the serve path reads.
+async fn seed_through_proxy(
+    config: &Arc<Config>,
+    cache_manager: &Arc<CacheManager>,
+    range_handler: &Arc<RangeHandler>,
+    path: &str,
+    body: &Bytes,
+    extents: &[(usize, usize)],
+) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let origin = proxy_rig::MockOrigin::default();
+    origin.put_bytes(path, body.clone());
+    origin.set_etag("\"scn1-etag\"");
+    let (origin_addr, _origin_shutdown) = origin.clone().spawn().await;
+    let origin_host = format!("127.0.0.1:{}", origin_addr.port());
+    let mut seed_config = (**config).clone();
+    seed_config.connection_pool.upstream_overrides.insert(
+        origin_host.clone(),
+        UpstreamOverrideConfig {
+            scheme: UpstreamScheme::Http,
+            validate_tls: true,
+        },
+    );
+    let seed_config = Arc::new(seed_config);
+    let ledger = Arc::new(s3_proxy::inflight_ledger::InflightLedger::new(
+        seed_config.server.max_inflight_buffer_bytes,
+    ));
+    let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(
+        s3_proxy::s3_client::S3Client::new(&seed_config.connection_pool, None)
+            .expect("s3 client")
+            .with_inflight_ledger(ledger),
+    );
+    let server = spawn_proxy_server(
+        seed_config,
+        Arc::clone(cache_manager),
+        Arc::clone(range_handler),
+        s3_client,
+    )
+    .await;
+    for &(s, e) in extents {
+        let resp = proxy_request_for_host(
+            server.addr,
+            Some(&origin_host),
+            "GET",
+            path,
+            Some(&range_header(s, e)),
+        )
+        .await;
+        assert_eq!(
+            resp.status,
+            StatusCode::PARTIAL_CONTENT,
+            "seed {s}-{e} of {path}"
+        );
+        assert_eq!(
+            resp.body.len(),
+            e - s + 1,
+            "seed {s}-{e} of {path}: body length"
+        );
+    }
+    // A cycle that finds the global consolidation lock held returns Ok having folded nothing,
+    // and the fills land after the responses end, so run cycles until the `.meta` covers every
+    // extent.
+    let cache_key = CacheManager::generate_cache_key(path, None);
+    let wanted = covered_bytes(extents.iter().map(|&(s, e)| (s as u64, e as u64)).collect());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
+            consolidator
+                .run_consolidation_cycle()
+                .await
+                .expect("consolidate seeded extents");
+        }
+        let listed = cache_manager
+            .get_metadata_from_disk(&cache_key)
+            .await
+            .ok()
+            .flatten()
+            .map_or(0, |m| {
+                covered_bytes(m.ranges.iter().map(|r| (r.start, r.end)).collect())
+            });
+        // Bytes covered, not extents listed: a fill may store only the part of its request the
+        // cache did not already hold, so the count of listed extents is not the count seeded.
+        if listed >= wanted {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the `.meta` of {path} covers {listed} of {wanted} seeded bytes after 60s: a fill never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 /// Build a proxy whose stub answers each range in `stub_ranges` with a 206 and
 /// the full GET with a 200, then warm the cache with one range GET per extent
 /// in `extents` (or one full GET when `extents` is empty), waiting until a
@@ -720,39 +846,22 @@ async fn multi_fixture(
     for &(s, _) in extents {
         stub = stub.with_response_for_range(range_header(s, s), stub_range_response(&body, s, s));
     }
-    // Seed each extent straight into the cache, as a range miss that cached its bytes
-    // would. An empty `extents` seeds the whole object as one extent.
+    // Seed each extent by a ranged GET that misses through a proxy, so the range fill the
+    // request path makes writes it. An empty `extents` seeds the whole object as one extent.
     let seeded: Vec<(usize, usize)> = if extents.is_empty() {
         vec![(0, body.len() - 1)]
     } else {
         extents.to_vec()
     };
-    let cache_key = CacheManager::generate_cache_key(path, None);
-    for &(s, e) in &seeded {
-        let object_metadata = s3_proxy::cache_types::ObjectMetadata {
-            etag: "\"scn1-etag\"".to_string(),
-            last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
-            content_length: body.len() as u64,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: s3_proxy::cache_types::UploadState::Complete,
-            cumulative_size: (e - s + 1) as u64,
-            ..Default::default()
-        };
-        range_handler
-            .get_cache_manager()
-            .create_configured_disk_cache_manager()
-            .store_range(
-                &cache_key,
-                s as u64,
-                e as u64,
-                &body[s..=e],
-                object_metadata,
-                config.cache.get_ttl,
-                true,
-            )
-            .await
-            .expect("seed extent");
-    }
+    seed_through_proxy(
+        &config,
+        &cache_manager,
+        &range_handler,
+        path,
+        &body,
+        &seeded,
+    )
+    .await;
     // Fold the seeding journal entries into the `.meta` the serve path reads. A cycle
     // that finds the global consolidation lock held returns Ok having folded nothing, and
     // nothing else runs a cycle in this test process, so run cycles until the `.meta`
@@ -1176,37 +1285,7 @@ async fn seeded_infra_ram(
     let config = Arc::new(cfg);
     let (cache_manager, range_handler) = make_cache_infra(&config).await;
     let cache_key = CacheManager::generate_cache_key(path, None);
-    for &(s, e) in extents {
-        let object_metadata = s3_proxy::cache_types::ObjectMetadata {
-            etag: "\"scn1-etag\"".to_string(),
-            last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
-            content_length: body.len() as u64,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: s3_proxy::cache_types::UploadState::Complete,
-            cumulative_size: (e - s + 1) as u64,
-            ..Default::default()
-        };
-        range_handler
-            .get_cache_manager()
-            .create_configured_disk_cache_manager()
-            .store_range(
-                &cache_key,
-                s as u64,
-                e as u64,
-                &body[s..=e],
-                object_metadata,
-                config.cache.get_ttl,
-                true,
-            )
-            .await
-            .expect("seed extent");
-    }
-    if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
-        consolidator
-            .run_consolidation_cycle()
-            .await
-            .expect("consolidate seeded extents");
-    }
+    seed_through_proxy(&config, &cache_manager, &range_handler, path, body, extents).await;
     (dir, config, cache_manager, range_handler, cache_key)
 }
 
@@ -1241,7 +1320,7 @@ async fn widened_measured(
         Arc::clone(cache_manager),
         Arc::clone(range_handler),
         stub.into_trait_object(),
-        "s3.amazonaws.com".to_string(),
+        "127.0.0.1".to_string(), // the host the seeding fills were claimed for
         format!("/{}", cache_key).parse().unwrap(),
         Arc::clone(config),
         &resolved,
@@ -2277,7 +2356,7 @@ async fn z_uncached_over_bound_forward_carries_proxy_referer() {
             Arc::clone(&cache_manager),
             Arc::clone(&range_handler),
             stub.clone().into_trait_object(),
-            "s3.amazonaws.com".to_string(),
+            "127.0.0.1".to_string(), // the host the seeding fills were claimed for
             format!("/{}", cache_key).parse().unwrap(),
             Arc::clone(&config),
             &resolved,

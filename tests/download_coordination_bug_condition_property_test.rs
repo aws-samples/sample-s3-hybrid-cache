@@ -134,7 +134,6 @@ use tokio::task::JoinSet;
 
 use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
-use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::Config;
 use s3_proxy::disk_cache::DiskCacheManager;
 use s3_proxy::http_proxy::HttpProxy;
@@ -261,39 +260,67 @@ fn signed_get_headers(authorization: &str) -> HashMap<String, String> {
     headers
 }
 
-/// Pre-populate the cache with a synthetic object so Case B starts from the
-/// "cache present" state. Under `get_ttl = 0` this entry is expired the
-/// moment it's written — i.e. `expires_at` is in the past.
-async fn prime_cache_with_expired_entry(cache_manager: &Arc<CacheManager>, cache_key: &str) {
-    let headers: HashMap<String, String> = [
-        ("etag".to_string(), CACHED_ETAG.to_string()),
-        (
-            "last-modified".to_string(),
-            "Wed, 01 Jan 2020 00:00:00 GMT".to_string(),
+/// Pre-populate the cache so Case B starts from the "cache present" state, by a real GET miss
+/// through the production coordination path (`forward_get_head_with_coordination`), the fill
+/// the request path runs. Under `get_ttl = 0` the stored entry is expired the moment it is
+/// written, i.e. `expires_at` is in the past.
+async fn prime_cache_with_expired_entry(
+    cache_manager: &Arc<CacheManager>,
+    range_handler: &Arc<RangeHandler>,
+    config: &Arc<Config>,
+    cache_key: &str,
+) {
+    let stub = StubS3Client::new()
+        .with_default(
+            StubResponse::ok(Bytes::from_static(FETCHER_BODY))
+                .with_header("etag", CACHED_ETAG)
+                .with_header("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT")
+                .with_header("content-type", "application/octet-stream"),
+        )
+        .into_trait_object();
+    let uri: hyper::Uri = format!("/{cache_key}").parse().expect("uri");
+    let (status, _body) = run_one_coordinated_get(
+        Method::GET,
+        uri,
+        "s3.amazonaws.com".to_string(),
+        signed_get_headers(
+            "AWS4-HMAC-SHA256 Credential=AKIA-PRIME/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=01",
         ),
-        (
-            "content-type".to_string(),
-            "application/octet-stream".to_string(),
-        ),
-        ("content-length".to_string(), FETCHER_BODY.len().to_string()),
-    ]
-    .into_iter()
-    .collect();
-
-    let metadata = CacheMetadata {
-        etag: CACHED_ETAG.to_string(),
-        last_modified: "Wed, 01 Jan 2020 00:00:00 GMT".to_string(),
-        content_length: FETCHER_BODY.len() as u64,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    };
-
-    cache_manager
-        .store_response_with_headers(cache_key, FETCHER_BODY, headers, metadata)
-        .await
-        .expect("prime cache");
+        cache_key.to_string(),
+        Arc::clone(cache_manager),
+        stub,
+        Arc::new(InFlightTracker::new()),
+        Arc::clone(range_handler),
+        Arc::clone(config),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "PRECONDITION MISSING: the priming GET returned {status:?}"
+    );
+    if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
+        consolidator
+            .consolidate_object(cache_key)
+            .await
+            .expect("fold the priming fill's journal entry");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let meta = cache_manager
+            .get_metadata_from_disk(cache_key)
+            .await
+            .ok()
+            .flatten();
+        if meta.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRECONDITION MISSING: the priming GET left no .meta for {cache_key} within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Run `forward_get_head_with_coordination` for a single signed GET. Returns
@@ -604,7 +631,8 @@ fn prop_case_b_expired_cache_stampede(participant_count: u8) -> TestResult {
         // Prime the cache BEFORE the stampede so every participant sees
         // `cache_state_at_entry = Expired`. With `get_ttl = 0` the entry is
         // written with `expires_at` in the past — the bug condition.
-        prime_cache_with_expired_entry(&cache_manager, &cache_key).await;
+        prime_cache_with_expired_entry(&cache_manager, &range_handler, &config, &cache_key)
+            .await;
 
         // All participants carry valid credentials — this property is
         // about coalescing arithmetic, not IAM. The stub returns 200 OK

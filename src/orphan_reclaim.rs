@@ -71,7 +71,7 @@ use crate::orphan_evidence::{journal_evidence, JournalEvidence};
 use crate::staged_fold::Shard;
 
 /// How often a pass is due on each instance.
-pub const PASS_INTERVAL_SECS: u64 = 300;
+const PASS_INTERVAL_SECS: u64 = 300;
 /// The youngest a range file may be, by its modification time, and still be reclaimed.
 ///
 /// Every writer, of this release and of 2.8.x, makes a range file visible in `ranges/` before
@@ -82,14 +82,14 @@ pub const PASS_INTERVAL_SECS: u64 = 300;
 /// between the proxy and the file server, while an orphan still goes within a few passes of
 /// [`PASS_INTERVAL_SECS`]. A multipart part keeps its upload-time mtime when it is renamed in,
 /// so it is guarded by its upload record instead (see [`UploadSnapshot`]).
-pub const MIN_CANDIDATE_AGE_SECS: u64 = 600;
+const MIN_CANDIDATE_AGE_SECS: u64 = 600;
 /// The wall-clock budget of one pass.
-pub const PASS_TIME_BUDGET: Duration = Duration::from_secs(30);
+const PASS_TIME_BUDGET: Duration = Duration::from_secs(30);
 /// The L2-leaf budget of one pass. With 4,096 leaves per `(bucket, L1)` shard this is one
 /// full shard per pass at most.
-pub const PASS_LEAF_BUDGET: usize = 4_096;
+const PASS_LEAF_BUDGET: usize = 4_096;
 /// A claim older than this is abandoned and may be taken over.
-pub const CLAIM_LEASE_SECS: u64 = 600;
+pub(crate) const CLAIM_LEASE_SECS: u64 = 600;
 /// How long a lease file that does not parse keeps counting as live, by its modification time
 ///Applies to every lease family.
 ///
@@ -229,7 +229,7 @@ pub fn counters() -> OrphanReclaimCounters {
 }
 
 /// Start the rotation for this process. Called once from cache init; there is no switch.
-pub fn enable() {
+pub(crate) fn enable() {
     ENABLED.store(true, Ordering::SeqCst);
 }
 
@@ -240,7 +240,7 @@ pub fn enabled() -> bool {
 
 /// Clears the in-progress flag when a claimed pass ends, however it ends.
 #[derive(Debug)]
-pub struct PassClaim(());
+pub(crate) struct PassClaim(());
 
 impl Drop for PassClaim {
     fn drop(&mut self) {
@@ -250,7 +250,7 @@ impl Drop for PassClaim {
 
 /// Claim this process's next pass: `Some` when enabled, due, and no pass is in flight. The
 /// same per-process claim pattern as the incomplete-upload sweep.
-pub fn claim_pass(now_secs: u64) -> Option<PassClaim> {
+pub(crate) fn claim_pass(now_secs: u64) -> Option<PassClaim> {
     if !enabled() {
         return None;
     }
@@ -274,7 +274,7 @@ pub fn claim_pass(now_secs: u64) -> Option<PassClaim> {
 
 /// One visit unit's rotation progress.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrphanCheckpoint {
+struct OrphanCheckpoint {
     /// Unix seconds when the last visit that reached the unit's final leaf finished.
     #[serde(default)]
     pub scanned_at: Option<u64>,
@@ -288,7 +288,7 @@ fn shard_state_dir(cache_dir: &Path) -> PathBuf {
 }
 
 /// Path of a unit's checkpoint.
-pub fn checkpoint_path(cache_dir: &Path, unit: &Shard) -> PathBuf {
+fn checkpoint_path(cache_dir: &Path, unit: &Shard) -> PathBuf {
     let dir = shard_state_dir(cache_dir).join("orphan");
     if unit.bucket == ROOT_BUCKET {
         dir.join("_root.json")
@@ -323,7 +323,7 @@ pub(crate) fn lease_path(cache_dir: &Path, dir_name: &str, unit: &Shard) -> Path
 
 /// Read a unit's checkpoint. `None` when there is none or it cannot be parsed (ranked first,
 /// which re-visits it: the safe direction).
-pub fn read_checkpoint(cache_dir: &Path, unit: &Shard) -> Option<OrphanCheckpoint> {
+fn read_checkpoint(cache_dir: &Path, unit: &Shard) -> Option<OrphanCheckpoint> {
     let text = std::fs::read_to_string(checkpoint_path(cache_dir, unit)).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -337,9 +337,7 @@ async fn write_checkpoint(cache_dir: &Path, unit: &Shard, checkpoint: &OrphanChe
             return;
         }
     };
-    if let Err(e) =
-        crate::disk_cache::write_atomic(&path, &body, crate::disk_cache::Shared::Yes).await
-    {
+    if let Err(e) = crate::disk_cache::write_atomic(&path, &body).await {
         debug!(
             "Orphan reclaim: could not write checkpoint {:?}: {}",
             path, e
@@ -350,7 +348,7 @@ async fn write_checkpoint(cache_dir: &Path, unit: &Shard, checkpoint: &OrphanChe
 /// The order a pass visits `units` in: the `st_size` fold's ranking applied to this rotation's
 /// checkpoints. No checkpoint first, then no `scanned_at`, then oldest `scanned_at`; the unit
 /// key breaks every tie.
-pub fn visit_order(
+fn visit_order(
     units: &BTreeSet<Shard>,
     checkpoints: &BTreeMap<Shard, OrphanCheckpoint>,
     now_secs: u64,
@@ -394,7 +392,7 @@ pub(crate) struct ShardLease {
 
 /// Whether a claim on a unit was won.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimState {
+pub(crate) enum ClaimState {
     /// This instance holds the unit until [`release_claim`].
     Claimed,
     /// A live peer holds it, or the claim could not be written.
@@ -486,7 +484,7 @@ pub(crate) fn remove_expired_unreadable_lease(
 /// Claim `unit` for an orphan visit. An exclusive create wins a free unit; a claim whose lease
 /// has lapsed is moved aside by rename (so of two instances taking it over, only one moves the
 /// stale file) and the create retried once. Any I/O error is `Busy`.
-pub fn claim_unit(cache_dir: &Path, unit: &Shard, instance_id: &str, now: u64) -> ClaimState {
+fn claim_unit(cache_dir: &Path, unit: &Shard, instance_id: &str, now: u64) -> ClaimState {
     claim_shard_lease(
         cache_dir,
         ORPHAN_CLAIMS_DIR,
@@ -578,7 +576,7 @@ pub(crate) fn claim_shard_lease(
 
 /// Release this instance's orphan claim on `unit`. Only a claim naming this instance is
 /// removed.
-pub fn release_claim(cache_dir: &Path, unit: &Shard, instance_id: &str) {
+pub(crate) fn release_claim(cache_dir: &Path, unit: &Shard, instance_id: &str) {
     release_shard_lease(cache_dir, ORPHAN_CLAIMS_DIR, unit, instance_id);
 }
 
@@ -1618,7 +1616,7 @@ fn record_rotation_progress(cache_dir: &Path, units: &BTreeSet<Shard>) {
 /// on the volume is older than 3.0.0, or the roster cannot be read. Within the pass the gate is
 /// re-read before each unit and under each candidate's slot lock, so a proxy that joins
 /// mid-pass stops it at the next unit and keeps every candidate not yet decided.
-pub async fn run_scheduled_pass(
+pub(crate) async fn run_scheduled_pass(
     cache_dir: &Path,
     instance_id: &str,
     budget: PassBudget,

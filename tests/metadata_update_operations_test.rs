@@ -4,6 +4,8 @@
 //! - refresh_object_ttl()
 //! - remove_invalidated_range()
 
+mod common;
+use common::SeedMetadata as _;
 use s3_proxy::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 use s3_proxy::compression::CompressionAlgorithm;
 use std::time::{Duration, SystemTime};
@@ -67,7 +69,7 @@ async fn test_update_range_access() {
     let initial_access_count = metadata.ranges[0].access_count;
     let initial_last_accessed = metadata.ranges[0].last_accessed;
 
-    manager.update_metadata(&metadata).await.unwrap();
+    manager.seed_metadata(&metadata);
 
     // Wait a bit to ensure time difference
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -93,7 +95,7 @@ async fn test_update_range_access_nonexistent_range() {
 
     // Create and store initial metadata
     let metadata = create_test_metadata(cache_key);
-    manager.update_metadata(&metadata).await.unwrap();
+    manager.seed_metadata(&metadata);
 
     // Try to update a non-existent range (should not error)
     let result = manager
@@ -127,7 +129,7 @@ async fn test_refresh_object_ttl() {
     let metadata = create_test_metadata(cache_key);
     let initial_expires_at = metadata.expires_at;
 
-    manager.update_metadata(&metadata).await.unwrap();
+    manager.seed_metadata(&metadata);
 
     // Wait a bit to ensure time difference
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -199,7 +201,7 @@ async fn test_remove_invalidated_range() {
         ..Default::default()
     };
 
-    manager.update_metadata(&metadata).await.unwrap();
+    manager.seed_metadata(&metadata);
 
     // Remove the invalidated range
     manager
@@ -262,7 +264,7 @@ async fn test_remove_invalidated_range_with_remaining_ranges() {
         ..Default::default()
     };
 
-    manager.update_metadata(&metadata).await.unwrap();
+    manager.seed_metadata(&metadata);
 
     // Remove the invalidated range
     manager
@@ -284,7 +286,7 @@ async fn test_remove_invalidated_range_nonexpired() {
 
     // Create metadata with a non-expired range
     let metadata = create_test_metadata(cache_key);
-    manager.update_metadata(&metadata).await.unwrap();
+    manager.seed_metadata(&metadata);
 
     // Remove a non-expired range (removes regardless of expiration status)
     manager
@@ -315,7 +317,7 @@ async fn test_concurrent_metadata_updates() {
 
     // Create and store initial metadata
     let metadata = create_test_metadata(cache_key);
-    manager1.update_metadata(&metadata).await.unwrap();
+    manager1.seed_metadata(&metadata);
 
     // Spawn concurrent updates from both managers
     let cache_key1 = cache_key.to_string();
@@ -362,7 +364,7 @@ async fn test_update_range_access_performance() {
 
     // Create and store initial metadata
     let metadata = create_test_metadata(cache_key);
-    manager.update_metadata(&metadata).await.unwrap();
+    manager.seed_metadata(&metadata);
 
     // Measure performance of update_range_access
     let start = std::time::Instant::now();

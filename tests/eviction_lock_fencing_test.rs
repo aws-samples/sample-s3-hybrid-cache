@@ -410,7 +410,7 @@ async fn test_release_does_not_truncate_when_uuid_changed() {
 /// setting the wrong config field entirely.
 ///
 /// Reaching the real branch needs a live holder in another process, the way
-/// `remove_corrupt_metadata_refuses_while_a_peer_holds_the_slot_then_deletes` does it. Until
+/// the former corrupt-metadata removal test did it. Until
 /// then the stale-takeover arm — including the `stale_locks_recovered` increment inside it —
 /// has no automated coverage. Do not read a pass here as evidence that it works.
 #[tokio::test]

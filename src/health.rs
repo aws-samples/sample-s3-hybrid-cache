@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 
 /// Health check status
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum HealthStatus {
+pub(crate) enum HealthStatus {
     Healthy,
     Degraded,
     Unhealthy,
@@ -23,7 +23,7 @@ pub enum HealthStatus {
 
 /// Component health information
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComponentHealth {
+pub(crate) struct ComponentHealth {
     pub name: String,
     pub status: HealthStatus,
     pub message: Option<String>,
@@ -33,7 +33,7 @@ pub struct ComponentHealth {
 
 /// Overall system health
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemHealth {
+pub(crate) struct SystemHealth {
     pub status: HealthStatus,
     pub timestamp: SystemTime,
     pub components: Vec<ComponentHealth>,

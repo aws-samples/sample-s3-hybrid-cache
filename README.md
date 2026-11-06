@@ -10,6 +10,8 @@ Read the introductory blog post: [Introducing Hybrid Cache for Amazon S3: An Int
 
 Users with hybrid or on-premises workloads find Amazon S3 slow or costly to use because of latency, bandwidth constraints, and data transfer out (DTO) costs, especially for repeat-read and read-after-write workflows.
 
+The same limits apply in the other direction, when compute runs in AWS and the data stays in an on-premises S3-compatible store. Every read crosses a Direct Connect or VPN link of fixed capacity, and each instance that reads a dataset pulls it across separately.
+
 This is particularly acute in healthcare, life sciences, quantitative trading, and autonomous driving, where large data volumes require frequent access with low latency and high throughput. Existing caching solutions don't support transparent authentication or shared storage, forcing users to either:
 - Accept repeated DTO costs when multiple users access the same data
 - Configure caches with their own credentials, breaking IAM policies and S3 access controls
@@ -69,7 +71,7 @@ Hybrid Cache for Amazon S3 provides a caching layer that serves repeat reads loc
 
 **Also Runs on AWS**
 
-The same proxy caches a cross-Region Amazon S3 bucket or an S3-compatible store outside AWS. Deploy a fleet of EC2 instances sharing an FSx for OpenZFS, FSx for NetApp ONTAP or EFS cache volume, point clients at the TLS proxy listener directly or through an NLB. Cache hits then avoid the cross-Region round-trip and per-GB transfer charge entirely. See the **[AWS Deployment Guide](docs/AWS_DEPLOYMENT.md)** for sizing, bootstrap scripts, client routing patterns, and cost modeling.
+The same proxy caches a cross-Region Amazon S3 bucket or an S3-compatible store outside AWS. Deploy a fleet of EC2 instances sharing an FSx for OpenZFS, FSx for NetApp ONTAP or EFS cache volume, point clients at the TLS proxy listener directly or through an NLB. For a cross-Region bucket, a cache hit avoids the cross-Region round trip and the per-GB transfer charge. For a store outside AWS, a hit avoids the round trip over the Direct Connect or VPN link and leaves the link's capacity for other traffic. See the **[AWS Deployment Guide](docs/AWS_DEPLOYMENT.md)** for sizing, bootstrap scripts, client routing patterns, and cost modeling.
 
 Where every client host can run a sidecar [affinity router](docs/REQUEST_AWARE_ROUTING.md), a cheaper option opens up: give each proxy its own local NVMe instance store. The router hashes each request to one proxy by object key and page index, so the private disks behave as one cache, at about 39% lower cost than a capacity-matched cache volume. The cache is erased when an instance is replaced. See **[Local NVMe Cache Fleets](docs/LOCAL_NVME_CACHE.md)**.
 
@@ -282,7 +284,7 @@ A: As the cache is transparent and has no credentials of its own, it cannot requ
 
 **Q: Will this work with S3-compatible storage?**
 
-A: Nothing about this solution is specific to Amazon S3. Any origin compatible with the S3 API should work.
+A: Yes, for an S3-compatible origin that meets the requirements in [S3-compatible store outside AWS](docs/AWS_DEPLOYMENT.md#s3-compatible-store-outside-aws). Among them, the origin returns an `ETag` on GET and HEAD, and a ranged response gives the object's total size in `Content-Range` (`bytes 0-99/1000`, not `bytes 0-99/*`), as S3's does. The project's tests use MinIO as an origin for upstream transport overrides, a signed PUT and GET round trip, and hedged upstream requests. Every other caching behavior is verified against Amazon S3 only.
 
 **Q: Does S3 Transfer Acceleration work with the proxy?**
 

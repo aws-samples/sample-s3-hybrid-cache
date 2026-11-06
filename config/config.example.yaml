@@ -49,11 +49,14 @@ server:
 
   # Ceiling on the bytes held at once by all the request and response bodies the proxy
   # buffers whole instead of streaming (default: 0, no ceiling). Most are responses
-  # (range merges, page widening, buffered range serving, recovery fallbacks); the rest
+  # (range merges, page widening, buffered range serving, recovery fallbacks, S3's
+  # answers to writes); the rest
   # are small non-GET/PUT request bodies such as a DeleteObjects POST. Uploads always
   # stream, and max_concurrent_requests bounds them instead.
   # A request whose buffered body would pass the ceiling gets HTTP 503 SlowDown with
-  # Retry-After, not 413, before any upstream connection opens.
+  # Retry-After, not 413, before any upstream connection opens. S3's answer to a write
+  # already sent is counted but never refused, so reserved_bytes can exceed the ceiling
+  # while such answers are held.
   # Start at about instance RAM / 4 - cache.max_ram_cache_size, then adjust against
   # inflight_memory.peak_reserved_bytes in /metrics under real traffic. On a 4 GiB
   # c6in.large with the default 512 MiB RAM cache that is 536870912 (512 MiB).
@@ -285,8 +288,9 @@ cache:
     # How long a waiting request waits for the fetch (default: 30s; range 5-120s, and a
     # value outside it is clamped with a warning). If the fetch is still running, the
     # waiter waits on the same fetch again, up to max_waiter_resubscriptions times
-    # (default: 3), then returns 504 Gateway Timeout. A waiter fetches from S3 itself
-    # only when the fetch it waits on fails or goes away.
+    # (default: 3). After that, a full-object GET or HEAD waiter fetches from S3 itself
+    # and a part or range waiter returns 504 Gateway Timeout. A waiter also fetches from
+    # S3 itself when the fetch it waits on fails or goes away.
     wait_timeout_secs: 30
 
   # Range merge gap threshold (default: 1 MiB).
@@ -589,6 +593,13 @@ connection_pool:
   # Retries when the first-byte timeout expires before any byte has gone to the client
   # (default: 2).
   # upstream_idle_retries: 2
+  # Upload idle timeout (default: 120s). Bounds each wait on S3 while the proxy forwards
+  # an upload, multipart operation or copy: sending the request, waiting for the response
+  # after the last request byte, and reading the response. Any byte moved re-arms it, and
+  # it never runs while the proxy waits on the client's body. On expiry the client gets
+  # 504 GatewayTimeout. connection_timeout bounds the connect for these requests. Must be
+  # greater than 0s.
+  # upstream_write_idle_timeout: "120s"
 
   # Hedged upstream requests: the per-proxy governor. A cache_rules.json rule turns
   # hedging on for a key pattern (hedging_enabled, hedge_trigger_after,

@@ -4,92 +4,14 @@
 //! - HEAD cache invalidation (Requirement 4.1)
 //! - Cached range hits (Requirement 4.2)
 //! - Complete cache hits (Requirement 4.3)
-
-use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
-use std::sync::Arc;
-use tempfile::TempDir;
+//!
+//! The cached ranges are made by ranged GETs that miss through a real `HttpProxy`.
+#[path = "common/proxy_rig.rs"]
+mod proxy_rig;
+use bytes::Bytes;
+use proxy_rig::{Rig, RigOptions};
+use s3_proxy::range_handler::RangeSpec;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-#[tokio::test]
-async fn test_head_cache_invalidation_logging() {
-    // Initialize tracing to capture logs
-    let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_test_writer())
-        .try_init();
-
-    let temp_dir = TempDir::new().unwrap();
-    let cache_dir = temp_dir.path().to_path_buf();
-
-    let cache_manager = Arc::new(CacheManager::new_with_all_ttls(
-        cache_dir,
-        false,
-        0,
-        CacheEvictionAlgorithm::TinyLFU,
-        1024,
-        true,
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(3600),
-        false,
-    ));
-
-    // Must call create_configured_disk_cache_manager() to set up the JournalConsolidator
-    let _disk_cache = cache_manager.create_configured_disk_cache_manager();
-
-    cache_manager.initialize().await.unwrap();
-
-    let cache_key = "/test-bucket/test-object.txt";
-
-    // Create a HEAD cache entry
-    let mut headers = std::collections::HashMap::new();
-    headers.insert("content-length".to_string(), "12345".to_string());
-    headers.insert("etag".to_string(), "test-etag".to_string());
-    headers.insert(
-        "last-modified".to_string(),
-        "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-    );
-
-    let metadata = s3_proxy::cache_types::CacheMetadata {
-        etag: "test-etag".to_string(),
-        last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        content_length: 12345,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    };
-
-    cache_manager
-        .store_head_cache_entry_unified(cache_key, headers, metadata)
-        .await
-        .unwrap();
-
-    // Verify HEAD cache exists using unified method
-    let head_entry = cache_manager
-        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
-        .await
-        .unwrap();
-    assert!(head_entry.is_some(), "HEAD cache entry should exist");
-
-    // Requirement 4.1: Invalidate HEAD cache and verify logging
-    // The logging happens inside invalidate_head_cache_entry_unified
-    cache_manager
-        .invalidate_head_cache_entry_unified(cache_key)
-        .await
-        .unwrap();
-
-    // Verify HEAD cache was invalidated using unified method
-    let head_entry_after = cache_manager
-        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
-        .await
-        .unwrap();
-    assert!(
-        head_entry_after.is_none(),
-        "HEAD cache entry should be invalidated"
-    );
-
-    println!("✓ HEAD cache invalidation logging test passed");
-}
 
 #[tokio::test]
 async fn test_cached_range_hit_logging() {
@@ -98,91 +20,26 @@ async fn test_cached_range_hit_logging() {
         .with(tracing_subscriber::fmt::layer().with_test_writer())
         .try_init();
 
-    let temp_dir = TempDir::new().unwrap();
-    let cache_dir = temp_dir.path().to_path_buf();
-
-    let cache_manager = Arc::new(CacheManager::new_with_all_ttls(
-        cache_dir.clone(),
-        false,
-        0,
-        CacheEvictionAlgorithm::TinyLFU,
-        1024,
-        true,
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(3600),
-        false,
-    ));
-
-    // Must call create_configured_disk_cache_manager() to set up the JournalConsolidator
-    let _disk_cache = cache_manager.create_configured_disk_cache_manager();
-
-    cache_manager.initialize().await.unwrap();
-
-    let cache_key = "/test-bucket/test-object.txt";
-
-    // Store a range in cache using the new storage format
-    let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false, 1_048_576),
-    ));
-
-    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
-        Arc::clone(&cache_manager),
-        Arc::clone(&disk_cache_manager),
-    ));
-
-    // Create test data
-    let test_data = vec![b'A'; 1024];
+    let rig = Rig::new(RigOptions::default()).await;
+    let path = "/test-bucket/test-object.txt";
+    rig.mock.put_bytes(path, Bytes::from(vec![b'A'; 1024]));
+    let cache_key = Rig::cache_key(path);
 
     // Store range 0-1023
-    let object_metadata = s3_proxy::cache_types::ObjectMetadata {
-        etag: "test-etag".to_string(),
-        last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        content_length: 1024,
-        content_type: Some("application/octet-stream".to_string()),
-        response_headers: std::collections::HashMap::new(),
-        upload_state: s3_proxy::cache_types::UploadState::Complete,
-        cumulative_size: 1024,
-        parts: Vec::new(),
-        compression_algorithm: s3_proxy::compression::CompressionAlgorithm::Lz4,
-        compressed_size: 0,
-        parts_count: None,
-        part_ranges: std::collections::HashMap::new(),
-        part_layout_verified: false,
-        upload_id: None,
-        is_write_cached: false,
-        write_cache_expires_at: None,
-        write_cache_created_at: None,
-        write_cache_last_accessed: None,
-        graduation_accounted: false,
-    };
-
-    let mut disk_cache = disk_cache_manager.write().await;
-    disk_cache
-        .store_range(
-            cache_key,
-            0,
-            1023,
-            &test_data,
-            object_metadata,
-            std::time::Duration::from_secs(315360000), // 10 years TTL
-            true,
-        )
-        .await
-        .unwrap();
-    drop(disk_cache);
+    rig.seed_range(path, 0, 1023).await;
 
     // Find cached ranges - this should trigger the logging
     // Requirement 4.2: Log when cached ranges are found during full object GET
     // The logging happens in handle_range_request with:
     // info!("Cached range hit: cache_key={}, range={}-{}, size={} bytes, etag={}", ...)
-    let range_spec = s3_proxy::range_handler::RangeSpec {
+    let range_spec = RangeSpec {
         start: 0,
         end: 1023,
     };
-    let overlap = range_handler
+    let overlap = rig
+        .range_handler
         .find_cached_ranges(
-            cache_key,
+            &cache_key,
             &range_spec,
             None,
             None,
@@ -217,104 +74,29 @@ async fn test_complete_cache_hit_metrics() {
         .with(tracing_subscriber::fmt::layer().with_test_writer())
         .try_init();
 
-    let temp_dir = TempDir::new().unwrap();
-    let cache_dir = temp_dir.path().to_path_buf();
-
-    let cache_manager = Arc::new(CacheManager::new_with_all_ttls(
-        cache_dir.clone(),
-        false,
-        0,
-        CacheEvictionAlgorithm::TinyLFU,
-        1024,
-        true,
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(3600),
-        false,
-    ));
-
-    // Must call create_configured_disk_cache_manager() to set up the JournalConsolidator
-    let _disk_cache = cache_manager.create_configured_disk_cache_manager();
-
-    cache_manager.initialize().await.unwrap();
-
-    let cache_key = "/test-bucket/test-object.txt";
-
-    // Store multiple ranges that cover the entire requested range
-    let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false, 1_048_576),
-    ));
-
-    let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
-        Arc::clone(&cache_manager),
-        Arc::clone(&disk_cache_manager),
-    ));
+    let rig = Rig::new(RigOptions::default()).await;
+    let path = "/test-bucket/test-object.txt";
+    let mut object = vec![b'A'; 512];
+    object.extend_from_slice(&[b'B'; 512]);
+    rig.mock.put_bytes(path, Bytes::from(object));
+    let cache_key = Rig::cache_key(path);
 
     // Store ranges 0-511 and 512-1023 (covering 0-1023 completely)
-    let test_data1 = vec![b'A'; 512];
-    let test_data2 = vec![b'B'; 512];
-
-    let object_metadata = s3_proxy::cache_types::ObjectMetadata {
-        etag: "test-etag".to_string(),
-        last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        content_length: 1024,
-        content_type: Some("application/octet-stream".to_string()),
-        response_headers: std::collections::HashMap::new(),
-        upload_state: s3_proxy::cache_types::UploadState::Complete,
-        cumulative_size: 1024,
-        parts: Vec::new(),
-        compression_algorithm: s3_proxy::compression::CompressionAlgorithm::Lz4,
-        compressed_size: 0,
-        parts_count: None,
-        part_ranges: std::collections::HashMap::new(),
-        part_layout_verified: false,
-        upload_id: None,
-        is_write_cached: false,
-        write_cache_expires_at: None,
-        write_cache_created_at: None,
-        write_cache_last_accessed: None,
-        graduation_accounted: false,
-    };
-
-    let mut disk_cache = disk_cache_manager.write().await;
-    disk_cache
-        .store_range(
-            cache_key,
-            0,
-            511,
-            &test_data1,
-            object_metadata.clone(),
-            std::time::Duration::from_secs(315360000), // 10 years TTL
-            true,
-        )
-        .await
-        .unwrap();
-
-    disk_cache
-        .store_range(
-            cache_key,
-            512,
-            1023,
-            &test_data2,
-            object_metadata,
-            std::time::Duration::from_secs(315360000), // 10 years TTL
-            true,
-        )
-        .await
-        .unwrap();
-    drop(disk_cache);
+    rig.seed_range(path, 0, 511).await;
+    rig.seed_range(path, 512, 1023).await;
 
     // Request the full range 0-1023
     // Requirement 4.3: Log when full object is served entirely from cache
     // The logging happens in handle_range_request with:
     // info!("Complete cache hit: cache_key={}, range={}-{}, requested_bytes={}, cached_ranges={}, cache_efficiency={:.2}%, s3_requests=0", ...)
-    let range_spec = s3_proxy::range_handler::RangeSpec {
+    let range_spec = RangeSpec {
         start: 0,
         end: 1023,
     };
-    let overlap = range_handler
+    let overlap = rig
+        .range_handler
         .find_cached_ranges(
-            cache_key,
+            &cache_key,
             &range_spec,
             None,
             None,

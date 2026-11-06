@@ -177,7 +177,7 @@ pub struct StSizeFoldOutcome {
 /// unexplained 40% and is non-monotonic across occupancy — and EFS is not the shared-storage
 /// backend the deployment guides recommend. Treat it as the starting point for the scaling
 /// below rather than as the interval a large volume will actually run at.
-pub const DEFAULT_SHARD_FOLD_INTERVAL_SECS: u64 = 3_600;
+pub(crate) const DEFAULT_SHARD_FOLD_INTERVAL_SECS: u64 = 3_600;
 
 /// How many times the last fold's own duration the next interval must be, at minimum.
 ///
@@ -318,7 +318,7 @@ pub fn collect_st_size_fold_gauges(checkpoints: &ShardCheckpointSet) -> StSizeFo
 ///
 /// See [`StSizeFoldGauges::st_size_fold_oldest_shard_scan_age_secs`] for what `None` means and
 /// why it is not a zero.
-pub fn oldest_shard_scan_age_secs(cache_dir: &Path) -> Option<u64> {
+fn oldest_shard_scan_age_secs(cache_dir: &Path) -> Option<u64> {
     oldest_shard_scan_age_from_checkpoints(&read_shard_checkpoints(cache_dir))
 }
 
@@ -494,7 +494,7 @@ pub async fn maybe_run_st_size_fold(
 }
 
 /// Longest wait before retrying a pass whose shard enumeration failed: five minutes.
-pub const ENUMERATION_FAILURE_BACKOFF_MAX_SECS: u64 = 300;
+const ENUMERATION_FAILURE_BACKOFF_MAX_SECS: u64 = 300;
 
 /// The retry delay after an enumeration failure: a tenth of the effective interval, at least
 /// one second, at most [`ENUMERATION_FAILURE_BACKOFF_MAX_SECS`], and never past the interval
@@ -732,7 +732,7 @@ pub(crate) fn fold_order(
 ///
 /// `L1` names are filtered through [`is_shard_level`], so a stray directory cannot become a
 /// shard no cache key could ever map to.
-pub fn enumerate_shards(cache_dir: &Path) -> std::io::Result<BTreeSet<Shard>> {
+fn enumerate_shards(cache_dir: &Path) -> std::io::Result<BTreeSet<Shard>> {
     let mut out = BTreeSet::new();
     // A missing tree is an empty tree: neither existing is an empty cache, not a failure.
     for root in ["ranges", "metadata"] {

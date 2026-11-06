@@ -149,6 +149,16 @@ fn seed_object(
     (meta_path, bin_path, size as u64)
 }
 
+/// Write the `size_tracking/size_state.json` document, as another instance's consolidation
+/// would leave it. The consolidator's `load_size_state` reads this file from disk.
+fn write_size_state_document(
+    cache_dir: &std::path::Path,
+    state: &s3_proxy::journal_consolidator::SizeState,
+) {
+    let p = cache_dir.join("size_tracking").join("size_state.json");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, serde_json::to_string_pretty(state).unwrap()).unwrap();
+}
 /// Install a Size_State directly, as another instance's consolidation would leave it.
 ///
 /// This is the cross-instance primitive: it writes the shared file **without** driving any
@@ -159,7 +169,7 @@ async fn seed_size_state(m: &CacheManager, total_size: u64, write_cache_size: u6
     let mut state = consolidator.load_size_state().await.unwrap();
     state.total_size = total_size;
     state.write_cache_size = write_cache_size;
-    consolidator.persist_size_state(&state).await.unwrap();
+    write_size_state_document(m.get_cache_dir(), &state);
 }
 
 /// Design test 12: fail-open (R7.5).

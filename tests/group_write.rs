@@ -18,18 +18,6 @@
 
 #[path = "bulk_write_invalidation_e2e_test.rs"]
 mod bulk_write_invalidation_e2e_test;
-#[path = "commit_concurrency_property_test.rs"]
-mod commit_concurrency_property_test;
-#[path = "incremental_range_commit_slot_wait_test.rs"]
-mod incremental_range_commit_slot_wait_test;
-#[path = "incremental_write_property_test.rs"]
-mod incremental_write_property_test;
-#[path = "large_file_cache_regression_fault_test.rs"]
-mod large_file_cache_regression_fault_test;
-#[path = "large_file_cache_regression_preservation_test.rs"]
-mod large_file_cache_regression_preservation_test;
-#[path = "metadata_heal_overwrite_test.rs"]
-mod metadata_heal_overwrite_test;
 #[path = "put_cache_delay_budget_test.rs"]
 mod put_cache_delay_budget_test;
 #[path = "put_cache_invalidation_property_test.rs"]
@@ -44,8 +32,6 @@ mod put_then_get_integration_test;
 mod response_overrides_and_non_object_puts_test;
 #[path = "signed_delete_cache_invalidation_test.rs"]
 mod signed_delete_cache_invalidation_test;
-#[path = "test_signed_put_handler.rs"]
-mod test_signed_put_handler;
 #[path = "test_write_cache_flag.rs"]
 mod test_write_cache_flag;
 #[path = "write_cache_add_accounting_test.rs"]
@@ -58,8 +44,6 @@ mod write_cache_last_modified_backfill_contention_test;
 mod write_cache_last_modified_test;
 #[path = "write_cache_max_object_size_reach_test.rs"]
 mod write_cache_max_object_size_reach_test;
-#[path = "write_cache_path_verification_test.rs"]
-mod write_cache_path_verification_test;
 #[path = "write_cache_range_test.rs"]
 mod write_cache_range_test;
 #[path = "write_cache_test.rs"]

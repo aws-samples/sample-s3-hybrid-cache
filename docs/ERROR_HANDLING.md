@@ -1,13 +1,14 @@
 # Error handling and recovery
 
-This page describes what Hybrid Cache for Amazon S3 does when something on the cache path fails: a damaged or missing cache file, a full or slow cache volume, a stalled upstream response, or a request loop. It is for operators deciding what to alert on and what to do when a counter moves. Each section names the detection, what the proxy does, and the metrics and log lines that show it.
+This page describes what Hybrid Cache for Amazon S3 does when something on the cache path fails. The failures it covers are a damaged or missing cache file, a full or slow cache volume, a stalled upstream response or upload, and a request loop. It is for operators deciding what to alert on and what to do when a counter moves. Each section names the detection, what the proxy does, and the metrics and log lines that show it.
 
 ## Overview
 
-Cache corruption, missing files and disk space errors do not stop the proxy. The proxy logs the error, records a metric where one exists, and serves the request from S3. Two cases reach the client:
+Cache corruption, missing files and disk space errors do not stop the proxy. The proxy logs the error, records a metric where one exists, and serves the request from S3. Three cases reach the client:
 
 - A stall mid-stream closes the client connection; see [Stalled upstream responses](#7-stalled-upstream-responses-mid-stream-idle-watchdog).
 - A read streamed from the cache that finds a damaged range file ends early with a connection error; see [Damaged range files](#damaged-range-files).
+- A write whose origin stops answering gets `504 Gateway Timeout`; see [Writes the origin stops answering](#10-writes-the-origin-stops-answering).
 
 Damaged state is cleared without operator action. Confidently corrupt metadata is overwritten by the next full-object fetch (see [Self-healing via overwrite-in-place](#self-healing-via-overwrite-in-place)), and range files that no metadata lists are deleted by the orphan reclamation rotation (see [Orphaned files](#6-orphaned-files)). A single damaged cache entry never stops the process.
 
@@ -216,6 +217,40 @@ Every request the proxy forwards over the HTTP listener or the TLS proxy listene
 - The entry is added whatever `add_referer_header` is set to; no setting turns it off.
 - The HTTPS passthrough (port 443) never reads request headers, so it neither adds the entry nor detects loops.
 
+### 10. Writes the origin stops answering
+
+**Detection**: while the proxy forwards an upload, multipart operation, copy or other write, the connect takes longer than `connection_pool.connection_timeout` (default `10s`), or the origin moves no byte for `connection_pool.upstream_write_idle_timeout` (default `120s`). [Upstream write timeout](CONFIGURATION.md#upstream-write-timeout) describes both.
+
+**What the proxy does**: it ends the attempt and answers `504 Gateway Timeout`. The request's permit and any memory it reserved are released, and the write cache stages nothing for an attempt that S3 did not answer with a `2xx`. A transfer that keeps moving is never cut off, and a client that pauses between body frames is never timed out by these fields.
+
+The proxy reads S3's answer to a write in full before the client sees any of it. An answer larger than 8 MiB, or one the origin cuts short, gets `502 Bad Gateway` instead of being returned as if complete.
+
+**Writes whose outcome is unknown.** Once the whole request has been sent, S3 may have applied the write although the proxy never saw the answer. So when such a write times out, loses its connection, or gets an answer cut short or over the bound, the proxy drops its cached copy of the key before it answers. The next GET goes to S3. This covers PUT, copy, CompleteMultipartUpload, DELETE and DeleteObjects, whether signed, presigned or anonymous. A GET that reaches S3 before S3 finishes applying the write can still get the previous version, and the proxy can cache that version until `cache.get_ttl` expires. A write that fails before its whole request was sent keeps the cached copy, because S3 does not apply a request it did not receive in full.
+
+## Error statuses the proxy sends itself
+
+The proxy passes S3's own error responses through. It answers the statuses below itself, with an S3-style XML error body unless the row says otherwise:
+
+| Status | Code | When |
+|---|---|---|
+| `400` | `InvalidRequest` | The `Host` header is repeated or is not a host name or address with an optional port, or in forward-proxy mode it names a different host or port from the request target |
+| `400` | `MissingHostHeader` | The request has no `Host` header |
+| `400` | `UpstreamTLSValidationFailed` | An upstream with `validate_tls: true` presents a certificate that fails verification. The proxy does not retry it without validation |
+| `400` | `MalformedXML` | A DeleteObjects request body the proxy cannot read exactly, refused without forwarding |
+| `400` | `BadRequest` | The proxy could not read the client's request body |
+| `400` | None: a plain-text body | A presigned URL whose signing parameters cannot be parsed, or, on the TLS listener, a CONNECT request that names no target |
+| `403` | `AccessDenied` | On the HTTP paths, the destination policy refuses the request's destination; see [Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection) |
+| `403` | None: a plain-text body | A presigned URL that has expired, refused before the cache lookup, or a CONNECT tunnel whose destination the policy refuses (the body is `Forbidden`) |
+| `405` | `MethodNotAllowed` | A method other than GET, HEAD, PUT, POST and DELETE |
+| `413` | `EntityTooLarge` | A body over S3's 5 GiB single-part PUT and UploadPart maximum, or a CompleteMultipartUpload body over `max_complete_body_bytes` (default 10 MiB). A request that declares its size in `Content-Length` is refused before any upstream connection opens. A streamed body with no `Content-Length` that passes 5 GiB is refused mid-stream, after the upstream request has started |
+| `500` | `InternalError` | An internal failure that is not the client's or the origin's |
+| `501` | `NotImplemented` | A SelectObjectContent request; see [Operations that bypass cache](CACHING.md#operations-that-bypass-cache) |
+| `502` | `BadGateway` | The origin cannot be reached, or S3's answer to a write is over 8 MiB or cut short. A request that waited on another request's fetch at `get_ttl: "0s"` also gets `502` when its own revalidation request to S3 does not complete, whatever the cause |
+| `503` | `SlowDown` | `server.max_concurrent_requests` or `server.max_inflight_buffer_bytes` is reached. The response carries `Retry-After` |
+| `504` | `GatewayTimeout` | An upstream timeout: a full-object GET or HEAD whose first byte does not arrive in time, a write's connect or idle bound, or the fixed 30-second timeout on each upstream read request |
+| `504` | None: an empty body | A part or range request that waited on another request's fetch and ran out of `max_waiter_resubscriptions`; see [Download coordination](CACHE_READ_PATHS.md#download-coordination) |
+| `508` | `LoopDetected` | The request has already passed through this proxy; see [Request loops](#9-request-loops-via-and-508-loop-detected) |
+
 ## Error metrics
 
 The error counters sit in the `cache` section of `/metrics` (`curl http://localhost:9090/metrics`); [`cache`](METRICS_REFERENCE.md#cache) is the field reference.
@@ -318,10 +353,10 @@ Size `cache.max_cache_size` against the volume as described under [Disk space ex
 
 ## Testing
 
-The error-handling paths are covered by `tests/error_handling_test.rs`, which builds inside the `group_other` test target:
+The error-handling paths are covered by `src/cache/moved_fill_tests/error_handling_test.rs`, which builds with the library's unit tests:
 
 ```bash
-cargo test --release --test group_other -- error_handling_test::  # Run the error-handling tests
+cargo test --release --lib -- moved_fill_tests::error_handling_test::  # Run the error-handling tests
 ```
 
 ## See also

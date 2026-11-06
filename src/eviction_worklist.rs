@@ -58,7 +58,7 @@
 //!
 //!
 //! The document is written to a temp file whose name carries the hostname, the pid and a
-//! process-local counter (`Shared::Yes` discipline: two instances, or two tasks in one process,
+//! process-local counter (`write_atomic`'s discipline: two instances, or two tasks in one process,
 //! never share a temp path), synced, then published with `link(tmp, path)`. `link` fails with
 //! `EEXIST` if the target exists, atomically, so a second author of the same path loses rather
 //! than replaces. `rename` would silently replace the first author's chunk.
@@ -695,7 +695,7 @@ async fn publish_once_with(
 async fn publish_once_io(path: &Path, bytes: &[u8], io: PublishIo) -> Result<PublishOutcome> {
     #[cfg(test)]
     if PUBLISH_BY_RENAME_OVER {
-        crate::disk_cache::write_atomic(path, bytes, crate::disk_cache::Shared::Yes).await?;
+        crate::disk_cache::write_atomic(path, bytes).await?;
         return Ok(PublishOutcome::Published);
     }
 
@@ -1194,12 +1194,7 @@ pub(crate) async fn advance_generation(
     })
     .map_err(|e| ProxyError::CacheError(format!("eviction generation: serialize: {}", e)))?;
     body.push(b'\n');
-    crate::disk_cache::write_atomic(
-        &generation_path(cache_dir),
-        &body,
-        crate::disk_cache::Shared::Yes,
-    )
-    .await?;
+    crate::disk_cache::write_atomic(&generation_path(cache_dir), &body).await?;
     latch_generation(cache_dir, next);
     Ok(Advance::Advanced)
 }
@@ -3302,7 +3297,7 @@ mod driver_tests {
             plant(&m, dir, i, now - Duration::from_secs(36_000 - i * 600));
         }
         consolidator
-            .persist_size_state(&crate::journal_consolidator::SizeState {
+            .seed_size_state_for_tests(&crate::journal_consolidator::SizeState {
                 total_size: MAX,
                 ..Default::default()
             })
@@ -3357,7 +3352,7 @@ mod driver_tests {
             plant(&m, dir, i, now - Duration::from_secs(36_000 - i * 600));
         }
         consolidator
-            .persist_size_state(&crate::journal_consolidator::SizeState {
+            .seed_size_state_for_tests(&crate::journal_consolidator::SizeState {
                 total_size: MAX,
                 ..Default::default()
             })

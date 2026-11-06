@@ -692,7 +692,6 @@ impl CacheInitializationCoordinator {
             return Ok(ValidationFreshnessInfo {
                 is_fresh: false,
                 message: "No validation timestamp file found".to_string(),
-                last_validation: None,
             });
         }
 
@@ -724,27 +723,23 @@ impl CacheInitializationCoordinator {
                                         age.as_secs_f64() / 3600.0
                                     )
                                 },
-                                last_validation: Some(last_validation),
                             })
                         } else {
                             Ok(ValidationFreshnessInfo {
                                 is_fresh: false,
                                 message: "Invalid validation timestamp format".to_string(),
-                                last_validation: None,
                             })
                         }
                     }
                     Err(_) => Ok(ValidationFreshnessInfo {
                         is_fresh: false,
                         message: "Corrupted validation timestamp file".to_string(),
-                        last_validation: None,
                     }),
                 }
             }
             Err(_) => Ok(ValidationFreshnessInfo {
                 is_fresh: false,
                 message: "Failed to read validation timestamp file".to_string(),
-                last_validation: None,
             }),
         }
     }
@@ -775,7 +770,7 @@ impl CacheInitializationCoordinator {
         //    the recreated path gets a *different inode* and therefore an *independent* lock. So
         //    the removal did not recover a stuck lock — it manufactured concurrent validation.
         //
-        // Concurrent validation is not a cosmetic problem. `update_size_from_validation` is an
+        // Concurrent validation is not a cosmetic problem. `update_size_from_validation_with_kind` is an
         // absolute install of `total_size`, `write_cache_size` and `cached_objects` that takes no
         // lock of its own, and it also calls `reset_all_delta_files()` and
         // `size_accumulator.reset()`. Two overlapping passes therefore discard each other's
@@ -1463,7 +1458,7 @@ impl CacheInitializationCoordinator {
         // figure comparable to a residency figure — there is no correct expected
         // relationship between them at all. The accounting invariant that DOES matter,
         // `write_cache_size <= total_size`, is enforced where it belongs, by the clamp in
-        // `JournalConsolidator::update_size_from_validation` (R6.4).
+        // `JournalConsolidator::update_size_from_validation_with_kind` (R6.4).
         //
         // Both figures are still reported, so the information is not lost, and
         // `/metrics` exposes them separately as `write_cache.inflight_bytes` and
@@ -1856,20 +1851,11 @@ impl ObjectsScanResults {
     }
 
     /// Calculate write cache usage percentage
-    pub fn write_cache_percentage(&self) -> f64 {
+    fn write_cache_percentage(&self) -> f64 {
         if self.total_size == 0 {
             0.0
         } else {
             (self.write_cached_size as f64 / self.total_size as f64) * 100.0
-        }
-    }
-
-    /// Calculate read cache usage percentage
-    pub fn read_cache_percentage(&self) -> f64 {
-        if self.total_size == 0 {
-            0.0
-        } else {
-            (self.read_cached_size as f64 / self.total_size as f64) * 100.0
         }
     }
 
@@ -1886,16 +1872,6 @@ impl ObjectsScanResults {
     /// Format read cached size in human-readable format
     pub fn format_read_cached_size(&self) -> String {
         format_bytes_human(self.read_cached_size)
-    }
-
-    /// Get average object size
-    pub fn average_object_size(&self) -> u64 {
-        self.total_size.checked_div(self.total_objects).unwrap_or(0)
-    }
-
-    /// Format average object size in human-readable format
-    pub fn format_average_object_size(&self) -> String {
-        format_bytes_human(self.average_object_size())
     }
 
     /// Get error count
@@ -1953,104 +1929,10 @@ impl CacheMetadataEntry {
         }
     }
 
-    /// Create from file path with error handling
-    pub async fn from_file(path: PathBuf) -> Result<Option<Self>> {
-        let mut entry = Self::new(path.clone());
-
-        // Read and parse metadata file
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => match serde_json::from_str::<NewCacheMetadata>(&content) {
-                Ok(metadata) => {
-                    entry.cache_key = metadata.cache_key.clone();
-                    entry.compressed_size = metadata
-                        .ranges
-                        .iter()
-                        .map(|range| range.compressed_size)
-                        .sum();
-                    entry.is_write_cached = metadata.object_metadata.is_write_cached;
-                    entry.metadata = Some(metadata);
-                }
-                Err(e) => {
-                    entry.parse_errors.push(format!("JSON parse error: {}", e));
-                }
-            },
-            Err(e) => {
-                entry.parse_errors.push(format!("File read error: {}", e));
-            }
-        }
-
-        Ok(Some(entry))
-    }
-
-    /// Create from file path synchronously (for use in parallel context)
-    pub fn from_file_sync(path: PathBuf) -> Self {
-        let mut entry = Self::new(path.clone());
-
-        // Read and parse metadata file
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<NewCacheMetadata>(&content) {
-                Ok(metadata) => {
-                    entry.cache_key = metadata.cache_key.clone();
-                    entry.compressed_size = metadata
-                        .ranges
-                        .iter()
-                        .map(|range| range.compressed_size)
-                        .sum();
-                    entry.is_write_cached = metadata.object_metadata.is_write_cached;
-                    entry.metadata = Some(metadata);
-                }
-                Err(e) => {
-                    entry.parse_errors.push(format!("JSON parse error: {}", e));
-                }
-            },
-            Err(e) => {
-                entry.parse_errors.push(format!("File read error: {}", e));
-            }
-        }
-
-        entry
-    }
-
-    /// Check if entry is valid for processing
-    pub fn is_valid(&self) -> bool {
-        self.metadata.is_some() && self.parse_errors.is_empty()
-    }
-
     /// Check if entry has errors
     pub fn has_errors(&self) -> bool {
         !self.parse_errors.is_empty()
     }
-
-    /// Get categorization for subsystem routing
-    pub fn get_category(&self) -> CacheCategory {
-        if !self.is_valid() {
-            CacheCategory::Invalid
-        } else if self.is_write_cached {
-            CacheCategory::WriteCached
-        } else {
-            CacheCategory::ReadCached
-        }
-    }
-
-    /// Get error summary string
-    pub fn error_summary(&self) -> String {
-        if self.parse_errors.is_empty() {
-            "No errors".to_string()
-        } else {
-            self.parse_errors.join("; ")
-        }
-    }
-}
-
-/// Categorization of cache entries
-#[derive(Debug, Clone, PartialEq)]
-pub enum CacheCategory {
-    /// Write-cached object (PUT operation)
-    WriteCached,
-    /// Read-cached object (GET operation)
-    ReadCached,
-    /// Invalid or corrupted entry
-    Invalid,
 }
 
 /// Error encountered during cache scanning
@@ -2072,24 +1954,6 @@ impl ScanError {
             message,
             category,
         }
-    }
-
-    /// Create a file read error
-    pub fn file_read_error(path: PathBuf, error: std::io::Error) -> Self {
-        Self::new(
-            path,
-            format!("File read error: {}", error),
-            ScanErrorCategory::FileRead,
-        )
-    }
-
-    /// Create a JSON parse error
-    pub fn json_parse_error(path: PathBuf, error: serde_json::Error) -> Self {
-        Self::new(
-            path,
-            format!("JSON parse error: {}", error),
-            ScanErrorCategory::JsonParse,
-        )
     }
 
     /// Create a validation error
@@ -2317,7 +2181,7 @@ impl Drop for InitializationLock {
 /// - Requirement 10.2: Add coordination for shared cache validation
 /// - Requirement 10.3: Ensure consistent view after initialization
 #[derive(Debug, Clone)]
-pub struct CacheConsistencyInfo {
+pub(crate) struct CacheConsistencyInfo {
     /// Status of shared cache validation coordination
     pub shared_validation_status: String,
     /// Message describing shared validation status
@@ -2386,18 +2250,16 @@ impl std::fmt::Display for CacheConsistencyInfo {
 
 /// Information about validation freshness check
 #[derive(Debug, Clone)]
-pub struct ValidationFreshnessInfo {
+struct ValidationFreshnessInfo {
     /// Whether the validation is fresh (< 23 hours old)
     pub is_fresh: bool,
     /// Descriptive message about the freshness status
     pub message: String,
-    /// Timestamp of last validation if available
-    pub last_validation: Option<std::time::SystemTime>,
 }
 
 /// Information about a specific validation check
 #[derive(Debug, Clone)]
-pub struct ValidationInfo {
+struct ValidationInfo {
     /// Status of the validation
     pub status: String,
     /// Descriptive message about the validation result
@@ -2488,66 +2350,6 @@ mod tests {
         assert_eq!(format_bytes_human(2097152), "2.0 MB");
     }
 
-    #[test]
-    fn test_objects_scan_results() {
-        let mut results = ObjectsScanResults::empty();
-        results.total_objects = 10;
-        results.total_size = 1000;
-        results.write_cached_size = 250;
-        results.read_cached_size = 750;
-
-        assert_eq!(results.write_cache_percentage(), 25.0);
-        assert_eq!(results.read_cache_percentage(), 75.0);
-        assert_eq!(results.format_total_size(), "1000 B");
-        assert_eq!(results.format_write_cached_size(), "250 B");
-        assert_eq!(results.format_read_cached_size(), "750 B");
-        assert_eq!(results.average_object_size(), 100);
-        assert_eq!(results.format_average_object_size(), "100 B");
-        assert!(!results.has_errors());
-        assert_eq!(results.error_count(), 0);
-    }
-
-    #[test]
-    fn test_cache_metadata_entry() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test.meta");
-
-        let mut entry = CacheMetadataEntry::new(file_path.clone());
-        entry.cache_key = "test-bucket/test-object".to_string();
-        entry.compressed_size = 1024;
-        entry.is_write_cached = true;
-
-        assert_eq!(entry.file_path, file_path);
-        assert_eq!(entry.cache_key, "test-bucket/test-object");
-        assert_eq!(entry.compressed_size, 1024);
-        assert!(entry.is_write_cached);
-        assert!(!entry.is_valid()); // No metadata set
-        assert!(!entry.has_errors());
-        assert_eq!(entry.get_category(), CacheCategory::Invalid);
-    }
-
-    #[test]
-    fn test_scan_error() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test.meta");
-
-        let error = ScanError::file_read_error(
-            file_path.clone(),
-            std::io::Error::new(std::io::ErrorKind::NotFound, "File not found"),
-        );
-
-        assert_eq!(error.path, file_path);
-        assert!(error.message.contains("File read error"));
-        assert_eq!(error.category, ScanErrorCategory::FileRead);
-    }
-
-    #[test]
-    fn test_cache_category() {
-        assert_eq!(CacheCategory::WriteCached, CacheCategory::WriteCached);
-        assert_ne!(CacheCategory::WriteCached, CacheCategory::ReadCached);
-        assert_ne!(CacheCategory::ReadCached, CacheCategory::Invalid);
-    }
-
     #[tokio::test]
     async fn test_cross_validate_subsystems_both_available() {
         use crate::cache::CacheEvictionAlgorithm;
@@ -2604,7 +2406,12 @@ mod tests {
         consolidator.initialize().await.unwrap();
         // Set write cache size to match manager
         consolidator
-            .update_size_from_validation(512, Some(512), None)
+            .update_size_from_validation_with_kind(
+                512,
+                Some(512),
+                None,
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
 
         // Create size tracker with consolidator reference
@@ -2702,7 +2509,12 @@ mod tests {
         consolidator.initialize().await.unwrap();
         // 1000 resident staged bytes on the shared volume.
         consolidator
-            .update_size_from_validation(1000, Some(1000), None)
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(1000),
+                None,
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
 
         let size_config = CacheSizeConfig {

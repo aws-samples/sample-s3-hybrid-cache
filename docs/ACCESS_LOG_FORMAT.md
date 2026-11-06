@@ -39,7 +39,7 @@ spaces inside their brackets or quotes, so split on the delimiters rather than o
 | 18 | `signature_version` | | Always `-` |
 | 19 | `cipher_suite` | | Always `-` |
 | 20 | `authentication_type` | | Always `Anonymous` |
-| 21 | `host_header` | | Client `Host` header |
+| 21 | `host_header` | | The host from the client's `Host` header after validation, without the port or IPv6 brackets |
 | 22 | `tls_version` | | Always `-` |
 | 23 | `access_point_arn` | | Always `-` |
 | 24 | `acl_required` | | Always `-` |
@@ -92,8 +92,9 @@ not. Check [Upgrading](UPGRADING.md) when adopting a new release.
 
 ## Escaping and redaction
 
-Three transformations run before a line is written, all to stop a client-controlled string from
-corrupting the log.
+Two transformations run before a line is written: presigned URL credentials are redacted, and
+the fields that carry request text are escaped so that a client-controlled string cannot corrupt
+the log.
 
 ### Presigned URL parameters are redacted
 
@@ -119,17 +120,24 @@ parameter with no `=` passes through unchanged.
 
 ### Free-text fields are escaped
 
-Fields 15 (`referer`) and 16 (`user_agent`) come straight from client headers, so three
-characters are escaped to keep the value inside its quotes and on one line:
+Six fields carry text from the request: 1 (`bucket_owner`) and 2 (`bucket`), parsed from the
+request path; 8 (`request_uri`); 15 (`referer`) and 16 (`user_agent`), from client headers; and
+21 (`host_header`). Four characters are escaped in each, to keep the value inside its quotes and
+on one line:
 
 | Input | Written as |
 |---|---|
 | CR | `\r` (a literal backslash, then `r`) |
 | LF | `\n` (a literal backslash, then `n`) |
 | `"` | `\"` |
+| `\` | `\\` |
 
-A parser must un-escape these two fields and must not treat `\"` inside them as a closing quote.
-No other field is escaped, because the proxy generates every other field itself.
+A parser must un-escape these six fields and must not treat `\"` inside them as a closing quote.
+Because a backslash is escaped too, a request path holding `\"` is written `\\\"`, and a parser
+that honors backslash escapes keeps the record's field count. `host_header` needs no escaping in
+practice, because the proxy answers `400` to a `Host` header that is not a host name or address
+with an optional port. The proxy generates every other field itself, apart from the method inside
+`operation`, which HTTP limits to characters that need no escaping.
 
 ### Nothing else is masked
 

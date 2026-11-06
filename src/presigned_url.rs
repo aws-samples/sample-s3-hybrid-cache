@@ -98,11 +98,6 @@ impl PresignedUrlInfo {
         SystemTime::now() > self.expires_at
     }
 
-    /// Get time remaining until expiration (None if already expired)
-    pub fn time_until_expiration(&self) -> Option<Duration> {
-        self.expires_at.duration_since(SystemTime::now()).ok()
-    }
-
     /// Get time since expiration (None if not yet expired)
     pub fn time_since_expiration(&self) -> Option<Duration> {
         SystemTime::now().duration_since(self.expires_at).ok()
@@ -423,7 +418,6 @@ mod tests {
         };
 
         assert!(info.is_expired());
-        assert!(info.time_until_expiration().is_none());
         assert!(info.time_since_expiration().is_some());
     }
 
@@ -442,7 +436,6 @@ mod tests {
         };
 
         assert!(!info.is_expired());
-        assert!(info.time_until_expiration().is_some());
         assert!(info.time_since_expiration().is_none());
     }
 

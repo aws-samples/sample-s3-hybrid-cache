@@ -205,7 +205,6 @@ fewer `.meta` files from disk, while staying consistent with the files on disk.
 MetadataCacheEntry {
     metadata: NewCacheMetadata,  // Full metadata including HEAD and GET fields
     loaded_at: Instant,          // When loaded from disk
-    disk_mtime: Option<SystemTime>, // Disk file modification time
     last_accessed: Instant,      // For LRU eviction
 }
 ```
@@ -1074,7 +1073,7 @@ in [Size tracking](SHARED_STORAGE.md#size-tracking).
 Cache size tracking uses an in-memory `AtomicI64` accumulator in each proxy:
 
 ```text
-store_range() success → accumulator.add(compressed_size)
+range commit          → accumulator.add(compressed_size)
 eviction              → accumulator.subtract(compressed_size)
                               ↓
               Flush to delta_{instance_id}_{seq}.json (every 5s)
@@ -1215,7 +1214,7 @@ Fields:
   **Every deletion of a range file must debit, and must release the range's dedup entry.** A path
   that removes a `.bin` and does not debit leaves the figure holding bytes the disk no longer
   has. The two write paths that replace an object's content
-  (`store_put_as_write_cached_range_with_ttl` on a re-PUT, and `store_full_object_as_range_new`
+  (`store_put_as_write_cached_range_with_ttl` on a re-PUT, and `store_full_object_as_range_witnessed`
   when it supersedes partial ranges) both route through `remove_range_files` and
   `debit_removed_ranges` for this reason.
 

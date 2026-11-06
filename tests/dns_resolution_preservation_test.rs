@@ -34,13 +34,14 @@ async fn test_live_dns_resolves_s3_endpoints() {
 
     for endpoint in &["s3.amazonaws.com", "s3.us-east-1.amazonaws.com"] {
         let ips = manager
-            .resolve_endpoint(endpoint)
+            .lookup()
+            .resolve(endpoint)
             .await
-            .unwrap_or_else(|e| panic!("resolve_endpoint({endpoint}) failed: {e}"));
+            .unwrap_or_else(|e| panic!("resolve({endpoint}) failed: {e}"));
 
         assert!(
             !ips.is_empty(),
-            "resolve_endpoint({endpoint}) returned an empty IP list"
+            "resolve({endpoint}) returned an empty IP list"
         );
 
         for ip in &ips {

@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "3.0.1"
+version = "3.0.2"
 edition = "2021"
 # MSRV. `time` and `hickory-{resolver,proto,net}` declare rust-version = "1.88", so the floor
 # cannot go below 1.88 whatever this crate does. 1.89 is retained rather than lowered to 1.88:
@@ -142,9 +142,6 @@ path = "examples/compression_demo.rs"
 name = "cache_consistency_demo"
 path = "examples/cache_consistency_demo.rs"
 
-[[example]]
-name = "cache_key_sanitization_demo"
-path = "examples/cache_key_sanitization_demo.rs"
 
 [[example]]
 name = "presigned_url_demo"
@@ -251,7 +248,7 @@ path = "tests/group_write.rs"
 name = "buffered_serve_memory_bound_test"
 path = "tests/buffered_serve_memory_bound_test.rs"
 
-# cache_logging_test: installs a global tracing subscriber with a capturing layer and asserts captured log lines
+# cache_logging_test: installs a global tracing subscriber (a test writer, for the rig's log output); it asserts on the range handler's results, not on captured log lines
 [[test]]
 name = "cache_logging_test"
 path = "tests/cache_logging_test.rs"
@@ -330,6 +327,11 @@ path = "tests/multipart_write_cache_signed_range_race_e2e.rs"
 [[test]]
 name = "origin_marker_test"
 path = "tests/origin_marker_test.rs"
+# logging_request_level_test: LoggerManager::initialize installs the process-global tracing
+# subscriber, and the checks read the application-log file it writes, so the process is its own.
+[[test]]
+name = "logging_request_level_test"
+path = "tests/logging_request_level_test.rs"
 
 # pending_journal_lookup_cost_test: #[global_allocator] (one per binary) measuring one journal lookup's peak heap
 [[test]]
@@ -401,6 +403,10 @@ path = "tests/st_size_fold_wiring_test.rs"
 name = "write_through_headers_and_multipart_test"
 path = "tests/write_through_headers_and_multipart_test.rs"
 
+# multipart_http_proxy_test: bounded fixture waits against a real HttpProxy, the shape of write_through_headers_and_multipart_test above (not measured grouped)
+[[test]]
+name = "multipart_http_proxy_test"
+path = "tests/multipart_http_proxy_test.rs"
 # volume_stall_breaker_test: sets the process-global volume-stall statics (set_probe_fails_for_tests)
 [[test]]
 name = "volume_stall_breaker_test"

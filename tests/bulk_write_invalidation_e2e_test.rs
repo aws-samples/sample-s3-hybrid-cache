@@ -65,12 +65,28 @@ struct MockState {
     delete: DeleteBehaviour,
     delete_requests: usize,
     post_requests: usize,
+    /// Close the connection without answering a form POST after reading all of it.
+    drop_form_post_answer: bool,
+    /// Delay between storing a PUT, DeleteObject or CompleteMultipartUpload and
+    /// answering it, so a client can disconnect meanwhile.
+    write_respond_after: Option<Duration>,
+    /// PUT, DeleteObject and CompleteMultipartUpload requests stored, and answered.
+    writes_received: usize,
+    writes_answered: usize,
 }
 
 #[derive(Clone, Default)]
 struct MockS3 {
     state: Arc<Mutex<MockState>>,
+    /// Lets the answer to a PUT of `STALL_KEY` finish (see `MockS3::serve`).
+    stall_release: Arc<tokio::sync::Notify>,
 }
+
+/// The key whose PUT the mock answers with a head and part of its body, then holds
+/// until `MockS3::stall_release` is notified.
+const STALL_KEY: &str = "stall/a.txt";
+
+type MockBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::convert::Infallible>;
 
 /// A request path's object key as Amazon S3 reads it: `%XX` is a byte, `+` a space and
 /// a raw non-ASCII byte a `?`.
@@ -192,7 +208,73 @@ impl MockS3 {
         self.state.lock().unwrap().delete = behaviour;
     }
 
-    async fn handle(self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    /// The key's generation, `None` once deleted.
+    fn generation(&self, key: &str) -> Option<u32> {
+        self.state.lock().unwrap().objects.get(key).copied()
+    }
+
+    /// (stored, answered) counts of PUT, DeleteObject and CompleteMultipartUpload.
+    fn writes(&self) -> (usize, usize) {
+        let st = self.state.lock().unwrap();
+        (st.writes_received, st.writes_answered)
+    }
+
+    /// `serve` in its own task. The error is an `io::Error` because a boxed `dyn Error`
+    /// in the task's output trips a higher-ranked lifetime check where the connection task
+    /// is spawned.
+    fn spawn_serve(
+        self,
+        req: Request<Incoming>,
+    ) -> tokio::task::JoinHandle<Result<Response<MockBody>, std::io::Error>> {
+        tokio::spawn(async move {
+            self.serve(req)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })
+    }
+
+    /// `handle`, except that a PUT of `STALL_KEY` is answered with its head and 10 of
+    /// its 64 body bytes, and the rest only once `stall_release` is notified.
+    async fn serve(
+        self,
+        req: Request<Incoming>,
+    ) -> Result<Response<MockBody>, Box<dyn std::error::Error + Send + Sync>> {
+        let stalls = req.method() == hyper::Method::PUT
+            && req.uri().path() == format!("/{}/{}", BUCKET, STALL_KEY);
+        if !stalls {
+            return Ok(self.handle(req).await?.map(|b| b.boxed_unsync()));
+        }
+        let _ = req.into_body().collect().await?;
+        let release = Arc::clone(&self.stall_release);
+        let frames = futures::stream::unfold(0u8, move |step| {
+            let release = Arc::clone(&release);
+            async move {
+                let data = match step {
+                    0 => Bytes::from_static(b"0123456789"),
+                    1 => {
+                        release.notified().await;
+                        Bytes::from(vec![b'x'; 54])
+                    }
+                    _ => return None,
+                };
+                Some((
+                    Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(data)),
+                    step + 1,
+                ))
+            }
+        });
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("etag", "\"etag-stall\"")
+            .header("content-length", "64")
+            .body(http_body_util::StreamBody::new(frames).boxed_unsync())
+            .unwrap())
+    }
+
+    async fn handle(
+        self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
         let method = req.method().clone();
         let host = req
             .headers()
@@ -202,6 +284,7 @@ impl MockS3 {
             .to_string();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
+        let copy_source = req.headers().contains_key("x-amz-copy-source");
         let body = req.into_body().collect().await?.to_bytes();
         let bucket_root = format!("/{}", BUCKET);
 
@@ -260,6 +343,11 @@ impl MockS3 {
             st.post_requests += 1;
             st.contents.remove(&key);
             *st.objects.entry(key).or_insert(0) += 1;
+            if st.drop_form_post_answer {
+                return Err(Box::new(std::io::Error::other(
+                    "the mock closes the connection without answering",
+                )));
+            }
             return Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header("location", location)
@@ -272,18 +360,97 @@ impl MockS3 {
                 path.strip_prefix(&format!("{}/", bucket_root))
                     .unwrap_or(""),
             );
-            let mut st = self.state.lock().unwrap();
-            let generation = {
-                let g = st.objects.entry(key.clone()).or_insert(0);
-                *g += 1;
-                *g
+            let (generation, delay) = {
+                let mut st = self.state.lock().unwrap();
+                let generation = {
+                    let g = st.objects.entry(key.clone()).or_insert(0);
+                    *g += 1;
+                    *g
+                };
+                if copy_source {
+                    st.contents.remove(&key);
+                } else {
+                    st.contents.insert(key, body);
+                }
+                st.writes_received += 1;
+                (generation, st.write_respond_after)
             };
-            st.contents.insert(key, body);
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.state.lock().unwrap().writes_answered += 1;
+            let out = if copy_source {
+                format!(
+                    "<CopyObjectResult><ETag>\"etag-{}\"</ETag><LastModified>2025-01-01T00:00:00.000Z</LastModified></CopyObjectResult>",
+                    generation
+                )
+            } else {
+                String::new()
+            };
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("etag", format!("\"etag-{}\"", generation))
-                .header("content-length", "0")
+                .header("content-length", out.len().to_string())
+                .body(Full::new(Bytes::from(out)))
+                .unwrap());
+        }
+
+        if method == hyper::Method::DELETE && query.is_empty() {
+            let key = percent_decode(
+                path.strip_prefix(&format!("{}/", bucket_root))
+                    .unwrap_or(""),
+            );
+            let delay = {
+                let mut st = self.state.lock().unwrap();
+                st.objects.remove(&key);
+                st.contents.remove(&key);
+                st.writes_received += 1;
+                st.write_respond_after
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.state.lock().unwrap().writes_answered += 1;
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
                 .body(Full::new(Bytes::new()))
+                .unwrap());
+        }
+
+        if method == hyper::Method::POST && path != bucket_root && query.contains("uploadId=") {
+            let key = percent_decode(
+                path.strip_prefix(&format!("{}/", bucket_root))
+                    .unwrap_or(""),
+            );
+            let (generation, delay) = {
+                let mut st = self.state.lock().unwrap();
+                st.contents.remove(&key);
+                let generation = {
+                    let g = st.objects.entry(key.clone()).or_insert(0);
+                    *g += 1;
+                    *g
+                };
+                st.writes_received += 1;
+                (generation, st.write_respond_after)
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.state.lock().unwrap().writes_answered += 1;
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>http://{}/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>\"etag-{}\"</ETag></CompleteMultipartUploadResult>",
+                host,
+                BUCKET,
+                xml_escape(&key),
+                BUCKET,
+                xml_escape(&key),
+                generation
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/xml")
+                .header("content-length", xml.len().to_string())
+                .body(Full::new(Bytes::from(xml)))
                 .unwrap());
         }
 
@@ -338,7 +505,16 @@ impl MockS3 {
                         let Ok((stream, _)) = accept else { break };
                         let mock = self.clone();
                         tokio::spawn(async move {
-                            let service = service_fn(move |req| mock.clone().handle(req));
+                            // Each request runs in its own task. hyper drops a service
+                            // future when its client closes the connection, and a proxy that
+                            // closes its upstream connection once the request is sent must
+                            // not cancel the mock's commit: S3 keeps what it received.
+                            let service = service_fn(move |req| {
+                                use futures::FutureExt;
+                                mock.clone()
+                                    .spawn_serve(req)
+                                    .map(|joined| joined.expect("mock task"))
+                            });
                             let _ = http1::Builder::new()
                                 .serve_connection(TokioIo::new(stream), service)
                                 .await;
@@ -361,9 +537,17 @@ struct Harness {
     mock: MockS3,
     mock_host: String,
     proxy: SocketAddr,
+    /// The proxy's in-flight ledger.
+    ledger: Arc<s3_proxy::inflight_ledger::InflightLedger>,
 }
 
 async fn harness() -> Harness {
+    harness_with_ceiling(0).await
+}
+
+/// The harness with `server.max_inflight_buffer_bytes` set to `ceiling` (0 disables the
+/// ledger, the default).
+async fn harness_with_ceiling(ceiling: u64) -> Harness {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mock = MockS3::default();
     let (mock_addr, mock_shutdown) = mock.clone().spawn().await;
@@ -379,6 +563,7 @@ async fn harness() -> Harness {
     config.cache.get_ttl = Duration::from_secs(3600);
     config.cache.head_ttl = Duration::from_secs(3600);
     config.cache.bucket_settings_staleness_threshold = Duration::ZERO;
+    config.server.max_inflight_buffer_bytes = ceiling;
     config.connection_pool.upstream_overrides.insert(
         mock_host.clone(),
         UpstreamOverrideConfig {
@@ -418,6 +603,7 @@ async fn harness() -> Harness {
     let inflight_ledger = Arc::new(s3_proxy::inflight_ledger::InflightLedger::new(
         config.server.max_inflight_buffer_bytes,
     ));
+    let ledger = Arc::clone(&inflight_ledger);
     let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(
         S3Client::new(&config.connection_pool, None)
             .expect("s3 client")
@@ -498,6 +684,7 @@ async fn harness() -> Harness {
         mock,
         mock_host,
         proxy,
+        ledger,
     }
 }
 
@@ -1066,6 +1253,86 @@ async fn form_post_with_unreadable_fields_invalidates_the_object_s3_names() {
     );
 }
 
+// ── A form POST the client cuts off does not drop the key it names ──
+/// A form POST naming `key` whose body is cut off before its end: the header declares the
+/// full length and the connection closes after all but the last bytes. The `key` field is
+/// complete, so the proxy has read which object the upload names.
+async fn truncated_form_post(h: &Harness, key: &str) {
+    use tokio::io::AsyncWriteExt;
+    let boundary = "----scn6boundary";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\n{key}\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nnew-bytes-that-never-finish\r\n--{b}--\r\n",
+        b = boundary,
+        key = key
+    );
+    let request = format!(
+        "POST /{} HTTP/1.1\r\nhost: {}\r\ncontent-type: multipart/form-data; boundary={}\r\ncontent-length: {}\r\n\r\n",
+        BUCKET,
+        h.mock_host,
+        boundary,
+        body.len()
+    );
+    let mut stream = TcpStream::connect(h.proxy).await.expect("connect");
+    stream.write_all(request.as_bytes()).await.expect("head");
+    stream
+        .write_all(&body.as_bytes()[..body.len() - 40])
+        .await
+        .expect("partial body");
+    stream.flush().await.expect("flush");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn form_post_cut_off_by_the_client_keeps_the_cached_key() {
+    let h = harness().await;
+    h.mock.put("cut/form.txt");
+    let old = h.cache("cut/form.txt").await;
+    truncated_form_post(&h, "cut/form.txt").await;
+    assert_eq!(
+        h.mock.state.lock().unwrap().post_requests,
+        0,
+        "the mock must not have seen a completed form POST"
+    );
+    let (reached, status, body) = h.probe("cut/form.txt").await;
+    assert!(
+        !reached && status == StatusCode::OK && body == old,
+        "a form POST cut off before it reached S3 dropped the cached key: reached_origin={} status={} body={:?}",
+        reached,
+        status,
+        String::from_utf8_lossy(&body)
+    );
+}
+
+// Control: the request was sent in full and S3's answer never came, so S3 may have stored
+// the object and the cached copy goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn form_post_sent_in_full_without_an_answer_invalidates_the_named_key() {
+    let h = harness().await;
+    h.mock.put("cut/unanswered.txt");
+    let old = h.cache("cut/unanswered.txt").await;
+    h.mock.state.lock().unwrap().drop_form_post_answer = true;
+    let status = h
+        .form_post("cut/unanswered.txt", "local.txt", "new-bytes")
+        .await;
+    assert!(
+        !status.is_success(),
+        "the proxy cannot have an answer to relay: {status}"
+    );
+    h.mock.state.lock().unwrap().drop_form_post_answer = false;
+    let (reached, status, body) = h.probe("cut/unanswered.txt").await;
+    assert!(
+        reached && status == StatusCode::OK && body != old,
+        "a form POST sent in full whose answer never came left the cached key servable: \
+         reached_origin={} status={} body={:?}",
+        reached,
+        status,
+        String::from_utf8_lossy(&body)
+    );
+}
+
 // ── A versioned <Error> exempts no key whose other version was deleted ──
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1476,4 +1743,473 @@ async fn delete_objects_non_utf8_declaration_is_refused_not_misread() {
         reached,
         status
     );
+}
+
+// ── A write sent while the in-flight ledger is past its ceiling ─────────────
+//
+// A write's response is read into memory without being refused, past the ledger's
+// ceiling if need be. A second write whose request finishes sending in that state has
+// reached S3 in full: the client must get S3's answer, and the cached key must go.
+
+const CEILING: u64 = 1 << 20;
+
+/// A raw HTTP/1.1 request to the proxy, for the mock's host.
+fn raw_request(
+    h: &Harness,
+    method: &str,
+    path_and_query: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\nhost: {}\r\ncontent-length: {}\r\n",
+        method,
+        path_and_query,
+        h.mock_host,
+        body.len()
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    head.push_str("\r\n");
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+/// Read a response head from `stream` and return its status code, 0 if the connection
+/// closed first.
+async fn read_status(stream: &mut TcpStream) -> u16 {
+    use tokio::io::AsyncReadExt;
+    let read = async {
+        let mut seen = Vec::new();
+        let mut byte = [0u8; 1];
+        while !seen.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte).await {
+                Ok(1) => seen.push(byte[0]),
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&seen)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0)
+    };
+    tokio::time::timeout(STEP, read)
+        .await
+        .expect("no response head within the step bound")
+}
+
+/// Send `request` (write B) so that its last byte reaches the proxy only after another
+/// write's response (write A, a PUT of `STALL_KEY`, which the mock answers in part and
+/// then holds) has taken the ledger past its ceiling. B is admitted with the ledger at
+/// most at its ceiling, and its request is sent in full while the ledger is above it.
+/// Returns B's status.
+async fn send_while_the_ledger_is_past_its_ceiling(h: &Harness, request: &[u8]) -> u16 {
+    use tokio::io::AsyncWriteExt;
+    let (head, last) = request.split_at(request.len() - 1);
+    let mut b = TcpStream::connect(h.proxy).await.expect("connect B");
+    b.write_all(head).await.expect("B, all but its last byte");
+    b.flush().await.expect("flush B");
+    // B's head is in, so any admission reservation it takes for its body is held.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let admitted = h.ledger.reserved_bytes();
+    assert!(
+        admitted <= CEILING,
+        "APPARATUS: the ledger is past its ceiling before write A (reserved {}); verdict UNKNOWN",
+        admitted
+    );
+    let pin = h
+        .ledger
+        .try_reserve(CEILING - admitted)
+        .expect("APPARATUS: pin the ledger at its ceiling; verdict UNKNOWN");
+    assert_eq!(
+        h.ledger.reserved_bytes(),
+        CEILING,
+        "APPARATUS: the ledger moved while pinning; verdict UNKNOWN"
+    );
+    let a_request = raw_request(
+        h,
+        "PUT",
+        &format!("/{}/{}", BUCKET, STALL_KEY),
+        &[("authorization", AUTH.to_string())],
+        b"write-a",
+    );
+    let mut a = TcpStream::connect(h.proxy).await.expect("connect A");
+    a.write_all(&a_request).await.expect("send A");
+    let deadline = tokio::time::Instant::now() + STEP;
+    while h.ledger.reserved_bytes() <= CEILING {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "APPARATUS: write A's response never took the ledger past its ceiling (reserved {}); verdict UNKNOWN",
+            h.ledger.reserved_bytes()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    b.write_all(last).await.expect("B's last byte");
+    let status = read_status(&mut b).await;
+    h.mock.stall_release.notify_one();
+    drop(pin);
+    assert_eq!(
+        read_status(&mut a).await,
+        200,
+        "APPARATUS: write A was not answered once released"
+    );
+    status
+}
+
+/// Cache `key`, send `request` past the ceiling, wait for the mock to have stored it (the
+/// key's generation becomes `stored`), and return B's status, the cached bytes and what a
+/// later GET of `key` saw.
+async fn ledger_case(
+    h: &Harness,
+    key: &str,
+    request: Vec<u8>,
+    stored: Option<u32>,
+) -> (u16, Bytes, (bool, StatusCode, Bytes)) {
+    h.mock.put(key);
+    let old = h.cache(key).await;
+    let status = send_while_the_ledger_is_past_its_ceiling(h, &request).await;
+    let deadline = tokio::time::Instant::now() + STEP;
+    while h.mock.generation(key) != stored {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: S3 stored write B: generation {:?}, want {:?} (client status {})",
+            h.mock.generation(key),
+            stored,
+            status
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (status, old, h.probe(key).await)
+}
+
+/// A form POST body naming `key`, and its content type.
+fn form_body(key: &str, content: &str) -> (String, Vec<u8>) {
+    let boundary = "----ledgerboundary7MA4";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\n{key}\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"policy\"\r\n\r\neyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoifQ==\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"x-amz-signature\"\r\n\r\n0000\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\n{content}\r\n--{b}--\r\n",
+        b = boundary,
+        key = key,
+        content = content
+    );
+    (
+        format!("multipart/form-data; boundary={}", boundary),
+        body.into_bytes(),
+    )
+}
+
+/// The body of a CompleteMultipartUpload naming one part.
+const COMPLETE_XML: &[u8] = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"etag-part-1\"</ETag></Part></CompleteMultipartUpload>";
+
+fn assert_rewritten(what: &str, status: u16, old: &Bytes, seen: &(bool, StatusCode, Bytes)) {
+    let (reached, got, body) = seen;
+    assert!(
+        (200..300).contains(&status) && *reached && *got == StatusCode::OK && body != old,
+        "{} that S3 received in full while the ledger was past its ceiling: client status {}, \
+         later GET reached_origin={} status={} body={:?}",
+        what,
+        status,
+        reached,
+        got,
+        String::from_utf8_lossy(body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_put_sent_while_the_ledger_is_past_its_ceiling_is_answered_and_invalidates() {
+    let h = harness_with_ceiling(CEILING).await;
+    let key = "lc/put.txt";
+    let request = raw_request(
+        &h,
+        "PUT",
+        &format!("/{}/{}", BUCKET, key),
+        &[("authorization", AUTH.to_string())],
+        b"new-bytes-for-the-key",
+    );
+    let (status, old, seen) = ledger_case(&h, key, request, Some(1)).await;
+    assert_rewritten("a signed PUT", status, &old, &seen);
+}
+
+// The DELETE carries a body so that its last byte can be held back. The proxy reserves a
+// DeleteObject body on the same ledger before sending it, so B's admission and its
+// post-send step see the ledger as an empty-bodied DELETE would in a busier proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_sent_while_the_ledger_is_past_its_ceiling_is_answered_and_invalidates() {
+    let h = harness_with_ceiling(CEILING).await;
+    let key = "lc/delete.txt";
+    let request = raw_request(
+        &h,
+        "DELETE",
+        &format!("/{}/{}", BUCKET, key),
+        &[("authorization", AUTH.to_string())],
+        b"deletebd",
+    );
+    let (status, _old, (reached, got, body)) = ledger_case(&h, key, request, None).await;
+    assert!(
+        (200..300).contains(&status) && reached && got == StatusCode::NOT_FOUND,
+        "a signed DeleteObject that S3 received in full while the ledger was past its ceiling: \
+         client status {}, later GET reached_origin={} status={} body={:?}",
+        status,
+        reached,
+        got,
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_form_post_sent_while_the_ledger_is_past_its_ceiling_is_answered_and_invalidates() {
+    let h = harness_with_ceiling(CEILING).await;
+    let key = "lc/form.txt";
+    let (content_type, body) = form_body(key, "new-form-bytes");
+    let request = raw_request(
+        &h,
+        "POST",
+        &format!("/{}", BUCKET),
+        &[("content-type", content_type)],
+        &body,
+    );
+    let (status, old, seen) = ledger_case(&h, key, request, Some(1)).await;
+    assert_rewritten("a form POST", status, &old, &seen);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_complete_sent_while_the_ledger_is_past_its_ceiling_is_answered_and_invalidates() {
+    let h = harness_with_ceiling(CEILING).await;
+    let key = "lc/mpu.txt";
+    let request = raw_request(
+        &h,
+        "POST",
+        &format!("/{}/{}?uploadId=lc-upload", BUCKET, key),
+        &[
+            ("authorization", AUTH.to_string()),
+            ("content-type", "application/xml".to_string()),
+        ],
+        COMPLETE_XML,
+    );
+    let (status, old, seen) = ledger_case(&h, key, request, Some(1)).await;
+    assert_rewritten("a signed CompleteMultipartUpload", status, &old, &seen);
+}
+
+// Control: DeleteObjects invalidates every requested key on any forwarding error, so it
+// passes with or without the post-send refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_objects_sent_while_the_ledger_is_past_its_ceiling_invalidates() {
+    let h = harness_with_ceiling(CEILING).await;
+    let key = "lc/bulk.txt";
+    let xml = format!(
+        "<Delete><Quiet>true</Quiet><Object><Key>{}</Key></Object></Delete>",
+        key
+    );
+    let request = raw_request(
+        &h,
+        "POST",
+        &format!("/{}?delete", BUCKET),
+        &[
+            ("authorization", AUTH.to_string()),
+            ("content-type", "application/xml".to_string()),
+        ],
+        xml.as_bytes(),
+    );
+    let (status, _old, (reached, got, body)) = ledger_case(&h, key, request, None).await;
+    assert!(
+        reached && got == StatusCode::NOT_FOUND,
+        "a DeleteObjects that S3 received in full while the ledger was past its ceiling left \
+         the key cached: client status {}, later GET reached_origin={} status={} body={:?}",
+        status,
+        reached,
+        got,
+        String::from_utf8_lossy(&body)
+    );
+}
+
+// ── A write whose client goes away once S3 has it ───────────────────────────
+//
+// hyper drops the request's future when the client closes the connection while the
+// response is pending. A write that S3 has stored by then must still invalidate.
+
+/// Cache `key`, send `request` whole on a raw connection, close the connection once the
+/// mock has stored the write and before it answers (it answers 500 ms later), then GET
+/// `key` for up to 3 s until a GET reaches the mock. Returns the cached bytes and what
+/// the last GET saw.
+async fn disconnect_case(
+    h: &Harness,
+    key: &str,
+    request: Vec<u8>,
+) -> (Bytes, (bool, StatusCode, Bytes)) {
+    use tokio::io::AsyncWriteExt;
+    h.mock.put(key);
+    let old = h.cache(key).await;
+    h.mock.state.lock().unwrap().write_respond_after = Some(Duration::from_millis(500));
+    let (received, answered) = h.mock.writes();
+    let mut stream = TcpStream::connect(h.proxy).await.expect("connect");
+    stream.write_all(&request).await.expect("send");
+    stream.flush().await.expect("flush");
+    tokio::time::timeout(STEP, async {
+        while h.mock.writes().0 == received {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the write never reached the mock");
+    // S3 has stored the write; the client goes away before the answer.
+    drop(stream);
+    tokio::time::timeout(STEP, async {
+        while h.mock.writes().1 == answered {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the mock never answered the write");
+    h.mock.state.lock().unwrap().write_respond_after = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let seen = h.probe(key).await;
+        if seen.0 || tokio::time::Instant::now() >= deadline {
+            return (old, seen);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn assert_refetched_after_disconnect(what: &str, old: &Bytes, seen: &(bool, StatusCode, Bytes)) {
+    let (reached, got, body) = seen;
+    assert!(
+        *reached && *got == StatusCode::OK && body != old,
+        "GET after {} whose client disconnected once S3 stored it was served from cache: \
+         reached_origin={} status={} body={:?}",
+        what,
+        reached,
+        got,
+        String::from_utf8_lossy(body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_put_invalidates_after_the_client_disconnects() {
+    let h = harness().await;
+    // Control: with the client connected, the same fixture sees the invalidation.
+    h.mock.put("dc/control.txt");
+    let old = h.cache("dc/control.txt").await;
+    let (status, _) = h
+        .send(
+            "PUT",
+            &format!("/{}/dc/control.txt", BUCKET),
+            &[("authorization", AUTH.to_string())],
+            Bytes::from_static(b"control-new-bytes"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "control PUT");
+    assert_refetched_after_disconnect(
+        "the control PUT (client connected)",
+        &old,
+        &h.probe("dc/control.txt").await,
+    );
+
+    let key = "dc/put.txt";
+    let request = raw_request(
+        &h,
+        "PUT",
+        &format!("/{}/{}", BUCKET, key),
+        &[("authorization", AUTH.to_string())],
+        b"new-bytes-for-the-key",
+    );
+    let (old, seen) = disconnect_case(&h, key, request).await;
+    assert_refetched_after_disconnect("a signed PUT", &old, &seen);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsigned_put_invalidates_after_the_client_disconnects() {
+    let h = harness().await;
+    let key = "dc/unsigned.txt";
+    let request = raw_request(
+        &h,
+        "PUT",
+        &format!("/{}/{}", BUCKET, key),
+        &[],
+        b"new-unsigned-bytes",
+    );
+    let (old, seen) = disconnect_case(&h, key, request).await;
+    assert_refetched_after_disconnect("an unsigned PUT", &old, &seen);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_invalidates_after_the_client_disconnects() {
+    let h = harness().await;
+    h.mock.put("dc/source.txt");
+    let key = "dc/copy.txt";
+    let request = raw_request(
+        &h,
+        "PUT",
+        &format!("/{}/{}", BUCKET, key),
+        &[
+            ("authorization", AUTH.to_string()),
+            ("x-amz-copy-source", format!("/{}/dc/source.txt", BUCKET)),
+        ],
+        b"",
+    );
+    let (old, seen) = disconnect_case(&h, key, request).await;
+    assert_refetched_after_disconnect("a CopyObject", &old, &seen);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_invalidates_after_the_client_disconnects() {
+    let h = harness().await;
+    let key = "dc/delete.txt";
+    let request = raw_request(
+        &h,
+        "DELETE",
+        &format!("/{}/{}", BUCKET, key),
+        &[("authorization", AUTH.to_string())],
+        b"",
+    );
+    let (_old, (reached, got, body)) = disconnect_case(&h, key, request).await;
+    assert!(
+        reached && got == StatusCode::NOT_FOUND,
+        "GET after a signed DeleteObject whose client disconnected once S3 deleted the key was \
+         served from cache: reached_origin={} status={} body={:?}",
+        reached,
+        got,
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_complete_invalidates_after_the_client_disconnects() {
+    let h = harness().await;
+    let key = "dc/mpu.txt";
+    let request = raw_request(
+        &h,
+        "POST",
+        &format!("/{}/{}?uploadId=dc-upload", BUCKET, key),
+        &[
+            ("authorization", AUTH.to_string()),
+            ("content-type", "application/xml".to_string()),
+        ],
+        COMPLETE_XML,
+    );
+    let (old, seen) = disconnect_case(&h, key, request).await;
+    assert_refetched_after_disconnect("a signed CompleteMultipartUpload", &old, &seen);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_presigned_complete_invalidates_after_the_client_disconnects() {
+    let h = harness().await;
+    let key = "dc/presigned-mpu.txt";
+    let request = raw_request(
+        &h,
+        "POST",
+        &format!(
+            "/{}/{}?uploadId=dc-upload&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=EXAMPLE%2F20991231%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20991231T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=0000",
+            BUCKET, key
+        ),
+        &[("content-type", "application/xml".to_string())],
+        COMPLETE_XML,
+    );
+    let (old, seen) = disconnect_case(&h, key, request).await;
+    assert_refetched_after_disconnect("a presigned CompleteMultipartUpload", &old, &seen);
 }

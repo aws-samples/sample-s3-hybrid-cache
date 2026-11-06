@@ -96,7 +96,6 @@ src/
 ├── cache_types.rs       # Cache data structures
 ├── cache_size_tracker.rs # Cache size tracking (delegates to consolidator)
 ├── cache_initialization_coordinator.rs # Coordinated cache initialization
-├── cache_validator.rs   # Cache integrity validation and file scanning
 ├── capacity_manager.rs  # Cache capacity checks and bypass decisions
 ├── disk_cache.rs        # Disk cache with streaming support
 ├── ram_cache.rs         # Sharded RAM cache (Arc<Bytes>, per-shard tokio RwLock, TinyLFU)
@@ -296,8 +295,8 @@ point, what actually happens.
 | `serve_range_from_cache_buffered` (`http_proxy.rs`) | Yes: `get_cached_range_data` → single-range branch checks RAM directly | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | **Yes**: the requested range length, held by `PermitBody` until the client drains or disconnects |
 | `serve_full_object_from_cache` (`http_proxy.rs`) | Yes, via `get_cached_range_data` | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | **Yes**: the full object length, held by `PermitBody` |
 | `get_cached_range_data` → single-range branch | Yes | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | Only its own recovery fetch, scoped to that fetch |
-| `get_cached_range_data` → merge branch → `RangeHandler::merge_range_segments` → `extract_bytes_from_cached_range` → `CacheManager::load_range_data_with_cache` | Yes, **per cached segment** | Yes, per segment on disk hit | `generate_ram_range_key` (colon grammar), keyed on each segment's stored-range bounds | Only its own fallback fetch, scoped to that fetch |
-| `fill_page` (page mode) → `load_page_from_cache` | Yes: page-keyed RAM lookup (`get_range_from_ram_cache` with page bounds) | Yes, on disk hit only, never on the cold S3-fetch fill | `generate_ram_range_key` (colon grammar), keyed on page bounds, not the client's sub-range | **No** |
+| `get_cached_range_data` → merge branch → `RangeHandler::merge_range_segments` → `extract_bytes_from_cached_range_tiered` → `CacheManager::load_range_data_with_cache` | Yes, **per cached segment** | Yes, per segment on disk hit | `generate_ram_range_key` (colon grammar), keyed on each segment's stored-range bounds | Only its own fallback fetch, scoped to that fetch |
+| `fill_page` (page mode) → `load_page_from_cache` | Yes: page-keyed RAM lookup (`get_range_from_ram_cache_hit` with page bounds) | Yes, on disk hit only, never on the cold S3-fetch fill | `generate_ram_range_key` (colon grammar), keyed on page bounds, not the client's sub-range | **No** |
 
 Notes:
 - **A request covering an object's entire byte range does not reach the buffered
@@ -310,12 +309,11 @@ Notes:
   the body is delivered or the client disconnects. Every other reservation in this
   table is scoped to an upstream fetch. See [in-flight memory](METRICS.md)
   when sizing a ceiling.
-- Every path in the table shares the **same RAM key grammar** (`generate_ram_range_key`,
-  colon-separated) via the single-source-of-truth helper next to
-  `generate_range_cache_key` in `cache.rs`. This is distinct from the
-  disk-cache key grammar (`generate_range_cache_key`, hyphen-separated).
+- Every path in the table shares the **same RAM key grammar**:
+  `generate_ram_range_key` in `cache.rs`, colon-separated. Range files on disk
+  use a separate, hyphen-separated name (`{object}_{start}-{end}.bin`).
 - `merge_range_segments` itself never mentions RAM. The tier access is
-  inside `extract_bytes_from_cached_range`, one call down.
+  inside `extract_bytes_from_cached_range_tiered`, one call down.
 - See [Caching](CACHING.md) for the maintained description of what gets
   cached and why; this map is about *which code path* reaches which tier, not
   about cache semantics.
@@ -370,11 +368,11 @@ Each proxy works independently; the cache volume is the only integration point.
 │  ┌─────────────────────┐    ┌─────────────────────────────────┐ │
 │  │  Request Handler    │    │  Cache Operations               │ │
 │  │                     │    │                                 │ │
-│  │  log_access()  ─────┼────┼──► AccessLogBuffer              │ │
+│  │  record_access()  ──┼────┼──► AccessLogBuffer              │ │
 │  │                     │    │    - entries: Vec<AccessLogEntry>│ │
 │  │                     │    │    - flush every 5s             │ │
 │  │                     │    │                                 │ │
-│  │                     │    │  store_range() ─────────────────┼─┤
+│  │                     │    │  range commit ──────────────────┼─┤
 │  │                     │    │    │                            │ │
 │  │                     │    │    ▼                            │ │
 │  │                     │    │  SizeAccumulator.add()          │ │
@@ -621,7 +619,7 @@ Separate from the access-control model above, the proxy's **data integrity model
 - **aws-chunked decoded length.** When the `x-amz-decoded-content-length` header is present, the decoder verifies the decoded body length matches and skips caching on mismatch (see `aws_chunked_decoder`).
 - **Cache metadata structural consistency.** A `.meta` that does not parse is treated as a miss, and one confidently corrupt is replaced by the next full-object fetch (see [Error handling](ERROR_HANDLING.md#1-corrupted-metadata-files)).
 - **Cache keys are validated to stay within the cache directory.** `parse_cache_key` rejects bucket segments equal to `.`, `..`, empty, or containing `/`, `\`, NUL, or ASCII control characters (0x00–0x1F, 0x7F). This ensures every sharded path produced by `get_sharded_path` is a descendant of the configured `cache_dir`, defending against path-traversal input from the HTTP listener.
-- **Host headers are validated against RFC 7230 / RFC 3986.** `parse_host_header` accepts bracketed IPv6 literals (`[::1]`, `[::1]:8081`, `[2001:db8::1]:443`), plain hostnames, and IPv4. It rejects unclosed brackets, stray `]`, unbracketed IPv6, invalid ports, and empty values with a 400 response.
+- **Host headers are validated against RFC 9110 and RFC 3986.** `parse_host_header` accepts host names, IPv4 addresses and bracketed IPv6 literals (`[::1]`, `[::1]:8081`, `[2001:db8::1]:443`), each with an optional decimal port. It answers `400` to an empty value, unclosed brackets, a stray `]`, unbracketed IPv6 and an invalid port. It also answers `400` to a host containing a character that RFC 3986 does not allow in a host, such as a space or a double quote. Forward-proxy requests get the same check.
 
 **Cache staleness is not a security boundary.** Any client with valid S3 credentials can write directly to a bucket, bypassing the proxy entirely. When that happens, cached entries for affected objects become stale until their TTL expires and the next read revalidates them by ETag. This is ordinary read-through cache behavior, with the usual mitigations: tune TTLs, use TTL=0 for per-request authorization, or configure clients to always go through the proxy.
 
@@ -667,7 +665,7 @@ The proxy includes a destination policy engine that prevents SSRF attacks by val
 
 **Gating**: The HTTP forwarding path's policy (on the port-80 listener and on the TLS proxy listener alike) is active only when `connect_allowlist` is configured in the `server.tls` section. Without an allowlist those paths skip the check entirely, which lets operators who rely on the proxy as a general forward proxy opt out. The CONNECT and SNI paths always apply the port gate and IP classification; an allowlist, when configured, adds hostname filtering to them.
 
-**What the check does and does not do**: it is a pre-flight rejection of destinations, evaluated before any request is sent. The validated addresses it returns are discarded, because the S3 client re-resolves through the connection pool when it dials. So the policy bounds which destinations may be attempted; it does not pin the connection to an address the policy inspected.
+**What the check does**: it is a pre-flight rejection of destinations, evaluated before any request is sent. The proxy then resolves the name again through the connection pool when it dials, and with an allowlist set the pool keeps only the addresses the policy accepts. So the connection goes only to an address the policy accepts, and a name whose every address is refused is not dialed. Addresses listed in `endpoint_overrides` are dialed as listed.
 
 **IP ranges blocked** (on every path the policy gates):
 - `0.0.0.0/8`, `127.0.0.0/8` (loopback), `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (private)

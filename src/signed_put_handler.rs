@@ -46,8 +46,8 @@ use crate::compression::CompressionHandler;
 use crate::metrics::{MetricsManager, RequestType};
 use crate::s3_client::S3ClientApi;
 use crate::signed_request_proxy::{
-    forward_signed_request_streaming, forward_signed_request_streaming_verbatim,
-    forward_signed_request_with_body, UpstreamTransport, STREAMED_BODY_CAP,
+    forward_signed_request_streaming, forward_signed_request_streaming_verbatim, UpstreamTransport,
+    STREAMED_BODY_CAP,
 };
 use crate::{ProxyError, Result};
 
@@ -123,6 +123,9 @@ pub(crate) const HOSTNAME_NOT_UNIQUE_SKIP_REASON: &str = "hostname_not_unique";
 /// `skipped_puts_total` reason for a store that declined to publish because a newer
 /// write or delete of the same key was acknowledged after this PUT.
 pub(crate) const SUPERSEDED_SKIP_REASON: &str = "superseded";
+/// `skipped_puts_total` reason for a store that declined to publish because the temporary
+/// its fill wrote was replaced or removed before the publish.
+pub(crate) const TEMPORARY_REPLACED_SKIP_REASON: &str = "temporary_replaced";
 
 /// `skipped_puts_total` reason for a PUT whose body is not the object's bytes: a
 /// subresource write or a server-side copy (see [`is_non_object_put`]).
@@ -164,6 +167,15 @@ fn is_non_object_put(query: &str, headers: &HeaderMap) -> bool {
         || NON_OBJECT_PUT_HEADERS
             .iter()
             .any(|name| headers.contains_key(*name))
+}
+/// Whether S3 may have executed the write a forward answered: it succeeded, or the
+/// request was sent in full and its answer never arrived or was refused (see
+/// [`crate::signed_request_proxy::write_outcome_unknown`]).
+fn write_may_have_executed(response: &Result<Response<BoxBody<Bytes, hyper::Error>>>) -> bool {
+    match response {
+        Ok(resp) => resp.status().is_success(),
+        Err(e) => crate::signed_request_proxy::write_outcome_unknown(e),
+    }
 }
 
 /// Whether an S3 response carries an `ETag` with something other than quotes in it. A
@@ -556,7 +568,10 @@ const UPLOAD_LOCK_RETRY_MAX: std::time::Duration = std::time::Duration::from_mil
 static PART_FINALIZE_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt};
+// The inline tests build request bodies with it; production code no longer does.
+#[cfg(test)]
+use http_body_util::Full;
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -888,9 +903,11 @@ fn extract_xml_value(xml: &str, tag: &str) -> Result<String> {
         .ok_or_else(|| ProxyError::InvalidRequest(format!("Missing <{}> tag", tag)))?
         + start_tag.len();
 
-    let end = xml
-        .find(&end_tag)
-        .ok_or_else(|| ProxyError::InvalidRequest(format!("Missing </{}> tag", tag)))?;
+    // Search after the start tag: an end tag that precedes it must not give `end < start`.
+    let end = start
+        + xml[start..]
+            .find(&end_tag)
+            .ok_or_else(|| ProxyError::InvalidRequest(format!("Missing </{}> tag", tag)))?;
 
     Ok(xml[start..end].trim().to_string())
 }
@@ -1428,7 +1445,7 @@ impl SignedPutHandler {
                 )
                 .await;
                 // Nothing else invalidates on this arm: no cache task is spawned.
-                if matches!(&response, Ok(resp) if resp.status().is_success()) {
+                if write_may_have_executed(&response) {
                     self.invalidate_prior_version_before_response(&cache_key, "PUT")
                         .await;
                 }
@@ -1472,7 +1489,8 @@ impl SignedPutHandler {
     }
 
     /// Forward a PUT whose body is not the object's bytes (see [`is_non_object_put`])
-    /// verbatim and uncached, and on success invalidate and stamp the key on the response
+    /// verbatim and uncached, and on success or an unknown outcome invalidate and stamp the
+    /// key on the response
     /// path, as an object PUT does. An ACL or tagging change leaves the bytes alone while a
     /// copy replaces them; invalidating on all of them is the one rule that is right for
     /// every case.
@@ -1502,7 +1520,7 @@ impl SignedPutHandler {
             STREAMED_BODY_CAP,
         )
         .await;
-        if matches!(&response, Ok(resp) if resp.status().is_success()) {
+        if write_may_have_executed(&response) {
             self.invalidate_prior_version_before_response(&cache_key, "PUT")
                 .await;
         }
@@ -1572,7 +1590,7 @@ impl SignedPutHandler {
     /// Content-Length).
     ///
     /// This replaces the former buffer-then-forward implementation
-    /// (`read_request_body_bounded` + inline `raw_request` assembly +
+    /// (a bounded body read + inline `raw_request` assembly +
     /// `forward_raw_request_to_s3`) with [`forward_signed_request_streaming`]: the
     /// client body frames flow straight to the upstream (the awaited socket write is
     /// the primary backpressure), and the same frames are tee'd to a bounded channel
@@ -1638,13 +1656,14 @@ impl SignedPutHandler {
         .await;
 
         // Invalidate the key's previous cached version before the client gets its 200,
-        // whether or not this PUT ends up cached. It runs before the S3 result is sent to
+        // whether or not this PUT ends up cached, and before an error that leaves the
+        // outcome unknown (S3 may have stored the object). It runs before the S3 result is sent to
         // the cache task, so the task (which waits for that result before it invalidates
         // and publishes) cannot have published yet, and this cannot remove the new entry.
         // The same call stamps the key's write-order marker; its token goes to the cache task
         // with the S3 result, so the task can publish only while no newer write of the key
         // has been acknowledged.
-        let write_guard = if matches!(&s3_response, Ok(resp) if resp.status().is_success()) {
+        let write_guard = if write_may_have_executed(&s3_response) {
             self.invalidate_prior_version_before_response(&cache_key, "PUT")
                 .await
         } else {
@@ -1671,7 +1690,8 @@ impl SignedPutHandler {
     }
 
     /// Invalidate `cache_key`'s previously cached version on the response path, after S3
-    /// accepted the write and before its response is returned to the client.
+    /// accepted the write, or may have (the request was sent and no answer was read), and
+    /// before its response is returned to the client.
     ///
     /// The background cache task invalidates too, just before it publishes, but it runs
     /// after the client's 200 and does not run at all when the PUT is not cached (capacity
@@ -2132,26 +2152,18 @@ impl SignedPutHandler {
         // response XML is inspected below. Stream its request verbatim. A client
         // disconnect can therefore reach S3 as a partial request, matching the main
         // signed PUT streaming path.
-        let s3_response = forward_signed_request_streaming_verbatim(
-            req,
-            &target_host,
-            &transport,
-            self.proxy_referer.as_deref(),
-            STREAMED_BODY_CAP,
-        )
-        .await?;
-
+        let s3_response =
+            crate::signed_request_proxy::forward_signed_request_streaming_verbatim_buffered(
+                req,
+                &target_host,
+                &transport,
+                self.proxy_referer.as_deref(),
+                STREAMED_BODY_CAP,
+            )
+            .await?;
         let status = s3_response.status();
-        let response_headers = s3_response.headers().clone();
-
-        // Read response body to extract uploadId from XML
-        let response_body_bytes = s3_response
-            .into_body()
-            .collect()
-            .await
-            .map(|collected| collected.to_bytes())
-            .unwrap_or_default();
-
+        // The forward holds the response body, bounded and reserved; read it in place.
+        let response_body_bytes = s3_response.body.clone();
         if status.is_success() {
             // Parse uploadId from XML response
             let body_str = String::from_utf8_lossy(&response_body_bytes);
@@ -2271,19 +2283,8 @@ impl SignedPutHandler {
             );
         }
 
-        // Rebuild response with the body we read (return S3 response unchanged)
-        let mut response_builder = Response::builder().status(status);
-        for (name, value) in response_headers.iter() {
-            response_builder = response_builder.header(name, value);
-        }
-        let rebuilt_response = response_builder
-            .body(
-                Full::new(response_body_bytes)
-                    .map_err(|never| match never {})
-                    .boxed(),
-            )
-            .map_err(|e| ProxyError::HttpError(format!("Failed to rebuild response: {}", e)))?;
-
+        // Return S3's response unchanged, still holding its reservation.
+        let rebuilt_response = s3_response.into_response();
         // CreateMultipartUpload is a POST and is out of scope for per-bucket traffic
         // (only GET object reads and PUT object/part writes are counted). The part data
         // bytes are recorded on the UploadPart path; the control POSTs are not counted.
@@ -2681,129 +2682,6 @@ impl SignedPutHandler {
         }
 
         result
-    }
-
-    /// Cache an upload part as a range file. **Test-support only** (`#[cfg(test)]`):
-    /// production caches parts through the streaming part sink
-    /// (`open_multipart_part_sink` + `MultipartPartSink::finalize`), which
-    /// consults per-bucket cache rules and streams rather than buffering. This
-    /// buffered one-shot writer is retained solely as the part-population helper
-    /// for the multipart test suite (cleanup, finalize, GET-from-cache, and the
-    /// same-part-race concurrency regression); it holds `part{N}.lock` across the
-    /// part-file rename and the part-record write, the same correctness gate the
-    /// sink enforces. It is compiled only under `cfg(test)` and never ships in
-    /// the production binary. Spec: compression-followup-fixes Requirement 4.
-    #[cfg(test)]
-    pub(crate) async fn cache_upload_part(
-        &mut self,
-        cache_key: &str,
-        upload_id: &str,
-        part_number: u32,
-        data: &[u8],
-        etag: &str,
-    ) -> Result<()> {
-        use crate::cache_types::CachedPartInfo;
-
-        // Ensure multipart tracking directory exists
-        let multipart_dir = mpu_upload_dir(&self.cache_dir, upload_id);
-        tokio::fs::create_dir_all(&multipart_dir)
-            .await
-            .map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create multipart directory: {}", e))
-            })?;
-
-        // Store part data in the upload-specific directory (isolated per upload_id)
-        let part_file_path = multipart_dir.join(format!("part{}.bin", part_number));
-
-        // Compress the part data (no shared state touched, safe outside the lock).
-        let should_compress = self.compression_handler.is_compression_enabled();
-        let compression_result =
-            self.compression_handler
-                .compress_with_metadata(data, cache_key, should_compress);
-
-        // Acquire the PER-PART lock before writing the part file and its record, so
-        // a racing same-part-number write cannot leave the on-disk bytes out of sync
-        // with the recorded ETag (the invariant exercised by the concurrency test).
-        // Per part rather than per upload: the invariant is per part, and a
-        // per-upload lock serialised every part of every concurrent upload.
-        let lock_file_path = Self::part_lock_path(&multipart_dir, part_number);
-
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_file_path)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
-
-        fs4::FileExt::lock(&lock_file).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to acquire per-part lock: {}", e))
-        })?;
-        // Unlocked explicitly when it drops: see `journal_consolidator::unlock_lock_file`.
-        let lock_file = crate::journal_consolidator::UnlockOnDrop(lock_file);
-
-        // Write part file atomically using temp file + rename (inside the lock)
-        let temp_part_file_path = part_file_path.with_extension("tmp");
-        // Synced before the rename: this part becomes a range the completion `.meta` names.
-        let file_identity = crate::disk_cache::write_synced_identity_of(
-            &temp_part_file_path,
-            &compression_result.data,
-            Some(cache_key),
-        )
-        .map_err(|e| {
-            // Logged once, with the key and the path, where it was found.
-            if crate::disk_cache::is_identity_unavailable(&e) {
-                return ProxyError::CacheError(e.to_string());
-            }
-            ProxyError::CacheError(format!("Failed to write temporary part file: {}", e))
-        })?;
-
-        tokio::fs::rename(&temp_part_file_path, &part_file_path)
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Failed to rename part file: {}", e)))?;
-
-        // Compressed on-disk length, `stat`-ed from the published `part{N}.bin` inside
-        // this same `part{N}.lock` hold — the same measurement, at the same point in the
-        // lifecycle, as the production streaming path in
-        // `finalize_and_record_cached_part`. Taken from the file rather than from
-        // `compression_result.data.len()` so that this helper cannot drift from the
-        // figure the product measures.
-        let compressed_size = match tokio::fs::metadata(&part_file_path).await {
-            Ok(m) => m.len(),
-            Err(e) => {
-                warn!(
-                    "Could not stat finalized part file for compressed size: path={}, error={}",
-                    part_file_path.display(),
-                    e
-                );
-                0
-            }
-        };
-
-        // Create part info for tracker (path is deterministic from upload_id + part_number)
-        // `size` stays UNCOMPRESSED (raw body length) — the S3-facing figure —
-        // while `compressed_size` carries the on-disk length. Two units, both named.
-        let part_info = CachedPartInfo::new(
-            part_number,
-            data.len() as u64,
-            etag.to_string(),
-            compression_result.algorithm.clone(),
-        )
-        .with_compressed_size(compressed_size)
-        .with_file_identity(file_identity);
-
-        // Read existing tracker or create new one
-        // One small file per part. Nothing shared is read or rewritten, so this
-        // costs the same at ten parts and at ten thousand.
-        let multipart_dir_owned = multipart_dir.clone();
-        let part_info_owned = part_info.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::record_part_blocking(&multipart_dir_owned, part_number, &part_info_owned)
-        })
-        .await
-        .map_err(|e| ProxyError::CacheError(format!("Part record task panicked: {}", e)))??;
-
-        drop(lock_file);
-        Ok(())
     }
 
     /// Path of the per-part record for `part_number`.
@@ -3222,7 +3100,7 @@ impl SignedPutHandler {
         };
 
         // Forward the original request body to S3 using the pre-buffered body
-        let s3_response = forward_signed_request_with_body(
+        let s3_response = crate::signed_request_proxy::forward_signed_request_with_body_buffered(
             method,
             uri,
             headers,
@@ -3232,7 +3110,22 @@ impl SignedPutHandler {
             &transport,
             self.proxy_referer.as_deref(),
         )
-        .await?;
+        .await;
+        let s3_response = match s3_response {
+            Ok(response) => response,
+            Err(e) => {
+                // S3 may have completed the upload; the replaced object must not stay
+                // servable.
+                if crate::signed_request_proxy::write_outcome_unknown(&e) {
+                    self.invalidate_prior_version_before_response(
+                        &cache_key,
+                        "CompleteMultipartUpload",
+                    )
+                    .await;
+                }
+                return Err(e);
+            }
+        };
 
         let status = s3_response.status();
 
@@ -3249,7 +3142,7 @@ impl SignedPutHandler {
             // Read response body to extract ETag from XML
             // S3 returns CompleteMultipartUpload response as XML with ETag in the body
 
-            let (parts, body) = s3_response.into_parts();
+            let (parts, body_bytes, reservation) = s3_response.into_parts();
 
             // Extract response headers for cache metadata
             let response_headers: std::collections::HashMap<String, String> = parts
@@ -3258,13 +3151,7 @@ impl SignedPutHandler {
                 .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
 
-            // Collect the body bytes
-            let body_bytes = body
-                .collect()
-                .await
-                .map_err(|e| ProxyError::HttpError(format!("Failed to read response body: {}", e)))?
-                .to_bytes();
-
+            // The forward holds the response body, bounded and reserved; read it in place.
             // Extract ETag from XML response body
             // Format: <CompleteMultipartUploadResult><ETag>"etag-value"</ETag>...</CompleteMultipartUploadResult>
             let body_str = String::from_utf8_lossy(&body_bytes);
@@ -3329,11 +3216,10 @@ impl SignedPutHandler {
                     );
                 }
                 drop(write_guard);
-                return Ok(Response::from_parts(
+                return Ok(crate::signed_request_proxy::BufferedResponse::respond(
                     parts,
-                    Full::new(body_bytes)
-                        .map_err(|never| match never {})
-                        .boxed(),
+                    body_bytes,
+                    reservation,
                 ));
             };
             let mut finisher = self.detached_clone();
@@ -3403,11 +3289,10 @@ impl SignedPutHandler {
             // Success log is in finalize_multipart_upload with full details
 
             // Reconstruct response to return to client
-            let response = Response::from_parts(
+            let response = crate::signed_request_proxy::BufferedResponse::respond(
                 parts,
-                Full::new(body_bytes)
-                    .map_err(|never| match never {})
-                    .boxed(),
+                body_bytes,
+                reservation,
             );
             Ok(response)
         } else {
@@ -3418,7 +3303,7 @@ impl SignedPutHandler {
                 key,
                 status.as_u16()
             );
-            Ok(s3_response)
+            Ok(s3_response.into_response())
         }
     }
 
@@ -3519,18 +3404,14 @@ impl SignedPutHandler {
 
     /// Clean up all cached parts and tracking metadata for a multipart upload
     ///
-    /// This method:
-    /// 1. Acquires lock on upload.meta
-    /// 2. Reads all cached parts from tracking metadata
-    /// 3. Deletes each part's range file from ranges/{bucket}/{XX}/{YYY}/
-    /// 4. Deletes the upload.meta file
-    /// 5. Deletes the mpus_in_progress/{uploadId}/ directory
+    /// Renames `mpus_in_progress/{digest}/` aside to a `.reaping-` name, then removes the renamed
+    /// directory. Parts are staged inside it, so this removes every part, record and lock.
     ///
     /// # Requirements
     ///
     /// - Requirement 4.5: Delete all cached parts for uploadId
     /// - Requirement 8.5: Clean up tracking metadata
-    pub async fn cleanup_multipart_upload(&mut self, upload_id: &str) -> Result<()> {
+    pub(crate) async fn cleanup_multipart_upload(&mut self, upload_id: &str) -> Result<()> {
         let multipart_dir = mpu_upload_dir(&self.cache_dir, upload_id);
 
         if !multipart_dir.exists() {
@@ -3541,18 +3422,7 @@ impl SignedPutHandler {
             return Ok(());
         }
 
-        // Parts are stored inside the upload directory, so a single remove_dir_all cleans everything
-        if let Err(e) = tokio::fs::remove_dir_all(&multipart_dir).await {
-            warn!(
-                "Failed to remove multipart directory: upload_id={}, error={}",
-                upload_id, e
-            );
-        } else {
-            info!(
-                "Cleaned up multipart upload directory: upload_id={}",
-                upload_id
-            );
-        }
+        remove_upload_dir_aside(&multipart_dir, upload_id).await;
 
         Ok(())
     }
@@ -4162,7 +4032,10 @@ impl SignedPutHandler {
         }
 
         #[cfg(test)]
-        remove_part_before_finalize_renames(&multipart_dir);
+        {
+            remove_part_before_finalize_renames(&multipart_dir);
+            replace_part_before_finalize_renames(&multipart_dir);
+        }
 
         // Rename part files with final byte offsets and create range specs
         let mut range_specs = Vec::new();
@@ -4229,6 +4102,28 @@ impl SignedPutHandler {
                     old_part_file, new_range_file_path
                 );
                 moved_range_files.push(new_range_file_path.clone());
+                // The file now at the range path must be the one the part's record describes.
+                // Size and mtime cannot tell two same-length parts written in one timestamp
+                // granule apart; the inode is kept by the rename and can. A record without an
+                // inode (written before the field existed) is not checked.
+                if let Some(recorded) = part_info.file_inode {
+                    let found = tokio::fs::metadata(&new_range_file_path)
+                        .await
+                        .ok()
+                        .and_then(|m| crate::disk_cache::file_inode(&m));
+                    if found != Some(recorded) {
+                        warn!(
+                            "Part file is not the one its record describes, declining to cache: cache_key={}, upload_id={}, part={}, recorded_inode={}, found_inode={:?}",
+                            cache_key, upload_id, part_number, recorded, found
+                        );
+                        moved_range_files.remove_all();
+                        drop(meta_lock);
+                        drop(lock_file);
+                        self.cleanup_incomplete_multipart_cache(&multipart_dir, upload_id)
+                            .await;
+                        return Ok(());
+                    }
+                }
             } else {
                 // The part was present at the existence check above and is gone now: something
                 // removed the staging directory (or this part) between the two. Publishing would
@@ -4400,7 +4295,7 @@ impl SignedPutHandler {
         //
         // A FIFTH credit site, not in R12.4's list of four, and it is the one that
         // matters most for the defect. R12.4 names
-        // `write_multipart_journal_entries` as the multipart credit site, which is
+        // `write_multipart_journal_entries_witnessed` as the multipart credit site, which is
         // where the *accounting* credit happens — but this function writes the
         // `.meta` **directly and first** (for atomicity, see the comment on the
         // journal call below), so the persisted range is this copy, not the journal's.
@@ -4466,7 +4361,7 @@ impl SignedPutHandler {
         // visible. A crash between the two therefore leaves entries naming a `.meta` that does
         // not exist, which `assess_staged_candidate` reads as `MetadataAbsent` and retires once
         // they are older than `write_ledger::ABSENT_RETIREMENT_GRACE`. The old order (rename,
-        // then append inside `write_multipart_journal_entries`) left a published staged `.meta`
+        // then append inside `write_multipart_journal_entries_witnessed`) left a published staged `.meta`
         // with no entry: invisible to staging eviction, uncounted by the fold, an under-count
         // of `write_cache_size` that biases the eviction trigger LATE until the ledger-repair
         // rotation reached the shard.
@@ -5118,6 +5013,18 @@ impl SignedPutHandler {
                                             .await;
                                     }
                                 }
+                                Ok(crate::cache::PublishOutcome::TemporaryReplaced) => {
+                                    debug!(
+                                        "PUT store dropped, its temporary was replaced: cache_key={}",
+                                        cache_key
+                                    );
+                                    if let Some(m) = &metrics {
+                                        m.read()
+                                            .await
+                                            .record_skipped_put(TEMPORARY_REPLACED_SKIP_REASON)
+                                            .await;
+                                    }
+                                }
                                 Ok(_) => {
                                     let streaming_duration_ms =
                                         start_time.elapsed().as_millis() as u64;
@@ -5499,9 +5406,9 @@ impl SignedPutHandler {
         // Read-after-write parity — an immediate GET after a PUT must hit: the buffered
         // write-cache path (`store_put_as_write_cached_range_with_ttl`) finalizes the
         // `.bin` and then writes the `.meta` synchronously via `store_new_metadata`,
-        // so an immediate post-PUT GET is a cache hit. `WriteCacheRangeSink::commit`
-        // is journal-only — it defers the `.meta` until consolidation, which would
-        // make that GET a miss. We therefore mirror the buffered path here:
+        // so an immediate post-PUT GET is a cache hit. A journal-only commit would
+        // defer the `.meta` until consolidation, which would make that GET a miss.
+        // We therefore mirror the buffered path here:
         // `sink.finalize()` (publish `.bin`) → build metadata → store `.meta` now via
         // `CacheManager::store_streamed_write_cache_metadata`.
         let object_metadata = Self::build_streaming_write_cache_metadata(
@@ -5636,6 +5543,20 @@ impl SignedPutHandler {
                         }
                         StreamingCacheOutcome::Skipped(SUPERSEDED_SKIP_REASON)
                     }
+                    Ok(crate::cache::PublishOutcome::TemporaryReplaced) => {
+                        debug!(
+                            "Streaming cache: store dropped, its temporary was replaced: \
+                             cache_key={}",
+                            cache_key
+                        );
+                        if let Some(m) = &metrics {
+                            m.read()
+                                .await
+                                .record_skipped_put(TEMPORARY_REPLACED_SKIP_REASON)
+                                .await;
+                        }
+                        StreamingCacheOutcome::Skipped(TEMPORARY_REPLACED_SKIP_REASON)
+                    }
                     Ok(_) => {
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         info!(
@@ -5700,8 +5621,8 @@ impl SignedPutHandler {
     ///
     /// `compressed_size`/`compression_algorithm` are left at their defaults here:
     /// the true per-range compressed size and algorithm are recorded on the
-    /// `RangeSpec` that `commit_incremental_range` derives from the sink and writes
-    /// to the journal; the object-level fields are not used for size accounting.
+    /// `RangeSpec` that `WriteCacheRangeSink::finalize_unpublished` returns, which the
+    /// `.meta` publish lists; the object-level fields are not used for size accounting.
     fn build_streaming_write_cache_metadata(
         content_length: u64,
         response: &ResponseInfo,
@@ -5951,8 +5872,9 @@ impl SignedPutHandler {
                     // the upload's Complete finds it missing and declines to build an entry.
                     if refusal == tracked_multipart_budget::Refusal::Full {
                         let upload_dir = mpu_upload_dir(&cache_dir, &task_upload);
+                        let upload = task_upload.clone();
                         tokio::spawn(async move {
-                            let _ = tokio::fs::remove_dir_all(&upload_dir).await;
+                            remove_upload_dir_aside(&upload_dir, &upload).await;
                         });
                     }
                     return;
@@ -6341,8 +6263,7 @@ impl SignedPutHandler {
     /// Finalize a streamed part and write its `part{N}.json` record, holding
     /// `part{N}.lock` across **both** the part-file publish (atomic `.tmp` →
     /// `part{N}.bin` rename, inside [`crate::cache::MultipartPartSink::finalize`])
-    /// AND the record write. This is the same correctness gate as
-    /// [`Self::cache_upload_part`]: a racing same-part-number write cannot leave the
+    /// AND the record write, so a racing same-part-number write cannot leave the
     /// on-disk bytes and the tracker ETag out of sync. Returns the part's
     /// uncompressed size for logging.
     ///
@@ -6380,12 +6301,11 @@ impl SignedPutHandler {
         };
 
         let multipart_dir = mpu_upload_dir(cache_dir, upload_id);
-        // The sink open already created this directory; ensure it regardless.
-        tokio::fs::create_dir_all(&multipart_dir)
-            .await
-            .map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create multipart directory: {}", e))
-            })?;
+        // The sink open created this directory, and it is not recreated here. UploadPart answers
+        // the client before this commit runs, so the directory can already be gone: an Abort, a
+        // Complete, the incomplete-upload sweep or a tracked-entry refusal removed it. Recreating
+        // it left the removed upload's directory and `part{N}.lock` behind. Without it, the lock
+        // open below fails and the part is discarded.
 
         // PER-PART lock, not per-upload. The invariant being protected is per part
         // (this part's bytes must agree with this part's recorded ETag), so nothing
@@ -6427,8 +6347,7 @@ impl SignedPutHandler {
 
                 // Publish the staged part bytes (flush residual batch + atomic rename)
                 // UNDER the lock, so the on-disk part file and its recorded ETag are
-                // updated as one critical section — identical correctness gate to
-                // `cache_upload_part`.
+                // updated as one critical section.
                 let info = sink.finalize()?;
                 let uncompressed_size = info.uncompressed_size;
 
@@ -6473,7 +6392,8 @@ impl SignedPutHandler {
                     info.compression_algorithm,
                 )
                 .with_compressed_size(compressed_size)
-                .with_file_identity(info.file_identity);
+                .with_file_identity(info.file_identity)
+                .with_file_inode(info.file_inode);
 
                 // One small file, written once. Nothing shared is read or rewritten,
                 // so this costs the same whether the upload has ten parts or ten
@@ -9676,6 +9596,118 @@ fn remove_part_before_finalize_renames(multipart_dir: &std::path::Path) {
     }
 }
 
+/// Remove an upload's staging directory by renaming it aside first and removing the renamed
+/// directory. Shared by the Abort cleanup and the tracked-refusal arm of UploadPart, so neither
+/// removes the live path while a part commit that still addresses it may write into it.
+async fn remove_upload_dir_aside(multipart_dir: &std::path::Path, upload_id: &str) {
+    // Renamed aside first, then removed. A part commit still running (UploadPart answers the
+    // client before its background commit) addresses every file by this upload's path, and
+    // once the directory is renamed each of those paths fails, so the commit creates nothing
+    // and writes nothing into the directory being removed. A `remove_dir_all` of the live path
+    // could miss a `part{N}.bin` or `part{N}.json` renamed in while it ran, and the directory
+    // then survived. A renamed directory this removal fails to clear is removed by the
+    // incomplete-upload sweep, which removes every `.reaping-` directory it finds.
+    let dir_name = multipart_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let aside = multipart_dir.with_file_name(format!(
+        "{}{}-abort-{:016x}",
+        crate::write_cache_manager::REAPING_PREFIX,
+        dir_name,
+        fastrand::u64(..)
+    ));
+    match tokio::fs::rename(multipart_dir, &aside).await {
+        Ok(()) => {
+            #[cfg(test)]
+            probe_live_path_after_rename_aside(multipart_dir);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(
+                "Multipart directory already removed during cleanup: upload_id={}",
+                upload_id
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "Failed to rename multipart directory aside, removing it in place: \
+                 upload_id={}, error={}",
+                upload_id, e
+            );
+            if let Err(e) = tokio::fs::remove_dir_all(multipart_dir).await {
+                warn!(
+                    "Failed to remove multipart directory: upload_id={}, error={}",
+                    upload_id, e
+                );
+            }
+            return;
+        }
+    }
+    if let Err(e) = tokio::fs::remove_dir_all(&aside).await {
+        warn!(
+            "Failed to remove multipart directory: upload_id={}, error={}",
+            upload_id, e
+        );
+    } else {
+        info!(
+            "Cleaned up multipart upload directory: upload_id={}",
+            upload_id
+        );
+    }
+}
+/// Test-only: sends whether a file can still be created under an upload's live path, right after
+/// [`remove_upload_dir_aside`] has renamed the directory. Keyed per directory, consumed on use.
+#[cfg(test)]
+pub(crate) static ASIDE_PROBES: std::sync::Mutex<Vec<(PathBuf, std::sync::mpsc::Sender<bool>)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn probe_live_path_after_rename_aside(multipart_dir: &std::path::Path) {
+    let hit = {
+        let mut pending = ASIDE_PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .iter()
+            .position(|(d, _)| d == multipart_dir)
+            .map(|i| pending.remove(i))
+    };
+    if let Some((_, tx)) = hit {
+        let _ = tx.send(std::fs::File::create(multipart_dir.join("part1.json.tmp")).is_ok());
+    }
+}
+/// Test-only: upload staging directories whose `part1.bin` `finalize_multipart_upload` replaces,
+/// after its part-existence check and before its renames, with a different file of the same
+/// length and the same modification time. Stands for a second commit of the same part number
+/// that renames its own file in after the record this Complete read. Keyed per directory,
+/// consumed on use.
+#[cfg(test)]
+pub(crate) static REPLACE_PART_BEFORE_RENAMES: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn replace_part_before_finalize_renames(multipart_dir: &std::path::Path) {
+    let hit = {
+        let mut pending = REPLACE_PART_BEFORE_RENAMES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .iter()
+            .position(|d| d == multipart_dir)
+            .map(|i| pending.remove(i))
+    };
+    if hit.is_some() {
+        let part = multipart_dir.join("part1.bin");
+        let meta = std::fs::metadata(&part).expect("the staged part exists");
+        let swap = multipart_dir.join("part1.swap");
+        std::fs::write(&swap, vec![0xA5u8; meta.len() as usize]).expect("write the other file");
+        filetime::set_file_mtime(
+            &swap,
+            filetime::FileTime::from_last_modification_time(&meta),
+        )
+        .expect("copy the mtime");
+        std::fs::rename(&swap, &part).expect("replace the part");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9742,8 +9774,15 @@ mod tests {
         // blocked worker also stops the runtime's timer, so a runtime-side timeout would hang
         // rather than fail.
         let mut handler = create_test_handler(&temp_dir);
-        rt.block_on(handler.cache_upload_part(cache_key, upload_id, 1, &[1u8; 1024], "etag1"))
-            .unwrap();
+        rt.block_on(stage_part(
+            &handler,
+            cache_key,
+            upload_id,
+            1,
+            &[1u8; 1024],
+            "etag1",
+        ))
+        .unwrap();
         let lock_path = mpu_upload_dir(temp_dir.path(), upload_id).join("upload.lock");
         let peer = std::fs::OpenOptions::new()
             .create(true)
@@ -9984,6 +10023,8 @@ mod tests {
             port: upstream_addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: crate::signed_request_proxy::UpstreamTimeouts::default(),
+            response_ledger: None,
         });
 
         // Bounded so a regression in the body-feeding path fails this test instead of
@@ -10179,7 +10220,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_upload_part() {
         let temp_dir = TempDir::new().unwrap();
-        let mut handler = create_test_handler(&temp_dir);
+        let handler = create_test_handler(&temp_dir);
 
         let cache_key = "test-bucket/test-object";
         let upload_id = "test-upload-123";
@@ -10188,9 +10229,7 @@ mod tests {
         let etag = "test-etag-1";
 
         // Cache the part
-        let result = handler
-            .cache_upload_part(cache_key, upload_id, part_number, data, etag)
-            .await;
+        let result = stage_part(&handler, cache_key, upload_id, part_number, data, etag).await;
         assert!(result.is_ok());
 
         // Verify upload.meta exists with tracker info
@@ -10218,9 +10257,9 @@ mod tests {
     ///
     /// Uses two separate SignedPutHandler instances pointing at the same cache
     /// dir — the same shape as two proxy instances sharing an EFS volume, which
-    /// is where this race would realistically surface. The buffered
-    /// `cache_upload_part` helper drives the same `part{N}.lock` critical section
-    /// that the production streaming part sink's `finalize` uses.
+    /// is where this race would realistically surface. `stage_part` drives the
+    /// `part{N}.lock` critical section that the production streaming part sink's `finalize`
+    /// takes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_cache_upload_part_concurrent_same_part_keeps_file_and_tracker_consistent() {
         let temp_dir = TempDir::new().unwrap();
@@ -10254,7 +10293,7 @@ mod tests {
 
             let handle_a = tokio::spawn(async move {
                 let compression_handler = CompressionHandler::new(1024, true);
-                let mut handler = SignedPutHandler::new(
+                let handler = SignedPutHandler::new(
                     temp_path,
                     compression_handler,
                     0,
@@ -10263,9 +10302,15 @@ mod tests {
                     10 * 1024 * 1024,
                     5,
                 );
-                handler
-                    .cache_upload_part(&key, &upload, part_number, &data_a_clone, &etag_a_s)
-                    .await
+                stage_part(
+                    &handler,
+                    &key,
+                    &upload,
+                    part_number,
+                    &data_a_clone,
+                    &etag_a_s,
+                )
+                .await
             });
 
             let temp_path_b = temp_dir.path().to_path_buf();
@@ -10273,7 +10318,7 @@ mod tests {
             let upload_b = iter_upload_id.clone();
             let handle_b = tokio::spawn(async move {
                 let compression_handler = CompressionHandler::new(1024, true);
-                let mut handler = SignedPutHandler::new(
+                let handler = SignedPutHandler::new(
                     temp_path_b,
                     compression_handler,
                     0,
@@ -10282,9 +10327,15 @@ mod tests {
                     10 * 1024 * 1024,
                     5,
                 );
-                handler
-                    .cache_upload_part(&key_b, &upload_b, part_number, &data_b_clone, &etag_b_s)
-                    .await
+                stage_part(
+                    &handler,
+                    &key_b,
+                    &upload_b,
+                    part_number,
+                    &data_b_clone,
+                    &etag_b_s,
+                )
+                .await
             });
 
             let (res_a, res_b) = tokio::join!(handle_a, handle_b);
@@ -10351,7 +10402,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_multiple_upload_parts() {
         let temp_dir = TempDir::new().unwrap();
-        let mut handler = create_test_handler(&temp_dir);
+        let handler = create_test_handler(&temp_dir);
 
         let cache_key = "test-bucket/test-object";
         let upload_id = "test-upload-456";
@@ -10361,9 +10412,15 @@ mod tests {
             let data = format!("test data for part {}", part_num);
             let etag = format!("test-etag-{}", part_num);
 
-            let result = handler
-                .cache_upload_part(cache_key, upload_id, part_num, data.as_bytes(), &etag)
-                .await;
+            let result = stage_part(
+                &handler,
+                cache_key,
+                upload_id,
+                part_num,
+                data.as_bytes(),
+                &etag,
+            )
+            .await;
             assert!(result.is_ok());
         }
 
@@ -10393,9 +10450,15 @@ mod tests {
             let data = format!("test data for part {}", part_num);
             let etag = format!("test-etag-{}", part_num);
 
-            let result = handler
-                .cache_upload_part(cache_key, upload_id, part_num, data.as_bytes(), &etag)
-                .await;
+            let result = stage_part(
+                &handler,
+                cache_key,
+                upload_id,
+                part_num,
+                data.as_bytes(),
+                &etag,
+            )
+            .await;
             assert!(result.is_ok());
         }
 
@@ -10433,9 +10496,7 @@ mod tests {
         // Cache only part 1, but not part 2
         let data1 = b"test data for part 1";
         let etag1 = "test-etag-1";
-        let result = handler
-            .cache_upload_part(cache_key, upload_id, 1, data1, etag1)
-            .await;
+        let result = stage_part(&handler, cache_key, upload_id, 1, data1, etag1).await;
         assert!(result.is_ok());
 
         // Record part 2 WITHOUT creating its data file, simulating a part that another
@@ -10452,6 +10513,7 @@ mod tests {
             etag: "test-etag-2".to_string(),
             compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
             file_identity: None,
+            file_inode: None,
         };
         SignedPutHandler::record_part_blocking(&multipart_dir, 2, &part2_info)
             .expect("record part 2 without its data file");
@@ -10540,18 +10602,17 @@ mod tests {
     // `MultipartPartSink::write` → `finalize_and_record_cached_part`), recording the
     // part in the SAME `upload.meta` tracker schema (`MultipartUploadTracker` +
     // `CachedPartInfo`) and the SAME `mpus_in_progress/{upload_id}/part{N}.bin`
-    // location the buffered `cache_upload_part` uses. These tests prove
-    // `finalize_multipart_upload` reads streamed parts identically to buffered
-    // parts: retain-on-success, and cleanup (no cache entry) on a missing requested
-    // part or an ETag mismatch. The buffered-staging variants of these gates are
-    // covered above; these lock in the streamed-staging path end-to-end.
+    // location every part test stages into. These tests prove
+    // `finalize_multipart_upload` reads streamed parts: retain-on-success, and cleanup (no cache entry) on a missing requested
+    // part or an ETag mismatch. Every part test stages through this streamed path;
+    // these lock it in end-to-end.
     // ============================================================================
 
     /// Stage an `UploadPart` body through the **streaming** part path, exactly as
     /// `run_streaming_part_cache_write` does on S3 success: open the part sink,
     /// write the (decoded) object bytes, then `finalize_and_record_cached_part`
     /// under `part{N}.lock`. Writes `part{N}.bin` and the part's `part{N}.json`
-    /// record in the same on-disk shape as the buffered `cache_upload_part`.
+    /// record.
     async fn stage_streamed_part(
         cache_dir: &std::path::Path,
         cache_key: &str,
@@ -10560,6 +10621,19 @@ mod tests {
         data: &[u8],
         etag: &str,
     ) {
+        try_stage_part(cache_dir, cache_key, upload_id, part_number, data, etag)
+            .await
+            .expect("stage the part through the streaming path");
+    }
+    /// [`stage_streamed_part`] for a test that checks the result.
+    async fn try_stage_part(
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+        etag: &str,
+    ) -> Result<()> {
         let cache_mgr = crate::cache::CacheManager::new(
             cache_dir.to_path_buf(),
             false, // ram_cache_enabled
@@ -10569,11 +10643,9 @@ mod tests {
         );
         let mut sink = cache_mgr
             .open_multipart_part_sink(cache_key, upload_id, part_number, Some(data.len() as u64))
-            .await
-            .expect("open streaming part sink")
-            .expect("the capacity guard admits with an unconfigured floor");
-        sink.write(data)
-            .expect("write part bytes to streaming sink");
+            .await?
+            .ok_or_else(|| ProxyError::CacheError("the capacity guard refused the part".into()))?;
+        sink.write(data)?;
         SignedPutHandler::finalize_and_record_cached_part(
             cache_dir,
             cache_key,
@@ -10584,7 +10656,27 @@ mod tests {
             None,
         )
         .await
-        .expect("finalize + record streamed part");
+        .map(|_| ())
+    }
+    /// Stage a part into `handler`'s cache directory through the streaming part path, the one
+    /// UploadPart takes in production.
+    async fn stage_part(
+        handler: &SignedPutHandler,
+        cache_key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+        etag: &str,
+    ) -> Result<()> {
+        try_stage_part(
+            &handler.cache_dir,
+            cache_key,
+            upload_id,
+            part_number,
+            data,
+            etag,
+        )
+        .await
     }
 
     /// Streamed parts that satisfy every gate (S3 success + all requested parts
@@ -10601,7 +10693,7 @@ mod tests {
         let etag = "test-final-etag";
         let response_headers = std::collections::HashMap::new();
 
-        // Stage three parts via the STREAMING path (not cache_upload_part).
+        // Stage three parts via the STREAMING path.
         let part1_data = vec![1u8; 1024];
         let part2_data = vec![2u8; 2048];
         let part3_data = vec![3u8; 512];
@@ -11238,6 +11330,14 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// An end tag that appears only before the start tag is an error, not a slice panic.
+    #[test]
+    fn test_extract_xml_value_end_tag_before_start_tag() {
+        let xml = "</ETag>x<ETag>";
+        assert!(extract_xml_value(xml, "ETag").is_err());
+        let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></ETag>x<ETag></Part></CompleteMultipartUpload>";
+        assert!(parse_complete_mpu_request(body).is_err());
+    }
     /// Test parsing XML with parts in non-sequential order
     /// Requirements: 4.1, 4.2
     #[test]
@@ -11344,8 +11444,7 @@ mod tests {
         // Cache a part with one ETag
         let part_data = vec![0u8; 1024];
         let cached_etag = "\"cached-etag-abc123\"";
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part_data, cached_etag)
+        stage_part(&handler, cache_key, upload_id, 1, &part_data, cached_etag)
             .await
             .unwrap();
 
@@ -11398,8 +11497,7 @@ mod tests {
         // Cache a part with quoted ETag
         let part_data = vec![0u8; 1024];
         let cached_etag = "\"abc123\"";
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part_data, cached_etag)
+        stage_part(&handler, cache_key, upload_id, 1, &part_data, cached_etag)
             .await
             .unwrap();
 
@@ -11449,8 +11547,7 @@ mod tests {
         // Cache a part with quoted ETag
         let part_data = vec![0u8; 1024];
         let cached_etag = "\"abc123\"";
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part_data, cached_etag)
+        stage_part(&handler, cache_key, upload_id, 1, &part_data, cached_etag)
             .await
             .unwrap();
 
@@ -11500,16 +11597,13 @@ mod tests {
         let part2_data = vec![2u8; 2048];
         let part3_data = vec![3u8; 512];
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1_data, "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &part1_data, "etag1")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 2, &part2_data, "etag2")
+        stage_part(&handler, cache_key, upload_id, 2, &part2_data, "etag2")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 3, &part3_data, "etag3")
+        stage_part(&handler, cache_key, upload_id, 3, &part3_data, "etag3")
             .await
             .unwrap();
 
@@ -11640,8 +11734,7 @@ mod tests {
         let cache_key = "test-bucket/metalock-b3-mpu-locked";
         let upload_id = "test-upload-metalock-b3";
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &vec![1u8; 1024], "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &vec![1u8; 1024], "etag1")
             .await
             .unwrap();
         let requested_parts = vec![RequestedPart {
@@ -11653,10 +11746,16 @@ mod tests {
         // range-addressed paths — so re-running the same one would fail for a reason that has
         // nothing to do with the lock, and the control would prove nothing.
         let control_upload_id = "test-upload-metalock-b3-control";
-        handler
-            .cache_upload_part(cache_key, control_upload_id, 1, &vec![1u8; 1024], "etag1")
-            .await
-            .unwrap();
+        stage_part(
+            &handler,
+            cache_key,
+            control_upload_id,
+            1,
+            &vec![1u8; 1024],
+            "etag1",
+        )
+        .await
+        .unwrap();
 
         // A peer's document, published under the peer's own guard before the completion runs.
         let metadata_file = crate::disk_cache::get_sharded_path(
@@ -11738,8 +11837,7 @@ mod tests {
         handler.set_cache_manager(cache_manager.clone());
         let cache_key = "test-bucket/r4a-reseed.bin";
         let upload_id = "r4a-upload";
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &vec![7u8; 1024], "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &vec![7u8; 1024], "etag1")
             .await
             .unwrap();
         let stale = crate::cache_types::NewCacheMetadata {
@@ -11799,10 +11897,16 @@ mod tests {
         // Parts are renamed in part-number order and the hook removes part 2, so part 1 has
         // already moved into `ranges/` when the missing part is found.
         for n in 1..=2u32 {
-            handler
-                .cache_upload_part(cache_key, upload_id, n, &vec![n as u8; 1024], "etag")
-                .await
-                .unwrap();
+            stage_part(
+                &handler,
+                cache_key,
+                upload_id,
+                n,
+                &vec![n as u8; 1024],
+                "etag",
+            )
+            .await
+            .unwrap();
         }
         let multipart_dir = mpu_upload_dir(temp_dir.path(), upload_id);
         assert!(
@@ -11869,6 +11973,88 @@ mod tests {
         );
     }
 
+    /// The Abort cleanup renames the upload directory aside before it removes it: right after the
+    /// rename, the live path takes no new file, so a part commit still running cannot write into
+    /// the directory being removed. Removing the live path in place leaves it open for the whole
+    /// walk.
+    #[tokio::test]
+    async fn the_abort_cleanup_closes_the_live_path_before_removing() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let upload_id = "test-upload-aside-probe";
+        let multipart_dir = mpu_upload_dir(temp_dir.path(), upload_id);
+        std::fs::create_dir_all(&multipart_dir).unwrap();
+        std::fs::write(multipart_dir.join("part1.bin"), b"staged").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ASIDE_PROBES
+            .lock()
+            .unwrap()
+            .push((multipart_dir.clone(), tx));
+        handler.cleanup_multipart_upload(upload_id).await.unwrap();
+        let created = rx
+            .try_recv()
+            .expect("fixture: the probe after the rename was never reached");
+        assert!(
+            !created,
+            "a file could still be created under the live path after the cleanup began removing it"
+        );
+        let left: Vec<_> = std::fs::read_dir(temp_dir.path().join("mpus_in_progress"))
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "the cleanup left {left:?}");
+    }
+    /// A part file replaced by a different same-length file with the same modification time
+    /// between the record read and the rename is not the file the record describes. The size and
+    /// mtime identity cannot tell them apart; the inode can. Declined: no `.meta`, no range file
+    /// left, staging removed.
+    #[tokio::test]
+    async fn a_part_replaced_by_a_same_length_file_before_the_renames_publishes_no_meta() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_key = "test-bucket/replaced-part";
+        let upload_id = "test-upload-replaced-part";
+        stage_part(&handler, cache_key, upload_id, 1, &vec![1u8; 1024], "etag")
+            .await
+            .unwrap();
+        let multipart_dir = mpu_upload_dir(temp_dir.path(), upload_id);
+        REPLACE_PART_BEFORE_RENAMES
+            .lock()
+            .unwrap()
+            .push(multipart_dir.clone());
+        let result = handler
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                "\"final-etag-1\"",
+                &std::collections::HashMap::new(),
+                &[RequestedPart {
+                    part_number: 1,
+                    etag: "etag".to_string(),
+                }],
+            )
+            .await;
+        assert!(result.is_ok(), "declining is not an error: {result:?}");
+        assert!(
+            REPLACE_PART_BEFORE_RENAMES.lock().unwrap().is_empty(),
+            "fixture: the replace seam was never reached"
+        );
+        let metadata_file = crate::disk_cache::get_sharded_path(
+            &temp_dir.path().join("metadata"),
+            cache_key,
+            ".meta",
+        )
+        .unwrap();
+        assert!(
+            !metadata_file.exists(),
+            "a Complete published a `.meta` over a part file that is not the one its record \
+             describes: {:?}",
+            std::fs::read_to_string(&metadata_file).ok()
+        );
+        assert!(
+            !multipart_dir.exists(),
+            "the declined upload's staging directory must be removed"
+        );
+    }
     /// U2: a finalization that fails at `point`, after part 1 has moved into `ranges/`,
     /// returns an error, publishes no `.meta` and leaves no range file in `ranges/`.
     async fn assert_finalize_failure_leaves_no_orphan(point: FinalizeFault, tag: &str) {
@@ -11877,10 +12063,16 @@ mod tests {
         let cache_key = format!("test-bucket/case50-{tag}");
         let upload_id = format!("test-upload-case50-{tag}");
         for n in 1..=2u32 {
-            handler
-                .cache_upload_part(&cache_key, &upload_id, n, &vec![n as u8; 1024], "etag")
-                .await
-                .unwrap();
+            stage_part(
+                &handler,
+                &cache_key,
+                &upload_id,
+                n,
+                &vec![n as u8; 1024],
+                "etag",
+            )
+            .await
+            .unwrap();
         }
         let requested_parts: Vec<RequestedPart> = (1..=2u32)
             .map(|part_number| RequestedPart {
@@ -11998,10 +12190,16 @@ mod tests {
             let cache_key = "test-bucket/scn1-multipart-etag-quoted";
             let upload_id = "test-upload-scn1";
 
-            handler
-                .cache_upload_part(cache_key, upload_id, 1, &vec![7u8; 1024], "\"part1\"")
-                .await
-                .unwrap();
+            stage_part(
+                &handler,
+                cache_key,
+                upload_id,
+                1,
+                &vec![7u8; 1024],
+                "\"part1\"",
+            )
+            .await
+            .unwrap();
             let requested_parts = vec![RequestedPart {
                 part_number: 1,
                 etag: "\"part1\"".to_string(),
@@ -12112,12 +12310,10 @@ mod tests {
         let part1_data = vec![0x66u8; 4096];
         let part2_data = vec![0x99u8; 2048];
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1_data, "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &part1_data, "etag1")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 2, &part2_data, "etag2")
+        stage_part(&handler, cache_key, upload_id, 2, &part2_data, "etag2")
             .await
             .unwrap();
 
@@ -12205,7 +12401,7 @@ mod tests {
     /// short by part 2, and `staged_compressed_size()` is short by the same amount.
     #[tokio::test]
     async fn a_part_finalized_on_another_proxy_is_recorded_at_its_writers_size() {
-        use crate::cache::{CacheEvictionAlgorithm, CacheManager};
+        use crate::cache::CacheManager;
         let temp_dir = TempDir::new().unwrap();
         let cache_dir = temp_dir.path();
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
@@ -12242,11 +12438,10 @@ mod tests {
             .unwrap();
 
         // Proxy C: the Complete, with accounting wired.
-        let manager_c = Arc::new(CacheManager::new_with_eviction_algorithm(
+        let manager_c = Arc::new(CacheManager::new_with_defaults(
             cache_dir.to_path_buf(),
             false,
             0,
-            CacheEvictionAlgorithm::TinyLFU,
         ));
         let _ = manager_c.create_configured_disk_cache_manager();
         let consolidator = manager_c
@@ -12362,7 +12557,7 @@ mod tests {
         Arc<crate::journal_consolidator::JournalConsolidator>,
         Vec<RequestedPart>,
     ) {
-        use crate::cache::{CacheEvictionAlgorithm, CacheManager};
+        use crate::cache::CacheManager;
         let cache_dir = temp_dir.path();
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
@@ -12385,11 +12580,10 @@ mod tests {
             "etag2",
         )
         .await;
-        let manager = Arc::new(CacheManager::new_with_eviction_algorithm(
+        let manager = Arc::new(CacheManager::new_with_defaults(
             cache_dir.to_path_buf(),
             false,
             0,
-            CacheEvictionAlgorithm::TinyLFU,
         ));
         let _ = manager.create_configured_disk_cache_manager();
         let consolidator = manager
@@ -13129,10 +13323,16 @@ mod tests {
             for (idx, size) in sizes.iter().enumerate() {
                 let n = (idx + 1) as u32;
                 let etag = format!("etag{n}");
-                handler
-                    .cache_upload_part(&cache_key, &upload_id, n, &vec![7u8; *size], &etag)
-                    .await
-                    .unwrap();
+                stage_part(
+                    &handler,
+                    &cache_key,
+                    &upload_id,
+                    n,
+                    &vec![7u8; *size],
+                    &etag,
+                )
+                .await
+                .unwrap();
                 requested_parts.push(RequestedPart {
                     part_number: n,
                     etag,
@@ -13195,12 +13395,10 @@ mod tests {
         );
         let part1 = vec![1u8; 1024];
         let part2 = vec![2u8; 2048];
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1, "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &part1, "etag1")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 2, &part2, "etag2")
+        stage_part(&handler, cache_key, upload_id, 2, &part2, "etag2")
             .await
             .unwrap();
         let requested_parts = vec![
@@ -13252,16 +13450,13 @@ mod tests {
         let part2_data = vec![2u8; 2048];
         let part3_data = vec![3u8; 512];
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1_data, "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &part1_data, "etag1")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 2, &part2_data, "etag2")
+        stage_part(&handler, cache_key, upload_id, 2, &part2_data, "etag2")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 3, &part3_data, "etag3")
+        stage_part(&handler, cache_key, upload_id, 3, &part3_data, "etag3")
             .await
             .unwrap();
 
@@ -13370,20 +13565,16 @@ mod tests {
         let part3_data = vec![3u8; 7 * 1024 * 1024]; // 7 MB
         let part4_data = vec![4u8; 3 * 1024 * 1024]; // 3 MB
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1_data, "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &part1_data, "etag1")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 2, &part2_data, "etag2")
+        stage_part(&handler, cache_key, upload_id, 2, &part2_data, "etag2")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 3, &part3_data, "etag3")
+        stage_part(&handler, cache_key, upload_id, 3, &part3_data, "etag3")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 4, &part4_data, "etag4")
+        stage_part(&handler, cache_key, upload_id, 4, &part4_data, "etag4")
             .await
             .unwrap();
 
@@ -13502,16 +13693,13 @@ mod tests {
         let part3_data = vec![3u8; 2048];
         let part5_data = vec![5u8; 512];
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1_data, "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &part1_data, "etag1")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 3, &part3_data, "etag3")
+        stage_part(&handler, cache_key, upload_id, 3, &part3_data, "etag3")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 5, &part5_data, "etag5")
+        stage_part(&handler, cache_key, upload_id, 5, &part5_data, "etag5")
             .await
             .unwrap();
 
@@ -13626,24 +13814,19 @@ mod tests {
         let part4_data = vec![4u8; 4000];
         let part5_data = vec![5u8; 5000];
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1_data, "etag1")
+        stage_part(&handler, cache_key, upload_id, 1, &part1_data, "etag1")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 2, &part2_data, "etag2")
+        stage_part(&handler, cache_key, upload_id, 2, &part2_data, "etag2")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 3, &part3_data, "etag3")
+        stage_part(&handler, cache_key, upload_id, 3, &part3_data, "etag3")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 4, &part4_data, "etag4")
+        stage_part(&handler, cache_key, upload_id, 4, &part4_data, "etag4")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 5, &part5_data, "etag5")
+        stage_part(&handler, cache_key, upload_id, 5, &part5_data, "etag5")
             .await
             .unwrap();
 
@@ -13764,16 +13947,13 @@ mod tests {
         let part2_data = vec![2u8; 2048];
         let part3_data = vec![3u8; 512];
 
-        handler
-            .cache_upload_part(cache_key, upload_id, 1, &part1_data, "\"etag1\"")
+        stage_part(&handler, cache_key, upload_id, 1, &part1_data, "\"etag1\"")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 2, &part2_data, "\"etag2\"")
+        stage_part(&handler, cache_key, upload_id, 2, &part2_data, "\"etag2\"")
             .await
             .unwrap();
-        handler
-            .cache_upload_part(cache_key, upload_id, 3, &part3_data, "\"etag3\"")
+        stage_part(&handler, cache_key, upload_id, 3, &part3_data, "\"etag3\"")
             .await
             .unwrap();
 
@@ -13843,7 +14023,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let mut handler = create_test_handler(&temp_dir);
+            let handler = create_test_handler(&temp_dir);
 
             let cache_key = "test-bucket/test-object";
             let upload_id = "test-upload-prop";
@@ -13851,9 +14031,15 @@ mod tests {
             let etag = format!("\"etag-{}\"", part_number);
 
             // Cache the part
-            let result = handler
-                .cache_upload_part(cache_key, upload_id, part_number as u32, &data, &etag)
-                .await;
+            let result = stage_part(
+                &handler,
+                cache_key,
+                upload_id,
+                part_number as u32,
+                &data,
+                &etag,
+            )
+            .await;
 
             if result.is_err() {
                 return TestResult::failed();
@@ -13913,9 +14099,15 @@ mod tests {
                 let data: Vec<u8> = (0..1024).map(|i| (i + part_num as usize) as u8).collect();
                 let etag = format!("\"part-etag-{}\"", part_num);
 
-                let result = handler
-                    .cache_upload_part(cache_key, upload_id, part_num as u32, &data, &etag)
-                    .await;
+                let result = stage_part(
+                    &handler,
+                    cache_key,
+                    upload_id,
+                    part_num as u32,
+                    &data,
+                    &etag,
+                )
+                .await;
 
                 if result.is_err() {
                     return TestResult::failed();
@@ -14028,9 +14220,15 @@ mod tests {
                 let data: Vec<u8> = (0..1024).map(|i| (i + part_num as usize) as u8).collect();
                 let etag = format!("\"part-etag-{}\"", part_num);
 
-                let result = handler
-                    .cache_upload_part(cache_key, upload_id, part_num as u32, &data, &etag)
-                    .await;
+                let result = stage_part(
+                    &handler,
+                    cache_key,
+                    upload_id,
+                    part_num as u32,
+                    &data,
+                    &etag,
+                )
+                .await;
 
                 if result.is_err() {
                     return TestResult::failed();
@@ -14722,6 +14920,69 @@ mod tests {
         assert_eq!(
             at_end, 2,
             "both permits must return once the stalled setups finish (elapsed {elapsed:?})"
+        );
+    }
+
+    /// An Abort whose cleanup runs before an UploadPart's background commit (the client already
+    /// has its UploadPart answer; the commit has not started) leaves nothing staged once that
+    /// commit runs: no upload directory and no `part{N}.*` file. The commit is held here simply
+    /// by not calling it until the cleanup has returned, which is the order the client's
+    /// Abort-after-answer produces when the commit lags.
+    ///
+    /// RED SIDE: with the commit's `create_dir_all` of the upload directory restored, the
+    /// directory and `part1.lock` are recreated and listed in the assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_part_commit_after_the_aborts_cleanup_leaves_no_staging() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+        let cache_key = "test-bucket/abort-before-commit";
+        let upload_id = "abort-before-commit-upload";
+        let cache_mgr = crate::cache::CacheManager::new(
+            cache_dir.clone(),
+            false, // ram_cache_enabled
+            0,     // max_ram_cache_size
+            100,   // compression_threshold
+            false, // compression_enabled
+        );
+        let mut sink = cache_mgr
+            .open_multipart_part_sink(cache_key, upload_id, 1, Some(4096))
+            .await
+            .expect("open streaming part sink")
+            .expect("the capacity guard admits with an unconfigured floor");
+        sink.write(&[0x5Au8; 4096]).expect("write part bytes");
+        assert!(
+            mpu_upload_dir(&cache_dir, upload_id).is_dir(),
+            "fixture: the sink open staged the upload"
+        );
+
+        let mut handler = create_test_handler(&temp_dir);
+        handler
+            .cleanup_multipart_upload(upload_id)
+            .await
+            .expect("the Abort's cleanup");
+        let commit = SignedPutHandler::finalize_and_record_cached_part(
+            &cache_dir, cache_key, upload_id, 1, "etag1", sink, None,
+        )
+        .await;
+
+        let mpus = cache_dir.join("mpus_in_progress");
+        let left: Vec<String> = walkdir::WalkDir::new(&mpus)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                e.path()
+                    .strip_prefix(&mpus)
+                    .unwrap_or(e.path())
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            (commit.is_err(), left),
+            (true, Vec::<String>::new()),
+            "(the late commit was refused, entries under mpus_in_progress/ after the Abort's \
+             cleanup and the late commit)"
         );
     }
 
@@ -15665,8 +15926,8 @@ mod tests {
     /// must write the `.meta` **immediately**, so an immediate post-PUT GET is a
     /// cache hit. This guards the parity fix that finalizes the range and stores the
     /// `.meta` synchronously (via `CacheManager::store_streamed_write_cache_metadata`)
-    /// rather than using the journal-only `WriteCacheRangeSink::commit`, which would
-    /// defer the `.meta` until consolidation and make that GET a miss.
+    /// rather than leaving the `.meta` to a journal entry, which would defer it until
+    /// consolidation and make that GET a miss.
     #[tokio::test]
     async fn streaming_cache_writes_meta_immediately_for_read_after_write_hit() {
         use crate::cache::CacheManager;
@@ -16677,6 +16938,8 @@ mod tests {
             port: upstream_addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: crate::signed_request_proxy::UpstreamTimeouts::default(),
+            response_ledger: None,
         });
 
         let response = tokio::time::timeout(
@@ -16870,7 +17133,7 @@ mod tests {
     async fn test_cache_upload_part_with_safe_upload_id_works() {
         // Normal uploadId still writes cache data (regression guard)
         let temp_dir = TempDir::new().unwrap();
-        let mut handler = create_test_handler(&temp_dir);
+        let handler = create_test_handler(&temp_dir);
 
         let cache_key = "test-bucket/test-object";
         let upload_id = "safe-upload-id-ABC123";
@@ -16878,9 +17141,7 @@ mod tests {
         let data = b"test data for safe uploadId";
         let etag = "test-etag-safe";
 
-        let result = handler
-            .cache_upload_part(cache_key, upload_id, part_number, data, etag)
-            .await;
+        let result = stage_part(&handler, cache_key, upload_id, part_number, data, etag).await;
         assert!(result.is_ok());
 
         // Verify the upload directory was created in the correct location
@@ -16894,7 +17155,7 @@ mod tests {
     #[tokio::test]
     async fn test_malicious_upload_id_no_directory_created() {
         // A malicious uploadId must NOT create any directory in the cache.
-        // (Handler validation rejects before cache_upload_part is called, but
+        // (Handler validation rejects before a part is staged, but
         // if the guard were bypassed, the path would be unsafe.)
         let temp_dir = TempDir::new().unwrap();
 
@@ -17006,6 +17267,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: crate::signed_request_proxy::UpstreamTimeouts::default(),
+            response_ledger: None,
         })
     }
 

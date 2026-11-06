@@ -20,28 +20,14 @@
 mod coordinated_cache_initialization_integration_test;
 #[path = "coordinated_cache_initialization_property_test.rs"]
 mod coordinated_cache_initialization_property_test;
-#[path = "cross_instance_ram_version_mix_test.rs"]
-mod cross_instance_ram_version_mix_test;
 #[path = "metadata_update_operations_test.rs"]
 mod metadata_update_operations_test;
-#[path = "mixed_version_range_store_test.rs"]
-mod mixed_version_range_store_test;
 #[path = "multi_instance_atomic_metadata_writes_integration_test.rs"]
 mod multi_instance_atomic_metadata_writes_integration_test;
 #[path = "multi_instance_integration_test.rs"]
 mod multi_instance_integration_test;
 #[path = "ram_cache_sharding_property_test.rs"]
 mod ram_cache_sharding_property_test;
-#[path = "ram_metadata_absence_confirmation_test.rs"]
-mod ram_metadata_absence_confirmation_test;
-#[path = "ram_metadata_admission_unification_test.rs"]
-mod ram_metadata_admission_unification_test;
-#[path = "ram_metadata_consistency_test.rs"]
-mod ram_metadata_consistency_test;
-#[path = "ram_metadata_masking_regression_test.rs"]
-mod ram_metadata_masking_regression_test;
-#[path = "ram_tier_standing_guards_test.rs"]
-mod ram_tier_standing_guards_test;
 #[path = "ram_verify_decision_table_test.rs"]
 mod ram_verify_decision_table_test;
 #[path = "ram_verify_locks_bound_test.rs"]

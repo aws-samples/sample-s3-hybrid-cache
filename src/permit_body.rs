@@ -33,7 +33,7 @@ use tokio::sync::OwnedSemaphorePermit;
 /// delegate straight through with no behavioural change. This lets call sites
 /// that legitimately have no permit to attach (see call-site comments
 /// justifying each such case) use the same type without a separate code path.
-pub struct PermitBody<B> {
+pub(crate) struct PermitBody<B> {
     inner: B,
     // Held only for its Drop side effect; never read. `Arc` (not a bare
     // `OwnedSemaphorePermit`) because Commit_Phase tasks (cache-write,
@@ -94,7 +94,7 @@ const CHUNKED_BYTES_FRAME_SIZE: usize = 64 * 1024;
 ///
 /// Spec: inflight-memory-accounting (response-side reservation lifetime);
 /// unsigned-write-path-streaming Requirement 6.2.
-pub struct ChunkedBytes {
+pub(crate) struct ChunkedBytes {
     data: Bytes,
     pos: usize,
 }

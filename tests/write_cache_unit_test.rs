@@ -374,7 +374,7 @@ async fn test_put_cached_objects_not_in_ram_cache() {
 
     // Verify object is NOT in RAM cache by checking entry count
     // RAM cache should be empty (0 entries) since PUT-cached objects should not be stored there
-    let ram_stats = cache_manager.get_ram_cache_stats();
+    let ram_stats = cache_manager.ram_cache_stats().await;
     assert!(
         ram_stats.is_some(),
         "RAM cache should be enabled for this test"

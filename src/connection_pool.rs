@@ -3,6 +3,7 @@
 //! Manages IP distribution, DNS resolution, and health tracking for S3 endpoints.
 //! Actual TCP connection pooling is handled by hyper's built-in pool.
 
+use crate::destination_policy::DestinationPolicy;
 use crate::{ProxyError, Result};
 use dashmap::DashMap;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -236,7 +238,7 @@ impl IpDistributor {
 
 /// Per-IP health state tracking unhealthy status and cooldown for recovery probing.
 #[derive(Debug, Clone)]
-pub struct IpHealthEntry {
+struct IpHealthEntry {
     /// Timestamp when the IP was marked unhealthy (threshold reached).
     pub unhealthy_at: Instant,
     /// Current cooldown duration before the IP becomes a probe candidate.
@@ -384,7 +386,7 @@ impl IpHealthTracker {
     /// Used when an IP has left DNS entirely: there is nothing left to re-admit,
     /// so retaining its failure count and cooldown would leak map entries and
     /// could mis-attribute a future reappearance of the same address.
-    pub fn forget(&self, ip: &IpAddr) {
+    pub(crate) fn forget(&self, ip: &IpAddr) {
         self.failures.remove(ip);
         self.unhealthy.remove(ip);
     }
@@ -410,6 +412,315 @@ impl IpHealthTracker {
 // ConnectionPoolManager — DNS resolution + IP distribution
 // ---------------------------------------------------------------------------
 
+/// Longest one upstream name lookup may run. hickory allows 5 s per attempt and two attempts
+/// per name server by default, so a working resolver answers or fails inside this, and one
+/// that goes silent cannot hold a request or the refresh task for longer. A named constant
+/// rather than a config field: no setting exists for it and none is added.
+const NAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One lookup's result, shared by every caller that joined it.
+type LookupOutcome = std::result::Result<Vec<IpAddr>, String>;
+
+/// A seam answer for a name: what the resolver returns, an optional gate that holds the
+/// lookup until the test adds a permit, and how many lookups ran.
+#[cfg(test)]
+#[derive(Clone)]
+struct SeamAnswer {
+    result: LookupOutcome,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    started: Arc<AtomicUsize>,
+}
+
+/// Name resolution for upstream hosts, separate from the pool's state so a caller can clone
+/// the handle out of the pool lock and resolve without holding it.
+///
+/// One lookup runs per name at a time: callers that arrive while it runs wait for its result.
+/// A failed lookup is remembered for `connection_pool.dns_refresh_interval`, so a host that
+/// does not resolve is not looked up again on every request.
+pub struct NameLookup {
+    resolver: TokioResolver,
+    overrides: EndpointOverrides,
+    /// With `server.tls.connect_allowlist` set, the policy every DNS answer is filtered
+    /// through. `endpoint_overrides` answers are never filtered.
+    dial_policy: Option<Arc<DestinationPolicy>>,
+    lookup_timeout: Duration,
+    failure_memory: Duration,
+    max_remembered_failures: usize,
+    /// Names with a live distributor in the pool. A lookup of one is never answered by, and
+    /// never recorded in, the failure memory: a registered host keeps the addresses it has.
+    registered: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Failed lookups by name: when, and the error message.
+    failures: std::sync::Mutex<HashMap<String, (Instant, String)>>,
+    /// Lookups running now, by name. The receiver yields the outcome once.
+    in_flight:
+        std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<LookupOutcome>>>>,
+    /// Fixed DNS answers keyed by name, standing in for the resolver in tests.
+    #[cfg(test)]
+    dns_answers: std::sync::Mutex<HashMap<String, SeamAnswer>>,
+}
+
+/// Removes a name from `in_flight` when its lookup task ends, however it ends.
+struct InFlightEntry {
+    lookup: Arc<NameLookup>,
+    name: String,
+}
+
+impl Drop for InFlightEntry {
+    fn drop(&mut self) {
+        self.lookup
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.name);
+    }
+}
+
+fn message_of(error: ProxyError) -> String {
+    match error {
+        ProxyError::ConnectionError(message) => message,
+        other => other.to_string(),
+    }
+}
+
+impl NameLookup {
+    fn new(
+        resolver: TokioResolver,
+        overrides: EndpointOverrides,
+        failure_memory: Duration,
+        max_remembered_failures: usize,
+    ) -> Self {
+        Self {
+            resolver,
+            overrides,
+            dial_policy: None,
+            lookup_timeout: NAME_LOOKUP_TIMEOUT,
+            failure_memory,
+            max_remembered_failures,
+            registered: std::sync::Mutex::new(std::collections::HashSet::new()),
+            failures: std::sync::Mutex::new(HashMap::new()),
+            in_flight: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            dns_answers: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve `endpoint`: `endpoint_overrides` first, then DNS (bypasses /etc/hosts).
+    /// Holds no lock of the pool's.
+    pub async fn resolve(self: &Arc<Self>, endpoint: &str) -> Result<Vec<IpAddr>> {
+        // Check overrides (exact then suffix)
+        if let Some(ips) = self.overrides.resolve(endpoint) {
+            // `debug!`, not `info!`: every registered suffix-override host passes
+            // through here on each `dns_refresh_interval`, so at INFO this line
+            // repeated once per virtual-hosted bucket per refresh. The one INFO line
+            // per host is emitted by `register_endpoint` on first registration.
+            debug!("Using endpoint override for {}: {:?}", endpoint, ips);
+            return Ok(ips.clone());
+        }
+        if let Some(message) = self.remembered_failure_unless_registered(endpoint) {
+            debug!(
+                host = %endpoint,
+                "Skipping DNS lookup: it failed within dns_refresh_interval"
+            );
+            return Err(ProxyError::ConnectionError(message));
+        }
+
+        let mut receiver = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            match in_flight.get(endpoint) {
+                Some(receiver) => receiver.clone(),
+                None => {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    in_flight.insert(endpoint.to_string(), receiver.clone());
+                    let entry = InFlightEntry {
+                        lookup: Arc::clone(self),
+                        name: endpoint.to_string(),
+                    };
+                    // A task, so a caller that goes away does not abandon the lookup
+                    // the others are waiting on.
+                    tokio::spawn(async move {
+                        let outcome = entry
+                            .lookup
+                            .resolve_uncached(&entry.name)
+                            .await
+                            .map_err(message_of);
+                        entry.lookup.record_outcome(&entry.name, &outcome);
+                        let _ = sender.send(Some(outcome));
+                    });
+                    receiver
+                }
+            }
+        };
+        let ended = || {
+            ProxyError::ConnectionError(format!(
+                "DNS resolution for {} ended without an answer",
+                endpoint
+            ))
+        };
+        let outcome = match receiver.wait_for(|outcome| outcome.is_some()).await {
+            Ok(outcome) => outcome.clone(),
+            Err(_) => None,
+        };
+        match outcome {
+            Some(Ok(ips)) => Ok(ips),
+            Some(Err(message)) => Err(ProxyError::ConnectionError(message)),
+            None => Err(ended()),
+        }
+    }
+
+    /// One lookup, bounded by the timeout, then filtered through the destination policy.
+    async fn resolve_uncached(&self, endpoint: &str) -> Result<Vec<IpAddr>> {
+        debug!("Resolving DNS for endpoint: {}", endpoint);
+
+        let ip_addresses =
+            match tokio::time::timeout(self.lookup_timeout, self.lookup_dns(endpoint)).await {
+                Ok(answer) => answer?,
+                Err(_) => {
+                    return Err(ProxyError::ConnectionError(format!(
+                        "DNS resolution timed out for {} after {:?}",
+                        endpoint, self.lookup_timeout
+                    )))
+                }
+            };
+
+        if ip_addresses.is_empty() {
+            return Err(ProxyError::ConnectionError(format!(
+                "No IP addresses found for endpoint: {}",
+                endpoint
+            )));
+        }
+
+        let ip_addresses = match &self.dial_policy {
+            None => ip_addresses,
+            Some(policy) => match policy.classify_ips(endpoint, &ip_addresses) {
+                Ok(kept) => {
+                    if kept.len() != ip_addresses.len() {
+                        debug!(
+                            host = %endpoint,
+                            answered = ?ip_addresses,
+                            kept = ?kept,
+                            "Destination policy dropped addresses from the DNS answer"
+                        );
+                    }
+                    kept
+                }
+                Err(reason) => {
+                    warn!(
+                        host = %endpoint,
+                        reason = %reason,
+                        "Destination policy refused every address the name resolved to; no connection will be attempted"
+                    );
+                    return Err(ProxyError::ConnectionError(format!(
+                        "destination policy refused every address resolved for {}: {}",
+                        endpoint, reason
+                    )));
+                }
+            },
+        };
+
+        info!(
+            "Resolved {} to {} IP addresses: {:?}",
+            endpoint,
+            ip_addresses.len(),
+            ip_addresses
+        );
+        Ok(ip_addresses)
+    }
+
+    fn is_registered(&self, name: &str) -> bool {
+        self.registered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
+    }
+
+    fn mark_registered(&self, name: &str) {
+        self.registered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+    }
+
+    /// The remembered failure for `name`, unless the name is registered.
+    fn remembered_failure_unless_registered(&self, name: &str) -> Option<String> {
+        if self.is_registered(name) {
+            return None;
+        }
+        self.remembered_failure(name)
+    }
+
+    fn remembered_failure(&self, name: &str) -> Option<String> {
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        match failures.get(name) {
+            Some((at, message)) if at.elapsed() < self.failure_memory => Some(message.clone()),
+            Some(_) => {
+                failures.remove(name);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// A success clears the name's remembered failure; a failure is remembered, within a
+    /// bound on how many names are held.
+    fn record_outcome(&self, name: &str, outcome: &LookupOutcome) {
+        if outcome.is_err() && self.is_registered(name) {
+            return;
+        }
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(_) => {
+                failures.remove(name);
+            }
+            Err(message) => {
+                if self.failure_memory.is_zero() {
+                    return;
+                }
+                if failures.len() >= self.max_remembered_failures && !failures.contains_key(name) {
+                    let memory = self.failure_memory;
+                    failures.retain(|_, (at, _)| at.elapsed() < memory);
+                    // Still full of unexpired entries: the oldest makes room.
+                    while failures.len() >= self.max_remembered_failures {
+                        let oldest = failures
+                            .iter()
+                            .min_by_key(|(_, (at, _))| *at)
+                            .map(|(key, _)| key.clone());
+                        match oldest {
+                            Some(key) => failures.remove(&key),
+                            None => return,
+                        };
+                    }
+                }
+                failures.insert(name.to_string(), (Instant::now(), message.clone()));
+            }
+        }
+    }
+
+    async fn lookup_dns(&self, endpoint: &str) -> Result<Vec<IpAddr>> {
+        #[cfg(test)]
+        {
+            let seeded = self
+                .dns_answers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(endpoint)
+                .cloned();
+            if let Some(answer) = seeded {
+                answer.started.fetch_add(1, Ordering::SeqCst);
+                if let Some(gate) = &answer.gate {
+                    if let Ok(permit) = gate.acquire().await {
+                        permit.forget();
+                    }
+                }
+                return answer.result.map_err(ProxyError::ConnectionError);
+            }
+        }
+        let response = self.resolver.lookup_ip(endpoint).await.map_err(|e| {
+            ProxyError::ConnectionError(format!("DNS resolution failed for {}: {}", endpoint, e))
+        })?;
+        Ok(response.iter().collect())
+    }
+}
+
 /// Manages DNS resolution and IP distribution for S3 endpoints.
 ///
 /// Actual TCP connection pooling is handled by hyper's built-in pool.
@@ -419,7 +730,7 @@ impl IpHealthTracker {
 /// - Per-endpoint IpDistributor for round-robin IP selection
 /// - Hostname lookup for TLS SNI when URI authority is rewritten to IP
 pub struct ConnectionPoolManager {
-    resolver: TokioResolver,
+    lookup: Arc<NameLookup>,
     default_dns_refresh_interval: Duration,
     dns_refresh_count: u64,
     /// Parsed endpoint overrides (exact + suffix) for PrivateLink etc.
@@ -458,7 +769,12 @@ impl ConnectionPoolManager {
         info!("DNS resolver initialized with external servers (bypassing /etc/hosts)");
 
         Ok(Self {
-            resolver,
+            lookup: Arc::new(NameLookup::new(
+                resolver,
+                EndpointOverrides::from_config(&HashMap::new()),
+                Duration::from_secs(60),
+                10_000,
+            )),
             default_dns_refresh_interval: Duration::from_secs(60),
             dns_refresh_count: 0,
             overrides: EndpointOverrides::from_config(&HashMap::new()),
@@ -527,10 +843,15 @@ impl ConnectionPoolManager {
         // A host matched only by a suffix (`*.`) entry gets its distributor on
         // first use, because the concrete hostname is not known until request
         // time: `register_endpoint` seeds it, keyed by that hostname, from the
-        // suffix entry's IPs (`resolve_endpoint` consults overrides first).
+        // suffix entry's IPs (`NameLookup::resolve` consults overrides first).
 
         Ok(Self {
-            resolver,
+            lookup: Arc::new(NameLookup::new(
+                resolver,
+                overrides.clone(),
+                config.dns_refresh_interval,
+                config.max_registered_endpoints,
+            )),
             default_dns_refresh_interval: config.dns_refresh_interval,
             dns_refresh_count: 0,
             overrides,
@@ -541,47 +862,25 @@ impl ConnectionPoolManager {
         })
     }
 
+    /// Filter every DNS answer through `policy` from here on (see [`NameLookup`]).
+    /// Call before the manager is shared.
+    pub(crate) fn with_dial_policy(mut self, policy: Option<Arc<DestinationPolicy>>) -> Self {
+        Arc::get_mut(&mut self.lookup)
+            .expect("the name lookup is not shared before the manager is built")
+            .dial_policy = policy;
+        self
+    }
+
+    /// The shared name-resolution handle. Clone it out under a read guard, drop the guard, and
+    /// resolve with the handle, so a slow lookup never holds the pool's lock.
+    pub fn lookup(&self) -> Arc<NameLookup> {
+        Arc::clone(&self.lookup)
+    }
+
     /// Look up an endpoint override — exact match first, then longest-suffix match.
     /// Returns the IPs if found, None otherwise.
     pub fn resolve_override(&self, endpoint: &str) -> Option<&Vec<IpAddr>> {
         self.overrides.resolve(endpoint)
-    }
-
-    /// Resolve endpoint to IP addresses using the configured DNS resolver
-    /// (bypasses /etc/hosts). Checks endpoint overrides first, then falls back to DNS.
-    pub async fn resolve_endpoint(&self, endpoint: &str) -> Result<Vec<IpAddr>> {
-        // Check overrides (exact then suffix)
-        if let Some(ips) = self.overrides.resolve(endpoint) {
-            // `debug!`, not `info!`: every registered suffix-override host passes
-            // through here on each `dns_refresh_interval`, so at INFO this line
-            // repeated once per virtual-hosted bucket per refresh. The one INFO line
-            // per host is emitted by `register_endpoint` on first registration.
-            debug!("Using endpoint override for {}: {:?}", endpoint, ips);
-            return Ok(ips.clone());
-        }
-
-        debug!("Resolving DNS for endpoint: {}", endpoint);
-
-        let response = self.resolver.lookup_ip(endpoint).await.map_err(|e| {
-            ProxyError::ConnectionError(format!("DNS resolution failed for {}: {}", endpoint, e))
-        })?;
-
-        let ip_addresses: Vec<IpAddr> = response.iter().collect();
-
-        if ip_addresses.is_empty() {
-            return Err(ProxyError::ConnectionError(format!(
-                "No IP addresses found for endpoint: {}",
-                endpoint
-            )));
-        }
-
-        info!(
-            "Resolved {} to {} IP addresses: {:?}",
-            endpoint,
-            ip_addresses.len(),
-            ip_addresses
-        );
-        Ok(ip_addresses)
     }
 
     /// Register an endpoint for DNS-based IP distribution.
@@ -592,63 +891,84 @@ impl ConnectionPoolManager {
     /// `endpoint_overrides` entry (those are seeded at startup).
     ///
     /// A host matched only by a suffix (`*.`) override IS registered: the
-    /// resolve goes through `resolve_endpoint`, which returns the suffix entry's
+    /// resolve goes through `NameLookup::resolve`, which returns the suffix entry's
     /// IPs, so the host gets a distributor of its own, keyed by the concrete
     /// hostname. Its IPs then sit in `resolved_ips`, which is what lets the
     /// recovery probe map an excluded IP back to this host, and what makes a DNS
     /// refresh rebuild the distributor from the override list minus unhealthy IPs.
     pub async fn register_endpoint(&mut self, endpoint: &str) {
+        let Some(lookup) = self.begin_registration(endpoint) else {
+            return;
+        };
+        let result = lookup.resolve(endpoint).await;
+        self.finish_registration(endpoint, result);
+    }
+
+    /// First half of registration, for a caller that resolves outside the pool's lock:
+    /// the lookup handle to resolve `endpoint` with, or `None` when there is nothing to do
+    /// (already registered, an exact `endpoint_overrides` entry, or the cap reached).
+    pub(crate) fn begin_registration(&self, endpoint: &str) -> Option<Arc<NameLookup>> {
         // Skip if already registered or seeded at startup from an exact override
         if self.resolved_ips.contains_key(endpoint) || self.overrides.is_exact(endpoint) {
-            return;
+            return None;
         }
         // Cap: prevent unbounded growth of registered endpoints. Suffix-override
         // hosts count against the same cap as DNS hosts, one slot per concrete
         // hostname; a host refused here gets no distributor and its requests
-        // connect to the first IP `resolve_endpoint` returns.
+        // connect to the first IP `NameLookup::resolve` returns.
         if self.resolved_ips.len() >= self.max_registered_endpoints {
             warn!(
                 endpoint = %endpoint,
                 cap = self.max_registered_endpoints,
                 "Endpoint registration cap reached; ignoring new endpoint"
             );
+            return None;
+        }
+        Some(Arc::clone(&self.lookup))
+    }
+
+    /// Second half of registration: store the lookup's result and seed the distributor.
+    /// A failed lookup stores nothing. Registrations of one host that overlap in time
+    /// store the result once.
+    pub(crate) fn finish_registration(&mut self, endpoint: &str, result: Result<Vec<IpAddr>>) {
+        if self.resolved_ips.contains_key(endpoint)
+            || self.resolved_ips.len() >= self.max_registered_endpoints
+        {
             return;
         }
-        if let Some(ips) = self.overrides.resolve(endpoint) {
-            // Logged once per host at INFO; later refreshes log at debug in
-            // `resolve_endpoint`.
-            info!(
-                endpoint = %endpoint,
-                ips = ?ips,
-                "Using endpoint override for suffix-matched host; registering its IP distributor"
-            );
-        } else {
-            info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
-        }
-        // `None`: this is a first-time registration (the early return above skips
-        // endpoints already known), so no health tracker is consulted. For a
-        // suffix-override host an IP can already be marked unhealthy by a failure
-        // on the hostname path before this ran; it is seeded anyway, removed again
-        // by its next failure (`record_failure` returns true at or above the
-        // threshold), and held out by the next `refresh_dns`.
-        if let Err(e) = self.refresh_endpoint_dns(endpoint, None).await {
-            warn!(
+        match result {
+            Ok(ips) => {
+                if let Some(override_ips) = self.overrides.resolve(endpoint) {
+                    // Logged once per host at INFO; later refreshes log at debug in
+                    // `NameLookup::resolve`.
+                    info!(
+                        endpoint = %endpoint,
+                        ips = ?override_ips,
+                        "Using endpoint override for suffix-matched host; registering its IP distributor"
+                    );
+                } else {
+                    info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
+                }
+                // `None`: this is a first-time registration, so no health tracker is
+                // consulted. For a suffix-override host an IP can already be marked
+                // unhealthy by a failure on the hostname path before this ran; it is
+                // seeded anyway, removed again by its next failure (`record_failure`
+                // returns true at or above the threshold), and held out by the next
+                // `refresh_dns`.
+                self.apply_resolution(endpoint, ips, None);
+            }
+            Err(e) => warn!(
                 "Initial DNS resolution failed for endpoint {}: {}",
                 endpoint, e
-            );
+            ),
         }
     }
 
-    /// Refresh DNS for all registered endpoints whose refresh interval has elapsed.
-    ///
-    /// When `health_tracker` is `Some`, IPs the tracker still considers unhealthy
-    /// are held out of the rebuilt distributor so a refresh cannot silently undo a
-    /// health exclusion. Pass `None` to rebuild from the raw DNS result (the
-    /// pre-recovery behaviour, retained for tests that exercise DNS alone).
-    pub async fn refresh_dns(&mut self, health_tracker: Option<&IpHealthTracker>) -> Result<()> {
+    /// The registered endpoints whose `dns_refresh_interval` has elapsed since their last
+    /// resolution.
+    pub(crate) fn endpoints_due_for_refresh(&self) -> Vec<String> {
         let now = std::time::SystemTime::now();
-        let endpoints_to_refresh: Vec<String> = self
-            .resolved_ips
+        self.resolved_ips
             .keys()
             .filter(|endpoint| {
                 self.last_dns_refresh
@@ -660,9 +980,17 @@ impl ConnectionPoolManager {
                     .unwrap_or(true)
             })
             .cloned()
-            .collect();
+            .collect()
+    }
 
-        for endpoint in endpoints_to_refresh {
+    /// Refresh DNS for all registered endpoints whose refresh interval has elapsed.
+    ///
+    /// When `health_tracker` is `Some`, IPs the tracker still considers unhealthy
+    /// are held out of the rebuilt distributor so a refresh cannot silently undo a
+    /// health exclusion. Pass `None` to rebuild from the raw DNS result (the
+    /// pre-recovery behaviour, retained for tests that exercise DNS alone).
+    pub async fn refresh_dns(&mut self, health_tracker: Option<&IpHealthTracker>) -> Result<()> {
+        for endpoint in self.endpoints_due_for_refresh() {
             if let Err(e) = self.refresh_endpoint_dns(&endpoint, health_tracker).await {
                 warn!("Failed to refresh DNS for endpoint {}: {}", endpoint, e);
             }
@@ -689,8 +1017,21 @@ impl ConnectionPoolManager {
     ) -> Result<()> {
         debug!("Refreshing DNS for endpoint: {}", endpoint);
 
-        let new_ip_addresses = self.resolve_endpoint(endpoint).await?;
+        let new_ip_addresses = self.lookup.resolve(endpoint).await?;
+        self.apply_resolution(endpoint, new_ip_addresses, health_tracker);
+        Ok(())
+    }
 
+    /// Store a resolution result for `endpoint` and rebuild its distributor from it, as
+    /// [`refresh_endpoint_dns`](Self::refresh_endpoint_dns) describes. Does no I/O, so a
+    /// caller that resolved outside the pool's lock holds the write guard only for this.
+    pub(crate) fn apply_resolution(
+        &mut self,
+        endpoint: &str,
+        new_ip_addresses: Vec<IpAddr>,
+        health_tracker: Option<&IpHealthTracker>,
+    ) {
+        self.lookup.mark_registered(endpoint);
         self.resolved_ips
             .insert(endpoint.to_string(), new_ip_addresses.clone());
         self.last_dns_refresh
@@ -756,8 +1097,6 @@ impl ConnectionPoolManager {
             self.ip_distributors
                 .insert(endpoint.to_string(), IpDistributor::new(distributor_ips));
         }
-
-        Ok(())
     }
 
     /// Get a distributed IP address for the given endpoint using round-robin selection.
@@ -902,6 +1241,88 @@ impl ConnectionPoolManager {
     #[cfg(test)]
     pub(crate) fn seed_resolved_ips_for_test(&mut self, endpoint: &str, ips: Vec<IpAddr>) {
         self.resolved_ips.insert(endpoint.to_string(), ips);
+    }
+
+    /// NAMED TEST SEAM. Make `NameLookup::resolve` answer `ips` for `name` in place of
+    /// a DNS query. `endpoint_overrides` still win, and the destination policy
+    /// still filters the answer, as it does a real one.
+    #[cfg(test)]
+    pub(crate) fn seed_dns_answer_for_test(&self, name: &str, ips: Vec<IpAddr>) {
+        self.seam_answer(name, Ok(ips));
+    }
+
+    /// NAMED TEST SEAM. Make the lookup of `name` fail.
+    #[cfg(test)]
+    pub(crate) fn seed_dns_failure_for_test(&self, name: &str) {
+        self.seam_answer(
+            name,
+            Err(format!("DNS resolution failed for {name}: fixture")),
+        );
+    }
+
+    #[cfg(test)]
+    fn seam_answer(&self, name: &str, result: LookupOutcome) {
+        let mut answers = self
+            .lookup
+            .dns_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = answers
+            .entry(name.to_string())
+            .or_insert_with(|| SeamAnswer {
+                result: Ok(Vec::new()),
+                gate: None,
+                started: Arc::new(AtomicUsize::new(0)),
+            });
+        entry.result = result;
+    }
+
+    /// NAMED TEST SEAM. Hold every lookup of `name` until a permit is added to the returned
+    /// semaphore. Seed the name's answer first.
+    #[cfg(test)]
+    pub(crate) fn gate_dns_lookups_for_test(&self, name: &str) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut answers = self
+            .lookup
+            .dns_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        answers.get_mut(name).expect("seed the answer first").gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// NAMED TEST SEAM. How many lookups of `name` reached the resolver.
+    #[cfg(test)]
+    pub(crate) fn dns_lookups_started_for_test(&self, name: &str) -> usize {
+        let answers = self
+            .lookup
+            .dns_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        answers
+            .get(name)
+            .map_or(0, |a| a.started.load(Ordering::SeqCst))
+    }
+
+    /// NAMED TEST SEAM. The counter behind `dns_lookups_started_for_test`, for a test that
+    /// must read it while the pool is locked.
+    #[cfg(test)]
+    pub(crate) fn dns_lookups_counter_for_test(&self, name: &str) -> Arc<AtomicUsize> {
+        let answers = self
+            .lookup
+            .dns_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&answers.get(name).expect("seed the answer first").started)
+    }
+
+    /// NAMED TEST SEAM. Replace the lookup timeout. Call before the manager is shared.
+    #[cfg(test)]
+    pub(crate) fn with_lookup_timeout_for_test(mut self, timeout: Duration) -> Self {
+        Arc::get_mut(&mut self.lookup)
+            .expect("the name lookup is not shared before the manager is built")
+            .lookup_timeout = timeout;
+        self
     }
 
     /// Look up the endpoint that owns an IP, including IPs currently excluded
@@ -1371,6 +1792,214 @@ mod tests {
         assert_eq!(
             manager.get_endpoint_for_ip(&unhealthy).as_deref(),
             Some("s3.us-west-2.amazonaws.com")
+        );
+    }
+
+    /// Callers that arrive while a lookup of one name runs share its result.
+    #[tokio::test]
+    async fn concurrent_lookups_of_one_name_share_one_resolution() {
+        let host = "shared.example.test";
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let pm = ConnectionPoolManager::new_with_config(Default::default()).unwrap();
+        pm.seed_dns_answer_for_test(host, vec![ip]);
+        let gate = pm.gate_dns_lookups_for_test(host);
+        let lookup = pm.lookup();
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let lookup = Arc::clone(&lookup);
+                tokio::spawn(async move { lookup.resolve(host).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(pm.dns_lookups_started_for_test(host), 1);
+
+        gate.add_permits(1);
+
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap().unwrap(), vec![ip]);
+        }
+        assert_eq!(pm.dns_lookups_started_for_test(host), 1);
+    }
+
+    /// A lookup that never answers ends at the timeout, and the failure is remembered.
+    #[tokio::test]
+    async fn a_lookup_that_never_answers_times_out_and_is_remembered() {
+        let host = "silent.example.test";
+        let pm = ConnectionPoolManager::new_with_config(Default::default())
+            .unwrap()
+            .with_lookup_timeout_for_test(Duration::from_millis(100));
+        pm.seed_dns_answer_for_test(host, vec!["192.0.2.10".parse().unwrap()]);
+        let _held = pm.gate_dns_lookups_for_test(host);
+
+        let first = tokio::time::timeout(Duration::from_secs(5), pm.lookup().resolve(host))
+            .await
+            .expect("the lookup is bounded");
+        match first {
+            Err(ProxyError::ConnectionError(message)) => {
+                assert!(message.contains("timed out"), "{message}")
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(pm.lookup().resolve(host).await.is_err());
+        assert_eq!(
+            pm.dns_lookups_started_for_test(host),
+            1,
+            "the second call within dns_refresh_interval must not look the name up again"
+        );
+    }
+
+    /// A failed background refresh of a registered host keeps its addresses and is not
+    /// remembered, so the next per-request lookup of that host runs and succeeds.
+    #[tokio::test]
+    async fn a_failed_refresh_of_a_registered_host_does_not_fail_later_lookups() {
+        let host = "registered.example.test";
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut pm = ConnectionPoolManager::new_with_config(Default::default()).unwrap();
+        pm.seed_dns_answer_for_test(host, vec![ip]);
+        pm.register_endpoint(host).await;
+        assert_eq!(pm.get_distributed_ip(host), Some(ip));
+
+        pm.seed_dns_failure_for_test(host);
+        assert!(pm.refresh_endpoint_dns(host, None).await.is_err());
+        assert_eq!(
+            pm.get_distributed_ip(host),
+            Some(ip),
+            "a failed refresh keeps the addresses the host already has"
+        );
+
+        pm.seed_dns_answer_for_test(host, vec![ip]);
+        assert_eq!(
+            pm.lookup().resolve(host).await.unwrap(),
+            vec![ip],
+            "a per-request lookup of a registered host is not answered by a failed refresh"
+        );
+    }
+
+    /// A name that fails while the memory is full is still remembered: the oldest entry
+    /// makes room.
+    #[tokio::test]
+    async fn a_full_failure_memory_evicts_its_oldest_entry() {
+        let config = crate::config::ConnectionPoolConfig {
+            max_registered_endpoints: 2,
+            ..Default::default()
+        };
+        let pm = ConnectionPoolManager::new_with_config(config).unwrap();
+        for host in ["a.example.test", "b.example.test", "c.example.test"] {
+            pm.seed_dns_failure_for_test(host);
+            assert!(pm.lookup().resolve(host).await.is_err());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let host = "c.example.test";
+        for _ in 0..3 {
+            assert!(pm.lookup().resolve(host).await.is_err());
+        }
+        assert_eq!(
+            pm.dns_lookups_started_for_test(host),
+            1,
+            "the newest failing name is looked up once, not once per request"
+        );
+    }
+
+    fn allowlist_policy(host: &str) -> Arc<DestinationPolicy> {
+        Arc::new(DestinationPolicy::new(
+            80,
+            Some(vec![host.to_string()]),
+            std::collections::HashSet::new(),
+        ))
+    }
+
+    /// With an allowlist the DNS answer keeps only the addresses the policy accepts.
+    #[tokio::test]
+    async fn dns_answer_is_filtered_through_the_policy_when_one_is_set() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "192.0.2.10".parse().unwrap();
+        let pm = ConnectionPoolManager::new_with_config(Default::default())
+            .unwrap()
+            .with_dial_policy(Some(allowlist_policy("named.example.test")));
+        pm.seed_dns_answer_for_test("named.example.test", vec![loopback, public]);
+
+        assert_eq!(
+            pm.lookup().resolve("named.example.test").await.unwrap(),
+            vec![public]
+        );
+    }
+
+    /// With no policy the answer is exactly what DNS returned.
+    #[tokio::test]
+    async fn dns_answer_is_unfiltered_without_a_policy() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "192.0.2.10".parse().unwrap();
+        let pm = ConnectionPoolManager::new_with_config(Default::default())
+            .unwrap()
+            .with_dial_policy(None);
+        pm.seed_dns_answer_for_test("named.example.test", vec![loopback, public]);
+
+        assert_eq!(
+            pm.lookup().resolve("named.example.test").await.unwrap(),
+            vec![loopback, public]
+        );
+    }
+
+    /// When the policy refuses every address the lookup fails and names the policy.
+    #[tokio::test]
+    async fn dns_answer_the_policy_refuses_entirely_is_a_connection_error() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let pm = ConnectionPoolManager::new_with_config(Default::default())
+            .unwrap()
+            .with_dial_policy(Some(allowlist_policy("named.example.test")));
+        pm.seed_dns_answer_for_test("named.example.test", vec![loopback]);
+
+        match pm.lookup().resolve("named.example.test").await {
+            Err(ProxyError::ConnectionError(message)) => {
+                assert!(message.contains("destination policy"), "{message}")
+            }
+            other => panic!("expected a ConnectionError, got {other:?}"),
+        }
+    }
+
+    /// `endpoint_overrides` answers are the documented carve-out: never filtered.
+    #[tokio::test]
+    async fn endpoint_override_answers_are_not_filtered_by_the_policy() {
+        let private: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("pinned.example.test".to_string(), vec![private.to_string()]);
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+        let pm = ConnectionPoolManager::new_with_config(config)
+            .unwrap()
+            .with_dial_policy(Some(allowlist_policy("pinned.example.test")));
+
+        assert_eq!(
+            pm.lookup().resolve("pinned.example.test").await.unwrap(),
+            vec![private]
+        );
+    }
+
+    /// The DNS-answer seam stands in for the resolver and never for an override.
+    #[tokio::test]
+    async fn seeded_dns_answer_replaces_the_resolver_and_overrides_still_win() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "192.0.2.10".parse().unwrap();
+        let pinned: IpAddr = "198.51.100.7".parse().unwrap();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("pinned.example.test".to_string(), vec![pinned.to_string()]);
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+        let pm = ConnectionPoolManager::new_with_config(config).unwrap();
+        pm.seed_dns_answer_for_test("named.example.test", vec![loopback, public]);
+        pm.seed_dns_answer_for_test("pinned.example.test", vec![loopback]);
+
+        assert_eq!(
+            pm.lookup().resolve("named.example.test").await.unwrap(),
+            vec![loopback, public]
+        );
+        assert_eq!(
+            pm.lookup().resolve("pinned.example.test").await.unwrap(),
+            vec![pinned]
         );
     }
 

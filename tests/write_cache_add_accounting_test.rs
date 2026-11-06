@@ -19,8 +19,8 @@
 //! accumulator flushes since 2026-05-20, 1,566 of them `write_cache_delta=+0`,
 //! **9** positive write-cache credits in total against **1,535** `committed
 //! write-cached range` log lines. The 9 came from the paths that DO journal
-//! (`CompleteMultipartUpload` and `store_full_object_as_range_new`, both via
-//! `JournalConsolidator::write_multipart_journal_entries`).
+//! (`CompleteMultipartUpload` and `store_full_object_as_range_witnessed`, both via
+//! `JournalConsolidator::write_multipart_journal_entries_witnessed`).
 //!
 //! Consequence, and why it outranks "a gauge reads low": with R6 grounding
 //! `write_cache_size` from the `.meta` files on disk, the figure returned to ~0 and
@@ -41,7 +41,7 @@
 //!
 //! Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
 
-use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
+use s3_proxy::cache::CacheManager;
 use std::collections::HashMap;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -62,11 +62,10 @@ fn setup(cache_dir: &std::path::Path) -> CacheManager {
         std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
     }
 
-    let manager = CacheManager::new_with_eviction_algorithm(
+    let manager = CacheManager::new_with_defaults(
         cache_dir.to_path_buf(),
         false, // ram_cache_enabled — irrelevant here, and off keeps the test cheap
         0,
-        CacheEvictionAlgorithm::TinyLFU,
     );
 
     // Wires the journal consolidator into the manager as a side effect.
@@ -150,7 +149,7 @@ async fn buffered_write_through_put_credits_total_and_write_cache() {
 ///
 /// This is the cross-instance over-count guard: on a shared volume another proxy
 /// may have already published and credited the identical range. `store_range` and
-/// `commit_incremental_range` both gate their credits on `!range_already_existed`,
+/// `commit_incremental_range_shared` both gate their credits on `!range_already_existed`,
 /// and the write-cache paths now do too — the flag used to be discarded by
 /// `finalize`, which is how the credit came to be missing in the first place.
 ///

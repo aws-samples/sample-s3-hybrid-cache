@@ -550,18 +550,7 @@ A nested object, per-proxy, reset on restart.
 ### Error and integrity counters
 
 All counters. `corruption_metadata_total`, `corruption_missing_range_total`,
-`disk_full_events_total`, `metadata_lock_retry_exhausted_total`,
-`cache_cleanup_failures_total`, `cache_etag_validations_total`,
-`cache_etag_mismatches_total`, `cache_range_invalidations_total`,
-`cache_orphaned_ranges_cleaned_total`.
-
-Three of these are always zero, and are documented here because the fields are published
-rather than because they carry a signal:
-- `cache_cleanup_failures_total`: nothing writes it.
-- `cache_orphaned_ranges_cleaned_total`: nothing writes it.
-- `cache_etag_validations_total`: nothing writes it. Note `cache_etag_mismatches_total` and
-  `cache_range_invalidations_total` **are** written on the range-serve path, so a mismatch is
-  observable even though the validation count is not.
+`disk_full_events_total`, `metadata_lock_retry_exhausted_total`.
 
 `disk_full_events_total` is a process-wide counter of cache writes refused with `ENOSPC`. It
 counts range data files, request-path `.meta` writes and journal appends, and not every write
@@ -847,12 +836,12 @@ Always present, including when disabled: `ceiling_bytes: 0` means the ledger is 
 
 | Field | Kind | Meaning |
 |---|---|---|
-| `reserved_bytes` | gauge | Bytes currently claimed by buffering paths |
+| `reserved_bytes` | gauge | Bytes currently claimed by buffering paths. Can exceed `ceiling_bytes` while S3's answers to writes already sent are held, because those are counted but never refused |
 | `ceiling_bytes` | config | `server.max_inflight_buffer_bytes`. **`0` = disabled** |
 | `peak_reserved_bytes` | high-water | Maximum `reserved_bytes` since start |
 | `rejected_total` | counter | Sheds attributable to this ledger only. Always `<= request_metrics.rejected_requests` |
 | `aborted_accumulations_total` | counter | Unknown-size accumulations aborted mid-stream at the ceiling |
-| `granted_total` | counter | Grants since start: each admitted reservation and each successful growth of one. Take a delta of this, not a sample of `reserved_bytes`, to prove a path reserved nothing: a reservation shorter than the sampling interval still moves it. `0` while disabled |
+| `granted_total` | counter | Grants since start: each admitted reservation and each successful growth of one. Take a delta of this, not a sample of `reserved_bytes`, to see whether a path reserved at all: a reservation shorter than the sampling interval still moves it. Every signed write moves it, because the write's response is counted. To tell a buffered request body from that, compare the `granted_bytes_total` delta with the body size. `0` while disabled |
 | `granted_bytes_total` | counter | Bytes granted by those grants |
 | `ram_cache_max_bytes` | config | `cache.max_ram_cache_size`, echoed so the two memory budgets read side by side |
 
@@ -1484,7 +1473,7 @@ the last validation on the volume rather than anything this process did.
 |---|---|---|
 | `instance_id` | string | The proxy (`{hostname}:{pid}`) that ran the validation |
 | `sampled_at` | unix seconds | When the sample was taken. Alarm on `now − sampled_at`: a low drift from a sample days old says nothing about now |
-| `sample_kind` | string | Which validation produced the reference figures: `full_scan`, `rolling_extrapolation` or `unspecified`. **Read this first.** Only `full_scan` can produce a drift; the other two set `unevaluable_reason` on every population |
+| `sample_kind` | string | Which validation produced the reference figures: `full_scan` or `rolling_extrapolation`. **Read this first.** Only `full_scan` can produce a drift; `rolling_extrapolation` sets `unevaluable_reason` on every population |
 
 Three populations follow, `total_size` (bytes), `write_cache_size` (bytes) and `cached_objects`
 (cache metadata `.meta` entries), each with the same five fields:
@@ -1495,7 +1484,7 @@ Three populations follow, `total_size` (bytes), `write_cache_size` (bytes) and `
 | `reference` | gauge (nullable) | The figure the validation computed. For a full scan it is a census taken over the scan's duration. The counters are corrected by `reference − persisted` rather than set to it, so writes and deletes made during the scan are kept. `null` when the validation supplied none for this population |
 | `drift` | gauge (nullable, signed) | `reference − persisted`. **Negative means the running counter was over-stating**, which makes the cache evict before it needs to. `null` whenever `unevaluable_reason` names a cause other than `reference_zero` |
 | `drift_ratio` | gauge (nullable) | `abs(drift) ÷ reference`. Compare this rather than `drift` across caches of different sizes. `null` when `drift` is, and when `reference` is `0` |
-| `unevaluable_reason` | string (nullable) | Why `drift` or `drift_ratio` is `null`: `persisted_state_unreadable`, `figure_not_supplied`, `reference_is_extrapolation` (a rolling cycle extrapolates from the counter it would be compared against), `sample_kind_unspecified`, or `reference_zero` (the ratio alone is missing; `drift` is still published). `null` when both are published |
+| `unevaluable_reason` | string (nullable) | Why `drift` or `drift_ratio` is `null`: `persisted_state_unreadable`, `figure_not_supplied`, `reference_is_extrapolation` (a rolling cycle extrapolates from the counter it would be compared against), or `reference_zero` (the ratio alone is missing; `drift` is still published). `null` when both are published |
 
 The published reading on a large cache is often `rolling_extrapolation` with every drift `null`,
 because a full scan does not fit there. That is the absence of a measurement, not a zero drift. A
@@ -1824,6 +1813,7 @@ Reason keys:
 | `backlog_full` | 1,024 PUTs or multipart parts on this proxy were already waiting for their background cache store, so this one was forwarded uncached. Also counts a `CreateMultipartUpload` whose tracker was not written, and a `CompleteMultipartUpload` not finalized, because the write-cache backlog was full. Sustained growth means PUTs are arriving faster than the cache volume commits them; the cached fraction is roughly the commit rate divided by the PUT rate. The key's previous cached version is still invalidated |
 | `hostname_not_unique` | Another running proxy holds this one's whole identity, the same hostname and the same process id, so the two would write the same per-proxy accounting files. This proxy stops caching writes for the life of the process: the write is forwarded to S3 and served normally, and the key's previous cached version is still invalidated. Reads are unaffected. A deployment error, not a transient: see [Each proxy needs its own hostname](SHARED_STORAGE.md#each-proxy-needs-its-own-hostname) and `cache.hostname_collisions_total` |
 | `superseded` | Another PUT, CompleteMultipartUpload or DELETE of the same key was acknowledged, on any proxy sharing the cache volume, after this write but before its cache store published, so the store did not publish. The newer write's own store, or the next GET, caches the current object. Occasional counts are expected when one key is overwritten in quick succession |
+| `temporary_replaced` | The temporary file this write's cache store wrote was replaced or removed before the store could publish it, or the store had no record of what it wrote, so it did not publish. The upload itself succeeded, and the next GET caches the object |
 | `multipart_tracking_full` | The cache volume already held 5,000 in-progress multipart entries, counting each upload the write cache is tracking and each of its uploaded parts, across every proxy sharing the volume. A `CreateMultipartUpload` counted here writes no tracker, so the upload is not cached. An `UploadPart` counted here is not staged, its upload stops being cached, and the parts the upload had staged are removed. The upload itself completes at S3 as usual, and its CompleteMultipartUpload still invalidates the key's previous cached version. An `UploadPart` whose upload has no staging directory yet counts as two entries, because staging it creates the directory too. The cap keeps the walk of in-progress uploads short: the metrics collector makes it once per collection interval, and the readers that decide on its figure up to once every 5 seconds. Sustained counts mean more multipart uploads are running at once than the write cache can track |
 | `multipart_tracking_unknown` | The count of in-progress multipart entries could not be read, because a listing of `mpus_in_progress/` failed, so the `CreateMultipartUpload` or `UploadPart` was forwarded uncached. Unlike `multipart_tracking_full`, the parts the upload had already staged are kept, though the upload is then not cached because a part is missing. The application log names the listing error. Sustained counts mean the cache volume cannot list `mpus_in_progress/` |
 

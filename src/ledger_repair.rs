@@ -3,7 +3,7 @@
 //! # What this exists to stop, and why nothing else stops it
 //!
 //! The staged fold's candidate set comes from the Write_Ledger and from nowhere else
-//! (`staged_fold::run_staged_fold_with_cap`, the `WriteLedger::group_by_key` loop). A staged
+//! (the `WriteLedger::group_by_key` loop in `staged_fold`). A staged
 //! `.meta` that no ledger entry names therefore contributes **nothing** to `F`, and no
 //! existing mechanism says so:
 //!
@@ -158,7 +158,7 @@ const REPAIR_CLAIM_LEASE_SECS: u64 = 1_800;
 ///
 /// Changing it is therefore a deliberate code change with the consequence published, not a knob.
 /// See [`REPAIR_SHARD_VISITS_PER_PASS_CEILING`] for the no-knob reasoning in full.
-pub const MAX_REPAIR_AGE_SECS: u64 = 86_400;
+pub(crate) const MAX_REPAIR_AGE_SECS: u64 = 86_400;
 
 /// How often a pass is eligible, seconds. Matched to the fold's cadence so the two rotations
 /// are driven from the same consolidation cycle without a second timer.
@@ -174,7 +174,7 @@ pub const MAX_REPAIR_AGE_SECS: u64 = 86_400;
 ///   fold: every pass performs one *complete* authority read of every ledger file, so halving `T`
 ///   doubles that fixed per-pass cost while leaving the total `.meta` work unchanged — spending the
 ///   cheap term to buy nothing.
-pub const LEDGER_REPAIR_INTERVAL_SECS: u64 = 300;
+pub(crate) const LEDGER_REPAIR_INTERVAL_SECS: u64 = 300;
 
 /// `.meta` files one visit will read before it stores a cursor and stops.
 ///
@@ -1012,7 +1012,7 @@ fn is_shard_level(name: &str) -> bool {
 
 /// Why a pass swept nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepairRefusal {
+pub(crate) enum RepairRefusal {
     /// The ledger read was incomplete, so the coverage set would be a partial view and
     /// repairing from it would append duplicates.
     LedgerIncomplete,
@@ -1062,7 +1062,7 @@ impl RepairRefusal {
 
 /// What one pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RepairPassSummary {
+pub(crate) struct RepairPassSummary {
     /// Shards whose sweep completed this pass.
     pub completed: Vec<Shard>,
     /// Shards whose sweep was capped and stored a cursor.
@@ -1086,7 +1086,7 @@ pub struct RepairPassSummary {
 
 /// The outcome of one pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RepairOutcome {
+pub(crate) enum RepairOutcome {
     /// At least one shard completed or advanced a sweep.
     Swept(RepairPassSummary),
     /// Nothing was swept, and this is why.

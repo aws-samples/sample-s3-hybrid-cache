@@ -24,6 +24,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
+/// Matches `key=value` pairs in a log message. Compiled once, not per line.
+static KEY_VALUE_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(\w+)=([^\s,]+)").expect("valid regex"));
+
 /// Connection guard to automatically decrement connection counter when dropped
 struct ConnectionGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
@@ -2683,6 +2687,8 @@ impl LogReader {
         })?;
 
         let content = String::from_utf8_lossy(&buffer[..bytes_read]);
+        // Files written before the application log masked credentials still hold presigned URLs.
+        let content = crate::logging::mask_log_line(&content);
 
         // Process lines in reverse order to get most recent entries first
         let lines: Vec<&str> = content.lines().collect();
@@ -2798,11 +2804,9 @@ impl LogReader {
         let mut fields = HashMap::new();
 
         // Look for key=value patterns in the message
-        if let Ok(key_value_regex) = regex::Regex::new(r"(\w+)=([^\s,]+)") {
-            for cap in key_value_regex.captures_iter(&message) {
-                if let (Some(key), Some(value)) = (cap.get(1), cap.get(2)) {
-                    fields.insert(key.as_str().to_string(), value.as_str().to_string());
-                }
+        for cap in KEY_VALUE_REGEX.captures_iter(&message) {
+            if let (Some(key), Some(value)) = (cap.get(1), cap.get(2)) {
+                fields.insert(key.as_str().to_string(), value.as_str().to_string());
             }
         }
 
@@ -2999,7 +3003,7 @@ pub struct LogQueryParams {
 
 /// Logs response structure
 #[derive(Debug, Serialize)]
-pub struct LogsResponse {
+struct LogsResponse {
     pub entries: Vec<LogEntry>,
     pub total_count: usize,
     pub has_more: bool,
@@ -3007,13 +3011,13 @@ pub struct LogsResponse {
 
 /// Cache rules response for `/api/bucket-stats`
 #[derive(Debug, Serialize)]
-pub struct BucketStatsResponse {
+struct BucketStatsResponse {
     pub rules: Vec<RuleStatsEntry>,
 }
 
 /// Per-bucket traffic response for `/api/bucket-traffic`
 #[derive(Debug, Serialize)]
-pub struct BucketTrafficResponse {
+struct BucketTrafficResponse {
     /// Map from "bucket" or "bucket/prefix" to traffic stats.
     pub bucket_traffic: std::collections::HashMap<String, BucketTrafficEntry>,
     /// True when the `__other__` overflow series is present (derived, never stored).
@@ -3023,7 +3027,7 @@ pub struct BucketTrafficResponse {
 /// Traffic counters for a single bucket (or bucket+prefix) series.
 /// Scope: object reads (GET) and object/part writes (PUT/UploadPart).
 #[derive(Debug, Serialize)]
-pub struct BucketTrafficEntry {
+struct BucketTrafficEntry {
     pub bytes_served: u64,
     pub bytes_saved: u64,
     pub bytes_uploaded: u64,
@@ -3033,7 +3037,7 @@ pub struct BucketTrafficEntry {
 
 /// One active cache rule, its set fields, and its hit/miss stats.
 #[derive(Debug, Serialize)]
-pub struct RuleStatsEntry {
+struct RuleStatsEntry {
     pub pattern: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub get_ttl: Option<String>,
@@ -3145,7 +3149,7 @@ pub fn parse_log_query_params(uri: &Uri) -> LogQueryParams {
                                 }
                             }
                             Err(_) => {
-                                warn!("Invalid limit parameter format: {}", decoded_value);
+                                warn!("Invalid limit parameter format: {:?}", decoded_value);
                             }
                         }
                     }
@@ -3165,7 +3169,7 @@ pub fn parse_log_query_params(uri: &Uri) -> LogQueryParams {
                                 }
                             } else {
                                 warn!(
-                                    "Log level parameter contains invalid characters: {}",
+                                    "Log level parameter contains invalid characters: {:?}",
                                     level_str
                                 );
                             }
@@ -3181,11 +3185,11 @@ pub fn parse_log_query_params(uri: &Uri) -> LogQueryParams {
                     }
                     "since" => {
                         // Since parameter reserved for future use
-                        debug!("Since parameter not yet implemented: {}", decoded_value);
+                        debug!("Since parameter not yet implemented: {:?}", decoded_value);
                     }
                     _ => {
                         // Log unknown parameters but don't fail
-                        debug!("Unknown query parameter: {}={}", key, decoded_value);
+                        debug!("Unknown query parameter: {:?}={:?}", key, decoded_value);
                     }
                 }
             } else {
@@ -3745,7 +3749,12 @@ mod tests {
             .expect("consolidator set by create_configured_disk_cache_manager");
         consolidator.initialize().await.unwrap();
         consolidator
-            .update_size_from_validation(4096, None, Some(7))
+            .update_size_from_validation_with_kind(
+                4096,
+                None,
+                Some(7),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
 
         let readable = cache_stats_json(&cache_manager).await;

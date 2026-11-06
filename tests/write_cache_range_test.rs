@@ -171,32 +171,6 @@ async fn test_range_request_from_write_cache() {
         String::from_utf8_lossy(range_data)
     );
 
-    // Test 2: TTL transition on first GET
-    println!("\nTest 2: Testing TTL transition...");
-
-    // Trigger TTL transition
-    cache_manager
-        .transition_to_get_ttl(cache_key)
-        .await
-        .unwrap();
-
-    // Verify metadata was updated with GET_TTL
-    let disk_cache = disk_cache_manager.read().await;
-    let updated_metadata = disk_cache.get_metadata(cache_key).await.unwrap().unwrap();
-    let now = SystemTime::now();
-    let new_time_until_expiry = updated_metadata.expires_at.duration_since(now).unwrap();
-
-    // Should now expire within GET_TTL window (with some tolerance)
-    assert!(
-        new_time_until_expiry > put_ttl,
-        "Should have transitioned to GET_TTL"
-    );
-    assert!(new_time_until_expiry <= get_ttl + Duration::from_secs(5));
-    assert!(new_time_until_expiry >= get_ttl - Duration::from_secs(5));
-
-    println!("✓ TTL transitioned from PUT_TTL to GET_TTL");
-    drop(disk_cache);
-
     // Test 3: Verify range data still accessible after TTL transition
     println!("\nTest 3: Verifying range access after TTL transition...");
 

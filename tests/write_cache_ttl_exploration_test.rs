@@ -140,7 +140,7 @@ fn prop_bug_condition_first_get_returns_expired(input: BugConditionInput) -> Tes
         if !meta.object_metadata.is_write_cached {
             return TestResult::discard();
         }
-        if meta.is_object_expired() {
+        if std::time::SystemTime::now() > meta.expires_at {
             // put_ttl already elapsed (shouldn't happen with 60s+ TTL, but discard)
             return TestResult::discard();
         }

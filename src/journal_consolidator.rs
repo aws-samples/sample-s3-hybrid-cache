@@ -79,7 +79,7 @@ const LEDGER_COMPACTION_RESUME_SECS: u64 = 60;
 /// discovery saw); no production code reads a count's value, and cleanup reads every file it
 /// processes in full whatever the count.
 #[derive(Debug, Clone)]
-pub struct DiscoveryResult {
+pub(crate) struct DiscoveryResult {
     /// cache_key → the files and line spans holding entries for that key
     pub key_index: HashMap<String, KeyLines>,
     /// journal file path → total number of parseable entries in that file at discovery time
@@ -472,7 +472,7 @@ impl ConsolidationResult {
 /// Global consolidation lock for distributed coordination
 /// Prevents multiple instances from running consolidation cycles simultaneously
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlobalConsolidationLock {
+struct GlobalConsolidationLock {
     /// Unique identifier for this proxy instance
     pub instance_id: String,
     /// Process ID of the lock holder
@@ -547,7 +547,7 @@ impl SizeStateFile {
         loaded
     }
 
-    /// Synchronous body of [`JournalConsolidator::persist_size_state_internal`]; records the
+    /// Synchronous body of `SizeStateFile::persist`; records the
     /// written state in the scrape memo.
     fn persist(&self, state: &SizeState) -> Result<()> {
         let written = self.persist_to_disk(state);
@@ -584,8 +584,32 @@ impl SizeStateFile {
         Ok(state)
     }
 
-    /// The write itself; [`JournalConsolidator::persist_size_state_internal`]'s doc comment
-    /// explains the `Schema_Fence` re-stamp.
+    /// The write itself, with atomic replace (temp file + rename).
+    ///
+    /// # The `Schema_Fence` is re-stamped here, at the single writer, and that is deliberate
+    ///
+    /// Several callers do `load_size_state()` → on error `SizeState::default()` → mutate two or
+    /// three fields → persist. `SizeState::default()` carries `schema: 0` and
+    /// `staged_authority_epoch: 0`, which after activation is **byte-for-byte the pre-C shape**
+    /// `detect_foreign_size_state` treats as a foreign write. So one transient read error on an
+    /// activated volume used to persist a document that armed the fold's refusal permanently and
+    /// blamed a binary that did not exist. `update_size_from_validation_with_kind` is the clearest instance
+    /// and the startup `cached_objects` back-fill is a second.
+    ///
+    /// Fixing it per call site means every future call site has to remember. Re-stamping at the
+    /// one function that writes the document means none of them can get it wrong: if this
+    /// volume's epoch latch says the fold is the authority, then this binary is C-capable and
+    /// activated, so any document it writes MUST carry the fence.
+    ///
+    /// Reading the **latch** rather than the document being written is what makes this safe from
+    /// self-reference: the latch comes from `staged_authority_epoch.json`, a different file with
+    /// a different writer (`activate`, under the global consolidation lock).
+    ///
+    /// During Phase L the latch is `EPOCH_LEGACY` and nothing is stamped — required, not
+    /// incidental: § 16.6.6 keeps Phase L writing the legacy schema precisely so a node can
+    /// still be rolled back to a pre-C binary during the upgrade window.
+    ///
+    /// Spec: cache-eviction-at-scale § 16.6.6.
     fn persist_to_disk(&self, state: &SizeState) -> Result<()> {
         let mut owned;
         let state = if crate::staged_authority::fold_authority_active_latched(&self.cache_dir)
@@ -1045,8 +1069,8 @@ pub struct SizeAccumulator {
 /// [`SizeAccumulator::add_range`] on the branch that actually credits. That is the single
 /// chokepoint for the population eviction debits: `add_range` is the only production credit path
 /// for `total_size`, reached from **four** sites — `CacheManager::credit_staged_range`,
-/// `DiskCacheManager::store_range`'s hybrid arm, `DiskCacheManager::commit_incremental_range`, and
-/// [`JournalConsolidator::write_multipart_journal_entries`] — so instrumenting the callee counts
+/// `PreparedRangeFill::finish`, `DiskCacheManager::commit_incremental_range_shared`, and
+/// [`JournalConsolidator::write_multipart_journal_entries_witnessed`] — so instrumenting the callee counts
 /// all four and cannot drift from them.
 ///
 /// Counting at the callee rather than per caller is what makes that robust, and the count above is
@@ -1130,7 +1154,7 @@ fn record_projected_cache_size(projected: u64) {
 /// last trigger evaluation, which on the consolidation-lock winner is one
 /// `consolidation_interval` and on a proxy that never wins the lock is the last eviction pass it
 /// ran. Safe to call from a metrics scrape: one relaxed atomic load.
-pub fn last_projected_cache_size() -> Option<u64> {
+pub(crate) fn last_projected_cache_size() -> Option<u64> {
     let v = LAST_PROJECTED_CACHE_SIZE.load(Ordering::Relaxed);
     (v >= 0).then_some(v as u64)
 }
@@ -1224,7 +1248,7 @@ impl SizeAccumulator {
     }
 
     /// Increment the write-cache size delta. Called for write-cached or MPU ranges.
-    pub fn add_write_cache(&self, compressed_size: u64) {
+    pub(crate) fn add_write_cache(&self, compressed_size: u64) {
         self.write_cache_delta
             .fetch_add(compressed_size as i64, Ordering::Relaxed);
     }
@@ -1266,7 +1290,7 @@ impl SizeAccumulator {
     /// validation scan may have reset the set since the range was added.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
-    pub fn subtract_range(
+    pub(crate) fn subtract_range(
         &self,
         cache_key: &str,
         start: u64,
@@ -1292,14 +1316,14 @@ impl SizeAccumulator {
     }
 
     /// Decrement the write-cache size delta. Called after write-cached range eviction.
-    pub fn subtract_write_cache(&self, compressed_size: u64) {
+    pub(crate) fn subtract_write_cache(&self, compressed_size: u64) {
         self.write_cache_delta
             .fetch_sub(compressed_size as i64, Ordering::Relaxed);
     }
 
     /// Add `n` (signed) to the pending `cached_objects` delta. Lock-free; the consolidation
     /// cycle applies it.
-    pub fn add_cached_objects(&self, n: i64) {
+    pub(crate) fn add_cached_objects(&self, n: i64) {
         self.cached_objects_delta.fetch_add(n, Ordering::Relaxed);
     }
 
@@ -1476,7 +1500,7 @@ impl SizeAccumulator {
     }
 
     /// Reset both accumulators to zero. Called after validation scan corrects drift.
-    pub fn reset(&self) {
+    pub(crate) fn reset(&self) {
         // The census re-grounded the figure from the volume, so every credited byte is in it
         // and the unflushed delta this clears will never reach a delta file.
         if let Some(cache_dir) = self.size_tracking_dir.parent() {
@@ -1509,10 +1533,6 @@ pub struct JournalConsolidator {
     size_state_path: PathBuf,
     /// Reference to cache manager for eviction (Weak to avoid circular references)
     cache_manager: Mutex<Option<Weak<crate::cache::CacheManager>>>,
-    /// Ranges that were evicted and should be immediately marked as stale in journals
-    /// Key: cache_key, Value: Vec<(start, end)> of evicted ranges
-    /// **Validates: Requirement 4.2**
-    evicted_ranges: Mutex<HashMap<String, Vec<(u64, u64)>>>,
     /// Global consolidation lock file handle (kept open while lock is held)
     consolidation_lock_file: Mutex<Option<std::fs::File>>,
     /// In-process gate in front of `size_state.lock`'s blocking `flock`. See
@@ -1896,7 +1916,7 @@ const DEAD_INSTANCE_TEMP_ROOTS: &[&str] = &[
 /// `Some(pid)` if `name` is a temp shape a producer in the three trees constructs, naming one of
 /// `my_hosts` and the writer's pid; `None` for every other name. Three shapes, all anchored:
 ///
-/// 1. `{doc}.tmp.{host}.{pid}` — the shared `Shared::Yes` scheme (checkpoints, claims, freshness,
+/// 1. `{doc}.tmp.{host}.{pid}` — the `write_atomic` scheme (checkpoints, claims, freshness,
 ///    repair, eviction results, epoch, ready and retired records, drift sample, size state).
 /// 2. `{host}:{pid}.resv.tmp.{pid}` — capacity reservations; both pids must agree.
 /// 3. `{host}:{pid}[:...]{suffix}` for a suffix in [`INSTANCE_TEMP_SUFFIXES`].
@@ -2093,11 +2113,11 @@ pub(crate) fn reap_dead_instance_temps(
 /// `Some(pid)` if `name` is a range temp this host's `{pid}` staged under `ranges/`:
 ///
 /// - family D, `{key}_{s}-{e}.bin.tmp.{host}.{pid}`, the shared name 3.0.0's whole-buffer range
-///   writers used (`store_range`, multipart completion, the full-object GET store). No 3.0.1
+///   writers used (`prepare_range_store`, multipart completion, the full-object GET store). No 3.0.1
 ///   writer creates it; it is matched so a dead 3.0.0 process's leftovers are still reaped;
 /// - family E1, `{key}_{s}-{e}.{rand:08x}.tmp.{host}.{pid}`, every range writer since 3.0.1
 ///   (R10.1): `begin_incremental_range_write` (the streamed GET-miss fill and write-cache sink),
-///   `prepare_range_store` (`store_range` and the part store), the full-object GET store and
+///   `prepare_range_store` (and the part store through it), the full-object GET store and
 ///   multipart completion.
 ///
 /// Both are built by `cache::instance_scoped_range_tmp_path`. The earlier names
@@ -3179,9 +3199,10 @@ enum DeadJournalReap {
 /// complete line still present is an entry no consolidation has applied. Such a journal is
 /// kept, and the normal cycle (whose discovery reads every `*.journal`) applies it. One holding
 /// nothing to apply ([`foreign_journal_is_reapable`]) is removed. One unmodified for longer
-/// than `replay_max_age` is removed unapplied: folding an `Add` into an absent `.meta` stamps
-/// `created_at`, the GET freshness anchor, with the fold time, so replaying a fill from before
-/// a long outage would extend its freshness by the length of the outage.
+/// than `replay_max_age` is removed unapplied. A replayed `Add` is judged from its own fill
+/// time, because the fold stamps a new `.meta`'s `created_at`, the GET freshness anchor, from
+/// the earliest `Add` of the document's version (never later than the fold), so replay does not
+/// extend a fill's freshness; the cap bounds how old a fill the cache adopts after an outage.
 ///
 /// The lock file is left for `cleanup_stale_lock_files`, as [`reap_foreign_journal`] leaves it.
 fn reap_dead_own_host_journal(
@@ -3732,7 +3753,7 @@ const DEFAULT_INCOMPLETE_UPLOAD_TTL_SECS: u64 = 86_400;
 
 /// The incomplete-upload sweep's interval for a TTL: a quarter of it, capped at one hour, so an
 /// abandoned upload is reaped at most a quarter-TTL (or an hour) after it expires. At least 1 s.
-pub fn incomplete_upload_sweep_interval_secs(ttl_secs: u64) -> u64 {
+fn incomplete_upload_sweep_interval_secs(ttl_secs: u64) -> u64 {
     (ttl_secs / 4).clamp(1, 3600)
 }
 
@@ -4315,7 +4336,6 @@ impl JournalConsolidator {
             config,
             size_state_path,
             cache_manager: Mutex::new(None),
-            evicted_ranges: Mutex::new(HashMap::new()),
             consolidation_lock_file: Mutex::new(None),
             size_state_gate: Arc::new(tokio::sync::Mutex::new(())),
             size_accumulator,
@@ -4463,7 +4483,7 @@ impl JournalConsolidator {
             && !self.has_pending_delta_files()
     }
 
-    /// Get reference to the size accumulator (for store_range and eviction to call)
+    /// Get reference to the size accumulator (for `PreparedRangeFill::finish` and eviction to call)
     pub fn size_accumulator(&self) -> &Arc<SizeAccumulator> {
         &self.size_accumulator
     }
@@ -4537,7 +4557,7 @@ impl JournalConsolidator {
     /// Spec: write-cache-accounting-and-eviction. Requirements: 2.1, 2.7;
     /// cache-eviction-at-scale § 16.6.12 point 3 (L1, L3).
     #[must_use = "a staged write-cache credit may be published only when this returns true"]
-    pub async fn record_staged_range(
+    pub(crate) async fn record_staged_range(
         &self,
         cache_key: &str,
         range_start: u64,
@@ -4874,44 +4894,6 @@ impl JournalConsolidator {
         }
     }
 
-    /// Mark ranges as evicted for immediate journal cleanup
-    ///
-    /// Called by CacheManager after eviction completes. Entries matching these ranges
-    /// will be removed in the next consolidation cycle, bypassing the 5-minute timeout.
-    ///
-    /// **Validates: Requirement 4.2**
-    ///
-    /// # Arguments
-    /// * `evicted_ranges` - Vec of (cache_key, start, end) tuples for evicted ranges
-    pub fn mark_ranges_evicted(&self, ranges: Vec<(String, u64, u64)>) {
-        if ranges.is_empty() {
-            return;
-        }
-
-        match self.evicted_ranges.lock() {
-            Ok(mut guard) => {
-                let mut count = 0;
-                for (cache_key, start, end) in ranges {
-                    guard
-                        .entry(cache_key.clone())
-                        .or_default()
-                        .push((start, end));
-                    count += 1;
-                }
-                debug!(
-                    "Marked {} ranges as evicted for immediate journal cleanup",
-                    count
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to acquire evicted_ranges lock: {}. Stale entries will be cleaned up via timeout.",
-                    e
-                );
-            }
-        }
-    }
-
     /// Write Remove journal entries for evicted ranges
     ///
     /// This is the journal-based approach to size tracking: eviction writes Remove entries
@@ -5091,33 +5073,7 @@ impl JournalConsolidator {
         }
     }
 
-    /// Write Add journal entries for multipart upload completion
-    ///
-    /// This is called after CompleteMultipartUpload to create journal entries for size tracking.
-    /// The multipart upload handler writes metadata directly (for atomicity), but we need
-    /// journal entries so the consolidator can track the size delta.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key for the completed multipart upload
-    /// * `ranges` - Vec of RangeSpec for each part of the completed upload
-    /// * `object_metadata` - Object metadata for the completed upload
-    pub async fn write_multipart_journal_entries(
-        &self,
-        cache_key: &str,
-        ranges: Vec<RangeSpec>,
-        object_metadata: ObjectMetadata,
-    ) {
-        self.write_multipart_journal_entries_inner(
-            cache_key,
-            ranges,
-            object_metadata,
-            StagedLedger::AppendHere,
-            None,
-        )
-        .await
-    }
-
-    /// [`Self::write_multipart_journal_entries`] for a full-object GET fill, whose `Add`s carry
+    /// [`Self::write_multipart_journal_entries_witnessed`] for a full-object GET fill, whose `Add`s carry
     /// its version witness so a fold after a newer acknowledged write drops them.
     pub(crate) async fn write_multipart_journal_entries_witnessed(
         &self,
@@ -5154,13 +5110,13 @@ impl JournalConsolidator {
     /// that landed before it name an unpublished `.meta` and take the same retirement path
     /// as the crash case.
     ///
-    /// Unlike [`Self::write_multipart_journal_entries`], this does not skip a range whose
+    /// Unlike [`Self::write_multipart_journal_entries_witnessed`], this does not skip a range whose
     /// `(cache_key, start, end)` the size accumulator already holds, because the
     /// accumulator's dedup has not run yet at this point. A repeated range therefore gets a
     /// second entry, which is harmless: both name the same extent, and eviction groups
     /// entries by key.
     #[must_use = "the .meta may be published as staged only when every staged range's entry landed"]
-    pub async fn record_staged_ranges_before_publish(
+    pub(crate) async fn record_staged_ranges_before_publish(
         &self,
         cache_key: &str,
         ranges: &[RangeSpec],
@@ -5186,7 +5142,7 @@ impl JournalConsolidator {
         true
     }
 
-    /// [`Self::write_multipart_journal_entries`] for ranges whose Write_Ledger entries were
+    /// [`Self::write_multipart_journal_entries_witnessed`] for ranges whose Write_Ledger entries were
     /// already appended by [`Self::record_staged_ranges_before_publish`] and all landed.
     ///
     /// Writes the journal `Add` entries and credits both size channels, and appends nothing
@@ -5194,7 +5150,7 @@ impl JournalConsolidator {
     /// consolidation creates a `.meta` from `Add` entries when none exists
     /// (`load_or_create_metadata_with_journal_entries`), so writing them before the rename
     /// would let a crash in between publish the object anyway, as staged.
-    pub async fn write_multipart_journal_entries_prerecorded(
+    pub(crate) async fn write_multipart_journal_entries_prerecorded(
         &self,
         cache_key: &str,
         ranges: Vec<RangeSpec>,
@@ -5274,7 +5230,7 @@ impl JournalConsolidator {
                     // funnel through here with an identical range on re-cache). `add_range`
                     // returns `false` for a duplicate (cache_key, start, end), so a re-cache
                     // credits nothing a second time, matching the other three credit sites
-                    // (`disk_cache::store_range`, `disk_cache::commit_incremental_range`,
+                    // (`PreparedRangeFill::finish`, `disk_cache::commit_incremental_range_shared`,
                     // `CacheManager::credit_staged_range`).
                     // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
                     let credited = self.size_accumulator.add_range(
@@ -5333,33 +5289,6 @@ impl JournalConsolidator {
         }
     }
 
-    /// Check if a range was recently evicted (should bypass timeout)
-    ///
-    /// Returns true if the range matches an evicted range and removes it from the tracking.
-    /// This ensures each evicted range is only matched once.
-    fn check_and_clear_evicted_range(&self, cache_key: &str, start: u64, end: u64) -> bool {
-        match self.evicted_ranges.lock() {
-            Ok(mut guard) => {
-                if let Some(ranges) = guard.get_mut(cache_key) {
-                    // Find and remove the matching range
-                    if let Some(pos) = ranges.iter().position(|&(s, e)| s == start && e == end) {
-                        ranges.remove(pos);
-                        // Clean up empty entries
-                        if ranges.is_empty() {
-                            guard.remove(cache_key);
-                        }
-                        return true;
-                    }
-                }
-                false
-            }
-            Err(e) => {
-                warn!("Failed to acquire evicted_ranges lock for check: {}", e);
-                false
-            }
-        }
-    }
-
     /// Load size state from disk (called on startup and during consolidation)
     ///
     /// Returns the loaded state, or a default state if the file doesn't exist.
@@ -5379,43 +5308,15 @@ impl JournalConsolidator {
         }
     }
 
-    /// Persist size state to disk with atomic write (temp file + rename)
-    ///
-    /// # The `Schema_Fence` is re-stamped here, at the single writer, and that is deliberate
-    ///
-    /// Several callers do `load_size_state()` → on error `SizeState::default()` → mutate two or
-    /// three fields → persist. `SizeState::default()` carries `schema: 0` and
-    /// `staged_authority_epoch: 0`, which after activation is **byte-for-byte the pre-C shape**
-    /// `detect_foreign_size_state` treats as a foreign write. So one transient read error on an
-    /// activated volume used to persist a document that armed the fold's refusal permanently and
-    /// blamed a binary that did not exist. `update_size_from_validation` is the clearest instance
-    /// and the startup `cached_objects` back-fill is a second.
-    ///
-    /// Fixing it per call site means every future call site has to remember. Re-stamping at the
-    /// one function that writes the document means none of them can get it wrong: if this
-    /// volume's epoch latch says the fold is the authority, then this binary is C-capable and
-    /// activated, so any document it writes MUST carry the fence.
-    ///
-    /// Reading the **latch** rather than the document being written is what makes this safe from
-    /// self-reference: the latch comes from `staged_authority_epoch.json`, a different file with
-    /// a different writer (`activate`, under the global consolidation lock).
-    ///
-    /// During Phase L the latch is `EPOCH_LEGACY` and nothing is stamped — required, not
-    /// incidental: § 16.6.6 keeps Phase L writing the legacy schema precisely so a node can
-    /// still be rolled back to a pre-C binary during the upgrade window.
-    ///
-    /// Spec: cache-eviction-at-scale § 16.6.6.
-    async fn persist_size_state_internal(&self, state: &SizeState) -> Result<()> {
-        let file = self.size_state_file();
+    /// Install `state` as the size-state document, through the production writer
+    /// (`SizeStateFile::persist` under `with_size_state_locked`). Test support.
+    #[cfg(test)]
+    pub(crate) async fn seed_size_state_for_tests(&self, state: &SizeState) -> Result<()> {
         let state = state.clone();
-        tokio::task::spawn_blocking(move || file.persist(&state))
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Size state write task failed: {}", e)))?
-    }
-
-    /// Persist size state to disk
-    pub async fn persist_size_state(&self, state: &SizeState) -> Result<()> {
-        self.persist_size_state_internal(state).await
+        self.with_size_state_locked("test seed", SIZE_STATE_LOCK_TIMEOUT, move |file| {
+            file.persist(&state)
+        })
+        .await?
     }
 
     /// Get current cache size (reads from disk for multi-instance consistency).
@@ -5590,7 +5491,7 @@ impl JournalConsolidator {
     /// the file by up to one consolidation interval. `None` is the UNREADABLE sentinel of
     /// [`Self::get_size_state`]: the last read failed. Before any read has happened (a
     /// scrape racing startup) this reads the file once.
-    pub async fn get_size_state_for_scrape(&self) -> Option<SizeState> {
+    pub(crate) async fn get_size_state_for_scrape(&self) -> Option<SizeState> {
         #[cfg(test)]
         if SCRAPE_READS_DISK {
             return self.get_size_state().await;
@@ -5719,7 +5620,8 @@ impl JournalConsolidator {
     /// Boolean form of `try_acquire_consolidation_lock_token` for the consolidation cycle's
     /// lock, released with [`Self::release_global_consolidation_lock`]. Validation installs
     /// take and release by token.
-    pub fn try_acquire_global_consolidation_lock(&self) -> Result<bool> {
+    #[cfg(test)]
+    pub(crate) fn try_acquire_global_consolidation_lock(&self) -> Result<bool> {
         Ok(self.try_acquire_cycle_lock()?.is_some())
     }
 
@@ -5834,7 +5736,8 @@ impl JournalConsolidator {
 
     /// Release the lock taken by the consolidation cycle or idle eviction (the boolean
     /// acquire). Releases by `cycle_lock_token`, so it is a no-op after a takeover.
-    pub fn release_global_consolidation_lock(&self) {
+    #[cfg(test)]
+    pub(crate) fn release_global_consolidation_lock(&self) {
         let token = ConsolidationLockToken(self.cycle_lock_token.load(Ordering::SeqCst));
         self.release_consolidation_lock(token);
     }
@@ -5888,7 +5791,7 @@ impl JournalConsolidator {
 
     /// Seconds this process has held the global consolidation lock, `0` when it does not hold
     /// it. Per-instance. Published as `consolidation.consolidation_lock_held_secs`.
-    pub fn consolidation_lock_held_secs(&self) -> u64 {
+    pub(crate) fn consolidation_lock_held_secs(&self) -> u64 {
         let since = self.lock_held_since_ms.load(Ordering::SeqCst);
         if since == 0 {
             return 0;
@@ -5898,7 +5801,7 @@ impl JournalConsolidator {
 
     /// Watchdog takeovers since process start. Published as
     /// `consolidation.consolidation_lock_takeovers`.
-    pub fn consolidation_lock_takeovers(&self) -> u64 {
+    pub(crate) fn consolidation_lock_takeovers(&self) -> u64 {
         self.lock_takeovers.load(Ordering::Relaxed)
     }
 
@@ -5992,56 +5895,7 @@ impl JournalConsolidator {
         Duration::from_millis(self.ledger_compaction_budget_ms.load(Ordering::Relaxed))
     }
 
-    /// Update size state from validation scan (Task 12)
-    ///
-    /// Called by CacheSizeTracker after a validation scan to correct any drift
-    /// between tracked size and actual filesystem size. This ensures the consolidator's
-    /// size state stays accurate even if journal entries are lost or corrupted.
-    ///
-    /// # Arguments
-    /// * `scanned_size` - The actual cache size calculated from filesystem scan
-    /// * `write_cache_size` - The actual write cache size from filesystem scan (optional).
-    ///   Both Validation_Scan callers now supply a real figure (Requirement 6.1); `None`
-    ///   remains accepted so a caller that cannot compute a whole-cache figure leaves the
-    ///   existing value alone rather than installing a partial sum.
-    /// * `cached_objects` - Authoritative object count from the scan (optional)
-    ///
-    /// # Subset invariant (Requirement 6.4)
-    ///
-    /// `write_cache_size` is a **subset** of `total_size` — the staged bytes are part of
-    /// the cache, not additional to it. A figure exceeding `total_size` is therefore
-    /// impossible for consistent inputs and indicates a scan that computed the two
-    /// figures from different views (or a caller passing an unscaled partial sum). It is
-    /// clamped with a WARN rather than accepted, because accepting it would make
-    /// `read_cache_size = total_size - write_cache_size` underflow at every reporting
-    /// site downstream.
-    /// # Prefer [`Self::update_size_from_validation_with_kind`] from production code
-    ///
-    /// This three-argument form cannot say **which** validation produced its figures, and that
-    /// decides whether the accounting drift it samples is evaluable at all (R12.6 wants two
-    /// independent producers; a rolling cycle's proportional correction is computed *from* the
-    /// counter it would be compared against). It therefore records the drift sample with
-    /// `sample_kind: "unspecified"` and every gauge unevaluable by name.
-    ///
-    /// Every remaining caller of this form is a test. It survives so that ~13 test call sites did
-    /// not have to be rewritten to publish a figure none of them asserts, and the wire spelling
-    /// makes a future production caller that reaches for it visible rather than silent.
-    pub async fn update_size_from_validation(
-        &self,
-        scanned_size: u64,
-        write_cache_size: Option<u64>,
-        cached_objects: Option<u64>,
-    ) {
-        self.update_size_from_validation_with_kind(
-            scanned_size,
-            write_cache_size,
-            cached_objects,
-            crate::cache_size_tracker::ValidationSampleKind::Unspecified,
-        )
-        .await
-    }
-
-    /// As [`Self::update_size_from_validation`], naming the validation that produced the figures
+    /// As [`Self::update_size_from_validation_with_kind`], naming the validation that produced the figures
     /// so R12.6-R12.8's drift gauges can say whether they are evaluable.
     pub async fn update_size_from_validation_with_kind(
         &self,
@@ -6617,7 +6471,7 @@ impl JournalConsolidator {
     /// # Returns
     /// * `Ok(new_size)` - The new total size after update
     /// * `Err` - If locking or persistence fails
-    pub async fn atomic_update_size_delta(
+    pub(crate) async fn atomic_update_size_delta(
         &self,
         size_delta: i64,
         write_cache_delta: i64,
@@ -7514,7 +7368,7 @@ impl JournalConsolidator {
     }
 
     /// Set the TTL the incomplete-upload maintenance pass reaps by (`cache.incomplete_upload_ttl`).
-    pub fn set_incomplete_upload_ttl(&self, ttl: Duration) {
+    pub(crate) fn set_incomplete_upload_ttl(&self, ttl: Duration) {
         self.incomplete_upload_ttl_secs
             .store(ttl.as_secs(), Ordering::Relaxed);
     }
@@ -9778,7 +9632,7 @@ impl JournalConsolidator {
     /// NFS caching delays or incomplete writes).
     ///
     /// An entry is considered stale if:
-    /// 1. The range was recently evicted (bypasses timeout via mark_ranges_evicted), OR
+    /// 1. The range was recently evicted, OR
     /// 2. The range file doesn't exist AND the entry's timestamp is older than stale_entry_timeout_secs
     ///
     /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 4.3**
@@ -9790,7 +9644,7 @@ impl JournalConsolidator {
     /// * `(valid_entries, stale_entries)` - Tuple where:
     ///   - valid_entries: Range file exists, process for size delta, remove from journal
     ///   - stale_entries: Range file missing + old, remove from journal without size delta
-    pub async fn validate_journal_entries_with_staleness(
+    async fn validate_journal_entries_with_staleness(
         &self,
         entries: &[JournalEntry],
     ) -> (Vec<JournalEntry>, Vec<JournalEntry>) {
@@ -9807,23 +9661,6 @@ impl JournalConsolidator {
                 debug!(
                     "Remove journal entry validated (file intentionally deleted): cache_key={}, range={}-{}",
                     entry.cache_key, entry.range_spec.start, entry.range_spec.end
-                );
-                continue;
-            }
-
-            // First check if this range was recently evicted (bypasses timeout)
-            // Requirement 4.3: Immediately mark journal entries for evicted ranges as stale
-            if self.check_and_clear_evicted_range(
-                &entry.cache_key,
-                entry.range_spec.start,
-                entry.range_spec.end,
-            ) {
-                stale_entries.push(entry.clone());
-                debug!(
-                    "Removing journal entry for evicted range (bypassing timeout): cache_key={}, range={}-{}",
-                    entry.cache_key,
-                    entry.range_spec.start,
-                    entry.range_spec.end
                 );
                 continue;
             }
@@ -10923,6 +10760,16 @@ impl JournalConsolidator {
 
     /// The create-new branch of [`Self::load_or_create_metadata_with_journal_entries`]: a
     /// document with the first journal entry's `object_metadata` and TTL and no ranges.
+    ///
+    /// `created_at` is when the bytes the document will list were fetched, not this fold: the
+    /// earliest timestamp among the `Add`s of the version the document names (the fills
+    /// `partition_other_version_fills` keeps), and `expires_at` is that plus the TTL. A range
+    /// fetched one consolidation interval before the fold is then that much older, as it is
+    /// before the fold, where the fill-visibility tracker judges it from its commit time. The
+    /// earliest is taken because one stamp covers every range the document lists: a range
+    /// fetched later than the first expires with it, and its next read revalidates early, which
+    /// is the safe direction. The stamp never passes now, so a writer whose clock runs ahead
+    /// cannot make an entry fresher than a fold-time stamp would.
     fn new_metadata_from_journal_entries(
         cache_key: &str,
         journal_entries: &[JournalEntry],
@@ -10980,12 +10827,29 @@ impl JournalConsolidator {
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::ZERO);
 
+            // The fetch time of the earliest fill this document will list. A fill of another
+            // version is dropped by `partition_other_version_fills`, so it does not count; one
+            // that recorded no ETag is kept there, so it does.
+            let document_etag = object_metadata.etag.as_str();
+            let created_at = journal_entries
+                .iter()
+                .filter(|entry| entry.operation == JournalOperation::Add)
+                .filter(|entry| match &entry.object_metadata {
+                    Some(om) if !om.etag.is_empty() && !document_etag.is_empty() => {
+                        crate::revalidation::etags_equal_ignoring_quotes(&om.etag, document_etag)
+                    }
+                    _ => true,
+                })
+                .map(|entry| entry.timestamp)
+                .min()
+                .map_or(now, |fetched| fetched.min(now));
+
             NewCacheMetadata {
                 cache_key: cache_key.to_string(),
                 object_metadata,
                 ranges: Vec::new(),
-                created_at: now,
-                expires_at: now + object_ttl,
+                created_at,
+                expires_at: created_at + object_ttl,
                 compression_info: crate::cache_types::CompressionInfo::default(),
                 ..Default::default()
             }
@@ -12045,10 +11909,6 @@ mod tests {
                 dir.clone(),
                 "scn3-instance".to_string(),
             )),
-            Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
-                1024 * 1024,
-                100,
-            )),
         );
         dc.set_hybrid_metadata_writer(Arc::new(tokio::sync::Mutex::new(writer)));
         dc.initialize().await.unwrap();
@@ -12065,7 +11925,7 @@ mod tests {
         let legacy = legacy_meta_json(key);
         std::fs::write(&meta_path, &legacy).unwrap();
 
-        dc.store_range(
+        dc.store_range_witnessed(
             key,
             0,
             4095,
@@ -12430,102 +12290,6 @@ mod tests {
             expires_at: now + Duration::from_secs(3600),
             ..Default::default()
         }
-    }
-
-    /// Task 49: `write_multipart_journal_entries` must credit through `add_range`'s
-    /// (cache_key, start, end) dedup, not the plain unconditional `add`. A fresh range
-    /// credits once; re-presenting the identical (cache_key, start, end) — exactly what
-    /// happens when a full object is re-cached via CompleteMultipartUpload or the
-    /// GET-miss `store_full_object_as_range_new` path — must NOT credit a second time.
-    ///
-    /// Shown failing first: reverting the fix (using `size_accumulator.add(...)`
-    /// unconditionally) makes the second assertion fail with the deltas doubled.
-    ///
-    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
-    #[tokio::test]
-    async fn write_multipart_journal_entries_does_not_double_credit_a_repeated_range() {
-        let temp_dir = TempDir::new().unwrap();
-        let consolidator = graduation_test_consolidator(&temp_dir);
-
-        let cache_key = "test-bucket/multipart-double-credit.bin";
-        let range_spec = create_test_range_spec(0, 4095);
-        let object_metadata = ObjectMetadata {
-            is_write_cached: true,
-            ..Default::default()
-        };
-
-        // First credit: a fresh (cache_key, start, end) must be counted on both
-        // channels, since `is_write_cached: true` makes it a staged range.
-        consolidator
-            .write_multipart_journal_entries(
-                cache_key,
-                vec![range_spec.clone()],
-                object_metadata.clone(),
-            )
-            .await;
-
-        let total_after_first = consolidator.size_accumulator().current_delta();
-        let write_cache_after_first = consolidator.size_accumulator().current_write_cache_delta();
-        assert_eq!(
-            total_after_first, 4096,
-            "first credit of a fresh range must move total_size delta"
-        );
-        assert_eq!(
-            write_cache_after_first, 4096,
-            "first credit of a fresh staged range must move write_cache_size delta"
-        );
-
-        // Second credit: identical (cache_key, start, end) — e.g. a re-cache of the
-        // same full object. `add_range`'s dedup must reject it, so neither channel
-        // moves again.
-        consolidator
-            .write_multipart_journal_entries(cache_key, vec![range_spec], object_metadata)
-            .await;
-
-        let total_after_second = consolidator.size_accumulator().current_delta();
-        let write_cache_after_second = consolidator.size_accumulator().current_write_cache_delta();
-        assert_eq!(
-            total_after_second, 4096,
-            "re-presenting the identical range must not double-credit total_size (got {total_after_second})"
-        );
-        assert_eq!(
-            write_cache_after_second, 4096,
-            "re-presenting the identical range must not double-credit write_cache_size (got {write_cache_after_second})"
-        );
-    }
-    /// Loss mode L1 at the multipart credit site (cache-eviction-at-scale § 16.6.12
-    /// point 3): when the staged range's `Write_Ledger` append fails, the write-cache
-    /// credit is declined and `total_size` is still credited. The failure is real I/O: a
-    /// regular file planted at `metadata/_write_ledger` makes the append's
-    /// `create_dir_all` fail. Credit-first ordering read `(4096, 4096)` here.
-    #[tokio::test]
-    async fn write_multipart_journal_entries_declines_write_cache_credit_on_failed_append() {
-        let temp_dir = TempDir::new().unwrap();
-        let consolidator = graduation_test_consolidator(&temp_dir);
-        std::fs::create_dir_all(temp_dir.path().join("metadata")).unwrap();
-        std::fs::write(
-            temp_dir.path().join("metadata/_write_ledger"),
-            b"not a directory",
-        )
-        .unwrap();
-        consolidator
-            .write_multipart_journal_entries(
-                "test-bucket/multipart-failed-append.bin",
-                vec![create_test_range_spec(0, 4095)],
-                ObjectMetadata {
-                    is_write_cached: true,
-                    ..Default::default()
-                },
-            )
-            .await;
-        assert_eq!(
-            (
-                consolidator.size_accumulator().current_delta(),
-                consolidator.size_accumulator().current_write_cache_delta()
-            ),
-            (4096, 0),
-            "a failed ledger append must credit total_size and decline the write-cache credit"
-        );
     }
 
     /// R1.1: a graduation debits `write_cache_size` by the entry's staged compressed
@@ -13795,7 +13559,10 @@ mod tests {
         };
 
         // Persist to disk
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Verify file exists
         let size_state_path = temp_dir
@@ -13845,7 +13612,10 @@ mod tests {
             last_consolidation: SystemTime::now(),
             ..Default::default()
         };
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Should reflect new size from disk
         assert_eq!(
@@ -13903,7 +13673,7 @@ mod tests {
             // The pre-fix fleet state: a large, real cache with an impossible staged
             // figure attached to it.
             consolidator
-                .persist_size_state(&SizeState {
+                .seed_size_state_for_tests(&SizeState {
                     total_size: 19_748_298_884,
                     write_cache_size: INFLATED,
                     cached_objects: 1_779,
@@ -13922,7 +13692,12 @@ mod tests {
             );
 
             consolidator
-                .update_size_from_validation(19_748_298_884, Some(0), Some(1_779))
+                .update_size_from_validation_with_kind(
+                    19_748_298_884,
+                    Some(0),
+                    Some(1_779),
+                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
                 .await;
 
             assert_eq!(
@@ -13953,7 +13728,12 @@ mod tests {
             let consolidator = consolidator(temp.path());
 
             consolidator
-                .update_size_from_validation(1_000, Some(INFLATED), None)
+                .update_size_from_validation_with_kind(
+                    1_000,
+                    Some(INFLATED),
+                    None,
+                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
                 .await;
 
             assert_eq!(
@@ -13974,7 +13754,12 @@ mod tests {
             let consolidator = consolidator(temp.path());
 
             consolidator
-                .update_size_from_validation(4_096, Some(4_096), None)
+                .update_size_from_validation_with_kind(
+                    4_096,
+                    Some(4_096),
+                    None,
+                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
                 .await;
 
             assert_eq!(
@@ -13995,7 +13780,7 @@ mod tests {
             let consolidator = consolidator(temp.path());
 
             consolidator
-                .persist_size_state(&SizeState {
+                .seed_size_state_for_tests(&SizeState {
                     total_size: 8_192,
                     write_cache_size: 4_096,
                     cached_objects: 2,
@@ -14008,7 +13793,12 @@ mod tests {
                 .unwrap();
 
             consolidator
-                .update_size_from_validation(8_192, None, Some(2))
+                .update_size_from_validation_with_kind(
+                    8_192,
+                    None,
+                    Some(2),
+                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
                 .await;
 
             assert_eq!(
@@ -14052,7 +13842,10 @@ mod tests {
             last_consolidation: SystemTime::now(),
             ..Default::default()
         };
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Should reflect new size from disk
         assert_eq!(
@@ -14091,7 +13884,10 @@ mod tests {
             last_consolidation: SystemTime::now(),
             ..Default::default()
         };
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Get state async (reads from disk)
         let loaded_state = consolidator.get_size_state().await.unwrap();
@@ -14154,7 +13950,10 @@ mod tests {
 
         // Persist should create the directory
         let state = SizeState::default();
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Directory should now exist
         assert!(size_tracking_dir.exists());
@@ -14330,8 +14129,8 @@ mod tests {
             &std::fs::metadata(&range_file_path).unwrap(),
         );
 
-        // Simulate what store_range() does: add size to accumulator
-        // In the real code path, store_range() calls accumulator.add() after writing the range file
+        // Simulate what `PreparedRangeFill::finish` does: add size to accumulator
+        // In the real code path, `PreparedRangeFill::finish` calls accumulator.add() after writing the range file
         consolidator
             .size_accumulator()
             .add(range_spec.compressed_size);
@@ -14403,7 +14202,7 @@ mod tests {
             ..Default::default()
         };
         consolidator
-            .persist_size_state(&initial_state)
+            .seed_size_state_for_tests(&initial_state)
             .await
             .unwrap();
 
@@ -14436,8 +14235,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate what store_range() does: add size to accumulator
-        // In the real code path, store_range() calls accumulator.add() after writing the range file
+        // Simulate what `PreparedRangeFill::finish` does: add size to accumulator
+        // In the real code path, `PreparedRangeFill::finish` calls accumulator.add() after writing the range file
         consolidator
             .size_accumulator()
             .add(range_spec.compressed_size);
@@ -14528,7 +14327,10 @@ mod tests {
             last_consolidation: SystemTime::now(),
             ..Default::default()
         };
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Call shutdown
         let result = consolidator.shutdown().await;
@@ -14598,8 +14400,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate what store_range() does: add size to accumulator
-        // In the real code path, store_range() calls accumulator.add() after writing the range file
+        // Simulate what `PreparedRangeFill::finish` does: add size to accumulator
+        // In the real code path, `PreparedRangeFill::finish` calls accumulator.add() after writing the range file
         consolidator
             .size_accumulator()
             .add(range_spec.compressed_size);
@@ -17319,14 +17121,14 @@ mod tests {
             "the retain must recur once the interval elapses: {third:?}"
         );
     }
-    /// `persist_size_state_internal` re-stamps the `Schema_Fence` on an activated volume, so a
+    /// `SizeStateFile::persist_to_disk` re-stamps the `Schema_Fence` on an activated volume, so a
     /// load-or-default-then-persist path cannot write the pre-C shape.
     ///
     /// # The state this makes unreachable
     ///
     /// `SizeState::default()` carries `schema: 0` and `staged_authority_epoch: 0`, which after
     /// activation is byte-for-byte what `detect_foreign_size_state` treats as a pre-C write. Several
-    /// callers load-or-default and then persist — `update_size_from_validation` is the clearest, and
+    /// callers load-or-default and then persist — `update_size_from_validation_with_kind` is the clearest, and
     /// the startup `cached_objects` back-fill is a second — so ONE transient read error used to
     /// persist a document that armed the fold's refusal permanently and blamed a binary that did not
     /// exist on the fleet.
@@ -17340,7 +17142,7 @@ mod tests {
     /// two arms use SEPARATE temp dirs because the epoch latch is per-directory and latches
     /// permanently once it reads `EPOCH_FOLD`.
     ///
-    /// A failure implicates the re-stamp block at the top of `persist_size_state_internal`.
+    /// A failure implicates the re-stamp block at the top of `SizeStateFile::persist_to_disk`.
     #[tokio::test]
     async fn persisting_size_state_restamps_the_schema_fence_once_activated() {
         use crate::staged_authority::{
@@ -17351,7 +17153,7 @@ mod tests {
         let legacy_dir = TempDir::new().unwrap();
         let legacy = graduation_test_consolidator(&legacy_dir);
         legacy
-            .persist_size_state_internal(&SizeState::default())
+            .seed_size_state_for_tests(&SizeState::default())
             .await
             .unwrap();
         let written = legacy.load_size_state().await.unwrap();
@@ -17376,7 +17178,7 @@ mod tests {
 
         // Exactly what a caller's error arm hands over.
         active
-            .persist_size_state_internal(&SizeState::default())
+            .seed_size_state_for_tests(&SizeState::default())
             .await
             .unwrap();
         let written = active.load_size_state().await.unwrap();
@@ -18048,7 +17850,7 @@ mod tests {
     /// More concurrent locked `cached_objects` callers (`apply_new_objects_now`) than
     /// blocking-pool threads all complete, and every increment lands.
     ///
-    /// The holder's `load_size_state` and `persist_size_state_internal` are `tokio::fs` calls,
+    /// The holder's `load_size_state` and `SizeStateFile::persist_to_disk` are `tokio::fs` calls,
     /// so the holder needs a blocking thread while it holds `size_state.lock`. Without the
     /// in-process gate each other caller parks a pool thread in `flock` on its own descriptor,
     /// the holder's read queues behind them, and the runtime deadlocks. That is the fleet wedge
@@ -18066,7 +17868,7 @@ mod tests {
         let joined = rt.block_on(async {
             let consolidator = Arc::new(graduation_test_consolidator(&tmp));
             consolidator
-                .persist_size_state(&SizeState::default())
+                .seed_size_state_for_tests(&SizeState::default())
                 .await
                 .unwrap();
             let tasks: Vec<_> = (0..CALLERS)
@@ -18154,7 +17956,7 @@ mod tests {
         let outcome = rt.block_on(async {
             let consolidator = Arc::new(graduation_test_consolidator(&tmp));
             consolidator
-                .persist_size_state(&SizeState::default())
+                .seed_size_state_for_tests(&SizeState::default())
                 .await
                 .unwrap();
             let peer = hold_size_state_lock(&tmp);
@@ -18202,7 +18004,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = Arc::new(graduation_test_consolidator(&tmp));
         consolidator
-            .persist_size_state(&SizeState::default())
+            .seed_size_state_for_tests(&SizeState::default())
             .await
             .unwrap();
         let peer = hold_size_state_lock(&tmp);
@@ -18261,7 +18063,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = Arc::new(graduation_test_consolidator(&tmp));
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 cached_objects: DELETES + 1,
                 ..Default::default()
             })
@@ -18318,7 +18120,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 4_321,
                 cached_objects: 7,
                 ..Default::default()
@@ -18350,7 +18152,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 1_000,
                 ..Default::default()
             })
@@ -18401,7 +18203,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 1_000,
                 ..Default::default()
             })
@@ -18452,7 +18254,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 1_000,
                 ..Default::default()
             })
@@ -18494,7 +18296,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 1_000,
                 ..Default::default()
             })
@@ -18542,7 +18344,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 1_000,
                 ..Default::default()
             })
@@ -18595,7 +18397,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 1_000,
                 ..Default::default()
             })
@@ -18640,7 +18442,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let consolidator = graduation_test_consolidator(&tmp);
         consolidator
-            .persist_size_state(&SizeState {
+            .seed_size_state_for_tests(&SizeState {
                 total_size: 1_000,
                 ..Default::default()
             })
@@ -18655,7 +18457,12 @@ mod tests {
             mid
         };
         let ((), mid) = tokio::join!(
-            consolidator.update_size_from_validation(500, None, None),
+            consolidator.update_size_from_validation_with_kind(
+                500,
+                None,
+                None,
+                crate::cache_size_tracker::ValidationSampleKind::FullScan
+            ),
             peer
         );
         assert_eq!(
@@ -20590,13 +20397,13 @@ mod journal_reap_tests {
     }
 
     /// Replay freshness. Folding an `Add` into an absent `.meta` stamps `created_at` (the
-    /// GET freshness anchor) with the fold time and `expires_at` with fold time plus the
-    /// entry's TTL. (i) A dead journal inside the cap is folded: the anchor is the fold time,
-    /// at most the cap after the fill. (ii) One older than the cap is dropped before the fold,
-    /// so its fill is not replayed as fresh.
+    /// GET freshness anchor) with the `Add`'s own timestamp, when its fill committed, and
+    /// `expires_at` with that plus the entry's TTL. (i) A dead journal inside the cap is
+    /// folded and the anchor is the fill's time, not the fold's. (ii) One older than the cap
+    /// is dropped before the fold, so its fill is not replayed.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_replayed_add_is_fresh_from_the_fold_only_inside_the_cap() {
+    async fn a_replayed_add_is_fresh_from_its_fill_only_inside_the_cap() {
         let _flag_guard = crate::cache::hostname_flag_test_guard().await;
         let temp_dir = TempDir::new().unwrap();
         let host = gethostname::gethostname().to_string_lossy().to_string();
@@ -20633,10 +20440,10 @@ mod journal_reap_tests {
 
         let young = document(&b, ky)
             .expect("(i) a dead journal inside the cap is folded: its key's .meta must exist");
-        assert!(
-            young.created_at >= started && young.created_at <= folded,
-            "(i) created_at must be the fold time: {:?} not in [{started:?}, {folded:?}]",
-            young.created_at
+        assert_eq!(
+            young.created_at, filled_young,
+            "(i) created_at must be the fill's time, not the fold's (the fold ran in \
+             [{started:?}, {folded:?}])"
         );
         assert_eq!(
             young
@@ -20647,16 +20454,10 @@ mod journal_reap_tests {
             Some(600),
             "(i) expires_at must be created_at plus the entry's TTL"
         );
-        let extension = young.created_at.duration_since(filled_young).unwrap();
-        assert!(
-            extension <= replay_cap(),
-            "(i) the freshness anchor moved {extension:?} past the fill, beyond the {:?} cap",
-            replay_cap()
-        );
         assert!(
             document(&b, ko).is_none(),
             "(ii) a dead journal older than the cap must be dropped before the fold, not \
-             replayed with created_at = now ({:?} after its fill)",
+             replayed ({:?} after its fill)",
             folded.duration_since(filled_old).unwrap()
         );
         assert!(

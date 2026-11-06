@@ -244,7 +244,12 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
     let consolidator = create_test_consolidator(cache_dir.clone()).await;
     // Set initial tracked size so proportional correction has something to work with
     consolidator
-        .update_size_from_validation(4000, None, Some(4))
+        .update_size_from_validation_with_kind(
+            4000,
+            None,
+            Some(4),
+            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
+        )
         .await;
 
     let max_duration = Duration::from_secs(60); // 1 minute budget
@@ -309,7 +314,12 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
 
     // Update size state
     consolidator
-        .update_size_from_validation(corrected_size, None, Some(corrected_objects))
+        .update_size_from_validation_with_kind(
+            corrected_size,
+            None,
+            Some(corrected_objects),
+            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
+        )
         .await;
 
     // Advance cursor and persist
@@ -381,7 +391,12 @@ async fn test_rolling_scan_cursor_continuity() {
 
     let consolidator = create_test_consolidator(cache_dir.clone()).await;
     consolidator
-        .update_size_from_validation(4000, None, Some(8))
+        .update_size_from_validation_with_kind(
+            4000,
+            None,
+            Some(8),
+            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
+        )
         .await;
 
     let max_duration = Duration::from_secs(60);
@@ -548,12 +563,15 @@ async fn test_full_scan_persists_duration_and_type() {
     // Simulate what perform_full_validation does: write validation metadata
     // then persist full scan duration
     tracker
-        .write_validation_metadata(
+        .write_validation_metadata_with_write_cache(
             5000,                     // scanned_size
             5000,                     // tracked_size
             0,                        // drift
             Duration::from_secs(120), // 2 minutes
             10,                       // files_scanned
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -592,7 +610,12 @@ async fn test_mode_transition_full_to_rolling_and_back() {
 
     let consolidator = create_test_consolidator(cache_dir.clone()).await;
     consolidator
-        .update_size_from_validation(2000, None, Some(4))
+        .update_size_from_validation_with_kind(
+            2000,
+            None,
+            Some(4),
+            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
+        )
         .await;
 
     let max_duration = Duration::from_secs(3600); // 1 hour budget

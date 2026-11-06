@@ -89,7 +89,7 @@ async fn get_ttl_zero_first_get_triggers_revalidation() {
         .unwrap()
         .unwrap();
     assert!(meta.object_metadata.is_write_cached);
-    assert!(!meta.is_object_expired());
+    assert!(meta.expires_at >= std::time::SystemTime::now());
 
     // THE FIX: synchronous transition before freshness check
     let transitioned = cache_manager

@@ -21,7 +21,7 @@ connection_pool:
   max_idle_per_host: 100         # Idle connections per host when IP distribution is off (default: 100)
   max_idle_per_ip: 10            # Idle connections per IP address when IP distribution is on (default: 10)
   dns_refresh_interval: "60s"    # DNS re-resolution interval (default: 60s)
-  connection_timeout: "10s"      # TCP connect timeout (default: 10s)
+  connection_timeout: "10s"      # Connect deadline for writes and recovery probes (default: 10s)
   ip_distribution_enabled: true  # One pool per IP address, by rewriting the URI authority (default: true)
   keepalive_idle_secs: 15        # TCP_KEEPIDLE: seconds idle before the first probe (default: 15)
   keepalive_interval_secs: 5     # TCP_KEEPINTVL: seconds between probes (default: 5)
@@ -64,7 +64,7 @@ An excluded address returns to rotation only when a probe confirms it is reachab
 - After `health_probe_initial_cooldown` (default `5s`), an excluded address becomes a probe candidate.
 - The proxy probes candidates once per `pool_check_interval` (default `10s`), right after the DNS refresh, so this interval only bounds how soon an elapsed cooldown is noticed.
 - A probe performs a full TCP connect and TLS handshake to the port and transport that live traffic would use, honoring any `upstream_overrides` entry for the destination. A handshake failure is one of the errors that excludes an address, so a connect-only check would readmit a host that accepts TCP and then fails to negotiate TLS.
-- A probe is bounded by `connection_timeout` (default `10s`). It opens no pooled connection, records no connection metrics and does not touch the failure count.
+- A probe is bounded by `connection_timeout` (default `10s`), the same deadline that bounds the connect for an upload or other write ([Upstream write timeout](CONFIGURATION.md#upstream-write-timeout)). It opens no pooled connection, records no connection metrics and does not touch the failure count.
 - When a probe succeeds, the exclusion clears and the address goes straight back into its distributor.
 - When a probe fails, the cooldown doubles, up to `health_probe_max_cooldown` (default `300s`), so an unreachable address is retried less and less often.
 - An excluded address that disappears from DNS is dropped from tracking rather than probed.
@@ -140,7 +140,7 @@ An aborted mid-stream fetch never caches a truncated range under the bounds that
 
 When a cache rule enables hedging for a key, the proxy can send a second, identical request when the first is slow to return its first byte, and serve whichever answers first. The hedge prefers a different IP address from the original, chosen through the same distributor, which is what makes it effective against one slow connection or one degraded address. If only one healthy address is available, both attempts use it on separate connections; if the destination matches an `upstream_overrides` entry, neither attempt is pinned to an address.
 
-[Hedged upstream requests](HEDGING.md) is the guide: when hedging helps, its rule fields and cost governor, and [how it relates to the upstream timeouts](HEDGING.md#relationship-to-the-upstream-timeouts). Each upstream request also has a fixed 30-second timeout from connect to response. No timer covers a whole client request: `server.request_timeout` has no effect, as described in [`request_timeout` is not enforced](CONFIGURATION.md#request_timeout-is-not-enforced).
+[Hedged upstream requests](HEDGING.md) is the guide: when hedging helps, its rule fields and cost governor, and [how it relates to the upstream timeouts](HEDGING.md#relationship-to-the-upstream-timeouts). Each upstream read request also has a fixed 30-second timeout from connect to response, and uploads and other writes are bounded by [Upstream write timeout](CONFIGURATION.md#upstream-write-timeout). No timer covers a whole client request: `server.request_timeout` has no effect, as described in [`request_timeout` is not enforced](CONFIGURATION.md#request_timeout-is-not-enforced).
 
 ## Metrics
 

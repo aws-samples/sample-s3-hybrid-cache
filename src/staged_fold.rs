@@ -149,7 +149,7 @@ const STAGED_FOLD_SCHEMA: u32 = 1;
 /// `staged_range_budget_bound_holds_at_the_design_point` is the executable statement of that
 /// arithmetic. Raising it on the strength of a larger fleet would require a measured `Agg(I)`
 /// for the backend in question.
-pub const STAGED_RANGE_BUDGET: u64 = 32_800_000;
+pub(crate) const STAGED_RANGE_BUDGET: u64 = 32_800_000;
 
 /// Default claim lease, seconds. § 16.2 floors the lease at 900 s and derives it from `2 ×`
 /// the observed p99 shard visit duration; the floor is what is used here because there is no
@@ -181,7 +181,7 @@ const CLAIM_LEASE_SECS: u64 = 900;
 /// What a day buys is capacity. [`STAGED_RANGE_BUDGET`] is linear in this window
 /// (`S ≤ D · I · A · R`), and the budget is an admission gate: at the hourly window it was
 /// 1,300,000 ranges, beyond which every new write-through PUT is declined.
-pub const MAX_AUTHORITY_AGE_SECS: u64 = 86_400;
+pub(crate) const MAX_AUTHORITY_AGE_SECS: u64 = 86_400;
 
 /// Hard ceiling on shards visited in one pass, whatever [`shards_per_pass`] derives.
 ///
@@ -373,7 +373,7 @@ const BUDGET_SNAPSHOT_TTL_SECS: u64 = 5;
 /// Same 300 s base as the ledger compaction interval it runs beside, and deliberately a
 /// `const`: § 16.6.9 records that an interval knob does not solve the scaling problem, so
 /// there is no config field for it.
-pub const STAGED_FOLD_INTERVAL_SECS: u64 = 300;
+pub(crate) const STAGED_FOLD_INTERVAL_SECS: u64 = 300;
 
 /// Shards this instance removed staged bytes from and has not yet re-folded, keyed by
 /// `(dir_tag(cache_dir), instance_id)`. Each mark is the `now_nanos()` at which it was recorded.
@@ -459,7 +459,7 @@ fn clear_dirty_mark(cache_dir: &Path, instance_id: &str, shard: &Shard, visit_st
 
 /// Dirty shards awaiting a visit on this volume, over every instance in this process — in
 /// production, this instance's. Published as `write_cache.staged_fold_dirty_shards`.
-pub fn dirty_shard_count(cache_dir: &Path) -> u64 {
+pub(crate) fn dirty_shard_count(cache_dir: &Path) -> u64 {
     let tag = dir_tag(cache_dir);
     DIRTY_SHARDS
         .lock()
@@ -681,7 +681,7 @@ pub(crate) fn candidate_read_inflight_peak() -> u64 {
 /// releases, and a shard visit whose duration matters is one that ran long, which the tail
 /// classes name directly. The edges are chosen around § 16.2's lease derivation (`2 ×` p99,
 /// floored at 900 s), so a visit landing in the last two classes is one whose lease is at risk.
-pub const SHARD_DURATION_CLASS_EDGES_SECS: [u64; 7] = [1, 5, 15, 60, 300, 900, 3600];
+const SHARD_DURATION_CLASS_EDGES_SECS: [u64; 7] = [1, 5, 15, 60, 300, 900, 3600];
 
 /// Counters for [`SHARD_DURATION_CLASS_EDGES_SECS`] plus a trailing `+Inf` class.
 static SHARD_DURATION_CLASSES: [AtomicU64; SHARD_DURATION_CLASS_EDGES_SECS.len() + 1] = [
@@ -1341,7 +1341,7 @@ pub(crate) fn invalidate_budget_snapshot_for_tests(cache_dir: impl AsRef<Path>) 
 
 /// What the budget says about admitting a new staged range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BudgetVerdict {
+pub(crate) enum BudgetVerdict {
     /// Below the budget, or the input could not be read. **Unreadable admits**, per R7.5's
     /// fail-open rule: an unreadable figure must never silently stop write-through caching,
     /// which is the outage this spec exists to fix.
@@ -1637,7 +1637,7 @@ pub(crate) fn budget_declines_total() -> u64 {
 /// write-through caching declines indefinitely, and the budget WARN promises a recovery that no
 /// mechanism delivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CountEvictionVerdict {
+pub(crate) enum CountEvictionVerdict {
     /// Below the trigger, or the count could not be read. **Unreadable does not evict** — this
     /// pass deletes objects, and guessing "yes" would delete data on no evidence. Same
     /// fail-open direction as the byte arm's unreadable `Resident_Bytes`.
@@ -1817,7 +1817,7 @@ pub(crate) async fn count_eviction_verdict(
 /// The reported reason of a pass that retained one shard and installed others is that shard's,
 /// so `staged_fold_incomplete_total` still increments and the cadence is still not consumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FoldRetainReason {
+pub(crate) enum FoldRetainReason {
     /// At least one `{bucket}/{l1}/{instance}.ledger` could not be opened or read.
     ///
     /// **Shard-scoped**: the file lives in the shard whose figure it explains, so only that
@@ -1977,7 +1977,7 @@ impl FoldRetainReason {
 ///   ([`read_shard_checkpoints`]), not of a pass, and it is enforced there: any
 ///   unreadable shard document makes the global figure unknown rather than short.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FoldOutcome {
+pub(crate) enum FoldOutcome {
     /// Every shard this pass visited performed a Complete_Install.
     Installed(FoldPassSummary),
     /// At least one visited shard retained. Every shard that installed is listed in the summary
@@ -1997,7 +1997,7 @@ pub enum FoldOutcome {
 
 /// Per-shard breakdown of one pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FoldPassSummary {
+pub(crate) struct FoldPassSummary {
     /// Shards that installed, in visit order, with the document each installed.
     pub installed: Vec<StagedShardCheckpoint>,
     /// Shards considered but held by a live peer claim.
@@ -2021,7 +2021,7 @@ pub struct FoldPassSummary {
     /// The two retains that still end the pass — `CandidateUnreadable` and
     /// `CheckpointWriteFailed` — push one entry and return, so their behaviour is unchanged.
     /// They have the same ordering exposure and it is pre-existing; see the note in
-    /// `run_staged_fold_with_cap`.
+    /// `run_staged_fold_scoped`.
     pub retained: Vec<(Shard, FoldRetainReason)>,
     /// Peak `.meta` reads this pass held outstanding at once, over its shard visits.
     ///
@@ -2048,7 +2048,7 @@ impl FoldOutcome {
     }
 
     /// The retain reason, if this pass retained.
-    pub fn retain_reason(&self) -> Option<FoldRetainReason> {
+    pub(crate) fn retain_reason(&self) -> Option<FoldRetainReason> {
         match self {
             Self::Installed(_) => None,
             Self::Retained(r, _) => Some(*r),
@@ -2107,7 +2107,7 @@ impl std::fmt::Display for Shard {
 /// Filtering it against any other shard's cut would either resurrect a folded credit or
 /// swallow a fresh one. See [`PendingReadOutcome::post_cut`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingCredit {
+pub(crate) struct PendingCredit {
     /// The `Ledger_Seq` of the ledger entry appended by the same call site.
     pub seq: u64,
     /// Bucket component of the cache key.
@@ -2132,7 +2132,7 @@ pub struct PendingCredit {
 /// The range identity a [`PendingCredit`] carries: the Write_Ledger entry's
 /// `(cache_key, range_start, range_end)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PendingRange {
+pub(crate) struct PendingRange {
     /// The ledger entry's cache key.
     pub cache_key: String,
     /// The ledger entry's range start.
@@ -2154,7 +2154,7 @@ impl PendingCredit {
 /// unreadable `.pending` file and an absent one must not be the same value, because one
 /// of them means the post-cut term is unknown and the fold must refuse.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PendingReadOutcome {
+pub(crate) struct PendingReadOutcome {
     /// Credits read, paired with the instance whose file held them. The instance is
     /// carried because the cut is per-instance, so a credit cannot be filtered without
     /// knowing which file it came from.
@@ -2279,7 +2279,7 @@ async fn run_pending_before_write_hook(cache_dir: &Path) {
 /// Only the owning instance ever rewrites its own file, which is a strict improvement on
 /// the ledger's shared-rewrite shape: a peer's fold reads these files but never writes
 /// them.
-pub struct PendingStore {
+pub(crate) struct PendingStore {
     cache_dir: PathBuf,
 }
 
@@ -2537,7 +2537,7 @@ impl PendingStore {
                 Err(e) => {
                     // Counted as unreadable whatever the cause: a file this pass did not read
                     // still forbids installing a figure from it (`is_complete`, read by
-                    // `run_staged_fold_with_cap`'s `PendingUnreadable` retain). Only the log
+                    // `run_staged_fold_scoped`'s `PendingUnreadable` retain). Only the log
                     // level depends on the cause.
                     outcome.files_unreadable += 1;
                     log_pending_read_join_failure(&path, &e);
@@ -3003,7 +3003,7 @@ pub(crate) fn is_shard_level(name: &str) -> bool {
 ///
 /// 1. **No partial shard figure can be read**, because `rename` is atomic: a reader sees
 ///    either the previous complete document or the new complete one, never a blend. The
-///    per-instance temp suffix (`Shared::Yes`, § 2 trap 6) is what keeps two instances from
+///    per-instance temp suffix (`write_atomic`'s, § 2 trap 6) is what keeps two instances from
 ///    sharing one temp file and producing a torn one.
 /// 2. **A shard that cannot be read makes the sum unknown, not short.**
 ///    [`read_shard_checkpoints`] reports completeness and
@@ -3323,7 +3323,7 @@ fn install_preserving_foreign_fields(
     checkpoint.install(cache_dir)
 }
 
-/// Hostname component for a shared-volume temp path, matching the `Shared::Yes` scheme
+/// Hostname component for a shared-volume temp path, matching the `write_atomic` scheme
 /// used elsewhere so two instances cannot collide on one temp file.
 fn hostname_for_tmp() -> String {
     hostname::get()
@@ -3406,7 +3406,7 @@ impl ShardCheckpointSet {
     ///
     /// This is the criterion figure: § 16.6.4 sets `Max_Authority_Age` on the maximum over
     /// shards, because an authority is only as fresh as its stalest component.
-    pub fn stalest_age_secs(&self) -> Option<u64> {
+    pub(crate) fn stalest_age_secs(&self) -> Option<u64> {
         self.by_shard
             .values()
             .map(|c| age_secs(c.staged_scanned_at))
@@ -3522,7 +3522,7 @@ pub fn read_shard_checkpoints(cache_dir: &Path) -> ShardCheckpointSet {
 /// absolute replacement installed atomically per shard. Any later change that makes a claim
 /// load-bearing has broken the design rather than tightened it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShardClaim {
+struct ShardClaim {
     /// The instance that wrote it.
     pub instance_id: String,
     /// Seconds since the epoch when it was written.
@@ -3546,7 +3546,7 @@ impl ShardClaim {
 
 /// The outcome of trying to claim a shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimOutcome {
+pub(crate) enum ClaimOutcome {
     /// This instance holds the claim for the lease.
     Claimed,
     /// A peer holds a live claim, or won the write-then-re-read race. Pick another shard.
@@ -3688,18 +3688,10 @@ fn release_claim(cache_dir: &Path, shard: &Shard, instance_id: &str) {
 /// **from the same complete, locked read** that yields the candidate list. Observing the
 /// cut from a second read would make the figure and the cut describe different instants,
 /// which is precisely the disagreement the atomic install exists to prevent.
-pub async fn run_staged_fold(
-    cache_dir: &Path,
-    ledger: &WriteLedger,
-    instance_id: &str,
-) -> FoldOutcome {
-    // Unbounded, always, in production. See `run_staged_fold_with_cap`.
-    run_staged_fold_with_cap(cache_dir, ledger, instance_id, 0).await
-}
-
-/// [`run_staged_fold`] with per-visit sampling for the scanner limiter (§ 16.6.13 K2). `None` is
-/// exactly [`run_staged_fold`]. The sampler only reads the scanner registry and feeds the
-/// limiter; it changes no claim, budget, install or lease.
+///
+/// Per-visit sampling feeds the scanner limiter (§ 16.6.13 K2); `None` samples nothing. The
+/// sampler only reads the scanner registry and feeds the limiter; it changes no claim, budget,
+/// install or lease.
 pub(crate) async fn run_staged_fold_sampled(
     cache_dir: &Path,
     ledger: &WriteLedger,
@@ -3709,29 +3701,9 @@ pub(crate) async fn run_staged_fold_sampled(
     run_staged_fold_scoped(cache_dir, ledger, instance_id, 0, None, sampler).await
 }
 
-/// [`run_staged_fold`] with an explicit ledger read cap.
-///
-/// `cap = 0` means unbounded and is what production uses, because a capped read sets
-/// [`crate::write_ledger::LedgerReadOutcome::truncated`] and truncation is an incomplete
-/// input — so a non-zero cap here would make the fold refuse on every ledger longer than
-/// the cap, which is precisely the ledger a fold is most needed for.
-///
-/// The parameter exists so the truncation class of incomplete input is reachable at all.
-/// It is otherwise unreachable through `run_staged_fold`, which would leave one branch of
-/// the Complete_Install gate asserted by nothing — and this repo's recorded failure mode is
-/// an assertion that never runs looking identical to one that passes.
-pub(crate) async fn run_staged_fold_with_cap(
-    cache_dir: &Path,
-    ledger: &WriteLedger,
-    instance_id: &str,
-    cap: usize,
-) -> FoldOutcome {
-    run_staged_fold_scoped(cache_dir, ledger, instance_id, cap, None, None).await
-}
-
 /// One fold pass that visits **only** `shards`, stalest first, every one of them if it can.
 ///
-/// The same pass as [`run_staged_fold`] — same gates, same per-shard visit, same install and
+/// The same pass as [`run_staged_fold_sampled`] — same gates, same per-shard visit, same install and
 /// pending GC — restricted to a named shard set and with the budget set to that set's size.
 /// It exists for one caller: staging eviction, which removes objects and then has to decide
 /// again from the figure those objects were in.
@@ -3745,7 +3717,7 @@ pub(crate) async fn run_staged_fold_with_cap(
 /// direction. For eviction it is not merely a stale reading: at epoch 1 the byte arm of the
 /// next staging pass compares **this** figure against the trigger, finds it exactly as high as
 /// before the objects were freed, and evicts again. Measured in
-/// `tests/fold_drops_removed_staged_objects_test.rs`: a 25,165,916-byte tier with a
+/// `src/cache/moved_fill_tests/fold_drops_removed_staged_objects_test.rs`: a 25,165,916-byte tier with a
 /// 19,922,944-byte trigger was drained to zero by two passes, where one pass had already left
 /// it at 12,582,958. Re-folding the evicted objects' shards before the lock is released makes
 /// the figure the next pass reads the figure after this one's removals, from the fold itself
@@ -4569,7 +4541,7 @@ const FOLD_FRESHNESS_FILE: &str = "staged_fold_freshness.json";
 /// that has never folded assert something about a fold. `completeness` falls back to its observable
 /// form when they are absent, which is also what covers § 16.6.6's mixed-version phase.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FoldFreshness {
+struct FoldFreshness {
     /// Unix seconds of the last `Complete_Install`.
     #[serde(default)]
     pub completed_at: Option<u64>,
@@ -5038,7 +5010,7 @@ impl StagedFoldGauges {
     ///
     /// `fold_incomplete_total` is published alongside either way, so the retained-figure row still
     /// carries its reason.
-    pub fn completeness(&self) -> StagedCompleteness {
+    pub(crate) fn completeness(&self) -> StagedCompleteness {
         // A figure that cannot be derived now is Unknown regardless of the last attempt: the badge
         // describes what is on display, and there is nothing complete to display.
         if self.staged_fold_bytes.is_none() {
@@ -5113,7 +5085,9 @@ impl StagedFoldGauges {
 /// small files, and inline it would block a tokio worker for the whole traversal. A `JoinError`
 /// yields the default set, which both consumers publish as the unreadable sentinel rather than a
 /// zero; it is logged because "the task panicked" and "no checkpoints" have different owners.
-pub async fn read_gauge_inputs(cache_dir: &Path) -> (PendingReadOutcome, ShardCheckpointSet) {
+pub(crate) async fn read_gauge_inputs(
+    cache_dir: &Path,
+) -> (PendingReadOutcome, ShardCheckpointSet) {
     let pending = PendingStore::new(cache_dir.to_path_buf()).read_all().await;
     #[cfg(test)]
     run_gauge_between_reads_hook(cache_dir).await;
@@ -5155,7 +5129,7 @@ pub async fn read_gauge_inputs(cache_dir: &Path) -> (PendingReadOutcome, ShardCh
 /// second let a peer install plus the credit owner's GC between the two reads drop every credit
 /// between the old and new cut from both sources, so `staged_fold_bytes` dipped below the true
 /// sum (`a_peer_install_between_the_gauge_reads_never_under_counts`).
-pub async fn collect_staged_fold_gauges(
+pub(crate) async fn collect_staged_fold_gauges(
     cache_dir: &Path,
     incumbent_resident_bytes: u64,
     pending: &PendingReadOutcome,
@@ -5303,7 +5277,7 @@ pub async fn collect_staged_fold_gauges(
 ///
 /// Spec: cache-eviction-at-scale §§ 16.6.1, 16.6.2, 16.6.6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StagedAuthorityFigure {
+pub(crate) struct StagedAuthorityFigure {
     /// `F` + the post-cut pending term: staged compressed bytes that are on the volume
     /// **under `ranges/`**, and therefore a subset of the persisted `total_size`.
     ///
@@ -5315,14 +5289,6 @@ pub struct StagedAuthorityFigure {
     /// `P`: summed `compressed_size` over `mpus_in_progress/*/part{N}.json` — bytes on the
     /// volume that `total_size` does **not** count.
     pub in_progress_part_bytes: u64,
-}
-
-impl StagedAuthorityFigure {
-    /// `write_cache_size`: `F + pending + P`, C's equation.
-    pub fn write_cache_size(&self) -> u64 {
-        self.resident_staged_bytes
-            .saturating_add(self.in_progress_part_bytes)
-    }
 }
 
 tokio::task_local! {
@@ -6024,7 +5990,7 @@ mod tests {
     ) -> usize {
         let mut installs = 0;
         for _ in 0..max_passes {
-            let outcome = run_staged_fold(dir, ledger, instance).await;
+            let outcome = run_staged_fold_sampled(dir, ledger, instance, None).await;
             match &outcome {
                 FoldOutcome::Installed(s) => {
                     installs += 1;
@@ -6091,7 +6057,7 @@ mod tests {
         // The fold, between the append and the rename.
         let _ = tokio::time::timeout(
             Duration::from_secs(30),
-            run_staged_fold(dir, &ledger, "host:1"),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
         )
         .await
         .expect("the fold did not finish within 30 s");
@@ -6121,7 +6087,7 @@ mod tests {
         // credit, still once.
         let _ = tokio::time::timeout(
             Duration::from_secs(30),
-            run_staged_fold(dir, &ledger, "host:1"),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
         )
         .await
         .expect("the second fold did not finish within 30 s");
@@ -6252,7 +6218,7 @@ mod tests {
     /// cut filter were removed, `post_cut` would return B at step 4 and the first
     /// assertion fails; if the reader stopped evaluating pending, the step-3 assertion
     /// fails. A failure implicates `PendingReadOutcome::post_cut` and the cut-max loop in
-    /// `run_staged_fold_with_cap`.
+    /// `run_staged_fold_scoped`.
     #[tokio::test]
     async fn exactly_once_across_the_cut() {
         const A_BYTES: u64 = 4096;
@@ -6265,7 +6231,7 @@ mod tests {
 
         // ---- Step 1: A published and folded.
         let seq_a = publish_staged_range(dir, &ledger, "bucket/a.bin", A_BYTES).await;
-        let first = run_staged_fold(dir, &ledger, "host:1").await;
+        let first = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         assert_eq!(
             installed(&first).installed.len(),
             1,
@@ -6379,7 +6345,7 @@ mod tests {
         );
 
         // ---- Step 4: fold again. B crosses the cut; the total does not move.
-        let second = run_staged_fold(dir, &ledger, "host:1").await;
+        let second = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         // A and B hash to different L1s, so this fixture is genuinely TWO shards — and with two
         // observed shards the derived per-pass budget is `ceil(2/12) = 1`, so this pass visits
         // exactly one. It must be **B's**, because B's shard has never been folded and therefore
@@ -6531,7 +6497,7 @@ mod tests {
 
         let a_at = SystemTime::now();
         let seq_a = publish_staged_range_at(dir, &ledger, "bucket/a.bin", A_BYTES, a_at).await;
-        let first = run_staged_fold(dir, &ledger, "host:1").await;
+        let first = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         assert_eq!(installed(&first).installed.len(), 1);
         let cut = cut_for(dir, "bucket/a.bin", "host:1");
         assert_eq!(folded_bytes(dir), A_BYTES);
@@ -6595,7 +6561,7 @@ mod tests {
         // into F and out of pending, with the total unmoved.
         // Two shards, so the derived per-pass budget is 1 and B's — never folded, therefore
         // stalest — is the one this pass takes.
-        let second = run_staged_fold(dir, &ledger, "host:1").await;
+        let second = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         let (b_bkt, b_l1) = shard_of("bucket/b.bin").unwrap();
         assert_eq!(
             installed(&second)
@@ -6741,7 +6707,7 @@ mod tests {
     //
     // One test per class of incomplete input. Not one test with three arms: a shared arm
     // hides which class is unhandled, and the three classes are handled by three separate
-    // branches in `run_staged_fold_with_cap`.
+    // branches in `run_staged_fold_scoped`.
     // =====================================================================
 
     /// Install a figure, then damage the ledger, then assert the installed document is
@@ -6757,7 +6723,7 @@ mod tests {
         before_raw: BTreeMap<PathBuf, String>,
         before: ShardCheckpointSet,
     ) {
-        let outcome = run_staged_fold_with_cap(dir, ledger, "host:1", cap).await;
+        let outcome = run_staged_fold_scoped(dir, ledger, "host:1", cap, None, None).await;
         assert_eq!(
             outcome.retain_reason(),
             Some(expected),
@@ -6806,7 +6772,7 @@ mod tests {
         ledger: &WriteLedger,
     ) -> (BTreeMap<PathBuf, String>, ShardCheckpointSet) {
         publish_staged_range(dir, ledger, "bucket/first.bin", 4096).await;
-        let first = run_staged_fold(dir, ledger, "host:1").await;
+        let first = run_staged_fold_sampled(dir, ledger, "host:1", None).await;
         assert_eq!(installed(&first).installed.len(), 1);
         let before = read_shard_checkpoints(dir);
         assert_eq!(before.staged_byte_sum(), 4096);
@@ -6925,7 +6891,7 @@ mod tests {
              shard and an installed sibling cannot occur together and the test is vacuous"
         );
         for _ in 0..PASSES_TO_CONVERGE {
-            run_staged_fold(dir, ledger, "host:1").await;
+            run_staged_fold_sampled(dir, ledger, "host:1", None).await;
         }
         let installed = read_shard_checkpoints(dir);
         assert!(installed.is_complete());
@@ -6980,7 +6946,7 @@ mod tests {
         let sibling = fixture.sibling().clone();
         let before_raw = &fixture.before_raw;
         let before = &fixture.before;
-        let outcome = run_staged_fold_with_cap(dir, ledger, "host:1", cap).await;
+        let outcome = run_staged_fold_scoped(dir, ledger, "host:1", cap, None, None).await;
 
         assert_eq!(
             outcome.retain_reason(),
@@ -7129,7 +7095,7 @@ mod tests {
     /// Class 3: the read hit its cap, so it saw a prefix — at SHARD scope, where the cap applies
     /// per shard.
     ///
-    /// Reached through `run_staged_fold_with_cap` because production passes `cap = 0` and
+    /// Reached through `run_staged_fold_scoped` because production passes `cap = 0` and
     /// truncation is therefore structurally unreachable there — an unreachable branch asserted by
     /// nothing looks exactly like a branch that works.
     ///
@@ -7256,7 +7222,7 @@ mod tests {
         let restore = std::fs::metadata(&path).unwrap().permissions();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         std::fs::set_permissions(&path, restore).unwrap();
 
         assert_eq!(
@@ -7349,7 +7315,7 @@ mod tests {
 
         // Two shards give a budget of one, so both need their own pass.
         for _ in 0..2 {
-            run_staged_fold(dir, &ledger, "host:1").await;
+            run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         }
         let set = read_shard_checkpoints(dir);
         assert!(set.is_complete());
@@ -7435,7 +7401,7 @@ mod tests {
         // visiting every shard is not reachable at this population under the shipped budget, and
         // the sum is the mixed-age sum § 3.6 specifies either way.
         for _ in 0..3 {
-            run_staged_fold(dir, &a, "host:1").await;
+            run_staged_fold_sampled(dir, &a, "host:1", None).await;
         }
         let set = read_shard_checkpoints(dir);
         assert!(set.is_complete());
@@ -7611,7 +7577,7 @@ mod tests {
         let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
 
         publish_staged_range(dir, &ledger, "bucket/idle.bin", 4096).await;
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         assert_eq!(installed(&outcome).installed.len(), 1);
 
         // Backdate the install so the age is unambiguously large. Written through
@@ -7713,7 +7679,7 @@ mod tests {
         let dir = tmp.path();
         let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
         publish_staged_range(dir, &ledger, "bucket/gap.bin", 4096).await;
-        run_staged_fold(dir, &ledger, "host:1").await;
+        run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
 
         let g = gauges_for_tests(dir, 1024).await;
         assert_eq!(g.staged_fold_bytes, Some(4096));
@@ -7747,7 +7713,7 @@ mod tests {
         let dir = tmp.path();
         let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
         publish_staged_range(dir, &ledger, "bucket/p.bin", 4096).await;
-        run_staged_fold(dir, &ledger, "host:1").await;
+        run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         let before = gauges_for_tests(dir, 0).await;
         assert_eq!(before.staged_fold_in_progress_part_bytes, Some(0));
 
@@ -7761,6 +7727,7 @@ mod tests {
             etag: "\"e\"".to_string(),
             compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
             file_identity: None,
+            file_inode: None,
         };
         std::fs::write(
             upload.join("part1.json"),
@@ -7993,7 +7960,7 @@ mod tests {
         // And the scheduler specifically: it may start a pass, and must not read a figure.
         let consolidator = std::fs::read_to_string(src.join("journal_consolidator.rs")).unwrap();
         assert!(
-            consolidator.contains("run_staged_fold"),
+            consolidator.contains("run_staged_fold_sampled"),
             "the scheduler is expected to start the pass — if this fails the test is \
              checking a file that no longer schedules anything"
         );
@@ -8133,7 +8100,6 @@ mod tests {
         let figure = staged_authority_figure(dir).await.unwrap();
         assert_eq!(figure.resident_staged_bytes, F_BYTES);
         assert_eq!(figure.in_progress_part_bytes, 0);
-        assert_eq!(figure.write_cache_size(), F_BYTES);
 
         // Now stage a part record. P must land in ITS OWN field.
         let upload = dir.join("mpus_in_progress").join("mpu-1");
@@ -8170,7 +8136,6 @@ mod tests {
              would subtract bytes total_size never held"
         );
         assert_eq!(figure.in_progress_part_bytes, P_BYTES);
-        assert_eq!(figure.write_cache_size(), F_BYTES + P_BYTES);
 
         // An unreadable `P` makes the whole figure unknown, not short by P.
         std::fs::write(upload.join("part2.json"), b"{ not json").unwrap();
@@ -8591,7 +8556,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(60),
-            run_staged_fold(&dir, &ledger, "host:1"),
+            run_staged_fold_sampled(&dir, &ledger, "host:1", None),
         )
         .await
         .expect("APPARATUS: the pass did not return within 60s");
@@ -9716,7 +9681,7 @@ mod tests {
     /// A pass skips a shard a peer holds, and installs the rest.
     ///
     /// A failure implicates the `ClaimOutcome::Busy => continue` arm in
-    /// `run_staged_fold_with_cap`, and the assertion reads the pass summary's `busy` and
+    /// `run_staged_fold_scoped`, and the assertion reads the pass summary's `busy` and
     /// `installed` lists plus the on-disk figure — so a pass that claimed to skip while
     /// folding anyway would fail on the figure.
     #[tokio::test]
@@ -9763,7 +9728,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         let summary = installed(&outcome);
         assert_eq!(
             summary.busy,
@@ -9810,7 +9775,7 @@ mod tests {
     /// staleness order, so the pass reaches one, installs it, reaches the other and fails.
     ///
     /// A failure implicates the `checkpoint.install(cache_dir)` error arm in
-    /// `run_staged_fold_with_cap`. The assertions read the two shards' on-disk
+    /// `run_staged_fold_scoped`. The assertions read the two shards' on-disk
     /// `staged_byte_sum` separately — never their sum — because a sum cannot distinguish
     /// "one retained and one installed" from "both did something else that happens to add up".
     #[tokio::test]
@@ -9848,7 +9813,7 @@ mod tests {
         // shared parent was found.
         publish_staged_range(dir, &ledger, "bucket-a/alpha.bin", 4096).await;
         publish_staged_range(dir, &ledger, "bucket-b/beta.bin", 8192).await;
-        let first = run_staged_fold(dir, &ledger, "host:1").await;
+        let first = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         assert_eq!(
             installed(&first).installed.len(),
             2,
@@ -9909,7 +9874,7 @@ mod tests {
         let restore = std::fs::metadata(&doomed_dir).unwrap().permissions();
         std::fs::set_permissions(&doomed_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         std::fs::set_permissions(&doomed_dir, restore).unwrap();
 
         assert_eq!(
@@ -9981,7 +9946,7 @@ mod tests {
         let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
 
         publish_staged_range(dir, &ledger, "bucket/real.bin", 4096).await;
-        run_staged_fold(dir, &ledger, "host:1").await;
+        run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         let (rb, rl) = shard_of("bucket/real.bin").unwrap();
         let real = Shard::new(rb, rl);
         assert_eq!(read_shard_checkpoints(dir).staged_byte_sum(), 4096);
@@ -10215,7 +10180,7 @@ mod tests {
     /// **It is NOT evidence for `install_preserving_foreign_fields`' locked re-read, and the
     /// attempt to make it so produced a GREEN RED SIDE that was measured and discarded.**
     /// Replacing the locked re-read with the pass's own start-of-pass snapshot leaves this test
-    /// passing, because `run_staged_fold` takes that snapshot *inside* the pass: a second,
+    /// passing, because `run_staged_fold_sampled` takes that snapshot *inside* the pass: a second,
     /// sequential call therefore snapshots a document the `st_size` fold has **already**
     /// rewritten, and the stale-snapshot path and the re-read path return the same map. The
     /// window the lock closes needs a write landing *between* one pass's snapshot and its own
@@ -10254,7 +10219,7 @@ mod tests {
         }
         seeded.install(dir).unwrap();
 
-        run_staged_fold(dir, &ledger, "host:1").await;
+        run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
 
         let after = read_shard_checkpoints(dir).get(&shard).unwrap().clone();
         assert_eq!(
@@ -10301,7 +10266,7 @@ mod tests {
         );
 
         // A second staged pass. Its own start-of-pass snapshot predates the fold above.
-        run_staged_fold(dir, &ledger, "host:1").await;
+        run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         let after2 = read_shard_checkpoints(dir).get(&shard).unwrap().clone();
         assert_eq!(
             after2.other.get("scanned_at").and_then(|v| v.as_u64()),
@@ -10381,7 +10346,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         assert_eq!(installed(&outcome).busy, vec![skipped.clone()]);
 
         let set = read_shard_checkpoints(dir);
@@ -11309,7 +11274,7 @@ mod tests {
     /// installed the derived number, so a correct `shards_per_pass` wired to nothing still fails.
     ///
     /// A failure in arm 1 or 3 implicates `shards_per_pass` and the `take(budget)` bound in
-    /// `run_staged_fold_with_cap`.
+    /// `run_staged_fold_scoped`.
     #[tokio::test]
     async fn staged_range_budget_visits_every_shard_inside_the_age_bound() {
         /// Seconds to revisit every one of `shards` at `per_pass` shards per pass.
@@ -11400,7 +11365,7 @@ mod tests {
             "the input: a single-bucket cache really does have 256 shards"
         );
 
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         assert_eq!(
             installed(&outcome).installed.len(),
             shards_per_pass(256),
@@ -12284,7 +12249,7 @@ mod tests {
                 // `starts_with` on the trimmed line, not `contains`: this test's own source
                 // mentions the declaration in a string and in a failure message, and a `contains`
                 // match counted those as definitions.
-                let is_definition = trimmed.starts_with("pub const STAGED_RANGE_BUDGET");
+                let is_definition = trimmed.starts_with("pub(crate) const STAGED_RANGE_BUDGET");
                 if is_definition {
                     definition_lines += 1;
                 }
@@ -12313,7 +12278,7 @@ mod tests {
         // this test would start reporting the constant itself — a confusing failure. Pin it.
         assert_eq!(
             definition_lines, 1,
-            "expected exactly one `pub const STAGED_RANGE_BUDGET` line across {GUARDED:?}; if \
+            "expected exactly one `pub(crate) const STAGED_RANGE_BUDGET` line across {GUARDED:?}; if \
              this fails the exclusion above is no longer matching the definition it means to allow"
         );
 
@@ -12535,7 +12500,7 @@ mod tests {
         std::fs::remove_file(&meta).unwrap();
         mark_shard_dirty(dir, "host-b:2", target);
 
-        let b_pass = run_staged_fold(dir, &ledger_b, "host-b:2").await;
+        let b_pass = run_staged_fold_sampled(dir, &ledger_b, "host-b:2", None).await;
         let summary = b_pass.summary();
         let b_visited = summary.installed.iter().any(|c| c.shard() == shard);
         let b_busy = summary.busy.contains(&shard);
@@ -12705,7 +12670,7 @@ mod tests {
             .unwrap()
             .resident_staged_bytes;
 
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         let visited: BTreeSet<Shard> = installed(&outcome)
             .installed
             .iter()
@@ -13064,7 +13029,7 @@ mod tests {
             publish_staged_range_at(dir, &ledger, key, BYTES, now).await;
         }
 
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         let summary = outcome.summary();
         assert!(
             outcome.installed(),
@@ -13134,7 +13099,7 @@ mod tests {
         }
 
         let before = read_shard_checkpoints(dir);
-        let outcome = run_staged_fold(dir, &ledger, "host:1").await;
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
         assert_eq!(
             outcome.retain_reason(),
             Some(FoldRetainReason::CandidateUnreadable),
@@ -13156,7 +13121,7 @@ mod tests {
         // The determinism half. Ten folds of the same damaged fixture must reach the same verdict
         // every time; a completion-order short-circuit would be stable only by luck.
         for attempt in 0..10 {
-            let repeat = run_staged_fold(dir, &ledger, "host:1").await;
+            let repeat = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
             assert_eq!(
                 repeat.retain_reason(),
                 Some(FoldRetainReason::CandidateUnreadable),

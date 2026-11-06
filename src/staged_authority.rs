@@ -94,10 +94,10 @@ pub(crate) const AUTHORITY_DOC_SCHEMA: u32 = 1;
 /// **Phase L.** The fold publishes gauges; the event-sourced incumbent is the authority.
 /// This is the value an absent or unparseable document reads as, which is the safe default:
 /// it is the behaviour that existed before decision C.
-pub const EPOCH_LEGACY: u64 = 0;
+pub(crate) const EPOCH_LEGACY: u64 = 0;
 
 /// **Phase Fold.** The fold is authoritative and `Graduation` is a cleanup-only no-op.
-pub const EPOCH_FOLD: u64 = 1;
+pub(crate) const EPOCH_FOLD: u64 = 1;
 
 /// `size_state.json`'s schema **before** activation: absent, i.e. `0` under
 /// `#[serde(default)]`.
@@ -105,7 +105,7 @@ pub const EPOCH_FOLD: u64 = 1;
 /// A C-capable binary deliberately keeps writing this value throughout Phase L, so that a
 /// node can still be rolled back to a pre-C binary during the upgrade window. The bump is
 /// part of the activation transaction and nothing else.
-pub const SIZE_STATE_SCHEMA_LEGACY: u32 = 0;
+pub(crate) const SIZE_STATE_SCHEMA_LEGACY: u32 = 0;
 
 /// `size_state.json`'s schema **after** activation — the `Schema_Fence`.
 ///
@@ -131,7 +131,7 @@ pub const SIZE_STATE_SCHEMA_LEGACY: u32 = 0;
 /// prohibition (procedure). Detection ([`detect_foreign_size_state`]) does not cover the
 /// pre-C consolidation path. That is a materially weaker position than prevention alone, and
 /// it must be reported as such.
-pub const SIZE_STATE_SCHEMA_FOLD: u32 = 2;
+pub(crate) const SIZE_STATE_SCHEMA_FOLD: u32 = 2;
 
 /// Age past which a `fold_capable` `.ready` record is **retired** from the activation verdict,
 /// seconds. Design § 16.6.6, 2026-09-25 amendment, B4.
@@ -157,7 +157,7 @@ pub const SIZE_STATE_SCHEMA_FOLD: u32 = 2;
 ///
 /// Not configurable, on the same no-knob reasoning as 3b's window: this is a gate, and a knob
 /// would let an operator satisfy it by widening or narrowing until the answer changed.
-pub const READY_RECORD_RETIRE_AGE_SECS: u64 = crate::ledger_repair::MAX_REPAIR_AGE_SECS;
+const READY_RECORD_RETIRE_AGE_SECS: u64 = crate::ledger_repair::MAX_REPAIR_AGE_SECS;
 
 const _: () = assert!(
     READY_RECORD_RETIRE_AGE_SECS >= crate::staged_fold::MAX_AUTHORITY_AGE_SECS,
@@ -181,7 +181,7 @@ const _: () = assert!(
 /// The price is the escape it leaves: a pre-C writer whose every surviving entry lies within an
 /// hour of the dead record passes. Not configurable, on the same reasoning as
 /// [`READY_RECORD_RETIRE_AGE_SECS`].
-pub const READY_RECORD_APPEND_MARGIN_SECS: u64 = 3_600;
+const READY_RECORD_APPEND_MARGIN_SECS: u64 = 3_600;
 
 /// How long every ledger file named for an id must have gone unmodified before an id that no
 /// `.ready` record vouches for stops counting against activation, seconds. Design § 16.6.6 B8;
@@ -203,7 +203,7 @@ pub const READY_RECORD_APPEND_MARGIN_SECS: u64 = 3_600;
 ///
 /// Not configurable, on the same reasoning as [`READY_RECORD_RETIRE_AGE_SECS`]; an operator who
 /// needs an id gone sooner retires it explicitly (`s3-proxy retire-instance`).
-pub const RECORDLESS_QUIET_RETIRE_SECS: u64 = 86_400;
+pub(crate) const RECORDLESS_QUIET_RETIRE_SECS: u64 = 86_400;
 
 /// How long a `LEGACY` reading is cached before the document is re-read.
 ///
@@ -284,7 +284,7 @@ static AUTHORITY_BLOCK: std::sync::RwLock<std::collections::BTreeMap<PathBuf, Au
 /// not tell which of three remedies applied, and the message named the one remedy (stop the
 /// fleet, per the rollback rule) that is most expensive and least often correct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthorityBlockKind {
+pub(crate) enum AuthorityBlockKind {
     /// `size_state.json` was read successfully, carries a pre-C schema/epoch, and **still did
     /// after this instance re-applied the fence**. Something else is writing it.
     ForeignPreCWrite,
@@ -313,7 +313,7 @@ impl AuthorityBlockKind {
 /// only writer. The extra fields exist so an operator can see who activated and when
 /// without correlating logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityEpochDoc {
+pub(crate) struct AuthorityEpochDoc {
     /// Document schema. Unknown ⇒ treated as unreadable ⇒ [`EPOCH_LEGACY`].
     pub schema: u32,
     /// [`EPOCH_LEGACY`] or [`EPOCH_FOLD`].
@@ -430,7 +430,7 @@ pub struct ReadyRecord {
 /// Each variant is a distinct operator action, which is the point of not collapsing them
 /// into a bool: "wait" and "a node is not upgraded" are different situations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActivationBlocker {
+pub(crate) enum ActivationBlocker {
     /// Already at [`EPOCH_FOLD`]. Not a failure.
     AlreadyActive,
     /// The `ready/` directory could not be listed, or a record could not be read. Absence
@@ -504,7 +504,7 @@ impl ActivationBlocker {
 
 /// The activation gate's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActivationVerdict {
+pub(crate) enum ActivationVerdict {
     /// Every precondition of § 16.6.6 holds.
     Permitted,
     /// Named reason it does not.
@@ -727,7 +727,7 @@ pub(crate) fn epoch_latched_for(cache_dir: &Path) -> u64 {
 }
 
 /// Whether the fold is the authority on this volume, refreshing the latch.
-pub fn fold_authority_active(cache_dir: &Path) -> bool {
+pub(crate) fn fold_authority_active(cache_dir: &Path) -> bool {
     read_epoch(cache_dir) == EPOCH_FOLD
 }
 
@@ -1078,7 +1078,7 @@ pub(crate) fn activation_verdict(
 /// The activation verdict and **every** instance holding the gate. Design § 16.6.6, the B9
 /// paragraph "Every holder is named".
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivationAssessment {
+pub(crate) struct ActivationAssessment {
     /// Whether the gate permits activation, and if not, the first blocker.
     pub verdict: ActivationVerdict,
     /// Every instance-naming blocker, in a stable order: each ledger id nothing vouches for, in
@@ -1164,7 +1164,7 @@ fn record_process_blocker(record: &ReadyRecord) -> Option<ActivationBlocker> {
 /// place the verdict reads either rotation from: the same flags on other records are a dead or
 /// idle process's snapshot of the same documents and are not consulted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CurrentReadiness {
+pub(crate) struct CurrentReadiness {
     /// The evaluating instance, named by any blocker these figures produce.
     pub instance_id: String,
     /// Precondition 3a's rotation half, from this call's read.
@@ -1462,7 +1462,7 @@ const RETIREMENT_MARKER_SCHEMA: u32 = 1;
 /// stages anything touches its ledger files far more often than that. It does not protect an
 /// idle live pre-C writer, which is exactly the case Ed's one-day rule already accepts; the marker
 /// narrows that exposure from one day to whenever the operator chose to act.
-pub const RETIRE_INSTANCE_REFUSAL_WINDOW_SECS: u64 = 3_600;
+const RETIRE_INSTANCE_REFUSAL_WINDOW_SECS: u64 = 3_600;
 
 /// `{cache_dir}/metadata/_shard_state/retired_instances`.
 pub fn retired_instances_dir(cache_dir: &Path) -> PathBuf {

@@ -23,10 +23,6 @@ fn main() {
 
     let mut handler = CompressionHandler::new(100, true); // 100-byte threshold, compression enabled
 
-    println!(
-        "Preferred algorithm: {:?}",
-        handler.get_preferred_algorithm()
-    );
     println!();
 
     // Scenario 1: a JPEG key under the built-in default denylist.

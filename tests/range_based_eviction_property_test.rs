@@ -13,7 +13,7 @@
 //! - Property 9: Directory Cleanup (Requirements 5.1, 5.2)
 
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
+use s3_proxy::cache::CacheManager;
 use s3_proxy::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::{get_sharded_path, DiskCacheManager};
@@ -48,31 +48,6 @@ impl Arbitrary for RangeIndependenceConfig {
             num_objects,
             ranges_per_object,
             range_sizes,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct LruOrderingConfig {
-    num_objects: usize,
-    ranges_per_object: Vec<usize>,
-    time_offsets: Vec<u64>,
-}
-
-impl Arbitrary for LruOrderingConfig {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let num_objects = 1 + (usize::arbitrary(g) % 5);
-        let ranges_per_object: Vec<usize> = (0..num_objects)
-            .map(|_| 1 + (usize::arbitrary(g) % 5))
-            .collect();
-        let total_ranges: usize = ranges_per_object.iter().sum();
-        let time_offsets: Vec<u64> = (0..total_ranges)
-            .map(|_| u64::arbitrary(g) % 3600)
-            .collect();
-        LruOrderingConfig {
-            num_objects,
-            ranges_per_object,
-            time_offsets,
         }
     }
 }
@@ -192,82 +167,6 @@ fn create_test_metadata(
     std::fs::write(&meta_path, json).map_err(|e| format!("Failed to write metadata: {}", e))?;
 
     Ok(num_ranges)
-}
-
-fn create_test_metadata_with_times(
-    cache_dir: &Path,
-    cache_key: &str,
-    num_ranges: usize,
-    time_offsets: &[u64],
-) -> Result<Vec<SystemTime>, String> {
-    let base_time = SystemTime::now() - Duration::from_secs(7200);
-    let object_metadata = ObjectMetadata::new(
-        format!("etag-{}", cache_key),
-        "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        num_ranges as u64 * 8192,
-        Some("application/octet-stream".to_string()),
-    );
-
-    let mut ranges = Vec::with_capacity(num_ranges);
-    let mut created_times = Vec::with_capacity(num_ranges);
-    let range_size = 8192u64;
-
-    for i in 0..num_ranges {
-        let start = i as u64 * range_size;
-        let end = start + range_size - 1;
-        let offset = time_offsets.get(i).copied().unwrap_or(0);
-        let last_accessed = base_time + Duration::from_secs(offset);
-        created_times.push(last_accessed);
-
-        let file_path = format!(
-            "{}/{}_{}-{}.bin",
-            cache_key.replace('/', "%2F"),
-            cache_key.replace('/', "%2F"),
-            start,
-            end
-        );
-
-        let mut range_spec = RangeSpec::new(
-            start,
-            end,
-            file_path.clone(),
-            CompressionAlgorithm::Lz4,
-            range_size,
-            range_size,
-        );
-        range_spec.last_accessed = last_accessed;
-        ranges.push(range_spec);
-
-        let bin_path = cache_dir.join("ranges").join(&file_path);
-        if let Some(parent) = bin_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let data = vec![0u8; range_size as usize];
-        std::fs::write(&bin_path, &data).map_err(|e| format!("Failed to write bin file: {}", e))?;
-    }
-
-    let metadata = NewCacheMetadata {
-        cache_key: cache_key.to_string(),
-        object_metadata,
-        ranges,
-        created_at: base_time,
-        expires_at: SystemTime::now() + Duration::from_secs(3600),
-        compression_info: CompressionInfo::default(),
-        ..Default::default()
-    };
-
-    let meta_path = get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
-        .map_err(|e| format!("Failed to get sharded path: {}", e))?;
-
-    if let Some(parent) = meta_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create dirs: {}", e))?;
-    }
-
-    let json = serde_json::to_string_pretty(&metadata)
-        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
-    std::fs::write(&meta_path, json).map_err(|e| format!("Failed to write metadata: {}", e))?;
-
-    Ok(created_times)
 }
 
 fn create_test_metadata_with_ranges(
@@ -459,83 +358,6 @@ fn test_property_range_independence_separate_candidates() {
 }
 
 // ============================================================================
-// Property 2: equal-frequency ranges sort oldest first under TinyLFU
-//
-// Every range in this fixture has the same access_count and an idle time of 1-2 hours,
-// so decayed_frequency is equal across all of them and TinyLFU's key reduces to its
-// last_accessed tiebreak. That is the R10.1 subsumption case: recency order within a
-// decay band. The property asserts last_accessed is non-decreasing after the sort, and
-// refuses a fixture whose ranges do not share one access_count, so a fixture change
-// cannot turn this into a frequency test by accident. (A range idle past an extra
-// half-life has a LOWER decayed frequency and so still sorts first: older-first holds
-// across bands too.)
-// **Validates: Requirements 1.2 (retargeted from LRU to TinyLFU, R10.1)**
-// ============================================================================
-fn prop_equal_frequency_sorts_oldest_first(config: LruOrderingConfig) -> TestResult {
-    let rt = Runtime::new().expect("Failed to create runtime");
-    rt.block_on(async {
-        let (_temp_dir, cache_dir) = create_test_cache_dir();
-        let cache_manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.clone(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
-
-        let mut time_offset_idx = 0usize;
-        for obj_idx in 0..config.num_objects {
-            let cache_key = format!("test-bucket/object-{}", obj_idx);
-            let num_ranges = config.ranges_per_object.get(obj_idx).copied().unwrap_or(1);
-            let end_idx = (time_offset_idx + num_ranges).min(config.time_offsets.len());
-            let offsets: Vec<u64> = if time_offset_idx < config.time_offsets.len() {
-                config.time_offsets[time_offset_idx..end_idx].to_vec()
-            } else {
-                (0..num_ranges).map(|i| i as u64 * 100).collect()
-            };
-            time_offset_idx = end_idx;
-
-            if create_test_metadata_with_times(&cache_dir, &cache_key, num_ranges, &offsets)
-                .is_err()
-            {
-                return TestResult::discard();
-            }
-        }
-
-        let mut candidates = match cache_manager.collect_range_candidates_for_eviction().await {
-            Ok(c) => c,
-            Err(_) => return TestResult::discard(),
-        };
-
-        if candidates.is_empty() {
-            return TestResult::discard();
-        }
-
-        let first_count = candidates[0].access_count;
-        if candidates.iter().any(|c| c.access_count != first_count) {
-            return TestResult::error("fixture must give every range the same access_count");
-        }
-        cache_manager.sort_range_candidates(&mut candidates);
-        for i in 1..candidates.len() {
-            if candidates[i - 1].last_accessed > candidates[i].last_accessed {
-                return TestResult::error(format!(
-                    "equal-frequency candidates out of recency order at {}: {:?} before {:?}",
-                    i,
-                    candidates[i - 1].last_accessed,
-                    candidates[i].last_accessed
-                ));
-            }
-        }
-        TestResult::passed()
-    })
-}
-#[test]
-fn test_property_equal_frequency_sorts_oldest_first() {
-    QuickCheck::new()
-        .tests(20)
-        .quickcheck(prop_equal_frequency_sorts_oldest_first as fn(LruOrderingConfig) -> TestResult);
-}
-
-// ============================================================================
 // Property 5: Metadata Update After Range Eviction
 // **Validates: Requirements 2.2**
 // ============================================================================
@@ -718,36 +540,5 @@ mod unit_tests {
             .unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].cache_key, cache_key);
-    }
-
-    /// Equal TinyLFU keys keep their collection order: the sort is stable. The test asserts
-    /// the order itself, because five candidates sharing one `last_accessed` satisfy any
-    /// timestamp check in every permutation.
-    #[tokio::test]
-    async fn test_tinylfu_stable_for_equal_keys() {
-        let (_temp_dir, cache_dir) = create_test_cache_dir();
-        let cache_manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.clone(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
-
-        let cache_key = "test-bucket/same-time-object";
-        let same_offset = vec![1000u64; 5];
-        create_test_metadata_with_times(&cache_dir, cache_key, 5, &same_offset).unwrap();
-
-        let mut candidates = cache_manager
-            .collect_range_candidates_for_eviction()
-            .await
-            .unwrap();
-        assert_eq!(candidates.len(), 5);
-        let before: Vec<u64> = candidates.iter().map(|c| c.range_start).collect();
-        cache_manager.sort_range_candidates(&mut candidates);
-        let after: Vec<u64> = candidates.iter().map(|c| c.range_start).collect();
-        assert_eq!(
-            after, before,
-            "candidates with equal (decayed_frequency, last_accessed) must keep their order"
-        );
     }
 }

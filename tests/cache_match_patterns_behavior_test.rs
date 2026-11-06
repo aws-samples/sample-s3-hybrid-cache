@@ -11,7 +11,7 @@
 //!
 //! This test closes that gap. It drives the genuine top-level request entry
 //! point — `HttpProxy::handle_request` — over a loopback HTTP/1 connection (the
-//! same shape as `tests/test_signed_put_handler.rs`), because the read-cache
+//! same shape as the signed-PUT handler tests), because the read-cache
 //! decision gate (`if !resolved_settings.read_cache_enabled`) lives inside the
 //! private `handle_get_head_request`, which `handle_request` dispatches to. The
 //! lower-level `forward_*_with_coordination` helpers (used by the resolve-once
@@ -1537,7 +1537,7 @@ async fn preservation_read_cache_enabled_true_not_deleted() {
 // (preservation-4) HEAD "not cached" gate: when head_expires_at is None
 // (HEAD metadata was never populated), a HEAD request must report a miss
 // (i.e. contact S3), not serve from a stale or synthesized entry.
-// Validates: Requirement 3.4 (is_head_expired "not cached" gate preserved)
+// Validates: Requirement 3.4 (the HEAD stored-expiry "not cached" gate preserved)
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread")]
 async fn preservation_head_not_cached_gate_reports_miss() {
@@ -1822,7 +1822,7 @@ fn preservation_ttl_unchanged_equivalence_property_head() {
         .quickcheck(prop as fn(u32, u32) -> TestResult);
 }
 
-/// Extended property: for random metadata, the `is_object_expired()` stored-
+/// Extended property: for random metadata, the object's stored-
 /// expiry check agrees with the current-TTL comparison when the TTL has not
 /// changed since write time. Tests against the real `NewCacheMetadata` type.
 #[test]
@@ -1861,7 +1861,7 @@ fn preservation_ttl_unchanged_equivalence_metadata_level() {
         };
 
         // Stored-expiry check (what the original code does)
-        let stored_fresh = !metadata.is_object_expired();
+        let stored_fresh = metadata.expires_at >= std::time::SystemTime::now();
 
         // Current-TTL comparison (what the fix does)
         let current_ttl_fresh = now.duration_since(created_at).unwrap_or(Duration::ZERO) <= ttl;
@@ -1872,4 +1872,192 @@ fn preservation_ttl_unchanged_equivalence_metadata_level() {
     QuickCheck::new()
         .tests(1000)
         .quickcheck(prop as fn(u32, u32) -> TestResult);
+}
+
+// ---------------------------------------------------------------------------
+// A request that asks the proxy to skip its cache (`Cache-Control: no-cache` or
+// `Pragma: no-cache`) still fills the cache where caching is on, and must not where
+// the resolved settings turn read caching off, whether by a rule or the global default.
+// ---------------------------------------------------------------------------
+
+/// HEAD `path` with extra request headers; returns the status.
+async fn proxy_head_with_headers(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> StatusCode {
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let mut builder = Request::builder()
+        .method("HEAD")
+        .uri(format!("http://{}{}", addr, path))
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=AKIA-TEST/20250101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=sig",
+        );
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let resp = client
+        .request(builder.body(Full::new(Bytes::new())).expect("build HEAD"))
+        .await
+        .expect("proxy HEAD failed");
+    let status = resp.status();
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+    status
+}
+
+/// GET `path` with extra request headers; returns the status and the body.
+async fn proxy_get_with_headers(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Bytes) {
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}{}", addr, path))
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=AKIA-TEST/20250101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=sig",
+        );
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let resp = client
+        .request(builder.body(Full::new(Bytes::new())).expect("build GET"))
+        .await
+        .expect("proxy GET failed");
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, body)
+}
+
+/// Whether any `.meta` or `.bin` for `fragment` appears within `wait`.
+async fn cache_files_appear(cache_dir: &std::path::Path, fragment: &str, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if !find_meta_files_for(cache_dir, fragment).is_empty()
+            || !find_bin_files_for(cache_dir, fragment).is_empty()
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// With read caching off for the key, each bypass directive is forwarded and streamed and
+/// leaves nothing on disk, and a plain GET afterwards reaches S3 again. A no-cache HEAD
+/// leaves nothing on disk either.
+async fn assert_no_cache_request_fills_nothing(config: Arc<Config>, dir: &TempDir) {
+    let (cache_manager, _disk, range_handler) = make_cache_infra(&config).await;
+    let stub = get_ok_stub();
+    let server = spawn_proxy_server(
+        Arc::clone(&config),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        stub.clone().into_trait_object(),
+        Arc::new(InFlightTracker::new()),
+    )
+    .await;
+    for (name, header) in [
+        ("nocacheccontrol", ("cache-control", "no-cache")),
+        ("nocachepragma", ("pragma", "no-cache")),
+    ] {
+        let path = format!("/mybucket/nocache/{name}.bin");
+        let (status, body) = proxy_get_with_headers(server.addr, &path, &[header]).await;
+        assert_eq!(status, StatusCode::OK, "{name}: no-cache GET");
+        assert_eq!(&body[..], OBJECT_BODY, "{name}: the origin's bytes");
+        assert!(
+            !cache_files_appear(dir.path(), name, Duration::from_millis(1500)).await,
+            "{name}: a no-cache request wrote cache files for a key whose read caching is off: \
+             meta={:?} bin={:?}",
+            find_meta_files_for(dir.path(), name),
+            find_bin_files_for(dir.path(), name)
+        );
+        let (status, body) = proxy_get_with_headers(server.addr, &path, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{name}: plain GET");
+        assert_eq!(&body[..], OBJECT_BODY);
+        assert_eq!(
+            s3_get_fetches_for(&stub, name),
+            2,
+            "{name}: the plain GET after the no-cache GET must reach S3 again"
+        );
+    }
+    for (name, header) in [
+        ("nocacheheadcc", ("cache-control", "no-cache")),
+        ("nocacheheadpragma", ("pragma", "no-cache")),
+    ] {
+        let path = format!("/mybucket/nocache/{name}.bin");
+        let status = proxy_head_with_headers(server.addr, &path, &[header]).await;
+        assert_eq!(status, StatusCode::OK, "{name}: no-cache HEAD");
+        assert!(
+            !cache_files_appear(dir.path(), name, Duration::from_millis(1500)).await,
+            "{name}: a no-cache HEAD wrote cache files for a key whose read caching is off: \
+             meta={:?} bin={:?}",
+            find_meta_files_for(dir.path(), name),
+            find_bin_files_for(dir.path(), name)
+        );
+    }
+    let _ = server.shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_cache_request_does_not_fill_under_a_read_cache_disabled_rule() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    write_cache_rules(
+        temp_dir.path(),
+        r#"{ "rules": [ { "pattern": "**/nocache/**", "read_cache_enabled": false } ] }"#,
+    );
+    let config = behavior_config(temp_dir.path().to_path_buf());
+    assert_no_cache_request_fills_nothing(config, &temp_dir).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_cache_request_does_not_fill_under_global_read_cache_disabled() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let mut config = (*behavior_config(temp_dir.path().to_path_buf())).clone();
+    config.cache.read_cache_enabled = false;
+    assert_no_cache_request_fills_nothing(Arc::new(config), &temp_dir).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_cache_request_still_fills_where_read_caching_is_on() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    write_cache_rules(
+        temp_dir.path(),
+        r#"{ "rules": [ { "pattern": "**/nocache/**", "read_cache_enabled": false } ] }"#,
+    );
+    let config = behavior_config(temp_dir.path().to_path_buf());
+    let (cache_manager, _disk, range_handler) = make_cache_infra(&config).await;
+    let stub = get_ok_stub();
+    let server = spawn_proxy_server(
+        Arc::clone(&config),
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        stub.clone().into_trait_object(),
+        Arc::new(InFlightTracker::new()),
+    )
+    .await;
+    let (status, body) = proxy_get_with_headers(
+        server.addr,
+        "/mybucket/cachedprefix/fillcontrol.bin",
+        &[("cache-control", "no-cache")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], OBJECT_BODY);
+    assert!(
+        cache_files_appear(temp_dir.path(), "fillcontrol", Duration::from_secs(10)).await,
+        "control: a no-cache request under a prefix with caching on must still fill the cache"
+    );
+    let _ = server.shutdown_tx.send(());
 }

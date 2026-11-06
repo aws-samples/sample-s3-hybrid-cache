@@ -254,11 +254,6 @@ async fn test_http_proxy_with_caching() {
     let test_key = CacheManager::generate_cache_key("/test-bucket/test-object", None);
     assert_eq!(test_key, "test-bucket/test-object");
 
-    // Test cache key with params
-    let key_with_params =
-        CacheManager::generate_cache_key_with_params("/test-bucket/test-object", None, None, None);
-    assert_eq!(key_with_params, "test-bucket/test-object");
-
     println!("HTTP proxy with caching configured successfully");
 }
 

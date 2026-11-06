@@ -24,6 +24,6 @@ coverage/
 *.log
 
 # Cache / runtime data
-cache/
+/cache/
 tmp/
 ProbeScanExport-*

@@ -133,7 +133,7 @@ impl CacheSizeConfig {
     /// rest take [`CacheSizeConfig::default`]. A field added to this struct
     /// that mirrors a `SharedStorageConfig` field belongs in this function, and
     /// `from_shared_storage_carries_every_operator_field` pins the ones that do.
-    pub fn from_shared_storage(
+    pub(crate) fn from_shared_storage(
         shared: &crate::config::SharedStorageConfig,
         incomplete_upload_ttl: Duration,
     ) -> Self {
@@ -632,7 +632,7 @@ pub(crate) fn tail_delta_path(cache_dir: &std::path::Path, instance_id: &str) ->
 /// Appending negative records would double the file's size to save a verification that has to
 /// happen anyway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TailDeltaRecord {
+pub(crate) struct TailDeltaRecord {
     pub bucket: String,
     pub l1: String,
     /// When this record was appended, **nanoseconds** since the epoch.
@@ -668,7 +668,7 @@ impl TailDeltaRecord {
 
 /// `(bucket, l1, at, instance_id, cache_key, range_start, range_end)` — what
 /// [`retire_tail_delta_records`] names a record by.
-pub type TailDeltaIdentity = (String, String, u64, String, String, u64, u64);
+pub(crate) type TailDeltaIdentity = (String, String, u64, String, String, u64, u64);
 
 /// The `(bucket, XX, YYY)` of a cache key.
 ///
@@ -1342,7 +1342,7 @@ const TAIL_PREFIX_READ_ATTEMPTS: usize = 4;
 /// **shallower** prefix than the truth warrants. Clamping up to this floor means a thin
 /// histogram can never predict a shallower read than no histogram at all, so the fold's
 /// incompleteness costs at most an extra escalation round rather than a missed candidate.
-pub const DEFAULT_TAIL_PREFIX_DEPTH: usize = 64;
+const DEFAULT_TAIL_PREFIX_DEPTH: usize = 64;
 
 /// What a bounded prefix read of one shard's Tail_Partition found.
 ///
@@ -1354,7 +1354,7 @@ pub const DEFAULT_TAIL_PREFIX_DEPTH: usize = 64;
 /// cold volume report `TAIL_EMPTY` — a claim that the cache holds nothing large — when what it
 /// actually holds is an unvisited shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TailPartitionRead {
+pub(crate) enum TailPartitionRead {
     /// No partition file. The shard is UNVISITED; nothing may be concluded about its contents.
     Absent,
     /// The partition exists and was read.
@@ -1843,10 +1843,6 @@ pub enum ValidationSampleKind {
     /// installs a **proportional correction**, which takes the persisted counter as an input —
     /// so its figure is not independent of the figure it would be compared against.
     RollingExtrapolation,
-    /// The producer did not name its validation kind. Reached only by the three-argument
-    /// [`crate::journal_consolidator::JournalConsolidator::update_size_from_validation`], whose
-    /// remaining callers are tests.
-    Unspecified,
 }
 
 impl ValidationSampleKind {
@@ -1855,7 +1851,6 @@ impl ValidationSampleKind {
         match self {
             Self::FullScan => "full_scan",
             Self::RollingExtrapolation => "rolling_extrapolation",
-            Self::Unspecified => "unspecified",
         }
     }
 
@@ -1865,7 +1860,6 @@ impl ValidationSampleKind {
         match self {
             Self::FullScan => None,
             Self::RollingExtrapolation => Some(DRIFT_REASON_REFERENCE_IS_EXTRAPOLATION),
-            Self::Unspecified => Some(DRIFT_REASON_SAMPLE_KIND_UNSPECIFIED),
         }
     }
 }
@@ -1875,17 +1869,14 @@ impl ValidationSampleKind {
 pub const DRIFT_REASON_PERSISTED_STATE_UNREADABLE: &str = "persisted_state_unreadable";
 /// `unevaluable_reason`: the validation supplied no figure for this population, so there is no
 /// reference term. The persisted value was left alone.
-pub const DRIFT_REASON_FIGURE_NOT_SUPPLIED: &str = "figure_not_supplied";
+const DRIFT_REASON_FIGURE_NOT_SUPPLIED: &str = "figure_not_supplied";
 /// `unevaluable_reason`: the reference figure is a proportional extrapolation computed **from**
 /// the persisted counter, so the difference is the correction term rather than a disagreement
 /// between two producers.
 pub const DRIFT_REASON_REFERENCE_IS_EXTRAPOLATION: &str = "reference_is_extrapolation";
-/// `unevaluable_reason`: the producer did not name its validation kind, so whether the reference
-/// is a census cannot be established.
-pub const DRIFT_REASON_SAMPLE_KIND_UNSPECIFIED: &str = "sample_kind_unspecified";
 /// `unevaluable_reason` for the RATIO only: the reference figure is zero, so there is no
 /// denominator. The absolute `drift` is still published.
-pub const DRIFT_REASON_REFERENCE_ZERO: &str = "reference_zero";
+const DRIFT_REASON_REFERENCE_ZERO: &str = "reference_zero";
 
 /// One accounted figure's drift, as facts plus R12.7's ratio plus R12.8's named cause.
 ///
@@ -2498,16 +2489,11 @@ impl CacheSizeTracker {
         *self.cache_manager.lock().unwrap() = Some(cache_manager);
     }
 
-    /// Get actively_remove_cached_data flag
-    pub fn is_active_expiration_enabled(&self) -> bool {
-        self.actively_remove_cached_data
-    }
-
     /// Get metrics for monitoring
     ///
     /// Note: Checkpoint-related metrics have been removed. Size tracking is now handled
     /// by the JournalConsolidator which exposes metrics via get_size_state().
-    pub async fn get_metrics(&self) -> CacheSizeMetrics {
+    pub(crate) async fn get_metrics(&self) -> CacheSizeMetrics {
         // Read validation metadata if it exists
         let (last_validation_time, last_validation_drift) =
             match self.read_validation_metadata().await {
@@ -2588,35 +2574,6 @@ impl CacheSizeTracker {
         })?;
 
         Ok(metadata)
-    }
-
-    /// Write validation metadata
-    #[allow(clippy::too_many_arguments)]
-    pub async fn write_validation_metadata(
-        &self,
-        scanned_size: u64,
-        tracked_size: u64,
-        drift: i64,
-        duration: Duration,
-        files_scanned: u64,
-        cache_expired: u64,
-        cache_skipped: u64,
-        cache_errors: u64,
-    ) -> Result<()> {
-        self.write_validation_metadata_with_write_cache(
-            scanned_size,
-            tracked_size,
-            drift,
-            duration,
-            files_scanned,
-            cache_expired,
-            cache_skipped,
-            cache_errors,
-            0, // write_cache_size
-            0, // write_cache_expired
-            0, // incomplete_uploads_evicted
-        )
-        .await
     }
 
     /// Write validation metadata with write cache information
@@ -3299,7 +3256,7 @@ impl CacheSizeTracker {
     }
 
     /// Calculate next validation time based on configured time of day with fixed 1-hour jitter
-    pub async fn calculate_next_validation_time(&self) -> SystemTime {
+    async fn calculate_next_validation_time(&self) -> SystemTime {
         use chrono::{Duration as ChronoDuration, Local, Timelike};
 
         // Check if validation metadata exists - if not, run immediately
@@ -4409,12 +4366,9 @@ impl CacheSizeTracker {
                 }
             }
         }
-        // `Shared::Yes`: any instance may rebuild any shard, so the temp name must carry this
-        // one's identity or two rebuilds racing publish a file that is half of each.
-        if let Err(e) =
-            crate::disk_cache::write_atomic(&path, body.as_bytes(), crate::disk_cache::Shared::Yes)
-                .await
-        {
+        // `write_atomic` names its temp after the host and pid: any instance may rebuild any shard,
+        // so the temp name must carry this one's identity or two rebuilds racing publish a file that is half of each.
+        if let Err(e) = crate::disk_cache::write_atomic(&path, body.as_bytes()).await {
             warn!(
                 "Tail_Partition {}/{}: failed to write {:?}: {}. The previous partition stays \
                  in place, this shard's tail-delta records are NOT retired, and the shard is \
@@ -4912,7 +4866,7 @@ impl CacheSizeTracker {
     /// Returns `(total_size, cache_expired, cache_skipped, cache_errors, files_scanned,
     /// staged_size, staged_paths)`. `staged_size` is the write-tier subset of `total_size`
     /// (Requirement 6.1) and is what the caller passes to
-    /// `update_size_from_validation` in place of the `None` it used to pass.
+    /// `update_size_from_validation_with_kind` in place of the `None` it used to pass.
     ///
     /// `staged_paths` is the `.meta` path of every object the scan found still staged,
     /// which the caller feeds to [`Self::reappend_missing_ledger_entries`] (R2.7 / R6.6).
@@ -5453,8 +5407,8 @@ impl CacheSizeTracker {
                 // destroyed — the local-decision / shared-effect corollary in
                 // the cache coherency invariants.
                 //
-                // `CacheManager::remove_corrupt_metadata`'s discipline — re-read and
-                // re-parse under the key's slot lock — is NOT available here, and the
+                // Re-reading and
+                // re-parsing under the key's slot lock is NOT available here, and the
                 // reason is structural rather than a matter of plumbing. The slot is
                 // `blake3(cache_key) % META_LOCK_SLOTS`, and this scanner holds only a
                 // path: the document that failed to parse is exactly the document that
@@ -6205,7 +6159,7 @@ mod tests {
 
         // Write validation metadata
         tracker
-            .write_validation_metadata(
+            .write_validation_metadata_with_write_cache(
                 1000000, // scanned_size
                 1000500, // tracked_size
                 -500,    // drift
@@ -6214,6 +6168,9 @@ mod tests {
                 5,     // cache_expired
                 1,     // cache_skipped
                 0,     // cache_errors
+                0,
+                0,
+                0,
             )
             .await
             .unwrap();
@@ -7364,7 +7321,19 @@ mod tests {
 
         // Write initial validation metadata — the RESULTS file.
         tracker
-            .write_validation_metadata(500000, 500000, 0, Duration::from_secs(60), 1000, 0, 0, 0)
+            .write_validation_metadata_with_write_cache(
+                500000,
+                500000,
+                0,
+                Duration::from_secs(60),
+                1000,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
             .await
             .unwrap();
         // And an existing cursor in the SCHEDULE file, so "preserves existing fields" has
@@ -7553,7 +7522,19 @@ mod tests {
         // Establish the baseline through the REAL full-mode writers: the metadata
         // writer, then the duration/type stamp a completed full scan leaves behind.
         tracker
-            .write_validation_metadata(4096, 4096, 0, Duration::from_secs(10), 4, 0, 0, 0)
+            .write_validation_metadata_with_write_cache(
+                4096,
+                4096,
+                0,
+                Duration::from_secs(10),
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
             .await
             .unwrap();
         tracker.persist_full_scan_duration(10.0).await.unwrap();
@@ -9336,7 +9317,19 @@ mod validation_spacing_tests {
 
         // `last_validation` is stamped now by the real writer.
         tracker
-            .write_validation_metadata(4096, 4096, 0, Duration::from_secs(10), 4, 0, 0, 0)
+            .write_validation_metadata_with_write_cache(
+                4096,
+                4096,
+                0,
+                Duration::from_secs(10),
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
             .await
             .unwrap();
         let meta = tracker
@@ -9400,7 +9393,19 @@ mod validation_spacing_tests {
         // -30 minutes: today's target is in the past, so the rollover above already applies.
         let (tracker, _dir) = tracker_targeting(-30).await;
         tracker
-            .write_validation_metadata(4096, 4096, 0, Duration::from_secs(10), 4, 0, 0, 0)
+            .write_validation_metadata_with_write_cache(
+                4096,
+                4096,
+                0,
+                Duration::from_secs(10),
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
             .await
             .unwrap();
 
@@ -9912,7 +9917,12 @@ mod write_cache_expiry_revival_tests {
         let consolidator = tracker.consolidator.clone();
         // Ground the tracked figures on both objects, discarding the publishes' credits.
         consolidator
-            .update_size_from_validation(live + expired, Some(0), Some(2))
+            .update_size_from_validation_with_kind(
+                live + expired,
+                Some(0),
+                Some(2),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
 
         tokio::time::timeout(Duration::from_secs(60), tracker.perform_full_validation())
@@ -11898,7 +11908,12 @@ mod validation_scheduler_fleet_tests {
         let peer = consolidator_on(&dir, "install-peer").await;
 
         consolidator
-            .update_size_from_validation(1000, Some(0), Some(1))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(0),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         plant_delta(&dir, "pre_scan", 200);
 
@@ -11972,7 +11987,12 @@ mod validation_scheduler_fleet_tests {
         let (tracker, consolidator) = tracker_on(&dir, "defer-tracker").await;
         let peer = consolidator_on(&dir, "defer-peer").await;
         consolidator
-            .update_size_from_validation(1000, Some(0), Some(1))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(0),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
 
         assert!(peer.try_acquire_global_consolidation_lock().unwrap());
@@ -12015,7 +12035,12 @@ mod validation_scheduler_fleet_tests {
         let (tracker, consolidator) = tracker_on(&dir, "drift-tracker").await;
         let peer = consolidator_on(&dir, "drift-peer").await;
         consolidator
-            .update_size_from_validation(1000, Some(0), Some(1))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(0),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
 
         assert!(peer.try_acquire_global_consolidation_lock().unwrap());
@@ -12061,7 +12086,12 @@ mod validation_scheduler_fleet_tests {
             4096,
         );
         consolidator
-            .update_size_from_validation(4096, Some(0), Some(1))
+            .update_size_from_validation_with_kind(
+                4096,
+                Some(0),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
     }
 
@@ -12203,7 +12233,12 @@ mod validation_scheduler_fleet_tests {
         let dir = tmp.path().to_path_buf();
         let consolidator = consolidator_on(&dir, "case44-clamp").await;
         consolidator
-            .update_size_from_validation(1000, Some(0), Some(1))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(0),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         plant_delta(&dir, "stalled_a", 4000);
         let baseline = consolidator
@@ -12421,7 +12456,12 @@ mod startup_census_tests {
         );
         let consolidator = consolidator_on(&dir, "case45-a").await;
         consolidator
-            .update_size_from_validation(5000, Some(0), Some(7))
+            .update_size_from_validation_with_kind(
+                5000,
+                Some(0),
+                Some(7),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         write_validation_json(&dir, Duration::from_secs(48 * 3600));
         let tracker = tracker_on(&dir, consolidator.clone()).await;
@@ -12580,7 +12620,12 @@ mod startup_census_tests {
         );
         let consolidator = consolidator_on(&dir, "case45-c-a").await;
         consolidator
-            .update_size_from_validation(1500, Some(0), Some(1))
+            .update_size_from_validation_with_kind(
+                1500,
+                Some(0),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         write_validation_json(&dir, Duration::from_secs(48 * 3600));
         let a = tracker_on(&dir, consolidator.clone()).await;
@@ -12638,7 +12683,12 @@ mod startup_census_tests {
         let dir = tmp.path().to_path_buf();
         let consolidator = consolidator_on(&dir, "case45-subset").await;
         consolidator
-            .update_size_from_validation(1000, Some(500), Some(1))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(500),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         plant_delta(&dir, "stalled_b", 4000, 0);
         let baseline = consolidator
@@ -12690,7 +12740,12 @@ mod startup_census_tests {
         let dir = tmp.path().to_path_buf();
         let consolidator = consolidator_on(&dir, "case45-cap").await;
         consolidator
-            .update_size_from_validation(1000, Some(0), Some(1))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(0),
+                Some(1),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         let baseline = consolidator
             .validation_baseline()
@@ -12848,7 +12903,12 @@ mod review_followups_tests {
         let recent = write_head_only(&dir, "case46-h", "recent", Duration::from_secs(3600));
         let consolidator = consolidator_on(&dir, "case46-h").await;
         consolidator
-            .update_size_from_validation(1000, Some(0), Some(3))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(0),
+                Some(3),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         let tracker = tracker_on(&dir, consolidator.clone()).await;
 
@@ -12902,7 +12962,12 @@ mod review_followups_tests {
         let stale = write_head_only(&dir, "case46-s", "stale", Duration::from_secs(2 * 86_400));
         let consolidator = consolidator_on(&dir, "case46-s").await;
         consolidator
-            .update_size_from_validation(1000, Some(0), Some(2))
+            .update_size_from_validation_with_kind(
+                1000,
+                Some(0),
+                Some(2),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         let tracker = tracker_on(&dir, consolidator.clone()).await;
 
@@ -13065,7 +13130,12 @@ mod review_followups_tests {
         );
         let a_consolidator = consolidator_on(&dir, "case46-pa").await;
         a_consolidator
-            .update_size_from_validation(5000, Some(0), Some(9))
+            .update_size_from_validation_with_kind(
+                5000,
+                Some(0),
+                Some(9),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         let a = tracker_on(&dir, a_consolidator.clone()).await;
         let b = tracker_on(&dir, consolidator_on(&dir, "case46-pb").await).await;
@@ -13133,7 +13203,12 @@ mod review_followups_tests {
         );
         let a_consolidator = consolidator_on(&dir, "case46-da").await;
         a_consolidator
-            .update_size_from_validation(5000, Some(0), Some(9))
+            .update_size_from_validation_with_kind(
+                5000,
+                Some(0),
+                Some(9),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         let a = tracker_on(&dir, a_consolidator.clone()).await;
         let b = tracker_on(&dir, consolidator_on(&dir, "case46-db").await).await;
@@ -13399,7 +13474,12 @@ mod rolling_self_debit_tests {
         let recent = write_head_only(&dir, "case47-h", "recent", Duration::from_secs(3600));
         let consolidator = consolidator_on(&dir, "case47-h").await;
         consolidator
-            .update_size_from_validation(1000 + INSTALL_MARK, Some(0), Some(3))
+            .update_size_from_validation_with_kind(
+                1000 + INSTALL_MARK,
+                Some(0),
+                Some(3),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         let tracker = tracker_on(&dir, consolidator.clone()).await;
         seed_whole_rotation(&dir);
@@ -13459,10 +13539,11 @@ mod rolling_self_debit_tests {
         let tracker = production_tracker(&manager).await;
         let consolidator = tracker.consolidator.clone();
         consolidator
-            .update_size_from_validation(
+            .update_size_from_validation_with_kind(
                 live + expired + INSTALL_MARK,
                 Some(live + expired),
                 Some(2),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
             )
             .await;
         seed_whole_rotation(temp.path());
@@ -13534,7 +13615,12 @@ mod rolling_self_debit_tests {
         let tracker = production_tracker(&manager).await;
         let consolidator = tracker.consolidator.clone();
         consolidator
-            .update_size_from_validation(live + superseded + INSTALL_MARK, Some(0), Some(2))
+            .update_size_from_validation_with_kind(
+                live + superseded + INSTALL_MARK,
+                Some(0),
+                Some(2),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
         seed_whole_rotation(temp.path());
 

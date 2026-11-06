@@ -2,81 +2,8 @@
 //!
 //! Tests S3-compatible access logging and application logging functionality.
 
-use chrono::Utc;
-use s3_proxy::logging::{AccessLogEntry, AccessLogMode, LoggerManager, LoggingConfig};
+use s3_proxy::logging::{AccessLogMode, LoggerManager, LoggingConfig};
 use tempfile::TempDir;
-
-#[tokio::test]
-async fn test_access_log_creation() {
-    let temp_dir = TempDir::new().unwrap();
-    let access_log_dir = temp_dir.path().join("access");
-    let app_log_dir = temp_dir.path().join("app");
-
-    let config = LoggingConfig {
-        access_log_dir,
-        app_log_dir,
-        access_log_enabled: true,
-        access_log_mode: AccessLogMode::All,
-        hostname: "test-host".to_string(),
-        log_level: "info".to_string(),
-        access_log_flush_interval: std::time::Duration::from_secs(5),
-        access_log_buffer_size: 1000,
-        access_log_retention_days: 30,
-        app_log_retention_days: 30,
-        log_cleanup_interval: std::time::Duration::from_secs(86400),
-        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
-    };
-
-    let mut logger = LoggerManager::new(config);
-    logger.initialize().unwrap();
-
-    // Create a test access log entry
-    let entry = AccessLogEntry {
-        bucket_owner: "test-bucket".to_string(),
-        bucket: "test-bucket".to_string(),
-        time: Utc::now(),
-        remote_ip: "192.168.1.1".to_string(),
-        requester: "-".to_string(),
-        request_id: "test-request-id".to_string(),
-        operation: "REST.GET.OBJECT".to_string(),
-        key: "test-key".to_string(),
-        request_uri: "/test-bucket/test-key".to_string(),
-        http_status: 200,
-        error_code: None,
-        bytes_sent: 1024,
-        object_size: Some(1024),
-        total_time: 100,
-        turn_around_time: 50,
-        referer: None,
-        user_agent: Some("test-agent".to_string()),
-        host_id: "test-host".to_string(),
-        signature_version: None,
-        cipher_suite: None,
-        authentication_type: Some("Anonymous".to_string()),
-        host_header: Some("test-bucket.s3.amazonaws.com".to_string()),
-        tls_version: None,
-        access_point_arn: None,
-        acl_required: None,
-        source_region: None,
-    };
-
-    // Log the entry
-    logger.log_access(entry, false).await.unwrap();
-
-    // Force flush to write buffered entries to disk
-    let _ = logger.force_flush().await;
-
-    // Verify the log file was created
-    let access_log_files = std::fs::read_dir(temp_dir.path().join("access"))
-        .unwrap()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    assert!(
-        !access_log_files.is_empty(),
-        "Access log file should be created"
-    );
-}
 
 #[test]
 fn test_access_log_entry_creation() {

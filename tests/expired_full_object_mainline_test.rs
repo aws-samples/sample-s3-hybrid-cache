@@ -459,6 +459,12 @@ async fn mode_b_if_match_on_stored_fresh_entry_still_serves_from_cache() {
 /// "assert the predicate the code evaluates"). The observable is that S3 was contacted
 /// at all, since that is the request on which S3 evaluates the caller's IAM permission.
 ///
+/// A GET whose `If-Match` names the cached ETag revalidates through the ordinary path
+/// (the client's request plus the proxy's `If-None-Match`); a HEAD is relayed to S3 as
+/// sent. Either way S3 is contacted and no local verdict is produced.
+/// `zero_ttl_if_match_revalidation_test` pins the GET revalidation; the HEAD relay is pinned in
+/// `zero_ttl_if_match_variants_test`.
+///
 /// Requirements: `get-ttl-zero-enforcement` R1.1, R1.2, R3.1, R3.3.
 #[tokio::test]
 async fn mode_b_if_match_with_get_ttl_zero_must_revalidate() {

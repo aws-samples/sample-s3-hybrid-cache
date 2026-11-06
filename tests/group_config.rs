@@ -20,8 +20,6 @@
 mod bounded_shutdown_exit_test;
 #[path = "cache_match_patterns_behavior_test.rs"]
 mod cache_match_patterns_behavior_test;
-#[path = "cache_match_patterns_resolve_once_test.rs"]
-mod cache_match_patterns_resolve_once_test;
 #[path = "common_harness_compiles.rs"]
 mod common_harness_compiles;
 #[path = "compression_batch_size_config_test.rs"]

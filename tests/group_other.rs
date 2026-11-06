@@ -26,10 +26,6 @@ mod connection_max_lifetime_test;
 mod connection_pool_validation_property_test;
 #[path = "dns_resolution_preservation_test.rs"]
 mod dns_resolution_preservation_test;
-#[path = "edge_case_handling_test.rs"]
-mod edge_case_handling_test;
-#[path = "error_handling_test.rs"]
-mod error_handling_test;
 #[path = "ip_distribution_property_test.rs"]
 mod ip_distribution_property_test;
 #[path = "retry_exponential_backoff_property_test.rs"]

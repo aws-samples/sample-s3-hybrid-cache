@@ -528,11 +528,11 @@ INFO ETag validation failed: invalidated 3 stale ranges for cache_key=bucket/obj
      cached_etag="abc123", current_etag="def456"
 ```
 
-### Coherency cost and metrics
+### Coherency cost
 
 ETag validation sends no S3 request of its own. Range cleanup is batched and runs in the background without blocking requests.
 
-Two counters observe these operations: `cache.cache_etag_mismatches_total` and `cache.cache_range_invalidations_total` (see [`cache`](METRICS_REFERENCE.md#cache)). `cache.cache_etag_validations_total` and `cache.cache_orphaned_ranges_cleaned_total` are published but always zero: nothing outside the metrics module's own tests writes them, so neither says anything about this path.
+The log lines in [Coherency log lines](#coherency-log-lines) record each mismatch and the ranges it invalidated.
 
 ## Signed range request handling
 
@@ -634,7 +634,7 @@ A waiter waits up to `wait_timeout_secs` for the fetcher to finish:
 
 - **The fetcher succeeds**: the waiter tries the cache first, since the fetcher should have cached the data. On a hit, it serves the response from disk or RAM with no S3 request. If the lookup misses, for example because the metadata is not yet consolidated, it makes its own S3 fetch.
 - **The fetcher fails**: the waiter makes its own S3 fetch.
-- **The wait times out**: the waiter makes its own S3 fetch.
+- **The wait times out**: the waiter waits on the same fetch again, up to `max_waiter_resubscriptions` times (default `3`). After that, a full-object GET or HEAD waiter makes its own S3 fetch, and the proxy answers a part or range waiter `504 Gateway Timeout`.
 
 ```yaml
 cache:
@@ -697,12 +697,12 @@ Serving expired bytes therefore always means reaching for the second accessor an
 | Full-object mainline GET | `RevalidationCandidate` | Mode B matching `If-Match`, a live-TTL `Fresh` verdict, or a `304` |
 | Range path, early full-object shortcut | `FreshServe` | A live-TTL `Fresh` verdict; when expired it falls through rather than serving |
 | Range path, range-specific lookup | `RevalidationCandidate` | A live-TTL `Fresh` verdict, or a `304` |
-| Page widening (`find_page_overlap`) | `FreshServe` | Stored expiry only, plus a live-TTL check once per request ahead of it; see below |
+| Page widening (`find_page_overlap`) | `FreshServe` | Stored expiry for an extent the `.meta` lists, the live `get_ttl` for an extent still pending in a journal, and a live-TTL check once per request ahead of both; see below |
 | Part-scoped lookup (`?partNumber=N`) | `FreshServe` | A live-TTL `Fresh` verdict and stored expiry; an expired part revalidates with one conditional request (`304`) |
 | Post-`304` validated-serve helpers | `RevalidationCandidate` | The `304` itself; coverage is checked again, because a `304` proves the version, not the coverage |
 | Degraded coalescing fallbacks | `FreshServe` | Stored expiry and the live `get_ttl` verdict; never for `get_ttl: "0s"`. These run when S3 returned an error, so there is no validation to rely on |
 
-For page widening, `find_page_overlap` passes `FreshServe` and is bounded only by stored expiry. Its caller, `try_widened_range_request`, checks the currently resolved `get_ttl` against the object's live age (since it was cached or last confirmed by a `304`) once per request, before either widening branch runs. Checking once per page instead would multiply cache-volume reads by the page count and undo the point of widening. On expiry it returns `None` and hands the request to the unwidened path's own revalidation, rather than running a second conditional-request flow. An already cached widened key therefore honors a tightened or zeroed `get_ttl` on its next request, the same guarantee the mainline GET paths give.
+For page widening, `find_page_overlap` passes `FreshServe`. An extent the `.meta` lists is bounded by the `.meta`'s stored expiry, counted from when the bytes were cached. An extent still pending in a journal carries no expiry, so it is coverage only while its age since it was cached is within the live `get_ttl`. Its caller, `try_widened_range_request`, checks the currently resolved `get_ttl` against the object's live age (since it was cached or last confirmed by a `304`) once per request, before either widening branch runs. Checking once per page instead would multiply cache-volume reads by the page count and undo the point of widening. On expiry it returns `None` and hands the request to the unwidened path's own revalidation, rather than running a second conditional-request flow. An already cached widened key therefore honors a tightened or zeroed `get_ttl` on its next request, the same guarantee the mainline GET paths give.
 
 The RAM cache check in `fill_page`, made before `find_page_overlap`, is gated on `resolved.ram_cache_eligible`. When the caller supplies a known `current_etag`, it is compared with the RAM entry's own ETag before serving, and a mismatch invalidates the entry and falls through to disk. When `current_etag` is unknown, the common case for a cold request, the RAM entry is trusted for `cache.ram_cache_verification_interval` (default `1s`) and then checked again against the shared `.meta`. A key whose `get_ttl` is `"0s"` is never widened.
 

@@ -354,12 +354,6 @@ pub struct CacheMetrics {
     /// Times this proxy's volume-stall breaker has opened. **Per-instance.**
     #[serde(default)]
     pub volume_stall_breaker_trips_total: u64,
-    // Cache coherency metrics
-    pub cache_etag_validations_total: u64,
-    pub cache_etag_mismatches_total: u64,
-    pub cache_range_invalidations_total: u64,
-    pub cache_orphaned_ranges_cleaned_total: u64,
-    pub cache_cleanup_failures_total: u64,
     // Part caching metrics - Requirements 8.1, 8.2, 8.3, 8.4, 8.5
     pub cache_part_hits: u64,
     pub cache_part_misses: u64,
@@ -1223,7 +1217,7 @@ impl OrphanReclaimMetrics {
     }
 
     /// Build the section from a counter snapshot, ageing the stalest checkpoint to `now_secs`.
-    pub fn from_counters(
+    fn from_counters(
         c: crate::orphan_reclaim::OrphanReclaimCounters,
         enabled: bool,
         now_secs: u64,
@@ -1802,8 +1796,8 @@ pub struct WriteCacheMetrics {
     /// Staged write-cache credits refused at a site that writes no `Write_Ledger` entry, since
     /// process start. **Per-instance.**
     ///
-    /// **This should read zero forever.** `disk_cache::store_range`'s hybrid arm and
-    /// `commit_incremental_range` credit no ledger entry, so a staged credit there would be a staged
+    /// **This should read zero forever.** `PreparedRangeFill::finish` and
+    /// `commit_incremental_range_shared` credit no ledger entry, so a staged credit there would be a staged
     /// range the fold's candidate set cannot see — a structural per-write loss mode. It is
     /// unreachable by caller convention; this counter is what makes the convention observable rather
     /// than assumed. Non-zero means a new caller reached one of those sites with staged metadata, and
@@ -2046,12 +2040,12 @@ static STALE_EVICTION_LOCKS_RECOVERED: std::sync::atomic::AtomicU64 =
 /// Record one successful takeover of a stale global eviction lock.
 ///
 /// Synchronous by necessity — see `STALE_EVICTION_LOCKS_RECOVERED`.
-pub fn record_stale_eviction_lock_recovered() {
+pub(crate) fn record_stale_eviction_lock_recovered() {
     STALE_EVICTION_LOCKS_RECOVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Successful stale global-eviction-lock takeovers since process start.
-pub fn stale_eviction_locks_recovered() -> u64 {
+fn stale_eviction_locks_recovered() -> u64 {
     STALE_EVICTION_LOCKS_RECOVERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -2122,8 +2116,8 @@ pub struct RequestMetrics {
 /// surrounding multipart context.  Mapping from the operation semantics keeps the
 /// proxy's per-type counters dimensionally comparable to S3's named request metrics.
 ///
-/// `SelectRequests` is intentionally out of scope: the proxy does not serve
-/// `SelectObjectContent`.
+/// `SelectRequests` is intentionally out of scope: the proxy refuses
+/// `SelectObjectContent` with 501 before any handler runs.
 ///
 /// Request type tracked for per-bucket traffic.
 ///
@@ -2133,7 +2127,7 @@ pub struct RequestMetrics {
 ///
 /// Spec: per-bucket-metrics. Requirements: 1.2, 2.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestType {
+pub(crate) enum RequestType {
     /// Object read: `GET <bucket>/<key>`, including range and presigned GETs.
     /// Mirrors S3 `GetRequests`. Bucket-level GETs with no object key
     /// (list-objects) are intentionally not counted.
@@ -2154,7 +2148,7 @@ pub enum RequestType {
 ///
 /// Spec: per-bucket-metrics. Requirements: 1.1, 5.2
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BucketTrafficKey {
+pub(crate) struct BucketTrafficKey {
     pub bucket: String,
     /// `None` = bucket-level aggregation. `Some(prefix)` = prefix-level attribution.
     pub prefix: Option<String>,
@@ -2198,7 +2192,7 @@ pub struct BucketTrafficStats {
 /// name used throughout the proxy.
 ///
 /// Spec: per-bucket-metrics. Requirements: 5.2, 5.3, 5.4
-pub fn resolve_traffic_key(
+pub(crate) fn resolve_traffic_key(
     bucket: &str,
     object_key: &str,
     configured_prefixes: Option<&[String]>,
@@ -2215,11 +2209,10 @@ pub fn resolve_traffic_key(
     }
 }
 
-/// Per-bucket cache hit/miss counters, split by GET vs HEAD.
-/// Tracked for every bucket with cache traffic. The same struct is reused
-/// for per-rule counters keyed by glob pattern (see `rule_cache_stats`).
+/// Cache hit/miss counters, split by GET vs HEAD, for one rule's glob pattern
+/// (see `rule_cache_stats`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BucketCacheStats {
+pub(crate) struct BucketCacheStats {
     pub hit_count: u64,
     pub miss_count: u64,
     pub head_hit_count: u64,
@@ -2244,12 +2237,10 @@ pub struct MetricsManager {
     /// Page-aligned range caching (widening) statistics.
     /// Spec: page-aligned-range-cache. Requirements: 8.1-8.6
     page_cache_stats: Arc<RwLock<PageCacheStats>>,
-    /// Per-bucket cache hit/miss counters (all buckets, keyed by bucket name)
-    bucket_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
     /// Per-rule cache hit/miss counters keyed by the rule's glob pattern
     rule_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
     /// Per-bucket traffic counters (keyed by BucketTrafficKey).
-    /// Mirrors the bucket_cache_stats concurrency pattern.
+    /// Mirrors the rule_cache_stats concurrency pattern.
     /// Spec: per-bucket-metrics. Requirements: 1.1, 1.4, 7.2
     bucket_traffic_stats: Arc<RwLock<HashMap<BucketTrafficKey, BucketTrafficStats>>>,
     /// Maximum number of distinct bucket+prefix series tracked.
@@ -2285,7 +2276,7 @@ pub struct MetricsManager {
 }
 
 /// At most this many levels are published in each `scanner_*_by_level_*` object.
-pub const SCANNER_LEVELS_PUBLISHED_MAX: usize = 64;
+const SCANNER_LEVELS_PUBLISHED_MAX: usize = 64;
 
 /// The scanner-concurrency limiter's state, one set of fields per scan kind (`_fold`, `_repair`),
 /// published flat under `write_cache` the way `setup_abandoned_total_put` carries its kind as a
@@ -2594,17 +2585,10 @@ impl Default for RequestStats {
 
 /// Internal error statistics tracking for cache operations
 #[derive(Debug, Default, Clone)]
-pub struct ErrorStats {
+pub(crate) struct ErrorStats {
     corruption_metadata_total: u64,
     corruption_missing_range_total: u64,
     cache_bypasses_by_reason: HashMap<String, u64>,
-    // Cache coherency metrics
-    cache_etag_validations_total: u64,
-    cache_etag_mismatches_total: u64,
-    cache_range_invalidations_total: u64,
-    cache_orphaned_ranges_cleaned_total: u64,
-    // Cache operation timing and error metrics
-    cache_cleanup_failures_total: u64,
     // Part caching metrics - Requirements 8.1, 8.2, 8.3, 8.4, 8.5
     cache_part_hits: u64,
     cache_part_misses: u64,
@@ -2619,7 +2603,7 @@ pub struct ErrorStats {
 
 /// Internal range storage metrics tracking
 #[derive(Debug, Clone, Default)]
-pub struct RangeStorageStats {
+struct RangeStorageStats {
     // Histogram data for metadata parse duration (in milliseconds)
     metadata_parse_durations: Vec<f64>,
     // Histogram data for range load duration (in milliseconds)
@@ -2659,7 +2643,7 @@ pub struct EvictionCoordinationStats {
 /// Internal signed PUT caching statistics tracking
 /// Requirements: 9.1, 9.2, 9.3, 9.4, 9.5
 #[derive(Debug, Clone, Default)]
-pub struct SignedPutStats {
+struct SignedPutStats {
     cached_puts_total: u64,
     bypassed_puts_total: u64,
     cache_failures_total: u64,
@@ -2675,7 +2659,7 @@ pub struct SignedPutStats {
 /// Internal connection keepalive statistics tracking
 /// Requirements: 6.1, 6.2, 6.3, 6.4, 6.5
 #[derive(Debug, Default, Clone)]
-pub struct ConnectionKeepaliveStats {
+pub(crate) struct ConnectionKeepaliveStats {
     /// Total connections created per endpoint
     connections_created: HashMap<String, u64>,
     /// Total connection reuses per endpoint (calculated as total_requests - connections_created)
@@ -2701,7 +2685,7 @@ pub struct ConnectionKeepaliveStats {
 /// Download coalescing statistics tracking
 /// Requirements: 19.1, 19.2, 19.3, 19.4, 19.5
 #[derive(Debug, Default, Clone)]
-pub struct CoalescingStats {
+struct CoalescingStats {
     /// Total number of requests that waited for an in-flight fetch (Requirement 19.1)
     pub waits_total: u64,
     /// Total number of requests served from cache after waiting (Requirement 19.2)
@@ -2740,7 +2724,7 @@ pub struct CoalescingStats {
 /// Page-aligned range caching (widening) statistics tracking.
 /// Spec: page-aligned-range-cache. Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
 #[derive(Debug, Default, Clone)]
-pub struct PageCacheStats {
+struct PageCacheStats {
     /// Total requests widened into a page-aligned fetch (Requirement 8.1)
     pub widened_requests: u64,
     /// Bytes actually requested by the client across all widened requests
@@ -2792,7 +2776,6 @@ impl MetricsManager {
             connection_keepalive_stats: Arc::new(RwLock::new(ConnectionKeepaliveStats::default())),
             coalescing_stats: Arc::new(RwLock::new(CoalescingStats::default())),
             page_cache_stats: Arc::new(RwLock::new(PageCacheStats::default())),
-            bucket_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             rule_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             bucket_traffic_stats: Arc::new(RwLock::new(HashMap::new())),
             max_bucket_traffic_series: 100, // config-compatible default; overridden via set_per_bucket_config
@@ -2889,7 +2872,7 @@ impl MetricsManager {
     /// counters) and `MetricsManager` (which reads them during collection).
     ///
     /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
-    pub fn set_hedge_metrics(&mut self, hedge_metrics: Arc<HedgeMetrics>) {
+    pub(crate) fn set_hedge_metrics(&mut self, hedge_metrics: Arc<HedgeMetrics>) {
         self.hedge_metrics = Some(hedge_metrics);
     }
 
@@ -3412,7 +3395,7 @@ impl MetricsManager {
     /// `cache_hit` is supplied only for GET/HEAD requests. The method stores scalars
     /// rather than request paths, hosts, buckets, or object keys, so its memory use is
     /// fixed even when the proxy serves an unbounded object namespace.
-    pub async fn record_response(
+    pub(crate) async fn record_response(
         &self,
         status: StatusCode,
         response_time: Duration,
@@ -3598,7 +3581,7 @@ impl MetricsManager {
     /// in-process reads plus a handful of single small-file reads (`size_state.json` and its
     /// siblings) that do not scale with the cache population. See [`VolumeSnapshotGauges`] for
     /// which figures are background-derived and how their age is published.
-    pub async fn current_metrics(&self) -> SystemMetrics {
+    pub(crate) async fn current_metrics(&self) -> SystemMetrics {
         let last = self.get_cached_metrics().await;
         // As a scrape: an expired staged-authority figure is served while one background refresh
         // re-derives it, rather than re-derived here behind `.pending` locks and a checkpoint
@@ -3997,12 +3980,6 @@ impl MetricsManager {
             write_stamp_pending_declined_total: crate::cache::write_stamp_pending_declined_total(),
             volume_stall_breaker_open: crate::volume_stall::breaker_open(),
             volume_stall_breaker_trips_total: crate::volume_stall::breaker_trips_total(),
-            // Cache coherency metrics
-            cache_etag_validations_total: error_stats.cache_etag_validations_total,
-            cache_etag_mismatches_total: error_stats.cache_etag_mismatches_total,
-            cache_range_invalidations_total: error_stats.cache_range_invalidations_total,
-            cache_orphaned_ranges_cleaned_total: error_stats.cache_orphaned_ranges_cleaned_total,
-            cache_cleanup_failures_total: error_stats.cache_cleanup_failures_total,
             // Part caching metrics - Requirements 8.1, 8.2, 8.3, 8.4, 8.5
             cache_part_hits: error_stats.cache_part_hits,
             cache_part_misses: error_stats.cache_part_misses,
@@ -4300,7 +4277,7 @@ impl MetricsManager {
     }
 
     /// Get cached metrics (non-blocking)
-    pub async fn get_cached_metrics(&self) -> Option<SystemMetrics> {
+    async fn get_cached_metrics(&self) -> Option<SystemMetrics> {
         self.last_metrics.read().await.clone()
     }
     /// Record corrupted metadata file event
@@ -4310,7 +4287,7 @@ impl MetricsManager {
     /// * `cache_key` - The cache key with corrupted metadata
     /// * `file_path` - The path to the corrupted metadata file
     /// * `error_details` - Details about the corruption error
-    pub async fn record_corrupted_metadata(
+    async fn record_corrupted_metadata(
         &self,
         cache_key: &str,
         file_path: &str,
@@ -4330,7 +4307,7 @@ impl MetricsManager {
 
     /// Record missing range binary file event
     /// Requirement 8.2: Track missing range file events
-    pub async fn record_missing_range_file(&self) {
+    pub(crate) async fn record_missing_range_file(&self) {
         let mut stats = self.error_stats.write().await;
         stats.corruption_missing_range_total += 1;
         debug!(
@@ -4353,7 +4330,7 @@ impl MetricsManager {
     ///
     /// # Arguments
     /// * `duration_ms` - The duration in milliseconds to parse the metadata
-    pub async fn record_metadata_parse_duration(&self, duration_ms: f64) {
+    pub(crate) async fn record_metadata_parse_duration(&self, duration_ms: f64) {
         let mut stats = self.range_storage_stats.write().await;
         stats.metadata_parse_durations.push(duration_ms);
 
@@ -4373,7 +4350,7 @@ impl MetricsManager {
     ///
     /// # Arguments
     /// * `size_bytes` - The size of the metadata file in bytes
-    pub async fn record_metadata_file_size(&self, size_bytes: u64) {
+    pub(crate) async fn record_metadata_file_size(&self, size_bytes: u64) {
         let mut stats = self.range_storage_stats.write().await;
         stats.metadata_file_size_bytes = size_bytes;
         debug!("Recorded metadata file size: {} bytes", size_bytes);
@@ -4387,7 +4364,7 @@ impl MetricsManager {
     ///
     /// # Arguments
     /// * `count` - The number of range files
-    pub async fn record_range_file_count(&self, count: u64) {
+    pub(crate) async fn record_range_file_count(&self, count: u64) {
         let mut stats = self.range_storage_stats.write().await;
         stats.range_file_count = count;
         debug!("Recorded range file count: {}", count);
@@ -4401,7 +4378,7 @@ impl MetricsManager {
     ///
     /// # Arguments
     /// * `duration_ms` - The duration in milliseconds to load the range data
-    pub async fn record_range_load_duration(&self, duration_ms: f64) {
+    pub(crate) async fn record_range_load_duration(&self, duration_ms: f64) {
         let mut stats = self.range_storage_stats.write().await;
         stats.range_load_durations.push(duration_ms);
 
@@ -4496,7 +4473,7 @@ impl MetricsManager {
     /// doc on `EvictionCoordinationStats::staging_evictions_skipped_lock_held`.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 7.4
-    pub async fn record_staging_eviction_skipped_lock_held(&self) {
+    pub(crate) async fn record_staging_eviction_skipped_lock_held(&self) {
         let mut stats = self.eviction_coordination_stats.write().await;
         stats.staging_evictions_skipped_lock_held += 1;
         debug!(
@@ -4548,7 +4525,7 @@ impl MetricsManager {
     /// # Arguments
     /// * `bytes_cached` - The number of bytes cached
     /// * `duration_ms` - The streaming duration in milliseconds
-    pub async fn record_cached_put(&self, bytes_cached: u64, duration_ms: u64) {
+    pub(crate) async fn record_cached_put(&self, bytes_cached: u64, duration_ms: u64) {
         let mut stats = self.signed_put_stats.write().await;
         stats.cached_puts_total += 1;
         stats.cached_bytes.push(bytes_cached);
@@ -4573,7 +4550,7 @@ impl MetricsManager {
     ///
     /// This method records when a signed PUT request bypasses the cache
     /// due to capacity limits or other reasons.
-    pub async fn record_bypassed_put(&self) {
+    pub(crate) async fn record_bypassed_put(&self) {
         let mut stats = self.signed_put_stats.write().await;
         stats.bypassed_puts_total += 1;
         debug!(
@@ -4587,7 +4564,7 @@ impl MetricsManager {
     ///
     /// This method records when a signed PUT request fails to cache
     /// due to errors during the caching process.
-    pub async fn record_put_cache_failure(&self) {
+    pub(crate) async fn record_put_cache_failure(&self) {
         let mut stats = self.signed_put_stats.write().await;
         stats.cache_failures_total += 1;
         debug!(
@@ -4611,7 +4588,7 @@ impl MetricsManager {
     ///   the maintained list of keys)
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.1
-    pub async fn record_skipped_put(&self, reason: &str) {
+    pub(crate) async fn record_skipped_put(&self, reason: &str) {
         let mut stats = self.signed_put_stats.write().await;
         let count = stats
             .skipped_puts_by_reason
@@ -4651,82 +4628,10 @@ impl MetricsManager {
         *stats.cache_bypasses_by_reason.get(reason).unwrap_or(&0)
     }
 
-    /// Record ETag mismatch event
-    /// Requirement 2.3: Track ETag mismatches that trigger cache invalidation
-    ///
-    /// This method records when an ETag mismatch is detected between cached ranges
-    /// and cached object metadata, indicating stale data that needs invalidation.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key with the mismatch
-    /// * `range_etag` - The ETag from the cached range
-    /// * `object_etag` - The ETag from the cached object metadata
-    pub async fn record_etag_mismatch(&self, cache_key: &str, range_etag: &str, object_etag: &str) {
-        let mut stats = self.error_stats.write().await;
-        stats.cache_etag_mismatches_total += 1;
-
-        warn!(
-            cache_key = %cache_key,
-            range_etag = %range_etag,
-            object_etag = %object_etag,
-            total_mismatches = stats.cache_etag_mismatches_total,
-            "ETag mismatch detected - invalidating cached ranges"
-        );
-    }
-
-    /// Record range invalidation event
-    /// Requirement 2.3: Track range invalidations due to cache coherency issues
-    ///
-    /// This method records when cached ranges are invalidated due to ETag mismatches
-    /// or full object caching operations.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key being invalidated
-    /// * `affected_ranges` - List of range specifications that were invalidated
-    /// * `reason` - The reason for invalidation (e.g., "etag_mismatch", "full_object_cached")
-    pub async fn record_range_invalidation(
-        &self,
-        cache_key: &str,
-        affected_ranges: &[String],
-        reason: &str,
-    ) {
-        let mut stats = self.error_stats.write().await;
-        stats.cache_range_invalidations_total += 1;
-
-        warn!(
-            cache_key = %cache_key,
-            affected_ranges = ?affected_ranges,
-            reason = %reason,
-            range_count = affected_ranges.len(),
-            total_invalidations = stats.cache_range_invalidations_total,
-            "Cache ranges invalidated for coherency"
-        );
-    }
-
     /// Backward compatibility method for simple corrupted metadata recording
-    pub async fn record_corrupted_metadata_simple(&self) {
+    pub(crate) async fn record_corrupted_metadata_simple(&self) {
         self.record_corrupted_metadata("unknown", "unknown", "unknown")
             .await;
-    }
-
-    /// Record corrupted metadata with a specific reason label (oversize, legacy, parse_failure).
-    /// Spec: cache-metadata-resilience Req 3, Task 6
-    pub async fn record_corrupted_metadata_with_reason(
-        &self,
-        cache_key: &str,
-        file_path: &str,
-        reason: &str,
-    ) {
-        let mut stats = self.error_stats.write().await;
-        stats.corruption_metadata_total += 1;
-
-        warn!(
-            cache_key = %cache_key,
-            file_path = %file_path,
-            reason = %reason,
-            total_corruptions = stats.corruption_metadata_total,
-            "Metadata corruption detected (classified)"
-        );
     }
 
     /// Record part cache hit event
@@ -4738,7 +4643,12 @@ impl MetricsManager {
     /// * `cache_key` - The cache key for the object
     /// * `part_number` - The part number that was served from cache
     /// * `size_bytes` - The size of the cached part in bytes
-    pub async fn record_part_cache_hit(&self, cache_key: &str, part_number: u32, size_bytes: u64) {
+    pub(crate) async fn record_part_cache_hit(
+        &self,
+        cache_key: &str,
+        part_number: u32,
+        size_bytes: u64,
+    ) {
         let mut stats = self.error_stats.write().await;
         stats.cache_part_hits += 1;
 
@@ -4764,7 +4674,7 @@ impl MetricsManager {
     /// # Arguments
     /// * `cache_key` - The cache key for the object
     /// * `part_number` - The part number that was not found in cache
-    pub async fn record_part_cache_miss(&self, cache_key: &str, part_number: u32) {
+    pub(crate) async fn record_part_cache_miss(&self, cache_key: &str, part_number: u32) {
         let mut stats = self.error_stats.write().await;
         stats.cache_part_misses += 1;
 
@@ -4785,7 +4695,7 @@ impl MetricsManager {
     /// * `cache_key` - The cache key for the object
     /// * `part_number` - The part number that was stored
     /// * `size_bytes` - The size of the stored part in bytes
-    pub async fn record_part_cache_store(
+    pub(crate) async fn record_part_cache_store(
         &self,
         cache_key: &str,
         part_number: u32,
@@ -4812,7 +4722,7 @@ impl MetricsManager {
     /// * `cache_key` - The cache key for the object
     /// * `part_numbers` - The part numbers that were evicted
     /// * `total_size_bytes` - The total size of evicted parts in bytes
-    pub async fn record_part_cache_eviction(
+    pub(crate) async fn record_part_cache_eviction(
         &self,
         cache_key: &str,
         part_numbers: &[u32],
@@ -4841,7 +4751,7 @@ impl MetricsManager {
     /// * `part_number` - The part number that encountered an error
     /// * `operation` - The operation that failed (e.g., "lookup", "store", "parse")
     /// * `error_details` - Details about the error
-    pub async fn record_part_cache_error(
+    pub(crate) async fn record_part_cache_error(
         &self,
         cache_key: &str,
         part_number: u32,
@@ -4883,7 +4793,7 @@ impl MetricsManager {
 
     /// Record a coalescing wait event
     /// Requirement 19.1: Track requests that waited for an in-flight fetch
-    pub async fn record_coalesce_wait(&self) {
+    pub(crate) async fn record_coalesce_wait(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.waits_total += 1;
         debug!("Recorded coalesce wait (total: {})", stats.waits_total);
@@ -4891,7 +4801,7 @@ impl MetricsManager {
 
     /// Record a cache hit after waiting for coalescing
     /// Requirement 19.2: Track requests served from cache after waiting
-    pub async fn record_coalesce_cache_hit(&self) {
+    pub(crate) async fn record_coalesce_cache_hit(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.cache_hits_after_wait_total += 1;
         stats.s3_fetches_saved_total += 1;
@@ -4903,7 +4813,7 @@ impl MetricsManager {
 
     /// Record a coalescing timeout event
     /// Requirement 19.3: Track requests that timed out waiting
-    pub async fn record_coalesce_timeout(&self) {
+    pub(crate) async fn record_coalesce_timeout(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.timeouts_total += 1;
         debug!(
@@ -4913,7 +4823,7 @@ impl MetricsManager {
     }
     /// Record wait duration for coalescing
     /// Requirement 19.5: Track wait duration histogram
-    pub async fn record_coalesce_wait_duration(&self, duration: std::time::Duration) {
+    pub(crate) async fn record_coalesce_wait_duration(&self, duration: std::time::Duration) {
         let mut stats = self.coalescing_stats.write().await;
         let duration_ms = duration.as_millis() as u64;
         stats.wait_duration_sum_ms += duration_ms;
@@ -4929,13 +4839,13 @@ impl MetricsManager {
     }
 
     /// Record fetcher completion (success)
-    pub async fn record_coalesce_fetcher_success(&self) {
+    pub(crate) async fn record_coalesce_fetcher_success(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.fetcher_completions_success += 1;
     }
 
     /// Record fetcher completion (error)
-    pub async fn record_coalesce_fetcher_error(&self) {
+    pub(crate) async fn record_coalesce_fetcher_error(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.fetcher_completions_error += 1;
     }
@@ -4944,7 +4854,7 @@ impl MetricsManager {
     /// This is the "validated cache serve" outcome — the waiter's
     /// credentials were just validated by S3 and the cache entry is
     /// authoritative for the waiter.
-    pub async fn record_coalesce_waiter_conditional_304(&self) {
+    pub(crate) async fn record_coalesce_waiter_conditional_304(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.waiter_conditional_304 += 1;
         debug!(
@@ -4956,7 +4866,7 @@ impl MetricsManager {
     /// Record a waiter's conditional request returning `200 OK` — the
     /// object changed between the fetcher's commit and the waiter's
     /// validation, and S3 returned a fresh body.
-    pub async fn record_coalesce_waiter_conditional_200(&self) {
+    pub(crate) async fn record_coalesce_waiter_conditional_200(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.waiter_conditional_200 += 1;
         debug!(
@@ -4968,7 +4878,7 @@ impl MetricsManager {
     /// Record a waiter's conditional request returning a `4xx` status —
     /// credentials issue (401/403) or other client error. The response
     /// is returned to the client unchanged; the cache is preserved.
-    pub async fn record_coalesce_waiter_conditional_4xx(&self) {
+    pub(crate) async fn record_coalesce_waiter_conditional_4xx(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.waiter_conditional_4xx += 1;
         debug!(
@@ -4979,7 +4889,7 @@ impl MetricsManager {
 
     /// Record a waiter's conditional request failing with a `5xx` from S3
     /// or a transport error. Triggers the degraded cache-serve fallback.
-    pub async fn record_coalesce_waiter_conditional_error(&self) {
+    pub(crate) async fn record_coalesce_waiter_conditional_error(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.waiter_conditional_error += 1;
         debug!(
@@ -4997,7 +4907,11 @@ impl MetricsManager {
     /// with the client-requested byte length and the total widened (Page)
     /// byte length, so the amplification ratio can be derived
     /// (Requirement 8.1, 8.2).
-    pub async fn record_page_widened_request(&self, bytes_requested: u64, bytes_widened: u64) {
+    pub(crate) async fn record_page_widened_request(
+        &self,
+        bytes_requested: u64,
+        bytes_widened: u64,
+    ) {
         let mut stats = self.page_cache_stats.write().await;
         stats.widened_requests += 1;
         stats.bytes_requested += bytes_requested;
@@ -5010,7 +4924,7 @@ impl MetricsManager {
 
     /// Record a Small_Read served from an already-cached Page with no S3
     /// fetch (Requirement 8.3).
-    pub async fn record_page_hit(&self) {
+    pub(crate) async fn record_page_hit(&self) {
         let mut stats = self.page_cache_stats.write().await;
         stats.page_hits += 1;
         debug!("Recorded page cache hit (total: {})", stats.page_hits);
@@ -5018,7 +4932,7 @@ impl MetricsManager {
 
     /// Record a request declined widening because the Range was signed
     /// (Requirement 8.4).
-    pub async fn record_page_skipped_signed_range(&self) {
+    pub(crate) async fn record_page_skipped_signed_range(&self) {
         let mut stats = self.page_cache_stats.write().await;
         stats.skipped_signed_range += 1;
         debug!(
@@ -5029,7 +4943,7 @@ impl MetricsManager {
 
     /// Record a widened/page fetch failure that fell back to the client's
     /// original range (Requirement 8.5).
-    pub async fn record_page_fallback(&self) {
+    pub(crate) async fn record_page_fallback(&self) {
         let mut stats = self.page_cache_stats.write().await;
         stats.fallbacks += 1;
         debug!(
@@ -5040,7 +4954,7 @@ impl MetricsManager {
 
     /// Record a Page successfully promoted to the RAM cache
     /// (Requirement 8.6).
-    pub async fn record_ram_page_promotion(&self) {
+    pub(crate) async fn record_ram_page_promotion(&self) {
         let mut stats = self.page_cache_stats.write().await;
         stats.ram_page_promotions += 1;
         debug!(
@@ -5051,7 +4965,7 @@ impl MetricsManager {
 
     /// Record a Page that was not promoted to RAM because it exceeded the
     /// applicable RAM budget (Requirement 8.6, see Requirement 7.7).
-    pub async fn record_ram_page_promotion_skipped(&self) {
+    pub(crate) async fn record_ram_page_promotion_skipped(&self) {
         let mut stats = self.page_cache_stats.write().await;
         stats.ram_page_promotion_skipped += 1;
         debug!(
@@ -5059,38 +4973,11 @@ impl MetricsManager {
             stats.ram_page_promotion_skipped
         );
     }
-    /// Record a per-bucket cache hit. Tracked for all buckets.
-    pub async fn record_bucket_cache_hit(&self, bucket: &str, is_head: bool) {
-        let mut stats = self.bucket_cache_stats.write().await;
-        let entry = stats.entry(bucket.to_string()).or_default();
-        entry.hit_count += 1;
-        if is_head {
-            entry.head_hit_count += 1;
-        } else {
-            entry.get_hit_count += 1;
-        }
-    }
-
-    /// Record a per-bucket cache miss. Tracked for all buckets.
-    pub async fn record_bucket_cache_miss(&self, bucket: &str, is_head: bool) {
-        let mut stats = self.bucket_cache_stats.write().await;
-        let entry = stats.entry(bucket.to_string()).or_default();
-        entry.miss_count += 1;
-        if is_head {
-            entry.head_miss_count += 1;
-        } else {
-            entry.get_miss_count += 1;
-        }
-    }
-
-    /// Get per-bucket cache stats for all tracked buckets.
-    /// Returns a snapshot of hit/miss counts keyed by bucket name. Test seam.
+    /// Number of per-rule cache series held in memory. Test seam.
     #[cfg(test)]
-    pub(crate) async fn get_bucket_cache_stats(&self) -> HashMap<String, BucketCacheStats> {
-        let stats = self.bucket_cache_stats.read().await;
-        stats.clone()
+    pub(crate) async fn tracked_cache_series_for_test(&self) -> usize {
+        self.rule_cache_stats.read().await.len()
     }
-
     /// Configure per-bucket traffic accounting from the loaded config.
     /// Must be called before any recording starts.
     pub fn set_per_bucket_config(
@@ -5109,14 +4996,14 @@ impl MetricsManager {
     /// configured for the bucket (bucket-level attribution applies).
     ///
     /// Spec: per-bucket-metrics. Requirements: 5.1, 5.2
-    pub fn bucket_prefixes_for(&self, bucket: &str) -> Option<&[String]> {
+    pub(crate) fn bucket_prefixes_for(&self, bucket: &str) -> Option<&[String]> {
         self.per_bucket_prefixes.get(bucket).map(|v| v.as_slice())
     }
 
     /// Record traffic for a completed request.
     ///
     /// Non-blocking write to the per-bucket traffic map (O(1) critical section,
-    /// mirrors bucket_cache_stats pattern). Empty bucket is a no-op at debug level.
+    /// follows the per-rule counters pattern). Empty bucket is a no-op at debug level.
     ///
     /// Overflow: once the map has `max_bucket_traffic_series` distinct series, any
     /// new series is folded into the `__other__` overflow sentinel (bucket:
@@ -5126,7 +5013,7 @@ impl MetricsManager {
     /// Only GET and PUT (object/part) are recorded — see `RequestType`.
     ///
     /// Spec: per-bucket-metrics. Requirements: 1.1, 1.2, 1.3, 1.4, 2.3, 2.4, 7.2, 7.3
-    pub async fn record_bucket_traffic(
+    pub(crate) async fn record_bucket_traffic(
         &self,
         bucket: &str,
         prefix: Option<&str>,
@@ -5191,7 +5078,9 @@ impl MetricsManager {
     /// returned map — callers should check `map.contains_key(&BucketTrafficKey { bucket: "__other__", prefix: None })`.
     ///
     /// Spec: per-bucket-metrics. Requirements: 1.3, 7.3
-    pub async fn get_bucket_traffic_stats(&self) -> HashMap<BucketTrafficKey, BucketTrafficStats> {
+    pub(crate) async fn get_bucket_traffic_stats(
+        &self,
+    ) -> HashMap<BucketTrafficKey, BucketTrafficStats> {
         self.bucket_traffic_stats.read().await.clone()
     }
 
@@ -5202,7 +5091,7 @@ impl MetricsManager {
     /// `"bucket/prefix"` when prefix attribution is active.
     ///
     /// Spec: per-bucket-metrics. Requirements: 3.1, 3.3
-    pub async fn get_bucket_traffic_stats_json(&self) -> HashMap<String, BucketTrafficStats> {
+    async fn get_bucket_traffic_stats_json(&self) -> HashMap<String, BucketTrafficStats> {
         self.bucket_traffic_stats
             .read()
             .await
@@ -5218,7 +5107,7 @@ impl MetricsManager {
     }
 
     /// Record a per-rule cache hit. Key is the rule's glob pattern.
-    pub async fn record_rule_cache_hit(&self, pattern: &str, is_head: bool) {
+    pub(crate) async fn record_rule_cache_hit(&self, pattern: &str, is_head: bool) {
         let mut stats = self.rule_cache_stats.write().await;
         let entry = stats.entry(pattern.to_string()).or_default();
         entry.hit_count += 1;
@@ -5230,7 +5119,7 @@ impl MetricsManager {
     }
 
     /// Record a per-rule cache miss. Key is the rule's glob pattern.
-    pub async fn record_rule_cache_miss(&self, pattern: &str, is_head: bool) {
+    pub(crate) async fn record_rule_cache_miss(&self, pattern: &str, is_head: bool) {
         let mut stats = self.rule_cache_stats.write().await;
         let entry = stats.entry(pattern.to_string()).or_default();
         entry.miss_count += 1;
@@ -5242,19 +5131,19 @@ impl MetricsManager {
     }
 
     /// Get per-rule cache stats. Keys are rule glob patterns.
-    pub async fn get_rule_cache_stats(&self) -> HashMap<String, BucketCacheStats> {
+    pub(crate) async fn get_rule_cache_stats(&self) -> HashMap<String, BucketCacheStats> {
         let stats = self.rule_cache_stats.read().await;
         stats.clone()
     }
 
     /// Record a successful eager invalidation triggered by `read_cache_enabled=false`.
-    pub async fn record_read_cache_disabled_invalidation(&self) {
+    pub(crate) async fn record_read_cache_disabled_invalidation(&self) {
         let mut stats = self.error_stats.write().await;
         stats.read_cache_disabled_invalidations_total += 1;
     }
 
     /// Record a TTL-driven revalidation (freshness expired, conditional request to S3).
-    pub async fn record_ttl_revalidation(&self) {
+    pub(crate) async fn record_ttl_revalidation(&self) {
         let mut stats = self.error_stats.write().await;
         stats.ttl_revalidations_total += 1;
     }
@@ -5278,7 +5167,7 @@ impl MetricsManager {
     ///
     /// # Arguments
     /// * `endpoint` - The endpoint for which the connection was created
-    pub async fn record_connection_created(&self, endpoint: &str) {
+    pub(crate) async fn record_connection_created(&self, endpoint: &str) {
         let mut stats = self.connection_keepalive_stats.write().await;
         *stats
             .connections_created
@@ -5331,7 +5220,7 @@ impl MetricsManager {
     ///
     /// # Arguments
     /// * `endpoint` - The endpoint for which the request was made
-    pub async fn record_request_to_endpoint(&self, endpoint: &str) {
+    pub(crate) async fn record_request_to_endpoint(&self, endpoint: &str) {
         let mut stats = self.connection_keepalive_stats.write().await;
 
         // Increment total requests for this endpoint
@@ -5360,7 +5249,7 @@ impl MetricsManager {
     /// Requirement 6.5: Track connections closed due to max lifetime
     ///
     /// This method records when a connection is closed because it exceeded the max lifetime.
-    pub async fn record_max_lifetime_closure(&self) {
+    pub(crate) async fn record_max_lifetime_closure(&self) {
         let mut stats = self.connection_keepalive_stats.write().await;
         stats.max_lifetime_closures += 1;
         debug!(
@@ -5373,7 +5262,7 @@ impl MetricsManager {
     /// Requirement 6.5: Track connections closed due to errors
     ///
     /// This method records when a connection is closed due to an error.
-    pub async fn record_error_closure(&self) {
+    pub(crate) async fn record_error_closure(&self) {
         let mut stats = self.connection_keepalive_stats.write().await;
         stats.error_closures += 1;
         debug!("Recorded error closure (total: {})", stats.error_closures);
@@ -5845,7 +5734,7 @@ mod tests {
     /// `CacheManager::initialize()` coordinated path: the latter also starts
     /// `CacheSizeTracker`'s background validation task, which — because no
     /// `validation.json` exists yet in a fresh temp dir — runs an immediate
-    /// filesystem-scan validation that calls `update_size_from_validation`
+    /// filesystem-scan validation that calls `update_size_from_validation_with_kind`
     /// and overwrites `write_cache_size` back to the scanned (zero) figure,
     /// racing with this test's own `atomic_update_size_delta` calls. Skipping
     /// it keeps the test deterministic without weakening what's under test:
@@ -6214,15 +6103,6 @@ mod tests {
     async fn test_cache_coherency_metrics() {
         let metrics_manager = MetricsManager::new();
 
-        // Record cache coherency events
-        metrics_manager
-            .record_etag_mismatch("test-key", "etag1", "etag2")
-            .await;
-        let ranges = vec!["range1".to_string(), "range2".to_string()];
-        metrics_manager
-            .record_range_invalidation("test-key", &ranges, "etag_mismatch")
-            .await;
-
         // Record error metrics
         metrics_manager
             .record_corrupted_metadata("test-key", "/path/to/meta", "parse error")
@@ -6230,10 +6110,6 @@ mod tests {
 
         // Get error stats directly
         let error_stats = metrics_manager.get_error_stats().await;
-
-        // Verify cache coherency metrics
-        assert_eq!(error_stats.cache_etag_mismatches_total, 1);
-        assert_eq!(error_stats.cache_range_invalidations_total, 1);
 
         // Verify error metrics
         assert_eq!(error_stats.corruption_metadata_total, 1);
@@ -6435,62 +6311,27 @@ mod tests {
         assert_eq!(stats.len(), 2);
     }
 
-    /// Per-bucket counters are maintained for ALL buckets, including a bucket
-    /// that no rule matched (resolution fell through to the global defaults).
-    /// This demonstrates per-bucket tracking is not restricted to buckets
-    /// referenced by a rule.
-    ///
-    /// Validates: Requirements 6.5
+    /// Cache hits and misses for many distinct buckets that match no rule leave no
+    /// per-bucket series behind, so the tracked figure does not grow with bucket count.
     #[tokio::test]
-    async fn test_bucket_cache_stats_tracks_bucket_without_matching_rule() {
-        let metrics_manager = MetricsManager::new();
-
-        // This bucket is referenced by a rule (e.g. matched "prod-*/static/**").
-        let rule_bucket = "prod-assets";
-        // This bucket matched no rule at all; resolution used global defaults,
-        // so there is no per-rule attribution for it. Per Requirement 6.5 the
-        // per-bucket counter must still track it.
-        let unruled_bucket = "ad-hoc-bucket";
-
-        metrics_manager
-            .record_bucket_cache_hit(rule_bucket, false)
-            .await;
-
-        // Record a GET hit, a HEAD hit, and a GET miss for the unruled bucket.
-        metrics_manager
-            .record_bucket_cache_hit(unruled_bucket, false)
-            .await;
-        metrics_manager
-            .record_bucket_cache_hit(unruled_bucket, true)
-            .await;
-        metrics_manager
-            .record_bucket_cache_miss(unruled_bucket, false)
-            .await;
-
-        let stats = metrics_manager.get_bucket_cache_stats().await;
-
-        // The bucket with no matching rule is tracked.
-        let unruled = stats
-            .get(unruled_bucket)
-            .expect("per-bucket counter must track buckets with no matching rule");
-        assert_eq!(unruled.hit_count, 2);
-        assert_eq!(unruled.miss_count, 1);
-        assert_eq!(unruled.head_hit_count, 1);
-        assert_eq!(unruled.get_hit_count, 1);
-        assert_eq!(unruled.head_miss_count, 0);
-        assert_eq!(unruled.get_miss_count, 1);
-
-        // The rule-referenced bucket is also tracked, independently.
-        let ruled = stats
-            .get(rule_bucket)
-            .expect("per-bucket counter must track rule-referenced buckets too");
-        assert_eq!(ruled.hit_count, 1);
-        assert_eq!(ruled.get_hit_count, 1);
-        assert_eq!(ruled.miss_count, 0);
-
-        assert_eq!(stats.len(), 2);
+    async fn cache_access_for_many_buckets_tracks_no_series() {
+        let (cache_manager, _dir) = build_cache_manager_with_write_cache(1_000_000, 10.0).await;
+        let mm = Arc::new(RwLock::new(MetricsManager::new()));
+        cache_manager.set_metrics_manager(mm.clone()).await;
+        let before = mm.read().await.tracked_cache_series_for_test().await;
+        let source = crate::bucket_settings::SettingsSource::Global;
+        for i in 0..2000 {
+            let key = format!("bucket-{i}/object.bin");
+            cache_manager
+                .record_bucket_cache_access(&key, i % 2 == 0, i % 3 == 0, &source)
+                .await;
+        }
+        let after = mm.read().await.tracked_cache_series_for_test().await;
+        assert_eq!(
+            after, before,
+            "per-bucket cache series grew with bucket count"
+        );
     }
-
     #[tokio::test]
     async fn test_record_read_cache_disabled_invalidation() {
         let mm = MetricsManager::new();
@@ -8139,7 +7980,10 @@ mod inverted_age_metric_tests {
         consolidator.initialize().await.unwrap();
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = TOTAL_BYTES;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
         crate::staged_fold::seed_shard_figure_for_tests(dir, "test-bucket", "3f", STAGED_BYTES, 1);
         assert!(
             crate::staged_authority::activate(dir, "host:test").unwrap(),

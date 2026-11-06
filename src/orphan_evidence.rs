@@ -46,7 +46,7 @@ impl JournalEvidence {
 
 /// One journal file as last observed: its name, length and modification time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafSnapshot {
+struct LeafSnapshot {
     pub name: String,
     pub len: u64,
     pub mtime: Option<SystemTime>,
@@ -71,7 +71,7 @@ struct Leaf {
 /// Reads every instance's journal and answers [`JournalEvidence`] queries, re-reading
 /// only journals whose snapshot changed on each [`refresh`](Self::refresh).
 #[derive(Debug)]
-pub struct JournalEvidenceReader {
+struct JournalEvidenceReader {
     journals_dir: PathBuf,
     leaves: BTreeMap<String, Leaf>,
     /// The last refresh's directory listing failed (or none has run yet).
@@ -211,18 +211,10 @@ impl JournalEvidenceReader {
             JournalEvidence::ConfirmedAbsent
         }
     }
-
-    /// The per-leaf snapshot as of the last refresh, in name order.
-    pub fn snapshot(&self) -> Vec<LeafSnapshot> {
-        self.leaves
-            .values()
-            .map(|leaf| leaf.snapshot.clone())
-            .collect()
-    }
 }
 
 /// One-shot query: list and read every journal, then answer for the extent.
-pub fn journal_evidence(
+pub(crate) fn journal_evidence(
     cache_dir: &Path,
     cache_key: &str,
     start: u64,
@@ -453,11 +445,6 @@ mod tests {
         std::fs::write(dir.join("b.journal"), "").unwrap();
         let mut reader = JournalEvidenceReader::new(temp.path());
         assert_eq!(reader.refresh(), 2);
-        let names: Vec<String> = reader.snapshot().into_iter().map(|s| s.name).collect();
-        assert_eq!(
-            names,
-            vec!["a.journal".to_string(), "b.journal".to_string()]
-        );
         assert_eq!(
             reader.evidence(KEY, 0, 99),
             JournalEvidence::ConfirmedAbsent
@@ -476,7 +463,6 @@ mod tests {
         // The journal is consolidated away (deleted): the evidence goes with it.
         std::fs::remove_file(dir.join("b.journal")).unwrap();
         reader.refresh();
-        assert_eq!(reader.snapshot().len(), 1);
         assert_eq!(
             reader.evidence(KEY, 0, 99),
             JournalEvidence::ConfirmedAbsent

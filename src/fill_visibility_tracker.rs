@@ -2,7 +2,7 @@
 //!
 //! # The window this closes
 //!
-//! A streamed GET miss commits through `DiskCacheManager::commit_incremental_range`, which
+//! A streamed GET miss commits through `DiskCacheManager::commit_incremental_range_shared`, which
 //! publishes the `.bin` synchronously and writes the metadata as a journal line only
 //! (`WriteMode::JournalOnly`). The `.meta` appears when the journal consolidator next folds that
 //! line, so until then the filling proxy's own lookup finds nothing and every re-read of the object
@@ -30,8 +30,9 @@
 //!    loads an existing `.meta` unchanged), so rule 2 still holds against the folded `.meta`.
 //! 2. **No freshness of its own.** Stored expiry is `commit time + ttl` and live TTL is judged by
 //!    `check_object_expiration`'s own verdict function against `created_at = commit time`, which is
-//!    earlier than the consolidation time the `.meta` will carry, so a tracker verdict is never
-//!    more generous than the `.meta`'s. A `get_ttl` of zero is never recorded and never consulted.
+//!    earlier than the `Add` timestamp the `.meta` will carry (the fold stamps `created_at` from
+//!    the earliest `Add` of the document's version, capped at the fold time), so a tracker
+//!    verdict is never more generous than the `.meta`'s for this fill. A `get_ttl` of zero is never recorded and never consulted.
 //! 3. **Invalidation removes it, on any proxy.** Every key-invalidation function on this
 //!    instance calls [`FillVisibilityTracker::invalidate`]. A peer's acknowledged write or delete
 //!    cannot remove a `.bin` no `.meta` lists yet, but it replaces the key's write-order marker
@@ -53,7 +54,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -90,10 +91,10 @@ pub(crate) fn same_object_version(tracked: &ObjectMetadata, disk: &ObjectMetadat
 pub const MAX_ENTRIES: usize = 8_192;
 
 /// Most estimated bytes held at once, across all entries. See [`estimate_entry_bytes`].
-pub const MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Floor of the age limit. See [`age_limit_for`].
-pub const MIN_AGE_LIMIT: Duration = Duration::from_secs(30);
+const MIN_AGE_LIMIT: Duration = Duration::from_secs(30);
 
 /// The age limit for a given consolidation interval: `max(4 × interval, 30 s)`.
 ///
@@ -107,7 +108,7 @@ pub(crate) fn age_limit_for(consolidation_interval: Duration) -> Duration {
 
 /// Why an entry left the tracker. Each reason has its own counter on `/metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DropReason {
+enum DropReason {
     /// A `.meta` for the key was seen by a lookup.
     DiskMeta,
     /// The consolidator wrote the key's `.meta`.
@@ -128,7 +129,7 @@ pub enum DropReason {
 
 /// Length and mtime of one committed `.bin`, as seen immediately after its rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RangeFileStamp {
+pub(crate) struct RangeFileStamp {
     /// Absolute path of the `.bin`.
     pub path: PathBuf,
     /// File length in bytes, as stored (compressed).
@@ -159,7 +160,7 @@ impl RangeFileStamp {
 
 /// The state of a key's write-order marker a tracked fill was published under. See rule 3.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarkerStamp {
+pub(crate) struct MarkerStamp {
     /// The key's `.meta` path; the marker is its `.wtok` sibling.
     meta_path: PathBuf,
     /// The token the marker held, or `None` when no marker existed.
@@ -176,20 +177,23 @@ impl MarkerStamp {
         }
     }
 
-    /// The marker as it is now, for a fill published without a witness. `None` when a marker
-    /// exists but cannot be read (a stamp mid-write), so nothing can be vouched for.
-    pub fn of(meta_path: &Path) -> Option<Self> {
-        let token = match crate::cache::read_write_marker(meta_path) {
-            Some(marker) => Some(marker.token),
-            None => match std::fs::symlink_metadata(crate::cache::write_marker_path(meta_path)) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                _ => return None,
-            },
-        };
-        Some(Self {
-            meta_path: meta_path.to_path_buf(),
-            token,
+    /// Test support: write `token` as the key's write-order marker and return the stamp of a fill
+    /// witnessed under it, as a streamed fill's publish records one.
+    #[cfg(test)]
+    pub(crate) fn witnessed_under_written_marker(
+        meta_path: &Path,
+        cache_key: &str,
+        token: &str,
+    ) -> Self {
+        let marker = crate::cache::write_marker_path(meta_path);
+        std::fs::create_dir_all(marker.parent().expect("a marker has a parent")).unwrap();
+        let doc = serde_json::to_string(&crate::cache::WriteMarker {
+            token: token.to_string(),
+            cache_key: cache_key.to_string(),
         })
+        .unwrap();
+        std::fs::write(&marker, doc).unwrap();
+        Self::witnessed(meta_path, token)
     }
 
     /// True while the marker still holds the recorded state: the same token, or still no
@@ -227,7 +231,7 @@ struct Inner {
 
 /// Cumulative counters and gauges, read by the metrics collector.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FillVisibilityStats {
+pub(crate) struct FillVisibilityStats {
     pub entries: u64,
     pub bytes: u64,
     pub recorded_total: u64,
@@ -241,10 +245,10 @@ pub struct FillVisibilityStats {
 }
 
 /// See the module documentation.
-pub struct FillVisibilityTracker {
+pub(crate) struct FillVisibilityTracker {
     inner: Mutex<Inner>,
-    max_entries: AtomicUsize,
-    max_bytes: AtomicU64,
+    max_entries: usize,
+    max_bytes: u64,
     max_age: Duration,
     recorded: AtomicU64,
     hits: AtomicU64,
@@ -297,8 +301,8 @@ impl FillVisibilityTracker {
     pub(crate) fn with_limits(max_entries: usize, max_bytes: u64, max_age: Duration) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
-            max_entries: AtomicUsize::new(max_entries.max(1)),
-            max_bytes: AtomicU64::new(max_bytes),
+            max_entries: max_entries.max(1),
+            max_bytes,
             max_age,
             recorded: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -309,16 +313,6 @@ impl FillVisibilityTracker {
             dropped_age: AtomicU64::new(0),
             dropped_range_file_changed: AtomicU64::new(0),
         }
-    }
-
-    /// Replace the entry and byte caps. Takes effect at the next record or stats read.
-    ///
-    /// Production never calls this; it exists so an integration test can reach the cap with a
-    /// handful of fills instead of thousands.
-    pub fn set_caps(&self, max_entries: usize, max_bytes: u64) {
-        self.max_entries
-            .store(max_entries.max(1), Ordering::Relaxed);
-        self.max_bytes.store(max_bytes, Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -353,8 +347,7 @@ impl FillVisibilityTracker {
     /// Drop entries from the front of the order queue while they are aged out or a cap is
     /// exceeded. Stale queue items (replaced or removed entries) are discarded as they surface.
     fn sweep_locked(&self, inner: &mut Inner) {
-        let max_entries = self.max_entries.load(Ordering::Relaxed);
-        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        let (max_entries, max_bytes) = (self.max_entries, self.max_bytes);
         while let Some((key, seq)) = inner.order.front().cloned() {
             let live = inner.entries.get(&key).map(|e| (e.seq, e.recorded_at));
             let (live_seq, recorded_at) = match live {
@@ -623,7 +616,11 @@ mod tests {
             ..Default::default()
         };
         let stamp = RangeFileStamp::of(&bin).unwrap();
-        let marker = MarkerStamp::of(&meta_path_for(dir, key)).unwrap();
+        // A fill recorded while the key has no marker.
+        let marker = MarkerStamp {
+            meta_path: meta_path_for(dir, key),
+            token: None,
+        };
         (metadata, vec![stamp], marker)
     }
 
@@ -792,10 +789,6 @@ mod tests {
         t.record(m, s, w);
         std::fs::write(marker_path("b/torn"), b"").unwrap();
         assert!(t.lookup("b/torn").is_none());
-        assert!(
-            MarkerStamp::of(&meta_path_for(dir.path(), "b/torn")).is_none(),
-            "an unreadable marker vouches for nothing"
-        );
 
         let st = t.stats();
         assert_eq!(st.dropped_invalidated_total, 4);
@@ -934,11 +927,17 @@ mod cross_proxy_tests {
             .await
             .expect("fixture: the streamed writer must open")
             .expect("fixture: the streamed writer is admitted");
-        writer.set_fill_witness(Some(witness));
         crate::disk_cache::DiskCacheManager::write_range_chunk(&mut writer, body)
             .expect("fixture: the chunk write must succeed");
         disk_cache
-            .commit_incremental_range(writer, object_metadata(BODY_LEN as u64, "\"v1\""), LONG_TTL)
+            .prepare_incremental_commit(
+                writer,
+                object_metadata(BODY_LEN as u64, "\"v1\""),
+                LONG_TTL,
+                witness,
+            )
+            .expect("fixture: the streamed fill is prepared")
+            .finish()
             .await
             .expect("fixture: the streamed fill must commit");
     }

@@ -97,7 +97,7 @@ async fn append_flush_lines(
 
 /// Type of cache-hit update
 #[derive(Debug, Clone, PartialEq)]
-pub enum CacheHitUpdateType {
+enum CacheHitUpdateType {
     /// Refresh TTL for a cached range
     TtlRefresh {
         /// New TTL duration in seconds
@@ -112,7 +112,7 @@ pub enum CacheHitUpdateType {
 
 /// Buffered cache-hit update entry waiting to be flushed to journal
 #[derive(Debug, Clone)]
-pub struct BufferedCacheHitUpdate {
+struct BufferedCacheHitUpdate {
     /// Cache key (bucket/object)
     pub cache_key: String,
     /// Range start byte
@@ -602,7 +602,7 @@ impl CacheHitUpdateBuffer {
     }
 
     /// Get the number of distinct entries currently in the buffer
-    pub async fn buffer_len(&self) -> usize {
+    pub(crate) async fn buffer_len(&self) -> usize {
         let buffer = self.buffer.lock().await;
         buffer.len()
     }

@@ -53,8 +53,7 @@ use tracing::{debug, error, info, warn};
 /// so the read forwards to S3 and the client gets the origin's bytes. Dropping the range
 /// instead would discard a range that may be perfectly good whenever this predicate is
 /// wrong, and would do so silently; leaving it costs a refetch and never wrong bytes.
-/// `cache_validator`'s `MetadataIntegrityError::InvalidFieldValue` already reports the
-/// resulting shape, so a refusal is observable rather than mute.
+/// The refusal logs a warning (see below), so it is observable rather than mute.
 ///
 /// # One copy, deliberately
 ///
@@ -95,43 +94,11 @@ pub enum WriteMode {
     Hybrid,
 }
 
-/// Size/entry-count threshold check on a key's pending journal entries.
-///
-/// Informational only: crossing it logs at debug level and triggers nothing. Journal
-/// consolidation runs on `consolidation_interval` alone, which is why
-/// `cache.shared_storage.consolidation_size_threshold` is deprecated as having no effect.
-pub struct ConsolidationTrigger {
-    size_threshold: u64,
-    entry_count_threshold: usize,
-}
-
-impl ConsolidationTrigger {
-    pub fn new(size_threshold: u64, entry_count_threshold: usize) -> Self {
-        Self {
-            size_threshold,
-            entry_count_threshold,
-        }
-    }
-
-    /// Whether the pending entries cross either threshold. No production caller since
-    /// the per-fill journal re-parse that fed it was removed; consolidation is
-    /// interval-driven. Kept, with its unit test, because removing the type means
-    /// changing its construction in `cache.rs`, outside this change's scope.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn should_trigger(&self, journal_size: u64, entry_count: usize) -> bool {
-        journal_size >= self.size_threshold || entry_count >= self.entry_count_threshold
-    }
-}
-
 /// Hybrid metadata writer combining immediate updates with journaling
 pub struct HybridMetadataWriter {
     cache_dir: PathBuf,
     lock_manager: Arc<MetadataLockManager>,
     journal_manager: Arc<JournalManager>,
-    // Unread since the per-fill threshold check was removed; kept so the constructor
-    // signature `cache.rs` calls stays unchanged (see `ConsolidationTrigger::should_trigger`).
-    #[allow(dead_code)]
-    consolidation_trigger: Arc<ConsolidationTrigger>,
 }
 
 impl HybridMetadataWriter {
@@ -140,43 +107,15 @@ impl HybridMetadataWriter {
         cache_dir: PathBuf,
         lock_manager: Arc<MetadataLockManager>,
         journal_manager: Arc<JournalManager>,
-        consolidation_trigger: Arc<ConsolidationTrigger>,
     ) -> Self {
         Self {
             cache_dir,
             lock_manager,
             journal_manager,
-            consolidation_trigger,
         }
     }
-    /// Write range metadata using the specified write mode
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key for the object
-    /// * `range_spec` - The range specification to write
-    /// * `write_mode` - The write mode (Immediate, JournalOnly, or Hybrid)
-    /// * `object_metadata` - Optional object metadata from S3 response (needed for JournalOnly mode
-    ///   when .meta file doesn't exist yet, to preserve response_headers)
-    pub async fn write_range_metadata(
-        &mut self,
-        cache_key: &str,
-        range_spec: RangeSpec,
-        write_mode: WriteMode,
-        object_metadata: Option<crate::cache_types::ObjectMetadata>,
-        ttl: std::time::Duration,
-    ) -> Result<()> {
-        self.write_range_metadata_witnessed(
-            cache_key,
-            range_spec,
-            write_mode,
-            object_metadata,
-            ttl,
-            None,
-        )
-        .await
-    }
 
-    /// [`Self::write_range_metadata`] for a GET-miss range fill carrying its version witness
+    /// [`Self::write_range_metadata_witnessed`] for a GET-miss range fill carrying its version witness
     /// A journal-only `Add` records it, and the consolidator folds the `Add` only while
     /// the key's write-order marker still holds it. `None` journals no witness, as before.
     pub async fn write_range_metadata_witnessed(
@@ -699,23 +638,6 @@ mod tests {
         assert_ne!(WriteMode::Immediate, WriteMode::Hybrid);
     }
 
-    #[test]
-    fn test_consolidation_trigger() {
-        let trigger = ConsolidationTrigger::new(1024, 10);
-
-        // Should not trigger below thresholds
-        assert!(!trigger.should_trigger(512, 5));
-
-        // Should trigger when size threshold exceeded
-        assert!(trigger.should_trigger(1024, 5));
-
-        // Should trigger when entry count threshold exceeded
-        assert!(trigger.should_trigger(512, 10));
-
-        // Should trigger when both thresholds exceeded
-        assert!(trigger.should_trigger(1024, 10));
-    }
-
     #[tokio::test]
     async fn test_hybrid_metadata_writer_creation() {
         let temp_dir = TempDir::new().unwrap();
@@ -728,14 +650,9 @@ mod tests {
             temp_dir.path().to_path_buf(),
             "test-instance".to_string(),
         ));
-        let consolidation_trigger = Arc::new(ConsolidationTrigger::new(1024, 10));
 
-        let writer = HybridMetadataWriter::new(
-            temp_dir.path().to_path_buf(),
-            lock_manager,
-            journal_manager,
-            consolidation_trigger,
-        );
+        let writer =
+            HybridMetadataWriter::new(temp_dir.path().to_path_buf(), lock_manager, journal_manager);
 
         assert_eq!(writer.cache_dir, temp_dir.path());
     }
@@ -751,12 +668,7 @@ mod tests {
             temp_dir.path().to_path_buf(),
             "test-instance".to_string(),
         ));
-        HybridMetadataWriter::new(
-            temp_dir.path().to_path_buf(),
-            lock_manager,
-            journal_manager,
-            Arc::new(ConsolidationTrigger::new(1024, 10)),
-        )
+        HybridMetadataWriter::new(temp_dir.path().to_path_buf(), lock_manager, journal_manager)
     }
 
     /// A peer's temp path for the same key: same shard directory, same file stem, a
@@ -949,14 +861,9 @@ mod tests {
             temp_dir.path().to_path_buf(),
             "test-instance".to_string(),
         ));
-        let consolidation_trigger = Arc::new(ConsolidationTrigger::new(1024, 10));
 
-        let writer = HybridMetadataWriter::new(
-            temp_dir.path().to_path_buf(),
-            lock_manager,
-            journal_manager,
-            consolidation_trigger,
-        );
+        let writer =
+            HybridMetadataWriter::new(temp_dir.path().to_path_buf(), lock_manager, journal_manager);
 
         let result = writer.get_metadata_file_path("noslash");
         assert!(

@@ -169,8 +169,9 @@ metadata. It writes nothing.
 
 The dashboard requires no authentication and is read-only. It shows cache statistics,
 application log excerpts and system information (hostname, version and uptime). It has no write
-operations, no credentials and no control actions. Presigned URL parameters are masked before
-they reach the log viewer, so signatures, credentials and session tokens are redacted.
+operations, no credentials and no control actions. Presigned URL parameters are masked in
+every application log line, at every level, and the log viewer masks them again as it reads
+each line, so signatures, credentials and session tokens are redacted.
 
 Access control is at the network level, so who can reach the port decides who can read the page:
 

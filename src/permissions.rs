@@ -174,7 +174,7 @@ impl PermissionValidator {
 
 /// An NFS mount holding the cache directory whose options leave negative lookup caching on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NegativeLookupCacheMount {
+struct NegativeLookupCacheMount {
     /// The mount point, unescaped.
     pub mount_point: String,
     /// `nfs` or `nfs4`.
@@ -223,7 +223,7 @@ impl NegativeLookupCacheMount {
 /// The longest mount point that contains `cache_dir` wins; among equal mount points the later
 /// line wins, because a later mount stacks on top. `cache_dir` must be absolute and should be
 /// canonical, or no mount point will contain it. Pure, so it can be tested over sample lines.
-pub fn nfs_negative_lookup_cache_mount(
+fn nfs_negative_lookup_cache_mount(
     mountinfo: &str,
     cache_dir: &Path,
 ) -> Option<NegativeLookupCacheMount> {

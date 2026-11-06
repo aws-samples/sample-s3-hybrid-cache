@@ -27,17 +27,15 @@
 //! before the partition, discarding B's publish. A believed throughout that it held the lock,
 //! nothing refused its rename, and neither side logs an error.
 //!
-//! Five callers do not publish by tmp-and-rename. `CacheManager::evict_range` and
-//! `DiskCacheManager::{update_range_access_direct, refresh_object_ttl_direct,
-//! remove_invalidated_range, delete_stale_range}` rewrite `{key}.meta` in place under the slot
+//! Some callers do not publish by tmp-and-rename. `DiskCacheManager::{update_range_access_direct, refresh_object_ttl_direct,
+//! remove_invalidated_range}` rewrite `{key}.meta` in place under the slot
 //! lock, with no temp file. The clobber above applies to them unchanged. They also carry a
 //! failure mode the rename shape cannot: `std::fs::write` truncates before it writes, so a
 //! write that fails partway leaves a zero-length `.meta` where a failed rename would have left
 //! the previous document intact. That needs no partition and no peer, only a failed write.
 //! The read path absorbs both. `disk_cache::read_and_parse_metadata_blocking` classifies an
-//! empty or size-changing document `TransientMiss`, which is an ordinary miss, and
-//! `CacheManager::remove_corrupt_metadata` re-parses under the lock before deleting. Of the
-//! five, only `remove_invalidated_range` is reachable in production.
+//! empty or size-changing document `TransientMiss`, which is an ordinary miss.
+//! Of the callers named here, only `remove_invalidated_range` is reachable in production.
 //!
 //! Nothing detects this, and the reason is structural rather than an oversight. Once `flock`
 //! returns, no code performs any further operation on the locked descriptor: the slot file
@@ -269,10 +267,10 @@ pub fn slot_acquire_wait_budget() -> Duration {
 /// The lock namespace is a fixed set of files, created on first use and **never unlinked
 /// by anyone**. A cache key maps to a slot by hash, so two distinct keys can share one —
 /// see `slot_for_cache_key` for the collision arithmetic and its consequence.
-pub const META_LOCK_SLOTS: u64 = 4096;
+const META_LOCK_SLOTS: u64 = 4096;
 
 /// Directory holding the fixed slot set, relative to `metadata/`.
-pub const META_LOCK_DIR: &str = "_meta_locks";
+const META_LOCK_DIR: &str = "_meta_locks";
 
 /// Map a cache key to its lock slot.
 ///
@@ -878,7 +876,7 @@ impl MetadataLockManager {
     /// Returns `Ok(lock)` if acquired, `Err` if the slot is held. Used by journal
     /// consolidation, where skipping a contended key and retrying next cycle is cheaper than
     /// waiting.
-    pub async fn try_acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
+    pub(crate) async fn try_acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
         try_acquire_slot_lock(&self.cache_dir, cache_key)
     }
 

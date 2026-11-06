@@ -272,15 +272,12 @@ impl TlsProxyListener {
                                         // either listener, and configuring an allowlist
                                         // covers both.
                                         //
-                                        // The check is a pre-flight rejection, not a
-                                        // pinning of the connection to validated
-                                        // addresses: `check` returns the IPs it accepted
-                                        // and `handle_request` discards them, because
-                                        // `S3Client` re-resolves through the connection
-                                        // pool when it dials. It bounds which
-                                        // destinations may be attempted; it does not
-                                        // guarantee the bytes leave for an address the
-                                        // policy saw.
+                                        // `handle_request` discards the IPs `check` returns,
+                                        // because `S3Client` resolves the name again through
+                                        // the connection pool when it dials. That pool was
+                                        // built with this policy, so it keeps only the
+                                        // addresses the policy accepts and the connection
+                                        // cannot leave for one the check refused.
                                         let (http_policy, http_policy_resolver) =
                                             match &http_destination_policy {
                                                 // Reuse the CONNECT path's resolver

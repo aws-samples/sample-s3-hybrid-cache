@@ -136,7 +136,7 @@ static ORIGIN_MARKER_UNRESOLVED_BYPASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// How long a request waits for its bucket's origin-marker read or claim before it is
 /// forwarded uncached. Same figure as the write-cache setup bound, an order of magnitude
 /// inside the clients' 60 s read timeout; a healthy claim is milliseconds.
-pub const ORIGIN_CLAIM_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const ORIGIN_CLAIM_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 /// `cache.origin_marker_unresolved_bypasses_total`, per-instance since process start.
 pub fn origin_marker_unresolved_bypasses_total() -> u64 {
     ORIGIN_MARKER_UNRESOLVED_BYPASSES_TOTAL.load(Ordering::Relaxed)

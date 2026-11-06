@@ -7,9 +7,6 @@ use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use s3_proxy::cache_initialization_coordinator::CacheInitializationCoordinator;
 use s3_proxy::cache_size_tracker::{CacheSizeConfig, CacheSizeTracker};
-use s3_proxy::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
-use s3_proxy::cache_validator::CacheValidator;
-use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::config::{CacheConfig, EvictionAlgorithm, InitializationConfig, SharedStorageConfig};
 use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::JournalManager;
@@ -17,7 +14,7 @@ use s3_proxy::metadata_lock_manager::MetadataLockManager;
 use s3_proxy::write_cache_manager::WriteCacheManager;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Helper function to create a test CacheSizeTracker with JournalConsolidator
@@ -118,191 +115,6 @@ fn create_test_cache_config() -> CacheConfig {
     }
 }
 
-/// Create test metadata for property testing
-fn create_test_metadata(
-    cache_key: String,
-    is_write_cached: bool,
-    compressed_size: u64,
-    uncompressed_size: u64,
-) -> NewCacheMetadata {
-    NewCacheMetadata {
-        cache_key,
-        object_metadata: ObjectMetadata {
-            etag: "test-etag".to_string(),
-            content_type: Some("text/plain".to_string()),
-            content_length: uncompressed_size,
-            last_modified: "Mon, 01 Jan 2024 00:00:00 GMT".to_string(),
-            is_write_cached,
-            ..Default::default()
-        },
-        ranges: vec![RangeSpec {
-            start: 0,
-            end: uncompressed_size.saturating_sub(1),
-            file_path: "test.bin".to_string(),
-            compression_algorithm: CompressionAlgorithm::Lz4,
-            compressed_size,
-            uncompressed_size,
-            created_at: SystemTime::now(),
-            last_accessed: SystemTime::now(),
-            access_count: 1,
-            staged: None,
-            unservable: false,
-            file_identity: None,
-        }],
-        created_at: SystemTime::now(),
-        expires_at: SystemTime::now() + Duration::from_secs(3600),
-        compression_info: Default::default(),
-        ..Default::default()
-    }
-}
-
-/// **Feature: coordinated-cache-initialization, Property 1: Single directory scan coordination**
-/// **Validates: Requirements 1.1, 6.1, 6.2**
-///
-/// For any cache directory with metadata files, the coordinated scan should process
-/// each metadata file exactly once and provide consistent results to all subsystems.
-#[quickcheck]
-fn prop_single_directory_scan_coordination(
-    metadata_files: Vec<(String, bool, u32, u32)>, // (cache_key, is_write_cached, compressed_size, uncompressed_size)
-) -> TestResult {
-    // Filter out invalid inputs
-    let valid_files: Vec<_> = metadata_files
-        .into_iter()
-        .filter(|(key, _, compressed, uncompressed)| {
-            !key.is_empty() && *compressed > 0 && *uncompressed > 0 && *compressed <= *uncompressed
-        })
-        .take(50) // Limit to reasonable number for testing
-        .collect();
-
-    if valid_files.is_empty() {
-        return TestResult::discard();
-    }
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let temp_dir = TempDir::new().unwrap();
-        let metadata_dir = temp_dir.path().join("metadata");
-        tokio::fs::create_dir_all(&metadata_dir).await.unwrap();
-
-        // Create metadata files
-        let mut expected_total_size = 0u64;
-        let mut expected_write_cached_size = 0u64;
-        let mut expected_write_cached_count = 0u64;
-        let mut expected_read_cached_count = 0u64;
-
-        for (i, (cache_key, is_write_cached, compressed_size, uncompressed_size)) in
-            valid_files.iter().enumerate()
-        {
-            let metadata = create_test_metadata(
-                cache_key.clone(),
-                *is_write_cached,
-                *compressed_size as u64,
-                *uncompressed_size as u64,
-            );
-
-            let metadata_file = metadata_dir.join(format!("object_{}.meta", i));
-            let metadata_json = serde_json::to_string(&metadata).unwrap();
-            tokio::fs::write(&metadata_file, metadata_json)
-                .await
-                .unwrap();
-
-            expected_total_size += *compressed_size as u64;
-            if *is_write_cached {
-                expected_write_cached_size += *compressed_size as u64;
-                expected_write_cached_count += 1;
-            } else {
-                expected_read_cached_count += 1;
-            }
-        }
-
-        let config = create_test_cache_config();
-        let _coordinator =
-            CacheInitializationCoordinator::new(temp_dir.path().to_path_buf(), true, config);
-
-        // Create a validator to perform the scan (since scan_cache_metadata is private)
-        let validator = CacheValidator::new(temp_dir.path().to_path_buf());
-        let cache_file_results = validator
-            .scan_and_process_parallel(&metadata_dir)
-            .await
-            .unwrap();
-
-        // Convert to scan results format for testing
-        let mut total_objects = 0u64;
-        let mut total_size = 0u64;
-        let mut write_cached_objects = 0u64;
-        let mut write_cached_size = 0u64;
-        let mut read_cached_objects = 0u64;
-        let mut _read_cached_size = 0u64;
-
-        for result in &cache_file_results {
-            if result.metadata.is_some() {
-                total_objects += 1;
-                total_size += result.compressed_size;
-
-                if result.is_write_cached {
-                    write_cached_objects += 1;
-                    write_cached_size += result.compressed_size;
-                } else {
-                    read_cached_objects += 1;
-                    _read_cached_size += result.compressed_size;
-                }
-            }
-        }
-
-        // Property 1: Single directory scan coordination
-        // Verify that each metadata file was processed exactly once
-        let processed_files = cache_file_results.len();
-        let expected_files = valid_files.len();
-
-        if processed_files != expected_files {
-            return TestResult::failed();
-        }
-
-        // Verify that scan results match expected aggregated values
-        if total_objects != (expected_write_cached_count + expected_read_cached_count) {
-            return TestResult::failed();
-        }
-
-        if total_size != expected_total_size {
-            return TestResult::failed();
-        }
-
-        if write_cached_size != expected_write_cached_size {
-            return TestResult::failed();
-        }
-
-        if write_cached_objects != expected_write_cached_count {
-            return TestResult::failed();
-        }
-
-        if read_cached_objects != expected_read_cached_count {
-            return TestResult::failed();
-        }
-
-        // Verify that all metadata entries are valid (no parsing errors for valid input)
-        let valid_entries = cache_file_results
-            .iter()
-            .filter(|result| result.metadata.is_some())
-            .count();
-
-        if valid_entries != expected_files {
-            return TestResult::failed();
-        }
-
-        // Verify no scan errors for valid metadata files
-        let error_entries = cache_file_results
-            .iter()
-            .filter(|result| !result.parse_errors.is_empty())
-            .count();
-
-        if error_entries > 0 {
-            return TestResult::failed();
-        }
-
-        TestResult::passed()
-    })
-}
-
 /// **Feature: write-cache-accounting-and-eviction, Requirements 3.3, 7.1, 7.2**
 ///
 /// *For any* pair of Inflight_Bytes and Resident_Bytes figures, cross-validation reports
@@ -367,11 +179,16 @@ fn prop_inflight_and_resident_are_never_cross_validated(
         let (size_tracker, consolidator) = create_test_size_tracker(temp_dir.path()).await;
 
         // `total_size` must be at least the write-cache figure: the staged figure is a
-        // SUBSET of the total and `update_size_from_validation` clamps it with a WARN
+        // SUBSET of the total and `update_size_from_validation_with_kind` clamps it with a WARN
         // otherwise (R6.4).
         if tracker_size > 0 {
             consolidator
-                .update_size_from_validation(tracker_size, Some(tracker_size), None)
+                .update_size_from_validation_with_kind(
+                    tracker_size,
+                    Some(tracker_size),
+                    None,
+                    s3_proxy::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
                 .await;
         }
 
@@ -410,172 +227,6 @@ fn prop_inflight_and_resident_are_never_cross_validated(
     })
 }
 
-/// **Feature: coordinated-cache-initialization, Property 9: Shared validation consistency**
-/// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
-///
-/// For any metadata validation operation, both WriteCacheManager and CacheSizeTracker
-/// should use identical validation logic and produce consistent results.
-#[quickcheck]
-fn prop_shared_validation_consistency(
-    metadata_entries: Vec<(String, bool, u32, u32)>, // (cache_key, is_write_cached, compressed_size, uncompressed_size)
-) -> TestResult {
-    // Filter out invalid inputs and limit size
-    let valid_entries: Vec<_> = metadata_entries
-        .into_iter()
-        .filter(|(key, _, compressed, uncompressed)| {
-            !key.is_empty() && *compressed > 0 && *uncompressed > 0 && *compressed <= *uncompressed
-        })
-        .take(20) // Limit to reasonable number for testing
-        .collect();
-
-    if valid_entries.is_empty() {
-        return TestResult::discard();
-    }
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let temp_dir = TempDir::new().unwrap();
-        let metadata_dir = temp_dir.path().join("metadata");
-        tokio::fs::create_dir_all(&metadata_dir).await.unwrap();
-
-        // Create metadata files
-        for (i, (cache_key, is_write_cached, compressed_size, uncompressed_size)) in
-            valid_entries.iter().enumerate()
-        {
-            let metadata = create_test_metadata(
-                cache_key.clone(),
-                *is_write_cached,
-                *compressed_size as u64,
-                *uncompressed_size as u64,
-            );
-
-            let metadata_file = metadata_dir.join(format!("object_{}.meta", i));
-            let metadata_json = serde_json::to_string(&metadata).unwrap();
-            tokio::fs::write(&metadata_file, metadata_json)
-                .await
-                .unwrap();
-        }
-
-        // Create two separate CacheValidator instances (simulating different subsystems)
-        let validator1 = CacheValidator::new(temp_dir.path().to_path_buf());
-        let validator2 = CacheValidator::new(temp_dir.path().to_path_buf());
-
-        // Perform parallel scans with both validators
-        let results1 = validator1
-            .scan_and_process_parallel(&metadata_dir)
-            .await
-            .unwrap();
-        let results2 = validator2
-            .scan_and_process_parallel(&metadata_dir)
-            .await
-            .unwrap();
-
-        // Property 9: Shared validation consistency
-        // Both validators should produce identical results
-        if results1.len() != results2.len() {
-            return TestResult::failed();
-        }
-
-        // Sort results by file path for consistent comparison
-        let mut sorted_results1 = results1;
-        let mut sorted_results2 = results2;
-        sorted_results1.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-        sorted_results2.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-
-        // Compare each result pair
-        for (result1, result2) in sorted_results1.iter().zip(sorted_results2.iter()) {
-            // File paths should match
-            if result1.file_path != result2.file_path {
-                return TestResult::failed();
-            }
-
-            // Compressed sizes should match
-            if result1.compressed_size != result2.compressed_size {
-                return TestResult::failed();
-            }
-
-            // Write cached flags should match
-            if result1.is_write_cached != result2.is_write_cached {
-                return TestResult::failed();
-            }
-
-            // Metadata presence should match
-            if result1.metadata.is_some() != result2.metadata.is_some() {
-                return TestResult::failed();
-            }
-
-            // If both have metadata, the content should match
-            if let (Some(meta1), Some(meta2)) = (&result1.metadata, &result2.metadata) {
-                if meta1.cache_key != meta2.cache_key {
-                    return TestResult::failed();
-                }
-                if meta1.object_metadata.is_write_cached != meta2.object_metadata.is_write_cached {
-                    return TestResult::failed();
-                }
-                // Compare compressed sizes calculated from ranges
-                let size1 = validator1.calculate_compressed_size(&meta1.ranges);
-                let size2 = validator2.calculate_compressed_size(&meta2.ranges);
-                if size1 != size2 {
-                    return TestResult::failed();
-                }
-            }
-
-            // Parse errors should match
-            if result1.parse_errors.len() != result2.parse_errors.len() {
-                return TestResult::failed();
-            }
-        }
-
-        // Test shared utility methods produce consistent results
-        let total_size1 = validator1.calculate_total_size(&sorted_results1);
-        let total_size2 = validator2.calculate_total_size(&sorted_results2);
-        if total_size1 != total_size2 {
-            return TestResult::failed();
-        }
-
-        // Test categorization consistency
-        let (write1, read1, invalid1) = validator1.group_by_category(&sorted_results1);
-        let (write2, read2, invalid2) = validator2.group_by_category(&sorted_results2);
-
-        if write1.len() != write2.len()
-            || read1.len() != read2.len()
-            || invalid1.len() != invalid2.len()
-        {
-            return TestResult::failed();
-        }
-
-        // Test filtering consistency
-        let valid1 = validator1.filter_valid_results(&sorted_results1);
-        let valid2 = validator2.filter_valid_results(&sorted_results2);
-        if valid1.len() != valid2.len() {
-            return TestResult::failed();
-        }
-
-        let error1 = validator1.filter_error_results(&sorted_results1);
-        let error2 = validator2.filter_error_results(&sorted_results2);
-        if error1.len() != error2.len() {
-            return TestResult::failed();
-        }
-
-        // Test size statistics consistency
-        let stats1 = validator1.calculate_size_statistics(&sorted_results1);
-        let stats2 = validator2.calculate_size_statistics(&sorted_results2);
-
-        if stats1.total_compressed_size != stats2.total_compressed_size
-            || stats1.write_cached_size != stats2.write_cached_size
-            || stats1.read_cached_size != stats2.read_cached_size
-            || stats1.total_count != stats2.total_count
-            || stats1.write_cached_count != stats2.write_cached_count
-            || stats1.read_cached_count != stats2.read_cached_count
-            || stats1.invalid_count != stats2.invalid_count
-        {
-            return TestResult::failed();
-        }
-
-        TestResult::passed()
-    })
-}
-
 /// Simple test to verify the property test functions compile and can be called
 #[tokio::test]
 async fn test_property_test_compilation() {
@@ -591,37 +242,6 @@ async fn test_property_test_compilation() {
 /// Additional property tests for edge cases
 mod edge_case_properties {
     use super::*;
-
-    /// Test that empty directories are handled consistently
-    #[quickcheck]
-    fn prop_empty_directory_handling() -> TestResult {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let empty_metadata_dir = temp_dir.path().join("metadata");
-            tokio::fs::create_dir_all(&empty_metadata_dir)
-                .await
-                .unwrap();
-
-            let config = create_test_cache_config();
-            let _coordinator =
-                CacheInitializationCoordinator::new(temp_dir.path().to_path_buf(), true, config);
-
-            // Use validator to scan empty directory
-            let validator = CacheValidator::new(temp_dir.path().to_path_buf());
-            let cache_file_results = validator
-                .scan_and_process_parallel(&empty_metadata_dir)
-                .await
-                .unwrap();
-
-            // Empty directory should produce empty results
-            if !cache_file_results.is_empty() {
-                return TestResult::failed();
-            }
-
-            TestResult::passed()
-        })
-    }
 
     /// Test that validation results are consistent for zero sizes
     #[quickcheck]

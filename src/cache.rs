@@ -531,7 +531,7 @@ static TAIL_VERDICT_TOTALS: [std::sync::atomic::AtomicU64; TailCandidateVerdict:
 ///
 /// Spec: cache-eviction-at-scale § 5.4. Requirements: 3.8
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TailCandidateVerdict {
+enum TailCandidateVerdict {
     /// The record matches the `.meta` and the range may be evicted.
     Evictable,
     /// No `.meta` at the recorded path: already evicted, or never landed.
@@ -595,7 +595,7 @@ impl TailCandidateVerdict {
 
 /// How a bounded selection pass ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TailSelectionStatus {
+pub(crate) enum TailSelectionStatus {
     /// The selected set meets `target_bytes`.
     Met,
     /// § 4.5's `TAIL_EMPTY`: every partition was read and none holds a member above the floor.
@@ -615,7 +615,7 @@ pub enum TailSelectionStatus {
 /// process-global counter is reset by sibling tests in the same binary, so an exact assertion on
 /// one passes in isolation and fails in the full suite.
 #[derive(Debug, Clone)]
-pub struct TailSelectionOutcome {
+pub(crate) struct TailSelectionOutcome {
     /// The verified candidates, grouped by object, priority order preserved.
     pub selected: Vec<(String, Vec<RangeEvictionCandidate>)>,
     /// Σ `size` over the selected candidates.
@@ -1917,9 +1917,8 @@ mod decayed_frequency_tests {
     }
 }
 
-/// Strip the known trailing suffix patterns that `generate_part_cache_key`,
-/// `generate_range_cache_key`, and `generate_cache_key_with_params` append to
-/// a bare object path, returning just the object path.
+/// Strip the known trailing `:part:<n>` and `:range:<start>-<end>` suffix patterns from
+/// a cache key, returning just the object path.
 ///
 /// Cache keys have the form:
 /// - `path`
@@ -1932,7 +1931,7 @@ mod decayed_frequency_tests {
 /// spec, Requirement 2).
 ///
 /// **Two `:range:` grammars exist and this function only recognizes one.**
-/// The disk-cache key produced by `generate_range_cache_key` uses a hyphen —
+/// The disk-cache key uses a hyphen —
 /// `:range:{start}-{end}` — which is what [`is_range_suffix_body`] validates
 /// below. The RAM-cache range key produced by `generate_ram_range_key` uses a
 /// colon instead — `:range:{start}:{end}` — which this function will decline
@@ -1944,8 +1943,8 @@ mod decayed_frequency_tests {
 /// will fail to strip it — treat that as a bug in the new caller, not in this
 /// function (page-aligned-range-cache Task 10).
 pub(crate) fn strip_known_cache_key_suffixes(cache_key: &str) -> String {
-    // `:range:<start>-<end>` is always the last suffix if present (see
-    // generate_cache_key_with_params: range wraps part, not the reverse).
+    // `:range:<start>-<end>` is always the last suffix if present (range wraps part,
+    // not the reverse).
     let without_range = match cache_key.rfind(":range:") {
         Some(pos) => {
             let (head, tail) = cache_key.split_at(pos);
@@ -1977,7 +1976,7 @@ pub(crate) fn strip_known_cache_key_suffixes(cache_key: &str) -> String {
 }
 
 /// Validate that a `:range:` suffix body matches `<digits>-<digits>`
-/// (the exact shape produced by `generate_range_cache_key`).
+/// (the exact shape of the disk-cache range suffix).
 fn is_range_suffix_body(body: &str) -> bool {
     match body.split_once('-') {
         Some((start, end)) => {
@@ -2011,7 +2010,7 @@ fn format_bytes_human(bytes: u64) -> String {
 /// the unreserved characters (`A-Z a-z 0-9 - . _ ~`) raw, `/` raw unless `encode_slash`,
 /// and every other byte as `%XX` with uppercase hex. This is the canonical URI encoding
 /// S3 itself computes for a request path, so an AWS SDK or CLI request is already in it.
-pub fn encode_s3_object_key(key: &[u8], encode_slash: bool) -> String {
+pub(crate) fn encode_s3_object_key(key: &[u8], encode_slash: bool) -> String {
     let mut out = String::with_capacity(key.len() * 3);
     for &b in key {
         if b.is_ascii_alphanumeric()
@@ -2066,7 +2065,7 @@ fn decode_s3_request_path(raw: &str) -> Option<Vec<u8>> {
 /// every spelling of one S3 object gives one string and spellings of different objects
 /// give different strings. A path S3 refuses as malformed keeps its literal spelling:
 /// it holds a `%` not followed by two hex digits, which no canonical spelling contains.
-pub fn canonical_s3_request_path(raw: &str, encode_slash: bool) -> String {
+fn canonical_s3_request_path(raw: &str, encode_slash: bool) -> String {
     match decode_s3_request_path(raw) {
         Some(key) => encode_s3_object_key(&key, encode_slash),
         None => raw.to_string(),
@@ -2194,7 +2193,7 @@ pub fn extract_virtual_hosted_bucket(host: &str) -> Option<&str> {
 
 /// Multipart information extracted from S3 response headers
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MultipartInfo {
+pub(crate) struct MultipartInfo {
     pub parts_count: Option<u32>,
     pub part_number: Option<u32>,
 }
@@ -2209,21 +2208,6 @@ pub struct CachedPartResponse {
     pub total_size: u64,
 }
 
-/// Cache entry for storing S3 objects and metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheEntry {
-    pub cache_key: String,
-    pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,
-    pub ranges: Vec<Range>,
-    pub metadata: CacheMetadata,
-    pub created_at: SystemTime,
-    pub expires_at: SystemTime,
-    pub metadata_expires_at: SystemTime, // Separate TTL for metadata validation (HEAD_TTL)
-    pub compression_info: CompressionInfo,
-    pub is_put_cached: bool, // Track if this was cached via PUT (for TTL transition)
-}
-
 /// Byte range for partial object caching
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Range {
@@ -2235,86 +2219,14 @@ pub struct Range {
     pub compression_algorithm: CompressionAlgorithm,
 }
 
-/// Compression information for cache entries
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressionInfo {
-    pub body_algorithm: CompressionAlgorithm, // Algorithm used for body
-    pub original_size: Option<u64>,           // Original size before compression
-    pub compressed_size: Option<u64>,         // Size after compression
-    pub file_extension: Option<String>,       // File extension when cached
-}
-
-impl Default for CompressionInfo {
-    fn default() -> Self {
-        Self {
-            body_algorithm: CompressionAlgorithm::Lz4,
-            original_size: None,
-            compressed_size: None,
-            file_extension: None,
-        }
-    }
-}
-
-/// Write cache entry for PUT operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteCacheEntry {
-    pub cache_key: String,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-    pub metadata: CacheMetadata,
-    pub created_at: SystemTime,
-    pub put_ttl_expires_at: SystemTime,
-    pub last_accessed: SystemTime,
-    pub compression_info: CompressionInfo,
-    pub is_put_cached: bool, // Track if this was cached via PUT (for TTL transition)
-}
-
 /// HEAD cache entry for metadata-only caching (separate from GET cache)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeadCacheEntry {
+pub(crate) struct HeadCacheEntry {
     pub cache_key: String,
     pub headers: HashMap<String, String>,
     pub metadata: CacheMetadata,
     pub created_at: SystemTime,
     pub expires_at: SystemTime, // HEAD_TTL expiration
-}
-
-/// Global eviction lock for distributed cache eviction coordination
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlobalEvictionLock {
-    /// Unique identifier for this proxy instance
-    pub instance_id: String,
-
-    /// Process ID of the lock holder
-    pub process_id: u32,
-
-    /// Hostname of the machine holding the lock
-    pub hostname: String,
-
-    /// When the lock was acquired (RFC3339 format)
-    pub acquired_at: SystemTime,
-
-    /// Lock timeout duration in seconds
-    pub timeout_seconds: u64,
-}
-
-impl GlobalEvictionLock {
-    /// Check if this lock is stale based on current time
-    pub fn is_stale(&self, now: SystemTime) -> bool {
-        if let Ok(elapsed) = now.duration_since(self.acquired_at) {
-            elapsed.as_secs() > self.timeout_seconds
-        } else {
-            true // If time went backwards, consider stale
-        }
-    }
-
-    /// Get the expiration time for this lock
-    pub fn expires_at(&self) -> SystemTime {
-        safe_expiry(
-            self.acquired_at,
-            std::time::Duration::from_secs(self.timeout_seconds),
-        )
-    }
 }
 
 /// UUID-fenced eviction lock payload for distributed fencing (Requirement 5)
@@ -2567,7 +2479,7 @@ impl Default for CacheStatistics {
 
 /// Write cache size tracking for PUT operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteCacheSizeTracker {
+struct WriteCacheSizeTracker {
     pub current_size: u64,
     pub max_object_size: u64,
     pub max_percent: f32,
@@ -2614,18 +2526,6 @@ pub enum CacheEvictionAlgorithm {
     TinyLFU,
 }
 
-/// Cache usage breakdown by type
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CacheUsageBreakdown {
-    pub full_objects: u64,
-    pub range_objects: u64,
-    pub ram_cache_objects: u64,
-    pub compressed_objects: u64,
-    pub compressed_bytes_saved: u64,
-    pub total_compressed_size: u64,
-    pub total_uncompressed_size: u64,
-}
-
 /// RAM cache entry for in-memory caching
 #[derive(Debug)]
 pub struct RamCacheEntry {
@@ -2657,13 +2557,6 @@ pub struct RamCacheRead {
     /// Unix millis of the last verification against the shared `.meta`. See
     /// `RamCacheEntry::verified_at`. Spec: ram-tier-effectiveness Requirement 4.
     pub verified_at_ms: u64,
-}
-
-/// Cache maintenance operation results
-#[derive(Debug, Clone)]
-pub struct CacheMaintenanceResult {
-    pub disk_cleaned: u64,
-    pub errors: Vec<String>,
 }
 
 /// Represents a single range as an independent eviction candidate.
@@ -2745,7 +2638,7 @@ pub struct RangeEvictionCandidate {
 
 /// Outcome of [`CacheManager::batch_evict_ranges`].
 #[derive(Debug, Default)]
-pub struct BatchEviction {
+struct BatchEviction {
     /// Bytes freed, summed over `.bin` files actually unlinked.
     pub bytes_freed: u64,
     /// Paths of every file removed, for directory cleanup.
@@ -2755,8 +2648,6 @@ pub struct BatchEviction {
     pub unlinked: Vec<crate::disk_cache::UnlinkedRange>,
     /// The key was rewritten since its candidates were selected, so nothing was deleted.
     pub identity_skipped: bool,
-    /// Whether the `.meta` itself was unlinked.
-    pub meta_unlinked: bool,
 }
 
 impl RangeEvictionCandidate {
@@ -3308,7 +3199,7 @@ async fn set_projected(manager: &CacheManager, bytes: u64) {
         .await
         .expect("fixture: size state readable");
     state.total_size = (state.total_size as i128 + bytes as i128 - projected as i128).max(0) as u64;
-    c.persist_size_state(&state).await.unwrap();
+    c.seed_size_state_for_tests(&state).await.unwrap();
     assert_eq!(
         c.get_projected_size().await,
         Some(bytes),
@@ -5416,6 +5307,9 @@ pub(crate) enum PublishOutcome {
     /// A newer write or delete of the key was acknowledged after this one, or its marker is
     /// gone; nothing was published.
     Superseded,
+    /// The fill's staged temporary is no longer the file this fill wrote (replaced or removed
+    /// before the publish); nothing was published.
+    TemporaryReplaced,
 }
 
 /// `{object}.wtok` beside `{object}.meta`.
@@ -6913,7 +6807,7 @@ struct LockedEntryRemoval {
     part_eviction: Option<(Vec<u32>, u64)>,
 }
 
-/// What `CacheManager::store_head_cache_entry_unified`'s locked closure published, handed back
+/// What `CacheManager::store_head_cache_entry_unified_witnessed`'s locked closure published, handed back
 /// from its blocking thread.
 enum HeadStoreOutcome {
     /// HEAD fields merged into a parseable `.meta`; `object_changed` when the HEAD detected a
@@ -7022,7 +6916,7 @@ pub(crate) mod invalidation_unlink_gate {
     }
 }
 
-/// Test-only gate in `store_head_cache_entry_unified`'s HEAD-detected-change arm: parks
+/// Test-only gate in `store_head_cache_entry_unified_witnessed`'s HEAD-detected-change arm: parks
 /// the arm after the old version's range files are unlinked and before their debit, so a test
 /// can cancel the HEAD store there. Async (a `Notify` pair), so the same seam can be awaited on
 /// the async side or driven with `futures::executor::block_on` from a blocking thread. Keyed by
@@ -7361,7 +7255,7 @@ pub const PUT_USAGE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration:
 /// How long startup waits for the seed read of the PUT capacity figure
 /// ([`CacheManager::start_put_usage_refresher`]) before continuing without one.
 /// Same figure as the write-cache setup bound.
-pub const PUT_USAGE_FIRST_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+const PUT_USAGE_FIRST_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long `HttpProxy::handle_put_request` waits on each of its two shared-volume reads before
 /// a PUT, `UploadPart`, `CreateMultipartUpload`, `CompleteMultipartUpload` or
@@ -7371,7 +7265,7 @@ pub const PUT_USAGE_FIRST_READ_BOUND: std::time::Duration = std::time::Duration:
 /// and, on success, the key's cached copy is invalidated, as the `write_cache_enabled: false`
 /// path does. A write is never failed or held for a cache read. Each wait also draws on
 /// the write's [`WRITE_CACHE_DELAY_BUDGET`].
-pub const PUT_ROUTER_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const PUT_ROUTER_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
 /// The most cache work may delay one write's response, summed over every cache wait on its path
 /// A PUT, `UploadPart`, `CreateMultipartUpload`, `CompleteMultipartUpload`,
 /// `AbortMultipartUpload`, DELETE or form POST, signed or not. A DeleteObjects has its own flat
@@ -7379,7 +7273,8 @@ pub const PUT_ROUTER_READ_BOUND: std::time::Duration = std::time::Duration::from
 /// takes the smaller of its own bound and what remains ([`CacheDelayBudget`]). A write is never failed for
 /// it: a read that does not finish forwards the write uncached, and an invalidation that does not
 /// finish goes to the background stamp retry ([`CacheManager::spawn_write_stamp_retry`]).
-pub const WRITE_CACHE_DELAY_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
+pub(crate) const WRITE_CACHE_DELAY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(1000);
 /// One write's [`WRITE_CACHE_DELAY_BUDGET`]: the time its cache waits have held the
 /// response so far, shared by every clone. Only cache waits are charged, by their elapsed time,
 /// so S3's own time and the client's upload never are. Concurrent waits are each charged in
@@ -7389,7 +7284,7 @@ pub const WRITE_CACHE_DELAY_BUDGET: std::time::Duration = std::time::Duration::f
 /// breaker ([`crate::volume_stall`]): at most one timeout per budget, and a completed
 /// invalidation as a success.
 #[derive(Clone, Debug)]
-pub struct CacheDelayBudget {
+pub(crate) struct CacheDelayBudget {
     total: std::time::Duration,
     spent_nanos: Arc<AtomicU64>,
     breaker: Option<Arc<crate::volume_stall::VolumeStallBreaker>>,
@@ -7406,7 +7301,7 @@ impl CacheDelayBudget {
         Self::with_total(WRITE_CACHE_DELAY_BUDGET)
     }
     /// A budget of `total`; `Duration::MAX` for work no client response waits on.
-    pub fn with_total(total: std::time::Duration) -> Self {
+    pub(crate) fn with_total(total: std::time::Duration) -> Self {
         Self {
             total,
             spent_nanos: Arc::new(AtomicU64::new(0)),
@@ -7415,7 +7310,10 @@ impl CacheDelayBudget {
         }
     }
     /// This budget, reporting its timeouts and successes to `breaker`.
-    pub fn reporting_to(mut self, breaker: Arc<crate::volume_stall::VolumeStallBreaker>) -> Self {
+    pub(crate) fn reporting_to(
+        mut self,
+        breaker: Arc<crate::volume_stall::VolumeStallBreaker>,
+    ) -> Self {
         self.breaker = Some(breaker);
         self
     }
@@ -7453,7 +7351,7 @@ impl CacheDelayBudget {
         own.min(self.remaining())
     }
     /// Charge a wait that took `waited`.
-    pub fn charge(&self, waited: std::time::Duration) {
+    pub(crate) fn charge(&self, waited: std::time::Duration) {
         let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
         let _ = self.spent_nanos.fetch_update(
             AtomicOrdering::Relaxed,
@@ -7746,7 +7644,7 @@ struct CacheManagerInner {
 }
 
 /// Floor for `cache.max_metadata_file_bytes`: 64 KiB.
-pub const MIN_METADATA_FILE_BYTES: u64 = 64 * 1024;
+const MIN_METADATA_FILE_BYTES: u64 = 64 * 1024;
 
 /// The warnings `set_metadata_io_limits` logs for a configured value it raises.
 pub(crate) fn metadata_io_limit_warnings(
@@ -8053,7 +7951,7 @@ impl CacheManager {
     /// `MIN_METADATA_FILE_BYTES` (64 KiB) is raised to that floor with a warning: a cap under a
     /// real `.meta` size turns every read of that object into a miss and a rewrite. The
     /// configured value stays in `Config`; the floor applies here, where it is used.
-    pub fn set_metadata_io_limits(
+    pub(crate) fn set_metadata_io_limits(
         &mut self,
         max_metadata_file_bytes: u64,
         metadata_io_concurrency: usize,
@@ -8088,7 +7986,7 @@ impl CacheManager {
     /// question rules answer.
     ///
     /// See `compression-content-aware-fix` spec, Requirement 1.
-    pub fn effective_compression(
+    pub(crate) fn effective_compression(
         &self,
         resolved: &crate::bucket_settings::ResolvedSettings,
         cache_key: &str,
@@ -8127,7 +8025,7 @@ impl CacheManager {
     /// [`JournalComponents`] for the defect that distinction fixes.
     pub fn create_configured_disk_cache_manager(&self) -> crate::disk_cache::DiskCacheManager {
         // Share the CacheManagerInner compression stats Arc so this manager's
-        // write paths (streaming writers + store_range) are visible in the
+        // write paths (streaming writers + prepare_range_store) are visible in the
         // /metrics snapshot, instead of counting into a throwaway Arc.
         // Spec: compression-followup-fixes Requirement 1.
         let mut disk_cache = {
@@ -8254,7 +8152,7 @@ impl CacheManager {
     /// The process-wide [`JournalComponents`], constructing them on first use.
     ///
     /// Also publishes them into the three `RwLock` slots that async readers
-    /// (`get_journal_consolidator`, `get_hybrid_metadata_writer`,
+    /// (`get_journal_consolidator`,
     /// `get_cache_hit_update_buffer`, `credit_staged_range`, `initialize`) use. The
     /// publication is *idempotent* — after the first call it writes the same `Arc`s
     /// back, and `publish_journal_component` skips the write entirely once a slot
@@ -8377,20 +8275,12 @@ impl CacheManager {
         consolidator.set_incomplete_upload_ttl(self.incomplete_upload_ttl);
         crate::orphan_reclaim::enable();
 
-        // Create ConsolidationTrigger
-        let consolidation_trigger =
-            std::sync::Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
-                shared_storage_config.consolidation_size_threshold,
-                100, // entry count threshold
-            ));
-
         // Create HybridMetadataWriter
         let hybrid_writer = Arc::new(tokio::sync::Mutex::new(
             crate::hybrid_metadata_writer::HybridMetadataWriter::new(
                 self.cache_dir.clone(),
                 lock_manager.clone(),
                 journal_manager,
-                consolidation_trigger,
             ),
         ));
 
@@ -8742,24 +8632,6 @@ impl CacheManager {
         };
         (max_cache_size as f32 * self.write_cache_percent / 100.0) as u64
     }
-    /// Create a new cache manager with specified eviction algorithm (same for RAM and disk)
-    pub fn new_with_eviction_algorithm(
-        cache_dir: PathBuf,
-        ram_cache_enabled: bool,
-        max_ram_cache_size: u64,
-        eviction_algorithm: CacheEvictionAlgorithm,
-    ) -> Self {
-        Self::new_with_eviction_and_ttl(
-            cache_dir,
-            ram_cache_enabled,
-            max_ram_cache_size,
-            eviction_algorithm,
-            1024,                                      // 1KB compression threshold
-            true,                                      // compression enabled
-            std::time::Duration::from_secs(315360000), // ~10 years (infinite caching)
-        )
-    }
-
     /// Initialize the cache manager using coordinated approach
     ///
     /// This method replaces the separate initialization with a coordinated approach
@@ -9175,7 +9047,7 @@ impl CacheManager {
     /// spelled it. A proxy on an earlier version, sharing the cache during a rolling
     /// upgrade, caches and serves an object under this key, so a write also invalidates
     /// it when it differs from [`Self::generate_cache_key`].
-    pub fn generate_request_spelling_cache_key(path: &str, host: Option<&str>) -> String {
+    pub(crate) fn generate_request_spelling_cache_key(path: &str, host: Option<&str>) -> String {
         let normalized_path = crate::disk_cache::normalize_cache_key(path);
         if let Some(h) = host {
             if let Some(prefix) = extract_access_point_prefix(h) {
@@ -9200,26 +9072,9 @@ impl CacheManager {
         crate::disk_cache::parse_cache_key(cache_key).is_ok()
     }
 
-    /// Generate cache key for object parts
-    pub fn generate_part_cache_key(path: &str, part_number: u32, host: Option<&str>) -> String {
-        let base_key = Self::generate_cache_key(path, host);
-        format!("{}:part:{}", base_key, part_number)
-    }
-
-    /// Generate cache key for range requests
-    pub fn generate_range_cache_key(
-        path: &str,
-        start: u64,
-        end: u64,
-        host: Option<&str>,
-    ) -> String {
-        let base_key = Self::generate_cache_key(path, host);
-        format!("{}:range:{}-{}", base_key, start, end)
-    }
-
     /// Generate the key used for a RAM-cache range entry.
     ///
-    /// This is a **distinct grammar** from [`generate_range_cache_key`], which
+    /// This is a **distinct grammar** from the disk-cache range key, which
     /// produces the disk-cache key `:range:{start}-{end}` (hyphen-separated,
     /// validated by `is_range_suffix_body`). The RAM range key uses a colon
     /// separator instead: `:range:{start}:{end}`. RAM range keys never pass
@@ -9228,72 +9083,13 @@ impl CacheManager {
     /// latent, not a live defect (page-aligned-range-cache Task 10).
     ///
     /// The three production sites that read or write a RAM range entry —
-    /// `load_range_data_with_cache`, `get_range_from_ram_cache`, and
+    /// `load_range_data_with_cache`, `get_range_from_ram_cache_hit`, and
     /// `promote_range_to_ram_cache_frame` — MUST build the key through this
     /// helper so lookup and promotion agree by construction. A mismatch
     /// between them would silently disable the RAM tier for ranges, with no
     /// test failure to surface it (the miss just falls through to disk).
     pub(crate) fn generate_ram_range_key(cache_key: &str, start: u64, end: u64) -> String {
         format!("{}:range:{}:{}", cache_key, start, end)
-    }
-
-    /// Generate cache key with part number and range parameters
-    pub fn generate_cache_key_with_params(
-        path: &str,
-        part_number: Option<u32>,
-        range: Option<(u64, u64)>,
-        host: Option<&str>,
-    ) -> String {
-        match (part_number, range) {
-            (Some(part), Some((start, end))) => format!(
-                "{}:range:{}-{}",
-                Self::generate_part_cache_key(path, part, host),
-                start,
-                end
-            ),
-            (Some(part), None) => Self::generate_part_cache_key(path, part, host),
-            (None, Some((start, end))) => Self::generate_range_cache_key(path, start, end, host),
-            (None, None) => Self::generate_cache_key(path, host),
-        }
-    }
-
-    /// Get cached response with decompression and expiration checking
-    /// Implements cache hierarchy: RAM -> Disk -> S3
-    pub async fn get_cached_response(&self, cache_key: &str) -> Result<Option<CacheEntry>> {
-        debug!("Retrieving cache entry for key: {}", cache_key);
-
-        // First tier: Check RAM cache if enabled
-        if self.ram_cache_enabled {
-            if let Some(ram_entry) = self.get_from_ram_cache(cache_key).await? {
-                debug!("Cache hit (RAM) for key: {}", cache_key);
-                self.update_ram_cache_hit_statistics();
-                let cache_entry = self.convert_ram_entry_to_cache_entry(cache_key, ram_entry)?;
-                return Ok(Some(cache_entry));
-            }
-        }
-
-        // Second tier: Check disk cache
-        let disk_cache_entry = self.get_from_disk_cache(cache_key).await?;
-
-        if let Some(cache_entry) = disk_cache_entry {
-            debug!("Cache hit (disk) for key: {}", cache_key);
-
-            // Promote to RAM cache if enabled (cache hierarchy promotion)
-            if self.ram_cache_enabled {
-                // RAM cache promotion is best-effort; failure only means the next read
-                // will serve from disk instead of RAM — no data loss or inconsistency.
-                let _ = self.promote_to_ram_cache(&cache_entry).await;
-            }
-
-            return Ok(Some(cache_entry));
-        }
-
-        // Third tier: Cache miss - caller will fetch from S3
-        debug!(
-            "Cache miss for key: {} (not found in RAM or disk)",
-            cache_key
-        );
-        Ok(None)
     }
 
     /// Refresh cache TTL for conditional requests (304 Not Modified responses)
@@ -9351,7 +9147,7 @@ impl CacheManager {
 
         // A second block used to follow, commented "Also try old format for backward
         // compatibility". It serialised a `CacheEntry` onto the path above — the
-        // *current* `.meta` path — whenever `get_cached_response` returned `Some`,
+        // *current* `.meta` path — whenever a whole-object lookup of the entry succeeded,
         // which is the common case for a non-expired fully cached entry. Since
         // `NewCacheMetadata::object_metadata` is required and `CacheEntry` has no such
         // field, the document it published did not parse as the current format; its
@@ -9362,94 +9158,10 @@ impl CacheManager {
         // refresh, and a genuinely legacy `.meta` is healed to the current format by
         // the read path (`disk_cache::read_and_parse_metadata_blocking` classifies it
         // as `CorruptReason::Legacy`), not by rewriting it here.
-        // Pinned by `tests/refresh_cache_ttl_metadata_format_test.rs`.
+        // Pinned by `src/cache/moved_fill_tests/refresh_cache_ttl_metadata_format_test.rs`.
 
         debug!(
             "Completed cache TTL refresh for conditional request: {}",
-            cache_key
-        );
-        Ok(())
-    }
-
-    /// Store response in cache with atomic file operations and compression
-    pub async fn store_response(
-        &self,
-        cache_key: &str,
-        response: &[u8],
-        metadata: CacheMetadata,
-    ) -> Result<()> {
-        // Use hierarchy storage with empty headers
-        self.store_response_in_hierarchy(cache_key, response, HashMap::new(), metadata)
-            .await
-    }
-
-    /// Store response in cache hierarchy (RAM + Disk) with headers
-    pub async fn store_response_in_hierarchy(
-        &self,
-        cache_key: &str,
-        response: &[u8],
-        headers: HashMap<String, String>,
-        metadata: CacheMetadata,
-    ) -> Result<()> {
-        debug!("Storing response in cache hierarchy for key: {}", cache_key);
-
-        // Extract path from cache_key for TTL override lookup
-        let path = self.parse_cache_key_for_ttl(cache_key);
-
-        // Create cache entry for RAM cache with proper expiration time using TTL overrides
-        let now = SystemTime::now();
-        let effective_head_ttl = self.get_effective_head_ttl(&path).await;
-        let cache_entry = CacheEntry {
-            cache_key: cache_key.to_string(),
-            headers: headers.clone(),
-            body: Some(response.to_vec()),
-            ranges: Vec::new(),
-            metadata: metadata.clone(),
-            created_at: now,
-            expires_at: self
-                .calculate_expiration_time_with_context(&headers, &path)
-                .await,
-            metadata_expires_at: now + effective_head_ttl,
-            compression_info: CompressionInfo::default(),
-            is_put_cached: false,
-        };
-
-        // Store in RAM cache if enabled
-        if self.ram_cache_enabled {
-            // RAM cache store is best-effort; failure only means the next read
-            // will serve from disk — no data loss or inconsistency.
-            let _ = self.store_in_ram_cache(&cache_entry).await;
-        }
-
-        // Store full object using range format
-        let content_length = response.len() as u64;
-        let object_metadata = crate::cache_types::ObjectMetadata {
-            etag: metadata.etag.clone(),
-            last_modified: metadata.last_modified.clone(),
-            content_length,
-            content_type: headers.get("content-type").cloned(),
-            response_headers: headers.clone(),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: content_length,
-            parts: Vec::new(),
-            compression_algorithm: CompressionAlgorithm::Lz4,
-            compressed_size: 0,
-            parts_count: None,
-            part_ranges: HashMap::new(),
-            part_layout_verified: false,
-            upload_id: None,
-            is_write_cached: false,
-            write_cache_expires_at: None,
-            write_cache_created_at: None,
-            write_cache_last_accessed: None,
-            graduation_accounted: false,
-        };
-
-        self.store_full_object_as_range_new(cache_key, response, object_metadata)
-            .await?;
-
-        info!(
-            "Successfully stored response in cache hierarchy for key: {}",
             cache_key
         );
         Ok(())
@@ -10121,7 +9833,7 @@ impl CacheManager {
     /// The cache-delay budget for one write's response, reporting to the volume-stall
     /// breaker. While the breaker is open the budget is zero: every cache wait is polled
     /// once, so an answer already in memory is used and nothing waits on the volume.
-    pub fn write_delay_budget(&self) -> CacheDelayBudget {
+    pub(crate) fn write_delay_budget(&self) -> CacheDelayBudget {
         let total = if self.volume_stalled() {
             std::time::Duration::ZERO
         } else {
@@ -10272,8 +9984,8 @@ impl CacheManager {
         // Nothing is lost by removing it. Granular eviction selects a range by BOUNDS, not by
         // an unvalidated index, and production reaches it through
         // `enforce_disk_cache_limits` -> `perform_eviction_with_lock` -> `batch_evict_ranges`
-        // -> `DiskCacheManager::batch_delete_ranges`; `evict_range` is the equivalent
-        // single-range entry point. Do not reintroduce a key-encoded second spelling: an
+        // -> `DiskCacheManager::batch_delete_ranges`.
+        // Do not reintroduce a key-encoded second spelling: an
         // invalidation target must arrive as its own argument, not smuggled through the key.
         //
         // Spec: cache-eviction-at-scale, unit RANGE-KEY-GRAMMAR-RETIRE.
@@ -10678,153 +10390,10 @@ impl CacheManager {
         }
     }
 
-    /// Invalidate stale ranges with mismatched ETags - Requirement 3.3
-    ///
-    /// This method:
-    /// 1. Reads the object metadata
-    /// 2. Compares the cached ETag with the current ETag
-    /// 3. If they don't match, removes all range files and updates metadata
-    /// 4. Logs the invalidation with details
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key for the object
-    /// * `current_etag` - The current ETag from S3 (from HEAD or GET response)
-    ///
-    /// # Returns
-    /// * `Ok(true)` - If stale ranges were found and invalidated
-    /// * `Ok(false)` - If no stale ranges were found (ETag matches or no metadata)
-    /// * `Err` - If there was an error during invalidation
-    pub async fn invalidate_stale_ranges(
-        &self,
-        cache_key: &str,
-        current_etag: &str,
-    ) -> Result<bool> {
-        info!(
-            "Checking for stale ranges: cache_key={}, current_etag={}",
-            cache_key, current_etag
-        );
-
-        // Hold the key's metadata slot lock across the read below and the range and `.meta`
-        // deletions that act on it, so no concurrent `.meta` writer can republish between
-        // the two. Released by `Drop` on every return. Waiting rather than skipping, as in
-        // `invalidate_cache_hierarchy`: a stale-ETag invalidation dropped on contention would
-        // leave data already known to be stale.
-        let _meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
-
-        // Get metadata from disk (UNDER the lock — this is the read the deletions act on)
-        let metadata = match self.read_metadata_file(cache_key).await? {
-            Some(meta) => meta,
-            None => {
-                debug!(
-                    "No metadata found for cache_key: {}, nothing to invalidate",
-                    cache_key
-                );
-                return Ok(false);
-            }
-        };
-
-        // Compare ETags
-        // Quote-insensitive via the shared helper. PRODUCTION-UNREACHABLE — kept as a
-        // contract pin, not a fix; see the function's reachability note.
-        if crate::revalidation::etags_equal_ignoring_quotes(
-            &metadata.object_metadata.etag,
-            current_etag,
-        ) {
-            debug!(
-                "ETag matches for cache_key: {}, etag={}, no invalidation needed",
-                cache_key, current_etag
-            );
-            return Ok(false);
-        }
-
-        // ETag mismatch detected - invalidate all ranges and clear multipart metadata
-        warn!(
-            "ETag mismatch detected: cache_key={}, cached_etag={}, current_etag={}, invalidating {} ranges, clearing multipart metadata",
-            cache_key, metadata.object_metadata.etag, current_etag, metadata.ranges.len()
-        );
-
-        // Clear multipart metadata fields (Requirements 7.3, 7.4, 7.5)
-        let had_multipart_metadata = metadata.object_metadata.parts_count.is_some()
-            || !metadata.object_metadata.part_ranges.is_empty()
-            || metadata.object_metadata.upload_id.is_some();
-
-        if had_multipart_metadata {
-            debug!(
-                "Clearing multipart metadata due to ETag mismatch: cache_key={}",
-                cache_key
-            );
-        }
-
-        let mut removed_ranges = 0;
-        let mut failed_removals = 0;
-
-        // Remove all range files
-        for range_spec in &metadata.ranges {
-            let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
-
-            if range_file_path.exists() {
-                match std::fs::remove_file(&range_file_path) {
-                    Ok(_) => {
-                        debug!(
-                            "Removed stale range file: cache_key={}, range={}-{}, file={:?}",
-                            cache_key, range_spec.start, range_spec.end, range_file_path
-                        );
-                        removed_ranges += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to remove stale range file: cache_key={}, range={}-{}, file={:?}, error={}",
-                            cache_key, range_spec.start, range_spec.end, range_file_path, e
-                        );
-                        failed_removals += 1;
-                    }
-                }
-            } else {
-                debug!(
-                    "Stale range file already removed: cache_key={}, range={}-{}, file={:?}",
-                    cache_key, range_spec.start, range_spec.end, range_file_path
-                );
-            }
-        }
-
-        // Remove metadata file to complete invalidation
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-        if metadata_file_path.exists() {
-            match std::fs::remove_file(&metadata_file_path) {
-                Ok(_) => {
-                    info!(
-                        "Successfully invalidated stale ranges: cache_key={}, removed_ranges={}, failed_removals={}, cached_etag={}, current_etag={}",
-                        cache_key, removed_ranges, failed_removals, metadata.object_metadata.etag, current_etag
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to remove metadata file during stale range invalidation: cache_key={}, path={:?}, error={}",
-                        cache_key, metadata_file_path, e
-                    );
-                    failed_removals += 1;
-                }
-            }
-        }
-
-        // The lock file is NOT removed: it is a shared slot in a fixed set. The comment this
-        // replaces said the lock "will expire naturally", which was never true of a `flock` —
-        // there is no expiry, and removal released nothing while deleting a file another key's
-        // holder may hold open.
-
-        if failed_removals > 0 {
-            warn!(
-                "Stale range invalidation completed with errors: cache_key={}, removed_ranges={}, failed_removals={}",
-                cache_key, removed_ranges, failed_removals
-            );
-        }
-
-        Ok(true)
-    }
     /// Get object ETag from cached metadata
     /// Returns the ETag if object metadata exists, None otherwise
     /// Requirements: 2.1, 2.4 - ETag retrieval for validation
-    pub async fn get_object_etag(&self, cache_key: &str) -> Result<Option<String>> {
+    pub(crate) async fn get_object_etag(&self, cache_key: &str) -> Result<Option<String>> {
         debug!("Getting object ETag for cache_key: {}", cache_key);
 
         match self.read_metadata_file(cache_key).await? {
@@ -10841,418 +10410,6 @@ impl CacheManager {
                 Ok(None)
             }
         }
-    }
-    /// Get cache coordination statistics
-    ///
-    /// No longer reports an `active_locks` figure. That figure counted `*.lock` files in
-    /// `cache_dir/locks`, which was a count of the retired per-key write sentinels — the
-    /// directory now holds only `global_eviction.lock` and `initialization.lock`, so the
-    /// name would assert per-key write activity that no longer exists.
-    pub fn get_coordination_stats(&self) -> HashMap<String, u64> {
-        let mut stats = HashMap::new();
-
-        // Add other coordination statistics
-        let inner = self.inner.lock().unwrap();
-        stats.insert("cache_hits".to_string(), inner.statistics.cache_hits);
-        stats.insert("cache_misses".to_string(), inner.statistics.cache_misses);
-        stats.insert(
-            "expired_entries".to_string(),
-            inner.statistics.expired_entries,
-        );
-
-        stats
-    }
-    /// Check cache consistency across instances
-    /// This method helps detect when cache entries might be inconsistent
-    pub async fn check_cache_consistency(&self, cache_key: &str) -> Result<bool> {
-        // Simply check if the cache entry can be retrieved successfully
-        // This is the most reliable way to check consistency
-        match self.get_cached_response(cache_key).await {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(_) => Ok(false),
-        }
-    }
-    /// Store multipart object part in cache - Requirements 7.1, 7.2
-    /// Store multipart part (NEW ARCHITECTURE)
-    /// Implements Requirements 5.1, 5.2, 5.3, 5.4, 5.5
-    ///
-    /// This method:
-    /// 1. Stores part info (number, size, etag, data) in metadata
-    /// 2. Increments cumulative_size by part size
-    /// 3. Supports out-of-order part arrivals
-    /// 4. Stores parts temporarily in metadata until CompleteMultipartUpload
-    /// 5. Checks capacity and marks upload as Bypassed if exceeded
-    pub async fn store_multipart_part(
-        &self,
-        path: &str,
-        part_number: u32,
-        part_data: &[u8],
-        etag: String,
-    ) -> Result<()> {
-        // Generate cache key
-        let cache_key = Self::generate_cache_key(path, None);
-
-        let part_size = part_data.len() as u64;
-
-        info!(
-            "Storing multipart part: path={}, part_number={}, cache_key={}, size={} bytes",
-            path, part_number, cache_key, part_size
-        );
-
-        // Requirement 5.1: Get current metadata
-        let mut metadata = match self.read_metadata_file(&cache_key).await? {
-            Some(meta)
-                if meta.object_metadata.upload_state
-                    == crate::cache_types::UploadState::InProgress =>
-            {
-                debug!(
-                    "Found in-progress upload: cache_key={}, cumulative_size={}, parts_count={}",
-                    cache_key,
-                    meta.object_metadata.cumulative_size,
-                    meta.object_metadata.parts.len()
-                );
-                meta
-            }
-            Some(meta)
-                if meta.object_metadata.upload_state
-                    == crate::cache_types::UploadState::Bypassed =>
-            {
-                debug!(
-                    "Upload is bypassed, skipping part: cache_key={}, part_number={}",
-                    cache_key, part_number
-                );
-                return Ok(());
-            }
-            Some(meta) => {
-                warn!(
-                    "Unexpected upload state for multipart part: cache_key={}, state={:?}, part_number={}",
-                    cache_key, meta.object_metadata.upload_state, part_number
-                );
-                return Ok(());
-            }
-            None => {
-                warn!(
-                    "No in-progress upload found for part: cache_key={}, part_number={}",
-                    cache_key, part_number
-                );
-                return Ok(());
-            }
-        };
-
-        // Requirement 5.2: Check capacity before storing part
-        let new_cumulative = metadata.object_metadata.cumulative_size + part_size;
-
-        // Requirement 6.1: Check if cumulative size would exceed capacity
-        let write_cache_capacity = self.get_write_cache_capacity();
-        if new_cumulative > write_cache_capacity {
-            warn!(
-                "Upload exceeds write cache capacity, marking as bypassed: cache_key={}, cumulative_size={}, capacity={}, part_number={}",
-                cache_key, new_cumulative, write_cache_capacity, part_number
-            );
-
-            // Requirement 6.2: Mark upload as Bypassed and clear cached parts
-            metadata.object_metadata.upload_state = crate::cache_types::UploadState::Bypassed;
-            metadata.object_metadata.parts.clear();
-            metadata.object_metadata.cumulative_size = 0;
-
-            // Write updated metadata
-            self.write_metadata_to_disk(&metadata).await?;
-
-            info!(
-                "Upload marked as bypassed due to capacity: cache_key={}, attempted_size={}, capacity={}",
-                cache_key, new_cumulative, write_cache_capacity
-            );
-
-            return Ok(());
-        }
-
-        // Requirement 5.1: Store part info in metadata
-        // Requirement 5.3: Support out-of-order part arrivals
-        let part_info = crate::cache_types::PartInfo {
-            part_number,
-            size: part_size,
-            etag: etag.clone(),
-            data: part_data.to_vec(), // Requirement 5.4: Store temporarily in metadata
-        };
-
-        // Check if this part number already exists (replace if so)
-        if let Some(existing_part_idx) = metadata
-            .object_metadata
-            .parts
-            .iter()
-            .position(|p| p.part_number == part_number)
-        {
-            debug!(
-                "Replacing existing part: cache_key={}, part_number={}, old_size={}, new_size={}",
-                cache_key,
-                part_number,
-                metadata.object_metadata.parts[existing_part_idx].size,
-                part_size
-            );
-
-            // Adjust cumulative size (subtract old, add new)
-            let old_size = metadata.object_metadata.parts[existing_part_idx].size;
-            metadata.object_metadata.cumulative_size = metadata
-                .object_metadata
-                .cumulative_size
-                .saturating_sub(old_size)
-                .saturating_add(part_size);
-
-            // Replace the part
-            metadata.object_metadata.parts[existing_part_idx] = part_info;
-        } else {
-            // Requirement 5.2: Increment cumulative_size by part size
-            metadata.object_metadata.cumulative_size = new_cumulative;
-
-            // Add new part
-            metadata.object_metadata.parts.push(part_info);
-        }
-
-        // Write updated metadata to disk
-        self.write_metadata_to_disk(&metadata).await?;
-
-        info!(
-            "Multipart part stored: cache_key={}, part_number={}, size={} bytes, cumulative_size={} bytes, total_parts={}",
-            cache_key, part_number, part_size, metadata.object_metadata.cumulative_size, metadata.object_metadata.parts.len()
-        );
-
-        Ok(())
-    }
-
-    /// Complete multipart upload
-    /// Implements Requirements 7.1, 7.2, 7.3, 7.4, 7.5
-    ///
-    /// This method:
-    /// 1. Sorts parts by part number
-    /// 2. Calculates byte positions from part sizes
-    /// 3. Stores each part as a range at calculated position
-    /// 4. Updates upload_state to Complete
-    /// 5. Clears temporary part data from metadata
-    /// 6. Sets expires_at using PUT_TTL
-    ///
-    /// Restored after an earlier, incorrect dead-code assessment during the
-    /// compression-content-aware-fix change: it has no caller within `src/`,
-    /// but is a public API exercised extensively by integration tests
-    /// (`tests/multipart_completion_test.rs`, `tests/archive_zip_corruption_test.rs`,
-    /// `tests/multipart_get_integration_test.rs`,
-    /// `tests/http_proxy_handlers_test.rs`,
-    /// `tests/put_cache_invalidation_property_test.rs`) simulating the
-    /// buffered-parts-in-metadata completion path. Not truly dead.
-    pub async fn complete_multipart_upload(&self, path: &str) -> Result<()> {
-        let cache_key = Self::generate_cache_key(path, None);
-
-        info!(
-            "Completing multipart upload: path={}, cache_key={}",
-            path, cache_key
-        );
-
-        // Requirement 7.1: Get current metadata
-        let mut metadata = match self.read_metadata_file(&cache_key).await? {
-            Some(meta)
-                if meta.object_metadata.upload_state
-                    == crate::cache_types::UploadState::InProgress =>
-            {
-                debug!(
-                    "Found in-progress upload to complete: cache_key={}, parts_count={}",
-                    cache_key,
-                    meta.object_metadata.parts.len()
-                );
-                meta
-            }
-            Some(meta)
-                if meta.object_metadata.upload_state
-                    == crate::cache_types::UploadState::Bypassed =>
-            {
-                info!(
-                    "Upload was bypassed, skipping completion: cache_key={}",
-                    cache_key
-                );
-                return Ok(());
-            }
-            Some(meta) => {
-                warn!(
-                    "Unexpected upload state for completion: cache_key={}, state={:?}",
-                    cache_key, meta.object_metadata.upload_state
-                );
-                return Ok(());
-            }
-            None => {
-                debug!(
-                    "No in-progress upload found to complete: cache_key={}",
-                    cache_key
-                );
-                return Ok(());
-            }
-        };
-
-        // Check if there are any parts to complete
-        if metadata.object_metadata.parts.is_empty() {
-            info!("No parts to complete for upload: cache_key={}", cache_key);
-            return Ok(());
-        }
-
-        // Requirement 7.1: Sort parts by part number
-        metadata
-            .object_metadata
-            .parts
-            .sort_by_key(|p| p.part_number);
-
-        debug!(
-            "Sorted {} parts for completion: cache_key={}, part_numbers={:?}",
-            metadata.object_metadata.parts.len(),
-            cache_key,
-            metadata
-                .object_metadata
-                .parts
-                .iter()
-                .map(|p| p.part_number)
-                .collect::<Vec<_>>()
-        );
-
-        // Requirement 7.2: Calculate byte positions from part sizes
-        // Requirement 7.3: Store each part as a range at calculated position
-        let mut current_position = 0u64;
-        let mut range_specs = Vec::new();
-        let resolved = self.resolve_settings(&cache_key).await;
-
-        for part in &metadata.object_metadata.parts {
-            let start = current_position;
-            let end = start + part.size - 1;
-
-            debug!(
-                "Processing part {}: start={}, end={}, size={} bytes",
-                part.part_number, start, end, part.size
-            );
-
-            // Compress the part data (Requirements 5.1, 5.2, 5.3: per-bucket
-            // compression control via `effective_compression`; always written
-            // as a checksummed LZ4 frame regardless of the decision).
-            let should_compress =
-                self.effective_compression(&resolved, path, part.data.len() as u64);
-            let compression_result = {
-                let mut inner = self.inner.lock().unwrap();
-                inner
-                    .compression_handler
-                    .compress_with_metadata(&part.data, path, should_compress)
-            }; // Lock is dropped here
-
-            let compressed_data = compression_result.data;
-            let compression_algorithm = compression_result.algorithm;
-            let compressed_size = compression_result.compressed_size;
-            let uncompressed_size = compression_result.original_size;
-
-            // Write range data to .tmp file then atomically rename
-            let range_file_path = self.get_new_range_file_path(&cache_key, start, end);
-            // This fill's own temp name, opened `create_new` (R10.1).
-            let range_tmp_path =
-                instance_scoped_range_tmp_path(&range_file_path, Some(fastrand::u32(..)));
-
-            // Ensure ranges directory exists
-            if let Some(parent) = range_file_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to create ranges directory: {}", e))
-                })?;
-            }
-
-            // Write to temporary file
-            let written = crate::disk_cache::write_synced_identity_exclusive(
-                &range_tmp_path,
-                &compressed_data,
-                &cache_key,
-            )
-            .map_err(|e| {
-                // Logged once, with the key and the path, where it was found.
-                if crate::disk_cache::is_identity_unavailable(&e) {
-                    return ProxyError::CacheError(e.to_string());
-                }
-                crate::disk_cache::note_disk_full(&e, "complete_multipart_upload.bin_tmp");
-                // Best-effort cleanup of temp file on write failure, unless it is not ours.
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    let _ = std::fs::remove_file(&range_tmp_path);
-                }
-                ProxyError::CacheError(format!(
-                    "Failed to write range tmp file for part {}: {}",
-                    part.part_number, e
-                ))
-            })?;
-
-            // Atomic rename
-            std::fs::rename(&range_tmp_path, &range_file_path).map_err(|e| {
-                // Best-effort cleanup of temp file on rename failure
-                let _ = std::fs::remove_file(&range_tmp_path);
-                ProxyError::CacheError(format!(
-                    "Failed to rename range file for part {}: {}",
-                    part.part_number, e
-                ))
-            })?;
-
-            // Create range spec with relative path from ranges directory
-            // The path should be relative to cache_dir/ranges, including bucket and hash directories
-            // e.g., "bucket/XX/YYY/filename.bin"
-            let ranges_dir = self.cache_dir.join("ranges");
-            let range_file_relative_path = range_file_path
-                .strip_prefix(&ranges_dir)
-                .map_err(|e| {
-                    ProxyError::CacheError(format!(
-                        "Failed to compute relative path for part {}: {}",
-                        part.part_number, e
-                    ))
-                })?
-                .to_string_lossy()
-                .to_string();
-
-            // Live write path, so membership is recorded explicitly (R12.2) rather
-            // than left `None` for a reader to re-derive from the object flag. Read
-            // from the `.meta` this function is updating in place, so a part inherits
-            // the tier of the object it completes.
-            // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
-            let counts_as_staged = crate::cache_types::classify_new_range_as_staged(
-                &range_file_relative_path,
-                metadata.object_metadata.is_write_cached,
-            );
-            let range_spec = crate::cache_types::RangeSpec::new_staged(
-                start,
-                end,
-                range_file_relative_path,
-                compression_algorithm,
-                compressed_size,
-                uncompressed_size,
-                counts_as_staged,
-            )
-            .with_file_identity(Some(written.identity));
-            range_specs.push(range_spec);
-            current_position += part.size;
-
-            debug!(
-                "Stored part {} as range {}-{} for cache_key={}",
-                part.part_number, start, end, cache_key
-            );
-        }
-
-        // Requirement 7.4: Update upload_state to Complete
-        metadata.object_metadata.upload_state = crate::cache_types::UploadState::Complete;
-        metadata.object_metadata.content_length = current_position;
-
-        // Requirement 7.5: Clear temporary part data from metadata
-        metadata.object_metadata.parts.clear();
-
-        // Requirement 7.5: Set expires_at using PUT_TTL
-        let now = SystemTime::now();
-        metadata.expires_at = safe_expiry(now, self.put_ttl);
-
-        // Update ranges in metadata
-        metadata.ranges = range_specs;
-
-        // Write updated metadata to disk
-        self.write_metadata_to_disk(&metadata).await?;
-
-        info!(
-            "Multipart upload completed: cache_key={}, total_size={} bytes, parts_stored={}, expires_at={:?}",
-            cache_key, current_position, metadata.ranges.len(), metadata.expires_at
-        );
-
-        Ok(())
     }
 
     /// Clear multipart metadata fields from ObjectMetadata - Requirements 7.4, 7.5
@@ -11272,109 +10429,6 @@ impl CacheManager {
                 had_parts_count, had_part_ranges, had_upload_id
             );
         }
-    }
-
-    /// Initiate multipart upload
-    /// Implements Requirements 4.1, 4.2, 4.3, 4.4, 4.5
-    ///
-    /// This method:
-    /// 1. Invalidates any existing cached data for the key
-    /// 2. Creates metadata with upload_state = InProgress
-    /// 3. Initializes empty parts list and cumulative_size = 0
-    /// 4. Sets 1-hour expiration for incomplete uploads
-    pub async fn initiate_multipart_upload(&self, path: &str) -> Result<()> {
-        let cache_key = Self::generate_cache_key(path, None);
-
-        info!(
-            "Initiating multipart upload: path={}, cache_key={}",
-            path, cache_key
-        );
-
-        // Requirement 4.2: Invalidate any existing cached data for that key
-        let metadata_file_path = self.get_new_metadata_file_path(&cache_key);
-
-        if metadata_file_path.exists() {
-            debug!(
-                "Existing metadata found for key: {}, invalidating before multipart initiation",
-                cache_key
-            );
-
-            // Read existing metadata to get range files to delete
-            if let Ok(Some(existing_metadata)) = self.read_metadata_file(&cache_key).await {
-                // Delete all associated range files
-                for range_spec in &existing_metadata.ranges {
-                    let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
-                    if range_file_path.exists() {
-                        match std::fs::remove_file(&range_file_path) {
-                            Ok(_) => {
-                                debug!(
-                                    "Deleted existing range file: key={}, range={}-{}, path={:?}",
-                                    cache_key, range_spec.start, range_spec.end, range_file_path
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to delete existing range file: key={}, path={:?}, error={}",
-                                    cache_key, range_file_path, e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Delete metadata file
-            match std::fs::remove_file(&metadata_file_path) {
-                Ok(_) => {
-                    info!(
-                        "Invalidated existing cache entry for key: {}, path={:?}",
-                        cache_key, metadata_file_path
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to delete existing metadata file: key={}, path={:?}, error={}",
-                        cache_key, metadata_file_path, e
-                    );
-                }
-            }
-        }
-
-        // Requirement 4.1: Create metadata with upload_state = InProgress
-        // Requirement 4.3: Initialize empty parts list
-        // Requirement 4.4: Set cumulative_size to 0
-        let now = SystemTime::now();
-        let object_metadata = crate::cache_types::ObjectMetadata {
-            etag: String::new(), // Empty for in-progress uploads
-            last_modified: String::new(),
-            content_length: 0,
-            content_type: None,
-            upload_state: crate::cache_types::UploadState::InProgress,
-            cumulative_size: 0,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        // Requirement 4.5: Set 1-hour expiration for incomplete uploads
-        let metadata = crate::cache_types::NewCacheMetadata {
-            cache_key: cache_key.clone(),
-            object_metadata,
-            ranges: Vec::new(),
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600), // 1 hour for incomplete uploads
-            compression_info: crate::cache_types::CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        // Write metadata to disk
-        self.write_metadata_to_disk(&metadata).await?;
-
-        info!(
-            "Multipart upload initiated: path={}, cache_key={}, expires_in=1h",
-            path, cache_key
-        );
-
-        Ok(())
     }
 
     /// Get cache statistics
@@ -11405,7 +10459,7 @@ impl CacheManager {
     /// the single figure behind both the `try_reserve` size refusal and
     /// [`Self::get_write_cache_max_object_size`]. Must be called before Arc-wrapping and
     /// before `initialize`, mirroring `set_disk_safety_free_space_floor`.
-    pub fn set_write_cache_max_object_size(&mut self, max_object_size: u64) {
+    pub(crate) fn set_write_cache_max_object_size(&mut self, max_object_size: u64) {
         self.write_cache_max_object_size = max_object_size;
     }
 
@@ -11475,9 +10529,9 @@ impl CacheManager {
         inner.statistics.last_updated = SystemTime::now();
     }
 
-    /// Record per-bucket and per-rule cache hit or miss.
-    /// Per-bucket counters are tracked for all buckets; per-rule counters are
-    /// attributed to the first matching rule from settings resolution.
+    /// Record per-rule cache hit or miss, attributed to the first matching rule
+    /// from settings resolution. No per-bucket series is kept: the bucket count is
+    /// unbounded, and per-bucket traffic has its own capped counters.
     ///
     /// Accepts the already-resolved `SettingsSource` to avoid a redundant
     /// second resolution per request (resolve-once, Requirement 8.2).
@@ -11488,11 +10542,9 @@ impl CacheManager {
         is_head: bool,
         source: &crate::bucket_settings::SettingsSource,
     ) {
-        let bucket = match crate::bucket_settings::BucketSettingsManager::extract_bucket(cache_key)
-        {
-            Some(b) => b.to_string(),
-            None => return,
-        };
+        if crate::bucket_settings::BucketSettingsManager::extract_bucket(cache_key).is_none() {
+            return;
+        }
 
         let matched_pattern = match source {
             crate::bucket_settings::SettingsSource::Rule(_, pattern) => Some(pattern.as_str()),
@@ -11502,12 +10554,10 @@ impl CacheManager {
         if let Some(mm_guard) = self.metrics_manager.read().await.as_ref() {
             let mm = mm_guard.read().await;
             if hit {
-                mm.record_bucket_cache_hit(&bucket, is_head).await;
                 if let Some(pattern) = matched_pattern {
                     mm.record_rule_cache_hit(pattern, is_head).await;
                 }
             } else {
-                mm.record_bucket_cache_miss(&bucket, is_head).await;
                 if let Some(pattern) = matched_pattern {
                     mm.record_rule_cache_miss(pattern, is_head).await;
                 }
@@ -11543,7 +10593,7 @@ impl CacheManager {
     /// |---|---|
     /// | `get_cached_range_data` → `serve_full_object_from_cache` | Live-TTL gate exists in `handle_get_head_request` (`check_object_expiration`). Branch-by-branch confirmation of which serve returns sit downstream of it is NOT complete — see the caveat below |
     /// | `get_cached_range_data` → `serve_range_from_cache_buffered` | As above, in `handle_range_request` |
-    /// | `extract_bytes_from_cached_range` → `merge_range_segments` → page widening (`load_page_from_cache`) | **Stored expiry only.** `find_page_overlap` looks up with `RangeLookupPurpose::FreshServe` and applies no live-TTL gate; `try_widened_range_request` does call `check_object_expiration`, but only when a `.meta` already exists |
+    /// | `extract_bytes_from_cached_range_tiered` → `merge_range_segments` → page widening (`load_page_from_cache`) | **Stored expiry only.** `find_page_overlap` looks up with `RangeLookupPurpose::FreshServe` and applies no live-TTL gate; `try_widened_range_request` does call `check_object_expiration`, but only when a `.meta` already exists |
     /// | ...the same path's **journal-fallback** arm | **Neither mechanism.** Journal records carry no expiry and the arm hardcodes `StoredFreshness::Fresh` |
     ///
     /// The third and fourth rows are pre-existing and owned by
@@ -11662,14 +10712,12 @@ impl CacheManager {
                 //
                 // SOURCE 2 — the metadata-backed path (`range_handler.rs`), which sets
                 // `etag: metadata.object_metadata.etag.clone()`. That is empty whenever
-                // the stored `ObjectMetadata` carries an empty etag, and two producers
-                // do: `UploadState::InProgress` multipart metadata sets
-                // `etag: String::new()` explicitly, and `ObjectMetadata::default()`
-                // leaves it empty so anything built through `..Default::default()`
-                // without an etag inherits it. Confirmed as a producer of empty stored
-                // etags; NOT confirmed that an `InProgress` object's ranges are ever
-                // served on a live GET, so treat source 2 as "exists in stored
-                // metadata" rather than "demonstrably served".
+                // the stored `ObjectMetadata` carries an empty etag. `ObjectMetadata::default()`
+                // leaves it empty, so anything built through `..Default::default()` without an
+                // etag inherits it, and a `.meta` written by an older binary that stored
+                // `UploadState::InProgress` multipart metadata carries an explicit
+                // `etag: String::new()` (no current code builds that state). Source 2 is
+                // therefore "exists in stored metadata", not "demonstrably served".
                 //
                 // NOT a source: `find_pending_journal_ranges` returns
                 // `cache_types::RangeSpec`, which has no etag field at all — the etag is
@@ -11800,11 +10848,9 @@ impl CacheManager {
                 self.record_ram_eligibility_skip();
             } else {
                 // Load the raw on-disk frame bytes (no decompression) so the RAM entry
-                // mirrors the on-disk footprint, matching the full-object
-                // (`convert_cache_entry_to_ram_entry`) and write-cache
-                // (`convert_write_entry_to_ram_entry`) promotion paths
-                // (compression-content-aware-fix Requirement 9). The client-facing
-                // decompressed `range_data` above is unaffected by this.
+                // mirrors the on-disk footprint (compression-content-aware-fix
+                // Requirement 9). The client-facing decompressed `range_data` above is
+                // unaffected by this.
                 match range_handler
                     .load_range_frame_from_new_storage(cache_key, range)
                     .await
@@ -13081,28 +12127,6 @@ impl CacheManager {
         new_total <= max_allowed
     }
 
-    /// Decompress RAM cache read data, returning the raw decompressed bytes.
-    pub(crate) fn decompress_ram_cache_read(&self, read: &RamCacheRead) -> Result<Vec<u8>> {
-        if read.compressed {
-            let inner = self.inner.lock().unwrap();
-            match inner
-                .compression_handler
-                .decompress_with_algorithm(&read.data, read.compression_algorithm.clone())
-            {
-                Ok(decompressed_data) => Ok(decompressed_data),
-                Err(e) => {
-                    error!(
-                        "Failed to decompress RAM cache entry with algorithm {:?}: {}",
-                        read.compression_algorithm, e
-                    );
-                    Err(e)
-                }
-            }
-        } else {
-            Ok(read.data.to_vec())
-        }
-    }
-
     /// Get compression handler (for testing, configuration, and health/metrics monitoring)
     pub fn get_compression_handler(&self) -> Arc<CompressionHandler> {
         let inner = self.inner.lock().unwrap();
@@ -13124,72 +12148,6 @@ impl CacheManager {
         } else {
             None
         }
-    }
-    /// Get cache usage breakdown with compression statistics
-    /// Updated to support new range storage architecture with range count breakdown
-    pub async fn get_cache_usage_breakdown(&self) -> CacheUsageBreakdown {
-        let mut breakdown = CacheUsageBreakdown::default();
-        let cache_types = ["metadata", "ranges", "parts"];
-
-        for cache_type in &cache_types {
-            let cache_type_dir = self.cache_dir.join(cache_type);
-            if !cache_type_dir.exists() {
-                continue;
-            }
-
-            if let Ok(dir_entries) = std::fs::read_dir(&cache_type_dir) {
-                for entry in dir_entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                        // Read metadata to get cache entry details
-                        if let Ok(metadata_content) = std::fs::read_to_string(&path) {
-                            // Try new format first
-                            if let Ok(new_metadata) =
-                                serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
-                                    &metadata_content,
-                                )
-                            {
-                                // Count ranges
-                                if new_metadata.ranges.len() == 1 {
-                                    // Check if this is a full object (range 0 to content_length)
-                                    let range = &new_metadata.ranges[0];
-                                    if range.start == 0
-                                        && range.end
-                                            == new_metadata.object_metadata.content_length - 1
-                                    {
-                                        breakdown.full_objects += 1;
-                                    } else {
-                                        breakdown.range_objects += 1;
-                                    }
-                                } else if new_metadata.ranges.len() > 1 {
-                                    breakdown.range_objects += 1;
-                                }
-
-                                // Count compression statistics (all data uses frame format)
-                                for range_spec in &new_metadata.ranges {
-                                    breakdown.compressed_objects += 1;
-                                    breakdown.total_compressed_size += range_spec.compressed_size;
-                                    breakdown.total_uncompressed_size +=
-                                        range_spec.uncompressed_size;
-                                    breakdown.compressed_bytes_saved += range_spec
-                                        .uncompressed_size
-                                        .saturating_sub(range_spec.compressed_size);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Count RAM cache objects
-        if self.ram_cache_enabled {
-            if let Some(ram_stats) = self.ram_cache_stats().await {
-                breakdown.ram_cache_objects = ram_stats.entries_count;
-            }
-        }
-
-        breakdown
     }
 
     /// Enforce disk cache size limits using configured eviction algorithm - Requirements 2.5
@@ -16614,7 +15572,7 @@ impl CacheManager {
     /// compresses to 10 MiB ahead of a 50 MiB incompressible one that frees five times more
     /// (§ 4.4's D4 defect). This is a byte-denominated mechanism, so it must rank on the bytes.
     ///
-    /// Distinct from [`Self::sort_range_candidates`], which is the coldness-only ordering the
+    /// Distinct from the coldness-only ordering the
     /// entry dimension and ten non-production oracles use and which is deliberately unchanged.
     ///
     /// Spec: cache-eviction-at-scale § 5.2. Requirements: 3.6
@@ -16790,60 +15748,6 @@ impl CacheManager {
         distinct.len() as u64 == total
     }
 
-    /// Sort range candidates based on the configured eviction algorithm
-    ///
-    /// This method sorts range eviction candidates for eviction priority by each range's
-    /// individual TinyLFU score (lowest score first, oldest `last_accessed` as tiebreak).
-    ///
-    /// Each range is treated as an independent candidate regardless of which object
-    /// it belongs to. This enables fine-grained eviction based on individual range
-    /// access patterns.
-    ///
-    /// # Arguments
-    /// * `candidates` - Mutable reference to vector of range candidates to sort in-place
-    ///
-    /// # Requirements
-    /// Implements Requirement 1.3 from range-based-disk-eviction spec: each range's
-    /// individual access_count and last_accessed values. (Requirement 1.2, the LRU arm,
-    /// was deleted under cache-eviction-at-scale R10.1.)
-    pub fn sort_range_candidates(&self, candidates: &mut [RangeEvictionCandidate]) {
-        match self.eviction_algorithm {
-            CacheEvictionAlgorithm::TinyLFU => self.sort_range_candidates_for_tinylfu(candidates),
-        }
-    }
-
-    /// Sort range candidates for TinyLFU eviction using decayed-frequency scoring
-    ///
-    /// Score = `decayed_frequency(access_count, idle_secs)` (lower = evict first), with
-    /// `last_accessed` as a tiebreak. `now` is computed once per sort pass rather than per
-    /// comparison. This is the same decay helper used by `RangeSpec::tinylfu_score` — see
-    /// Requirement 1.2 (shared scoring, no duplicated formula).
-    ///
-    /// # Arguments
-    /// * `candidates` - Mutable reference to vector of range candidates to sort in-place
-    ///
-    /// # Requirements
-    /// Implements Requirement 1.3 from range-based-disk-eviction spec
-    fn sort_range_candidates_for_tinylfu(&self, candidates: &mut [RangeEvictionCandidate]) {
-        let now = SystemTime::now();
-
-        candidates.sort_by_key(|c| {
-            let idle_secs = now
-                .duration_since(c.last_accessed)
-                .unwrap_or_default()
-                .as_secs();
-            (
-                decayed_frequency(c.access_count, idle_secs),
-                c.last_accessed,
-            )
-        });
-
-        debug!(
-            "Sorted {} range candidates for TinyLFU eviction (lowest decayed-frequency score first)",
-            candidates.len()
-        );
-    }
-
     /// Create RangeEvictionCandidate entries from a metadata file
     ///
     /// For each range in the metadata, creates a separate candidate with:
@@ -17007,7 +15911,7 @@ impl CacheManager {
     /// Implements Requirements 1.1, 6.4 from range-based-disk-eviction spec:
     /// - 1.1: Each range is treated as an independent candidate
     /// - 6.4: Account for individual range sizes when calculating eviction target
-    pub fn group_candidates_by_object(
+    fn group_candidates_by_object(
         &self,
         candidates: Vec<RangeEvictionCandidate>,
         target_bytes: u64,
@@ -17178,7 +16082,7 @@ impl CacheManager {
     /// - 6.3: Update size tracker before releasing eviction locks
     /// - 7.1: Log cache_key, range start/end, and freed bytes on eviction
     /// - 7.2: Log metadata deletion with reason (all ranges evicted)
-    pub async fn batch_evict_ranges(
+    async fn batch_evict_ranges(
         &self,
         cache_key: &str,
         ranges: &[RangeEvictionCandidate],
@@ -17365,7 +16269,6 @@ impl CacheManager {
             deleted_paths: deletion.deleted_paths,
             unlinked: deletion.unlinked_ranges,
             identity_skipped: false,
-            meta_unlinked: deletion.meta_unlinked,
         })
     }
 
@@ -17690,7 +16593,7 @@ impl CacheManager {
         // This is the relationship `SizeState::write_cache_size`'s own field doc states
         // ("a subset of `total_size`, not an addition to it, so `read_cache_size` is
         // `total_size - write_cache_size`") and that Requirement 6.4's clamp in
-        // `update_size_from_validation` exists to protect — that clamp's doc comment
+        // `update_size_from_validation_with_kind` exists to protect — that clamp's doc comment
         // says an out-of-range staged figure is rejected precisely "because accepting it
         // would make `read_cache_size = total_size - write_cache_size` underflow at every
         // reporting site downstream". Until 2026-08-26 no reporting site performed the
@@ -17699,7 +16602,7 @@ impl CacheManager {
         // staged bytes twice.
         //
         // Checked rather than `saturating_sub`, and WARN rather than silence: R6.4's
-        // clamp covers `update_size_from_validation`, but `atomic_update_size_delta`
+        // clamp covers `update_size_from_validation_with_kind`, but `atomic_update_size_delta`
         // applies the two deltas independently and enforces no relationship between
         // them, so `write_cache_size > total_size` is reachable on the delta path. It has
         // been reached — the state this spec was opened for had `write_cache_size` at
@@ -17974,13 +16877,6 @@ impl CacheManager {
         self.journal_consolidator.read().await.clone()
     }
 
-    /// Get hybrid metadata writer for background orphan recovery (if shared storage is enabled)
-    pub async fn get_hybrid_metadata_writer(
-        &self,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::hybrid_metadata_writer::HybridMetadataWriter>>> {
-        self.hybrid_metadata_writer.read().await.clone()
-    }
-
     /// Get cache hit update buffer for background flush task (if shared storage is enabled)
     pub async fn get_cache_hit_update_buffer(
         &self,
@@ -18055,7 +16951,7 @@ impl CacheManager {
     /// RAM-cache hits whose access record was dropped since process start because the queue was
     /// full (or its drain task had ended). Published as
     /// `cache_hit_buffer.ram_records_dropped_total`.
-    pub fn ram_access_records_dropped(&self) -> u64 {
+    pub(crate) fn ram_access_records_dropped(&self) -> u64 {
         self.ram_access_records_dropped
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -18073,7 +16969,7 @@ impl CacheManager {
     }
 
     /// This instance's fill-visibility tracker. See [`crate::fill_visibility_tracker`].
-    pub fn fill_visibility_tracker(
+    pub(crate) fn fill_visibility_tracker(
         &self,
     ) -> Arc<crate::fill_visibility_tracker::FillVisibilityTracker> {
         self.fill_visibility_tracker.clone()
@@ -18154,181 +17050,6 @@ impl CacheManager {
                 Err(e)
             }
         }
-    }
-
-    /// Classified metadata lookup that exposes the corruption flag, consults the
-    /// RAM metadata tier, and publishes into it on a parse.
-    ///
-    /// Returns a `MetadataLookup` so the caller can detect when a `.meta` file
-    /// is confidently corrupt and trigger the overwrite-in-place heal after
-    /// fetching from S3 (Req 3).
-    ///
-    /// This method checks MetadataCache (RAM) first; on a RAM miss it runs the
-    /// blocking `read_and_parse_metadata_blocking` helper under `spawn_blocking`
-    /// to classify the file.
-    ///
-    /// # Not to be confused with `DiskCacheManager::get_metadata_classified`
-    /// That is a **different method on a different type**, and it was named
-    /// identically until this rename, so a grep for the old name could not tell
-    /// the two apart. The distinction is the one in this name: the disk manager's
-    /// version holds no `MetadataCache` and so neither reads nor publishes to the
-    /// RAM metadata tier, while this one does both and therefore carries the
-    /// v1.9.4 admission guard on what may be published.
-    ///
-    /// This method has **zero `src/` callers** — its consumers are the two
-    /// standing-guard assertions in
-    /// `tests/ram_metadata_admission_unification_test.rs`
-    /// (`row2_classified_lookup_withholds_an_empty_ranges_document`), which pin
-    /// the admission guard's shape for a future caller. `DEADCODE-SWEEP` closed
-    /// without deleting it, so its survival is settled; read a hit on this name
-    /// as being about the RAM tier, and a hit on the disk manager's as not.
-    ///
-    /// Spec: cache-metadata-resilience Req 3, Task 6
-    pub async fn get_metadata_classified_and_publish_to_ram(
-        &self,
-        cache_key: &str,
-    ) -> Result<crate::disk_cache::MetadataLookup> {
-        // First, try RAM cache — if present, it's valid (not corrupt)
-        if let Some(metadata) = self.metadata_cache.get(cache_key).await {
-            debug!(
-                "Metadata cache hit (RAM) for classified lookup: {}",
-                cache_key
-            );
-            return Ok(crate::disk_cache::MetadataLookup {
-                meta: Some(metadata),
-                corrupt: false,
-                corrupt_reason: None,
-            });
-        }
-
-        // RAM miss — read from disk with classification
-        let metadata_path = self.get_new_metadata_file_path(cache_key);
-        if !metadata_path.exists() {
-            return Ok(crate::disk_cache::MetadataLookup {
-                meta: None,
-                corrupt: false,
-                corrupt_reason: None,
-            });
-        }
-
-        // Use the blocking helper (same as DiskCacheManager::get_metadata) to classify
-        let path_clone = metadata_path.clone();
-        let cap = self.max_metadata_file_bytes;
-        let cache_key_owned = cache_key.to_string();
-
-        let outcome = match tokio::task::spawn_blocking(move || {
-            crate::disk_cache::read_and_parse_metadata_blocking(&path_clone, cap)
-        })
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(join_err) => {
-                warn!(
-                    "[METADATA_CLASSIFIED] spawn_blocking JoinError: cache_key={}, error={}",
-                    cache_key_owned, join_err
-                );
-                crate::disk_cache::MetadataReadOutcome::TransientMiss
-            }
-        };
-
-        match outcome {
-            crate::disk_cache::MetadataReadOutcome::Missing => {
-                Ok(crate::disk_cache::MetadataLookup {
-                    meta: None,
-                    corrupt: false,
-                    corrupt_reason: None,
-                })
-            }
-            crate::disk_cache::MetadataReadOutcome::TransientMiss => {
-                Ok(crate::disk_cache::MetadataLookup {
-                    meta: None,
-                    corrupt: false,
-                    corrupt_reason: None,
-                })
-            }
-            crate::disk_cache::MetadataReadOutcome::Corrupt { reason } => {
-                warn!(
-                    "[METADATA_CLASSIFIED] Corrupt metadata flagged for heal: cache_key={}, reason={:?}",
-                    cache_key, reason
-                );
-                Ok(crate::disk_cache::MetadataLookup {
-                    meta: None,
-                    corrupt: true,
-                    corrupt_reason: Some(reason),
-                })
-            }
-            crate::disk_cache::MetadataReadOutcome::Parsed(metadata) => {
-                // Cache in RAM for future lookups. Census row 2 — same rule and same
-                // expression as row 1; see `ram_admission_permitted`.
-                if crate::metadata_cache::ram_admission_permitted(&metadata) {
-                    self.metadata_cache
-                        .put(
-                            cache_key,
-                            (*metadata).clone(),
-                            self.resolved_metadata_ttls(cache_key).await,
-                        )
-                        .await;
-                }
-                self.metadata_cache.record_disk_hit();
-                Ok(crate::disk_cache::MetadataLookup {
-                    meta: Some(*metadata),
-                    corrupt: false,
-                    corrupt_reason: None,
-                })
-            }
-        }
-    }
-
-    /// Remove a corrupt `.meta` file (for HEAD-only paths that don't persist a fresh
-    /// `.meta` via `store_range`).
-    ///
-    /// The removal runs under the key's metadata slot lock, and the corruption verdict
-    /// is re-taken under that lock: the caller classified the file as corrupt from a read
-    /// it took before calling, and a concurrent writer may have republished a valid
-    /// `.meta` since. Deleting on the stale verdict would discard that writer's update,
-    /// so a file that parses at the time of the locked re-read is left in place.
-    ///
-    /// Spec: cache-metadata-resilience Req 3, Task 6
-    pub async fn remove_corrupt_metadata(&self, cache_key: &str) -> Result<()> {
-        let metadata_path = self.get_new_metadata_file_path(cache_key);
-        if metadata_path.exists() {
-            // Scoped to this block so the guard is released before the RAM invalidation
-            // below, which does not touch the `.meta`. The retrying `acquire_lock`: the
-            // caller has already served its response, so waiting here costs nothing on
-            // the client's path, and a corrupt file left behind costs a re-heal per request.
-            let _meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
-
-            // Re-check UNDER the lock. A file that now parses was republished by a
-            // concurrent writer after the caller's read, and is not ours to delete.
-            let still_corrupt = match std::fs::read_to_string(&metadata_path) {
-                Ok(content) => {
-                    serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content).is_err()
-                }
-                // Unreadable is the caller's verdict, confirmed.
-                Err(_) => true,
-            };
-            if !still_corrupt {
-                info!(
-                    "[METADATA_HEAL] .meta parses under the lock, leaving it in place: cache_key={}, path={:?}",
-                    cache_key, metadata_path
-                );
-            } else if let Err(e) = tokio::fs::remove_file(&metadata_path).await {
-                warn!(
-                    "[METADATA_HEAL] Failed to remove corrupt .meta: cache_key={}, path={:?}, error={}",
-                    cache_key, metadata_path, e
-                );
-                // Non-fatal — worst case, next request re-detects and re-heals
-            } else {
-                info!(
-                    "[METADATA_HEAL] Removed corrupt .meta for HEAD-only heal: cache_key={}, path={:?}",
-                    cache_key, metadata_path
-                );
-                crate::disk_cache::note_metadata_heal_overwrite(cache_key);
-            }
-        }
-        // Also invalidate RAM cache entry for this key
-        self.metadata_cache.invalidate(cache_key).await;
-        Ok(())
     }
 
     /// Invalidate metadata in both MetadataCache and optionally on disk
@@ -18739,304 +17460,6 @@ impl CacheManager {
             )))
         } else {
             Ok(())
-        }
-    }
-
-    /// Evict a single range
-    ///
-    /// Removes a specific range from cache by deleting its .bin file and
-    /// updating the metadata file. If this is the last range for an object,
-    /// the metadata file is also deleted.
-    ///
-    /// # Requirements
-    ///
-    /// - Requirement 9.4: Delete .bin file when range is deleted
-    /// - Requirement 9.5: Delete .meta file when last range is deleted
-    pub async fn evict_range(&self, cache_key: &str, start: u64, end: u64) -> Result<()> {
-        let metadata_path = self.get_new_metadata_file_path(cache_key);
-        // The lock lives in the SHARED slot namespace, not at a per-key `{key}.meta.lock`, so
-        // this holder excludes — and is excluded by — every other `.meta` writer including
-        // `MetadataLockManager` and the eviction rewrite. The slot file is never unlinked.
-        //
-        // Held as a guard for the rest of the function, bounded by the configured wait budget
-        // and acquired on the blocking pool.
-        let _meta_lock = crate::metadata_lock_manager::acquire_slot_lock_within_budget(
-            &self.cache_dir,
-            cache_key,
-        )
-        .await?;
-
-        // Read metadata
-        let metadata_content = std::fs::read_to_string(&metadata_path)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to read metadata: {}", e)))?;
-
-        let mut metadata: crate::cache_types::NewCacheMetadata =
-            serde_json::from_str(&metadata_content)
-                .map_err(|e| ProxyError::CacheError(format!("Failed to parse metadata: {}", e)))?;
-
-        // Find the range to evict
-        let range_to_evict = metadata
-            .ranges
-            .iter()
-            .find(|r| r.start == start && r.end == end)
-            .cloned();
-
-        if let Some(range) = range_to_evict {
-            // Delete .bin file
-            let range_path = self.cache_dir.join("ranges").join(&range.file_path);
-            if range_path.exists() {
-                std::fs::remove_file(&range_path).map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to delete range file: {}", e))
-                })?;
-            }
-        }
-
-        // Remove range from metadata
-        metadata
-            .ranges
-            .retain(|r| !(r.start == start && r.end == end));
-
-        if metadata.ranges.is_empty() {
-            // No ranges left, delete metadata file
-            std::fs::remove_file(&metadata_path).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to delete metadata file: {}", e))
-            })?;
-            debug!(
-                "Deleted metadata file for {} (no ranges remaining)",
-                cache_key
-            );
-        } else {
-            // Update metadata
-            let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
-            })?;
-            std::fs::write(&metadata_path, json).map_err(|e| {
-                crate::disk_cache::note_disk_full(&e, "evict_range.meta");
-                ProxyError::CacheError(format!("Failed to write metadata: {}", e))
-            })?;
-        }
-
-        // The `.meta` just changed or went away; this instance's RAM copy of it is stale.
-        self.metadata_cache.invalidate(cache_key).await;
-
-        // The lock is released by `_meta_lock`'s `Drop` at the end of this function, on every
-        // path including the `?` returns above — which the explicit unlock this replaced did
-        // not cover.
-        Ok(())
-    }
-
-    /// Coordinate cache cleanup across multiple instances
-    pub async fn coordinate_cleanup(&self) -> Result<u64> {
-        // Check if active GET cache expiration is enabled
-        if !self.actively_remove_cached_data {
-            debug!("GET cache active expiration is disabled (actively_remove_cached_data=false), skipping cleanup");
-            return Ok(0);
-        }
-
-        debug!("Starting coordinated GET cache cleanup (actively_remove_cached_data=true)");
-        let mut cleaned_count = 0u64;
-        let now = SystemTime::now();
-
-        // Walk through all cache directories
-        let cache_types = ["metadata", "ranges", "parts"];
-
-        for cache_type in &cache_types {
-            let cache_type_dir = self.cache_dir.join(cache_type);
-            if !cache_type_dir.exists() {
-                continue;
-            }
-
-            let entries = match std::fs::read_dir(&cache_type_dir) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    warn!("Failed to read cache directory {:?}: {}", cache_type_dir, e);
-                    continue;
-                }
-            };
-
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(_) => continue,
-                };
-
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                    // Read metadata file to check expiration
-                    if let Ok(metadata_content) = std::fs::read_to_string(&path) {
-                        if let Ok(new_metadata) = serde_json::from_str::<
-                            crate::cache_types::NewCacheMetadata,
-                        >(&metadata_content)
-                        {
-                            let cache_key = &new_metadata.cache_key;
-
-                            // Check if entry is expired
-                            if now > new_metadata.expires_at {
-                                // Check if entry is actively being used by other instances
-                                if !self.is_cache_entry_active(cache_key).await? {
-                                    // Safe to clean up
-                                    if let Err(e) = self.invalidate_cache(cache_key).await {
-                                        warn!(
-                                            "Failed to clean up expired entry {}: {}",
-                                            cache_key, e
-                                        );
-                                    } else {
-                                        cleaned_count += 1;
-                                        debug!("Cleaned up expired cache entry: {}", cache_key);
-                                    }
-                                } else {
-                                    debug!(
-                                        "Skipping cleanup of {} - actively being used",
-                                        cache_key
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // A sweep of `cache_dir/locks` used to sit here, unlinking every `*.lock` whose
-        // payload deserialised as an expired per-key write sentinel. The sentinel namespace
-        // is retired, so there is nothing left in that directory for a sweep to remove: it
-        // holds `global_eviction.lock` and `initialization.lock`, both payload-free `fs4`
-        // advisory locks that no sweep may ever unlink — unlinking a held `flock` does not
-        // delay mutual exclusion, it ends it. Removing the sweep removes that hazard
-        // outright rather than guarding against it.
-
-        if cleaned_count > 0 {
-            info!(
-                "Coordinated cleanup removed {} expired cache entries",
-                cleaned_count
-            );
-            let mut inner = self.inner.lock().unwrap();
-            inner.statistics.expired_entries += cleaned_count;
-        }
-
-        Ok(cleaned_count)
-    }
-
-    /// Calculate expiration time with path for TTL overrides
-    async fn calculate_expiration_time_with_context(
-        &self,
-        headers: &HashMap<String, String>,
-        path: &str,
-    ) -> SystemTime {
-        let effective_get_ttl = self.get_effective_get_ttl(path).await;
-        self.calculate_expiration_time_with_get_ttl(headers, effective_get_ttl)
-    }
-
-    /// Calculate expiration time with configurable default TTL
-    ///
-    /// No stored entry's expiry depends on this. Its two callers put the result only in the
-    /// transient `CacheEntry` handed to `store_in_ram_cache`, and
-    /// `convert_cache_entry_to_ram_entry` does not carry `expires_at` into the RAM entry.
-    fn calculate_expiration_time_with_get_ttl(
-        &self,
-        headers: &HashMap<String, String>,
-        get_ttl: std::time::Duration,
-    ) -> SystemTime {
-        let now = SystemTime::now();
-
-        // Check Cache-Control header - Requirements 5.1, 5.2
-        if let Some(cache_control) = headers.get("cache-control") {
-            let cache_control_lower = cache_control.to_lowercase();
-
-            // Requirement 5.2: Handle no-cache and no-store directives
-            if cache_control_lower.contains("no-cache") || cache_control_lower.contains("no-store")
-            {
-                debug!(
-                    "Cache-Control directive prevents caching: {}",
-                    cache_control
-                );
-                return now; // Expire immediately
-            }
-
-            // Handle must-revalidate directive
-            if cache_control_lower.contains("must-revalidate") {
-                debug!("Cache-Control must-revalidate directive found");
-                // Still cache but with shorter TTL for revalidation
-            }
-
-            // Requirement 5.1: Parse max-age directive
-            if let Some(max_age) = self.parse_cache_control_max_age(&cache_control_lower) {
-                debug!("Using Cache-Control max-age: {} seconds", max_age);
-                return safe_expiry(now, std::time::Duration::from_secs(max_age));
-            }
-
-            // s-maxage is read only when max-age is absent, so max-age wins when both are
-            // set. Left in that order because nothing consumes the result (see above).
-            if let Some(s_maxage) =
-                self.parse_cache_control_directive(&cache_control_lower, "s-maxage")
-            {
-                debug!("Using Cache-Control s-maxage: {} seconds", s_maxage);
-                return safe_expiry(now, std::time::Duration::from_secs(s_maxage));
-            }
-        }
-
-        // Requirement 5.3: Check Expires header if no Cache-Control
-        if let Some(expires) = headers.get("expires") {
-            if let Some(expires_time) = self.parse_http_date(expires) {
-                debug!("Using Expires header: {}", expires);
-                return expires_time;
-            } else {
-                warn!("Failed to parse Expires header: {}", expires);
-            }
-        }
-
-        // Requirement 5.4: Use configured default TTL when no cache headers are present
-        debug!("Using default TTL: {:?}", get_ttl);
-        safe_expiry(now, get_ttl)
-    }
-
-    /// Parse Cache-Control max-age directive
-    fn parse_cache_control_max_age(&self, cache_control: &str) -> Option<u64> {
-        self.parse_cache_control_directive(cache_control, "max-age")
-    }
-
-    /// Parse a specific Cache-Control directive value
-    fn parse_cache_control_directive(&self, cache_control: &str, directive: &str) -> Option<u64> {
-        let directive_pattern = format!("{}=", directive);
-        if let Some(start) = cache_control.find(&directive_pattern) {
-            let value_start = start + directive_pattern.len();
-            let value_str = &cache_control[value_start..];
-
-            // Find the end of the value (comma, semicolon, or end of string)
-            let value_end = value_str.find([',', ';']).unwrap_or(value_str.len());
-            let value_str = &value_str[..value_end].trim();
-
-            match value_str.parse::<u64>() {
-                Ok(value) => Some(value),
-                Err(_) => {
-                    warn!(
-                        "Failed to parse Cache-Control {} value: {}",
-                        directive, value_str
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Parse HTTP date format (RFC 7231) - Requirement 5.3
-    fn parse_http_date(&self, date_str: &str) -> Option<SystemTime> {
-        // Try to parse common HTTP date formats
-        // RFC 7231 specifies three formats:
-        // 1. IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
-        // 2. RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
-        // 3. asctime: Sun Nov  6 08:49:37 1994
-
-        // For now, implement a basic parser for the most common format
-        // A full implementation would use a proper HTTP date parsing library
-
-        if let Ok(parsed_time) = httpdate::parse_http_date(date_str) {
-            Some(parsed_time)
-        } else {
-            warn!("Failed to parse HTTP date: {}", date_str);
-            None
         }
     }
 
@@ -19685,30 +18108,8 @@ impl CacheManager {
             part_number,
         }
     }
-    /// Store GetObjectPart response as range with comprehensive error handling
-    /// Requirements: 3.1, 3.3, 3.4, 3.5, 8.2, 11.1, 11.2
-    ///
-    /// This method stores a GetObjectPart response as a range using Content-Range header
-    /// and records appropriate metrics. Handles storage failures gracefully.
-    pub async fn store_part_as_range(
-        &self,
-        cache_key: &str,
-        part_number: u32,
-        content_range: &str,
-        headers: &HashMap<String, String>,
-        body: &[u8],
-    ) -> Result<()> {
-        self.store_part_as_range_witnessed(
-            cache_key,
-            part_number,
-            content_range,
-            headers,
-            body,
-            None,
-        )
-        .await
-    }
-    /// [`Self::store_part_as_range`] guarded by the `?partNumber=` GET's version witness:
+    /// Store a GetObjectPart response as the range its `Content-Range` names, guarded by the
+    /// `?partNumber=` GET's version witness:
     /// the range publishes, its journal `Add` is folded and the part's entry is added to the
     /// `.meta`'s `part_ranges` only while the key's write-order marker still holds the witness,
     /// each checked under the key's slot lock. The layout is recorded only in a `.meta` of the
@@ -19720,7 +18121,7 @@ impl CacheManager {
         content_range: &str,
         headers: &HashMap<String, String>,
         body: &[u8],
-        fill_witness: Option<FillWitness>,
+        fill_witness: FillWitness,
     ) -> Result<()> {
         debug!(
             "Storing part as range: cache_key={}, part_number={}, content_range={}",
@@ -19787,7 +18188,7 @@ impl CacheManager {
         let resolved = self.resolve_settings(cache_key).await;
         let should_compress = self.effective_compression(&resolved, cache_key, body.len() as u64);
 
-        // `store_range`'s two phases, with the witness attached to the publish.
+        // `prepare_range_store`'s two phases, with the witness attached to the publish.
         let stored = match disk_cache
             .prepare_range_store(
                 cache_key,
@@ -19797,10 +18198,11 @@ impl CacheManager {
                 object_metadata,
                 resolved.get_ttl,
                 should_compress,
+                fill_witness.clone(),
             )
             .await
         {
-            Ok(Some(fill)) => fill.with_fill_witness(fill_witness.clone()).finish().await,
+            Ok(Some(fill)) => fill.finish().await,
             Ok(None) => Ok(()),
             Err(e) => Err(e),
         };
@@ -19836,7 +18238,7 @@ impl CacheManager {
                         body.len() as u64,
                         Some(part_number),
                         Some((start, end)),
-                        fill_witness.as_ref(),
+                        &fill_witness,
                     )
                     .await
                 {
@@ -19879,7 +18281,7 @@ impl CacheManager {
                         .record_part_cache_error(
                             cache_key,
                             part_number,
-                            "store_range",
+                            "prepare_range_store",
                             &e.to_string(),
                         )
                         .await;
@@ -19923,7 +18325,7 @@ impl CacheManager {
         content_length: u64,
         part_number: Option<u32>,
         part_range: Option<(u64, u64)>,
-        fill_witness: Option<&FillWitness>,
+        fill_witness: &FillWitness,
     ) -> Result<()> {
         debug!(
             "Populating multipart metadata on part request for cache_key: {}, part_number: {:?}, part_range: {:?}",
@@ -19939,7 +18341,7 @@ impl CacheManager {
             cache_key,
         )
         .await?;
-        if fill_witness.is_some_and(|w| !w.holds(&metadata_file_path)) {
+        if !fill_witness.holds(&metadata_file_path) {
             debug!(
                 "Part layout not recorded (superseded by an acknowledged write): key={}",
                 cache_key
@@ -20099,100 +18501,6 @@ impl CacheManager {
             Ok(())
         }
     }
-    /// Get a whole-object entry from the RAM cache.
-    ///
-    /// Gated on the global `ram_cache_enabled` only — no freshness check, no
-    /// `get_ttl`, no `ram_cache_eligible`.
-    ///
-    /// # Reachability, established 2026-09-01 — and it is NOT what it looks like
-    ///
-    /// `get-ttl-zero-enforcement` task 16 asked whether this needs a `get_ttl` gate,
-    /// and explicitly said to establish reachability before assigning severity. Done,
-    /// searching `src/`, `tests/` and `examples/` separately. Two callers:
-    ///
-    /// **(a) [`CacheManager::get_cached_response`] — NO LONGER LIVE, as of the
-    /// `META-CLOBBER-FIX` deletion.** It had exactly one request-reachable caller,
-    /// [`CacheManager::refresh_cache_ttl`]'s old-format backward-compatibility block,
-    /// reached from the three download-coordination "validated serve" paths. That
-    /// block published a `CacheEntry` over the current-format `.meta` and has been
-    /// deleted, so `refresh_cache_ttl` no longer calls `get_cached_response` at all.
-    ///
-    /// Its remaining callers were already not live:
-    /// `check_cache_consistency` (only callers are in `tests/`) and a `quickcheck`
-    /// property fn inside `#[cfg(test)]`. A third, `get_multipart_part`, had zero
-    /// callers anywhere and was **deleted by `DEADCODE-SWEEP`**; it was `pub`, which
-    /// is why `dead_code` never fired on it.
-    ///
-    /// So `get_cached_response`, and therefore this function through it, is now
-    /// production-unreachable. That makes the severity question moot rather than
-    /// answered — an unreachable read cannot serve a stale response — and it makes
-    /// both functions dead `pub` surface. Recorded here, deliberately not actioned:
-    /// `DEADCODE-SWEEP` owns that removal, and this function is also reached from
-    /// `tests/`.
-    ///
-    /// **(b) [`CacheManager::get_write_cache_entry`] — TEST-ONLY.** Its sole `src/`
-    /// caller is `is_write_cache_entry_expired`, which itself has no `src/` caller;
-    /// the entire live-caller set of both is the test suite. What production reads
-    /// staged write-cache entries with instead was NOT traced — treat that as
-    /// unverified rather than assumed.
-    ///
-    /// # Decision: documented, not gated
-    ///
-    /// Originally decided when the caller above was live: a `get_ttl` argument here
-    /// would have changed one legacy compatibility arm of a best-effort TTL refresh,
-    /// on a path that serves no bytes, at the cost of a signature change. That arm no
-    /// longer exists, so there is even less to gate. The authorization boundary this
-    /// spec is about is enforced where bytes are actually served — see
-    /// [`CacheManager::get_range_from_ram_cache_hit`], which does take the resolved
-    /// `get_ttl` as a required parameter.
-    ///
-    /// Revisit if a future caller uses this function's result to build a response.
-    /// That is the condition, and it is the only one.
-    async fn get_from_ram_cache(&self, cache_key: &str) -> Result<Option<RamCacheRead>> {
-        if !self.ram_cache_enabled {
-            return Ok(None);
-        }
-
-        if let Some(ram_cache) = &self.ram_cache {
-            let result = ram_cache.get(cache_key).await;
-            Ok(result)
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Store cache entry in RAM cache
-    /// Gated on the per-key `ram_cache_eligible` as well as the global flag
-    /// (`get-ttl-zero-enforcement` R4.4, task 19). **Hygiene, not a control**: the
-    /// lookup-side gates shipped in 2.8.6/2.8.7 already make such an entry unreachable
-    /// from the three range entry points, and admission cannot bind a key whose rule is
-    /// tightened after the write. What it buys is not spending the footprint on an
-    /// entry no read path may use.
-    async fn store_in_ram_cache(&self, cache_entry: &CacheEntry) -> Result<()> {
-        if !self.ram_cache_enabled {
-            return Ok(());
-        }
-
-        let resolved = self.resolve_settings(&cache_entry.cache_key).await;
-        if !resolved.ram_cache_eligible {
-            debug!(
-                "Skipping RAM cache store for {}: ram_cache_eligible=false (source={:?})",
-                cache_entry.cache_key, resolved.source
-            );
-            self.record_ram_eligibility_skip();
-            return Ok(());
-        }
-
-        // Convert CacheEntry to RamCacheEntry
-        let ram_entry = self.convert_cache_entry_to_ram_entry(cache_entry)?;
-
-        if let Some(ram_cache) = &self.ram_cache {
-            ram_cache.put(ram_entry).await?;
-            debug!("Stored entry in RAM cache: {}", cache_entry.cache_key);
-        }
-
-        Ok(())
-    }
 
     /// Remove cache entry from RAM cache - unified invalidation for both GET and HEAD entries
     /// Requirements: 11.1, 11.3, 11.4
@@ -20225,9 +18533,9 @@ impl CacheManager {
         }
 
         if let Some(ram_cache) = &self.ram_cache {
-            // Invalidate the exact entry
-            ram_cache.invalidate(cache_key).await?;
-            // Invalidate all range entries for this cache key
+            // The RAM tier holds ranges only, keyed `{key}:range:{start}:{end}`, so the
+            // key's prefix is the whole of what it can hold. An exact-key invalidation
+            // would evict a range of some other object named `{key}:range:{start}:{end}`.
             let range_prefix = format!("{}:range:", cache_key);
             let removed = ram_cache.invalidate_by_prefix(&range_prefix).await?;
             if removed > 0 {
@@ -20239,95 +18547,6 @@ impl CacheManager {
         }
 
         Ok(())
-    }
-
-    /// Convert RAM cache read-view to regular cache entry
-    fn convert_ram_entry_to_cache_entry(
-        &self,
-        cache_key: &str,
-        ram_read: RamCacheRead,
-    ) -> Result<CacheEntry> {
-        // Decompress if needed — returns owned Vec<u8>
-        let data = if ram_read.compressed {
-            self.decompress_ram_cache_read(&ram_read)?
-        } else {
-            ram_read.data.to_vec()
-        };
-
-        Ok(CacheEntry {
-            cache_key: cache_key.to_string(),
-            headers: HashMap::new(), // RAM cache doesn't store headers separately
-            body: Some(data),
-            ranges: Vec::new(),
-            metadata: ram_read.metadata.clone(),
-            created_at: SystemTime::now(),
-            expires_at: safe_expiry(SystemTime::now(), std::time::Duration::from_secs(3600)),
-            metadata_expires_at: safe_expiry(SystemTime::now(), self.head_ttl),
-            compression_info: CompressionInfo::default(),
-            is_put_cached: false,
-        })
-    }
-
-    /// Convert regular cache entry to RAM cache entry
-    /// Preserves compression state from disk cache to avoid decompress/recompress cycles
-    fn convert_cache_entry_to_ram_entry(&self, cache_entry: &CacheEntry) -> Result<RamCacheEntry> {
-        // Extract data and compression info from disk cache entry
-        // All cached data uses LZ4 frame format now
-        let (data, compression_algorithm, is_compressed) = if let Some(body) = &cache_entry.body {
-            // Use body data as-is (already processed by disk cache)
-            let algorithm = cache_entry.compression_info.body_algorithm.clone();
-            (body.clone(), algorithm, true)
-        } else if !cache_entry.ranges.is_empty() {
-            // If no body but has ranges, concatenate range data
-            let mut combined_data = Vec::new();
-            let mut first_algorithm = None;
-            let mut all_same_algorithm = true;
-
-            for range in &cache_entry.ranges {
-                combined_data.extend_from_slice(&range.data);
-
-                // Track compression algorithm consistency across ranges
-                if first_algorithm.is_none() {
-                    first_algorithm = Some(range.compression_algorithm.clone());
-                } else if first_algorithm.as_ref() != Some(&range.compression_algorithm) {
-                    all_same_algorithm = false;
-                }
-            }
-
-            // Use the first range's algorithm if all ranges use the same algorithm
-            let algorithm = if all_same_algorithm {
-                first_algorithm.unwrap_or(crate::compression::CompressionAlgorithm::Lz4)
-            } else {
-                // Mixed compression algorithms in ranges - use Lz4 as default
-                crate::compression::CompressionAlgorithm::Lz4
-            };
-
-            (combined_data, algorithm, true)
-        } else {
-            // No data
-            (
-                Vec::new(),
-                crate::compression::CompressionAlgorithm::Lz4,
-                false,
-            )
-        };
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        Ok(RamCacheEntry {
-            cache_key: cache_entry.cache_key.clone(),
-            data: Arc::new(Bytes::from(data)),
-            metadata: cache_entry.metadata.clone(),
-            created_at: cache_entry.created_at,
-            last_accessed: AtomicU64::new(now_ms),
-            access_count: AtomicU64::new(0),
-            compressed: is_compressed,
-            compression_algorithm,
-            verified_at: AtomicU64::new(now_ms),
-        })
     }
 
     // ===== UNIFIED HEAD CACHE OPERATIONS =====
@@ -20394,7 +18613,7 @@ impl CacheManager {
                         cache_key
                     );
                     // Invalidate for the same convergence reason as the part-scoped
-                    // guard: a cache-hit HEAD never calls store_head_cache_entry_unified,
+                    // guard: a cache-hit HEAD never calls store_head_cache_entry_unified_witnessed,
                     // so nothing heals this entry, and it has no ranges to re-publish it
                     // to RAM after the disk rewrite (R5.3).
                     self.metadata_cache.invalidate(cache_key).await;
@@ -20436,7 +18655,7 @@ impl CacheManager {
     /// written before the anchor existed.
     ///
     /// Uses the new MetadataCache for RAM caching and NewCacheMetadata for unified storage.
-    pub async fn get_head_cache_entry_unified(
+    pub(crate) async fn get_head_cache_entry_unified(
         &self,
         cache_key: &str,
         current_head_ttl: Duration,
@@ -20581,21 +18800,7 @@ impl CacheManager {
         }
     }
 
-    /// Store HEAD cache entry unified with comprehensive error handling - Task 3.3, 7.1
-    /// Requirements: 1.2, 3.1, 11.1, 11.2
-    ///
-    /// This method stores HEAD metadata in the unified format (NewCacheMetadata).
-    pub async fn store_head_cache_entry_unified(
-        &self,
-        cache_key: &str,
-        headers: HashMap<String, String>,
-        metadata: CacheMetadata,
-    ) -> Result<()> {
-        self.store_head_cache_entry_unified_witnessed(cache_key, headers, metadata, None)
-            .await
-    }
-
-    /// [`Self::store_head_cache_entry_unified`] for a HEAD-miss response, guarded by the version
+    /// Store a HEAD-miss response in the unified metadata format, guarded by the version
     /// witness captured before its S3 request: nothing is published, merged or
     /// dereferenced unless, under the key's slot lock, the write-order marker still holds it.
     pub(crate) async fn store_head_cache_entry_unified_witnessed(
@@ -20603,7 +18808,7 @@ impl CacheManager {
         cache_key: &str,
         headers: HashMap<String, String>,
         metadata: CacheMetadata,
-        fill_witness: Option<FillWitness>,
+        fill_witness: FillWitness,
     ) -> Result<()> {
         debug!("Storing HEAD cache entry (unified) for key: {}", cache_key);
 
@@ -20695,10 +18900,7 @@ impl CacheManager {
             .metadata_lock_manager()
             .try_run_locked_blocking(cache_key, move |meta_lock| {
                 let cache_key = owned_key.as_str();
-                if fill_witness
-                    .as_ref()
-                    .is_some_and(|w| !w.holds(&metadata_path))
-                {
+                if !fill_witness.holds(&metadata_path) {
                     drop(meta_lock);
                     return Ok(HeadStoreOutcome::Superseded);
                 }
@@ -20859,7 +19061,7 @@ impl CacheManager {
     /// [`Self::is_part_scoped_entry`] to be able to use it as a fingerprint
     /// without firing on entries this release itself writes. Nothing is lost:
     /// the part count survives as the typed `ObjectMetadata::parts_count` field,
-    /// which `store_part_as_range` populates from this same header.
+    /// which `store_part_as_range_witnessed` populates from this same header.
     fn strip_response_scoped_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
         headers
             .iter()
@@ -20875,7 +19077,7 @@ impl CacheManager {
     ///
     /// A correct whole-object entry never carries a stored `content-range` or
     /// `x-amz-mp-parts-count`: [`Self::strip_response_scoped_headers`] removes
-    /// both at every write site, including `store_part_as_range`, so an entry
+    /// both at every write site, including `store_part_as_range_witnessed`, so an entry
     /// legitimately populated by a part GET does not trip this. Their presence in
     /// stored object metadata is therefore the fingerprint of the
     /// part-scoped-HEAD defect present from v0.5.0 (2026-01-02) through 2.5.0, so
@@ -20898,7 +19100,7 @@ impl CacheManager {
     /// practice, one release cycle after every fleet has upgraded and the
     /// configured `get_ttl` / `head_ttl` have elapsed. Delete the detector, its
     /// call site in the read path, and the tests that plant a poisoned entry.
-    pub fn is_part_scoped_entry(om: &crate::cache_types::ObjectMetadata) -> bool {
+    pub(crate) fn is_part_scoped_entry(om: &crate::cache_types::ObjectMetadata) -> bool {
         om.response_headers.keys().any(|k| {
             k.eq_ignore_ascii_case("content-range")
                 || k.eq_ignore_ascii_case("x-amz-mp-parts-count")
@@ -20963,7 +19165,7 @@ impl CacheManager {
     /// release cycle after every fleet has upgraded and the configured `get_ttl`
     /// / `head_ttl` have elapsed. Delete the detector, [`EMPTY_OBJECT_ETAG`], the
     /// three read-path call sites, and `empty_object_etag_guard_tests`.
-    pub fn is_empty_object_etag_entry(om: &crate::cache_types::ObjectMetadata) -> bool {
+    pub(crate) fn is_empty_object_etag_entry(om: &crate::cache_types::ObjectMetadata) -> bool {
         om.content_length > 0 && crate::revalidation::normalize_etag(&om.etag) == EMPTY_OBJECT_ETAG
     }
 
@@ -20986,7 +19188,7 @@ impl CacheManager {
     ///
     /// `dereference_all_ranges_for_empty_publish` does NOT republish — it removes and debits
     /// the superseded range files and reports whether the document was staged. Both existing
-    /// callers (`store_full_object_as_range_new`'s zero-length arm and the signed-PUT
+    /// callers (`store_full_object_as_range_witnessed`'s zero-length arm and the signed-PUT
     /// empty-body arm) follow it with their own `store_new_metadata` under the same lock.
     /// This does the same, in the same order, under the same lock.
     ///
@@ -21105,12 +19307,12 @@ impl CacheManager {
     /// same convention as [`Self::store_new_metadata`] and
     /// `dereference_superseded_full_object_ranges`. It must NOT acquire: the caller's read
     /// already chose this arm over the HEAD-only one, so the lock has to span that read too
-    /// — see `store_head_cache_entry_unified`. Acquiring here would also self-deadlock
+    /// — see `store_head_cache_entry_unified_witnessed`. Acquiring here would also self-deadlock
     /// against the caller's guard, since `flock` conflicts between two descriptors of the
     /// same slot file within one process.
     ///
     /// Synchronous, and run on the blocking thread that holds the slot: see
-    /// `store_head_cache_entry_unified`. `metadata` is the caller's locked read of the `.meta`,
+    /// `store_head_cache_entry_unified_witnessed`. `metadata` is the caller's locked read of the `.meta`,
     /// so the document mutated below cannot be superseded between that read and the rename at
     /// the end of this function — and note the mutation is not merely additive: the
     /// `etag_changed || size_changed` branch below CLEARS `ranges`, so a lost update here
@@ -21504,7 +19706,7 @@ impl CacheManager {
     /// Note: This does NOT delete the .meta file in metadata/ directory because
     /// ranges may still be valid even if HEAD is invalidated. The HEAD fields
     /// in NewCacheMetadata will be refreshed on the next HEAD request.
-    pub async fn invalidate_head_cache_entry_unified(&self, cache_key: &str) -> Result<()> {
+    pub(crate) async fn invalidate_head_cache_entry_unified(&self, cache_key: &str) -> Result<()> {
         debug!(
             "Invalidating HEAD cache entry (unified) for key: {}",
             cache_key
@@ -21558,19 +19760,8 @@ impl CacheManager {
         debug!("Invalidated HEAD cache entry for key: {}", cache_key);
         Ok(())
     }
-    /// Store response with headers for full HTTP response caching
-    pub async fn store_response_with_headers(
-        &self,
-        cache_key: &str,
-        response: &[u8],
-        headers: HashMap<String, String>,
-        metadata: CacheMetadata,
-    ) -> Result<()> {
-        self.store_response_with_headers_witnessed(cache_key, response, headers, metadata, None)
-            .await
-    }
 
-    /// [`Self::store_response_with_headers`] for a full-object GET-miss fill, guarded by the
+    /// A full-object GET-miss fill, guarded by the
     /// version witness captured before its S3 request. The disk publish checks it under
     /// the key's slot lock. This function stores no RAM copy. After the publish it re-reads the
     /// marker and, if a stamp ran meanwhile, invalidates the key's RAM range entries (a stamp's
@@ -21581,7 +19772,7 @@ impl CacheManager {
         response: &[u8],
         headers: HashMap<String, String>,
         metadata: CacheMetadata,
-        fill_witness: Option<FillWitness>,
+        fill_witness: FillWitness,
     ) -> Result<()> {
         debug!("Storing cache entry with headers for key: {}", cache_key);
 
@@ -21621,19 +19812,16 @@ impl CacheManager {
                 cache_key,
                 response,
                 object_metadata,
-                fill_witness.as_ref(),
+                &fill_witness,
             )
             .await?;
-        if let Some(witness) = &fill_witness {
-            if published && self.ram_cache_enabled {
-                let meta_path = self.get_new_metadata_file_path(cache_key);
-                let witness = witness.clone();
-                let still_current = tokio::task::spawn_blocking(move || witness.holds(&meta_path))
-                    .await
-                    .unwrap_or(false);
-                if !still_current {
-                    let _ = self.remove_from_ram_cache_unified(cache_key).await;
-                }
+        if published && self.ram_cache_enabled {
+            let meta_path = self.get_new_metadata_file_path(cache_key);
+            let still_current = tokio::task::spawn_blocking(move || fill_witness.holds(&meta_path))
+                .await
+                .unwrap_or(false);
+            if !still_current {
+                let _ = self.remove_from_ram_cache_unified(cache_key).await;
             }
         }
 
@@ -21644,55 +19832,11 @@ impl CacheManager {
 
         Ok(())
     }
-    /// Expiration cleanup of the disk cache and the write cache - Requirements 5.1, 5.2, 5.3, 5.4, 5.5.
-    /// The RAM cache is not swept here.
-    pub async fn cleanup_expired_entries_comprehensive(&self) -> Result<CacheMaintenanceResult> {
-        debug!("Starting comprehensive cache expiration cleanup");
-        let mut result = CacheMaintenanceResult {
-            disk_cleaned: 0,
-            errors: Vec::new(),
-        };
-
-        // Clean up disk cache expired entries
-        match self.coordinate_cleanup().await {
-            Ok(cleaned) => {
-                result.disk_cleaned = cleaned;
-                debug!("Cleaned up {} expired disk cache entries", cleaned);
-            }
-            Err(e) => {
-                let error_msg = format!("Disk cache cleanup failed: {}", e);
-                warn!("{}", error_msg);
-                result.errors.push(error_msg);
-            }
-        }
-
-        // Clean up expired write cache entries
-        match self.cleanup_expired_write_cache_entries().await {
-            Ok(write_cleaned) => {
-                result.disk_cleaned += write_cleaned;
-                debug!("Cleaned up {} expired write cache entries", write_cleaned);
-            }
-            Err(e) => {
-                let error_msg = format!("Write cache cleanup failed: {}", e);
-                warn!("{}", error_msg);
-                result.errors.push(error_msg);
-            }
-        }
-
-        if result.disk_cleaned > 0 {
-            info!(
-                "Comprehensive cache cleanup completed: {} disk cleaned",
-                result.disk_cleaned
-            );
-        }
-
-        Ok(result)
-    }
 
     /// RAM cache statistics, awaited rather than blocked on.
     ///
     /// The form every async caller uses, and the only one the `/health`, `/metrics` and
-    /// dashboard scrapes reach: [`Self::get_ram_cache_stats`] runs `block_in_place`,
+    /// dashboard scrapes reach: [`Self::ram_cache_stats`] runs `block_in_place`,
     /// which takes the calling worker out of the runtime for the whole call.
     ///
     /// It still awaits every shard's read lock (`ShardedRamCache::stats`), so a scrape queues
@@ -21704,29 +19848,6 @@ impl CacheManager {
         }
         let ram_cache = self.ram_cache.as_ref()?;
         Some(ram_cache.stats().await)
-    }
-
-    /// Get RAM cache statistics from synchronous code. Async callers use
-    /// [`Self::ram_cache_stats`].
-    pub fn get_ram_cache_stats(&self) -> Option<crate::ram_cache::RamCacheStats> {
-        if !self.ram_cache_enabled {
-            return None;
-        }
-
-        // ShardedRamCache::stats() is async; use a blocking call here.
-        // Tasks 4.2–4.7 will refactor callers to async where needed.
-        if let Some(ram_cache) = &self.ram_cache {
-            let handle = tokio::runtime::Handle::try_current();
-            if let Ok(handle) = handle {
-                Some(tokio::task::block_in_place(|| {
-                    handle.block_on(ram_cache.stats())
-                }))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
     }
 
     /// Count one RAM-tier admission declined because `ram_cache_eligible` resolved `false`.
@@ -22090,98 +20211,13 @@ impl CacheManager {
         }
     }
 
-    /// Load range data from RAM cache, returning the decompressed data if found.
-    /// Records hit/miss statistics. Returns None on miss, if RAM cache is disabled,
-    /// or if `get_ttl` is zero.
-    ///
-    /// # This function has NO production caller, and that is why it takes `get_ttl`
-    ///
-    /// Every call site is in this module's own `#[cfg(test)]` block or under
-    /// `tests/` (established 2026-09-01 by grepping `src/`, `tests/` and
-    /// `examples/` separately, per `cache-tier-verification.md` § "Establish
-    /// reachability BEFORE assigning severity"). Production uses
-    /// [`CacheManager::get_range_from_ram_cache_hit`] instead, which returns the
-    /// entry's validators alongside its bytes.
-    ///
-    /// So the exposure today is zero, and the hazard is entirely prospective: a
-    /// `pub fn` that reads the RAM tier with no freshness argument is exactly what a
-    /// future read path would reach for, and nothing would fail. Taking `get_ttl`
-    /// costs the tests a parameter and removes that. It is NOT dead code — see the
-    /// same steering note on `pub` items and on tests as specification oracles;
-    /// several of its callers are the property tests that pin RAM-tier
-    /// byte-exactness.
-    pub fn get_range_from_ram_cache(
-        &self,
-        cache_key: &str,
-        start: u64,
-        end: u64,
-        get_ttl: Duration,
-    ) -> Option<Bytes> {
-        if !self.ram_cache_enabled {
-            return None;
-        }
-        // `get-ttl-zero-enforcement` R4.2, same rule as `get_range_from_ram_cache_hit`.
-        if get_ttl.is_zero() {
-            return None;
-        }
-
-        let range_cache_key = Self::generate_ram_range_key(cache_key, start, end);
-
-        let ram_read = {
-            if let Some(ram_cache) = &self.ram_cache {
-                let handle = tokio::runtime::Handle::try_current().ok()?;
-                tokio::task::block_in_place(|| handle.block_on(ram_cache.get(&range_cache_key)))
-            } else {
-                None
-            }
-        };
-
-        if let Some(ram_read) = ram_read {
-            let compressed = ram_read.compressed;
-            let entry_data = ram_read.data.clone();
-            // Dispatch by the entry's algorithm tag so legacy None-tagged (raw)
-            // ranges are returned verbatim instead of being fed to the LZ4
-            // decoder. Spec: compression-followup-fixes Requirement 2.
-            let algorithm = ram_read.compression_algorithm.clone();
-
-            // The uncompressed arm clones the `Bytes` out of the `Arc` (a refcount
-            // bump) rather than `.to_vec()`, which copied the whole Page on every RAM
-            // hit — the hottest path in page mode. Requirement: IMA 5.2
-            let data = if compressed {
-                debug!("Decompressing RAM cache range data for {}-{}", start, end);
-                let inner = self.inner.lock().unwrap();
-                match inner
-                    .compression_handler
-                    .decompress_with_algorithm(&entry_data, algorithm)
-                {
-                    Ok(decompressed) => Bytes::from(decompressed),
-                    Err(e) => {
-                        error!(
-                            "Failed to decompress RAM cache range data for {}-{}: {}",
-                            start, end, e
-                        );
-                        return None;
-                    }
-                }
-            } else {
-                entry_data.as_ref().clone()
-            };
-
-            self.update_ram_cache_hit_statistics();
-            Some(data)
-        } else {
-            None
-        }
-    }
-
     /// Promote a range to RAM cache from its on-disk frame bytes, verbatim.
     ///
     /// Unlike `promote_range_to_ram_cache` (which stores caller-supplied bytes
     /// uncompressed), this stores `frame_data` — the raw on-disk frame
     /// (compressed or store-mode) — with `compressed: true` and the range's
-    /// tagged `compression_algorithm`, performing no decompression. This
-    /// mirrors the full-object (`convert_cache_entry_to_ram_entry`) and
-    /// write-cache (`convert_write_entry_to_ram_entry`) promotion paths
+    /// tagged `compression_algorithm`, performing no decompression, so the
+    /// RAM entry mirrors the on-disk footprint
     /// (compression-content-aware-fix Requirement 9). Skips promotion if RAM
     /// cache is disabled or the frame exceeds `max_ram_cache_size`.
     ///
@@ -22683,7 +20719,7 @@ impl CacheManager {
         if !pending_publish.still_written_by_this_fill(cache_key) {
             drop(pending_publish);
             crate::metadata_lock_manager::release_off_worker(meta_lock).await;
-            return Ok(PublishOutcome::Superseded);
+            return Ok(PublishOutcome::TemporaryReplaced);
         }
         let range_already_existed = pending_publish.publish()?;
         #[cfg(test)]
@@ -22910,10 +20946,9 @@ impl CacheManager {
     /// [`crate::cache_types::NewCacheMetadata`], and writes the `.meta`
     /// **immediately** via `store_new_metadata` (then invalidates the RAM metadata
     /// cache). Writing the `.meta` synchronously is what preserves read-after-write
-    /// cache semantics — an immediate post-PUT GET is a hit. The streaming sink's
-    /// journal-only `commit` defers the `.meta` until consolidation, which would
-    /// turn that GET into a miss, so the streaming cache task uses `finalize` +
-    /// this method instead of `commit`.
+    /// cache semantics — an immediate post-PUT GET is a hit. A journal entry alone
+    /// would defer the `.meta` until consolidation and turn that GET into a miss, so
+    /// the streaming cache task publishes with `finalize` and then calls this method.
     /// Credit the size accumulator for a range published by a write-cache PUT sink.
     ///
     /// # Why this exists at all
@@ -22935,8 +20970,8 @@ impl CacheManager {
     /// since 2026-05-20, 1,566 of them `write_cache_delta=+0`, **9** positive
     /// write-cache credits in total against **1,535** `committed write-cached range`
     /// log lines. The 9 came from the paths that do journal (`CompleteMPU` and
-    /// `store_full_object_as_range_new`, both via
-    /// `JournalConsolidator::write_multipart_journal_entries`). The consequence was
+    /// `store_full_object_as_range_witnessed`, both via
+    /// `JournalConsolidator::write_multipart_journal_entries_witnessed`). The consequence was
     /// not merely a wrong gauge: with R6 grounding `write_cache_size` from the
     /// `.meta` files, the figure returned to ~0 and stayed there, so
     /// `write_cache_percent` bounded nothing at all — while eviction and
@@ -22945,8 +20980,8 @@ impl CacheManager {
     ///
     /// # Contract
     ///
-    /// Mirrors the two credit sites in `DiskCacheManager` (`store_range` and
-    /// `commit_incremental_range`) exactly, so all four agree:
+    /// Mirrors the two credit sites in `DiskCacheManager` (`PreparedRangeFill::finish` and
+    /// `commit_incremental_range_shared`) exactly, so all four agree:
     ///
     /// - `add_range` for the total, which dedups on `(key_hash, start, end)`.
     /// - `add_write_cache` only when [`crate::cache_types::is_staged_range_spec`]
@@ -23128,7 +21163,7 @@ impl CacheManager {
     /// The mirror image of [`Self::credit_staged_range`], and it was missing. Both
     /// paths that replace an object's cached content —
     /// [`Self::store_put_as_write_cached_range_with_ttl`] on a re-PUT and
-    /// [`Self::store_full_object_as_range_new`] when it supersedes partial ranges —
+    /// [`Self::store_full_object_as_range_witnessed`] when it supersedes partial ranges —
     /// deleted the old `.bin` files and then credited the new one, with nothing in
     /// between. One overwrite therefore left `write_cache_size` holding two copies of
     /// an object the disk held once, and the inflation compounded per overwrite.
@@ -23407,7 +21442,7 @@ impl CacheManager {
                     {
                         drop(pending_publish);
                         drop(meta_lock);
-                        return Ok(None);
+                        return Ok(Err(PublishOutcome::Superseded));
                     }
                 }
                 // The `.bin` rename runs inside this hold: before it, an eviction holding
@@ -23416,7 +21451,7 @@ impl CacheManager {
                 if !pending_publish.still_written_by_this_fill(cache_key) {
                     drop(pending_publish);
                     drop(meta_lock);
-                    return Ok(None);
+                    return Ok(Err(PublishOutcome::TemporaryReplaced));
                 }
                 let range_already_existed = pending_publish.publish()?;
                 // A `Notify` pair, so any executor can drive it.
@@ -23504,7 +21539,8 @@ impl CacheManager {
                 }
                 // Release on this thread: the `close` is a shared-storage round trip too.
                 drop(meta_lock);
-                Ok::<_, ProxyError>(Some((
+                // `Ok(Err(outcome))` is a store dropped before publishing, with its reason.
+                Ok::<_, ProxyError>(Ok((
                     store_result,
                     metadata,
                     prior_existed,
@@ -23512,12 +21548,15 @@ impl CacheManager {
                 )))
             })
             .await?;
-        let Some((store_result, metadata, prior_existed, range_already_existed)) = tail? else {
-            debug!(
-                "Streamed PUT store superseded by a newer write of the key: cache_key={}",
-                cache_key
-            );
-            return Ok(PublishOutcome::Superseded);
+        let (store_result, metadata, prior_existed, range_already_existed) = match tail? {
+            Ok(published) => published,
+            Err(dropped) => {
+                debug!(
+                    "Streamed PUT store dropped before publishing ({:?}): cache_key={}",
+                    dropped, cache_key
+                );
+                return Ok(dropped);
+            }
         };
         // Invalidate RAM metadata cache so subsequent requests see the new PUT data,
         // mirroring `store_put_as_write_cached_range_with_ttl`.
@@ -23572,29 +21611,99 @@ impl CacheManager {
         consolidator.increment_cached_objects(1).await;
     }
 
-    /// Store full object as range using new range storage architecture
-    /// This is a helper method for write cache that stores PUT body as range 0 to content_length-1
-    /// Requirements: 1.1, 1.2, 1.3, 2.9
-    async fn store_full_object_as_range_new(
+    /// Helper method to write metadata to disk (new architecture)
+    #[cfg(test)]
+    async fn write_metadata_to_disk(
+        &self,
+        metadata: &crate::cache_types::NewCacheMetadata,
+    ) -> Result<()> {
+        let metadata_file_path = self.get_new_metadata_file_path(&metadata.cache_key);
+        // Use instance-specific tmp file to avoid race conditions on shared storage
+        // Format: {key}.meta.tmp.{hostname}.{pid}, bounded to NAME_MAX.
+        let metadata_tmp_path = instance_scoped_meta_tmp_path(&metadata_file_path);
+        // The lock lives in the SHARED slot namespace, not at a per-key `{key}.meta.lock`, so
+        // this holder excludes — and is excluded by — every other `.meta` writer including
+        // `MetadataLockManager` and the eviction rewrite. The slot file is never unlinked.
+
+        // Ensure objects directory exists
+        if let Some(parent) = metadata_file_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProxyError::CacheError(format!("Failed to create objects directory: {}", e))
+            })?;
+        }
+
+        // Acquire the key's metadata slot lock, held as a guard for the rest of the function.
+        // Bounded by the configured wait budget and acquired on the blocking pool.
+        let _meta_lock = crate::metadata_lock_manager::acquire_slot_lock_within_budget(
+            &self.cache_dir,
+            &metadata.cache_key,
+        )
+        .await?;
+
+        // Serialize metadata to JSON
+        let metadata_json = serde_json::to_string_pretty(metadata)
+            .map_err(|e| ProxyError::CacheError(format!("Failed to serialize metadata: {}", e)))?;
+
+        // Write to temporary file
+        crate::disk_cache::write_synced(&metadata_tmp_path, &metadata_json).map_err(|e| {
+            crate::disk_cache::note_disk_full(&e, "write_metadata_to_disk.meta_tmp");
+            ProxyError::CacheError(format!("Failed to write metadata tmp file: {}", e))
+        })?;
+
+        // Atomically rename to final file
+        std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
+            let _ = std::fs::remove_file(&metadata_tmp_path);
+            ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
+        })?;
+
+        // The lock is released by `_meta_lock`'s `Drop` at the end of this function.
+        debug!(
+            "Successfully wrote metadata to disk for key: {}",
+            metadata.cache_key
+        );
+        Ok(())
+    }
+    /// Test support: a full-object GET fill the way the request path makes one. Captures the
+    /// key's version witness, as the request path does before its S3 request, then stores
+    /// through [`Self::store_full_object_as_range_witnessed`] and returns whether it published.
+    #[cfg(test)]
+    async fn try_seed_full_object_fill(
+        &self,
+        cache_key: &str,
+        data: &[u8],
+        object_metadata: crate::cache_types::ObjectMetadata,
+    ) -> Result<bool> {
+        let witness = self.capture_fill_witness(cache_key).await;
+        self.store_full_object_as_range_witnessed(cache_key, data, object_metadata, &witness)
+            .await
+    }
+    /// [`Self::try_seed_full_object_fill`] for a fixture that needs the entry: a seed the
+    /// production store declined fails the test.
+    #[cfg(test)]
+    async fn seed_full_object_fill(
         &self,
         cache_key: &str,
         data: &[u8],
         object_metadata: crate::cache_types::ObjectMetadata,
     ) -> Result<()> {
-        self.store_full_object_as_range_witnessed(cache_key, data, object_metadata, None)
-            .await
-            .map(|_| ())
+        let published = self
+            .try_seed_full_object_fill(cache_key, data, object_metadata)
+            .await?;
+        assert!(
+            published,
+            "seed_full_object_fill: the production store declined the seed for {cache_key}, so \
+             the fixture holds no entry"
+        );
+        Ok(())
     }
-
-    /// [`Self::store_full_object_as_range_new`] guarded by a full-object GET fill's version
-    /// witness, checked under the key's slot lock before the `.bin` rename. Returns
+    /// A full-object GET fill guarded by its version witness, checked under the key's slot lock before the `.bin` rename. Returns
     /// whether the `.meta` was published (`false` for every decline).
     async fn store_full_object_as_range_witnessed(
         &self,
         cache_key: &str,
         data: &[u8],
         object_metadata: crate::cache_types::ObjectMetadata,
-        fill_witness: Option<&FillWitness>,
+        fill_witness: &FillWitness,
     ) -> Result<bool> {
         use crate::cache_types::{NewCacheMetadata, RangeSpec};
 
@@ -23647,7 +21756,7 @@ impl CacheManager {
             // `dereference_all_ranges_for_empty_publish` for what the orphan sweep then did
             // with them.
             let meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
-            if fill_witness.is_some_and(|w| !w.holds(&self.get_new_metadata_file_path(cache_key))) {
+            if !fill_witness.holds(&self.get_new_metadata_file_path(cache_key)) {
                 crate::metadata_lock_manager::release_off_worker(meta_lock).await;
                 return Ok(false);
             }
@@ -23669,16 +21778,16 @@ impl CacheManager {
         //
         // This is the production full-object GET publication and had no capacity check of
         // any kind: it writes `.bin` + `.meta` directly rather than through
-        // `DiskCacheManager::store_range`, so P1's guard does not reach it. Guarded here,
-        // at the boundary, rather than at its two callers
-        // (`store_response_with_headers`, `store_response_in_hierarchy`).
+        // `DiskCacheManager::prepare_range_store`, so P1's guard does not reach it. Guarded here,
+        // at the boundary, rather than at its callers (`store_response_with_headers_witnessed`
+        // in production, and the test seeder `seed_full_object_fill`).
         //
         // Placed before the write lock is acquired so a declined store never contends for
         // it, and before the existing-range cleanup so a decline leaves the cache exactly
         // as it found it — a decline must not delete a usable entry in order to not
         // replace it.
         //
-        // Declining returns `Ok(())`: the response has already been sent or is being
+        // Declining returns `Ok(false)`: the response has already been sent or is being
         // streamed, and this function only decides whether to keep a copy.
         // ===================================================================
         // The `max_cache_size` soft stop, decided once for this fill. Before the
@@ -23883,7 +21992,7 @@ impl CacheManager {
         let meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
         // The version witness, before the version-independent `.bin` is renamed.
         // Dropping `pending_publish` unpublished removes the `.tmp`.
-        if fill_witness.is_some_and(|w| !w.holds(&self.get_new_metadata_file_path(cache_key))) {
+        if !fill_witness.holds(&self.get_new_metadata_file_path(cache_key)) {
             drop(pending_publish);
             crate::metadata_lock_manager::release_off_worker(meta_lock).await;
             return Ok(false);
@@ -23937,7 +22046,7 @@ impl CacheManager {
                     cache_key,
                     vec![range_spec],
                     object_metadata_clone,
-                    fill_witness.map(|w| w.journal_token()),
+                    Some(fill_witness.journal_token()),
                 )
                 .await;
         } else {
@@ -23957,7 +22066,7 @@ impl CacheManager {
     /// Read the key's existing `.meta` and unlink the range files this full-object
     /// publication supersedes, debiting both size channels for what actually went.
     ///
-    /// Factored out of `store_full_object_as_range_new` so the metadata slot lock spans a
+    /// Factored out of `store_full_object_as_range_witnessed` so the metadata slot lock spans a
     /// named transaction — this read plus the `.meta` publish that follows it — rather than
     /// the whole-object compression and `.bin` write that used to sit between them.
     ///
@@ -24252,45 +22361,32 @@ impl CacheManager {
         // of the same key shared. Two writers then corrupted each other with no lock
         // involved: one could `rename` the other's half-serialised bytes onto the live
         // `.meta`, publishing content that is neither writer's. The hazard is not
-        // hypothetical or limited to two proxies — `disk_cache::update_metadata` builds
-        // the identical fixed path, and the flock it holds does not exclude this function
-        // because this function never asked for it.
+        // hypothetical or limited to two proxies — the since-deleted
+        // the removed whole-file `.meta` updater built the identical fixed path, and the flock it held
+        // did not exclude this function because this function never asked for it.
         //
         // Fixing it here rather than at each caller is deliberate: every caller of
         // `store_new_metadata` inherits it.
         //
-        // That does NOT close the fixed-temp-path orphan gap on the volume. THREE functions
-        // still construct `{key}.meta.tmp`, and current production reaches that publish in
-        // exactly ONE of them:
+        // That does NOT close the fixed-temp-path orphan gap on the volume. THREE functions in
+        // `disk_cache.rs` still construct `{key}.meta.tmp` (`grep -rn 'with_extension("meta.tmp")'
+        // src/` finds those three plus two test fixtures, in `hybrid_metadata_writer.rs` and
+        // `cache.rs`), and current production reaches that publish in TWO of them:
         //
-        // 1. `DiskCacheManager::batch_delete_ranges`, through
-        //    `enforce_disk_cache_limits` -> `perform_eviction_with_lock` -> `batch_evict_ranges`.
+        // 1. `DiskCacheManager::batch_delete_ranges_expecting` (under `batch_delete_ranges`),
+        //    through `enforce_disk_cache_limits` -> `perform_eviction_with_lock` ->
+        //    `batch_evict_ranges`.
+        // 2. `DiskCacheManager::invalidate_all_ranges`, through `rewrite_metadata_file`. It is
+        //    reachable from `http_proxy.rs` (three sites) and `range_handler.rs` (one site).
         //
-        // This count was FIVE constructions and TWO reachable until `RANGE-KEY-GRAMMAR-RETIRE`.
-        // The second reachable one was `CacheManager::delete_specific_range`, and it is not
-        // merely unreachable now — the function is deleted, along with the composite-key
-        // decoder in `invalidate_cache_hierarchy` that was its only production caller. Do not
-        // count that as a separate fix for this comment's subject: one deletion closed the
-        // decoder's cross-object redirect, this fixed-temp-path item, and that function's
-        // missing size debit together, so each is the same change rather than three.
+        // The third, the direct fallback in `DiskCacheManager::prepare_range_store`, is reached
+        // only when the manager has no hybrid metadata writer, which no production manager is:
+        // the hybrid-writer arm returns before it. The two reachable functions take the key's
+        // slot lock, so the fixed name is not a cross-writer corruption gap in the current
+        // binary, but a crash can still leave a `{key}.meta.tmp` behind indefinitely.
         //
-        // The other two stay unreached: `DiskCacheManager::store_range` returns from its
-        // hybrid-writer arm in production before its direct fixed-name fallback, and
-        // `DiskCacheManager::update_metadata` is reached only by tests and the test-only
-        // `store_full_object_as_range`. (A fourth, `update_object_metadata_after_cleanup`,
-        // had no caller and was deleted earlier.) All three take the slot lock if
-        // reached, so the fixed name is not a cross-writer corruption gap in the current
-        // binary, but a crash can still leave it behind indefinitely.
-        //
-        // Both figures above count FUNCTIONS that publish an object `.meta` through the fixed
-        // name, which is narrower than the number of construction sites and narrower again
-        // than a grep. Do not check them with `grep -c '\.meta\.tmp'`: every site is
-        // `metadata_path.with_extension("meta.tmp")`, so that literal appears only in comments
-        // and test fixtures. `grep -rn 'with_extension("meta.tmp")' src/` finds five sites
-        // across `cache.rs`, `disk_cache.rs` and `hybrid_metadata_writer.rs` (2026-09-29, after
-        // deleted the per-key temp sweep and its tests); the three counted here are the
-        // publishing subset, excluding the two test sites. Re-derive by naming the function at each site, not by counting
-        // matches.
+        // The count is of FUNCTIONS that publish an object `.meta` through the fixed name.
+        // Re-derive it by naming the function at each site, not by counting matches.
         //
         // The three that held NO lock — `update_metadata_head_fields`,
         // `create_head_only_metadata` and `invalidate_head_cache_entry_unified`, all on the
@@ -24301,8 +22397,7 @@ impl CacheManager {
         // `with_extension("tmp")` produced `{key}.tmp`, which no cleanup path recognizes.
         // It too now locks and uses the shared producer.
         //
-        // Byte-identical construction to `write_metadata_to_disk` below,
-        // `journal_consolidator::write_metadata_to_disk` and
+        // Byte-identical construction to `journal_consolidator::write_metadata_to_disk` and
         // `hybrid_metadata_writer::write_metadata_to_disk`, and to the shared producer
         // `instance_scoped_meta_tmp_path` the HEAD-store and multipart-completion writers now
         // use. No production cleanup reaches crash leftovers of this shape; see that producer's
@@ -24393,7 +22488,7 @@ impl CacheManager {
     /// (caller must forward), `Err` on a read/parse/write failure.
     ///
     /// Spec: write-cache-last-modified. Requirements: 3.1, 3.3, 6.4, 7.1, 7.2, 7.3, 8.4
-    pub async fn backfill_write_cache_last_modified(
+    pub(crate) async fn backfill_write_cache_last_modified(
         &self,
         cache_key: &str,
         last_modified: String,
@@ -25011,8 +23106,7 @@ impl CacheManager {
     ///
     /// R1.8: the read and parse run off the async worker. This is awaited inline on the
     /// request task for every cached GET, so on NFS/EFS it is a network round-trip on the
-    /// hot path. Same `spawn_blocking`-around-a-blocking-helper shape as
-    /// `get_metadata_classified_and_publish_to_ram`.
+    /// hot path. Same `spawn_blocking`-around-a-blocking-helper shape as the other metadata readers.
     async fn read_metadata_for_graduation(
         &self,
         metadata_file_path: &std::path::Path,
@@ -25184,12 +23278,12 @@ impl CacheManager {
     /// Before this change, this method wrote flat at the `ranges/` root
     /// (`ranges/{sanitized_key}_{start}-{end}.bin`) while the `DiskCacheManager`
     /// producer sharded. Both of this method's two callers —
-    /// `store_full_object_as_range_new` (the full-object GET store path) and
-    /// `complete_multipart_upload` — therefore wrote unsharded `.bin` files,
+    /// `store_full_object_as_range_witnessed` (the full-object GET store path) and
+    /// a multipart-completion path since deleted — therefore wrote unsharded `.bin` files,
     /// invisible to any shard-rooted `ranges/{bucket}/{XX}/{YYY}` traversal
     /// (design § 6.8's orphan reclamation and the planned readdir-based tail
     /// index). See
-    /// `tests/full_object_range_path_shape_test.rs` for the measured finding and
+    /// `src/cache/moved_fill_tests/full_object_range_path_shape_test.rs` for the measured finding and
     /// the red-then-green evidence.
     ///
     /// Falls back to the pre-existing flat layout on a `get_sharded_path`
@@ -25228,233 +23322,6 @@ impl CacheManager {
         }
     }
 
-    /// Get write cache entry with decompression - supports cache hierarchy
-    pub async fn get_write_cache_entry(&self, cache_key: &str) -> Result<Option<WriteCacheEntry>> {
-        debug!("Retrieving write cache entry for key: {}", cache_key);
-
-        // First check RAM cache if enabled
-        if self.ram_cache_enabled {
-            if let Some(ram_entry) = self.get_from_ram_cache(cache_key).await? {
-                debug!("Write cache hit (RAM) for key: {}", cache_key);
-                let write_entry = self.convert_ram_entry_to_write_entry(cache_key, ram_entry)?;
-                return Ok(Some(write_entry));
-            }
-        }
-
-        // Check disk cache
-        let write_entry = self.get_write_entry_from_disk(cache_key).await?;
-
-        if let Some(mut entry) = write_entry {
-            debug!("Write cache hit (disk) for key: {}", cache_key);
-
-            // Check TTL expiration
-            if SystemTime::now() > entry.put_ttl_expires_at {
-                debug!("Write cache entry expired for key: {}", cache_key);
-                if let Err(e) = self.invalidate_write_cache_entry(cache_key).await {
-                    warn!(
-                        "Failed to invalidate expired write cache entry: cache_key={}, error={}",
-                        cache_key, e
-                    );
-                }
-                return Ok(None);
-            }
-
-            // Update last accessed time
-            entry.last_accessed = SystemTime::now();
-
-            // Promote to RAM cache if enabled
-            if self.ram_cache_enabled {
-                // RAM cache promotion is best-effort; failure only means the next read
-                // will serve from disk — no data loss or inconsistency.
-                let _ = self.promote_write_entry_to_ram(&entry).await;
-            }
-
-            return Ok(Some(entry));
-        }
-
-        debug!("Write cache miss for key: {}", cache_key);
-        Ok(None)
-    }
-    /// Transition from PUT_TTL to GET_TTL (metadata-only update)
-    /// Requirements: 2.5, 3.1, 3.2, 3.3, 3.4, 3.5
-    ///
-    /// This method checks if an object is PUT-cached (using PUT_TTL) and transitions it
-    /// to GET_TTL when first accessed via GET request. This is a metadata-only operation
-    /// that doesn't copy or move any range binary files.
-    pub async fn transition_to_get_ttl(&self, cache_key: &str) -> Result<()> {
-        debug!("Checking if TTL transition needed for key: {}", cache_key);
-
-        // Get metadata from new storage architecture
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        if !metadata_file_path.exists() {
-            debug!("No metadata file found for TTL transition: {}", cache_key);
-            return Ok(());
-        }
-
-        // A contract pin rather than a live fix: this function has zero `src/` callers and is
-        // driven only by `tests/write_cache_range_test.rs`. It is still a read-modify-write
-        // that publishes the whole document, so it acquires like every other one.
-        //
-        // The retrying `acquire_lock` is used because nothing here is on a request path today.
-        // Whatever revives this must reconsider that: on a GET path the single-attempt
-        // `try_acquire_lock` is the right form, as `refresh_write_cache_ttl` and
-        // `update_metadata_expiration_unified` use.
-        let meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
-
-        // Read metadata
-        let metadata_content = match std::fs::read_to_string(&metadata_file_path) {
-            Ok(content) => content,
-            Err(e) => {
-                warn!("Failed to read metadata file for TTL transition: {}", e);
-                return Ok(());
-            }
-        };
-
-        let mut metadata: crate::cache_types::NewCacheMetadata =
-            match serde_json::from_str(&metadata_content) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    warn!("Failed to parse metadata for TTL transition: {}", e);
-                    return Ok(());
-                }
-            };
-
-        // Check if using PUT_TTL (expires soon)
-        let now = SystemTime::now();
-
-        // Calculate time until expiry
-        let time_until_expiry = if metadata.expires_at > now {
-            metadata.expires_at.duration_since(now).unwrap_or_default()
-        } else {
-            // Already expired
-            std::time::Duration::from_secs(0)
-        };
-
-        // If expires within PUT_TTL window, this is likely a PUT-cached object
-        // Transition to GET_TTL
-        if time_until_expiry <= self.put_ttl {
-            let old_expires_at = metadata.expires_at;
-            metadata.expires_at = safe_expiry(now, self.fill_get_ttl(cache_key).await);
-
-            // Store updated metadata
-            self.store_new_metadata(&metadata, &meta_lock).await?;
-            crate::metadata_lock_manager::release_off_worker(meta_lock).await;
-
-            info!(
-                "Transitioned {} from PUT_TTL to GET_TTL (old_expiry: {:?}, new_expiry: {:?})",
-                cache_key,
-                old_expires_at.duration_since(SystemTime::UNIX_EPOCH).ok(),
-                metadata
-                    .expires_at
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .ok()
-            );
-        } else {
-            debug!(
-                "No TTL transition needed for {} (expires in {:?}, PUT_TTL is {:?})",
-                cache_key, time_until_expiry, self.put_ttl
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Invalidate write cache entry - Requirement 10.2
-    pub async fn invalidate_write_cache_entry(&self, cache_key: &str) -> Result<()> {
-        debug!("Invalidating write cache entry for key: {}", cache_key);
-
-        // Remove from RAM cache if enabled - unified invalidation
-        if self.ram_cache_enabled {
-            self.remove_from_ram_cache_unified(cache_key).await?;
-        }
-
-        // NOTE: removed_size tracking removed - size tracking is now handled by JournalConsolidator
-
-        // Try new range storage architecture first
-        let new_metadata_file_path = self.get_new_metadata_file_path(cache_key);
-        if new_metadata_file_path.exists() {
-            // Hold the key's metadata slot lock from the read below through the `.meta`
-            // removal, so the range list acted on cannot be republished by a concurrent
-            // writer in between. Scoped to this `if` block: it is released before the
-            // function returns and nothing after it touches the `.meta`.
-            let _meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
-
-            // Read metadata to get list of all range files (UNDER the lock)
-            if let Ok(metadata_content) = std::fs::read_to_string(&new_metadata_file_path) {
-                if let Ok(new_metadata) =
-                    serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content)
-                {
-                    debug!(
-                        "Deleting write cache entry with new architecture: {} ({} ranges)",
-                        cache_key,
-                        new_metadata.ranges.len()
-                    );
-
-                    // Delete all range binary files and debit both size channels for
-                    // what was actually removed.
-                    // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
-                    let (removed, _failed) = self.remove_range_files(
-                        cache_key,
-                        &new_metadata.ranges,
-                        new_metadata.object_metadata.is_write_cached,
-                    );
-                    self.debit_removed_ranges(cache_key, &removed).await;
-
-                    // Delete metadata file
-                    let metadata_deleted = match std::fs::remove_file(&new_metadata_file_path) {
-                        Ok(_) => {
-                            debug!("Removed new metadata file: {:?}", new_metadata_file_path);
-                            true
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to remove new metadata file {:?}: {}",
-                                new_metadata_file_path, e
-                            );
-                            false
-                        }
-                    };
-
-                    // The lock file is NOT deleted. Lock files are shared slots in a fixed
-                    // set, so deleting one would remove a file another key's holder is
-                    // locking — and `flock` binds to the open file description rather than to
-                    // the path, so the deletion releases nothing and merely hands the next
-                    // opener an independent lock on a different inode.
-
-                    // The `.meta` is gone, so the object no longer exists — decrement
-                    // `cached_objects`, mirroring `evict_write_cached_object`'s
-                    // `metadata_deleted` gate. Every parseable `.meta` is counted, rangeless
-                    // included (`ObjectEntryRemoval`).
-                    if metadata_deleted {
-                        if let Some(consolidator) = self.journal_consolidator.read().await.clone() {
-                            consolidator.decrement_cached_objects(1).await;
-                        }
-                    }
-
-                    // Unlike `check_and_invalidate_expired_write_cache`, this function
-                    // has no early `is_write_cached` guard — it is reachable for a
-                    // read-cached (already-graduated) entry too, which must not move
-                    // the gauge. Gate on the flag this call actually read.
-                    // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
-                    if new_metadata.object_metadata.is_write_cached {
-                        self.decrement_write_cache_staged_entries().await;
-                    }
-
-                    info!(
-                        "Invalidated write cache entry with new architecture for key: {}",
-                        cache_key
-                    );
-                }
-            }
-        }
-
-        // NOTE: Write cache size tracking is now handled by JournalConsolidator through journal entries.
-
-        info!("Invalidated write cache entry for key: {}", cache_key);
-        Ok(())
-    }
-
     /// Check if request is a multipart upload - Requirement 10.4
     pub fn is_multipart_upload(
         &self,
@@ -25480,550 +23347,6 @@ impl CacheManager {
         }
 
         false
-    }
-    /// Get write cache entry from disk
-    async fn get_write_entry_from_disk(&self, cache_key: &str) -> Result<Option<WriteCacheEntry>> {
-        // Try new range storage architecture first
-        let new_metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        if new_metadata_file_path.exists() {
-            // Read new architecture metadata
-            let metadata_content = match std::fs::read_to_string(&new_metadata_file_path) {
-                Ok(content) => content,
-                Err(e) => {
-                    warn!(
-                        "Failed to read new metadata file for key {}: {}",
-                        cache_key, e
-                    );
-                    return Ok(None);
-                }
-            };
-
-            let new_metadata: crate::cache_types::NewCacheMetadata =
-                match serde_json::from_str(&metadata_content) {
-                    Ok(meta) => meta,
-                    Err(e) => {
-                        warn!(
-                            "Failed to deserialize new metadata for key {}: {}",
-                            cache_key, e
-                        );
-                        return Ok(None);
-                    }
-                };
-
-            // Check if this is a PUT-cached object (upload_state = Complete)
-            if new_metadata.object_metadata.upload_state
-                != crate::cache_types::UploadState::Complete
-            {
-                debug!("Object is not in Complete state for key: {}", cache_key);
-                return Ok(None);
-            }
-
-            // Check expiration
-            if SystemTime::now() > new_metadata.expires_at {
-                debug!("Write cache entry expired for key: {}", cache_key);
-                return Ok(None);
-            }
-
-            // Read and decompress all range data
-            let mut body_data = Vec::new();
-            for range_spec in &new_metadata.ranges {
-                let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
-
-                if !range_file_path.exists() {
-                    warn!(
-                        "Range file missing for key {}: {:?}",
-                        cache_key, range_file_path
-                    );
-                    return Ok(None);
-                }
-
-                // Read compressed range data through a descriptor whose identity is the
-                // listing's. A refused file is counted and healed like any other read's,
-                // and the write entry is not returned.
-                let compressed_data = match crate::disk_cache::read_range_file_checked(
-                    &range_file_path,
-                    range_spec.file_identity,
-                ) {
-                    Ok(Ok((data, _stamp))) => data,
-                    Ok(Err(wrong)) => {
-                        let consolidator = self.journal_consolidator.read().await.clone();
-                        let _ = crate::disk_cache::refuse_wrong_range_file(
-                            &self.cache_dir,
-                            consolidator.as_ref(),
-                            Some(&self.metadata_cache),
-                            range_spec,
-                            wrong,
-                        )
-                        .await;
-                        return Ok(None);
-                    }
-                    Err(e) => {
-                        warn!("Failed to read range file for key {}: {}", cache_key, e);
-                        return Ok(None);
-                    }
-                };
-
-                // Decompress range data
-                let inner = self.inner.lock().unwrap();
-                let decompressed_data = match inner.compression_handler.decompress_with_algorithm(
-                    &compressed_data,
-                    range_spec.compression_algorithm.clone(),
-                ) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        drop(inner);
-                        warn!(
-                            "Failed to decompress range data for key {}: {}",
-                            cache_key, e
-                        );
-                        return Ok(None);
-                    }
-                };
-                drop(inner);
-
-                body_data.extend_from_slice(&decompressed_data);
-            }
-
-            // Convert to WriteCacheEntry format for compatibility
-            let write_entry = WriteCacheEntry {
-                cache_key: cache_key.to_string(),
-                headers: HashMap::new(), // Headers not stored in new format
-                body: body_data,
-                metadata: CacheMetadata {
-                    etag: new_metadata.object_metadata.etag.clone(),
-                    last_modified: new_metadata.object_metadata.last_modified.clone(),
-                    content_length: new_metadata.object_metadata.content_length,
-                    part_number: None,
-                    cache_control: None,
-                    access_count: 0,
-                    last_accessed: SystemTime::now(),
-                },
-                created_at: new_metadata.created_at,
-                put_ttl_expires_at: new_metadata.expires_at,
-                last_accessed: SystemTime::now(),
-                compression_info: CompressionInfo::default(),
-                is_put_cached: true,
-            };
-
-            return Ok(Some(write_entry));
-        }
-
-        // No entry found in unified storage
-        Ok(None)
-    }
-
-    /// Convert write cache entry to RAM cache entry
-    fn convert_write_entry_to_ram_entry(
-        &self,
-        write_entry: &WriteCacheEntry,
-    ) -> Result<RamCacheEntry> {
-        // Extract compression info from write cache entry
-        let algorithm = write_entry.compression_info.body_algorithm.clone();
-        let is_compressed = true; // All data uses frame format now
-
-        let last_accessed_ms = write_entry
-            .last_accessed
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        Ok(RamCacheEntry {
-            cache_key: write_entry.cache_key.clone(),
-            data: Arc::new(Bytes::from(write_entry.body.clone())),
-            metadata: write_entry.metadata.clone(),
-            created_at: write_entry.created_at,
-            last_accessed: AtomicU64::new(last_accessed_ms),
-            access_count: AtomicU64::new(0),
-            compressed: is_compressed,
-            compression_algorithm: algorithm,
-            verified_at: AtomicU64::new(last_accessed_ms),
-        })
-    }
-
-    /// Convert RAM cache read-view to write cache entry
-    fn convert_ram_entry_to_write_entry(
-        &self,
-        cache_key: &str,
-        ram_read: RamCacheRead,
-    ) -> Result<WriteCacheEntry> {
-        // Decompress if needed
-        let body = if ram_read.compressed {
-            self.decompress_ram_cache_read(&ram_read)?
-        } else {
-            ram_read.data.to_vec()
-        };
-
-        Ok(WriteCacheEntry {
-            cache_key: cache_key.to_string(),
-            headers: HashMap::new(), // RAM cache doesn't store headers separately
-            body,
-            metadata: ram_read.metadata.clone(),
-            created_at: SystemTime::now(),
-            put_ttl_expires_at: safe_expiry(SystemTime::now(), self.put_ttl),
-            last_accessed: SystemTime::now(),
-            compression_info: CompressionInfo::default(),
-            is_put_cached: true, // Write cache entries are PUT-cached
-        })
-    }
-
-    /// Store RAM cache entry from write entry
-    async fn store_in_ram_cache_from_write_entry(&self, ram_entry: RamCacheEntry) -> Result<()> {
-        // Per-key gate, as `store_in_ram_cache` (R4.4, task 19). Same hygiene-not-a-
-        // control caveat. Note the RAM key here is the object key, not a range key —
-        // this is the whole-object write-cache tier.
-        let resolved = self.resolve_settings(&ram_entry.cache_key).await;
-        if !resolved.ram_cache_eligible {
-            debug!(
-                "Skipping RAM write-entry store for {}: ram_cache_eligible=false (source={:?})",
-                ram_entry.cache_key, resolved.source
-            );
-            self.record_ram_eligibility_skip();
-            return Ok(());
-        }
-
-        if let Some(ram_cache) = &self.ram_cache {
-            let key = ram_entry.cache_key.clone();
-            ram_cache.put(ram_entry).await?;
-            debug!("Stored write entry in RAM cache: {}", key);
-        }
-
-        Ok(())
-    }
-
-    /// Promote write cache entry to RAM cache
-    async fn promote_write_entry_to_ram(&self, write_entry: &WriteCacheEntry) -> Result<()> {
-        if !self.ram_cache_enabled {
-            return Ok(());
-        }
-
-        debug!(
-            "Promoting write cache entry to RAM: {}",
-            write_entry.cache_key
-        );
-        let ram_entry = self.convert_write_entry_to_ram_entry(write_entry)?;
-        self.store_in_ram_cache_from_write_entry(ram_entry).await
-    }
-
-    /// Clean up expired write cache entries - Requirement 10.6
-    /// Scans unified storage (metadata/ directory) for write-cached entries that have expired
-    pub(crate) async fn cleanup_expired_write_cache_entries(&self) -> Result<u64> {
-        debug!("Starting cleanup of expired write cache entries");
-        let mut cleaned_count = 0u64;
-        let now = SystemTime::now();
-
-        let metadata_dir = self.cache_dir.join("metadata");
-        if !metadata_dir.exists() {
-            return Ok(0);
-        }
-
-        // Scan metadata directory recursively for metadata files with is_write_cached=true
-        use walkdir::WalkDir;
-
-        for entry in WalkDir::new(&metadata_dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-
-            // Only process .meta files
-            if path.extension().is_some_and(|ext| ext == "meta") {
-                if let Ok(metadata_content) = std::fs::read_to_string(path) {
-                    if let Ok(new_metadata) = serde_json::from_str::<
-                        crate::cache_types::NewCacheMetadata,
-                    >(&metadata_content)
-                    {
-                        // Only process write-cached objects
-                        if !new_metadata.object_metadata.is_write_cached {
-                            continue;
-                        }
-
-                        let cache_key = &new_metadata.cache_key;
-
-                        // Check if entry is expired based on expires_at (PUT TTL)
-                        if now > new_metadata.expires_at {
-                            // Check if entry is actively being used by other instances
-                            if !self.is_cache_entry_active(cache_key).await? {
-                                // Safe to clean up
-                                if let Err(e) = self.invalidate_write_cache_entry(cache_key).await {
-                                    warn!(
-                                        "Failed to clean up expired write cache entry {}: {}",
-                                        cache_key, e
-                                    );
-                                } else {
-                                    cleaned_count += 1;
-                                    debug!("Cleaned up expired write cache entry: {}", cache_key);
-                                }
-                            } else {
-                                debug!("Skipping cleanup of {} - actively being used", cache_key);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if cleaned_count > 0 {
-            info!("Cleaned up {} expired write cache entries", cleaned_count);
-        }
-
-        Ok(cleaned_count)
-    }
-
-    /// Handle failed PUT cleanup across cache layers - Requirement 10.2
-    pub async fn cleanup_failed_put(&self, cache_key: &str) -> Result<()> {
-        debug!("Cleaning up failed PUT for cache key: {}", cache_key);
-
-        // Remove from write cache
-        self.invalidate_write_cache_entry(cache_key).await?;
-
-        // Also remove from regular cache if it exists
-        self.invalidate_cache(cache_key).await?;
-
-        info!("Cleaned up failed PUT for cache key: {}", cache_key);
-        Ok(())
-    }
-
-    /// Check if write cache entry has expired based on PUT TTL
-    pub async fn is_write_cache_entry_expired(&self, cache_key: &str) -> Result<bool> {
-        if let Some(write_entry) = self.get_write_cache_entry(cache_key).await? {
-            Ok(SystemTime::now() > write_entry.put_ttl_expires_at)
-        } else {
-            Ok(true) // Entry doesn't exist, consider it expired
-        }
-    }
-    /// Get cached entry from disk cache (second tier)
-    async fn get_from_disk_cache(&self, cache_key: &str) -> Result<Option<CacheEntry>> {
-        // Try new architecture first (metadata/ directory with NewCacheMetadata)
-        let new_metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        if new_metadata_file_path.exists() {
-            // Try to parse as new architecture metadata
-            if let Ok(content) = std::fs::read_to_string(&new_metadata_file_path) {
-                // Try parsing as NewCacheMetadata first
-                if let Ok(new_meta) =
-                    serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content)
-                {
-                    // This is new architecture metadata
-                    debug!("Found new architecture metadata for key: {}", cache_key);
-
-                    // Check if entry has expired
-                    if SystemTime::now() > new_meta.expires_at {
-                        debug!("Cache entry expired for key: {}", cache_key);
-                        return Ok(None);
-                    }
-
-                    // Check if this is a full object (single range covering entire content)
-                    let content_length = new_meta.object_metadata.content_length;
-                    let is_full_object = new_meta.ranges.len() == 1
-                        && new_meta.ranges[0].start == 0
-                        && new_meta.ranges[0].end == content_length.saturating_sub(1);
-
-                    // Convert cache_types::CompressionInfo to cache::CompressionInfo
-                    let compression_info = CompressionInfo {
-                        body_algorithm: new_meta.compression_info.body_algorithm.clone(),
-                        original_size: new_meta.compression_info.original_size,
-                        compressed_size: new_meta.compression_info.compressed_size,
-                        file_extension: new_meta.compression_info.file_extension.clone(),
-                    };
-
-                    if is_full_object && content_length > 0 {
-                        // Load the full object data from the range file
-                        let range_spec = &new_meta.ranges[0];
-                        let range_file_path =
-                            self.cache_dir.join("ranges").join(&range_spec.file_path);
-
-                        if range_file_path.exists() {
-                            // R13.1b: through `load_range_data`, so the read takes the content,
-                            // length and identity checks every serve path takes, and a listing
-                            // with no file identity is refused like everywhere else.
-                            if crate::disk_cache::unverified_listing_refused(
-                                range_spec,
-                                content_length,
-                            ) {
-                                return Ok(None);
-                            }
-                            match self
-                                .create_configured_disk_cache_manager()
-                                .load_range_data(range_spec)
-                                .await
-                            {
-                                Ok(body) => {
-                                    // Convert to CacheEntry
-                                    let cache_entry = CacheEntry {
-                                        cache_key: cache_key.to_string(),
-                                        headers: new_meta.object_metadata.response_headers.clone(),
-                                        body: Some(body),
-                                        ranges: Vec::new(),
-                                        metadata: CacheMetadata {
-                                            etag: new_meta.object_metadata.etag.clone(),
-                                            last_modified: new_meta
-                                                .object_metadata
-                                                .last_modified
-                                                .clone(),
-                                            content_length,
-                                            part_number: None,
-                                            cache_control: new_meta
-                                                .object_metadata
-                                                .response_headers
-                                                .get("cache-control")
-                                                .cloned(),
-                                            access_count: range_spec.access_count,
-                                            last_accessed: range_spec.last_accessed,
-                                        },
-                                        created_at: new_meta.created_at,
-                                        expires_at: new_meta.expires_at,
-                                        metadata_expires_at: new_meta.expires_at,
-                                        compression_info,
-                                        is_put_cached: new_meta.object_metadata.is_write_cached,
-                                    };
-
-                                    debug!("Successfully loaded full object from new architecture for key: {}", cache_key);
-                                    return Ok(Some(cache_entry));
-                                }
-                                Err(e) => {
-                                    warn!("Failed to read range file for key {}: {}", cache_key, e);
-                                    return Ok(None);
-                                }
-                            }
-                        } else {
-                            debug!("Range file not found for key: {}", cache_key);
-                            return Ok(None);
-                        }
-                    } else if content_length == 0 {
-                        // Handle empty objects
-                        let cache_entry = CacheEntry {
-                            cache_key: cache_key.to_string(),
-                            headers: new_meta.object_metadata.response_headers.clone(),
-                            body: Some(Vec::new()),
-                            ranges: Vec::new(),
-                            metadata: CacheMetadata {
-                                etag: new_meta.object_metadata.etag.clone(),
-                                last_modified: new_meta.object_metadata.last_modified.clone(),
-                                content_length: 0,
-                                part_number: None,
-                                cache_control: new_meta
-                                    .object_metadata
-                                    .response_headers
-                                    .get("cache-control")
-                                    .cloned(),
-                                access_count: 0,
-                                last_accessed: SystemTime::now(),
-                            },
-                            created_at: new_meta.created_at,
-                            expires_at: new_meta.expires_at,
-                            metadata_expires_at: new_meta.expires_at,
-                            compression_info,
-                            is_put_cached: new_meta.object_metadata.is_write_cached,
-                        };
-
-                        debug!(
-                            "Successfully loaded empty object from new architecture for key: {}",
-                            cache_key
-                        );
-                        return Ok(Some(cache_entry));
-                    } else {
-                        // Partial ranges - return None, let range handler deal with it
-                        debug!(
-                            "Found partial ranges for key: {}, deferring to range handler",
-                            cache_key
-                        );
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-
-        // No cache entry found
-        debug!(
-            "Disk cache miss for key: {} (metadata file doesn't exist)",
-            cache_key
-        );
-        Ok(None)
-    }
-
-    /// Promote cache entry to RAM cache (cache hierarchy promotion)
-    async fn promote_to_ram_cache(&self, cache_entry: &CacheEntry) -> Result<()> {
-        if !self.ram_cache_enabled {
-            return Ok(());
-        }
-
-        debug!("Promoting cache entry to RAM: {}", cache_entry.cache_key);
-        self.store_in_ram_cache(cache_entry).await
-    }
-
-    /// Store range data in cache with compression - Requirements 3.1, 3.2, 3.3, 3.4, 12.7
-    ///
-    /// This method stores range data using the new range storage architecture.
-    pub async fn store_range_in_cache(
-        &self,
-        cache_key: &str,
-        range_start: u64,
-        range_end: u64,
-        range_data: &[u8],
-        metadata: CacheMetadata,
-    ) -> Result<()> {
-        debug!(
-            "Storing range {}-{} in cache for key: {}",
-            range_start, range_end, cache_key
-        );
-
-        // Create object metadata for the range storage
-        let object_metadata = crate::cache_types::ObjectMetadata {
-            etag: metadata.etag.clone(),
-            last_modified: metadata.last_modified.clone(),
-            content_length: metadata.content_length,
-            content_type: None,
-            response_headers: HashMap::new(),
-            upload_state: crate::cache_types::UploadState::Complete, // GET-cached objects are always complete
-            cumulative_size: range_data.len() as u64,
-            parts: Vec::new(),
-            compression_algorithm: CompressionAlgorithm::Lz4,
-            compressed_size: 0,
-            parts_count: None,
-            part_ranges: HashMap::new(),
-            part_layout_verified: false,
-            upload_id: None,
-            is_write_cached: false,
-            write_cache_expires_at: None,
-            write_cache_created_at: None,
-            write_cache_last_accessed: None,
-            graduation_accounted: false,
-        };
-
-        // Resolve per-bucket compression settings (Requirements 5.1, 5.2, 5.3)
-        let resolved = self.resolve_settings(cache_key).await;
-        let should_compress =
-            self.effective_compression(&resolved, cache_key, range_data.len() as u64);
-
-        // Use the disk cache manager to store the range. Uses the same
-        // configured threshold/enabled as the rest of the manager.
-        let mut disk_cache_manager = crate::disk_cache::DiskCacheManager::new(
-            self.cache_dir.clone(),
-            self.compression_enabled_global,
-            self.compression_threshold,
-            false,
-            1_048_576,
-        );
-
-        disk_cache_manager
-            .store_range(
-                cache_key,
-                range_start,
-                range_end,
-                range_data,
-                object_metadata,
-                self.fill_get_ttl(cache_key).await,
-                should_compress,
-            )
-            .await?;
-
-        debug!(
-            "Successfully stored range {}-{} for key: {}",
-            range_start, range_end, cache_key
-        );
-        Ok(())
     }
 
     /// Release all locks held by this instance (for graceful shutdown)
@@ -26519,7 +23842,7 @@ impl CacheManager {
     /// * `Ok(Some((has_ranges, content_length)))` - If metadata exists, returns whether ranges exist and the content length
     /// * `Ok(None)` - If no metadata exists (neither .meta file nor HEAD cache)
     /// * `Err` - If there was an error reading metadata
-    pub async fn has_cached_ranges(
+    pub(crate) async fn has_cached_ranges(
         &self,
         cache_key: &str,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
@@ -26632,74 +23955,6 @@ impl CacheManager {
             }
         }
     }
-
-    /// Helper method to write metadata to disk (new architecture)
-    async fn write_metadata_to_disk(
-        &self,
-        metadata: &crate::cache_types::NewCacheMetadata,
-    ) -> Result<()> {
-        self.write_metadata_to_disk_witnessed(metadata, None).await
-    }
-    /// [`Self::write_metadata_to_disk`] that, with a fill witness, writes nothing unless the
-    /// witness still holds under the key's slot lock.
-    async fn write_metadata_to_disk_witnessed(
-        &self,
-        metadata: &crate::cache_types::NewCacheMetadata,
-        fill_witness: Option<&FillWitness>,
-    ) -> Result<()> {
-        let metadata_file_path = self.get_new_metadata_file_path(&metadata.cache_key);
-        // Use instance-specific tmp file to avoid race conditions on shared storage
-        // Format: {key}.meta.tmp.{hostname}.{pid}, bounded to NAME_MAX.
-        let metadata_tmp_path = instance_scoped_meta_tmp_path(&metadata_file_path);
-        // The lock lives in the SHARED slot namespace, not at a per-key `{key}.meta.lock`, so
-        // this holder excludes — and is excluded by — every other `.meta` writer including
-        // `MetadataLockManager` and the eviction rewrite. The slot file is never unlinked.
-
-        // Ensure objects directory exists
-        if let Some(parent) = metadata_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create objects directory: {}", e))
-            })?;
-        }
-
-        // Acquire the key's metadata slot lock, held as a guard for the rest of the function.
-        // Bounded by the configured wait budget and acquired on the blocking pool.
-        let _meta_lock = crate::metadata_lock_manager::acquire_slot_lock_within_budget(
-            &self.cache_dir,
-            &metadata.cache_key,
-        )
-        .await?;
-        if fill_witness.is_some_and(|w| !w.holds(&metadata_file_path)) {
-            debug!(
-                "Metadata rewrite skipped (superseded by an acknowledged write): key={}",
-                metadata.cache_key
-            );
-            return Ok(());
-        }
-
-        // Serialize metadata to JSON
-        let metadata_json = serde_json::to_string_pretty(metadata)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to serialize metadata: {}", e)))?;
-
-        // Write to temporary file
-        crate::disk_cache::write_synced(&metadata_tmp_path, &metadata_json).map_err(|e| {
-            crate::disk_cache::note_disk_full(&e, "write_metadata_to_disk.meta_tmp");
-            ProxyError::CacheError(format!("Failed to write metadata tmp file: {}", e))
-        })?;
-
-        // Atomically rename to final file
-        std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
-            let _ = std::fs::remove_file(&metadata_tmp_path);
-            ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
-        })?;
-
-        // The lock is released by `_meta_lock`'s `Drop` at the end of this function.
-        debug!(
-            "Successfully wrote metadata to disk for key: {}",
-            metadata.cache_key
-        );
-        Ok(())
-    }
 }
 
 /// Streaming write-cache sink built over the GET path's
@@ -26709,8 +23964,8 @@ impl CacheManager {
 /// `open()` reserves write-cache capacity and begins an incremental range write,
 /// `write()` feeds decoded object bytes into the same
 /// `cache.compression_batch_size`-batched LZ4 writer the GET miss path uses
-/// (`begin_incremental_range_write` + `write_range_chunk`), and `commit()` /
-/// `discard()` finalize (`commit_incremental_range`) or abandon
+/// (`begin_incremental_range_write` + `write_range_chunk`), and `finalize_unpublished()` /
+/// `discard()` finalize (`finalize_incremental_range_unpublished`) or abandon
 /// (`abort_incremental_range`) the range. This replaces the whole-object
 /// compress-then-single-`std::fs::write` of
 /// `store_put_as_write_cached_range_with_ttl` with a bounded-memory incremental
@@ -26720,8 +23975,8 @@ impl CacheManager {
 /// The [`crate::write_cache_manager::WriteReservation`] returned by
 /// `try_reserve_write_cache` is held for the sink's lifetime and auto-released on
 /// drop (RAII), preserving today's write-cache capacity accounting whether the
-/// sink commits, is discarded, or is dropped on an error path. If the sink is
-/// dropped before `commit()`/`discard()`, the in-progress `.tmp` file is cleaned
+/// sink is finalized, is discarded, or is dropped on an error path. If the sink is
+/// dropped before `finalize_unpublished()`/`discard()`, the in-progress `.tmp` file is cleaned
 /// up via `abort_incremental_range`.
 ///
 /// The `compression_batch_size` named in the open contract is carried by the
@@ -26734,9 +23989,8 @@ impl CacheManager {
 // The streaming write-cache task (`SignedPutHandler::run_streaming_cache_write`)
 // also uses `finalize` + an immediate `store_new_metadata` (via
 // `CacheManager::store_streamed_write_cache_metadata`) to preserve read-after-write
-// cache semantics. The journal-only `commit` defers the `.meta` until
-// consolidation; it is retained as the journal-based finalizer and is exercised by
-// `write_cache_range_sink_tests`.
+// cache semantics. The sink has no journal-only finalizer: a journal entry alone
+// would defer the `.meta` until consolidation.
 pub(crate) struct WriteCacheRangeSink {
     /// Configured disk cache manager used to begin/commit/abort the incremental
     /// range. Carries `compression_batch_size` and the journal/size-tracking wiring.
@@ -26837,7 +24091,7 @@ impl WriteCacheRangeSink {
     /// deliberately does not journal, so nothing downstream credits for them — see
     /// `CacheManager::credit_staged_range`), and crediting an overwrite would double-count a
     /// range another instance already published on the shared volume.
-    /// `commit_incremental_range` gates its own credits on the same flag (`disk_cache.rs`).
+    /// `commit_incremental_range_shared` gates its own credits on the same flag (`disk_cache.rs`).
     /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
     pub(crate) fn finalize_unpublished(
         &mut self,
@@ -26853,38 +24107,6 @@ impl WriteCacheRangeSink {
         })?;
         self.disk_cache
             .finalize_incremental_range_unpublished(writer, None)
-    }
-
-    /// Finalize the range: flush any residual batch, validate the written length,
-    /// atomically publish the `.bin`, and write the write-cache metadata + journal
-    /// entry with `object_metadata` and `ttl`. Consumes the sink; the capacity
-    /// reservation is released when it drops.
-    //
-    // The journal-only metadata write defers the `.meta` until consolidation. Both
-    // the whole-buffer write-cache path AND the streaming forward path
-    // (`run_streaming_cache_write`) instead use `finalize` + an immediate
-    // `store_new_metadata` so a post-write GET hits the cache, so `commit` has no
-    // production caller. It is retained as the journal-based finalizer and is
-    // exercised by `write_cache_range_sink_tests`; `#[allow(dead_code)]` covers the
-    // non-test build where it is unreferenced.
-    #[allow(dead_code)]
-    pub(crate) async fn commit(
-        mut self,
-        object_metadata: crate::cache_types::ObjectMetadata,
-        ttl: Duration,
-    ) -> Result<()> {
-        let writer = self.writer.take().ok_or_else(|| {
-            ProxyError::CacheError(format!(
-                "WriteCacheRangeSink::commit called with no active writer: key={}",
-                self.cache_key
-            ))
-        })?;
-
-        // Borrow (not move) `self.disk_cache`; `self` drops at the end of this
-        // method, releasing the reservation after the commit completes.
-        self.disk_cache
-            .commit_incremental_range(writer, object_metadata, ttl)
-            .await
     }
 
     /// Abandon the range, cleaning up the in-progress `.tmp` file. Consumes the
@@ -27537,12 +24759,12 @@ mod canonical_cache_key_tests {
         }
     }
 
-    /// The part and range keys keep their suffix grammar on a canonical base.
+    /// The canonical key encodes the `+`; the request-spelling key keeps it.
     #[test]
-    fn part_and_range_suffixes_are_not_canonicalised() {
+    fn the_canonical_key_encodes_a_plus_and_the_request_spelling_keeps_it() {
         assert_eq!(
-            CacheManager::generate_cache_key_with_params("/bkt/a+b", Some(2), Some((0, 9)), None),
-            "bkt/a%20b:part:2:range:0-9"
+            CacheManager::generate_cache_key("/bkt/a+b", None),
+            "bkt/a%20b"
         );
         assert_eq!(
             CacheManager::generate_request_spelling_cache_key("/bkt/a+b", Some(S3_HOST)),
@@ -27910,7 +25132,7 @@ mod cache_key_sanitization_tests {
 
                     // Store the part as a range using the existing range storage mechanism
                     let store_result = disk_cache
-                        .store_range(
+                        .store_range_witnessed(
                             cache_key,
                             parsed_start,
                             parsed_end,
@@ -28028,7 +25250,7 @@ mod cache_key_sanitization_tests {
             };
 
             // Store the part as a range (this should compress the data)
-            let store_result = disk_cache.store_range(
+            let store_result = disk_cache.store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -28147,7 +25369,7 @@ mod cache_key_sanitization_tests {
                 let test_data = vec![i; 1024]; // Each range has different data pattern
 
                 let store_result = disk_cache
-                    .store_range(
+                    .store_range_witnessed(
                         cache_key,
                         start,
                         end,
@@ -28208,7 +25430,7 @@ mod cache_key_sanitization_tests {
             let new_test_data = vec![255u8; 1024]; // Different pattern
 
             let update_result = disk_cache
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     new_start,
                     new_end,
@@ -28415,7 +25637,7 @@ mod cache_key_sanitization_tests {
         );
 
         disk_cache
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 8388607,
@@ -28612,7 +25834,7 @@ mod cache_key_sanitization_tests {
             );
 
             match disk_cache
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     expected_start,
                     expected_end,
@@ -28858,7 +26080,7 @@ mod cache_key_sanitization_tests {
             );
 
             match disk_cache
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     expected_start,
                     expected_end,
@@ -29032,12 +26254,13 @@ mod cache_key_sanitization_tests {
                 headers.insert("etag".to_string(), "\"test-etag\"".to_string());
 
                 match cache_manager
-                    .store_part_as_range(
+                    .store_part_as_range_witnessed(
                         cache_key,
                         part_number,
                         headers.get("content-range").unwrap(),
                         &headers,
                         &test_data,
+                        cache_manager.capture_fill_witness(cache_key).await,
                     )
                     .await
                 {
@@ -29137,12 +26360,13 @@ mod cache_key_sanitization_tests {
 
                 // Store the part
                 match cache_manager
-                    .store_part_as_range(
+                    .store_part_as_range_witnessed(
                         cache_key,
                         part_number,
                         headers.get("content-range").unwrap(),
                         &headers,
                         &test_data,
+                        cache_manager.capture_fill_witness(cache_key).await,
                     )
                     .await
                 {
@@ -29715,13 +26939,6 @@ mod cache_key_sanitization_tests {
                 Err(_) => {} // Error is acceptable (e.g., file not found)
             }
 
-            // Property: Attempting to read cached data should fail
-            match cache_manager.get_cached_response(&cache_key).await {
-                Ok(None) => {}                              // Expected - no cache entry
-                Ok(Some(_)) => return TestResult::failed(), // Unexpected - cache entry exists
-                Err(_) => {}                                // Error is acceptable
-            }
-
             // Now verify that a successful PUT would create an entry
             // (to ensure our test setup is correct)
             let response_headers: std::collections::HashMap<String, String> =
@@ -30272,7 +27489,7 @@ mod ram_cache_range_property_tests {
     /// **Feature: ram-cache-range-fix, Property 1: Range RAM cache round-trip**
     /// For any valid cache_key (non-empty string), start offset, end offset (where start <= end),
     /// and range data (non-empty byte vector), storing the range in RAM cache via
-    /// `promote_range_to_ram_cache` and then looking it up via `get_range_from_ram_cache`
+    /// `promote_range_to_ram_cache` and then looking it up via `get_range_from_ram_cache_hit`
     /// with the same cache_key, start, and end should return data equal to the original.
     /// **Validates: Requirements 1.1, 1.2, 1.3**
     #[quickcheck]
@@ -30321,12 +27538,15 @@ mod ram_cache_range_property_tests {
             promote_raw(&cache_manager, &cache_key, start, end, &data, etag);
 
             // Look up the range from RAM cache
-            match cache_manager.get_range_from_ram_cache(
-                &cache_key,
-                start,
-                end,
-                std::time::Duration::from_secs(3600),
-            ) {
+            match cache_manager
+                .get_range_from_ram_cache_hit(
+                    &cache_key,
+                    start,
+                    end,
+                    std::time::Duration::from_secs(3600),
+                )
+                .map(|hit| hit.data)
+            {
                 Some(retrieved_data) => {
                     if retrieved_data == data {
                         TestResult::passed()
@@ -30383,18 +27603,19 @@ mod ram_cache_range_property_tests {
                 1u64 << 40,
             );
 
-            // Path 2: get_range_from_ram_cache — verbatim, byte-exact.
+            // Path 2: get_range_from_ram_cache_hit — verbatim, byte-exact.
             let via_get = cache_manager
-                .get_range_from_ram_cache(
+                .get_range_from_ram_cache_hit(
                     cache_key,
                     start,
                     end,
                     std::time::Duration::from_secs(3600),
                 )
+                .map(|hit| hit.data)
                 .expect("None-tagged range should be a RAM hit");
             assert_eq!(
                 via_get, raw,
-                "get_range_from_ram_cache must return raw bytes verbatim"
+                "get_range_from_ram_cache_hit must return raw bytes verbatim"
             );
 
             // Path 1: load_range_data_with_cache — RAM hit; disk is never touched.
@@ -30426,7 +27647,7 @@ mod ram_cache_range_property_tests {
     ///
     /// When widening is enabled, the RAM entry stored for an object is keyed
     /// by the *containing Page's* bounds (`fill_page` looks up
-    /// `get_range_from_ram_cache(cache_key, page_start, page_end, get_ttl)`, not the
+    /// `get_range_from_ram_cache_hit(cache_key, page_start, page_end, get_ttl)`, not the
     /// client's requested sub-range — see `http_proxy.rs::fill_page`). No new
     /// heat-tracking code is needed for this: because the stored entry *is*
     /// the whole Page, any lookup keyed on the Page's bounds — regardless of
@@ -30470,39 +27691,45 @@ mod ram_cache_range_property_tests {
             );
 
             let stats_before = cache_manager
-                .get_ram_cache_stats()
+                .ram_cache_stats()
+                .await
                 .expect("ram_cache must be enabled");
 
             // Simulate two sub-page client reads: each independently resolves
             // to the same page-keyed RAM lookup (`fill_page` computes the
-            // containing Page and calls `get_range_from_ram_cache` with the
+            // containing Page and calls `get_range_from_ram_cache_hit` with the
             // Page's bounds, then slices the client's narrower sub-range from
             // the returned buffer) — never a lookup keyed on the client's own
             // sub-range.
-            let sub_range_1 = cache_manager.get_range_from_ram_cache(
-                cache_key,
-                page_start,
-                page_end,
-                std::time::Duration::from_secs(3600),
-            );
+            let sub_range_1 = cache_manager
+                .get_range_from_ram_cache_hit(
+                    cache_key,
+                    page_start,
+                    page_end,
+                    std::time::Duration::from_secs(3600),
+                )
+                .map(|hit| hit.data);
             assert!(
                 sub_range_1.is_some(),
                 "page-keyed lookup (standing in for a sub-page hit) must be a RAM hit"
             );
             assert_eq!(sub_range_1.unwrap(), page_data);
-            let sub_range_2 = cache_manager.get_range_from_ram_cache(
-                cache_key,
-                page_start,
-                page_end,
-                std::time::Duration::from_secs(3600),
-            );
+            let sub_range_2 = cache_manager
+                .get_range_from_ram_cache_hit(
+                    cache_key,
+                    page_start,
+                    page_end,
+                    std::time::Duration::from_secs(3600),
+                )
+                .map(|hit| hit.data);
             assert!(
                 sub_range_2.is_some(),
                 "a second sub-page hit must also resolve against the same cached Page"
             );
 
             let stats_after = cache_manager
-                .get_ram_cache_stats()
+                .ram_cache_stats()
+                .await
                 .expect("ram_cache must be enabled");
 
             assert_eq!(
@@ -30647,7 +27874,7 @@ mod ram_cache_range_property_tests {
     }
 
     /// **Feature: ram-cache-range-fix, Property 3: Hit and miss counting accuracy**
-    /// For any sequence of `get_range_from_ram_cache` calls (some for keys that exist in RAM,
+    /// For any sequence of `get_range_from_ram_cache_hit` calls (some for keys that exist in RAM,
     /// some for keys that don't), the RAM cache `hit_count` should equal the number of calls
     /// that returned `Some`, and `miss_count` should equal the number of calls that returned `None`.
     /// **Validates: Requirements 3.2, 3.3, 4.1, 4.2, 4.3, 4.4**
@@ -30710,12 +27937,15 @@ mod ram_cache_range_property_tests {
                         let key = key_pool[(*key_idx as usize) % key_pool.len()];
                         let s = *start as u64;
                         let e = s + (*end as u64); // ensure end >= start
-                        match cache_manager.get_range_from_ram_cache(
-                            key,
-                            s,
-                            e,
-                            std::time::Duration::from_secs(3600),
-                        ) {
+                        match cache_manager
+                            .get_range_from_ram_cache_hit(
+                                key,
+                                s,
+                                e,
+                                std::time::Duration::from_secs(3600),
+                            )
+                            .map(|hit| hit.data)
+                        {
                             Some(_) => expected_hits += 1,
                             None => expected_misses += 1,
                         }
@@ -30725,7 +27955,8 @@ mod ram_cache_range_property_tests {
 
             // Compare with stats
             let stats = cache_manager
-                .get_ram_cache_stats()
+                .ram_cache_stats()
+                .await
                 .expect("RAM cache should be enabled");
 
             if stats.hit_count == expected_hits && stats.miss_count == expected_misses {
@@ -30834,7 +28065,7 @@ mod ram_cache_range_property_tests {
 
                 // Check size invariant after each promotion
                 let stats = cache_manager
-                    .get_ram_cache_stats()
+                    .ram_cache_stats().await
                     .expect("RAM cache should be enabled");
 
                 if stats.current_size > max_ram_cache_size {
@@ -30900,7 +28131,7 @@ mod ram_cache_range_unit_tests {
         (cm, temp_dir)
     }
 
-    /// After promote_range_to_ram_cache, get_range_from_ram_cache returns the exact data.
+    /// After promote_range_to_ram_cache, get_range_from_ram_cache_hit returns the exact data.
     /// **Validates: Requirements 3.1, 2.2**
     #[tokio::test(flavor = "multi_thread")]
     async fn test_promote_then_get_returns_data() {
@@ -30914,12 +28145,14 @@ mod ram_cache_range_unit_tests {
 
         promote_raw(&cm, cache_key, start, end, &data, etag);
 
-        let result = cm.get_range_from_ram_cache(
-            cache_key,
-            start,
-            end,
-            std::time::Duration::from_secs(3600),
-        );
+        let result = cm
+            .get_range_from_ram_cache_hit(
+                cache_key,
+                start,
+                end,
+                std::time::Duration::from_secs(3600),
+            )
+            .map(|hit| hit.data);
         assert!(
             result.is_some(),
             "Expected data from RAM cache after promotion"
@@ -30944,12 +28177,14 @@ mod ram_cache_range_unit_tests {
 
         promote_raw(&cm, cache_key, 0, data.len() as u64 - 1, &data, etag);
 
-        let result = cm.get_range_from_ram_cache(
-            cache_key,
-            0,
-            data.len() as u64 - 1,
-            std::time::Duration::from_secs(3600),
-        );
+        let result = cm
+            .get_range_from_ram_cache_hit(
+                cache_key,
+                0,
+                data.len() as u64 - 1,
+                std::time::Duration::from_secs(3600),
+            )
+            .map(|hit| hit.data);
         assert!(
             result.is_none(),
             "Oversized range must not be promoted to RAM cache"
@@ -30958,8 +28193,8 @@ mod ram_cache_range_unit_tests {
 
     /// With RAM cache disabled, promote is a no-op and get returns None.
     /// **Validates: Requirements 3.1, 2.2**
-    #[test]
-    fn test_ram_cache_disabled_noop() {
+    #[tokio::test]
+    async fn test_ram_cache_disabled_noop() {
         let (cm, _dir) = create_disabled_ram_cache_manager();
 
         let cache_key = "bucket/object.txt";
@@ -30970,13 +28205,14 @@ mod ram_cache_range_unit_tests {
         promote_raw(&cm, cache_key, 0, 4, &data, etag);
 
         // Get should return None
-        let result =
-            cm.get_range_from_ram_cache(cache_key, 0, 4, std::time::Duration::from_secs(3600));
+        let result = cm
+            .get_range_from_ram_cache_hit(cache_key, 0, 4, std::time::Duration::from_secs(3600))
+            .map(|hit| hit.data);
         assert!(result.is_none(), "RAM cache disabled: get must return None");
 
         // Stats should also reflect disabled state
         assert!(
-            cm.get_ram_cache_stats().is_none(),
+            cm.ram_cache_stats().await.is_none(),
             "RAM cache disabled: stats must be None"
         );
     }
@@ -31002,12 +28238,13 @@ mod ram_cache_range_unit_tests {
 
         // Control arm: the entry IS resident under a generous TTL.
         assert!(
-            cm.get_range_from_ram_cache(
+            cm.get_range_from_ram_cache_hit(
                 cache_key,
                 start,
                 end,
                 std::time::Duration::from_secs(3600)
             )
+            .map(|hit| hit.data)
             .is_some(),
             "PRECONDITION MISSING: the range is not resident in RAM at all, so the \
              zero-TTL arm below would pass without exercising the gate"
@@ -31026,9 +28263,10 @@ mod ram_cache_range_unit_tests {
 
         // The assertion: same entry, same call, zero TTL.
         assert!(
-            cm.get_range_from_ram_cache(cache_key, start, end, Duration::ZERO)
+            cm.get_range_from_ram_cache_hit(cache_key, start, end, Duration::ZERO)
+                .map(|hit| hit.data)
                 .is_none(),
-            "get-ttl-zero-enforcement R4.2: get_range_from_ram_cache must refuse a zero \
+            "get-ttl-zero-enforcement R4.2: get_range_from_ram_cache_hit must refuse a zero \
              get_ttl. A resident range answered here is a read S3 never authorized — \
              get_ttl: 0 is an authorization boundary, not only a freshness one"
         );
@@ -31074,7 +28312,7 @@ mod ram_promotion_frame_property_tests {
         (cache_manager, range_handler)
     }
 
-    /// Store `data` as a range on disk via `DiskCacheManager::store_range`, honoring
+    /// Store `data` as a range on disk via `DiskCacheManager::prepare_range_store`, honoring
     /// `compression_enabled` (true => real LZ4 compression via the compressible
     /// payload; false => store-mode frame, per `compress_with_metadata`).
     async fn store_test_range(
@@ -31095,7 +28333,7 @@ mod ram_promotion_frame_property_tests {
             .get_disk_cache_manager()
             .write()
             .await
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 data.len() as u64 - 1,
@@ -31105,7 +28343,7 @@ mod ram_promotion_frame_property_tests {
                 compression_enabled,
             )
             .await
-            .expect("DiskCacheManager::store_range should succeed");
+            .expect("DiskCacheManager::prepare_range_store should succeed");
     }
 
     /// Read the on-disk frame bytes + algorithm directly, bypassing RAM,
@@ -31339,7 +28577,7 @@ mod ram_promotion_frame_property_tests {
             .get_disk_cache_manager()
             .write()
             .await
-            .store_range(
+            .store_range_witnessed(
                 etagless_key,
                 0,
                 data.len() as u64 - 1,
@@ -31370,7 +28608,7 @@ mod ram_promotion_frame_property_tests {
             .expect("disk-hit load should succeed");
         assert!(!ram_hit);
         assert_eq!(served, data, "the disk hit must still be served byte-exact");
-        let entries = cache_manager.get_ram_cache_stats().unwrap().entries_count;
+        let entries = cache_manager.ram_cache_stats().await.unwrap().entries_count;
         assert_eq!(
             entries, 0,
             "a disk hit with an empty etag was promoted to RAM ({} entries)",
@@ -31383,7 +28621,7 @@ mod ram_promotion_frame_property_tests {
             .await
             .expect("disk-hit load should succeed");
         assert_eq!(
-            cache_manager.get_ram_cache_stats().unwrap().entries_count,
+            cache_manager.ram_cache_stats().await.unwrap().entries_count,
             1,
             "CONTROL: a disk hit with a known etag must still be promoted"
         );
@@ -31528,7 +28766,7 @@ mod head_freshness_current_ttl_tests {
 #[cfg(test)]
 mod write_cache_range_sink_tests {
     use super::*;
-    use crate::cache_types::{ObjectMetadata, RangeSpec};
+    use crate::cache_types::RangeSpec;
     use crate::compression::CompressionAlgorithm;
     use tempfile::TempDir;
 
@@ -31579,19 +28817,8 @@ mod write_cache_range_sink_tests {
         sink.write(&input[5000..6000]).unwrap();
         sink.write(&input[6000..7000]).unwrap();
 
-        let object_metadata = ObjectMetadata {
-            etag: "sink-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: total_len as u64,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: total_len as u64,
-            is_write_cached: true,
-            ..Default::default()
-        };
-        sink.commit(object_metadata, Duration::from_secs(3600))
-            .await
-            .unwrap();
+        let (_spec, pending) = sink.finalize_unpublished().unwrap();
+        pending.publish().unwrap();
 
         // Read back via a second manager pointed at the same cache dir.
         let reader = make_disk_cache(&temp_dir, batch_size).await;
@@ -31722,7 +28949,6 @@ mod write_cache_range_sink_tests {
 #[cfg(test)]
 mod write_cache_range_sink_property_tests {
     use super::*;
-    use crate::cache_types::ObjectMetadata;
     use quickcheck::TestResult;
     use quickcheck_macros::quickcheck;
     use tempfile::TempDir;
@@ -31781,19 +29007,8 @@ mod write_cache_range_sink_property_tests {
         // Build the write-cache metadata exactly as the whole-buffer path does and
         // commit, so this is a faithful end-to-end store rather than a bare range
         // finalize.
-        let object_metadata = ObjectMetadata {
-            etag: "prop-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: total_len,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: total_len,
-            is_write_cached: true,
-            ..Default::default()
-        };
-        sink.commit(object_metadata, Duration::from_secs(3600))
-            .await
-            .unwrap();
+        let (_spec, pending) = sink.finalize_unpublished().unwrap();
+        pending.publish().unwrap();
 
         // Read the committed range back through a second manager on the same dir
         // and decompress, reconstructing the RangeSpec from the published file.
@@ -31995,147 +29210,6 @@ mod global_cache_stats_unit_tests {
 }
 
 #[cfg(test)]
-mod range_tinylfu_sort_tests {
-    use super::{CacheEvictionAlgorithm, CacheManager, RangeEvictionCandidate};
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
-    use tempfile::TempDir;
-
-    /// Build a minimal `RangeEvictionCandidate` for sort-ordering tests. Only
-    /// `access_count` and `last_accessed` affect `sort_range_candidates`; the
-    /// remaining fields are filled with harmless placeholders.
-    fn make_candidate(
-        cache_key: &str,
-        access_count: u64,
-        last_accessed: SystemTime,
-    ) -> RangeEvictionCandidate {
-        RangeEvictionCandidate {
-            cache_key: cache_key.to_string(),
-            range_start: 0,
-            range_end: 1023,
-            last_accessed,
-            size: 1024,
-            compressed_size: 1024,
-            access_count,
-            bin_file_path: PathBuf::from(format!("ranges/{}.bin", cache_key)),
-            is_write_cached: false,
-            staged: None,
-            expires_at: None,
-            object_range_count: None,
-            identity: None,
-        }
-    }
-
-    /// Construct a `CacheManager` configured for TinyLFU eviction, backed by a
-    /// throwaway temp dir (no cache I/O is exercised by `sort_range_candidates`,
-    /// which operates purely on the in-memory candidate slice).
-    fn make_tinylfu_manager() -> (CacheManager, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let cm = CacheManager::new_with_eviction_and_ttl(
-            temp_dir.path().to_path_buf(),
-            false, // ram_cache_enabled — irrelevant to disk-tier range sorting
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-            1_048_576,                 // compression_threshold
-            false,                     // compression_enabled
-            Duration::from_secs(3600), // get_ttl — irrelevant to sorting
-        );
-        (cm, temp_dir)
-    }
-
-    /// A fresh one-hit range (`access_count == 1`, just accessed) sorts before
-    /// (i.e. is ordered for eviction ahead of) an idle-hot range (`access_count ==
-    /// 100_000`, idle 2 half-lives) for a fixed scenario.
-    ///
-    /// Ascending sort means index 0 is evicted first. With
-    /// `TINYLFU_HALF_LIFE_SECS == 3600`:
-    ///   - idle-hot:  decayed_frequency(100_000, 2*3600) == 100_000 >> 2 == 25_000
-    ///   - fresh:     decayed_frequency(1, 0)            == 1
-    ///
-    /// `25_000 > 1`, so the fresh one-hit range has the lower score and sorts
-    /// first (evicted before the idle-hot range). This is the correct, expected
-    /// post-fix ordering for this choice of numbers — the idle-hot range's
-    /// historical access_count (100_000) is still far above the fresh range's
-    /// decayed score even after 2 half-lives of decay, so it correctly survives
-    /// longer than the fresh one-hit-wonder. This test pins the ordering
-    /// direction; the RAM-tier test (7.2) is what exercises the actual inversion
-    /// regression (there, the fresh entry is inserted at a *later* point after
-    /// the hot entry already occupies a full shard, so eviction pressure lands
-    /// on the fresh entry specifically to prove the hot entry is shielded).
-    ///
-    /// **Validates: Requirements 6.2**
-    #[test]
-    fn test_fresh_one_hit_sorts_before_idle_hot() {
-        let (cm, _temp_dir) = make_tinylfu_manager();
-        let now = SystemTime::now();
-
-        let idle_hot = make_candidate(
-            "bucket/idle-hot-object",
-            100_000,
-            now - Duration::from_secs(2 * crate::cache::TINYLFU_HALF_LIFE_SECS),
-        );
-        let fresh_one_hit = make_candidate("bucket/fresh-one-hit-object", 1, now);
-
-        let mut candidates = vec![idle_hot.clone(), fresh_one_hit.clone()];
-        cm.sort_range_candidates(&mut candidates);
-
-        let fresh_pos = candidates
-            .iter()
-            .position(|c| c.cache_key == fresh_one_hit.cache_key)
-            .expect("fresh one-hit candidate must remain in the sorted output");
-        let idle_hot_pos = candidates
-            .iter()
-            .position(|c| c.cache_key == idle_hot.cache_key)
-            .expect("idle-hot candidate must remain in the sorted output");
-
-        assert!(
-            fresh_pos < idle_hot_pos,
-            "fresh one-hit range (decayed score 1) must sort before (be ordered for \
-             eviction ahead of) the idle-hot range (decayed score 25_000): \
-             fresh_pos={}, idle_hot_pos={}",
-            fresh_pos,
-            idle_hot_pos
-        );
-    }
-
-    /// When every candidate has decayed to the same `Effective_Frequency`
-    /// (`access_count == 1`, idle well under one half-life so no decay has
-    /// occurred), `sort_range_candidates_for_tinylfu` must fall back to the
-    /// `Last_Accessed` tiebreak — i.e. ascending `last_accessed` (oldest
-    /// evicted first), matching plain LRU order.
-    ///
-    /// **Validates: Requirements 6.4**
-    #[test]
-    fn test_all_cold_candidates_fall_back_to_lru_order() {
-        let (cm, _temp_dir) = make_tinylfu_manager();
-        let now = SystemTime::now();
-
-        // All access_count == 1, idle_secs all well under TINYLFU_HALF_LIFE_SECS
-        // (3600s), so every candidate decays to the same Effective_Frequency == 1.
-        let oldest = make_candidate("bucket/all-cold-0", 1, now - Duration::from_secs(300));
-        let middle = make_candidate("bucket/all-cold-1", 1, now - Duration::from_secs(150));
-        let newest = make_candidate("bucket/all-cold-2", 1, now - Duration::from_secs(10));
-
-        // Insert out of order to prove the sort actually reorders them.
-        let mut candidates = vec![newest.clone(), oldest.clone(), middle.clone()];
-        cm.sort_range_candidates(&mut candidates);
-
-        let keys: Vec<&str> = candidates.iter().map(|c| c.cache_key.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec![
-                oldest.cache_key.as_str(),
-                middle.cache_key.as_str(),
-                newest.cache_key.as_str()
-            ],
-            "all-cold candidates (identical Effective_Frequency) must sort in \
-             ascending last_accessed order (oldest evicted first) — got {:?}",
-            keys
-        );
-    }
-}
-
-#[cfg(test)]
 mod head_freshness_anchor_tests {
     use super::is_head_fresh;
     use std::time::{Duration, SystemTime};
@@ -32272,7 +29346,12 @@ mod head_anchor_integration_tests {
 
         let headers = HashMap::from([(String::from("content-type"), String::from("text/plain"))]);
         manager
-            .store_head_cache_entry_unified(key, headers, head_response_metadata())
+            .store_head_cache_entry_unified_witnessed(
+                key,
+                headers,
+                head_response_metadata(),
+                manager.capture_fill_witness(key).await,
+            )
             .await
             .unwrap();
         let refreshed = manager.get_metadata_from_disk(key).await.unwrap().unwrap();
@@ -32286,7 +29365,12 @@ mod head_anchor_integration_tests {
         manager.write_metadata_to_disk(&next_window).await.unwrap();
         manager.get_metadata_cache().invalidate(key).await;
         manager
-            .store_head_cache_entry_unified(key, HashMap::new(), head_response_metadata())
+            .store_head_cache_entry_unified_witnessed(
+                key,
+                HashMap::new(),
+                head_response_metadata(),
+                manager.capture_fill_witness(key).await,
+            )
             .await
             .unwrap();
         assert!(manager
@@ -32303,7 +29387,7 @@ mod head_anchor_integration_tests {
 /// routing half of the fix (a part-scoped HEAD neither reading nor writing the
 /// whole-object entry) is a branch inside `handle_get_head_request` and cannot be
 /// reached from a `#[cfg(test)]` unit test; it lives in
-/// `tests/part_scoped_head_cache_test.rs`.
+/// `src/cache/moved_fill_tests/part_scoped_head_cache_test.rs`.
 #[cfg(test)]
 mod part_scoped_head_storage_tests {
     use super::*;
@@ -32333,7 +29417,7 @@ mod part_scoped_head_storage_tests {
     /// stored as object metadata on a fresh HEAD-only entry.
     ///
     /// Note this test does NOT also plant a `Content-Range`: such a response is
-    /// now refused outright by `store_head_cache_entry_unified`, which is
+    /// now refused outright by `store_head_cache_entry_unified_witnessed`, which is
     /// `store_head_entry_refuses_a_partial_response` below. The two together are
     /// the requirement; either alone would leave a gap.
     #[tokio::test]
@@ -32348,7 +29432,12 @@ mod part_scoped_head_storage_tests {
             (String::from("etag"), String::from("\"whole-object-etag\"")),
         ]);
         manager
-            .store_head_cache_entry_unified(key, headers, whole_object_head_metadata())
+            .store_head_cache_entry_unified_witnessed(
+                key,
+                headers,
+                whole_object_head_metadata(),
+                manager.capture_fill_witness(key).await,
+            )
             .await
             .unwrap();
 
@@ -32437,7 +29526,12 @@ mod part_scoped_head_storage_tests {
             (String::from("content-type"), String::from("text/plain")),
         ]);
         manager
-            .store_head_cache_entry_unified(key, headers, whole_object_head_metadata())
+            .store_head_cache_entry_unified_witnessed(
+                key,
+                headers,
+                whole_object_head_metadata(),
+                manager.capture_fill_witness(key).await,
+            )
             .await
             .unwrap();
 
@@ -32484,10 +29578,11 @@ mod part_scoped_head_storage_tests {
         ]);
         assert!(
             manager
-                .store_head_cache_entry_unified(
+                .store_head_cache_entry_unified_witnessed(
                     "bucket/partial-cr",
                     with_content_range,
-                    whole_object_head_metadata()
+                    whole_object_head_metadata(),
+                    manager.capture_fill_witness("bucket/partial-cr").await
                 )
                 .await
                 .is_err(),
@@ -32507,10 +29602,11 @@ mod part_scoped_head_storage_tests {
         ]);
         assert!(
             manager
-                .store_head_cache_entry_unified(
+                .store_head_cache_entry_unified_witnessed(
                     "bucket/partial-pc",
                     with_parts_count,
-                    whole_object_head_metadata()
+                    whole_object_head_metadata(),
+                    manager.capture_fill_witness("bucket/partial-pc").await
                 )
                 .await
                 .is_err(),
@@ -32576,7 +29672,7 @@ mod head_last_modified_guard_tests {
     use tempfile::TempDir;
 
     /// Plant a `.meta` directly, bypassing every write-side guard — the same
-    /// technique `plant_meta` in `tests/part_scoped_head_cache_test.rs` uses, and
+    /// technique `plant_meta` in `src/cache/moved_fill_tests/part_scoped_head_cache_test.rs` uses, and
     /// the technique task 0.4 used to construct R5.4's state (a `304` revalidation
     /// that set `head_expires_at` and `head_cached_at` without touching
     /// `last_modified`, which this function's caller reproduces by fields rather
@@ -32724,7 +29820,12 @@ mod head_last_modified_guard_tests {
             last_accessed: SystemTime::now(),
         };
         manager
-            .store_head_cache_entry_unified(key, HashMap::new(), head_response)
+            .store_head_cache_entry_unified_witnessed(
+                key,
+                HashMap::new(),
+                head_response,
+                manager.capture_fill_witness(key).await,
+            )
             .await
             .unwrap();
 
@@ -32825,12 +29926,7 @@ mod credit_staged_range_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -33076,12 +30172,7 @@ mod journal_components_identity_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        )
+        CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0)
     }
 
     fn staged_range_spec() -> crate::cache_types::RangeSpec {
@@ -33104,7 +30195,7 @@ mod journal_components_identity_tests {
         // The startup call — `HttpProxy::new` does this once.
         let _startup = manager.create_configured_disk_cache_manager();
         let consolidator_before = manager.get_journal_consolidator().await.unwrap();
-        let writer_before = manager.get_hybrid_metadata_writer().await.unwrap();
+        let writer_before = manager.hybrid_metadata_writer.read().await.clone().unwrap();
         let buffer_before = manager.get_cache_hit_update_buffer().await.unwrap();
 
         // A request-path call.
@@ -33121,7 +30212,7 @@ mod journal_components_identity_tests {
         assert!(
             Arc::ptr_eq(
                 &writer_before,
-                &manager.get_hybrid_metadata_writer().await.unwrap()
+                &manager.hybrid_metadata_writer.read().await.clone().unwrap()
             ),
             "a request-path call replaced the HybridMetadataWriter; its JournalManager \
              carries the append_mutex that serializes writes to this instance's journal \
@@ -33264,12 +30355,7 @@ mod debit_removed_ranges_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -33523,7 +30609,7 @@ mod debit_removed_ranges_tests {
     }
 }
 
-/// Tests that `store_full_object_as_range_new` removes and debits the partial ranges
+/// Tests that `store_full_object_as_range_witnessed` removes and debits the partial ranges
 /// it supersedes, in **both** ETag cases.
 ///
 /// Both cases matter because the removal used to sit under the wrong arm of an
@@ -33550,12 +30636,7 @@ mod full_object_supersedes_partial_ranges_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -33636,7 +30717,7 @@ mod full_object_supersedes_partial_ranges_tests {
             ..Default::default()
         };
         manager
-            .store_full_object_as_range_new(KEY, &vec![3u8; OBJECT_BYTES as usize], object_metadata)
+            .seed_full_object_fill(KEY, &vec![3u8; OBJECT_BYTES as usize], object_metadata)
             .await
             .expect("full-object store should succeed");
     }
@@ -33701,7 +30782,7 @@ mod full_object_supersedes_partial_ranges_tests {
 
 /// Producer audit (cache-eviction-at-scale task 29 part 3, see
 /// `CAPACITY-AUTHORITY-PATH-FORWARD.md` § "CORRECTION 2026-09-03"). Pins, for
-/// `CacheManager::store_full_object_as_range_new` (`cache.rs:10638`), that the
+/// `CacheManager::store_full_object_as_range_witnessed` (`cache.rs:10638`), that the
 /// persisted `.bin` file's on-disk byte length equals `RangeSpec.compressed_size`
 /// exactly, and that those bytes decode as a valid LZ4 frame. This is the sixth
 /// `.bin` producer in the audit and the only one of the four `RangeSpec`-building
@@ -33716,12 +30797,7 @@ mod store_full_object_st_size_audit_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(temp.path().join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            temp.path().to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(temp.path().to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
 
         const KEY: &str = "test-bucket/producer-audit-full-object.bin";
@@ -33735,7 +30811,7 @@ mod store_full_object_st_size_audit_tests {
         };
 
         manager
-            .store_full_object_as_range_new(KEY, &data, object_metadata)
+            .seed_full_object_fill(KEY, &data, object_metadata)
             .await
             .expect("full-object store should succeed");
 
@@ -33752,19 +30828,19 @@ mod store_full_object_st_size_audit_tests {
         assert_eq!(
             st_size, range_spec.compressed_size,
             "st_size(.bin) must equal RangeSpec.compressed_size for \
-             store_full_object_as_range_new's output"
+             store_full_object_as_range_witnessed's output"
         );
 
         let handler = crate::compression::CompressionHandler::new(10, true);
-        let decoded = handler
-            .decompress_data(&on_disk)
-            .expect(".bin bytes from store_full_object_as_range_new must decode as LZ4 frame(s)");
+        let decoded = handler.decompress_data(&on_disk).expect(
+            ".bin bytes from store_full_object_as_range_witnessed must decode as LZ4 frame(s)",
+        );
         assert_eq!(decoded, data);
     }
 }
 
 /// Unit tests for [`CacheManager::check_and_invalidate_expired_write_cache`] and
-/// [`CacheManager::invalidate_write_cache_entry`] — the last two undebited delete
+/// the explicit write-cache invalidation path (since removed) — the last two undebited delete
 /// sites from the cache eviction at scale feature R7.1. Both delete `.bin` range
 /// files and the `.meta` with no debit and no journal entry before this fix, so a
 /// lazy expiration or an explicit/eviction invalidation freed disk space without ever
@@ -33790,12 +30866,7 @@ mod undebited_write_cache_invalidation_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -33857,7 +30928,10 @@ mod undebited_write_cache_invalidation_tests {
         // Seed cached_objects=1 so the decrement this fix adds is observable.
         let mut state = consolidator.load_size_state().await.unwrap();
         state.cached_objects = 1;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
     }
 
     /// Shown failing first: without the fix, both deltas stay (0, 0) and
@@ -33879,28 +30953,6 @@ mod undebited_write_cache_invalidation_tests {
             deltas(&manager).await,
             (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
             "lazy expiration must debit both total_size and write_cache_size"
-        );
-        assert_eq!(
-            cached_objects(&manager).await,
-            0,
-            "the .meta is gone, so cached_objects must decrement"
-        );
-    }
-
-    /// Same fixture, driven through `invalidate_write_cache_entry` (the explicit /
-    /// eviction / cleanup path) instead of the lazy-expiration check.
-    #[tokio::test]
-    async fn explicit_invalidation_debits_both_channels_and_decrements_cached_objects() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path());
-        plant_expired_staged_entry(&manager, temp.path()).await;
-
-        manager.invalidate_write_cache_entry(KEY).await.unwrap();
-
-        assert_eq!(
-            deltas(&manager).await,
-            (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
-            "explicit invalidation must debit both total_size and write_cache_size"
         );
         assert_eq!(
             cached_objects(&manager).await,
@@ -33932,12 +30984,7 @@ mod invalidation_cancellation_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -34000,7 +31047,10 @@ mod invalidation_cancellation_tests {
         let consolidator = manager.get_journal_consolidator().await.unwrap();
         let mut state = consolidator.load_size_state().await.unwrap();
         state.cached_objects = 1;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
         bins
     }
 
@@ -34109,7 +31159,7 @@ mod invalidation_cancellation_tests {
 /// version's ranges either wholly dereferenced (unlinked, debited, and a `.meta` that no longer
 /// names them) or wholly untouched, and the counted bytes must equal the bytes on disk.
 ///
-/// The HEAD-miss path awaits `store_head_cache_entry_unified` inline, so a client disconnect
+/// The HEAD-miss path awaits `store_head_cache_entry_unified_witnessed` inline, so a client disconnect
 /// drops it. If the arm's unlinks run before an await and its debit and `.meta` rename after
 /// it, that drop leaves the ranges unlinked but counted and a `.meta` naming absent `.bin` files.
 #[cfg(test)]
@@ -34128,12 +31178,7 @@ mod head_change_cancellation_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -34210,8 +31255,13 @@ mod head_change_cancellation_tests {
         let task = {
             let m = manager.clone();
             tokio::spawn(async move {
-                m.store_head_cache_entry_unified(KEY, HashMap::new(), changed_head())
-                    .await
+                m.store_head_cache_entry_unified_witnessed(
+                    KEY,
+                    HashMap::new(),
+                    changed_head(),
+                    m.capture_fill_witness(KEY).await,
+                )
+                .await
             })
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -34803,31 +31853,6 @@ mod staged_entries_lifecycle_tests {
         );
     }
 
-    /// Explicit invalidation (the eviction / cleanup path) of a staged entry must
-    /// return the gauge to 0. Covers the decrement task 51's fix left ungated in
-    /// `invalidate_write_cache_entry` and `invalidate_cache_hierarchy`.
-    #[tokio::test]
-    async fn invalidating_a_staged_entry_returns_staged_entries_to_zero() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path()).await;
-        let cache_key = "test-bucket/staged-entries-invalidate.bin";
-        let body = vec![5u8; BODY_LEN];
-
-        put_write_cached(&manager, cache_key, &body).await;
-        assert_eq!(staged_entries(&manager).await, 1);
-
-        manager
-            .invalidate_write_cache_entry(cache_key)
-            .await
-            .expect("invalidation should succeed");
-
-        assert_eq!(
-            staged_entries(&manager).await,
-            0,
-            "invalidating a staged entry must return staged_entries to 0"
-        );
-    }
-
     /// A re-PUT of the SAME key where the first entry has already GRADUATED must
     /// not decrement the gauge a second time: graduation already released its slot,
     /// so the re-PUT's dereference must see the flag cleared and do nothing.
@@ -34888,12 +31913,8 @@ mod total_cache_size_definition_tests {
         }
         // RAM caching ON with a real budget: `ram_cache_size` has to be a non-zero
         // summand or this test cannot tell the two definitions apart.
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            true,
-            64 * 1024 * 1024,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager =
+            CacheManager::new_with_defaults(cache_dir.to_path_buf(), true, 64 * 1024 * 1024);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -34924,7 +31945,10 @@ mod total_cache_size_definition_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = DISK_BYTES;
         state.write_cache_size = STAGED_BYTES;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Make the RAM tier non-empty. These bytes are a promoted copy of bytes already
         // counted on disk, so they must not be added to the total.
@@ -35027,7 +32051,10 @@ mod total_cache_size_definition_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = DISK_BYTES;
         state.write_cache_size = STAGED_BYTES;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // Stage part records for two in-flight uploads, with byte counts large enough
         // that any leakage into a composite figure would be unmistakable.
@@ -35164,7 +32191,10 @@ mod total_cache_size_definition_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = DISK_BYTES;
         state.write_cache_size = INCUMBENT_BYTES;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // `F`, in the fold's own document.
         crate::staged_fold::seed_shard_figure_for_tests(
@@ -35302,7 +32332,10 @@ mod total_cache_size_definition_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = DISK_BYTES;
         state.write_cache_size = INCUMBENT_BYTES;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         crate::staged_fold::seed_shard_figure_for_tests(temp.path(), "test-bucket", "3f", 500, 2);
         assert!(crate::staged_authority::activate(temp.path(), "host:test").unwrap());
@@ -35398,7 +32431,10 @@ mod total_cache_size_definition_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = 1_000;
         state.write_cache_size = 16_922_745_347;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         let sizes = manager
             .get_cache_size_stats()
@@ -35433,7 +32469,10 @@ mod total_cache_size_definition_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = DISK_BYTES;
         state.write_cache_size = STAGED_BYTES;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         // The synchronous getter cannot read shared storage, so it must not claim to know.
         assert!(
@@ -35470,7 +32509,10 @@ mod total_cache_size_definition_tests {
             let mut state = consolidator.load_size_state().await.unwrap();
             state.total_size = DISK_BYTES;
             state.write_cache_size = STAGED_BYTES;
-            consolidator.persist_size_state(&state).await.unwrap();
+            consolidator
+                .seed_size_state_for_tests(&state)
+                .await
+                .unwrap();
         }
 
         // Only B holds a RAM-resident range — the .34.221 vs .34.83 difference.
@@ -35533,7 +32575,10 @@ mod total_cache_size_definition_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = FLEET_TOTAL;
         state.write_cache_size = FLEET_STAGED;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
 
         let sizes = manager
             .get_cache_size_stats()
@@ -35611,12 +32656,7 @@ mod eviction_phantom_debit_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -36132,12 +33172,7 @@ mod eviction_executor_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -37816,12 +34851,7 @@ mod eviction_byte_target_red_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager
     }
@@ -38013,56 +35043,6 @@ mod eviction_byte_target_red_tests {
         count
     }
 
-    async fn collect_and_select(manager: &CacheManager) -> (usize, usize, u64, String) {
-        let mut candidates = manager
-            .collect_range_candidates_for_eviction()
-            .await
-            .unwrap();
-        let collected = candidates.len();
-        assert_eq!(
-            collected,
-            SMALL_RANGE_COUNT + 1,
-            "fixture must reach the real collector with every metadata file eligible"
-        );
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.size == candidate.compressed_size),
-            "the byte target must use the same on-disk size the collector passes to selection"
-        );
-
-        manager.sort_range_candidates(&mut candidates);
-        let selected = manager.group_candidates_by_object(candidates, BYTES_TO_FREE);
-        let selected_count = selected
-            .iter()
-            .map(|(_, ranges)| ranges.len())
-            .sum::<usize>();
-        let selected_bytes = selected
-            .iter()
-            .flat_map(|(_, ranges)| ranges)
-            .map(|candidate| candidate.size)
-            .sum::<u64>();
-        let selected_key = selected
-            .first()
-            .expect("the oldest large range must satisfy the target")
-            .0
-            .clone();
-        (collected, selected_count, selected_bytes, selected_key)
-    }
-
-    #[tokio::test]
-    async fn r13_2_fixture_reaches_the_byte_target_with_one_old_large_range() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = mixed_fixture(temp.path());
-        let (collected, selected_count, selected_bytes, selected_key) =
-            collect_and_select(&manager).await;
-
-        assert_eq!(collected, SMALL_RANGE_COUNT + 1);
-        assert_eq!(selected_count, 1, "one range must satisfy the byte target");
-        assert_eq!(selected_bytes, BYTES_TO_FREE);
-        assert_eq!(selected_key, "test-bucket/r13-2-old-large.bin");
-    }
-
     /// R13.2, no longer ignored: the bounded selector materialises only the candidates selection
     /// needs, AND opens only the `.meta` files it has decided it wants.
     ///
@@ -38198,7 +35178,7 @@ mod eviction_byte_target_red_tests {
     ///
     /// # The exact-fit case cannot see this, which is why the test exists
     ///
-    /// `r13_2_fixture_reaches_the_byte_target_with_one_old_large_range` targets exactly 64 KiB
+    /// The exact-fit test for the same fixture targets exactly 64 KiB
     /// against a 64 KiB range: the accumulation lands ON the target and there is no overshoot to
     /// improve on. TRAP 2 — a target met exactly is where this defect is invisible.
     ///
@@ -40609,12 +37589,7 @@ mod tail_selection_outcome_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let mut manager = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let mut manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
         manager.set_tail_config_for_tests(floor, cap, 4096);
         manager
@@ -41568,7 +38543,7 @@ mod tail_selection_outcome_tests {
 /// value alone.
 ///
 /// The fixture is deterministic: no sleeps and no task spawning. The concurrent writer
-/// holds the key's metadata slot lock — the same `fs4` namespace `disk_cache::update_metadata` and
+/// holds the key's metadata slot lock — the same `fs4` namespace the removed whole-file `.meta` updater and
 /// the journal consolidator hold — for the whole of its read-modify-write, which is
 /// exactly the shape a correct writer has. Nothing about the outcome depends on
 /// scheduling.
@@ -42077,7 +39052,7 @@ mod graduation_is_a_locked_transaction_tests {
 /// `METALOCK-B1` tests below, and `invalidate_cache_hierarchy` — the site that reached
 /// `delete_specific_range` — is the first of them.
 ///
-/// The second defect was `coordinate_cleanup`'s sweep of `cache_dir/locks`, which unlinked
+/// The second defect was the cleanup coordinator's sweep of `cache_dir/locks`, which unlinked
 /// every `*.lock` whose payload deserialised as an expired per-key write sentinel and so
 /// enumerated `global_eviction.lock` too. It is gone: the sentinel namespace was retired and
 /// the sweep went with it, which removes the hazard rather than guarding against it. The two
@@ -42103,7 +39078,7 @@ mod metadata_lock_discipline_tests {
     /// path that seeds the fixture is wired.
     ///
     /// `actively_remove_cached_data` is a parameter rather than a constant because
-    /// `coordinate_cleanup` returns immediately when it is `false`, so the sweep test needs
+    /// The cleanup coordinator returns immediately when it is `false`, so the sweep test needs
     /// `true` while the lock test does not care.
     async fn setup(cache_dir: &std::path::Path, actively_remove_cached_data: bool) -> CacheManager {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
@@ -42358,91 +39333,10 @@ mod metadata_lock_discipline_tests {
         );
     }
 
-    /// Site 2. No production caller on this tree (every caller chains to a test-only or
-    /// zero-caller entry point), so this pins the contract for whatever revives it.
-    #[tokio::test]
-    async fn invalidate_write_cache_entry_refuses_while_a_peer_holds_the_slot_then_deletes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), false).await;
-        let cache_key = "test-bucket/metalock-b1-invalidate-write-cache.bin";
-        let (peer_lock, meta_path, _lock_path) =
-            contended_single_range_fixture(&manager, cache_key).await;
-        let bin_path = fixture_bin_path(&manager, cache_key);
-
-        let contended = manager.invalidate_write_cache_entry(cache_key).await;
-        assert!(
-            contended.is_err(),
-            "invalidate_write_cache_entry must fail rather than delete while a peer holds \
-             the key's metadata slot lock. got={contended:?}"
-        );
-        assert!(
-            meta_path.exists() && bin_path.exists(),
-            "the entry was deleted while a peer held the slot. meta_exists={} bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
-
-        drop(peer_lock);
-        manager
-            .invalidate_write_cache_entry(cache_key)
-            .await
-            .expect("once the slot is free the invalidation must proceed");
-        assert!(
-            !meta_path.exists() && !bin_path.exists(),
-            "positive control: with the slot free the entry must be deleted. meta_exists={} \
-             bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
-    }
-
-    /// Site 6. Zero `src/` callers; three integration tests drive it.
-    #[tokio::test]
-    async fn invalidate_stale_ranges_refuses_while_a_peer_holds_the_slot_then_deletes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), false).await;
-        let cache_key = "test-bucket/metalock-b1-invalidate-stale.bin";
-        let (peer_lock, meta_path, _lock_path) =
-            contended_single_range_fixture(&manager, cache_key).await;
-        let bin_path = fixture_bin_path(&manager, cache_key);
-        // The fixture stores ETag "metalock-fix"; any other value is a mismatch.
-        let new_etag = "\"metalock-b1-changed\"";
-
-        let contended = manager.invalidate_stale_ranges(cache_key, new_etag).await;
-        assert!(
-            contended.is_err(),
-            "invalidate_stale_ranges must fail rather than delete while a peer holds the \
-             key's metadata slot lock. got={contended:?}"
-        );
-        assert!(
-            meta_path.exists() && bin_path.exists(),
-            "the entry was deleted while a peer held the slot. meta_exists={} bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
-
-        drop(peer_lock);
-        let freed = manager
-            .invalidate_stale_ranges(cache_key, new_etag)
-            .await
-            .expect("once the slot is free the invalidation must proceed");
-        assert!(
-            freed,
-            "positive control: the ETag mismatch must be acted on"
-        );
-        assert!(
-            !meta_path.exists() && !bin_path.exists(),
-            "positive control: with the slot free the entry must be deleted. meta_exists={} \
-             bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
-    }
-
     /// `setup` without `initialize()`. `initialize()` starts the size tracker's validation
     /// task, whose census deletes any `.meta` it cannot parse — which is exactly the fixture
     /// the corrupt-metadata test below plants, and the census raced it to the delete during
-    /// the ~3s the contended acquisition spends retrying. `remove_corrupt_metadata` needs
+    /// the ~3s the contended acquisition spends retrying. The corrupt-metadata removal needs
     /// only the lock manager (built lazily) and the RAM metadata cache, neither of which
     /// depends on `initialize()`.
     async fn setup_without_background_tasks(cache_dir: &std::path::Path) -> CacheManager {
@@ -42478,78 +39372,6 @@ mod metadata_lock_discipline_tests {
         );
         let _ = manager.create_configured_disk_cache_manager();
         manager
-    }
-
-    /// Site 7, found by the enumeration rather than listed: `remove_corrupt_metadata`, the
-    /// request-path heal reached from three `http_proxy` serve paths.
-    #[tokio::test]
-    async fn remove_corrupt_metadata_refuses_while_a_peer_holds_the_slot_then_deletes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup_without_background_tasks(temp.path()).await;
-        let cache_key = "test-bucket/metalock-b1-corrupt.bin";
-        let meta_path = manager.get_new_metadata_file_path(cache_key);
-        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
-        std::fs::write(&meta_path, b"{ this is not metadata").unwrap();
-        assert!(
-            serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
-                &std::fs::read_to_string(&meta_path).unwrap()
-            )
-            .is_err(),
-            "fixture: the .meta must be unparseable, or the heal never reaches its delete"
-        );
-
-        let peer_lock = manager
-            .metadata_lock_manager()
-            .acquire_lock(cache_key)
-            .await
-            .expect("fixture: the peer must be able to take the slot");
-
-        let contended = manager.remove_corrupt_metadata(cache_key).await;
-        assert!(
-            matches!(contended, Err(ProxyError::LockContention(_))),
-            "remove_corrupt_metadata must be REFUSED by the held slot rather than delete \
-             while a peer holds it. got={contended:?}"
-        );
-        assert!(
-            meta_path.exists(),
-            "the corrupt .meta was deleted while a peer held the slot"
-        );
-
-        drop(peer_lock);
-        manager
-            .remove_corrupt_metadata(cache_key)
-            .await
-            .expect("once the slot is free the heal must proceed");
-        assert!(
-            !meta_path.exists(),
-            "positive control: with the slot free the corrupt .meta must be removed"
-        );
-    }
-
-    /// The lost update `remove_corrupt_metadata`'s lock exists to prevent, made concrete:
-    /// the caller's verdict was "corrupt", but by the time the heal holds the lock a peer
-    /// has republished a valid `.meta`. The heal must re-read under the lock and leave it.
-    #[tokio::test]
-    async fn remove_corrupt_metadata_spares_a_meta_that_parses_under_the_lock() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), false).await;
-        let cache_key = "test-bucket/metalock-b1-republished.bin";
-        // A VALID entry stands in for the peer's republish — the caller's stale "corrupt"
-        // verdict is simulated by calling the heal anyway.
-        let (peer_lock, meta_path, _lock_path) =
-            contended_single_range_fixture(&manager, cache_key).await;
-        drop(peer_lock);
-
-        manager
-            .remove_corrupt_metadata(cache_key)
-            .await
-            .expect("the heal must not error on a valid .meta");
-        assert!(
-            meta_path.exists(),
-            "a .meta that parses under the lock was deleted on the caller's stale verdict — \
-             that is a peer's republished write, lost"
-        );
-        assert_eq!(read_meta(&manager, cache_key).ranges.len(), 1);
     }
 
     /// Site 8, found by the enumeration: `check_and_invalidate_expired_write_cache`, the
@@ -42631,19 +39453,15 @@ mod metadata_lock_discipline_tests {
     ///
     /// # The recorded set is EMPTY, and the deletion paths now acquire
     ///
-    /// The six deletion paths this pin once listed as unlinking-without-locking —
-    /// `invalidate_cache_hierarchy`, `invalidate_stale_ranges`, `invalidate_write_cache_entry`,
-    /// `DiskCacheManager::invalidate_cache_entry`, `DiskCacheManager::delete_cache_entry` and
-    /// the startup sweep in `perform_metadata_consistency_validation` — lost their unlink
-    /// lines when the protocol moved to permanent shared slots, and each now acquires the
-    /// key's slot lock across its read-then-delete. `delete_cache_entry` has since been
-    /// deleted as production-unreachable. The exclusion tests in this module
+    /// The deletion paths this pin once listed as unlinking-without-locking lost their unlink
+    /// lines when the protocol moved to permanent shared slots, and each remaining path now
+    /// acquires the key's slot lock across its read-then-delete. The exclusion tests in this module
     /// (`*_refuses_while_a_peer_holds_the_slot*`) are where that is asserted; this scan only
     /// guards against an unlink coming back.
     ///
     /// # Shown failing first
     ///
-    /// Restoring an unlink of the scanned shape in `invalidate_stale_ranges` takes `cache.rs`
+    /// Restoring an unlink of the scanned shape in the stale-range invalidation path takes `cache.rs`
     /// from absent to 1 and the assertion names the file and both counts.
     #[test]
     fn meta_lock_unlink_sites_are_pinned() {
@@ -42795,7 +39613,7 @@ mod metadata_lock_discipline_tests {
             let body = body.clone();
             tokio::spawn(async move {
                 manager
-                    .store_full_object_as_range_new(
+                    .seed_full_object_fill(
                         &key,
                         &body,
                         b2_object_metadata(B2_BODY_LEN as u64, "\"b2-boundary\""),
@@ -42918,7 +39736,7 @@ mod metadata_lock_discipline_tests {
             let body = publication_body.clone();
             tokio::spawn(async move {
                 manager
-                    .store_full_object_as_range_new(
+                    .seed_full_object_fill(
                         &key,
                         &body,
                         b2_object_metadata(B2_BODY_LEN as u64, "\"b2-publication\""),
@@ -43018,7 +39836,7 @@ mod metadata_lock_discipline_tests {
             contended_single_range_fixture(&manager, cache_key).await;
 
         let contended = manager
-            .store_full_object_as_range_new(cache_key, &[], b2_object_metadata(0, "\"b2-empty\""))
+            .seed_full_object_fill(cache_key, &[], b2_object_metadata(0, "\"b2-empty\""))
             .await;
         // The outcome first, deliberately: the surviving document is the predicate, and
         // `contended.is_err()` below only says a lock was wanted.
@@ -43037,7 +39855,7 @@ mod metadata_lock_discipline_tests {
 
         drop(peer_lock);
         manager
-            .store_full_object_as_range_new(cache_key, &[], b2_object_metadata(0, "\"b2-empty\""))
+            .seed_full_object_fill(cache_key, &[], b2_object_metadata(0, "\"b2-empty\""))
             .await
             .expect("positive control: once the slot is free the arm must publish");
         assert!(
@@ -43054,7 +39872,7 @@ mod metadata_lock_discipline_tests {
     // =========================================================================
     // METALOCK-B3: the HEAD-cache metadata path acquires the key's slot lock
     //
-    // `store_head_cache_entry_unified` is a TWO-ARM decision — merge into the existing
+    // `store_head_cache_entry_unified_witnessed` is a TWO-ARM decision — merge into the existing
     // document, or publish a fresh HEAD-only one — and the read that chooses the arm is in
     // the caller. So the acquisition is in the caller too, and both arms are covered.
     //
@@ -43128,7 +39946,12 @@ mod metadata_lock_discipline_tests {
         // A HEAD response captured BEFORE the peer's re-cache.
         let stale_head = b3_head_response("\"metalock-fix\"", BODY_LEN as u64);
         let contended = manager
-            .store_head_cache_entry_unified(cache_key, HashMap::new(), stale_head)
+            .store_head_cache_entry_unified_witnessed(
+                cache_key,
+                HashMap::new(),
+                stale_head,
+                manager.capture_fill_witness(cache_key).await,
+            )
             .await;
 
         // OUTCOME FIRST. Asserting the call's disposition before the document would test
@@ -43230,10 +40053,11 @@ mod metadata_lock_discipline_tests {
             .await
             .expect("fixture: the peer writer must be able to take the slot");
         let contended = manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 cache_key,
                 HashMap::new(),
                 b3_head_response("\"metalock-b3-head\"", BODY_LEN as u64),
+                manager.capture_fill_witness(cache_key).await,
             )
             .await;
         drop(peer_lock);
@@ -43272,10 +40096,11 @@ mod metadata_lock_discipline_tests {
             contended_single_range_fixture(&manager, cache_key).await;
 
         let contended = manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 cache_key,
                 HashMap::new(),
                 b3_head_response("\"metalock-fix\"", BODY_LEN as u64),
+                manager.capture_fill_witness(cache_key).await,
             )
             .await;
         assert!(
@@ -44191,7 +41016,7 @@ mod write_cache_count_eviction_tests {
 
 /// **P4 — the production full-object GET publication boundary.**
 ///
-/// Spec: `cache-eviction-at-scale` task 36 (A4). `store_full_object_as_range_new` is
+/// Spec: `cache-eviction-at-scale` task 36 (A4). `store_full_object_as_range_witnessed` is
 /// crate-private, so its boundary test lives here rather than in
 /// `tests/capacity_guard_publication_boundaries_test.rs` with the three
 /// `DiskCacheManager` boundaries.
@@ -44199,7 +41024,7 @@ mod write_cache_count_eviction_tests {
 /// # Why P4 needs its own boundary test rather than inheriting P1's
 ///
 /// It writes its `.bin` and `.meta` **directly** — `std::fs::write` then `std::fs::rename`,
-/// not through `DiskCacheManager::store_range` — so P1's guard does not reach it. That is
+/// not through `DiskCacheManager::prepare_range_store` — so P1's guard does not reach it. That is
 /// the whole reason `u4-get-publication.md` lists it separately, and a test that only
 /// covered P1 would leave the production full-object path unguarded while reading as
 /// covered.
@@ -44276,7 +41101,7 @@ mod p4_full_object_publication_guard_tests {
     /// A declined full-object store publishes no metadata and returns no error.
     ///
     /// A failure implicates the decline block at the head of
-    /// `CacheManager::store_full_object_as_range_new` — specifically its `return Ok(())`.
+    /// `CacheManager::store_full_object_as_range_witnessed` — specifically its `return Ok(())`.
     /// Read the `.meta`, not the return value, per the module doc.
     #[tokio::test]
     async fn p4_declined_full_object_store_publishes_no_metadata() {
@@ -44286,13 +41111,13 @@ mod p4_full_object_publication_guard_tests {
         let body = vec![9u8; 4096];
 
         let result = manager
-            .store_full_object_as_range_new(key, &body, object_metadata(4096))
+            .try_seed_full_object_fill(key, &body, object_metadata(4096))
             .await;
 
         assert!(
-            result.is_ok(),
-            "a capacity decline must not surface as an error: {:?}",
-            result.err()
+            matches!(result, Ok(false)),
+            "a capacity decline is Ok(false), not an error and not a publish: {:?}",
+            result
         );
         assert!(
             !manager.get_new_metadata_file_path(key).exists(),
@@ -44303,12 +41128,12 @@ mod p4_full_object_publication_guard_tests {
     /// A declined store leaves an **existing partial range** alone.
     ///
     /// This is the property that makes the guard's *placement* load-bearing rather than
-    /// cosmetic. `store_full_object_as_range_new` removes superseding partial ranges before
+    /// cosmetic. `store_full_object_as_range_witnessed` removes superseding partial ranges before
     /// it writes, so a guard placed after that cleanup would delete usable cached data in
     /// order to then decline to replace it — strictly worse than not being there at all, and
     /// invisible to the previous test, which starts from an empty cache.
     ///
-    /// A failure implicates the guard's **position** in `store_full_object_as_range_new`: it
+    /// A failure implicates the guard's **position** in `store_full_object_as_range_witnessed`: it
     /// must precede the existing-range cleanup (and, before that namespace was retired, the
     /// `locks/{key}.lock` acquisition too).
     ///
@@ -44344,7 +41169,7 @@ mod p4_full_object_publication_guard_tests {
         );
         seeder.initialize().await.unwrap();
         seeder
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 partial_end,
@@ -44364,10 +41189,11 @@ mod p4_full_object_publication_guard_tests {
 
         // Now attempt a full-object store the guard must decline.
         let guarded = setup(temp.path(), UNSATISFIABLE_FLOOR).await;
-        guarded
-            .store_full_object_as_range_new(key, &vec![4u8; 4096], object_metadata(4096))
+        let published = guarded
+            .try_seed_full_object_fill(key, &vec![4u8; 4096], object_metadata(4096))
             .await
             .expect("a decline is not an error");
+        assert!(!published, "the guard must decline this store");
 
         assert!(
             partial_bin.exists(),
@@ -44378,7 +41204,7 @@ mod p4_full_object_publication_guard_tests {
 
     /// The admitting arm: identical fixture, permitting floor, published.
     ///
-    /// Without this the declining arms would pass against a `store_full_object_as_range_new`
+    /// Without this the declining arms would pass against a `store_full_object_as_range_witnessed`
     /// broken for some entirely unrelated reason, which is the recorded failure mode this
     /// repo keeps hitting — an assertion that cannot tell the defect it names from an
     /// adjacent one.
@@ -44390,7 +41216,7 @@ mod p4_full_object_publication_guard_tests {
         let body = vec![9u8; 4096];
 
         manager
-            .store_full_object_as_range_new(key, &body, object_metadata(4096))
+            .seed_full_object_fill(key, &body, object_metadata(4096))
             .await
             .expect("an unguarded store must succeed");
 
@@ -44416,7 +41242,7 @@ mod p4_full_object_publication_guard_tests {
             std::fs::write(&path, b"{ this is not json").unwrap();
             let before = crate::disk_cache::metadata_heal_overwrite_total();
             manager
-                .store_full_object_as_range_new(key, &body, object_metadata(body.len() as u64))
+                .seed_full_object_fill(key, &body, object_metadata(body.len() as u64))
                 .await
                 .expect("the fill must succeed over an unparseable document");
             let parsed = serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
@@ -44440,7 +41266,7 @@ mod p4_full_object_publication_guard_tests {
 // ZERO-LENGTH-ARM-ORPHANS: a zero-length publish must not leave its predecessor's
 // range files on disk, or its predecessor's bytes servable.
 //
-// Both zero-length publish arms — `store_full_object_as_range_new`'s and
+// Both zero-length publish arms — `store_full_object_as_range_witnessed`'s and
 // `store_put_as_write_cached_range_with_ttl`'s — publish a ranges-empty document over an
 // existing entry, and must remove and debit the `.bin` files they dereference. A file they
 // left behind is an orphan: no `.meta` lists it. Earlier releases ran a sweep that re-adopted
@@ -44534,7 +41360,7 @@ pub(crate) mod zero_length_arm_orphan_tests {
     /// Seed a cached object through the production full-object publish.
     ///
     /// Exists so test modules in OTHER files can drive this seed without
-    /// `store_full_object_as_range_new` being widened out of `cache.rs` — this wrapper is
+    /// `store_full_object_as_range_witnessed` being widened out of `cache.rs` — this wrapper is
     /// `#[cfg(test)]`, so it adds no production surface.
     pub(crate) async fn seed_full_object(
         manager: &CacheManager,
@@ -44543,7 +41369,7 @@ pub(crate) mod zero_length_arm_orphan_tests {
         om: crate::cache_types::ObjectMetadata,
     ) {
         manager
-            .store_full_object_as_range_new(cache_key, body, om)
+            .seed_full_object_fill(cache_key, body, om)
             .await
             .expect("fixture: the full-object publish must succeed");
     }
@@ -44588,7 +41414,7 @@ pub(crate) mod zero_length_arm_orphan_tests {
         let body = incompressible_body(1);
 
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &body,
                 object_metadata(BODY_LEN as u64, "\"v1-nonempty\""),
@@ -44613,7 +41439,7 @@ pub(crate) mod zero_length_arm_orphan_tests {
         );
 
         manager
-            .store_full_object_as_range_new(cache_key, &[], object_metadata(0, "\"v2-empty\""))
+            .seed_full_object_fill(cache_key, &[], object_metadata(0, "\"v2-empty\""))
             .await
             .expect("fixture: the zero-length publish must succeed");
 
@@ -44702,7 +41528,7 @@ pub(crate) mod zero_length_arm_orphan_tests {
         );
     }
 
-    /// THE STOP, read-cache arm. `store_full_object_as_range_new`'s zero-length branch must
+    /// THE STOP, read-cache arm. `store_full_object_as_range_witnessed`'s zero-length branch must
     /// remove the range files it dereferences, not merely stop naming them.
     ///
     /// Separate from the severity test above because the two have different predicates and
@@ -44717,7 +41543,7 @@ pub(crate) mod zero_length_arm_orphan_tests {
         let body = incompressible_body(2);
 
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &body,
                 object_metadata(BODY_LEN as u64, "\"v1-nonempty\""),
@@ -44738,7 +41564,7 @@ pub(crate) mod zero_length_arm_orphan_tests {
         assert!(v1_bin.exists(), "PRECONDITION: seeded .bin at {:?}", v1_bin);
 
         manager
-            .store_full_object_as_range_new(cache_key, &[], object_metadata(0, "\"v2-empty\""))
+            .seed_full_object_fill(cache_key, &[], object_metadata(0, "\"v2-empty\""))
             .await
             .expect("the zero-length publish must succeed");
 
@@ -44863,7 +41689,7 @@ mod head_change_range_orphan_tests {
         body: &[u8],
     ) -> crate::cache_types::RangeSpec {
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 body,
                 object_metadata(BODY_LEN as u64, "\"v1-head-change\""),
@@ -44878,10 +41704,11 @@ mod head_change_range_orphan_tests {
             seeded.ranges
         );
         manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 cache_key,
                 HashMap::new(),
                 changed_head_response("\"v2-head-change\""),
+                manager.capture_fill_witness(cache_key).await,
             )
             .await
             .expect("fixture: the HEAD store must succeed");
@@ -45009,7 +41836,7 @@ mod head_change_range_orphan_tests {
         let cache_key = "scn4-bucket/head-change-debit.bin";
         let body = incompressible_body(50);
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &body,
                 object_metadata(BODY_LEN as u64, "\"v1-head-change\""),
@@ -45025,10 +41852,11 @@ mod head_change_range_orphan_tests {
             .expect("fixture: the consolidator must be wired");
         let before = consolidator.size_accumulator().current_delta();
         manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 cache_key,
                 HashMap::new(),
                 changed_head_response("\"v2-head-change\""),
+                manager.capture_fill_witness(cache_key).await,
             )
             .await
             .expect("fixture: the HEAD store must succeed");
@@ -45091,7 +41919,7 @@ mod head_change_range_orphan_tests {
     /// a range whose journal `Add` has not been folded yet.
     ///
     /// The shape: a HEAD-only document for v1, then a GET fill of v1 through the production
-    /// hybrid `store_range` (the `.bin` published, the `Add` journalled, the `.meta` not yet
+    /// hybrid `prepare_range_store` (the `.bin` published, the `Add` journalled, the `.meta` not yet
     /// naming it), then a HEAD reporting v2 before any consolidation — S3 changed within one
     /// `consolidation_interval` of the fill. Then the mainline GET's lookup, before
     /// consolidation (the Journal_Fallback) and after it (the consolidator's `Add` arm, which
@@ -45110,16 +41938,17 @@ mod head_change_range_orphan_tests {
         let v1_body = incompressible_body(51);
 
         manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 cache_key,
                 HashMap::new(),
                 changed_head_response("\"v1-head-change\""),
+                manager.capture_fill_witness(cache_key).await,
             )
             .await
             .expect("fixture: the v1 HEAD store must succeed");
         let mut disk_cache = manager.create_configured_disk_cache_manager();
         disk_cache
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 BODY_LEN as u64 - 1,
@@ -45145,10 +41974,11 @@ mod head_change_range_orphan_tests {
         );
 
         manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 cache_key,
                 HashMap::new(),
                 changed_head_response("\"v2-head-change\""),
+                manager.capture_fill_witness(cache_key).await,
             )
             .await
             .expect("fixture: the v2 HEAD store must succeed");
@@ -45216,7 +42046,7 @@ mod head_change_range_orphan_tests {
 // is that this release has no orphan re-adoption sweep at all, so the corruption is
 // UNPRODUCIBLE by this release. The plant below therefore drives every field-mutating step through production
 // code — the seed, the zero-length publish, and the `add_or_update_range` heal via the same
-// `write_range_metadata(.., WriteMode::Hybrid, None, Duration::ZERO)` call the sweep makes —
+// `write_range_metadata_witnessed(.., WriteMode::Hybrid, None, Duration::ZERO)` call the sweep makes —
 // and does by hand only the one thing a pre-3.0.0 release did for it: leave the dereferenced
 // range file on disk.
 // =============================================================================
@@ -45249,8 +42079,8 @@ mod has_cached_ranges_preloaded_rangeless_tests {
     /// function. This test states the contingency: a unit that relaxes or relocates the
     /// admission rule reopens the v1.9.4 masking shape here, and this function will not catch
     /// it. It does not re-assert the admission rule itself (R3.11): that is
-    /// `tests/ram_metadata_masking_regression_test.rs` and
-    /// `tests/ram_metadata_admission_unification_test.rs`.
+    /// `src/cache/moved_fill_tests/ram_metadata_masking_regression_test.rs` and
+    /// `src/cache/moved_fill_tests/ram_metadata_admission_unification_test.rs`.
     ///
     /// # RED SIDE
     ///
@@ -45262,7 +42092,7 @@ mod has_cached_ranges_preloaded_rangeless_tests {
         let manager = setup(temp.path()).await;
         let cache_key = "r12-bucket/preloaded-rangeless.bin";
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &incompressible_body(7),
                 object_metadata(BODY_LEN as u64, "\"v1\""),
@@ -45317,13 +42147,13 @@ pub(crate) mod empty_object_etag_guard_tests {
     /// Build the corrupt document, and return the range file it names plus the healed length.
     ///
     /// Steps 3 and 4 are hand-written and neither is a shortcut — both exist because 3.0.0
-    /// closed the producer this fixture models. `store_full_object_as_range_new`'s
+    /// closed the producer this fixture models. `store_full_object_as_range_witnessed`'s
     /// zero-length arm removes the range files it dereferences, so step 3 restores the file
     /// a pre-3.0.0 publish left behind; and `derive_full_object_content_length` now refuses
     /// to write a length into a document that has already published one, so step 4 writes
     /// the healed `content_length` directly rather than obtaining it from the writer.
     ///
-    /// Step 4 USED to drive `write_range_metadata` in the `WriteMode::Hybrid` shape the
+    /// Step 4 USED to drive `write_range_metadata_witnessed` in the `WriteMode::Hybrid` shape the
     /// orphan sweep uses, which was the real producer at the time. That producer is gone:
     /// see `CacheManager::is_empty_object_etag_entry`'s "compatibility code with an expiry"
     /// note, whose claim that no entry matching the predicate can be created by this release
@@ -45342,7 +42172,7 @@ pub(crate) mod empty_object_etag_guard_tests {
 
         // 1. Production seed: a real non-empty cached object.
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &body,
                 object_metadata(BODY_LEN as u64, "\"v1-nonempty\""),
@@ -45366,7 +42196,7 @@ pub(crate) mod empty_object_etag_guard_tests {
 
         // 2. Production zero-length publish, under the real empty-object ETag.
         manager
-            .store_full_object_as_range_new(cache_key, &[], object_metadata(0, EMPTY_OBJECT_ETAG))
+            .seed_full_object_fill(cache_key, &[], object_metadata(0, EMPTY_OBJECT_ETAG))
             .await
             .expect("fixture: the zero-length publish must succeed");
         let published = read_meta(manager, cache_key);
@@ -45427,7 +42257,7 @@ pub(crate) mod empty_object_etag_guard_tests {
 
     /// Set the two HEAD freshness anchors a later HEAD would set, and nothing else.
     ///
-    /// `store_head_cache_entry_unified` cannot be used to reach this state: it takes the S3
+    /// `store_head_cache_entry_unified_witnessed` cannot be used to reach this state: it takes the S3
     /// response as authoritative and would overwrite the very `object_metadata` under test.
     /// These two fields are the whole difference between a document the HEAD path skips as
     /// "not cached" and one it will answer from, so setting them is what makes the HEAD arms
@@ -45576,7 +42406,7 @@ pub(crate) mod empty_object_etag_guard_tests {
         let cache_key = "eoe-bucket/genuinely-empty.bin";
 
         manager
-            .store_full_object_as_range_new(cache_key, &[], object_metadata(0, EMPTY_OBJECT_ETAG))
+            .seed_full_object_fill(cache_key, &[], object_metadata(0, EMPTY_OBJECT_ETAG))
             .await
             .expect("fixture: the empty-object publish must succeed");
         make_head_fresh(&manager, cache_key);
@@ -45620,7 +42450,7 @@ pub(crate) mod empty_object_etag_guard_tests {
         let body = incompressible_body(12);
 
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &body,
                 object_metadata(BODY_LEN as u64, "\"an-ordinary-etag\""),
@@ -45655,7 +42485,7 @@ pub(crate) mod empty_object_etag_guard_tests {
     /// DOES REPORTING A MISS CONVERGE? **NO**, and this test pins that rather than hiding it.
     ///
     /// The design this guard implements traced miss → forward-and-cache →
-    /// `store_full_object_as_range_new`'s zero-length arm → republish `ranges: []`, and
+    /// `store_full_object_as_range_witnessed`'s zero-length arm → republish `ranges: []`, and
     /// flagged as its own least-confident claim that a zero-byte `200` reaches that arm. It
     /// does not, on either GET body path:
     ///
@@ -45709,7 +42539,7 @@ pub(crate) mod empty_object_etag_guard_tests {
         // The republish is not broken — it is merely never reached by a zero-byte GET. Drive
         // the production store path directly with the body a repair would carry.
         manager
-            .store_full_object_as_range_new(cache_key, &[], object_metadata(0, EMPTY_OBJECT_ETAG))
+            .seed_full_object_fill(cache_key, &[], object_metadata(0, EMPTY_OBJECT_ETAG))
             .await
             .expect("the repairing publish must succeed");
         let repaired = read_meta(&manager, cache_key);
@@ -45808,7 +42638,7 @@ mod no_validator_no_fresh_serve_tests {
     async fn plant_readopted_orphan(manager: &CacheManager, cache_key: &str) {
         let body = incompressible_body(23);
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &body,
                 object_metadata(BODY_LEN as u64, "\"v1-before-invalidation\""),
@@ -45915,7 +42745,7 @@ mod no_validator_no_fresh_serve_tests {
 
         let body = incompressible_body(7);
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 cache_key,
                 &body,
                 object_metadata(BODY_LEN as u64, "\"v1-ordinary\""),
@@ -45965,7 +42795,7 @@ mod no_validator_no_fresh_serve_tests {
         let mut om = object_metadata(BODY_LEN as u64, "");
         om.etag = String::new();
         manager
-            .store_full_object_as_range_new(cache_key, &body, om)
+            .seed_full_object_fill(cache_key, &body, om)
             .await
             .expect("the no-ETag seed must publish");
 
@@ -46025,7 +42855,7 @@ mod no_validator_no_fresh_serve_tests {
 /// `parts[0]`, which is always a **strict prefix** of the key the caller named, and therefore
 /// on a different object.
 ///
-/// Nothing internal could produce that grammar. `generate_range_cache_key` appends
+/// Nothing internal could produce that grammar. The disk-cache key appends
 /// `:range:{start}-{end}` and `generate_ram_range_key` appends `:range:{start}:{end}`; the
 /// decoder needs a colon *and then* a hyphen in one body, so no composition of the producers
 /// decodes. The reachability came from the object name: `generate_cache_key` ->
@@ -46039,7 +42869,7 @@ mod no_validator_no_fresh_serve_tests {
 /// Validating the parsed `start`/`end` against the selected range would constrain *which*
 /// range was removed while leaving `parts[0]` as the target, so the redirect would stand.
 /// Escaping or rejecting colons at key generation would reshape the cache key for every
-/// object whose name legally contains one, orphaning cached entries. `evict_range` already
+/// object whose name legally contains one, orphaning cached entries. `batch_evict_ranges` already
 /// provides bounds-selected granular eviction, and production eviction runs through
 /// `batch_evict_ranges` -> `DiskCacheManager::batch_delete_ranges`, so nothing is lost.
 ///
@@ -46357,12 +43187,7 @@ mod r3_9_whole_object_precedence_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let mut cm = CacheManager::new_with_eviction_algorithm(
-            cache_dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let mut cm = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = cm.create_configured_disk_cache_manager();
         cm.set_tail_config_for_tests(KIB, 4096, 4096);
         cm
@@ -46883,7 +43708,7 @@ mod r3_9_whole_object_precedence_tests {
 mod general_eviction_dirty_shard_tests {
     use super::*;
     use crate::staged_fold::{
-        dirty_shard_count, published_figure_for_tests, run_staged_fold, shard_of,
+        dirty_shard_count, published_figure_for_tests, run_staged_fold_sampled, shard_of,
         shard_scan_times_for_tests, Shard, MAX_AUTHORITY_AGE_SECS, STAGED_FOLD_INTERVAL_SECS,
     };
     use std::collections::BTreeMap;
@@ -46897,7 +43722,7 @@ mod general_eviction_dirty_shard_tests {
     }
 
     /// A fully initialised manager with a 10 GiB `max_cache_size`, the same construction as
-    /// `tests/fold_drops_removed_staged_objects_test.rs` uses, so the consolidator, the write
+    /// `src/cache/moved_fill_tests/fold_drops_removed_staged_objects_test.rs` uses, so the consolidator, the write
     /// ledger and the write-cache manager are all wired.
     async fn manager(cache_dir: &Path) -> CacheManager {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
@@ -46988,7 +43813,7 @@ mod general_eviction_dirty_shard_tests {
         let consolidator = m.get_journal_consolidator().await.expect("consolidator");
         let ledger = consolidator.write_ledger().clone();
         let instance = ledger.instance_id().to_string();
-        run_staged_fold(m.get_cache_dir(), &ledger, &instance)
+        run_staged_fold_sampled(m.get_cache_dir(), &ledger, &instance, None)
             .await
             .summary()
             .installed
@@ -47157,41 +43982,56 @@ mod general_eviction_dirty_shard_tests {
 /// `ram_cache_eligible: false`, and only that.
 ///
 /// Per-instance (a `CacheManager` field, not a module static), so parallel tests in this binary
-/// cannot move it and an exact delta is safe.
+/// cannot move it and an exact delta is safe. Driven through the tiered range load, the path
+/// the proxy uses to promote a disk hit.
 ///
 /// # RED SIDE
 ///
-/// With the `self.record_ram_eligibility_skip()` line in `store_in_ram_cache_from_write_entry`
-/// deleted, the closed-gate assertion fails with `left: 0, right: 1`.
+/// With the `self.record_ram_eligibility_skip()` line in `load_range_data_tiered` deleted, the
+/// closed-gate assertion fails with `left: 0, right: 1`.
 #[cfg(test)]
 mod ram_eligibility_skip_counter_tests {
     use super::*;
-    fn ram_entry(key: &str) -> RamCacheEntry {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        RamCacheEntry {
-            cache_key: key.to_string(),
-            data: Arc::new(Bytes::from_static(b"eligibility-skip")),
-            metadata: crate::cache_types::CacheMetadata {
-                etag: "\"e\"".to_string(),
-                last_modified: "m".to_string(),
-                content_length: 16,
-                part_number: None,
-                cache_control: None,
-                access_count: 0,
-                last_accessed: SystemTime::now(),
-            },
-            created_at: SystemTime::now(),
-            last_accessed: AtomicU64::new(now_ms),
-            access_count: AtomicU64::new(0),
-            compressed: false,
+    async fn load_one_extent(manager: &Arc<CacheManager>, key: &str) {
+        let disk = Arc::new(tokio::sync::RwLock::new(
+            manager.create_configured_disk_cache_manager(),
+        ));
+        disk.write().await.initialize().await.unwrap();
+        let handler = crate::range_handler::RangeHandler::new(manager.clone(), disk.clone());
+        let body = vec![7u8; 64];
+        manager
+            .create_configured_disk_cache_manager()
+            .store_range_witnessed(
+                key,
+                0,
+                63,
+                &body,
+                crate::cache_types::ObjectMetadata {
+                    etag: "\"e\"".to_string(),
+                    last_modified: "Tue, 23 Sep 2026 00:00:00 GMT".to_string(),
+                    content_length: 64,
+                    content_type: Some("application/octet-stream".to_string()),
+                    ..Default::default()
+                },
+                Duration::from_secs(3600),
+                false,
+            )
+            .await
+            .expect("fixture: seed the extent on disk");
+        let range = Range {
+            start: 0,
+            end: 63,
+            data: Vec::new(),
+            etag: "\"e\"".to_string(),
+            last_modified: "Tue, 23 Sep 2026 00:00:00 GMT".to_string(),
             compression_algorithm: crate::compression::CompressionAlgorithm::None,
-            verified_at: AtomicU64::new(now_ms),
-        }
+        };
+        manager
+            .load_range_data_with_cache(key, &range, &handler)
+            .await
+            .expect("fixture: tiered load of the seeded extent");
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_closed_eligibility_gate_is_counted_and_an_open_one_is_not() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
@@ -47199,12 +44039,13 @@ mod ram_eligibility_skip_counter_tests {
             r#"{"rules": [{"pattern": "test-bucket/closed/**", "ram_cache_eligible": false}]}"#,
         )
         .unwrap();
-        let manager = CacheManager::new_with_eviction_algorithm(
+        let manager = Arc::new(CacheManager::new_with_defaults(
             tmp.path().to_path_buf(),
             true,
             16 * 1024 * 1024,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        ));
+        let _ = manager.create_configured_disk_cache_manager();
+        manager.initialize().await.expect("fixture: initialize");
         let closed = "test-bucket/closed/object";
         let open = "test-bucket/open/object";
         assert!(
@@ -47216,19 +44057,13 @@ mod ram_eligibility_skip_counter_tests {
             "PRECONDITION MISSING: the gate is closed for {open} too, so the control proves nothing"
         );
         assert_eq!(manager.ram_eligibility_skips_total(), 0);
-        manager
-            .store_in_ram_cache_from_write_entry(ram_entry(open))
-            .await
-            .unwrap();
+        load_one_extent(&manager, open).await;
         assert_eq!(
             manager.ram_eligibility_skips_total(),
             0,
             "an admission through an OPEN gate must not count as an eligibility skip"
         );
-        manager
-            .store_in_ram_cache_from_write_entry(ram_entry(closed))
-            .await
-            .unwrap();
+        load_one_extent(&manager, closed).await;
         assert_eq!(
             manager.ram_eligibility_skips_total(),
             1,
@@ -47236,7 +44071,6 @@ mod ram_eligibility_skip_counter_tests {
         );
     }
 }
-
 #[cfg(test)]
 mod staged_range_budget_warn_tests {
     #[test]
@@ -47605,7 +44439,10 @@ mod eviction_delete_identity_tests {
         );
         assert!(out.unlinked.is_empty(), "nothing may be reported for debit");
         assert_eq!(out.bytes_freed, 0, "no bytes may be reported freed");
-        assert!(!out.meta_unlinked);
+        assert!(
+            disk(temp.path()).get_new_metadata_file_path(KEY).exists(),
+            "a skipped key keeps its .meta"
+        );
         assert_peer_survived(temp.path(), &peer, 0x22);
     }
 
@@ -47652,7 +44489,10 @@ mod eviction_delete_identity_tests {
             !out.identity_skipped,
             "an unchanged .meta must not be skipped"
         );
-        assert!(out.meta_unlinked, "the whole object must be removed");
+        assert!(
+            !disk(temp.path()).get_new_metadata_file_path(KEY).exists(),
+            "the whole object must be removed"
+        );
         assert_eq!(out.bytes_freed, RANGE_BYTES);
         assert_eq!(out.unlinked.len(), 1);
         assert_eq!(
@@ -47927,7 +44767,74 @@ mod eviction_delete_identity_tests {
              .bin files={bins:?}"
         );
     }
-    /// Full-object GET fill (`store_full_object_as_range_new`).
+    /// A buffered PUT store dropped because its temporary was replaced reports that reason,
+    /// not a newer write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_whose_temp_was_replaced_reports_temporary_replaced() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = std::sync::Arc::new(setup(temp.path()).await);
+        let key = "test-bucket/put-outcome.bin";
+        let pause = crate::disk_cache::range_rename_pause::arm_before_publish(key);
+        let store = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                let body = vec![0x45u8; RANGE_BYTES as usize];
+                manager
+                    .store_put_as_write_cached_range_inner(
+                        key,
+                        &body,
+                        "\"v2\"".to_string(),
+                        "Thu, 22 Oct 2015 07:28:00 GMT".to_string(),
+                        None,
+                        HashMap::new(),
+                        Duration::from_secs(3600),
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+            .await
+            .expect("the PUT must reach the publish seam");
+        replace_the_one_temp(temp.path());
+        pause.resume.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), store)
+            .await
+            .expect("the PUT must finish")
+            .unwrap()
+            .expect("the store returns Ok whether or not it publishes");
+        assert_eq!(outcome, PublishOutcome::TemporaryReplaced);
+    }
+    /// A streamed PUT store dropped because its temporary was replaced reports that reason,
+    /// not a newer write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_put_whose_temp_was_replaced_reports_temporary_replaced() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "test-bucket/streamed-put-outcome.bin";
+        let mut sink = manager
+            .open_write_cache_sink(key, RANGE_BYTES)
+            .await
+            .unwrap()
+            .expect("capacity must admit the sink");
+        sink.write(&vec![0x56u8; RANGE_BYTES as usize]).unwrap();
+        let (range_spec, pending) = sink.finalize_unpublished().unwrap();
+        replace_the_one_temp(temp.path());
+        let outcome = manager
+            .store_streamed_write_cache_metadata(
+                key,
+                range_spec,
+                v2_object_metadata(true),
+                Duration::from_secs(3600),
+                pending,
+                None,
+            )
+            .await
+            .expect("the store returns Ok whether or not it publishes");
+        drop(sink);
+        assert_eq!(outcome, PublishOutcome::TemporaryReplaced);
+    }
+    /// Full-object GET fill (`store_full_object_as_range_witnessed`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_object_fill_rename_is_inside_the_slot_lock_hold() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -47939,7 +44846,7 @@ mod eviction_delete_identity_tests {
         let out = race_eviction_against(
             &manager,
             &candidates,
-            manager.store_full_object_as_range_new(KEY, &body, v2_object_metadata(false)),
+            manager.seed_full_object_fill(KEY, &body, v2_object_metadata(false)),
         )
         .await;
         assert_v2_intact(temp.path(), &out);
@@ -48222,7 +45129,7 @@ mod projected_size_reread_tests {
             plant(&m, dir, i, now - Duration::from_secs(36_000 - i * 600));
         }
         consolidator
-            .persist_size_state(&crate::journal_consolidator::SizeState {
+            .seed_size_state_for_tests(&crate::journal_consolidator::SizeState {
                 total_size: MAX,
                 ..Default::default()
             })
@@ -48270,7 +45177,7 @@ mod projected_size_reread_tests {
 /// an invalidation (`invalidate_cache_hierarchy`, reached by every DELETE and
 /// overwriting PUT) that removes a valid `.meta` debits `cached_objects` exactly once.
 ///
-/// The object is credited through the production route: a hybrid `store_range` journals the
+/// The object is credited through the production route: a hybrid `prepare_range_store` journals the
 /// `Add`, and `run_consolidation_cycle` folds it into a new `.meta` and counts it
 /// (`is_new_object`). After the invalidation a further cycle runs, so a debit owed to
 /// consolidation would land before the assertion. The re-cache leg then shows the count
@@ -48334,7 +45241,7 @@ mod cached_objects_one_per_meta_tests {
         let body = incompressible_body(seed);
         let mut disk_cache = manager.create_configured_disk_cache_manager();
         disk_cache
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 BODY_LEN as u64 - 1,
@@ -48355,7 +45262,7 @@ mod cached_objects_one_per_meta_tests {
             (String::from("etag"), etag.clone()),
         ]);
         manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 key,
                 headers,
                 super::CacheMetadata {
@@ -48367,6 +45274,7 @@ mod cached_objects_one_per_meta_tests {
                     access_count: 0,
                     last_accessed: std::time::SystemTime::now(),
                 },
+                manager.capture_fill_witness(key).await,
             )
             .await
             .expect("fixture: the HEAD entry must store");
@@ -48457,7 +45365,7 @@ mod cached_objects_one_per_meta_tests {
         )
         .await;
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 "case15-bucket/full-0.bin",
                 &incompressible_body(6),
                 object_metadata(BODY_LEN as u64, "\"case15-f0\""),
@@ -48465,7 +45373,7 @@ mod cached_objects_one_per_meta_tests {
             .await
             .expect("fixture: the full-object store must publish");
         manager
-            .store_full_object_as_range_new(
+            .seed_full_object_fill(
                 "case15-bucket/full-empty.bin",
                 &[],
                 object_metadata(0, "\"case15-fe\""),
@@ -48556,7 +45464,7 @@ mod invalidation_cached_objects_count_tests {
         let body = incompressible_body(seed);
         let mut disk_cache = manager.create_configured_disk_cache_manager();
         disk_cache
-            .store_range(
+            .store_range_witnessed(
                 KEY,
                 0,
                 BODY_LEN as u64 - 1,
@@ -48729,7 +45637,7 @@ mod invalidation_cached_objects_count_tests {
             (String::from("etag"), String::from("\"case18-head\"")),
         ]);
         manager
-            .store_head_cache_entry_unified(
+            .store_head_cache_entry_unified_witnessed(
                 HEAD_KEY,
                 headers,
                 super::CacheMetadata {
@@ -48741,6 +45649,7 @@ mod invalidation_cached_objects_count_tests {
                     access_count: 0,
                     last_accessed: std::time::SystemTime::now(),
                 },
+                manager.capture_fill_witness(HEAD_KEY).await,
             )
             .await
             .expect("fixture: the HEAD entry must store");
@@ -48865,11 +45774,10 @@ mod put_usage_narrowed_read_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = Arc::new(CacheManager::new_with_eviction_algorithm(
+        let manager = Arc::new(CacheManager::new_with_defaults(
             cache_dir.to_path_buf(),
             false,
             0,
-            CacheEvictionAlgorithm::TinyLFU,
         ));
         let _ = manager.create_configured_disk_cache_manager();
         manager
@@ -48880,7 +45788,10 @@ mod put_usage_narrowed_read_tests {
         let mut state = consolidator.load_size_state().await.unwrap();
         state.total_size = total_size;
         state.write_cache_size = INCUMBENT_BYTES;
-        consolidator.persist_size_state(&state).await.unwrap();
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
     }
 
     fn seed_in_progress_part(cache_dir: &std::path::Path) {
@@ -49289,11 +46200,12 @@ mod fill_reorder_tests {
                 object_metadata(BODY_LEN as u64, "\"v1\""),
                 LONG_TTL,
                 true,
+                witness,
             )
             .await
             .expect("fixture: the fill's .tmp write must succeed");
         if let Some(fill) = prepared {
-            let _ = fill.with_fill_witness(Some(witness)).finish().await;
+            let _ = fill.finish().await;
         }
     }
 
@@ -49411,7 +46323,7 @@ mod fill_reorder_tests {
         let mut headers = HashMap::new();
         headers.insert("etag".to_string(), "\"v1\"".to_string());
         let _ = manager
-            .store_head_cache_entry_unified_witnessed(key, headers, v1_head, Some(witness))
+            .store_head_cache_entry_unified_witnessed(key, headers, v1_head, witness)
             .await;
 
         let stored = std::fs::read_to_string(manager.get_new_metadata_file_path(key))
@@ -49504,11 +46416,12 @@ mod fill_reorder_tests {
                 object_metadata(BODY_LEN as u64, etag),
                 LONG_TTL,
                 true,
+                witness,
             )
             .await
             .expect("fixture: the fill's .tmp write must succeed");
         if let Some(fill) = prepared {
-            let _ = fill.with_fill_witness(Some(witness)).finish().await;
+            let _ = fill.finish().await;
         }
     }
     /// The direct-publish witness check on its own. v1's fill captured
@@ -49573,14 +46486,7 @@ mod fill_reorder_tests {
             .expect("the response-path invalidation must succeed");
         let content_range = format!("bytes 0-{}/{}", BODY_LEN - 1, BODY_LEN);
         manager
-            .store_part_as_range_witnessed(
-                key,
-                1,
-                &content_range,
-                &part_headers_v1(),
-                &v1,
-                Some(witness),
-            )
+            .store_part_as_range_witnessed(key, 1, &content_range, &part_headers_v1(), &v1, witness)
             .await
             .expect("a part store reports success to its caller");
         consolidate(&manager).await;
@@ -49631,7 +46537,7 @@ mod fill_reorder_tests {
                 &content_range,
                 &part_headers_v1(),
                 &v1[..BODY_LEN / 2],
-                Some(witness),
+                witness,
             )
             .await
             .expect("a part store reports success to its caller");
@@ -49672,7 +46578,14 @@ mod fill_reorder_tests {
             let content_range = content_range.clone();
             tokio::spawn(async move {
                 manager
-                    .store_part_as_range_witnessed(key, 1, &content_range, &headers, &body, None)
+                    .store_part_as_range_witnessed(
+                        key,
+                        1,
+                        &content_range,
+                        &headers,
+                        &body,
+                        manager.capture_fill_witness(key).await,
+                    )
                     .await
             })
         };
@@ -49711,8 +46624,8 @@ mod fill_reorder_tests {
             decoded == y
         );
     }
-    /// The streamed GET-miss fill (`IncrementalRangeWriter` with
-    /// `set_fill_witness`, committed through `prepare_incremental_commit`).
+    /// The streamed GET-miss fill (`IncrementalRangeWriter`, committed through
+    /// `prepare_incremental_commit` with the fill's witness).
     #[tokio::test]
     async fn a_streamed_fill_fetched_before_an_acknowledged_overwrite_does_not_publish_after_it() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -49730,11 +46643,17 @@ mod fill_reorder_tests {
             .await
             .expect("fixture: the streamed writer must open")
             .expect("fixture: the streamed writer is admitted");
-        writer.set_fill_witness(Some(witness));
         crate::disk_cache::DiskCacheManager::write_range_chunk(&mut writer, &v1)
             .expect("fixture: the chunk write must succeed");
         let _ = disk_cache
-            .commit_incremental_range(writer, object_metadata(BODY_LEN as u64, "\"v1\""), LONG_TTL)
+            .prepare_incremental_commit(
+                writer,
+                object_metadata(BODY_LEN as u64, "\"v1\""),
+                LONG_TTL,
+                witness,
+            )
+            .expect("fixture: the streamed fill is prepared")
+            .finish()
             .await;
         consolidate(&manager).await;
         let served = served(&manager, key).await;
@@ -49771,7 +46690,7 @@ mod fill_reorder_tests {
             last_accessed: SystemTime::now(),
         };
         let _ = manager
-            .store_response_with_headers_witnessed(key, &v1, headers, v1_meta, Some(witness))
+            .store_response_with_headers_witnessed(key, &v1, headers, v1_meta, witness)
             .await;
         consolidate(&manager).await;
         let served = served(&manager, key).await;
@@ -49860,7 +46779,7 @@ mod stamp_retry_clear_tests {
                     access_count: 0,
                     last_accessed: SystemTime::now(),
                 },
-                Some(witness),
+                witness,
             )
             .await
             .expect("the sibling's witnessed full-object store");
@@ -49875,6 +46794,16 @@ mod stamp_retry_clear_tests {
         );
     }
 
+    /// Whether the RAM tier holds the range entry `[0, len - 1]` of `key`.
+    async fn ram_range_present(manager: &CacheManager, key: &str, len: u64) -> bool {
+        match &manager.ram_cache {
+            Some(ram) => ram
+                .get(&CacheManager::generate_ram_range_key(key, 0, len - 1))
+                .await
+                .is_some(),
+            None => false,
+        }
+    }
     /// What a streamed full-object fill leaves on this proxy when it publishes: a committed
     /// `.bin`, a fill-visibility entry recorded inside its publish hold, and a RAM copy.
     async fn publish_fill(
@@ -49895,37 +46824,29 @@ mod stamp_retry_clear_tests {
             ..Default::default()
         };
         let stamp = crate::fill_visibility_tracker::RangeFileStamp::of(&bin).unwrap();
-        let marker = crate::fill_visibility_tracker::MarkerStamp::of(
+        let marker = crate::fill_visibility_tracker::MarkerStamp::witnessed_under_written_marker(
             &manager.get_new_metadata_file_path(key),
-        )
-        .expect("fixture: the key's write marker is readable");
+            key,
+            "fixture-fill-token",
+        );
         manager
             .fill_visibility_tracker
             .record(tracked, vec![stamp], marker);
-        let entry = CacheEntry {
-            cache_key: key.to_string(),
-            headers: HashMap::new(),
-            body: Some(body.to_vec()),
-            ranges: Vec::new(),
-            metadata: CacheMetadata {
-                etag: "\"v1\"".to_string(),
-                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                content_length: body.len() as u64,
-                part_number: None,
-                cache_control: None,
-                access_count: 0,
-                last_accessed: now,
-            },
-            created_at: now,
-            expires_at: now + Duration::from_secs(3600),
-            metadata_expires_at: now + Duration::from_secs(3600),
-            compression_info: CompressionInfo::default(),
-            is_put_cached: false,
-        };
-        manager.store_in_ram_cache(&entry).await.unwrap();
+        assert!(
+            manager.promote_range_to_ram_cache_frame(
+                key,
+                (0, body.len() as u64 - 1),
+                body.to_vec(),
+                crate::compression::CompressionAlgorithm::None,
+                "\"v1\"".to_string(),
+                String::new(),
+                body.len() as u64,
+            ),
+            "fixture: the fill's RAM range entry must be admitted"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_retried_stamp_clears_a_fill_recorded_inside_its_publish_hold() {
         let dir = tempfile::TempDir::new().unwrap();
         let manager = setup_with_ram(dir.path()).await;
@@ -49953,12 +46874,7 @@ mod stamp_retry_clear_tests {
             .ok()
             .flatten()
             .is_some();
-        let ram_before = manager
-            .get_from_ram_cache(key)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
+        let ram_before = ram_range_present(&manager, key, BODY_LEN as u64).await;
         hold.resume.notify_one();
         let stamped = tokio::time::timeout(Duration::from_secs(30), retry.stamped.notified())
             .await
@@ -49969,12 +46885,7 @@ mod stamp_retry_clear_tests {
             .ok()
             .flatten()
             .is_some();
-        let ram_after = manager
-            .get_from_ram_cache(key)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
+        let ram_after = ram_range_present(&manager, key, BODY_LEN as u64).await;
         assert!(
             first.is_err(),
             "fixture: the DELETE's first stamp must fail"
@@ -50084,11 +46995,12 @@ mod stamp_overflow_tests {
                 object_metadata(BODY_LEN as u64, "\"v1\""),
                 LONG_TTL,
                 true,
+                witness,
             )
             .await
             .expect("fixture: the fill's .tmp write must succeed");
         if let Some(fill) = prepared {
-            let _ = fill.with_fill_witness(Some(witness)).finish().await;
+            let _ = fill.finish().await;
         }
     }
 
@@ -50475,11 +47387,12 @@ mod shared_fill_lease_tests {
                 object_metadata(BODY_LEN as u64, "\"v1\""),
                 LONG_TTL,
                 true,
+                witness,
             )
             .await
             .expect("fixture: the fill's .tmp write must succeed");
         if let Some(fill) = prepared {
-            let _ = fill.with_fill_witness(Some(witness)).finish().await;
+            let _ = fill.finish().await;
         }
     }
     async fn consolidate(manager: &CacheManager) {
@@ -50848,7 +47761,7 @@ mod marker_hygiene_tests {
         let body = incompressible_body(7);
         let mut disk_cache = manager.create_configured_disk_cache_manager();
         disk_cache
-            .store_range(
+            .store_range_witnessed(
                 live,
                 0,
                 BODY_LEN as u64 - 1,
@@ -51052,11 +47965,12 @@ mod stamp_backlog_tests {
                 object_metadata(BODY_LEN as u64, "\"v1\""),
                 LONG_TTL,
                 true,
+                witness,
             )
             .await
             .expect("fixture: the fill's .tmp write must succeed");
         if let Some(fill) = prepared {
-            let _ = fill.with_fill_witness(Some(witness)).finish().await;
+            let _ = fill.finish().await;
         }
     }
 
@@ -51682,15 +48596,11 @@ mod stamp_backlog_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = Arc::new(CacheManager::new_with_eviction_algorithm(
-            cache_dir.clone(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        ));
+        let manager = Arc::new(CacheManager::new_with_defaults(cache_dir.clone(), false, 0));
         let dcm = Arc::new(tokio::sync::RwLock::new(
             manager.create_configured_disk_cache_manager(),
         ));
+        let witness = manager.capture_fill_witness(KEY).await;
         let slot = crate::metadata_lock_manager::try_acquire_slot_lock(&cache_dir, KEY)
             .expect("fixture: take the key's slot lock");
         let store = {
@@ -51712,7 +48622,7 @@ mod stamp_backlog_tests {
                     },
                     Duration::from_secs(3600),
                     false,
-                    None,
+                    witness,
                     SlotWait::WithinBudget,
                 )
                 .await
@@ -52086,12 +48996,7 @@ mod writer_identity_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        Arc::new(CacheManager::new_with_eviction_algorithm(
-            dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        ))
+        Arc::new(CacheManager::new_with_defaults(dir.to_path_buf(), false, 0))
     }
 
     fn data(n: usize, seed: u8) -> Vec<u8> {
@@ -52178,7 +49083,7 @@ mod writer_identity_tests {
             .expect("begin")
             .expect("a writer");
         crate::disk_cache::DiskCacheManager::write_range_chunk(&mut writer, &d).expect("write");
-        dcm.commit_incremental_range(
+        dcm.commit_incremental_range_witnessed(
             writer,
             object_metadata("\"w-stream\"", d.len() as u64),
             Duration::from_secs(3600),
@@ -52233,7 +49138,7 @@ mod writer_identity_tests {
 
             let key = format!("test-bucket/case32/{}/get.bin", tag);
             let d = data(150_000, 0x51);
-            dcm.store_range(
+            dcm.store_range_witnessed(
                 &key,
                 0,
                 d.len() as u64 - 1,
@@ -52254,7 +49159,7 @@ mod writer_identity_tests {
                 .expect("begin")
                 .expect("a writer");
             crate::disk_cache::DiskCacheManager::write_range_chunk(&mut writer, &d).expect("write");
-            dcm.commit_incremental_range(
+            dcm.commit_incremental_range_witnessed(
                 writer,
                 object_metadata("\"c-stream\"", d.len() as u64),
                 ttl,
@@ -52281,34 +49186,10 @@ mod writer_identity_tests {
             let key = format!("test-bucket/case32/{}/full.bin", tag);
             let d = data(150_000, 0x54);
             manager
-                .store_full_object_as_range_new(
-                    &key,
-                    &d,
-                    object_metadata("\"c-full\"", d.len() as u64),
-                )
+                .seed_full_object_fill(&key, &d, object_metadata("\"c-full\"", d.len() as u64))
                 .await
                 .expect("full-object store");
             filled.push((key, 0, d));
-
-            let path = format!("/test-bucket/case32/{}/mpu.bin", tag);
-            let key = CacheManager::generate_cache_key(&path, None);
-            let parts = [data(100_000, 0x55), data(100_000, 0x56)];
-            manager
-                .initiate_multipart_upload(&path)
-                .await
-                .expect("initiate");
-            for (i, part) in parts.iter().enumerate() {
-                manager
-                    .store_multipart_part(&path, i as u32 + 1, part, format!("etag-part-{}", i + 1))
-                    .await
-                    .expect("part");
-            }
-            manager
-                .complete_multipart_upload(&path)
-                .await
-                .expect("complete");
-            filled.push((key.clone(), 0, parts[0].clone()));
-            filled.push((key, parts[0].len() as u64, parts[1].clone()));
 
             let consolidator = manager
                 .get_journal_consolidator()
@@ -52498,7 +49379,7 @@ mod writer_identity_tests {
                 let c = &cached[0];
                 manager
                     .create_configured_disk_cache_manager()
-                    .store_range(
+                    .store_range_witnessed(
                         &c.key,
                         c.start,
                         c.end(),
@@ -52599,7 +49480,7 @@ mod writer_identity_tests {
             .expect("begin")
             .expect("a writer");
         crate::disk_cache::DiskCacheManager::write_range_chunk(&mut writer, &d).expect("write");
-        dcm.commit_incremental_range(
+        dcm.commit_incremental_range_witnessed(
             writer,
             object_metadata("\"w-tracker\"", d.len() as u64),
             Duration::from_secs(3600),
@@ -52702,52 +49583,10 @@ mod writer_identity_tests {
         let key = "test-bucket/case31/writer-full.bin";
         let d = data(200_000, 0x33);
         manager
-            .store_full_object_as_range_new(key, &d, object_metadata("\"w-full\"", d.len() as u64))
+            .seed_full_object_fill(key, &d, object_metadata("\"w-full\"", d.len() as u64))
             .await
             .expect("full-object store");
         assert_recorded_and_hits("full-object store", dir.path(), &manager, key, 0, &d).await;
-    }
-
-    /// `CacheManager::complete_multipart_upload`: each part's range.
-    #[tokio::test]
-    async fn complete_multipart_upload_records_each_parts_file_identity() {
-        let dir = TempDir::new().unwrap();
-        let manager = setup(dir.path());
-        let path = "/test-bucket/case31/writer-mpu.bin";
-        let key = CacheManager::generate_cache_key(path, None);
-        let parts = [data(100_000, 0x34), data(100_000, 0x35)];
-        manager
-            .initiate_multipart_upload(path)
-            .await
-            .expect("initiate");
-        for (i, part) in parts.iter().enumerate() {
-            manager
-                .store_multipart_part(path, i as u32 + 1, part, format!("etag-part-{}", i + 1))
-                .await
-                .expect("part");
-        }
-        manager
-            .complete_multipart_upload(path)
-            .await
-            .expect("complete");
-        assert_recorded_and_hits(
-            "complete_multipart_upload part 1",
-            dir.path(),
-            &manager,
-            &key,
-            0,
-            &parts[0],
-        )
-        .await;
-        assert_recorded_and_hits(
-            "complete_multipart_upload part 2",
-            dir.path(),
-            &manager,
-            &key,
-            parts[0].len() as u64,
-            &parts[1],
-        )
-        .await;
     }
 }
 
@@ -52806,7 +49645,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
         }
     }
 
-    /// A direct-mode `DiskCacheManager` on `cache_dir`: P1 (`store_range`) and P3a
+    /// A direct-mode `DiskCacheManager` on `cache_dir`: P1 (`prepare_range_store`) and P3a
     /// (`begin_incremental_range_write_for_read_fill`) publish their own `.bin` and `.meta`
     /// here, which is what the assertions read. Its `cache_dir` is the registry key.
     async fn direct_manager(cache_dir: &Path) -> crate::disk_cache::DiskCacheManager {
@@ -52882,7 +49721,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
 
         let result = tokio::time::timeout(
             BOUND,
-            disk_cache.store_range(
+            disk_cache.store_range_witnessed(
                 key,
                 0,
                 FILL_LEN - 1,
@@ -52923,7 +49762,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
 
         let result = tokio::time::timeout(
             BOUND,
-            manager.store_full_object_as_range_new(
+            manager.try_seed_full_object_fill(
                 key,
                 &vec![9u8; FILL_LEN as usize],
                 object_metadata(FILL_LEN),
@@ -52931,11 +49770,10 @@ mod read_fill_max_cache_size_soft_stop_tests {
         )
         .await
         .expect("the fill must not hang");
-
         assert!(
-            result.is_ok(),
-            "a max_cache_size decline must not surface as an error: {:?}",
-            result.err()
+            matches!(result, Ok(false)),
+            "a max_cache_size decline is Ok(false), not an error and not a publish: {:?}",
+            result
         );
         // Both halves, the check returns before any write,
         // so a `.bin` with no `.meta` would be an orphan the `.meta` assertion cannot see.
@@ -53037,7 +49875,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
         let range_key = "case34-bucket/admitted-range";
         tokio::time::timeout(
             BOUND,
-            disk_cache.store_range(
+            disk_cache.store_range_witnessed(
                 range_key,
                 0,
                 FILL_LEN - 1,
@@ -53063,7 +49901,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
         let object_key = "case34-bucket/admitted-full-object";
         tokio::time::timeout(
             BOUND,
-            manager.store_full_object_as_range_new(
+            manager.seed_full_object_fill(
                 object_key,
                 &vec![9u8; FILL_LEN as usize],
                 object_metadata(FILL_LEN),
@@ -53092,7 +49930,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
 
         tokio::time::timeout(
             BOUND,
-            disk_cache.store_range(
+            disk_cache.store_range_witnessed(
                 key,
                 0,
                 FILL_LEN - 1,
@@ -53164,7 +50002,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
         .unwrap();
         tokio::time::timeout(
             BOUND,
-            disk_cache.commit_incremental_range(
+            disk_cache.commit_incremental_range_witnessed(
                 writer,
                 object_metadata(FILL_LEN),
                 Duration::from_secs(3600),
@@ -53870,12 +50708,8 @@ mod ram_access_queue_bound_tests {
         let mut observed = Vec::new();
         for hits in [1_000usize, 10_000] {
             let dir = tempfile::TempDir::new().unwrap();
-            let manager = CacheManager::new_with_eviction_algorithm(
-                dir.path().to_path_buf(),
-                true,
-                64 * 1024 * 1024,
-                CacheEvictionAlgorithm::TinyLFU,
-            );
+            let manager =
+                CacheManager::new_with_defaults(dir.path().to_path_buf(), true, 64 * 1024 * 1024);
             let alive_before = metrics.num_alive_tasks();
             for i in 0..hits {
                 if i % 2 == 0 {
@@ -54217,8 +51051,11 @@ mod ram_page_extent_memo_tests {
             expires_at: now + Duration::from_secs(3600),
             ..ranged_meta_to(key, STORED_END)
         };
-        let marker = MarkerStamp::of(&paths(cache_dir).get_new_metadata_file_path(key))
-            .expect("fixture: the key's write marker is readable");
+        let marker = MarkerStamp::witnessed_under_written_marker(
+            &paths(cache_dir).get_new_metadata_file_path(key),
+            key,
+            "fixture-fill-token",
+        );
         let tracker = Arc::new(FillVisibilityTracker::new(Duration::from_secs(5)));
         tracker.record(tracked, vec![RangeFileStamp::of(&bin).unwrap()], marker);
         assert!(
@@ -54454,7 +51291,7 @@ mod part_layout_version_tests {
                 &format!("bytes {}-{}/{}", start, end, len),
                 &part_headers("\"v2\""),
                 &v2[start as usize..=end as usize],
-                None,
+                manager.capture_fill_witness(key).await,
             )
             .await
             .expect("the part store returns Ok whether or not it caches");
@@ -54526,7 +51363,12 @@ mod part_layout_version_tests {
             describe(&before)
         );
         manager
-            .store_head_cache_entry_unified(key, HashMap::new(), head_response("\"v2\""))
+            .store_head_cache_entry_unified_witnessed(
+                key,
+                HashMap::new(),
+                head_response("\"v2\""),
+                manager.capture_fill_witness(key).await,
+            )
             .await
             .expect("fixture: the v2 HEAD store must succeed");
         let relabelled = read_meta(&manager, key);
@@ -54536,7 +51378,7 @@ mod part_layout_version_tests {
         );
         let mut disk_cache = manager.create_configured_disk_cache_manager();
         disk_cache
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 len - 1,
@@ -54697,7 +51539,7 @@ mod part_layout_version_tests {
         let ttl = std::time::Duration::from_secs(3600);
         let mut dcm = manager.create_configured_disk_cache_manager();
         let old = dcm
-            .prepare_range_store(
+            .prepare_range_store_witnessed(
                 key,
                 0,
                 4095,
@@ -54726,7 +51568,7 @@ mod part_layout_version_tests {
             .await
             .expect("the acknowledged write's invalidation");
         let refill = dcm
-            .prepare_range_store(
+            .prepare_range_store_witnessed(
                 key,
                 0,
                 4095,
@@ -54806,7 +51648,7 @@ mod part_layout_version_tests {
                 &format!("bytes 0-{}/{}", PART_LEN - 1, len),
                 &part_headers("\"v2\""),
                 &v2[..PART_LEN as usize],
-                None,
+                manager.capture_fill_witness(key).await,
             )
             .await
             .expect("the part store returns Ok");
@@ -54849,6 +51691,7 @@ mod full_object_recheck_tests {
         let key = "layout-bucket/full-object-recheck.bin";
         let body = incompressible_body(76);
         let pause = crate::disk_cache::range_rename_pause::arm_before_publish(key);
+        let witness = manager.capture_fill_witness(key).await;
         let store = {
             let manager = manager.clone();
             let body = body.clone();
@@ -54858,7 +51701,7 @@ mod full_object_recheck_tests {
                         key,
                         &body,
                         object_metadata(BODY_LEN as u64, "\"v1\""),
-                        None,
+                        &witness,
                     )
                     .await
             })
@@ -54903,3 +51746,6 @@ mod full_object_recheck_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod moved_fill_tests;

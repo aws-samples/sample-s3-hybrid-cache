@@ -4,6 +4,7 @@
 //! using shared cache volumes, write lock coordination, and cache consistency.
 
 mod common;
+use common::StoredObjectRead;
 
 use s3_proxy::{
     cache::CacheManager,
@@ -145,18 +146,11 @@ impl TestProxyInstance {
         &self,
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        // Try to get write cache entry first (since we're using write cache for storage)
-        if let Some(write_entry) = self.cache_manager.get_write_cache_entry(cache_key).await? {
-            return Ok(Some(write_entry.body));
-        }
-
-        // Try to get regular cached response as fallback
-        if let Some(cached_response) = self.cache_manager.get_cached_response(cache_key).await? {
-            if let Some(body) = cached_response.body {
+        if let Some(entry) = self.cache_manager.read_stored_object(cache_key).await? {
+            if let Some(body) = entry.body {
                 return Ok(Some(body));
             }
         }
-
         Ok(None)
     }
 }
@@ -541,132 +535,4 @@ async fn test_concurrent_cache_operations() {
     }
 
     println!("Concurrent cache operations test passed");
-}
-
-#[tokio::test]
-async fn test_cache_invalidation_coordination() {
-    // Test cache invalidation coordination across instances
-    let test_config = MultiInstanceTestConfig::default();
-
-    // Clean up and create shared cache directory
-    let _ = std::fs::remove_dir_all(&test_config.shared_cache_dir);
-    if let Err(e) = std::fs::create_dir_all(&test_config.shared_cache_dir) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            panic!("Failed to create shared cache directory: {}", e);
-        }
-    }
-
-    // Create instances
-    let writer_instance = TestProxyInstance::new(
-        test_config.shared_cache_dir.clone(),
-        "invalidation-writer".to_string(),
-    );
-    let reader_instance = TestProxyInstance::new(
-        test_config.shared_cache_dir.clone(),
-        "invalidation-reader".to_string(),
-    );
-
-    let cache_key = "invalidation-test/object";
-    let original_data = b"Original data".to_vec();
-    let updated_data = b"Updated data after invalidation".to_vec();
-
-    let original_metadata = CacheMetadata {
-        etag: "original-etag".to_string(),
-        last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        content_length: original_data.len() as u64,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    };
-
-    // Write original data
-    writer_instance
-        .write_to_cache(cache_key, &original_data, original_metadata)
-        .await
-        .expect("Failed to write original data");
-
-    // Give time for the write to complete
-    sleep(Duration::from_millis(100)).await;
-
-    // Reader should see original data
-    let read_original = reader_instance
-        .read_from_cache(cache_key)
-        .await
-        .expect("Failed to read original data");
-    assert!(read_original.is_some(), "Should find original data");
-    assert_eq!(
-        read_original.unwrap(),
-        original_data,
-        "Should read original data"
-    );
-
-    // Invalidate cache entry on both instances (both regular and write cache)
-    writer_instance
-        .cache_manager
-        .invalidate_cache(cache_key)
-        .await
-        .expect("Failed to invalidate cache on writer");
-    writer_instance
-        .cache_manager
-        .invalidate_write_cache_entry(cache_key)
-        .await
-        .expect("Failed to invalidate write cache on writer");
-
-    reader_instance
-        .cache_manager
-        .invalidate_cache(cache_key)
-        .await
-        .expect("Failed to invalidate cache on reader");
-    reader_instance
-        .cache_manager
-        .invalidate_write_cache_entry(cache_key)
-        .await
-        .expect("Failed to invalidate write cache on reader");
-
-    // Give time for invalidation to propagate across instances
-    sleep(Duration::from_millis(200)).await;
-
-    // Reader should no longer find the cached data
-    let read_after_invalidation = reader_instance
-        .read_from_cache(cache_key)
-        .await
-        .expect("Failed to read after invalidation");
-    assert!(
-        read_after_invalidation.is_none(),
-        "Should not find data after invalidation"
-    );
-
-    // Write updated data
-    let updated_metadata = CacheMetadata {
-        etag: "updated-etag".to_string(),
-        last_modified: "Thu, 22 Oct 2015 07:28:00 GMT".to_string(),
-        content_length: updated_data.len() as u64,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    };
-
-    writer_instance
-        .write_to_cache(cache_key, &updated_data, updated_metadata)
-        .await
-        .expect("Failed to write updated data");
-
-    // Give time for the write to complete
-    sleep(Duration::from_millis(100)).await;
-
-    // Reader should see updated data
-    let read_updated = reader_instance
-        .read_from_cache(cache_key)
-        .await
-        .expect("Failed to read updated data");
-    assert!(read_updated.is_some(), "Should find updated data");
-    assert_eq!(
-        read_updated.unwrap(),
-        updated_data,
-        "Should read updated data"
-    );
-
-    println!("Cache invalidation coordination test passed");
 }

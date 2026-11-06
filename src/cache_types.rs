@@ -295,6 +295,14 @@ pub struct CachedPartInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub file_identity: Option<RangeFileIdentity>,
+    /// Inode number of the part's `.bin` as its writer published it. The completion renames
+    /// that file into `ranges/`, which keeps the inode, and checks the renamed file's inode
+    /// against this one: size and modification time ([`Self::file_identity`]) cannot tell
+    /// two same-length files written in one timestamp granule apart, the inode can. `None`
+    /// for a record written before the field existed, which is then not checked. Omitted from
+    /// the record when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_inode: Option<u64>,
 }
 impl CachedPartInfo {
     /// Create a new CachedPartInfo
@@ -311,6 +319,7 @@ impl CachedPartInfo {
             etag,
             compression_algorithm,
             file_identity: None,
+            file_inode: None,
         }
     }
 
@@ -326,6 +335,7 @@ impl CachedPartInfo {
             etag,
             compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
             file_identity: None,
+            file_inode: None,
         }
     }
 
@@ -344,12 +354,17 @@ impl CachedPartInfo {
         self.file_identity = file_identity;
         self
     }
+    /// Attach the inode number of the part file its writer published.
+    pub(crate) fn with_file_inode(mut self, file_inode: Option<u64>) -> Self {
+        self.file_inode = file_inode;
+        self
+    }
 }
 
 /// Tracks an in-progress multipart upload for write caching
 /// Stored as JSON in mpus_in_progress/{uploadId}/upload.meta
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MultipartUploadTracker {
+pub(crate) struct MultipartUploadTracker {
     /// Unique identifier for the multipart upload (from S3)
     pub upload_id: String,
     /// Cache key for the object being uploaded (bucket/key)
@@ -418,19 +433,6 @@ impl MultipartUploadTracker {
         let mut sorted: Vec<&CachedPartInfo> = self.parts.iter().collect();
         sorted.sort_by_key(|p| p.part_number);
         sorted
-    }
-
-    /// Check if the upload has exceeded the given TTL
-    pub fn is_expired(&self, ttl: std::time::Duration) -> bool {
-        match self.started_at.elapsed() {
-            Ok(elapsed) => elapsed > ttl,
-            Err(_) => false, // Clock went backwards, don't expire
-        }
-    }
-
-    /// Serialize to JSON for storage
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
     }
 
     /// Deserialize from JSON
@@ -711,8 +713,8 @@ impl ObjectMetadata {
 /// Traced 2026-08-25: every `RangeSpec` built by a live write path derives
 /// `file_path` from `strip_prefix(cache_dir/ranges)`, which returns `Err` (and is
 /// propagated) for anything outside `ranges/`. The four producers are
-/// `DiskCacheManager::store_range`, `DiskCacheManager::finalize_incremental_range`,
-/// `CacheManager::store_full_object_as_range_new`, and the multipart-completion
+/// `PreparedRangeFill::finish`, `DiskCacheManager::finalize_incremental_range`,
+/// `CacheManager::store_full_object_as_range_witnessed`, and the multipart-completion
 /// finalizer in `signed_put_handler` — and that last one *renames* each part out
 /// of `mpus_in_progress/` into `ranges/` **before** building its `RangeSpec`.
 /// Multipart parts are finalized by `finalize_incremental_part`, which
@@ -928,7 +930,7 @@ pub struct RangeFileIdentity {
 /// truncates to whole seconds (default `tar`, older `rsync`) leaves most times outside it:
 /// those ranges miss, are healed and refill, never served from the wrong file. Not a
 /// configuration field.
-pub const MTIME_MATCH_WINDOW_NS: u64 = 1_000_000;
+const MTIME_MATCH_WINDOW_NS: u64 = 1_000_000;
 
 impl RangeFileIdentity {
     /// The identity `fstat` (or `stat`) reported. `None` off Unix, or when the modification
@@ -1069,7 +1071,7 @@ impl RangeSpec {
     ///
     /// Compatibility code with an expiry: it can be deleted once no listing written before
     /// 3.0.0 can remain on a cache volume, one release after every fleet has upgraded.
-    pub fn is_unverified_prefix(&self, content_length: u64) -> bool {
+    pub(crate) fn is_unverified_prefix(&self, content_length: u64) -> bool {
         #[cfg(unix)]
         {
             self.file_identity.is_none()
@@ -1110,29 +1112,6 @@ impl RangeSpec {
                 uncompressed_size,
             )
         }
-    }
-
-    /// Calculate LRU score (lower = evict first)
-    /// Returns seconds since Unix epoch for last access time
-    pub fn lru_score(&self) -> u64 {
-        self.last_accessed
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }
-
-    /// Decayed-frequency eviction score (lower = evict first). Testable via injected `now`.
-    ///
-    /// Halves `access_count` once per `TINYLFU_HALF_LIFE_SECS` of idle time (see
-    /// `crate::cache::decayed_frequency`). Monotonic non-increasing in idle time and never
-    /// divides by recency, which avoids the inversion where an idle-hot range is evicted
-    /// before a fresh one-hit-wonder.
-    pub fn tinylfu_score(&self, now: SystemTime) -> u64 {
-        let idle_secs = now
-            .duration_since(self.last_accessed)
-            .unwrap_or_default()
-            .as_secs();
-        crate::cache::decayed_frequency(self.access_count, idle_secs)
     }
 
     /// Update access statistics
@@ -1180,7 +1159,7 @@ pub struct NewCacheMetadata {
 impl NewCacheMetadata {
     /// The instant the live GET age is measured from: the later of `created_at` and
     /// `last_validated_at`.
-    pub fn freshness_anchor(&self) -> SystemTime {
+    pub(crate) fn freshness_anchor(&self) -> SystemTime {
         match self.last_validated_at {
             Some(validated) if validated > self.created_at => validated,
             _ => self.created_at,
@@ -1191,19 +1170,10 @@ impl NewCacheMetadata {
     /// `now + ttl` and the live GET age re-anchors to now. Only an origin `304` may call this.
     /// A Mode B `If-Match` served from cache compares the client's ETag against the cache's
     /// own and must use [`Self::refresh_object_ttl`] instead.
-    pub fn record_origin_validation(&mut self, ttl: Duration) {
+    pub(crate) fn record_origin_validation(&mut self, ttl: Duration) {
         let now = SystemTime::now();
         self.expires_at = safe_expiry(now, ttl);
         self.last_validated_at = Some(now);
-    }
-
-    /// Check if HEAD cache has expired
-    /// Returns true if head_expires_at is None or in the past
-    pub fn is_head_expired(&self) -> bool {
-        match self.head_expires_at {
-            Some(expires_at) => SystemTime::now() > expires_at,
-            None => true, // No HEAD expiry set means HEAD is not cached
-        }
     }
 
     /// Refresh HEAD TTL and freshness anchor from the same instant.
@@ -1215,15 +1185,9 @@ impl NewCacheMetadata {
     }
 
     /// Record a HEAD access (increment count and update last_accessed)
-    pub fn record_head_access(&mut self) {
+    pub(crate) fn record_head_access(&mut self) {
         self.head_access_count += 1;
         self.head_last_accessed = Some(SystemTime::now());
-    }
-
-    /// Check if the cached object has expired.
-    /// Checks object-level expires_at against now.
-    pub fn is_object_expired(&self) -> bool {
-        SystemTime::now() > self.expires_at
     }
 
     /// Sum of `compressed_size` over the ranges that count toward the write
@@ -1242,16 +1206,6 @@ impl NewCacheMetadata {
             .filter(|r| is_staged_range_spec(r, self.object_metadata.is_write_cached))
             .map(|r| r.compressed_size)
             .sum()
-    }
-
-    /// Whether any range of this object counts toward the write (staging) tier.
-    /// Used for **object counts** where `staged_compressed_size` gives bytes.
-    ///
-    /// Spec: write-cache-accounting-and-eviction. Requirements: 6.1, 6.2
-    pub fn has_staged_range(&self) -> bool {
-        self.ranges
-            .iter()
-            .any(|r| is_staged_range_spec(r, self.object_metadata.is_write_cached))
     }
 
     /// Refresh the object-level TTL by setting `expires_at = now + ttl`.
@@ -1601,29 +1555,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_object_expired() {
-        let now = SystemTime::now();
-
-        // expires_at in the future → not expired
-        let fresh = NewCacheMetadata {
-            cache_key: "k".to_string(),
-            created_at: now,
-            expires_at: now + Duration::from_secs(3600),
-            ..Default::default()
-        };
-        assert!(!fresh.is_object_expired());
-
-        // expires_at in the past → expired
-        let expired = NewCacheMetadata {
-            cache_key: "k".to_string(),
-            created_at: now - Duration::from_secs(7200),
-            expires_at: now - Duration::from_secs(1),
-            ..Default::default()
-        };
-        assert!(expired.is_object_expired());
-    }
-
-    #[test]
     fn test_refresh_object_ttl() {
         let now = SystemTime::now();
         let mut meta = NewCacheMetadata {
@@ -1632,7 +1563,7 @@ mod tests {
             expires_at: now - Duration::from_secs(1), // expired
             ..Default::default()
         };
-        assert!(meta.is_object_expired());
+        assert!(std::time::SystemTime::now() > meta.expires_at);
 
         meta.refresh_object_ttl(Duration::from_secs(3600));
 
@@ -1647,88 +1578,7 @@ mod tests {
             diff < Duration::from_secs(2),
             "expires_at not within tolerance"
         );
-        assert!(!meta.is_object_expired());
-    }
-
-    #[test]
-    fn test_range_spec_lru_score() {
-        let now = SystemTime::now();
-        let range = RangeSpec {
-            start: 0,
-            end: 1024,
-            file_path: "test.bin".to_string(),
-            compression_algorithm: CompressionAlgorithm::Lz4,
-            compressed_size: 1024,
-            uncompressed_size: 1024,
-            created_at: now,
-            last_accessed: now,
-            access_count: 1,
-            staged: None,
-            unservable: false,
-            file_identity: None,
-        };
-
-        let score = range.lru_score();
-        // Score should be seconds since Unix epoch
-        assert!(score > 0);
-
-        // More recently accessed range should have higher score
-        let older_range = RangeSpec {
-            start: 0,
-            end: 1024,
-            file_path: "test.bin".to_string(),
-            compression_algorithm: CompressionAlgorithm::Lz4,
-            compressed_size: 1024,
-            uncompressed_size: 1024,
-            created_at: now - std::time::Duration::from_secs(3600),
-            last_accessed: now - std::time::Duration::from_secs(3600),
-            access_count: 1,
-            staged: None,
-            unservable: false,
-            file_identity: None,
-        };
-
-        assert!(range.lru_score() > older_range.lru_score());
-    }
-
-    #[test]
-    fn test_range_spec_tinylfu_score() {
-        let now = SystemTime::now();
-
-        // Frequently accessed, recently accessed range
-        let hot_range = RangeSpec {
-            start: 0,
-            end: 1024,
-            file_path: "test.bin".to_string(),
-            compression_algorithm: CompressionAlgorithm::Lz4,
-            compressed_size: 1024,
-            uncompressed_size: 1024,
-            created_at: now - std::time::Duration::from_secs(3600),
-            last_accessed: now - std::time::Duration::from_secs(10),
-            access_count: 100,
-            staged: None,
-            unservable: false,
-            file_identity: None,
-        };
-
-        // Infrequently accessed, old range
-        let cold_range = RangeSpec {
-            start: 0,
-            end: 1024,
-            file_path: "test.bin".to_string(),
-            compression_algorithm: CompressionAlgorithm::Lz4,
-            compressed_size: 1024,
-            uncompressed_size: 1024,
-            created_at: now - std::time::Duration::from_secs(7200),
-            last_accessed: now - std::time::Duration::from_secs(3600),
-            access_count: 5,
-            staged: None,
-            unservable: false,
-            file_identity: None,
-        };
-
-        // Hot range should have higher score (less likely to be evicted)
-        assert!(hot_range.tinylfu_score(now) > cold_range.tinylfu_score(now));
+        assert!(meta.expires_at >= std::time::SystemTime::now());
     }
 
     #[test]
@@ -2104,6 +1954,17 @@ mod tests {
         assert_eq!(deserialized.etag, "\"d8e8fca2dc0f896fd7cb4cb0031ba249\"");
     }
 
+    /// A part record written before `file_inode` existed parses, with no inode to check.
+    #[test]
+    fn a_part_record_without_an_inode_parses_unchecked() {
+        let json = r#"{"part_number":1,"size":10,"etag":"\"e\""}"#;
+        let part: CachedPartInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(part.file_inode, None);
+        let with = part.with_file_inode(Some(42));
+        let round: CachedPartInfo =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(round.file_inode, Some(42));
+    }
     #[test]
     fn test_multipart_upload_tracker_new() {
         let tracker = MultipartUploadTracker::new(
@@ -2214,7 +2075,7 @@ mod tests {
         ));
 
         // Serialize
-        let json = tracker.to_json().unwrap();
+        let json = serde_json::to_string_pretty(&tracker).unwrap();
 
         // Deserialize
         let deserialized = MultipartUploadTracker::from_json(&json).unwrap();
@@ -2223,24 +2084,6 @@ mod tests {
         assert_eq!(deserialized.cache_key, "test-bucket/test-object");
         assert_eq!(deserialized.parts.len(), 2);
         assert_eq!(deserialized.total_size, 10485760);
-    }
-
-    #[test]
-    fn test_multipart_upload_tracker_is_expired() {
-        // Create a tracker with a past start time to test expiration
-        let mut tracker = MultipartUploadTracker::new(
-            "abc123xyz".to_string(),
-            "test-bucket/test-object".to_string(),
-        );
-
-        // Set started_at to 2 hours ago
-        tracker.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-
-        // Should not be expired with 3 hour TTL
-        assert!(!tracker.is_expired(std::time::Duration::from_secs(10800)));
-
-        // Should be expired with 1 hour TTL (started 2 hours ago)
-        assert!(tracker.is_expired(std::time::Duration::from_secs(3600)));
     }
 
     /// **Feature: write-through-cache-finalization, Property: MultipartUploadTracker round-trip**
@@ -2278,7 +2121,7 @@ mod tests {
         }
 
         // Serialize
-        let json = match tracker.to_json() {
+        let json = match serde_json::to_string_pretty(&tracker) {
             Ok(j) => j,
             Err(_) => return TestResult::failed(),
         };
@@ -2330,7 +2173,7 @@ mod tests {
 
             // Populate the in-progress upload directory directly on disk (part
             // files + tracker), mirroring what a part write produces. The
-            // buffered `cache_upload_part` helper was removed as dead code; this
+            // buffered one-shot part writer was removed as dead code; this
             // test targets abort cleanup (`cleanup_multipart_upload`), so it only
             // needs parts present on disk, not the write path itself.
             let multipart_dir =
@@ -2352,9 +2195,12 @@ mod tests {
             }
 
             let upload_meta_file = multipart_dir.join("upload.meta");
-            tokio::fs::write(&upload_meta_file, tracker.to_json().unwrap())
-                .await
-                .unwrap();
+            tokio::fs::write(
+                &upload_meta_file,
+                serde_json::to_string_pretty(&tracker).unwrap(),
+            )
+            .await
+            .unwrap();
 
             if !upload_meta_file.exists() {
                 return TestResult::failed();
@@ -2386,126 +2232,6 @@ mod tests {
             }
 
             // Verify multipart directory is completely removed (all parts gone with it)
-            if multipart_dir.exists() {
-                return TestResult::failed();
-            }
-
-            TestResult::passed()
-        })
-    }
-
-    /// **Feature: write-through-cache-finalization, Property 8: Incomplete upload eviction**
-    /// *For any* multipart upload that exceeds the incomplete upload TTL without completion, all cached parts and tracking metadata SHALL be actively removed.
-    /// **Validates: Requirements 4.2, 4.3**
-    #[quickcheck]
-    fn prop_incomplete_upload_eviction(part_count: u8, ttl_seconds: u8) -> TestResult {
-        // Filter out invalid inputs
-        let part_count = (part_count % 3) + 1; // 1-3 parts
-        let ttl_seconds = (ttl_seconds % 10) + 1; // 1-10 seconds
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            use crate::cache::CacheEvictionAlgorithm;
-            use crate::write_cache_manager::WriteCacheManager;
-            use std::time::Duration;
-            use tempfile::TempDir;
-
-            let temp_dir = TempDir::new().unwrap();
-            let ttl = Duration::from_secs(ttl_seconds as u64);
-
-            let manager = WriteCacheManager::new(
-                temp_dir.path().to_path_buf(),
-                10 * 1024 * 1024,           // 10MB total cache
-                10.0,                       // 10% for write cache
-                Duration::from_secs(86400), // 1 day write TTL
-                ttl,                        // Short incomplete upload TTL for testing
-                CacheEvictionAlgorithm::TinyLFU,
-                256 * 1024 * 1024, // 256MB max object size
-            );
-
-            // Create an incomplete multipart upload
-            let upload_id = "test-upload-eviction";
-            let multipart_dir =
-                crate::signed_put_handler::mpu_upload_dir(temp_dir.path(), upload_id);
-
-            if tokio::fs::create_dir_all(&multipart_dir).await.is_err() {
-                return TestResult::failed();
-            }
-
-            // Create upload.meta with some parts
-            let mut tracker = MultipartUploadTracker::new(
-                upload_id.to_string(),
-                "test-bucket/test-object".to_string(),
-            );
-
-            // Add some parts to the tracker and create part files in the upload directory
-            for part_num in 1..=part_count {
-                let data = vec![part_num; 100]; // 100 bytes per part
-                let etag = format!("\"etag-{}\"", part_num);
-
-                // Create part file in the upload directory
-                let part_file = multipart_dir.join(format!("part{}.bin", part_num));
-
-                if tokio::fs::write(&part_file, &data).await.is_err() {
-                    return TestResult::failed();
-                }
-
-                let part_info =
-                    CachedPartInfo::new_uncompressed(part_num as u32, data.len() as u64, etag);
-
-                tracker.add_part(part_info);
-            }
-
-            // Write the tracker to upload.meta
-            let upload_meta_file = multipart_dir.join("upload.meta");
-            let tracker_json = match tracker.to_json() {
-                Ok(json) => json,
-                Err(_) => return TestResult::failed(),
-            };
-
-            if tokio::fs::write(&upload_meta_file, tracker_json)
-                .await
-                .is_err()
-            {
-                return TestResult::failed();
-            }
-
-            // Verify parts exist before eviction
-            for part_info in &tracker.parts {
-                let part_file = multipart_dir.join(format!("part{}.bin", part_info.part_number));
-                if !part_file.exists() {
-                    return TestResult::failed();
-                }
-            }
-
-            // Set file mtime to be older than TTL (instead of sleeping)
-            let old_time = std::time::SystemTime::now() - ttl - Duration::from_secs(10);
-            let old_filetime = filetime::FileTime::from_system_time(old_time);
-            if filetime::set_file_mtime(&upload_meta_file, old_filetime).is_err() {
-                return TestResult::failed();
-            }
-            // Backdate the DIRECTORY too, for the same reason as the sibling fixture in
-            // `write_cache_manager.rs`: the sweep takes the newest of the directory's
-            // mtime and `upload.meta`'s, because that file is written once at
-            // CreateMultipartUpload and so records the upload's START. A fresh
-            // directory is what a live long-running upload looks like, and the sweep
-            // must not evict one of those.
-            if filetime::set_file_mtime(&multipart_dir, old_filetime).is_err() {
-                return TestResult::failed();
-            }
-
-            // Run eviction
-            let freed_bytes = match manager.evict_incomplete_uploads().await {
-                Ok(freed) => freed,
-                Err(_) => return TestResult::failed(),
-            };
-
-            // Verify eviction occurred
-            if freed_bytes == 0 {
-                return TestResult::failed();
-            }
-
-            // Verify multipart directory is removed (all parts gone with it)
             if multipart_dir.exists() {
                 return TestResult::failed();
             }

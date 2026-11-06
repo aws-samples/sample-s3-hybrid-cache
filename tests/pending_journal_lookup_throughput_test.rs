@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use s3_proxy::cache_types::RangeSpec;
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::DiskCacheManager;
-use s3_proxy::hybrid_metadata_writer::{ConsolidationTrigger, HybridMetadataWriter};
+use s3_proxy::hybrid_metadata_writer::HybridMetadataWriter;
 use s3_proxy::journal_manager::{JournalEntry, JournalManager, JournalOperation};
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
 use tempfile::TempDir;
@@ -75,7 +75,6 @@ async fn manager_over_journal(journal_target: usize) -> (DiskCacheManager, usize
             0,
         )),
         Arc::new(JournalManager::new(cache_dir.clone(), INSTANCE.to_string())),
-        Arc::new(ConsolidationTrigger::new(10 * 1024 * 1024, 1000)),
     ))));
     assert!(manager.is_shared_storage_mode(), "fixture precondition");
 

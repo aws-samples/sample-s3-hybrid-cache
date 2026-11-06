@@ -14,7 +14,6 @@ pub mod cache_hit_update_buffer;
 pub mod cache_initialization_coordinator;
 pub mod cache_size_tracker;
 pub mod cache_types;
-pub mod cache_validator;
 pub mod capacity_guard;
 pub mod capacity_manager;
 pub mod compression;
@@ -79,3 +78,6 @@ pub use error::{ProxyError, Result, UpstreamSendFailureKind};
 // reach it without depending on internal module paths. The concrete `S3Client`
 // type stays reachable via the `s3_client` module for callers that need it.
 pub use s3_client::{S3ClientApi, S3RequestContext, S3Response, S3ResponseBody};
+
+#[cfg(test)]
+extern crate self as s3_proxy;

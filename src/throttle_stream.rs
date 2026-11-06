@@ -53,7 +53,7 @@ const MAX_WAIT: Duration = Duration::from_secs(5);
 /// conversion to a `BoxBody`.  Pass `known_len` from `Content-Length` (full
 /// GET) or `parse_content_range_length` (range GET) so small requests never
 /// over-acquire budget.
-pub struct ThrottleStream<S> {
+pub(crate) struct ThrottleStream<S> {
     inner: S,
     limiter: Arc<BandwidthLimiter>,
     key: FairnessKey,
@@ -708,7 +708,11 @@ mod perf_tests {
         }
         assert_eq!(total, 64 * 1024, "byte-exact under cap");
         // failopen_total must remain 0 — no DRR enqueue / no timeout.
-        assert_eq!(lim.failopen_total(), 0, "no fail-open events under cap");
+        assert_eq!(
+            lim.snapshot().failopen_total,
+            0,
+            "no fail-open events under cap"
+        );
     }
 
     // ── Req 9.8: small-object flood — budget consumed ≈ real bytes ────────────
@@ -770,7 +774,7 @@ mod perf_tests {
             obj_size * n_objects as u64
         );
         assert_eq!(
-            lim.failopen_total(),
+            lim.snapshot().failopen_total,
             0,
             "no fail-open in small-object flood"
         );

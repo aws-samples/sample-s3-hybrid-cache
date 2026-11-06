@@ -100,9 +100,10 @@ enabled, sends to `http://localhost:4318` by default.
 #### `request_timeout` is not enforced
 
 `server.request_timeout` (`Duration`, default `30s`) is accepted and validated but has no
-effect on request handling. The proxy waits at most 30 seconds for each upstream response
-whatever this field says. The upstream timeouts you can set are described under
-[Upstream timeout](#upstream-timeout-stalled-response-fast-fail).
+effect on request handling. Each upstream read request has a fixed 30-second timeout from
+connect to response. The upstream timeouts you can set are
+[Upstream timeout](#upstream-timeout-stalled-response-fast-fail) for GET and HEAD, and
+[Upstream write timeout](#upstream-write-timeout) for uploads and other writes.
 
 #### Max concurrent requests
 
@@ -113,8 +114,9 @@ representative load.
 ##### What this limit actually covers
 
 A request holds its permit until its response body has finished streaming to the client or
-the connection drops, and a background cache commit holds a share of it until the commit
-completes. The field therefore bounds concurrent transfers, and many large, slow transfers
+the connection drops. A write whose client disconnects keeps it until the proxy has finished
+the write with S3 and updated the cache. A background cache commit holds a share of it until
+the commit completes. The field therefore bounds concurrent transfers, and many large, slow transfers
 reach it sooner than their request rate suggests.
 
 A request over the limit is rejected at once with HTTP 503 `SlowDown` and a `Retry-After`
@@ -135,8 +137,9 @@ combined ceiling:
 
 1. Streamed transfers: about `max_concurrent_requests` × 3.9 MiB per proxy if every request is a streamed hit with a slow client. A miss with a slow client holds about 46 KiB, and one whose cache write stalls can hold up to about 40 MiB.
 2. Buffered bodies, on the paths that hold a whole body or range in memory: bounded by
-   [`server.max_inflight_buffer_bytes`](#in-flight-memory-ceiling). At its default of `0`
-   this budget has no bound.
+   [`server.max_inflight_buffer_bytes`](#in-flight-memory-ceiling), apart from S3's answers to
+   writes already sent, which it counts but never refuses. At its default of `0` this budget
+   has no bound.
 3. The RAM cache: `cache.max_ram_cache_size`, default 512 MiB (`536870912`).
 
 Size the instance from its measured peak resident memory under representative load.
@@ -151,14 +154,17 @@ server:
 **`max_inflight_buffer_bytes`** (`u64`, default `0`, which disables it) caps the bytes held
 at once by the request and response bodies that the proxy buffers whole instead of
 streaming. Almost all of them are responses: range merges, page widening, buffered range
-serving, and the recovery and tee fallbacks. Every upload streams, so a request body counts
-only on the small verbs other than GET and PUT, such as a `DeleteObjects` POST, which a
-fixed 1 MiB bound covers. Streamed transfers do not count; [Memory impact](#memory-impact)
-bounds them.
+serving, the recovery and tee fallbacks, and S3's answers to uploads and other writes, each at
+most 8 MiB. S3's answer to a `DeleteObjects` request, up to about 4 MiB, is held while the
+result is replayed to the connection. Every upload streams, so a request body counts only on
+the small verbs other than GET and PUT, such as a `DeleteObjects` POST, which a fixed 1 MiB
+bound covers. Streamed transfers do not count; [Memory impact](#memory-impact) bounds them.
 
 A request whose buffered body would take the total over the ceiling is rejected with HTTP
 503 `SlowDown` and `Retry-After`, as for `max_concurrent_requests`, before any upstream
-connection opens. A request that re-fetches the same range internally counts once, at the
+connection opens. S3's answer to a write the proxy has already sent is counted but never
+refused, so `reserved_bytes` can exceed `ceiling_bytes` while such answers are held. A request
+that re-fetches the same range internally counts once, at the
 larger of the two sizes. Startup validation rejects a non-zero value below 1 MiB
 (`1048576`), the bound on a single buffered request body.
 
@@ -263,6 +269,7 @@ server:
 | `tls_proxy_port` | `3129` | Port of the TLS proxy listener |
 | `cert_path` | (empty) | Path to PEM certificate file (required when enabled) |
 | `key_path` | (empty) | Path to PEM private key file (required when enabled) |
+| `connect_allowlist` | unset | Hostname patterns the proxy may connect to. Setting it also turns on the destination policy for the HTTP forwarding paths, which then connect only to addresses the policy accepts. See [Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection) |
 
 **Validation rules**:
 - With `enabled: true`, `cert_path` and `key_path` must be set.
@@ -617,7 +624,7 @@ The file holds an optional `$schema` reference plus an ordered `rules` array. Ea
 
 **Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`, `hedging_enabled`, `hedge_trigger_after`, `hedge_max_per_request`
 
-**`get_ttl` and `head_ttl` are independent per rule.** Neither is derived from or clamped to the other. A rule setting `get_ttl: "0s"` without `head_ttl` leaves HEAD requests for matching keys answerable from cache for the resolved `head_ttl` (default 60s). A prefix that must reach S3 on every read, so that S3 evaluates IAM for each request, needs both `get_ttl` and `head_ttl` at `"0s"`, because each covers a different request class. The example also sets `evaluate_conditions_from_cache: false`, which a zero `get_ttl` already implies for a lone `If-Match` or `If-Range` GET:
+**`get_ttl` and `head_ttl` are independent per rule.** Neither is derived from or clamped to the other. A rule setting `get_ttl: "0s"` without `head_ttl` leaves HEAD requests for matching keys answerable from cache for the resolved `head_ttl` (default 60s). A prefix that must reach S3 on every read, so that S3 evaluates IAM for each request, needs both `get_ttl` and `head_ttl` at `"0s"`, because each covers a different request class. The example also sets `evaluate_conditions_from_cache: false`, so that a lone `If-Match` or `If-Range` GET is forwarded as the client sent it:
 
 ```json
 { "pattern": "**/restricted/**", "get_ttl": "0s", "head_ttl": "0s", "evaluate_conditions_from_cache": false }
@@ -974,7 +981,7 @@ cache:
 ```
 `wait_timeout_secs` outside 5 to 120 is clamped to that range, with a startup warning.
 
-When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter that times out rejoins the fetch still in flight, up to `download_coordination.max_waiter_resubscriptions` times (default `3`), and then receives HTTP 504; it never starts a duplicate fetch. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
+When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter that times out rejoins the fetch still in flight, up to `download_coordination.max_waiter_resubscriptions` times (default `3`). After that, a full-object GET or HEAD waiter fetches from S3 itself, as an uncoalesced request does, and a part or range waiter receives HTTP 504. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
 
 ## Cache size tracking
 
@@ -988,16 +995,15 @@ Orphan reclamation and the eviction work list have no fields. Both start once ev
 compression:
   enabled: true
   threshold: 1024                    # Size floor in bytes; smaller writes always skip compression
-  preferred_algorithm: "lz4"         # Options: lz4 (parsed but otherwise inert)
+  preferred_algorithm: "lz4"         # Accepted; has no effect (LZ4 is the only algorithm)
 ```
 
 **`threshold`** (`usize`, default `1024`): size floor in bytes. Writes smaller than
 this always skip compression, regardless of extension or any `cache_rules.json`
 override.
 
-**`preferred_algorithm`** (`String`, default `"lz4"`): parsed and stored per entry, but
-otherwise inert; LZ4 is the only implemented algorithm. Changing it does not invalidate
-existing cache entries, which continue to be read with the algorithm recorded in their
+**`preferred_algorithm`** (`String`, default `"lz4"`): accepted and has no effect, because
+LZ4 is the only algorithm. Each cache entry records the algorithm it was written with in its
 own metadata.
 
 `compression.content_aware` is ignored with a startup warning; delete it.
@@ -1078,7 +1084,7 @@ chosen for a low-latency path throttles a high-latency one.
 
 ### Upstream timeout (stalled-response fast-fail)
 
-These fields set how soon the proxy gives up on a stalled connection to the origin. They apply to the request that fetches from S3, not to requests waiting on that fetch through [download coordination](#download-coordination).
+These fields set how soon the proxy gives up on a stalled GET or HEAD to the origin. They apply to the request that fetches from S3, not to requests waiting on that fetch through [download coordination](#download-coordination). Uploads and other writes have their own bound, [Upstream write timeout](#upstream-write-timeout).
 
 ```yaml
 connection_pool:
@@ -1089,7 +1095,7 @@ connection_pool:
 
 **`upstream_first_byte_timeout`** (`Duration`, default `"5s"`)
 
-How long the proxy waits, after connecting, for the first byte of the response. On timeout, before anything has been sent to the client, the proxy retries up to `upstream_idle_retries` times, failing over between the origin's addresses, and then returns an error. Set it above the slowest first-byte times you see from the origin and well below the client's 60-second read timeout, so the proxy retries before the client gives up.
+How long the proxy waits for the first byte of a full-object GET or HEAD response, timed from the start of each attempt, so the connect counts against it. Range GETs do not use it; they are bounded by the fixed 30-second read timeout (see [`request_timeout` is not enforced](#request_timeout-is-not-enforced)). On timeout, before anything has been sent to the client, the proxy retries up to `upstream_idle_retries` times, failing over between the origin's addresses, and then answers `504 Gateway Timeout`. Set it above the slowest first-byte times you see from the origin and well below the client's 60-second read timeout, so the proxy retries before the client gives up.
 
 **`upstream_idle_timeout`** (`Duration`, default `"5s"`)
 
@@ -1097,7 +1103,24 @@ Mid-stream idle watchdog: if no bytes are received from upstream for this durati
 
 **`upstream_idle_retries`** (`usize`, default `2`)
 
-How many times the proxy retries a fetch whose first byte timed out before anything was sent to the client. Each retry fails over between addresses; when the retries run out, the proxy returns an error.
+How many times the proxy retries a fetch whose first byte timed out before anything was sent to the client. Each retry fails over between addresses; when the retries run out, the proxy answers `504 Gateway Timeout`.
+
+### Upstream write timeout
+
+These fields bound how long an upload, multipart operation, copy or other write waits on the origin. GET and HEAD use [Upstream timeout](#upstream-timeout-stalled-response-fast-fail) instead.
+
+```yaml
+connection_pool:
+  connection_timeout: "10s"
+  # upstream_write_idle_timeout: "120s"
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `connection_timeout` | `Duration` | `10s` | One deadline over the whole connect for a write: every TCP attempt, every TLS handshake and the pauses between retries. It also bounds each [recovery probe](CONNECTION_POOLING.md#3a-recovery-probing) |
+| `upstream_write_idle_timeout` | `Duration` | `120s` | How long the origin may go without moving a byte while the proxy sends a write's request, waits for the response head and reads the response. Startup rejects `0s` |
+
+Any byte written or read restarts the idle timer, so a transfer that keeps moving is never cut off and an upload has no overall time limit. The timer never runs while the proxy waits for the client's next body bytes, and over TLS it sees progress only when a whole TLS record moves. When either bound expires, the proxy answers `504 Gateway Timeout`; [Writes the origin stops answering](ERROR_HANDLING.md#10-writes-the-origin-stops-answering) describes what happens to the cached copy. The keepalive fields and `tcp_recv_buffer_size` under [TCP socket options](#tcp-socket-options) apply to write connections too.
 
 ### Hedged requests governor
 
@@ -1226,6 +1249,10 @@ on port 443. `dns_servers` does not cover the passthrough handler.
 **Health exclusion**: an ENI IP that health tracking excludes, from an exact or a suffix
 entry, returns to round-robin only when a recovery probe to it succeeds. See
 [PrivateLink (endpoint_overrides) interaction](#privatelink-endpoint_overrides-interaction).
+
+### Failed lookups
+
+Each lookup is bounded at 10 seconds, and concurrent lookups of one name share one query. When a lookup fails for a name that has no addresses yet, the proxy remembers the failure for `dns_refresh_interval`. Until the interval passes, requests for that name fail at once instead of each waiting on a new lookup. It remembers up to `max_registered_endpoints` such names and drops the oldest first. A name that already has addresses keeps them when a refresh fails, and the refresh is tried again on the next `pool_check_interval` tick. A slow lookup does not hold up requests to other origins.
 
 ### `dns_servers` with Route 53 Resolver
 
@@ -1718,7 +1745,7 @@ The [annotated example configuration](../config/config.example.yaml) shows every
 
 ### Connection issues
 
-- Raise `connection_timeout`.
+- Raise `connection_timeout` for uploads and other writes, whose connects it bounds. For a full-object GET or HEAD the connect counts against `upstream_first_byte_timeout`. A range GET's connect is bounded only by the fixed 30-second read timeout; see [`request_timeout` is not enforced](#request_timeout-is-not-enforced).
 - Raise `max_idle_per_ip`, or `max_idle_per_host` with IP distribution off.
 - Check `dns_refresh_interval` and the connection pool figures on `/metrics`.
 

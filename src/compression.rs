@@ -198,15 +198,13 @@ pub struct CompressionHandler {
     // "compress if size >= threshold" decision lives in
     // `CacheManager::effective_compression`, which owns its own threshold and
     // passes an explicit `should_compress` bool into `compress_with_metadata`.
-    // Retained as part of the handler's configuration surface alongside the
-    // future-use `preferred_algorithm` (see Requirement 5) — a future
+    // Retained as part of the handler's configuration surface: a future
     // multi-algorithm decision made inside the handler would consult it. Kept on
     // the constructor signature to avoid churning every call site.
     // Spec: compression-followup-fixes Requirement 4/5.
     #[allow(dead_code)]
     compression_threshold: usize,
     compression_enabled: bool,
-    preferred_algorithm: CompressionAlgorithm,
     /// Shared across every clone so stats mutated on one clone (e.g. a fresh
     /// `DiskCacheManager`'s handler) are visible through any other clone
     /// (e.g. the snapshot `main.rs` hands to health/metrics at startup).
@@ -219,28 +217,6 @@ impl CompressionHandler {
         Self {
             compression_threshold,
             compression_enabled,
-            preferred_algorithm: CompressionAlgorithm::Lz4,
-            stats: Arc::new(CompressionStatsAtomic::default()),
-        }
-    }
-
-    /// Create a new compression handler with a specific algorithm preference.
-    ///
-    /// FUTURE USE — intentionally retained, not dead code. Production handlers
-    /// are built via `new` (which hardcodes Lz4); this constructor is the
-    /// forward-looking surface for planned multi-algorithm support (e.g. zstd),
-    /// paired with `get_preferred_algorithm` and the `preferred_algorithm`
-    /// config field. Do not remove in dead-code sweeps.
-    /// Spec: compression-followup-fixes Requirement 5.
-    pub fn new_with_algorithm(
-        compression_threshold: usize,
-        compression_enabled: bool,
-        preferred_algorithm: CompressionAlgorithm,
-    ) -> Self {
-        Self {
-            compression_threshold,
-            compression_enabled,
-            preferred_algorithm,
             stats: Arc::new(CompressionStatsAtomic::default()),
         }
     }
@@ -258,7 +234,6 @@ impl CompressionHandler {
         Self {
             compression_threshold,
             compression_enabled,
-            preferred_algorithm: stats_source.preferred_algorithm.clone(),
             stats: stats_source.stats.clone(),
         }
     }
@@ -555,16 +530,6 @@ impl CompressionHandler {
     /// Check if compression is enabled
     pub fn is_compression_enabled(&self) -> bool {
         self.compression_enabled
-    }
-
-    /// Get the preferred compression algorithm.
-    ///
-    /// FUTURE USE — intentionally retained, not dead code. Reads the
-    /// `preferred_algorithm` set via `new_with_algorithm`; part of the planned
-    /// multi-algorithm surface. Do not remove in dead-code sweeps.
-    /// Spec: compression-followup-fixes Requirement 5.
-    pub fn get_preferred_algorithm(&self) -> &CompressionAlgorithm {
-        &self.preferred_algorithm
     }
 
     /// Compress data with algorithm-specific logic
@@ -880,17 +845,6 @@ mod tests {
         assert!(!CompressionHandler::is_denylisted_extension("notes.txt"));
         assert!(!CompressionHandler::is_denylisted_extension("data.json"));
         assert!(!CompressionHandler::is_denylisted_extension("index.html"));
-    }
-
-    #[test]
-    fn test_compression_handler_with_algorithm() {
-        let handler = CompressionHandler::new_with_algorithm(1024, true, CompressionAlgorithm::Lz4);
-
-        assert!(handler.is_compression_enabled());
-        assert_eq!(
-            *handler.get_preferred_algorithm(),
-            CompressionAlgorithm::Lz4
-        );
     }
 
     #[test]

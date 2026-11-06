@@ -183,7 +183,7 @@ If decoding fails, or the decoded length differs from the header, the proxy skip
 | A staging record for a part cannot be written | Does not finalize: no `.meta` is published and the renamed range files are removed. Counted in `write_cache.mpu_completion_ledger_declines_total` | S3's success response |
 | A part record is unreadable | That part counts as not cached, which trips the missing-parts gate | S3's success response |
 | aws-chunked decoding fails | Skips caching that part only; the upload continues | S3's success response |
-| `AbortMultipartUpload` | Always removes the upload directory, whatever S3 answers | S3's response |
+| `AbortMultipartUpload` | Always removes the upload directory, whatever S3 answers. It moves the directory aside first, so a part still being committed is discarded | S3's response |
 | The proxy restarts mid-upload | `mpus_in_progress/` persists, so later parts sent through the same cache volume resume normally. A proxy with its own cache starts without the earlier parts and does not cache the object | No change |
 
 ### Why the missing-parts path does not clean up
@@ -195,6 +195,8 @@ The paths that do clean up are the ones where the staged state itself is unusabl
 ### What reaps abandoned staging
 
 The incomplete-upload sweep removes any upload directory idle for longer than `cache.incomplete_upload_ttl` (default 1 day, valid range 1 hour to 7 days). Idle time runs from the upload's last activity: the newest of the directory's modification time, `upload.meta`'s, and every `part{N}.json` record's. An upload that keeps receiving parts is never reaped, however long it runs. Abandoned uploads count against the in-progress multipart limit until the sweep removes them, so many abandoned uploads leave room for fewer new ones.
+
+An UploadPart is staged even when the proxy holds no record of the upload's CreateMultipartUpload, so an upload started through another route is still cached. An UploadPart that arrives after the upload's `AbortMultipartUpload` is therefore staged too, and can leave an empty upload directory, or that one part's files, under `mpus_in_progress/` until the sweep removes it. On an NFS or EFS cache volume, a part that another proxy is committing during the Abort can also land in the directory the Abort moved aside. The next sweep pass removes that directory whatever its age. Neither leftover is served to a client.
 
 The sweep runs at startup and then on every proxy as a background pass every `min(incomplete_upload_ttl / 4, 1h)`. With the default TTL, abandoned parts are reclaimed at most an hour after their TTL passes. The sweep does not depend on the daily validation scan.
 

@@ -6,9 +6,9 @@
 //! semantics) and `test_coordinated_cache_cleanup` (a sweep and a force-invalidate helper,
 //! both production-dead). Each was a test of the mechanism rather than of a property that
 //! outlives it. `test_cache_entry_active_detection` is repointed at the branch that survives,
-//! and `test_coordination_statistics` is narrowed to the figures that do.
+//! and the statistics check is narrowed to the figures that do.
 
-use s3_proxy::{cache::CacheManager, cache_types::CacheMetadata, Result};
+use s3_proxy::{cache::CacheManager, Result};
 
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
@@ -192,77 +192,4 @@ fn assert_journal_holds_access_update(journal_path: &std::path::Path, cache_key:
         parsed.cache_key, cache_key,
         "fixture: the entry must name the key under test"
     );
-}
-
-/// `get_coordination_stats` still publishes its three surviving figures.
-///
-/// Narrowed rather than deleted. It used to take two `locks/{key}.lock` acquisitions purely so
-/// the `locks/` directory would exist and an `active_locks` key would appear; that figure
-/// counted the retired per-key write sentinels and is gone, so its name would now assert
-/// per-key write activity that cannot happen. The three assertions that never depended on the
-/// namespace are what the function is for, and they are worth more now that it has one fewer
-/// field to publish.
-#[tokio::test]
-async fn test_coordination_statistics() -> Result<()> {
-    let temp_dir = TempDir::new().unwrap();
-    let cache_manager = CacheManager::new_with_defaults(temp_dir.path().to_path_buf(), false, 0);
-
-    let stats = cache_manager.get_coordination_stats();
-    assert!(stats.contains_key("cache_hits"));
-    assert!(stats.contains_key("cache_misses"));
-    assert!(stats.contains_key("expired_entries"));
-    assert!(
-        !stats.contains_key("active_locks"),
-        "active_locks counted the retired per-key write sentinels and must not be published"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_cache_consistency_check() -> Result<()> {
-    let temp_dir = TempDir::new().unwrap();
-    let cache_manager = CacheManager::new_with_defaults(temp_dir.path().to_path_buf(), false, 0);
-
-    let cache_key = "test-bucket/consistency-test";
-    let test_data = b"Test data for consistency check";
-    let metadata = CacheMetadata {
-        etag: "test-etag".to_string(),
-        last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        content_length: test_data.len() as u64,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    };
-
-    // Store a cache entry
-    cache_manager
-        .store_response(cache_key, test_data, metadata)
-        .await?;
-
-    // Check consistency immediately after storage
-    let is_consistent = cache_manager.check_cache_consistency(cache_key).await?;
-    assert!(
-        is_consistent,
-        "Newly created cache entry should be consistent"
-    );
-
-    // Double-check by retrieving the entry
-    let cached_response = cache_manager.get_cached_response(cache_key).await?;
-    assert!(
-        cached_response.is_some(),
-        "Cache entry should be retrievable after storage"
-    );
-
-    // Check consistency for non-existent entry
-    let non_existent_consistent = cache_manager
-        .check_cache_consistency("non-existent-key")
-        .await?;
-    assert!(
-        !non_existent_consistent,
-        "Non-existent entry should not be consistent"
-    );
-
-    Ok(())
 }

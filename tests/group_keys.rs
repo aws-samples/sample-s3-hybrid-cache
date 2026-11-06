@@ -24,24 +24,14 @@ mod cache_bypass_headers_integration_test;
 mod cache_bypass_headers_property_test;
 #[path = "cache_key_access_point_test.rs"]
 mod cache_key_access_point_test;
-#[path = "cache_key_collision_test.rs"]
-mod cache_key_collision_test;
-#[path = "cache_key_length_test.rs"]
-mod cache_key_length_test;
 #[path = "cache_key_virtual_hosted_test.rs"]
 mod cache_key_virtual_hosted_test;
 #[path = "host_header_ipv6_integration_test.rs"]
 mod host_header_ipv6_integration_test;
-#[path = "injected_precondition_ingress_test.rs"]
-mod injected_precondition_ingress_test;
-#[path = "list_operation_cache_bypass_test.rs"]
-mod list_operation_cache_bypass_test;
 #[path = "path_traversal_integration_test.rs"]
 mod path_traversal_integration_test;
 #[path = "s3_request_context_literal_guard_test.rs"]
 mod s3_request_context_literal_guard_test;
-#[path = "sanitization_consistency_test.rs"]
-mod sanitization_consistency_test;
 #[path = "unshardable_cache_key_bypass_test.rs"]
 mod unshardable_cache_key_bypass_test;
 #[path = "versioned_request_bypass_test.rs"]

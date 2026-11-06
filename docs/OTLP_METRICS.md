@@ -166,8 +166,6 @@ by roughly the proxy count. See [What to alarm on](LOCAL_NVME_CACHE.md#what-to-a
 | `cache.corruption_missing_range_total` | Gauge | Missing range files detected |
 | `cache.disk_full_events_total` | Gauge | Cache writes refused with `ENOSPC`: range data files (whole or streamed), request-path `.meta` writes, and journal appends. Consolidator and orphan-sweep `.meta` writes, cache-hit journal flushes and accounting state files are not counted; see [ERROR_HANDLING.md: Disk Space Exhaustion](ERROR_HANDLING.md#3-disk-space-exhaustion) |
 | `cache.metadata_lock_retry_exhausted_total` | Gauge | Callers that exhausted `lock_max_retries` waiting for a metadata slot lock and gave up. The retry count bounds the wait; the metadata lock protocol has no timeout |
-| `cache.etag_mismatches_total` | Gauge | ETag mismatches (cache coherency violations) |
-| `cache.range_invalidations_total` | Gauge | Range invalidations triggered by ETag mismatch |
 | `cache.incomplete_uploads_evicted` | Gauge | Incomplete multipart uploads evicted from the write cache |
 | `cache.consumed_bytes` | Gauge (bytes) | Real `statvfs`-derived bytes consumed on the cache volume's file system. Observability only, not a capacity authority. Per-proxy file system, `0` on a read failure. Compare against `cache.total_cache_size` yourself only with the scope mismatch in mind; see [Metrics reference](METRICS_REFERENCE.md) |
 | `cache.capacity_guard.declines_total` | Gauge (count) | GET-miss fills and full-object stores declined because the cache volume was near `disk_safety_free_space_floor`. The client request is served either way. Per-proxy |

@@ -222,7 +222,7 @@ fn every_emitted_meta_parses_as_new_cache_metadata_at_its_own_sharded_path() {
             entry.display()
         );
         assert!(
-            !meta.is_object_expired(),
+            meta.expires_at >= std::time::SystemTime::now(),
             "fixture entry {} is already expired; a selection measurement over it would \
              silently also be measuring expiry",
             meta.cache_key

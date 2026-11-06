@@ -17,8 +17,8 @@ use tracing::{debug, error, info, warn};
 /// Staged write-cache credits refused at a site that writes no `Write_Ledger` entry, since process
 /// start.
 ///
-/// **This counter should read zero forever.** Non-zero means a caller reached `store_range` or
-/// `commit_incremental_range` with metadata that classifies as staged, and those two functions have
+/// **This counter should read zero forever.** Non-zero means a caller reached `PreparedRangeFill::finish` or
+/// `commit_incremental_range_shared` with metadata that classifies as staged, and those two functions have
 /// no ledger append — see [`refuse_unledgered_staged_credit`]. Published as
 /// `write_cache.unledgered_staged_credits_refused_total`. **Per-instance.**
 static UNLEDGERED_STAGED_CREDITS_REFUSED_TOTAL: std::sync::atomic::AtomicU64 =
@@ -117,7 +117,7 @@ pub(crate) fn is_shard_subdirectory(entry: &std::fs::DirEntry) -> bool {
 ///
 /// # The hazard, and why it needed a guard rather than a comment
 ///
-/// `DiskCacheManager::store_range`'s hybrid arm and `commit_incremental_range` both compute
+/// `PreparedRangeFill::finish` and `commit_incremental_range_shared` both compute
 /// `counts_as_staged` and both used to credit `SizeAccumulator::add_write_cache` on it. Neither
 /// writes a ledger entry. A staged credit with no entry is a staged range that the fold's candidate
 /// set — which is the Write_Ledger and nothing else — cannot see, so it would be a **structural
@@ -127,8 +127,7 @@ pub(crate) fn is_shard_subdirectory(entry: &std::fs::DirEntry) -> bool {
 /// It is **not currently reachable**. Every production caller supplies an `ObjectMetadata` built by
 /// `Default` or `new_with_headers`, both of which hardcode `is_write_cached: false`
 /// (`cache_types.rs`), and both functions resolve paths under `ranges/` so the `mpus_in_progress/`
-/// term of `classify_new_range_as_staged` cannot fire either. The one caller that would pass `true`,
-/// `WriteCacheRangeSink::commit`, is `#[allow(dead_code)]` with no production caller.
+/// term of `classify_new_range_as_staged` cannot fire either. No production caller passes `true`.
 ///
 /// But it was unreachable **by caller convention**, with nothing at either site saying so. A
 /// convention is not a guard: it holds until someone adds a caller, and the failure would be silent
@@ -154,8 +153,8 @@ pub(crate) fn is_shard_subdirectory(entry: &std::fs::DirEntry) -> bool {
 ///
 /// Making the state unconstructible means these two functions cannot accept metadata that says
 /// "staged" — i.e. splitting `ObjectMetadata` into staged and read-tier types and threading that
-/// through `store_range`, `commit_incremental_range`, `finalize_incremental_range`, `RangeSpec`
-/// construction, `HybridMetadataWriter::write_range_metadata` and `NewCacheMetadata` itself. That is
+/// through `prepare_range_store`, `commit_incremental_range_shared`, `finalize_incremental_range`, `RangeSpec`
+/// construction, `HybridMetadataWriter::write_range_metadata_witnessed` and `NewCacheMetadata` itself. That is
 /// a refactor of live write paths to forbid a state nothing currently constructs, and its own risk
 /// to the reachable paths is larger than the latent hazard it removes. The assertion is the
 /// proportionate instrument; if a legitimate staged caller is ever wanted at these sites, the fix is
@@ -469,7 +468,7 @@ impl ExpectedObjectIdentity {
 /// What a caller expects the locked `.meta` to be, for
 /// [`DiskCacheManager::batch_delete_ranges_expecting`].
 #[derive(Debug, Clone, Copy)]
-pub struct DeleteExpectation<'a> {
+pub(crate) struct DeleteExpectation<'a> {
     pub identity: &'a ExpectedObjectIdentity,
     /// Whether the caller selected any staged range. When false, a selected extent that the
     /// locked read shows as staged skips the key.
@@ -495,7 +494,7 @@ pub(crate) fn write_synced(path: &Path, data: impl AsRef<[u8]>) -> std::io::Resu
     sync_written_file(&file, path)
 }
 
-/// The error [`write_synced_identity_of`] returns when the finished file's identity could not be
+/// The error [`write_synced_identity_exclusive`] returns when the finished file's identity could not be
 /// taken (R12.2). It has already been logged, so a caller that tells it apart with
 /// [`is_identity_unavailable`] does not log it again as a failed write.
 #[derive(Debug)]
@@ -519,24 +518,6 @@ pub(crate) fn is_identity_unavailable(e: &std::io::Error) -> bool {
 pub(crate) fn is_identity_unavailable_error(e: &ProxyError) -> bool {
     matches!(e, ProxyError::CacheError(m) if m == IDENTITY_UNAVAILABLE)
 }
-/// [`write_synced`], returning the identity of the file it wrote
-/// ([`crate::cache_types::RangeFileIdentity`]): the writing descriptor is closed after the sync
-/// and the identity taken by [`identity_after_close`]. The rename that later publishes the file
-/// keeps its length and modification time, so this is what a reader's `fstat` reports.
-///
-/// A failed reopen or `fstat` fails the write: the temp file is unlinked here, one `warn!`
-/// naming `cache_key` and the temp file is logged, and [`IdentityUnavailable`] is returned, so
-/// no caller publishes a range it cannot verify (R12.2). `Ok` always holds
-/// `Some`. Test builds only: its last caller, `SignedPutHandler::cache_upload_part`, is
-/// `cfg(test)`; every production range writer uses [`write_synced_identity_exclusive`].
-#[cfg(test)]
-pub(crate) fn write_synced_identity_of(
-    path: &Path,
-    data: impl AsRef<[u8]>,
-    cache_key: Option<&str>,
-) -> std::io::Result<Option<crate::cache_types::RangeFileIdentity>> {
-    write_synced_range_temp(path, data.as_ref(), cache_key, false).map(|w| Some(w.identity))
-}
 /// What [`write_synced_identity_exclusive`] wrote: the identity a reader's `fstat` will report,
 /// and the inode number `fstat` of the writing descriptor reported, for the publish-time re-check
 /// ([`PendingRangePublish::expecting`], R10.2).
@@ -545,7 +526,16 @@ pub(crate) struct WrittenRangeTemp {
     pub(crate) identity: crate::cache_types::RangeFileIdentity,
     ino: u64,
 }
-/// [`write_synced_identity_of`] for a fill's own temp name (R10.1): the file is opened
+/// [`write_synced`], returning the identity of the file it wrote
+/// ([`crate::cache_types::RangeFileIdentity`]): the writing descriptor is closed after the sync
+/// and the identity taken by [`identity_after_close`]. The rename that later publishes the file
+/// keeps its length and modification time, so this is what a reader's `fstat` reports.
+///
+/// A failed reopen or `fstat` fails the write: the temp file is unlinked here, one `warn!`
+/// naming `cache_key` and the temp file is logged, and [`IdentityUnavailable`] is returned, so
+/// no caller publishes a range it cannot verify (R12.2).
+///
+/// For a fill's own temp name (R10.1): the file is opened
 /// `create_new`, so a fill never opens or truncates a file another fill created. An
 /// `AlreadyExists` error names a file this fill did not create, which the caller must not unlink.
 pub(crate) fn write_synced_identity_exclusive(
@@ -553,23 +543,18 @@ pub(crate) fn write_synced_identity_exclusive(
     data: &[u8],
     cache_key: &str,
 ) -> std::io::Result<WrittenRangeTemp> {
-    write_synced_range_temp(path, data, Some(cache_key), true)
+    write_synced_range_temp(path, data, Some(cache_key))
 }
 fn write_synced_range_temp(
     path: &Path,
     data: &[u8],
     cache_key: Option<&str>,
-    exclusive: bool,
 ) -> std::io::Result<WrittenRangeTemp> {
     use std::io::Write;
-    let mut file = if exclusive {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?
-    } else {
-        std::fs::File::create(path)?
-    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     file.write_all(data)?;
     sync_written_file(&file, path)?;
     let ino = writing_descriptor_inode(&file);
@@ -667,34 +652,20 @@ pub(crate) fn sync_written_file(file: &std::fs::File, path: &Path) -> std::io::R
     file.sync_data()
 }
 
-/// Test seam recording which temp files were synced before publish, scoped to a registered
-/// cache root so concurrent tests do not see each other's events.
+/// Test seam failing the sync of temp files before publish, scoped to a registered cache root so
+/// concurrent tests do not see each other's failures.
 #[cfg(test)]
 pub(crate) mod publish_sync_probe {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-
-    /// One sync, with whether each named final path already existed when it ran.
-    #[derive(Debug, Clone)]
-    pub(crate) struct SyncEvent {
-        pub path: PathBuf,
-        /// Snapshot of `watched` finals that existed at the moment of the sync.
-        pub finals_present: Vec<PathBuf>,
-    }
-
     #[derive(Debug, Default)]
     pub(crate) struct Probe {
-        pub events: Mutex<Vec<SyncEvent>>,
-        /// Final paths whose existence is snapshotted at every sync.
-        pub watched: Mutex<Vec<PathBuf>>,
         /// Fail every sync under the root with an injected error.
         pub fail: AtomicBool,
     }
-
     static REGISTRY: Mutex<Vec<(PathBuf, Arc<Probe>)>> = Mutex::new(Vec::new());
-
-    /// Start recording syncs of files under `root`.
+    /// Start intercepting syncs of files under `root`.
     pub(crate) fn register(root: &Path) -> Arc<Probe> {
         let probe = Arc::new(Probe::default());
         REGISTRY
@@ -703,7 +674,6 @@ pub(crate) mod publish_sync_probe {
             .push((root.to_path_buf(), Arc::clone(&probe)));
         probe
     }
-
     pub(super) fn before_sync(path: &Path) -> std::io::Result<()> {
         let probes: Vec<Arc<Probe>> = REGISTRY
             .lock()
@@ -713,18 +683,6 @@ pub(crate) mod publish_sync_probe {
             .map(|(_, p)| Arc::clone(p))
             .collect();
         for probe in probes {
-            let finals_present = probe
-                .watched
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|p| p.exists())
-                .cloned()
-                .collect();
-            probe.events.lock().unwrap().push(SyncEvent {
-                path: path.to_path_buf(),
-                finals_present,
-            });
             if probe.fail.load(Ordering::SeqCst) {
                 return Err(std::io::Error::other("injected publish sync failure"));
             }
@@ -732,7 +690,6 @@ pub(crate) mod publish_sync_probe {
         Ok(())
     }
 }
-
 /// A finished range `.tmp` whose rename to its final `.bin` path has not happened yet.
 ///
 /// Range paths are `{key}_{start}-{end}.bin` whatever the object version, and eviction's
@@ -857,19 +814,11 @@ pub struct PreparedRangeFill {
     /// Held until the publish completes, as it was when the whole store ran in one call.
     _capacity_reservation: Option<crate::capacity_guard::FleetReservation>,
     operation_start: std::time::Instant,
-    /// The fill's version witness, captured before its S3 request. `None`: unguarded
-    /// (callers with no S3 request behind them, and tests).
-    fill_witness: Option<crate::cache::FillWitness>,
+    /// The fill's version witness, captured before its S3 request: the publish happens, and
+    /// the journal `Add` is folded, only while the key's write-order marker still holds it.
+    fill_witness: crate::cache::FillWitness,
 }
-
 impl PreparedRangeFill {
-    /// Guard the publish with the fill's version witness: it publishes, and its journal
-    /// `Add` is folded, only while the key's write-order marker still holds the witness.
-    pub(crate) fn with_fill_witness(mut self, witness: Option<crate::cache::FillWitness>) -> Self {
-        self.fill_witness = witness;
-        self
-    }
-
     /// Publish the fill: take the key's slot lock (waiting up to `lock_acquire_wait_budget`),
     /// rename the `.bin` visible if the published `.meta` is the same version, journal it and
     /// credit it. Call it after dropping any `DiskCacheManager` guard.
@@ -922,7 +871,7 @@ impl PreparedRangeFill {
             &object_metadata.etag,
             pending,
             slot_wait,
-            fill_witness.as_ref(),
+            &fill_witness,
         )
         .await
         .inspect_err(|e| {
@@ -949,7 +898,7 @@ impl PreparedRangeFill {
                 WriteMode::JournalOnly,
                 Some(object_metadata.clone()),
                 ttl,
-                fill_witness.as_ref().map(|w| w.journal_token()),
+                Some(fill_witness.journal_token()),
             )
             .await
         {
@@ -990,7 +939,7 @@ impl PreparedRangeFill {
                 // Spec: cache-eviction-at-scale § 16.6.6; write-cache-accounting-and-eviction 6.2
                 if counts_as_staged {
                     refuse_unledgered_staged_credit(
-                        "DiskCacheManager::store_range (hybrid arm)",
+                        "PreparedRangeFill::finish",
                         cache_key,
                         start,
                         end,
@@ -1189,24 +1138,6 @@ pub enum MetadataReadOutcome {
     Corrupt { reason: CorruptReason },
 }
 
-/// Result of a classified metadata lookup.
-///
-/// Exposes the corruption flag so callers (e.g. the GET miss path in `cache.rs`)
-/// can trigger the overwrite-in-place heal when `corrupt == true`.
-///
-/// Spec: cache-metadata-resilience Req 3, Task 6
-#[derive(Debug)]
-pub struct MetadataLookup {
-    /// Parsed metadata, or `None` on miss/corrupt.
-    pub meta: Option<crate::cache_types::NewCacheMetadata>,
-    /// `true` when the `.meta` file was classified as confidently corrupt
-    /// (oversize, legacy, or stable parse failure). The caller should ensure
-    /// the corrupt file is overwritten after a successful S3 fetch.
-    pub corrupt: bool,
-    /// The specific corruption reason, if `corrupt == true`.
-    pub corrupt_reason: Option<CorruptReason>,
-}
-
 /// Synchronous, blocking metadata read+parse helper.
 ///
 /// Designed to run inside `tokio::task::spawn_blocking` so that filesystem I/O
@@ -1243,7 +1174,7 @@ pub fn read_and_parse_metadata_blocking(path: &Path, cap: u64) -> MetadataReadOu
 /// The removal debits neither `cached_objects` nor bytes, and that is the accounting the rest
 /// of the tree already applies to an unparseable document. `cached_objects` is credited only by
 /// consolidation's `is_new_object` and installed only by censuses that skip unparseable
-/// documents (`ObjectsScanResults` counts `is_valid()` entries; the full validation subtracts
+/// documents (the full validation counts parseable documents only and subtracts
 /// the ones it self-heals), and a legacy `CacheEntry` held its body inline and was never
 /// produced by consolidation. So the healed key's next consolidation crediting one new object
 /// is correct. The old range files stay on disk and keep whatever credit they had; a fill
@@ -1692,7 +1623,7 @@ fn read_and_parse_metadata_with_io(
 }
 
 /// State for an in-progress incremental range write to disk cache.
-/// Created by `begin_incremental_range_write()`, consumed by `commit_incremental_range()` or `abort_incremental_range()`.
+/// Created by `begin_incremental_range_write()`, consumed by `prepare_incremental_commit()` or `abort_incremental_range()`.
 pub struct IncrementalRangeWriter {
     /// Path to the temporary file being written
     tmp_path: PathBuf,
@@ -1743,16 +1674,8 @@ pub struct IncrementalRangeWriter {
     ///
     /// Spec: cache-eviction-at-scale task 36 (A2).
     _capacity_reservation: Option<crate::capacity_guard::FleetReservation>,
-    /// The fill's version witness, set by the GET-miss caller before its S3 request.
-    fill_witness: Option<crate::cache::FillWitness>,
 }
 impl IncrementalRangeWriter {
-    /// Guard this fill's publish with its version witness. See
-    /// [`PreparedRangeFill::with_fill_witness`].
-    pub(crate) fn set_fill_witness(&mut self, witness: Option<crate::cache::FillWitness>) {
-        self.fill_witness = witness;
-    }
-
     /// Returns the number of bytes currently held in the compression batch
     /// buffer (not yet flushed to disk). Primarily used by tests to verify
     /// batching behavior. Always `0` when compression is disabled.
@@ -1776,6 +1699,23 @@ pub(crate) struct PartFinalizeInfo {
     /// Identity of the part file, taken after its writer synced and closed it
     /// ([`identity_after_close`], [`crate::cache_types::CachedPartInfo::file_identity`]).
     pub(crate) file_identity: Option<crate::cache_types::RangeFileIdentity>,
+    /// Inode of the part file, from the writing descriptor ([`file_inode`],
+    /// [`crate::cache_types::CachedPartInfo::file_inode`]).
+    pub(crate) file_inode: Option<u64>,
+}
+/// `st_ino` of a file, `None` where the platform has none. A rename keeps it, so it names
+/// the file across the rename that publishes it.
+pub(crate) fn file_inode(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
 }
 
 /// Which enumeration named a `.bin` file that invalidation is about to remove.
@@ -1883,7 +1823,7 @@ pub(crate) fn note_disk_full(e: &std::io::Error, site: &'static str) -> bool {
 /// Counted on the two paths that read a `.bin` for a client: the buffered
 /// `load_range_data` and the streamed `stream_range_data`. Also counted: a file that decodes
 /// cleanly to a length other than the metadata records (a truncation at a frame boundary).
-/// Every writer names a range file by the bounds it holds (`store_range` and the partial
+/// Every writer names a range file by the bounds it holds (`prepare_range_store` and the partial
 /// commit both re-path a clamped range), so a newer version of the object written to the same
 /// path decodes to the same length and cannot produce this. Deliberately not counted: I/O
 /// errors (an NFS read failure is not evidence the stored bytes are damaged).
@@ -2805,10 +2745,9 @@ async fn heal_damaged_range_once(
 ///
 /// Counted only after the replacement is renamed into place, at the three writes that read
 /// the existing document under the key's metadata lock and replace it when it does not
-/// parse: [`DiskCacheManager::store_range`], the full-object fill
-/// (`CacheManager::store_full_object_as_range_new`) and its zero-length arm. Also counted by
-/// `CacheManager::remove_corrupt_metadata` when it removes one, a HEAD-path heal that has no
-/// production caller. The denominator is `cache.corruption_metadata_total`: a detection that
+/// parse: [`DiskCacheManager::prepare_range_store`], the full-object fill
+/// (`CacheManager::store_full_object_as_range_witnessed`) and its zero-length arm.
+/// The denominator is `cache.corruption_metadata_total`: a detection that
 /// is never followed by a full-object fill of that key is never healed.
 static METADATA_HEAL_OVERWRITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2836,6 +2775,10 @@ thread_local! {
 /// Disk cache manager for file-based cache operations
 pub struct DiskCacheManager {
     cache_dir: PathBuf,
+    /// Set by [`Self::store_range_witnessed_outcome`] when it wired the hybrid metadata writer a
+    /// test configuration lacks: the key's journal is then folded after every fill.
+    #[cfg(test)]
+    folds_after_store: bool,
     compression_handler: CompressionHandler,
     metrics_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
     size_tracker: Option<std::sync::Arc<crate::cache_size_tracker::CacheSizeTracker>>,
@@ -2872,12 +2815,12 @@ pub struct DiskCacheManager {
     /// clamped sub-range on the read/GET commit path. `1.0` = exact-only (the
     /// default for an unconfigured manager, preserving legacy behaviour); the
     /// configured path sets it from `CacheConfig::partial_range_commit_ratio`
-    /// (default 0.5). Only consulted by `commit_incremental_range`; the PUT
+    /// (default 0.5). Only consulted by `commit_incremental_range_shared`; the PUT
     /// write-cache path passes `None` to `finalize_incremental_range`.
     /// Spec: crt-conditional-range-caching Req 2
     partial_range_commit_ratio: f64,
     /// Free-space floor, in bytes, for the danger-band publication guard on this
-    /// manager's three publication boundaries (P1 `store_range`, P3a
+    /// manager's three publication boundaries (P1 `prepare_range_store`, P3a
     /// `begin_incremental_range_write`, P3c `begin_incremental_part_write`).
     ///
     /// `0` disables the guard, which is the default for a manager built by
@@ -2905,6 +2848,8 @@ impl DiskCacheManager {
     ) -> Self {
         Self {
             cache_dir,
+            #[cfg(test)]
+            folds_after_store: false,
             compression_handler: CompressionHandler::new(
                 compression_threshold,
                 compression_enabled,
@@ -2940,22 +2885,25 @@ impl DiskCacheManager {
     }
 
     /// Record a just-committed streamed fill in the fill-visibility tracker, if it is the one
-    /// shape the tracker covers. Called by `commit_incremental_range` after the `.bin` rename and
-    /// after the journal append has returned `Ok` (design point 6).
+    /// shape the tracker covers. Called by `PreparedIncrementalCommit::finish` after the `.bin`
+    /// rename and after the journal append has returned `Ok` (design point 6).
     ///
     /// Covered: a whole-object (`0..content_length`), read-cache, unstaged range with a non-zero
     /// TTL and at least one validator. Anything else is left to consolidation, as before.
     ///
     /// The document is built the way the consolidator's create-new branch builds one
     /// (`JournalConsolidator::load_or_create_metadata_with_journal_entries`): the journal line's
-    /// object metadata, one range, `expires_at = created_at + ttl`. `created_at` is now, which
-    /// precedes the consolidation time the `.meta` will carry, so freshness judged from this
-    /// entry is never more generous than freshness judged from the `.meta`.
+    /// object metadata, one range, `expires_at = created_at + ttl`. `created_at` is
+    /// `committed_at`, taken before the fill's journal `Add` is appended, so it precedes this
+    /// fill's `Add` timestamp. The `.meta` the fold creates takes the earliest `Add` of the
+    /// version (capped at the fold time), so with several `Add`s its `created_at` can predate
+    /// this fill's; freshness judged from this entry is never more generous than freshness
+    /// judged from the `.meta` of this fill alone, and the tracker is consulted only while no
+    /// `.meta` exists.
     ///
     /// The entry carries the key's write-order marker state the fill was published under, so a
-    /// peer's acknowledged write or delete ends it (`fill_visibility_tracker`, rule 3): a
-    /// witnessed fill's token, recorded inside its publish hold, or for a fill without a witness
-    /// the marker as it is now.
+    /// peer's acknowledged write or delete ends it (`fill_visibility_tracker`, rule 3): the
+    /// fill's witness token, recorded inside its publish hold.
     ///
     /// A free function over the tracker and cache directory rather than a method, so
     /// [`PreparedIncrementalCommit::finish`] can call it with no `DiskCacheManager` guard held.
@@ -2965,10 +2913,11 @@ impl DiskCacheManager {
         cache_dir: &Path,
         cache_key: &str,
         meta_path: &Path,
-        fill_witness: Option<&crate::cache::FillWitness>,
+        fill_witness: &crate::cache::FillWitness,
         range_spec: &crate::cache_types::RangeSpec,
         object_metadata: &crate::cache_types::ObjectMetadata,
         ttl: Duration,
+        committed_at: SystemTime,
     ) {
         let Some(tracker) = tracker else {
             return;
@@ -2992,26 +2941,17 @@ impl DiskCacheManager {
             // (reaped or evicted). Nothing to vouch for.
             return;
         };
-        let marker = match fill_witness {
-            Some(witness) => match witness.token() {
-                Some(token) => {
-                    crate::fill_visibility_tracker::MarkerStamp::witnessed(meta_path, token)
-                }
-                // An unestablished witness publishes nothing, so no fill reaches here with one.
-                None => return,
-            },
-            None => match crate::fill_visibility_tracker::MarkerStamp::of(meta_path) {
-                Some(marker) => marker,
-                None => return,
-            },
+        let marker = match fill_witness.token() {
+            Some(token) => crate::fill_visibility_tracker::MarkerStamp::witnessed(meta_path, token),
+            // An unestablished witness publishes nothing, so no fill reaches here with one.
+            None => return,
         };
-        let now = SystemTime::now();
         let metadata = crate::cache_types::NewCacheMetadata {
             cache_key: cache_key.to_string(),
             object_metadata: object_metadata.clone(),
             ranges: vec![range_spec.clone()],
-            created_at: now,
-            expires_at: now + ttl,
+            created_at: committed_at,
+            expires_at: committed_at + ttl,
             compression_info: crate::cache_types::CompressionInfo::default(),
             ..Default::default()
         };
@@ -3331,7 +3271,7 @@ impl DiskCacheManager {
 
     /// Record a range access using the cache hit update buffer (journal-based)
     /// This records access count increments that will be consolidated to metadata
-    pub async fn record_range_access(
+    pub(crate) async fn record_range_access(
         &self,
         cache_key: &str,
         range_start: u64,
@@ -3492,7 +3432,7 @@ impl DiskCacheManager {
     /// The object length a pending journal `Add` of version `etag` (quote-insensitive)
     /// recorded from the S3 response its bytes arrived in; 0 when none did. Page widening
     /// promotes a Page to RAM under this length before any `.meta` lists the Page.
-    pub async fn pending_journal_object_size(&self, cache_key: &str, etag: &str) -> u64 {
+    pub(crate) async fn pending_journal_object_size(&self, cache_key: &str, etag: &str) -> u64 {
         if !self.is_shared_storage_mode() {
             return 0;
         }
@@ -3942,196 +3882,6 @@ impl DiskCacheManager {
         Ok(())
     }
 
-    /// Invalidate cache entry by removing files
-    ///
-    /// This method removes both metadata and all associated range files for a cache entry.
-    /// Handles both the new bucket-first sharded structure and legacy flat structure
-    /// for backward compatibility.
-    ///
-    /// # Requirements
-    /// Implements Requirement 8.4: Update invalidate_cache_entry() to use sharded paths
-    ///
-    /// # Behavior
-    /// 1. Tries new sharded structure first (for range-based caching)
-    /// 2. Falls back to old flat structure (for legacy full-object caching)
-    /// 3. Removes all range binary files (.bin) if using new structure
-    /// 4. Removes metadata and cache files
-    /// 5. Handles missing files gracefully (logs warning but continues)
-    /// 6. Removes lock files if they exist
-    pub async fn invalidate_cache_entry(&self, cache_key: &str) -> Result<()> {
-        debug!("Invalidating cache entry for key: {}", cache_key);
-
-        let mut removed_count = 0;
-        let mut failed_count = 0;
-
-        // Hold the key's metadata slot lock for the whole read-then-delete. The `.meta`
-        // read below decides which `.bin` files go and whether the `.meta` itself does;
-        // without the lock a concurrent writer's read-modify-write of the same `.meta` can
-        // republish between our read and our `remove_file`, and either its update or our
-        // deletion is silently lost. Released by `Drop` on every return path.
-        let _meta_lock = self.acquire_meta_slot_lock(cache_key).await?;
-
-        // ===== NEW SHARDED STRUCTURE (range-based caching) =====
-
-        // Step 1: Get metadata file path using new sharded structure
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        // Step 2: Try to load metadata to find all range files
-        // If metadata doesn't exist or is corrupted, we'll still try to clean up
-        let ranges_to_remove = if metadata_file_path.exists() {
-            match std::fs::read_to_string(&metadata_file_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content) {
-                        Ok(metadata) => {
-                            debug!(
-                                "Loaded metadata for invalidation: key={}, ranges={}",
-                                cache_key,
-                                metadata.ranges.len()
-                            );
-                            metadata.ranges
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to parse metadata during invalidation: key={}, error={}. Will remove metadata file only.",
-                                cache_key, e
-                            );
-                            Vec::new()
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to read metadata during invalidation: key={}, error={}. Will remove metadata file only.",
-                        cache_key, e
-                    );
-                    Vec::new()
-                }
-            }
-        } else {
-            debug!(
-                "Metadata file not found in new structure: key={}, path={:?}",
-                cache_key, metadata_file_path
-            );
-            Vec::new()
-        };
-
-        // Step 3: Remove all range binary files (new structure)
-        for range_spec in &ranges_to_remove {
-            let range_file_path =
-                self.get_new_range_file_path(cache_key, range_spec.start, range_spec.end);
-
-            if range_file_path.exists() {
-                match std::fs::remove_file(&range_file_path) {
-                    Ok(_) => {
-                        removed_count += 1;
-                        debug!(
-                            "Removed range file: key={}, range={}-{}, path={:?}",
-                            cache_key, range_spec.start, range_spec.end, range_file_path
-                        );
-                    }
-                    Err(e) => {
-                        failed_count += 1;
-                        warn!(
-                            "Failed to remove range file: key={}, range={}-{}, path={:?}, error={}",
-                            cache_key, range_spec.start, range_spec.end, range_file_path, e
-                        );
-                    }
-                }
-            } else {
-                debug!(
-                    "Range file not found (already removed?): key={}, range={}-{}, path={:?}",
-                    cache_key, range_spec.start, range_spec.end, range_file_path
-                );
-            }
-        }
-
-        // Step 4: Remove metadata file (new structure)
-        if metadata_file_path.exists() {
-            match std::fs::remove_file(&metadata_file_path) {
-                Ok(_) => {
-                    removed_count += 1;
-                    debug!(
-                        "Removed metadata file: key={}, path={:?}",
-                        cache_key, metadata_file_path
-                    );
-                }
-                Err(e) => {
-                    failed_count += 1;
-                    warn!(
-                        "Failed to remove metadata file: key={}, path={:?}, error={}",
-                        cache_key, metadata_file_path, e
-                    );
-                }
-            }
-        }
-
-        // The lock file is NOT removed. It is a shared slot in a fixed set: removing it would
-        // delete a file other keys' holders are locking, and would release nothing, because
-        // `flock` binds to the open file description rather than to the path.
-
-        // ===== OLD FLAT STRUCTURE (legacy full-object caching) =====
-        // For backward compatibility with old cache entries
-
-        let old_cache_file_path = self.get_cache_file_path(cache_key);
-        let old_metadata_file_path = self.get_legacy_flat_metadata_file_path(cache_key);
-
-        // Remove old cache file
-        if old_cache_file_path.exists() {
-            match std::fs::remove_file(&old_cache_file_path) {
-                Ok(_) => {
-                    removed_count += 1;
-                    debug!(
-                        "Removed old cache file: key={}, path={:?}",
-                        cache_key, old_cache_file_path
-                    );
-                }
-                Err(e) => {
-                    failed_count += 1;
-                    warn!(
-                        "Failed to remove old cache file: key={}, path={:?}, error={}",
-                        cache_key, old_cache_file_path, e
-                    );
-                }
-            }
-        }
-
-        // Remove old metadata file
-        if old_metadata_file_path.exists() {
-            match std::fs::remove_file(&old_metadata_file_path) {
-                Ok(_) => {
-                    removed_count += 1;
-                    debug!(
-                        "Removed old metadata file: key={}, path={:?}",
-                        cache_key, old_metadata_file_path
-                    );
-                }
-                Err(e) => {
-                    failed_count += 1;
-                    warn!(
-                        "Failed to remove old metadata file: key={}, path={:?}, error={}",
-                        cache_key, old_metadata_file_path, e
-                    );
-                }
-            }
-        }
-
-        info!(
-            "Invalidated cache entry: key={}, removed={} files, failed={} files",
-            cache_key, removed_count, failed_count
-        );
-
-        Ok(())
-    }
-
-    /// Get cache file path for a given cache key
-    fn get_cache_file_path(&self, cache_key: &str) -> PathBuf {
-        let cache_type = self.determine_cache_type(cache_key);
-        let safe_key = self.sanitize_cache_key(cache_key);
-        self.cache_dir
-            .join(cache_type)
-            .join(format!("{}.cache", safe_key))
-    }
-
     /// Get the **legacy flat** metadata file path for a given cache key.
     ///
     /// Returns `{cache_type}/{percent-encoded key}.meta` — the pre-sharding construction.
@@ -4175,8 +3925,7 @@ impl DiskCacheManager {
     /// Cache keys are generated by `CacheManager::generate_cache_key` (bare
     /// object path) or with one or both of the suffixes
     /// `:part:<n>` / `:range:<start>-<end>` appended by
-    /// `generate_part_cache_key` / `generate_range_cache_key` /
-    /// `generate_cache_key_with_params` (see `cache.rs`). Strip only those
+    /// the cache key builders (see `cache.rs`). Strip only those
     /// known trailing suffix patterns rather than splitting at the first
     /// colon, so object keys that legitimately contain a colon are not
     /// truncated before extension detection
@@ -4189,6 +3938,19 @@ impl DiskCacheManager {
     // New Range Storage Architecture Methods
     // ============================================================================
 
+    /// Test support: writes `metadata` as the key's `.meta` document, creating its directory.
+    /// It takes no slot lock and journals nothing, so it is for single-threaded fixtures.
+    #[cfg(test)]
+    pub(crate) fn seed_metadata_for_tests(&self, metadata: &crate::cache_types::NewCacheMetadata) {
+        let path = self.get_new_metadata_file_path(&metadata.cache_key);
+        std::fs::create_dir_all(path.parent().expect("a .meta path has a parent"))
+            .expect("create the metadata directory");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(metadata).expect("serialize the metadata"),
+        )
+        .expect("write the .meta document");
+    }
     /// Get metadata file path for new range storage architecture
     /// Returns path: cache_dir/metadata/{bucket}/{XX}/{YYY}/{sanitized_key}.meta
     /// Uses bucket-first hash-based sharding for scalability
@@ -4312,17 +4074,14 @@ impl DiskCacheManager {
             sanitized
         }
     }
-    /// Store a range with atomic operations
-    /// Implements Requirements 1.1, 3.1, 3.2, 3.4, 3.5
-    ///
-    /// This method:
-    /// 1. Compresses the range data if appropriate
-    /// 2. Writes range data to a .tmp file then atomically renames it
-    /// 3. Updates metadata file atomically
-    /// 4. Ensures both operations succeed or both fail (atomic guarantee)
-    /// 5. Handles partial write failures with cleanup
+    /// Test support: a range fill the way the request path makes one. Runs
+    /// [`Self::prepare_range_store_witnessed`] and [`PreparedRangeFill::finish`], on a manager
+    /// built without a hybrid metadata writer after wiring the one production builds. A store the
+    /// manager declines leaves nothing to publish, which is an error here so a seed that
+    /// stored nothing fails the test. Not compiled into the binary.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub async fn store_range(
+    pub(crate) async fn store_range_witnessed(
         &mut self,
         cache_key: &str,
         start: u64,
@@ -4332,21 +4091,30 @@ impl DiskCacheManager {
         ttl: std::time::Duration,
         compression_enabled: bool,
     ) -> Result<()> {
-        self.store_range_with_slot_wait(
-            cache_key,
-            start,
-            end,
-            data,
-            object_metadata,
-            ttl,
-            compression_enabled,
-            SlotWait::WithinBudget,
-        )
-        .await
+        let stored = self
+            .store_range_witnessed_outcome(
+                cache_key,
+                start,
+                end,
+                data,
+                object_metadata,
+                ttl,
+                compression_enabled,
+            )
+            .await?;
+        if !stored && !self.folds_after_store {
+            return Err(ProxyError::CacheError(format!(
+                "range store declined: key={}, range={}-{}",
+                cache_key, start, end
+            )));
+        }
+        Ok(())
     }
-
+    /// [`Self::store_range_witnessed`] reporting whether a fill was published: `false` when the
+    /// manager declined the fill (admission, danger band) and nothing was stored.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    async fn store_range_with_slot_wait(
+    pub(crate) async fn store_range_witnessed_outcome(
         &mut self,
         cache_key: &str,
         start: u64,
@@ -4355,10 +4123,24 @@ impl DiskCacheManager {
         object_metadata: crate::cache_types::ObjectMetadata,
         ttl: std::time::Duration,
         compression_enabled: bool,
-        slot_wait: SlotWait,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        // A manager built with `DiskCacheManager::new` has no hybrid metadata writer, which is
+        // how a test configuration differs from production. Wire the one production builds, and
+        // fold the key's journal after the fill so its `.meta` is visible at once.
+        if self.hybrid_metadata_writer.is_none() {
+            self.folds_after_store = true;
+            let manager =
+                crate::cache::CacheManager::new_with_defaults(self.cache_dir.clone(), false, 0);
+            let configured = manager.create_configured_disk_cache_manager();
+            self.hybrid_metadata_writer = configured.hybrid_metadata_writer.clone();
+            // A test that installed its own consolidator keeps it: it reads that one's
+            // accumulator.
+            if self.journal_consolidator.is_none() {
+                self.journal_consolidator = configured.journal_consolidator.clone();
+            }
+        }
         match self
-            .prepare_range_store(
+            .prepare_range_store_witnessed(
                 cache_key,
                 start,
                 end,
@@ -4369,25 +4151,32 @@ impl DiskCacheManager {
             )
             .await?
         {
-            Some(fill) => fill.finish_with_slot_wait(slot_wait).await,
-            None => Ok(()),
+            Some(fill) => {
+                fill.finish().await?;
+                if self.folds_after_store {
+                    if let Some(consolidator) = &self.journal_consolidator {
+                        // Fold as the cycle does, then remove the applied lines: left in the
+                        // journal they would read as pending fills beside the `.meta`.
+                        let folded = consolidator.consolidate_object(cache_key).await?;
+                        consolidator
+                            .cleanup_consolidated_entries(
+                                &folded.consolidated_entries,
+                                &std::collections::HashMap::new(),
+                            )
+                            .await?;
+                    }
+                }
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
-
-    /// The part of [`Self::store_range`] that needs the manager: validation, the
-    /// danger-band admission, compression and the `.tmp` write.
-    ///
-    /// Returns `Some(fill)` when the publish remains to be done. [`PreparedRangeFill::finish`]
-    /// takes the key's slot lock (waiting up to `lock_acquire_wait_budget`), publishes the
-    /// `.bin`, journals and credits it, and borrows nothing from the manager, so a caller
-    /// holding `disk_cache.write()` drops the guard between the two calls and the slot wait
-    /// does not hold the `RwLock`. Dropping an unfinished fill removes its `.tmp` and releases
-    /// its capacity reservation.
-    ///
-    /// Returns `None` when nothing remains: the fill was declined, or the manager has no
-    /// hybrid metadata writer and the direct-mode store (test configurations only) ran here.
+    /// Test support: [`Self::prepare_range_store`] with a version witness captured for the key
+    /// first, as the request path captures one before its S3 request. Not compiled into the
+    /// binary.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub async fn prepare_range_store(
+    pub(crate) async fn prepare_range_store_witnessed(
         &mut self,
         cache_key: &str,
         start: u64,
@@ -4397,7 +4186,61 @@ impl DiskCacheManager {
         ttl: std::time::Duration,
         compression_enabled: bool,
     ) -> Result<Option<PreparedRangeFill>> {
+        let cache_dir = self.cache_dir.clone();
+        let meta_path = self.get_new_metadata_file_path(cache_key);
+        let key = cache_key.to_string();
+        let registry = Arc::new(crate::cache::FillLeaseRegistry::default());
+        let witness = tokio::task::spawn_blocking(move || {
+            crate::cache::capture_fill_witness_blocking(&cache_dir, &meta_path, &key, &registry)
+        })
+        .await
+        .map_err(|e| ProxyError::CacheError(format!("witness capture task failed: {}", e)))?;
+        self.prepare_range_store(
+            cache_key,
+            start,
+            end,
+            data,
+            object_metadata,
+            ttl,
+            compression_enabled,
+            witness,
+        )
+        .await
+    }
+    /// A range store in two parts. This is the part that needs the manager: validation, the
+    /// danger-band admission, compression and the `.tmp` write.
+    ///
+    /// Returns `Some(fill)` when the publish remains to be done. [`PreparedRangeFill::finish`]
+    /// takes the key's slot lock (waiting up to `lock_acquire_wait_budget`), publishes the
+    /// `.bin`, journals and credits it, and borrows nothing from the manager, so a caller
+    /// holding `disk_cache.write()` drops the guard between the two calls and the slot wait
+    /// does not hold the `RwLock`. Dropping an unfinished fill removes its `.tmp` and releases
+    /// its capacity reservation.
+    ///
+    /// `fill_witness` is the key's version witness, captured before the fill's S3 request; the
+    /// publish and the journal `Add` are guarded by it. A manager with no hybrid metadata
+    /// writer is an error: only a test configuration lacks one.
+    ///
+    /// Returns `None` when nothing remains: the fill was declined.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_range_store(
+        &mut self,
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        data: &[u8],
+        object_metadata: crate::cache_types::ObjectMetadata,
+        ttl: std::time::Duration,
+        compression_enabled: bool,
+        fill_witness: crate::cache::FillWitness,
+    ) -> Result<Option<PreparedRangeFill>> {
         use crate::cache_types::{NewCacheMetadata, RangeSpec};
+        let Some(hybrid_writer) = self.hybrid_metadata_writer.as_ref().map(Arc::clone) else {
+            return Err(ProxyError::CacheError(format!(
+                "range store needs the hybrid metadata writer: key={}, range={}-{}",
+                cache_key, start, end
+            )));
+        };
 
         let operation_start = std::time::Instant::now();
         debug!(
@@ -4485,9 +4328,8 @@ impl DiskCacheManager {
 
         // A range that arrives without an ETag (a non-2xx or otherwise ETag-less upstream
         // response reaching a store path) is never published over metadata that carries one.
-        // In journal mode it would fold into that `.meta` under the cached ETag (the
-        // consolidator keeps an ETag-less fill); in direct mode its ETag mismatch would wipe
-        // every cached range.
+        // It would fold into that `.meta` under the cached ETag (the consolidator keeps an
+        // ETag-less fill).
         if object_metadata.etag.is_empty() {
             let metadata_file_path = self.get_new_metadata_file_path(cache_key);
             let existing_etag = std::fs::read_to_string(&metadata_file_path)
@@ -4510,12 +4352,12 @@ impl DiskCacheManager {
         // ===================================================================
         // P1 — the danger-band publication guard (cache-eviction-at-scale task 36).
         //
-        // This is the boundary, not a call site: this function has six production callers
-        // (`store_range_shared_witnessed`'s five in `http_proxy.rs`, and
-        // `store_part_as_range_witnessed`)
-        // and is also where `store_full_object_as_range` (P2),
-        // `RangeHandler::store_range_new_storage` (P5) and page widening (P6) all land, so
-        // one check here covers four of U4's nine paths and no alternate route bypasses it.
+        // This is the boundary, not a call site: this function has two production callers
+        // (`store_range_shared_witnessed`, which has five in `http_proxy.rs`, and
+        // `store_part_as_range_witnessed`) and is where the range GET-miss fill (P5) and page
+        // widening (P6) land, so one check here covers three of U4's nine paths and no
+        // alternate route bypasses it. The full-object store is not one of them: it is
+        // guarded as P4 in `CacheManager::store_full_object_as_range_witnessed`.
         //
         // `uncompressed_size` rather than the compressed figure, deliberately: the
         // compressed size is not known until the next step, and over-stating the incoming
@@ -4649,7 +4491,7 @@ impl DiskCacheManager {
 
                     // Check if this is a disk space exhaustion error
                     // Requirement 8.3: Handle disk space exhaustion
-                    if note_disk_full(&e, "store_range.bin_tmp") {
+                    if note_disk_full(&e, "prepare_range_store.bin_tmp") {
                         error!(
                     "Disk space exhausted: key={}, range={}-{}, attempted_size={} bytes, error={}",
                     cache_key, start, end, compressed_size, e
@@ -4715,381 +4557,31 @@ impl DiskCacheManager {
         // The `.tmp`'s identity; the publish renames it, which keeps its length and
         // modification time.
         .with_file_identity(Some(written.identity));
-        // Step 3: Update metadata - use hybrid writer for coordinated metadata updates
-        // (always enabled in production; tests may not have it configured)
-        let metadata_start = std::time::Instant::now();
-
-        if let Some(hybrid_writer) = &self.hybrid_metadata_writer {
-            // Shared storage mode: the publish, journal and credit run in
-            // `PreparedRangeFill::finish`, which needs no `&self`. A caller holding the
-            // `DiskCacheManager` write guard drops it before `finish`, so the slot-lock wait
-            // there does not hold the `RwLock`.
-            let pending = PendingRangePublish::new(range_tmp_path.clone(), range_file_path.clone())
-                .expecting(written);
-            return Ok(Some(PreparedRangeFill {
-                cache_dir: self.cache_dir.clone(),
-                meta_path: self.get_new_metadata_file_path(cache_key),
-                cache_key: cache_key.to_string(),
-                start,
-                end,
-                object_metadata,
-                ttl,
-                range_spec,
-                compressed_size,
-                uncompressed_size,
-                counts_as_staged,
-                pending,
-                hybrid_writer: Arc::clone(hybrid_writer),
-                journal_consolidator: self.journal_consolidator.clone(),
-                _capacity_reservation,
-                operation_start,
-                fill_witness: None,
-            }));
-        }
-
-        // Fallback: direct file locking for metadata updates (used in tests without hybrid writer)
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-        let metadata_tmp_path = metadata_file_path.with_extension("meta.tmp");
-
-        debug!(
-            "Updating metadata (direct mode): key={}, metadata_path={:?}",
-            cache_key, metadata_file_path
-        );
-
-        // Ensure metadata directory exists
-        if let Some(parent) = metadata_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                // Clean up temp range file on failure
-                let _ = std::fs::remove_file(&range_tmp_path);
-                error!(
-                    "Failed to create metadata directory: key={}, path={:?}, error={}",
-                    cache_key, parent, e
-                );
-                ProxyError::CacheError(format!("Failed to create metadata directory: {}", e))
-            })?;
-        }
-
-        // Acquire the key's metadata slot lock, through the SAME namespace and protocol as
-        // `MetadataLockManager`. This path used to take its own inline `flock` on a per-key
-        // `{key}.meta.lock` that it never wrote a payload into — precisely the state the
-        // retired stale-detection branch judged stale, so a contending manager acquirer
-        // unlinked this holder's file and took an independent lock on a fresh inode.
-        //
-        // Bounded and off the runtime. It called the blocking primitive INLINE on a runtime
-        // worker with no bound at all, so a wedged peer both stalled this task indefinitely and
-        // occupied a worker while doing it.
-        let lock_acquire_start = std::time::Instant::now();
-        let meta_lock = self.acquire_meta_slot_lock(cache_key).await.map_err(|e| {
-            // Clean up temp range file on failure
-            let _ = std::fs::remove_file(&range_tmp_path);
-            error!(
-                "Failed to acquire metadata slot lock: key={}, error={}",
-                cache_key, e
-            );
-            e
-        })?;
-        let lock_file_path = meta_lock.lock_file_path().to_path_buf();
-
-        let lock_duration = lock_acquire_start.elapsed();
-        debug!(
-            "Acquired exclusive lock: key={}, lock_path={:?}, wait_time={:.2}ms",
-            cache_key,
-            lock_file_path,
-            lock_duration.as_secs_f64() * 1000.0
-        );
-
-        // Read existing metadata or create new (inside lock). `replaces_unparseable` is
-        // counted in `cache.metadata_heal_overwrite_total` once the new document is in place.
-        let mut replaces_unparseable = false;
-        let mut cache_metadata = if metadata_file_path.exists() {
-            debug!(
-                "Reading existing metadata: key={}, path={:?}",
-                cache_key, metadata_file_path
-            );
-
-            match std::fs::read_to_string(&metadata_file_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<NewCacheMetadata>(&content) {
-                        Ok(metadata) => {
-                            debug!(
-                                "Parsed existing metadata: key={}, ranges={}, etag={}",
-                                cache_key,
-                                metadata.ranges.len(),
-                                metadata.object_metadata.etag
-                            );
-
-                            // Verify object metadata matches
-                            // Quote-insensitive via the shared helper. The largest blast
-                            // radius of the seven sites — a bare-vs-quoted spelling of the
-                            // SAME ETag invalidated every existing range for the key.
-                            if !crate::revalidation::etags_equal_ignoring_quotes(
-                                &metadata.object_metadata.etag,
-                                &object_metadata.etag,
-                            ) {
-                                warn!(
-                                    "ETag mismatch detected: key={}, existing_etag={}, new_etag={} - invalidating existing ranges",
-                                    cache_key, metadata.object_metadata.etag, object_metadata.etag
-                                );
-
-                                // Requirement 14.1, 14.2, 14.3: Invalidate existing cached ranges
-                                // and allow new data to be cached
-                                let invalidated_count = metadata.ranges.len();
-
-                                // Delete existing range files
-                                let ranges_dir = self.cache_dir.join("ranges");
-                                for range in &metadata.ranges {
-                                    let range_path = ranges_dir.join(&range.file_path);
-                                    if range_path.exists() {
-                                        if let Err(e) = std::fs::remove_file(&range_path) {
-                                            warn!(
-                                                "Failed to delete invalidated range file: key={}, path={:?}, error={}",
-                                                cache_key, range_path, e
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Record metrics for ETag mismatch invalidation
-                                if let Some(metrics_manager) = &self.metrics_manager {
-                                    metrics_manager
-                                        .read()
-                                        .await
-                                        .record_etag_mismatch(
-                                            cache_key,
-                                            &metadata.object_metadata.etag,
-                                            &object_metadata.etag,
-                                        )
-                                        .await;
-                                    let range_names: Vec<String> = metadata
-                                        .ranges
-                                        .iter()
-                                        .map(|r| format!("{}-{}", r.start, r.end))
-                                        .collect();
-                                    metrics_manager
-                                        .read()
-                                        .await
-                                        .record_range_invalidation(
-                                            cache_key,
-                                            &range_names,
-                                            "etag_mismatch",
-                                        )
-                                        .await;
-                                }
-
-                                info!(
-                                    "Invalidated {} existing ranges due to ETag mismatch: key={}, old_etag={}, new_etag={}",
-                                    invalidated_count, cache_key, metadata.object_metadata.etag, object_metadata.etag
-                                );
-
-                                // Create fresh metadata with new object_metadata
-                                let now = SystemTime::now();
-                                NewCacheMetadata {
-                                    cache_key: cache_key.to_string(),
-                                    object_metadata: object_metadata.clone(),
-                                    ranges: Vec::new(),
-                                    created_at: now,
-                                    expires_at: now + ttl,
-                                    compression_info: crate::cache_types::CompressionInfo::default(
-                                    ),
-                                    ..Default::default()
-                                }
-                            } else {
-                                metadata
-                            }
-                        }
-                        Err(e) => {
-                            // Spec: cache-metadata-resilience Req 3, Task 6
-                            // Existing .meta is corrupt — create fresh metadata instead of
-                            // failing. This is the heal path: store_range will overwrite
-                            // the corrupt file with a valid one via atomic tmp+rename below.
-                            warn!(
-                                "[METADATA_HEAL] Existing metadata unparseable during store_range, creating fresh: key={}, path={:?}, error={}",
-                                cache_key, metadata_file_path, e
-                            );
-                            replaces_unparseable = true;
-                            let now = SystemTime::now();
-                            NewCacheMetadata {
-                                cache_key: cache_key.to_string(),
-                                object_metadata: object_metadata.clone(),
-                                ranges: Vec::new(),
-                                created_at: now,
-                                expires_at: now + ttl,
-                                compression_info: crate::cache_types::CompressionInfo::default(),
-                                ..Default::default()
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to read existing metadata: key={}, path={:?}, error={}",
-                        cache_key, metadata_file_path, e
-                    );
-                    // Clean up temp range file and release lock
-                    let _ = std::fs::remove_file(&range_tmp_path);
-                    return Err(ProxyError::CacheError(format!(
-                        "Failed to read metadata file: {}",
-                        e
-                    )));
-                }
-            }
-        } else {
-            // Create new metadata
-            info!(
-                "Creating new metadata entry: key={}, etag={}",
-                cache_key, object_metadata.etag
-            );
-
-            let now = SystemTime::now();
-            NewCacheMetadata {
-                cache_key: cache_key.to_string(),
-                object_metadata: object_metadata.clone(),
-                ranges: Vec::new(),
-                created_at: now,
-                expires_at: now + ttl,
-                compression_info: crate::cache_types::CompressionInfo::default(),
-                ..Default::default()
-            }
-        };
-
-        // Refresh object-level expiration on every cache write
-        cache_metadata.refresh_object_ttl(ttl);
-
-        // Check if this range already exists and update it, or add new
-        let range_update_type = if let Some(existing_range) = cache_metadata
-            .ranges
-            .iter_mut()
-            .find(|r| r.start == start && r.end == end)
-        {
-            *existing_range = range_spec.clone();
-            debug!(
-                "Updated existing range in metadata: key={}, range={}-{}",
-                cache_key, start, end
-            );
-            "update"
-        } else {
-            cache_metadata.ranges.push(range_spec.clone());
-            debug!(
-                "Added new range to metadata: key={}, range={}-{}, total_ranges={}",
-                cache_key,
-                start,
-                end,
-                cache_metadata.ranges.len()
-            );
-            "add"
-        };
-
-        // Write metadata to temporary file
-        let serialize_start = std::time::Instant::now();
-        let metadata_json = serde_json::to_string_pretty(&cache_metadata).map_err(|e| {
-            // Clean up temp range file and release lock on failure
-            let _ = std::fs::remove_file(&range_tmp_path);
-            error!(
-                "Failed to serialize metadata: key={}, error={}",
-                cache_key, e
-            );
-            ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
-        })?;
-
-        let serialize_duration = serialize_start.elapsed();
-        debug!(
-            "Metadata serialized: key={}, size={} bytes, duration={:.2}ms",
-            cache_key,
-            metadata_json.len(),
-            serialize_duration.as_secs_f64() * 1000.0
-        );
-
-        write_synced(&metadata_tmp_path, metadata_json).map_err(|e| {
-            crate::disk_cache::note_disk_full(&e, "store_range.meta_tmp");
-            // Clean up both tmp files, release lock on failure
-            let _ = std::fs::remove_file(&metadata_tmp_path);
-            let _ = std::fs::remove_file(&range_tmp_path);
-            error!(
-                "Failed to write metadata tmp file: key={}, path={:?}, error={}",
-                cache_key, metadata_tmp_path, e
-            );
-            ProxyError::CacheError(format!("Failed to write metadata tmp file: {}", e))
-        })?;
-
-        // Atomic rename of metadata
-        debug!(
-            "Performing atomic metadata rename: tmp={:?} -> final={:?}",
-            metadata_tmp_path, metadata_file_path
-        );
-
-        std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
-            // Clean up both tmp files, release lock on failure
-            let _ = std::fs::remove_file(&metadata_tmp_path);
-            let _ = std::fs::remove_file(&range_tmp_path);
-            error!(
-                "Failed to rename metadata file: key={}, tmp={:?}, final={:?}, error={}",
-                cache_key, metadata_tmp_path, metadata_file_path, e
-            );
-            ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
-        })?;
-        if replaces_unparseable {
-            note_metadata_heal_overwrite(cache_key);
-        }
-
-        // Release the slot lock by dropping the guard: `MetadataLock::Drop` closes the
-        // descriptor, which is what releases the `flock`. The slot file is permanent.
-        drop(meta_lock);
-
-        let metadata_duration = metadata_start.elapsed();
-        debug!(
-            "Released lock: key={}, total_metadata_update_duration={:.2}ms",
-            cache_key,
-            metadata_duration.as_secs_f64() * 1000.0
-        );
-
-        // Step 4: NOW make the range file visible by renaming from .tmp to .bin
-        // This ensures metadata is updated BEFORE the range file becomes visible
-        // This fixes the race condition where concurrent requests could see the range file
-        // but not find it in metadata
-        debug!(
-            "Making range file visible: tmp={:?} -> final={:?}",
-            range_tmp_path, range_file_path
-        );
-
-        std::fs::rename(&range_tmp_path, &range_file_path)
-            .map_err(|e| {
-                // Clean up tmp file on failure
-                let _ = std::fs::remove_file(&range_tmp_path);
-                error!(
-                    "Failed to rename range file after metadata update: key={}, range={}-{}, tmp={:?}, final={:?}, error={}",
-                    cache_key, start, end, range_tmp_path, range_file_path, e
-                );
-                // Note: Metadata is already updated, so this is a partial failure
-                // The range will be in metadata but the binary file won't exist
-                // This will be handled as a cache miss on next read
-                ProxyError::CacheError(format!("Failed to make range file visible: {}", e))
-            })?;
-
-        debug!(
-            "Range binary file made visible: key={}, range={}-{}, path={:?}",
-            cache_key, start, end, range_file_path
-        );
-
-        let total_duration = operation_start.elapsed();
-        debug!(
-            "Range storage operation completed: key={}, range={}-{}, operation={}, uncompressed={} bytes, compressed={} bytes, compression_ratio={:.2}%, total_ranges={}, total_duration={:.2}ms",
-            cache_key,
+        // The publish, journal and credit run in `PreparedRangeFill::finish`, which needs no
+        // `&self`. A caller holding the `DiskCacheManager` write guard drops it before `finish`,
+        // so the slot-lock wait there does not hold the `RwLock`.
+        let pending = PendingRangePublish::new(range_tmp_path.clone(), range_file_path.clone())
+            .expecting(written);
+        Ok(Some(PreparedRangeFill {
+            cache_dir: self.cache_dir.clone(),
+            meta_path: self.get_new_metadata_file_path(cache_key),
+            cache_key: cache_key.to_string(),
             start,
             end,
-            range_update_type,
-            uncompressed_size,
+            object_metadata,
+            ttl,
+            range_spec,
             compressed_size,
-            (compressed_size as f64 / uncompressed_size as f64) * 100.0,
-            cache_metadata.ranges.len(),
-            total_duration.as_secs_f64() * 1000.0
-        );
-
-        // Size tracking is handled unconditionally by JournalConsolidator through journal entries.
-        // SharedStorageConfig tunes coordination parameters; it has no `enabled` flag.
-
-        Ok(None)
+            uncompressed_size,
+            counts_as_staged,
+            pending,
+            hybrid_writer,
+            journal_consolidator: self.journal_consolidator.clone(),
+            _capacity_reservation,
+            operation_start,
+            fill_witness,
+        }))
     }
-
     /// Begin an incremental range write. Creates a `.tmp` file with a random suffix
     /// for concurrent write safety and returns an `IncrementalRangeWriter`.
     ///
@@ -5228,7 +4720,6 @@ impl DiskCacheManager {
             batch_size: self.compression_batch_size,
             stats: self.compression_handler.shared_stats(),
             _capacity_reservation: capacity_reservation,
-            fill_witness: None,
         }))
     }
 
@@ -5237,7 +4728,7 @@ impl DiskCacheManager {
     /// Chunk bytes are always accumulated into an in-memory batch buffer and
     /// flushed as a single LZ4 frame once the buffer reaches `batch_size`.
     /// Residual bytes remaining at commit time are flushed by
-    /// `commit_incremental_range`. This produces fewer, larger frames (better
+    /// `commit_incremental_range_shared`. This produces fewer, larger frames (better
     /// compression ratio + fewer syscalls) versus a one-frame-per-chunk
     /// approach. `FrameDecoder` reads concatenated frames transparently on load.
     ///
@@ -5330,56 +4821,65 @@ impl DiskCacheManager {
         Ok(())
     }
 
-    /// Validate total size, flush file, atomic rename `.tmp` → `.bin`, and write journal entry.
-    ///
-    /// Returns an error (and cleans up the `.tmp` file) if `bytes_written != end - start + 1`.
-    ///
-    /// Takes `&self` rather than `&mut self` — no `DiskCacheManager` field is mutated here.
-    /// All internal mutation is serialized by finer-grained locks: `HybridMetadataWriter`'s
-    /// async `Mutex` for the journal append, and `SizeAccumulator`'s internal atomics + dedup
-    /// `HashSet` for size tracking. This lets callers hold a read lock (or plain `Arc` deref)
-    /// during commit instead of a write lock, so concurrent commits of distinct ranges
-    /// proceed in parallel.
-    ///
-    /// The publish waits for the key's slot lock for up to `lock_acquire_wait_budget`, so a
-    /// caller holding the manager through a `tokio::sync::RwLock` should call
-    /// [`Self::commit_incremental_range_shared`] instead, which holds the guard only for the
-    /// finalize.
-    pub async fn commit_incremental_range(
+    /// Test support: validate the written length, publish the `.bin` under the key's slot lock,
+    /// journal and credit the fill, with a version witness captured for the key first, as the
+    /// request path captures one before its S3 request. Not compiled into the binary.
+    #[cfg(test)]
+    pub(crate) async fn commit_incremental_range_witnessed(
         &self,
         writer: IncrementalRangeWriter,
         object_metadata: crate::cache_types::ObjectMetadata,
         ttl: Duration,
     ) -> Result<()> {
-        self.prepare_incremental_commit(writer, object_metadata, ttl)?
+        let fill_witness = self.capture_test_fill_witness(&writer.cache_key).await?;
+        self.prepare_incremental_commit(writer, object_metadata, ttl, fill_witness)?
             .finish()
             .await
     }
+    /// Test support: a version witness for `cache_key`, captured as the request path captures one.
+    #[cfg(test)]
+    pub(crate) async fn capture_test_fill_witness(
+        &self,
+        cache_key: &str,
+    ) -> Result<crate::cache::FillWitness> {
+        let cache_dir = self.cache_dir.clone();
+        let meta_path = self.get_new_metadata_file_path(cache_key);
+        let key = cache_key.to_string();
+        let registry = Arc::new(crate::cache::FillLeaseRegistry::default());
+        tokio::task::spawn_blocking(move || {
+            crate::cache::capture_fill_witness_blocking(&cache_dir, &meta_path, &key, &registry)
+        })
+        .await
+        .map_err(|e| ProxyError::CacheError(format!("witness capture task failed: {}", e)))
+    }
 
-    /// [`Self::commit_incremental_range`] for a manager behind the shared `RwLock`: the read
+    /// Commit a streamed range fill for a manager behind the shared `RwLock`: the read
     /// guard covers only [`Self::prepare_incremental_commit`] and is dropped before the
     /// slot-lock wait in [`PreparedIncrementalCommit::finish`].
     ///
     /// Holding the read guard through that wait (up to 5 s by default while consolidation holds
     /// the slot) would let one queued `write()` block every later `read()` behind it, because
     /// tokio's `RwLock` is write-preferring.
-    pub async fn commit_incremental_range_shared(
+    pub(crate) async fn commit_incremental_range_shared(
         lock: &tokio::sync::RwLock<Self>,
         writer: IncrementalRangeWriter,
         object_metadata: crate::cache_types::ObjectMetadata,
         ttl: Duration,
+        fill_witness: crate::cache::FillWitness,
     ) -> Result<()> {
-        let prepared =
-            lock.read()
-                .await
-                .prepare_incremental_commit(writer, object_metadata, ttl)?;
+        let prepared = lock.read().await.prepare_incremental_commit(
+            writer,
+            object_metadata,
+            ttl,
+            fill_witness,
+        )?;
         prepared.finish().await
     }
 
-    /// A buffered GET-miss range fill guarded by its version witness: the two-phase
-    /// store `RangeHandler::store_range_new_storage` runs (the write guard covers the admission,
-    /// compression and `.tmp` write and is dropped before the slot-lock wait), with the witness
-    /// attached to the publish.
+    /// A buffered GET-miss range fill guarded by its version witness: [`Self::prepare_range_store`]
+    /// under the write guard (admission, compression and the `.tmp` write), then
+    /// [`PreparedRangeFill::finish_with_slot_wait`] with the guard dropped before the slot-lock
+    /// wait, the witness attached to the publish.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn store_range_shared_witnessed(
         lock: &tokio::sync::RwLock<Self>,
@@ -5390,7 +4890,7 @@ impl DiskCacheManager {
         object_metadata: crate::cache_types::ObjectMetadata,
         ttl: Duration,
         compression_enabled: bool,
-        fill_witness: Option<crate::cache::FillWitness>,
+        fill_witness: crate::cache::FillWitness,
         slot_wait: SlotWait,
     ) -> Result<()> {
         let prepared = {
@@ -5404,31 +4904,28 @@ impl DiskCacheManager {
                     object_metadata,
                     ttl,
                     compression_enabled,
+                    fill_witness,
                 )
                 .await?
         };
         match prepared {
-            Some(fill) => {
-                fill.with_fill_witness(fill_witness)
-                    .finish_with_slot_wait(slot_wait)
-                    .await
-            }
+            Some(fill) => fill.finish_with_slot_wait(slot_wait).await,
             None => Ok(()),
         }
     }
 
-    /// The part of [`Self::commit_incremental_range`] that needs the manager: flush the
+    /// The part of [`Self::commit_incremental_range_shared`] that needs the manager: flush the
     /// residual batch, validate the length and leave the `.tmp` ready to publish. Without a
     /// hybrid writer the `.bin` is published here, since nothing waits for a slot lock on that
     /// arm. The returned value owns everything the publish, journal and credit need.
-    pub fn prepare_incremental_commit(
+    pub(crate) fn prepare_incremental_commit(
         &self,
         writer: IncrementalRangeWriter,
         object_metadata: crate::cache_types::ObjectMetadata,
         ttl: Duration,
+        fill_witness: crate::cache::FillWitness,
     ) -> Result<PreparedIncrementalCommit> {
         let cache_key = writer.cache_key.clone();
-        let fill_witness = writer.fill_witness.clone();
 
         // Finalize the bytes (flush residual batch, validate length, publish the
         // `.bin`). Shared with the no-journal write-cache path so both produce
@@ -5438,7 +4935,7 @@ impl DiskCacheManager {
         // the PUT write-cache path passes `None` (exact-only).
         //
         // With a hybrid writer the fill is journal-only, so the rename goes under the key's slot
-        // lock with the same version check as `store_range`'s hybrid arm; a dropped fill
+        // lock with the same version check as `PreparedRangeFill::finish`; a dropped fill
         // journals and credits nothing. Without one, nothing is folded later, so the immediate
         // publish is kept.
         let (range_spec, publish) = if self.hybrid_metadata_writer.is_some() {
@@ -5483,7 +4980,7 @@ enum IncrementalPublish {
 /// Owns everything [`Self::finish`] needs, so it runs with no `DiskCacheManager` guard held.
 /// Dropping it unfinished removes an unpublished `.tmp`; nothing is journaled or credited.
 #[must_use = "an unfinished streamed fill is discarded when dropped"]
-pub struct PreparedIncrementalCommit {
+pub(crate) struct PreparedIncrementalCommit {
     cache_dir: PathBuf,
     meta_path: PathBuf,
     cache_key: String,
@@ -5494,14 +4991,13 @@ pub struct PreparedIncrementalCommit {
     hybrid_writer: Option<Arc<Mutex<HybridMetadataWriter>>>,
     journal_consolidator: Option<Arc<crate::journal_consolidator::JournalConsolidator>>,
     fill_visibility_tracker: Option<Arc<crate::fill_visibility_tracker::FillVisibilityTracker>>,
-    fill_witness: Option<crate::cache::FillWitness>,
+    fill_witness: crate::cache::FillWitness,
 }
-
 impl PreparedIncrementalCommit {
     /// Publish the fill (under the key's slot lock, waiting up to `lock_acquire_wait_budget`,
     /// when a hybrid writer is configured), journal it, credit it and record its visibility.
     /// Call it after dropping any `DiskCacheManager` guard.
-    pub async fn finish(self) -> Result<()> {
+    pub(crate) async fn finish(self) -> Result<()> {
         let PreparedIncrementalCommit {
             cache_dir,
             meta_path,
@@ -5527,7 +5023,7 @@ impl PreparedIncrementalCommit {
                     &object_metadata.etag,
                     pending,
                     SlotWait::WithinBudget,
-                    fill_witness.as_ref(),
+                    &fill_witness,
                 )
                 .await?
                 {
@@ -5555,9 +5051,10 @@ impl PreparedIncrementalCommit {
         range_spec.staged = Some(counts_as_staged);
         // Kept for the fill-visibility record below; the journal write moves `range_spec`.
         let committed_range = range_spec.clone();
-        let mut journalled = false;
-
-        // Write journal entry (same pattern as store_range)
+        // Before the journal append, so the tracked fill is never fresher than the `.meta`
+        // the fold stamps from the `Add`'s timestamp.
+        let committed_at = SystemTime::now();
+        // Write journal entry (same pattern as `PreparedRangeFill::finish`)
         if let Some(hybrid_writer) = &hybrid_writer {
             let mut hw = hybrid_writer.lock().await;
             if let Err(e) = hw
@@ -5567,7 +5064,7 @@ impl PreparedIncrementalCommit {
                     WriteMode::JournalOnly,
                     Some(object_metadata.clone()),
                     ttl,
-                    fill_witness.as_ref().map(|w| w.journal_token()),
+                    Some(fill_witness.journal_token()),
                 )
                 .await
             {
@@ -5582,24 +5079,22 @@ impl PreparedIncrementalCommit {
                 }
                 return Err(e);
             }
-            // A witnessed fill records its visibility inside the publish hold, so a stamp
-            // that runs after the hold also clears the record (`invalidate_cache_hierarchy_stamped`
-            // invalidates the tracker again after its own hold), and a peer's stamp replaces the
-            // marker token the record carries.
-            if fill_witness.is_some() {
-                DiskCacheManager::record_fill_visibility_at(
-                    fill_visibility_tracker.as_ref(),
-                    &cache_dir,
-                    &cache_key,
-                    &meta_path,
-                    fill_witness.as_ref(),
-                    &committed_range,
-                    &object_metadata,
-                    ttl,
-                );
-            }
+            // The fill records its visibility inside the publish hold, so a stamp that runs after
+            // the hold also clears the record (`invalidate_cache_hierarchy_stamped` invalidates
+            // the tracker again after its own hold), and a peer's stamp replaces the marker token
+            // the record carries.
+            DiskCacheManager::record_fill_visibility_at(
+                fill_visibility_tracker.as_ref(),
+                &cache_dir,
+                &cache_key,
+                &meta_path,
+                &fill_witness,
+                &committed_range,
+                &object_metadata,
+                ttl,
+                committed_at,
+            );
             drop(published);
-            journalled = true;
 
             // Track size via in-memory accumulator
             if let Some(consolidator) = &journal_consolidator {
@@ -5610,13 +5105,13 @@ impl PreparedIncrementalCommit {
                         end,
                         compressed_size,
                     );
-                    // Same guard as `store_range`'s hybrid arm, and for the same reason: no
+                    // Same guard as `PreparedRangeFill::finish`, and for the same reason: no
                     // ledger append happens here, so a staged credit would be invisible to
                     // the fold and to staging eviction.
                     // Spec: cache-eviction-at-scale § 16.6.6
                     if counts_as_staged {
                         refuse_unledgered_staged_credit(
-                            "DiskCacheManager::commit_incremental_range",
+                            "PreparedIncrementalCommit::finish",
                             &cache_key,
                             start,
                             end,
@@ -5625,24 +5120,6 @@ impl PreparedIncrementalCommit {
                     }
                 }
             }
-        }
-
-        // The `.bin` is published (`finalize_incremental_range` above) and the journal line is
-        // appended, so this instance may now serve the fill before consolidation writes its
-        // `.meta`. Only when journalled: without a hybrid writer nothing is journalled and there
-        // is no fold for the tracker to bridge. After the hybrid-writer lock is released, because
-        // the record stats the `.bin` and on shared storage that is a network round trip.
-        if journalled && fill_witness.is_none() {
-            DiskCacheManager::record_fill_visibility_at(
-                fill_visibility_tracker.as_ref(),
-                &cache_dir,
-                &cache_key,
-                &meta_path,
-                None,
-                &committed_range,
-                &object_metadata,
-                ttl,
-            );
         }
 
         Ok(())
@@ -5669,7 +5146,7 @@ impl DiskCacheManager {
     ///   the prefix is exactly the object's bytes for the clamped range. Below the
     ///   ratio (or zero), the `.tmp` is discarded and an error is returned.
     ///
-    /// `commit_incremental_range` uses this for the byte-finalize step and then
+    /// `commit_incremental_range_shared` uses this for the byte-finalize step and then
     /// writes the journal entry + size deltas. The write-cache PUT path
     /// (`CacheManager::store_put_as_write_cached_range_with_ttl` via
     /// `WriteCacheRangeSink::finalize`) uses it directly and writes its `.meta`
@@ -5824,7 +5301,7 @@ impl DiskCacheManager {
         // Leaves `staged` as `None` on purpose: this function publishes bytes and knows
         // nothing about the object's tier — it takes no `ObjectMetadata`. Every caller
         // records membership before the range is persisted, and each is commented at
-        // that point: `commit_incremental_range` (just below, for the journal write),
+        // that point: `commit_incremental_range_shared` (for the journal write),
         // `CacheManager::store_put_as_write_cached_range_with_ttl` and
         // `store_streamed_write_cache_metadata` (both via `WriteCacheRangeSink::finalize`,
         // before their `store_new_metadata`). Adding an `is_write_cached` parameter here
@@ -5979,7 +5456,6 @@ impl DiskCacheManager {
             batch_size: self.compression_batch_size,
             stats: self.compression_handler.shared_stats(),
             _capacity_reservation: capacity_reservation,
-            fill_witness: None,
         }))
     }
 
@@ -6027,6 +5503,7 @@ impl DiskCacheManager {
         })?;
         // Closed, then stamped from a new descriptor; same rationale as
         // `finalize_incremental_range_unpublished`.
+        let part_inode = file.metadata().ok().and_then(|m| file_inode(&m));
         drop(file);
         let file_identity = Some(identity_or_discard(&writer.tmp_path, &writer.cache_key)?);
 
@@ -6058,6 +5535,7 @@ impl DiskCacheManager {
             compression_algorithm,
             uncompressed_size: writer.bytes_written,
             file_identity,
+            file_inode: part_inode,
         })
     }
 
@@ -6223,355 +5701,6 @@ impl DiskCacheManager {
         }
     }
 
-    /// Classified metadata lookup — exposes the corruption flag.
-    ///
-    /// Same logic as `get_metadata` but returns a `MetadataLookup` so the caller
-    /// can trigger the overwrite-in-place heal (Req 3) when `corrupt == true`.
-    ///
-    /// Spec: cache-metadata-resilience Req 3, Task 6
-    pub async fn get_metadata_classified(&self, cache_key: &str) -> Result<MetadataLookup> {
-        let operation_start = std::time::Instant::now();
-        let sanitized_key = self.sanitize_cache_key_new(cache_key);
-
-        debug!(
-            "Starting classified metadata retrieval: key={}, sanitized_key={}",
-            cache_key, sanitized_key
-        );
-
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        // Fast path: check if metadata file exists before acquiring semaphore
-        if !metadata_file_path.exists() {
-            return Ok(MetadataLookup {
-                meta: None,
-                corrupt: false,
-                corrupt_reason: None,
-            });
-        }
-
-        // Acquire semaphore permit to bound concurrent blocking metadata ops
-        let _permit = self.metadata_io_semaphore.acquire().await.map_err(|_| {
-            crate::ProxyError::CacheError("Metadata I/O semaphore closed unexpectedly".to_string())
-        })?;
-
-        // Run blocking read+parse off the async runtime
-        let path_clone = metadata_file_path.clone();
-        let cap = self.max_metadata_file_bytes;
-        let cache_key_owned = cache_key.to_string();
-
-        let outcome = match tokio::task::spawn_blocking(move || {
-            read_and_parse_metadata_blocking(&path_clone, cap)
-        })
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(join_err) => {
-                warn!(
-                    "[METADATA_CLASSIFIED] spawn_blocking JoinError: cache_key={}, error={}",
-                    cache_key_owned, join_err
-                );
-                MetadataReadOutcome::TransientMiss
-            }
-        };
-
-        // Map outcome to MetadataLookup
-        match outcome {
-            MetadataReadOutcome::Missing => Ok(MetadataLookup {
-                meta: None,
-                corrupt: false,
-                corrupt_reason: None,
-            }),
-            MetadataReadOutcome::TransientMiss => {
-                warn!(
-                    "[METADATA_CLASSIFIED] Transient miss, not healing: cache_key={}, path={:?}",
-                    cache_key, metadata_file_path
-                );
-                if let Some(metrics_manager) = &self.metrics_manager {
-                    metrics_manager
-                        .read()
-                        .await
-                        .record_corrupted_metadata_simple()
-                        .await;
-                }
-                Ok(MetadataLookup {
-                    meta: None,
-                    corrupt: false,
-                    corrupt_reason: None,
-                })
-            }
-            MetadataReadOutcome::Corrupt { reason } => {
-                warn!(
-                    "[METADATA_CLASSIFIED] Corrupt metadata detected, flagging for heal: cache_key={}, path={:?}, reason={:?}",
-                    cache_key, metadata_file_path, reason
-                );
-                if let Some(metrics_manager) = &self.metrics_manager {
-                    metrics_manager
-                        .read()
-                        .await
-                        .record_corrupted_metadata_with_reason(
-                            cache_key,
-                            &metadata_file_path.to_string_lossy(),
-                            &format!("{:?}", reason),
-                        )
-                        .await;
-                }
-                Ok(MetadataLookup {
-                    meta: None,
-                    corrupt: true,
-                    corrupt_reason: Some(reason),
-                })
-            }
-            MetadataReadOutcome::Parsed(metadata) => {
-                // Check write cache expiration (lazy expiration)
-                if metadata.object_metadata.is_write_cached
-                    && metadata.object_metadata.is_write_cache_expired()
-                {
-                    info!(
-                        "Write cache entry expired (lazy expiration): key={}, write_cache_expires_at={:?}",
-                        cache_key, metadata.object_metadata.write_cache_expires_at
-                    );
-                    return Ok(MetadataLookup {
-                        meta: None,
-                        corrupt: false,
-                        corrupt_reason: None,
-                    });
-                }
-
-                let total_duration = operation_start.elapsed();
-                debug!(
-                    "Classified metadata retrieval completed: key={}, ranges={}, duration={:.2}ms",
-                    cache_key,
-                    metadata.ranges.len(),
-                    total_duration.as_secs_f64() * 1000.0
-                );
-
-                Ok(MetadataLookup {
-                    meta: Some(*metadata),
-                    corrupt: false,
-                    corrupt_reason: None,
-                })
-            }
-        }
-    }
-
-    /// Validate cached GET data against HEAD metadata
-    ///
-    /// Compares ETag and Last-Modified from HEAD cache with cached GET metadata.
-    /// If they differ, invalidates all cached GET data (metadata and range files).
-    ///
-    /// # Arguments
-    ///
-    /// * `cache_key` - The cache key for the object
-    /// * `head_etag` - ETag from HEAD request
-    /// * `head_last_modified` - Last-Modified from HEAD request
-    ///
-    /// # Returns
-    ///
-    /// Returns Ok(true) if cache was invalidated, Ok(false) if cache is valid or doesn't exist
-    ///
-    /// # Requirements
-    ///
-    /// Implements Requirements 7.1, 7.2, 7.3, 7.4, 7.5
-    pub async fn validate_cache_against_head(
-        &self,
-        cache_key: &str,
-        head_etag: &str,
-        head_last_modified: &str,
-    ) -> Result<bool> {
-        debug!(
-            "[CACHE_INVALIDATION] Starting cache validation: cache_key={}, head_etag={}, head_last_modified={}",
-            cache_key, head_etag, head_last_modified
-        );
-
-        // Get cached GET metadata
-        let cached_metadata = match self.get_metadata(cache_key).await? {
-            Some(metadata) => metadata,
-            None => {
-                debug!(
-                    "[CACHE_INVALIDATION] No cached GET metadata found: cache_key={}, result=no_action",
-                    cache_key
-                );
-                return Ok(false);
-            }
-        };
-
-        let cached_etag = &cached_metadata.object_metadata.etag;
-        let cached_last_modified = &cached_metadata.object_metadata.last_modified;
-
-        // Requirement 7.1, 7.2: Compare ETag and Last-Modified
-        // Quote-insensitive via the shared helper. PRODUCTION-UNREACHABLE — a contract
-        // pin for whatever revives this function, not a fix.
-        let etag_mismatch =
-            !crate::revalidation::etags_equal_ignoring_quotes(cached_etag, head_etag);
-        let last_modified_mismatch = cached_last_modified != head_last_modified;
-
-        if etag_mismatch || last_modified_mismatch {
-            // Requirement 7.5: Log invalidation with old and new metadata values
-            warn!(
-                "[CACHE_INVALIDATION] Metadata mismatch detected: cache_key={}, \
-                cached_etag={}, head_etag={}, etag_mismatch={}, \
-                cached_last_modified={}, head_last_modified={}, last_modified_mismatch={}, \
-                action=invalidate_cache",
-                cache_key,
-                cached_etag,
-                head_etag,
-                etag_mismatch,
-                cached_last_modified,
-                head_last_modified,
-                last_modified_mismatch
-            );
-
-            // Requirement 7.3, 7.4: Invalidate all cached metadata and range binary files
-            self.invalidate_cache_entry(cache_key).await?;
-
-            info!(
-                "[CACHE_INVALIDATION] Cache invalidated due to metadata mismatch: cache_key={}, \
-                old_etag={}, new_etag={}, old_last_modified={}, new_last_modified={}, \
-                ranges_deleted={}, result=invalidated",
-                cache_key,
-                cached_etag,
-                head_etag,
-                cached_last_modified,
-                head_last_modified,
-                cached_metadata.ranges.len()
-            );
-
-            Ok(true)
-        } else {
-            debug!(
-                "[CACHE_INVALIDATION] Cache metadata matches HEAD: cache_key={}, etag={}, last_modified={}, result=valid",
-                cache_key, cached_etag, cached_last_modified
-            );
-            Ok(false)
-        }
-    }
-
-    /// Update metadata file with atomic writes
-    /// Implements Requirements 1.3, 2.1, 3.2
-    ///
-    /// This method:
-    /// 1. Acquires exclusive lock on metadata file
-    /// 2. Writes metadata to .tmp file
-    /// 3. Atomically renames .tmp to final file
-    /// 4. Releases lock
-    /// 5. Ensures metadata operations don't load range data
-    pub async fn update_metadata(
-        &self,
-        metadata: &crate::cache_types::NewCacheMetadata,
-    ) -> Result<()> {
-        let operation_start = std::time::Instant::now();
-        info!(
-            "Starting metadata update: key={}, ranges={}, operation=update_metadata",
-            metadata.cache_key,
-            metadata.ranges.len()
-        );
-
-        let metadata_file_path = self.get_new_metadata_file_path(&metadata.cache_key);
-        let metadata_tmp_path = metadata_file_path.with_extension("meta.tmp");
-        // The lock lives in the SHARED slot namespace (`metadata_lock_manager::slot_lock_path`),
-        // not at a per-key `{key}.meta.lock`. A per-key lock file that nobody writes a payload
-        // into was the state the retired stale-detection branches judged stale, and every such
-        // branch then unlinked the live holder's file. The slot file is never unlinked.
-
-        debug!(
-            "Metadata update paths: key={}, metadata={:?}, tmp={:?}",
-            metadata.cache_key, metadata_file_path, metadata_tmp_path
-        );
-
-        // Ensure metadata directory exists
-        if let Some(parent) = metadata_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                error!(
-                    "Failed to create metadata directory: key={}, path={:?}, error={}",
-                    metadata.cache_key, parent, e
-                );
-                ProxyError::CacheError(format!("Failed to create metadata directory: {}", e))
-            })?;
-        }
-
-        // Acquire the key's metadata slot lock, held as a guard for the rest of the function.
-        // Bounded by the configured wait budget and taken on the blocking pool, so a contended
-        // slot neither stalls a runtime worker nor waits on a wedged peer indefinitely.
-        let lock_start = std::time::Instant::now();
-        let _meta_lock = self.acquire_meta_slot_lock(&metadata.cache_key).await?;
-
-        let lock_duration = lock_start.elapsed();
-        debug!(
-            "Acquired exclusive lock: key={}, wait_time={:.2}ms",
-            metadata.cache_key,
-            lock_duration.as_secs_f64() * 1000.0
-        );
-
-        // Serialize metadata to JSON
-        let serialize_start = std::time::Instant::now();
-        let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
-            error!(
-                "Failed to serialize metadata: key={}, error={}",
-                metadata.cache_key, e
-            );
-            ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
-        })?;
-
-        let serialize_duration = serialize_start.elapsed();
-        debug!(
-            "Metadata serialized: key={}, size={} bytes, duration={:.2}ms",
-            metadata.cache_key,
-            metadata_json.len(),
-            serialize_duration.as_secs_f64() * 1000.0
-        );
-
-        // Write to temporary file
-        let write_start = std::time::Instant::now();
-        write_synced(&metadata_tmp_path, &metadata_json).map_err(|e| {
-            crate::disk_cache::note_disk_full(&e, "update_metadata.meta_tmp");
-            let _ = std::fs::remove_file(&metadata_tmp_path);
-            error!(
-                "Failed to write metadata tmp file: key={}, path={:?}, error={}",
-                metadata.cache_key, metadata_tmp_path, e
-            );
-            ProxyError::CacheError(format!("Failed to write metadata tmp file: {}", e))
-        })?;
-
-        let write_duration = write_start.elapsed();
-        debug!(
-            "Metadata tmp file written: key={}, path={:?}, size={} bytes, duration={:.2}ms",
-            metadata.cache_key,
-            metadata_tmp_path,
-            metadata_json.len(),
-            write_duration.as_secs_f64() * 1000.0
-        );
-
-        // Atomic rename
-        debug!(
-            "Performing atomic rename: key={}, tmp={:?} -> final={:?}",
-            metadata.cache_key, metadata_tmp_path, metadata_file_path
-        );
-
-        std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
-            let _ = std::fs::remove_file(&metadata_tmp_path);
-            error!(
-                "Failed to rename metadata file: key={}, tmp={:?}, final={:?}, error={}",
-                metadata.cache_key, metadata_tmp_path, metadata_file_path, e
-            );
-            ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
-        })?;
-
-        // The lock is released by `_meta_lock`'s `Drop` at the end of this function.
-        let total_duration = operation_start.elapsed();
-        debug!(
-            "Releasing lock: key={}, total_duration={:.2}ms",
-            metadata.cache_key,
-            total_duration.as_secs_f64() * 1000.0
-        );
-
-        info!(
-            "Metadata update completed: key={}, ranges={}, file_size={} bytes, total_duration={:.2}ms",
-            metadata.cache_key, metadata.ranges.len(), metadata_json.len(), total_duration.as_secs_f64() * 1000.0
-        );
-
-        Ok(())
-    }
-
     /// Acquire the key's metadata slot lock from an async context, bounded by the configured
     /// wait budget.
     ///
@@ -6625,7 +5754,7 @@ async fn publish_range_fill_under_slot_lock_at(
     fill_etag: &str,
     pending: PendingRangePublish,
     slot_wait: SlotWait,
-    fill_witness: Option<&crate::cache::FillWitness>,
+    fill_witness: &crate::cache::FillWitness,
 ) -> Result<Option<PublishedFill>> {
     #[cfg(test)]
     range_rename_pause::before_publish(cache_key).await;
@@ -6662,14 +5791,12 @@ async fn publish_range_fill_under_slot_lock_at(
     };
     // The version witness, before anything is renamed: a write or delete of the key
     // acknowledged after this fill's S3 request began replaced the marker's token.
-    if let Some(witness) = fill_witness {
-        if !witness.holds(meta_path) {
-            debug!(
-                "Range fill dropped (superseded by an acknowledged write): key={}, range={}-{}",
-                cache_key, start, end
-            );
-            return Ok(None);
-        }
+    if !fill_witness.holds(meta_path) {
+        debug!(
+            "Range fill dropped (superseded by an acknowledged write): key={}, range={}-{}",
+            cache_key, start, end
+        );
+        return Ok(None);
     }
     let text = std::fs::read_to_string(meta_path).ok();
     let mut published = text
@@ -7074,7 +6201,7 @@ impl DiskCacheManager {
     /// the key is skipped whole. Nothing is unlinked, the `.meta` is untouched, and the result
     /// carries `identity_mismatch = true` with no extents, so a caller cannot debit or count
     /// anything for it. `None` is the unchecked behaviour.
-    pub async fn batch_delete_ranges_expecting(
+    pub(crate) async fn batch_delete_ranges_expecting(
         &self,
         cache_key: &str,
         ranges_to_delete: &[(u64, u64)],
@@ -8642,7 +7769,7 @@ impl DiskCacheManager {
     /// damage that only that frame's content checksum detects is not detected on that
     /// response. That is accepted (Ed, 2026-10-31): verifying before sending would mean
     /// decoding to the end of the frame first.
-    pub async fn stream_range_data_between(
+    pub(crate) async fn stream_range_data_between(
         &self,
         range_spec: &crate::cache_types::RangeSpec,
         chunk_size: usize,
@@ -9022,79 +8149,6 @@ impl DiskCacheManager {
         ))
     }
 
-    /// Store full object as a range (0 to content_length-1)
-    /// Implements Requirements 4.1, 4.2, 4.3
-    ///
-    /// This method treats full objects uniformly as ranges, eliminating special casing.
-    /// A full object is simply stored as range 0 to content_length-1.
-    ///
-    /// This enables:
-    /// - Consistent storage model (everything is a range)
-    /// - Ability to serve any range request from a cached full object
-    /// - No distinction between "full object" and "range" cache entries
-    pub async fn store_full_object_as_range(
-        &mut self,
-        cache_key: &str,
-        data: &[u8],
-        object_metadata: crate::cache_types::ObjectMetadata,
-        ttl: std::time::Duration,
-        compression_enabled: bool,
-    ) -> Result<()> {
-        debug!("Storing full object as range for key: {}", cache_key);
-
-        let content_length = data.len() as u64;
-
-        // Validate that data length matches object metadata
-        if content_length != object_metadata.content_length {
-            return Err(ProxyError::CacheError(format!(
-                "Data length ({}) doesn't match object metadata content_length ({})",
-                content_length, object_metadata.content_length
-            )));
-        }
-
-        // Handle empty objects specially
-        if content_length == 0 {
-            info!("Storing empty object for key: {}", cache_key);
-
-            // For empty objects, we still create metadata but with no ranges
-            // This is consistent with the design: empty objects have no data to cache
-            let now = SystemTime::now();
-            let metadata = crate::cache_types::NewCacheMetadata {
-                cache_key: cache_key.to_string(),
-                object_metadata,
-                ranges: Vec::new(), // No ranges for empty object
-                created_at: now,
-                expires_at: now + ttl,
-                compression_info: crate::cache_types::CompressionInfo::default(),
-                ..Default::default()
-            };
-
-            return self.update_metadata(&metadata).await;
-        }
-
-        // Store as range 0 to content_length-1
-        // This is the key insight: full objects are just ranges from 0 to N
-        let start = 0u64;
-        let end = content_length - 1;
-
-        info!(
-            "Storing full object as range {}-{} for key: {} ({} bytes)",
-            start, end, cache_key, content_length
-        );
-
-        // Use the existing store_range method - no special casing needed!
-        self.store_range(
-            cache_key,
-            start,
-            end,
-            data,
-            object_metadata,
-            ttl,
-            compression_enabled,
-        )
-        .await
-    }
-
     /// Load metadata from file (helper method)
     /// Used internally by metadata update operations
     async fn load_metadata_new(
@@ -9383,7 +8437,7 @@ impl DiskCacheManager {
     /// orders the write against every other `.meta` writer, in this process and in its peers,
     /// so callers hold the manager's read lock. Under the write lock every revalidated hit in
     /// the process queued behind every reader, journal scans included (the lock is fair).
-    pub async fn record_origin_validation(
+    pub(crate) async fn record_origin_validation(
         &self,
         cache_key: &str,
         new_ttl: std::time::Duration,
@@ -9508,7 +8562,7 @@ impl DiskCacheManager {
             // Reached in shared-storage mode as well, where a peer may read this `.meta` at
             // any moment, so publish by temp + rename rather than an in-place write that a
             // reader could observe half-written.
-            write_atomic(&metadata_path, json.as_bytes(), Shared::Yes)
+            write_atomic(&metadata_path, json.as_bytes())
                 .await
                 .inspect_err(|e| {
                     error!(
@@ -9729,294 +8783,46 @@ impl DiskCacheManager {
         Ok(())
     }
 
-    /// Delete a stale range (known to be invalid)
-    /// Implements Requirements 10.1, 10.3, 10.4, 10.5
-    ///
-    /// This method should be called when a range is known to be stale due to:
-    /// - ETag mismatch (Requirement 10.1)
-    /// - Corrupted cache files (Requirement 10.3)
-    /// - Conditional validation returning 200 OK (Requirement 10.4)
-    ///
-    /// This method:
-    /// 1. Acquires exclusive file lock on metadata file
-    /// 2. Reads current metadata
-    /// 3. Deletes the .bin file for the range
-    /// 4. Removes the range from metadata
-    /// 5. If no ranges remain, deletes the metadata file
-    /// 6. Releases lock
-    /// 7. Logs the deletion with reason (Requirement 10.5)
-    pub async fn delete_stale_range(
-        &mut self,
+    /// [`Self::check_object_expiration`] for a key that may have no document at all. `None`
+    /// when the key has neither a `.meta` nor a streamed fill this instance holds that no
+    /// consolidation cycle has folded and the tracker still accepts; asking the plain check
+    /// there logs a warning for an expected state. The tracker's
+    /// [`crate::fill_visibility_tracker::FillVisibilityTracker::lookup`] (a marker read and a
+    /// stat per `.bin`) runs once here, and its result is the verdict's basis.
+    pub(crate) async fn check_object_expiration_when_documented(
+        &self,
         cache_key: &str,
-        start: u64,
-        end: u64,
-        reason: &str,
-    ) -> Result<()> {
-        let operation_start = std::time::Instant::now();
-        info!(
-            "Deleting stale range: key={}, range={}-{}, reason={}, operation=delete_stale_range",
-            cache_key, start, end, reason
-        );
-
-        let metadata_path = self.get_new_metadata_file_path(cache_key);
-        // The lock lives in the SHARED slot namespace (`metadata_lock_manager::slot_lock_path`),
-        // not at a per-key `{key}.meta.lock`. A per-key lock file that nobody writes a payload
-        // into was the state the retired stale-detection branches judged stale, and every such
-        // branch then unlinked the live holder's file. The slot file is never unlinked.
-
-        // Check if metadata file exists
-        if !metadata_path.exists() {
-            debug!(
-                "Metadata file not found for stale range deletion: key={}, path={:?}, result=skip",
-                cache_key, metadata_path
-            );
-            return Ok(());
+        current_get_ttl: std::time::Duration,
+    ) -> Result<Option<crate::cache_types::ObjectExpirationResult>> {
+        use crate::cache_types::ObjectExpirationResult;
+        if tokio::fs::try_exists(self.get_new_metadata_file_path(cache_key))
+            .await
+            .unwrap_or(true)
+        {
+            return self
+                .check_object_expiration(cache_key, current_get_ttl)
+                .await
+                .map(Some);
         }
-
-        // Acquire the key's metadata slot lock, held as a guard for the rest of the function.
-        // Bounded by the configured wait budget and taken on the blocking pool.
-        let lock_start = std::time::Instant::now();
-        let _meta_lock = self.acquire_meta_slot_lock(cache_key).await?;
-
-        let lock_duration = lock_start.elapsed();
-        debug!(
-            "Acquired exclusive lock for stale range deletion: key={}, wait_time={:.2}ms",
-            cache_key,
-            lock_duration.as_secs_f64() * 1000.0
-        );
-
-        // Read metadata
-        let mut metadata = match self.load_metadata_new(cache_key).await {
-            Ok(meta) => meta,
-            Err(e) => {
-                error!(
-                    "Failed to load metadata for stale range deletion: key={}, error={}",
-                    cache_key, e
-                );
-                return Err(e);
-            }
+        let Some(tracker) = &self.fill_visibility_tracker else {
+            return Ok(None);
         };
-
-        // Find and delete the range
-        let range_to_remove = metadata
-            .ranges
-            .iter()
-            .find(|r| r.start == start && r.end == end)
-            .cloned();
-
-        if let Some(range) = range_to_remove {
-            info!(
-                "Removing stale range: key={}, range={}-{}, file={}, reason={}",
-                cache_key, start, end, range.file_path, reason
-            );
-
-            // Delete .bin file (Requirement 9.4)
-            let range_path = self.cache_dir.join("ranges").join(&range.file_path);
-            if range_path.exists() {
-                match std::fs::remove_file(&range_path) {
-                    Ok(_) => {
-                        debug!(
-                            "Deleted stale range binary file: key={}, range={}-{}, path={:?}, reason={}",
-                            cache_key, start, end, range_path, reason
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to delete stale range binary file: key={}, range={}-{}, path={:?}, error={}, reason={}",
-                            cache_key, start, end, range_path, e, reason
-                        );
-                        // Continue anyway - metadata will be updated
-                    }
-                }
-            } else {
-                debug!(
-                    "Stale range binary file already deleted: key={}, range={}-{}, path={:?}, reason={}",
-                    cache_key, start, end, range_path, reason
-                );
-            }
-
-            // Remove range from metadata
-            metadata
-                .ranges
-                .retain(|r| !(r.start == start && r.end == end));
-
-            debug!(
-                "Stale range removed from metadata: key={}, range={}-{}, remaining_ranges={}, reason={}",
-                cache_key, start, end, metadata.ranges.len(), reason
-            );
-
-            if metadata.ranges.is_empty() {
-                // No ranges left, delete metadata file (Requirement 9.5)
-                match std::fs::remove_file(&metadata_path) {
-                    Ok(_) => {
-                        info!(
-                            "Deleted metadata file (no ranges remaining): key={}, path={:?}, reason={}",
-                            cache_key, metadata_path, reason
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to delete metadata file: key={}, path={:?}, error={}, reason={}",
-                            cache_key, metadata_path, e, reason
-                        );
-                    }
-                }
-            } else {
-                // Update metadata with remaining ranges
-                let json = serde_json::to_string_pretty(&metadata)
-                    .map_err(|e| {
-                        error!(
-                            "Failed to serialize metadata after stale range deletion: key={}, error={}, reason={}",
-                            cache_key, e, reason
-                        );
-                        ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
-                    })?;
-
-                std::fs::write(&metadata_path, json)
-                    .map_err(|e| {
-                        crate::disk_cache::note_disk_full(&e, "stale_range_deletion.meta");
-                        error!(
-                            "Failed to write metadata after stale range deletion: key={}, path={:?}, error={}, reason={}",
-                            cache_key, metadata_path, e, reason
-                        );
-                        ProxyError::CacheError(format!("Failed to write metadata: {}", e))
-                    })?;
-
-                debug!(
-                    "Metadata updated after stale range deletion: key={}, remaining_ranges={}, reason={}",
-                    cache_key, metadata.ranges.len(), reason
-                );
-            }
-        } else {
-            debug!(
-                "Stale range not found for deletion: key={}, range={}-{}, reason={}, result=skip",
-                cache_key, start, end, reason
-            );
-        }
-
-        // The lock is released by `_meta_lock`'s `Drop` at the end of this function.
-        let total_duration = operation_start.elapsed();
-        info!(
-            "Stale range deletion completed: key={}, range={}-{}, reason={}, total_duration={:.2}ms",
-            cache_key, start, end, reason, total_duration.as_secs_f64() * 1000.0
-        );
-
-        Ok(())
-    }
-
-    /// Delete all ranges for an object (e.g., on PUT conflict)
-    /// Implements Requirements 10.2, 10.5
-    ///
-    /// This method should be called when all ranges for an object need to be invalidated,
-    /// such as when a PUT request is received for the object (Requirement 10.2).
-    ///
-    /// This method:
-    /// 1. Checks if metadata file exists
-    /// 2. Loads metadata to get range files
-    /// 3. Deletes all .bin files for all ranges
-    /// 4. Deletes the metadata file
-    /// 5. Logs the deletion with reason (Requirement 10.5)
-    pub async fn delete_all_ranges(&mut self, cache_key: &str, reason: &str) -> Result<()> {
-        let operation_start = std::time::Instant::now();
-        info!(
-            "Deleting all ranges for object: key={}, reason={}, operation=delete_all_ranges",
-            cache_key, reason
-        );
-        if let Some(tracker) = &self.fill_visibility_tracker {
-            tracker.invalidate(cache_key);
-        }
-
-        let metadata_path = self.get_new_metadata_file_path(cache_key);
-
-        if !metadata_path.exists() {
-            debug!(
-                "Metadata file not found for all ranges deletion: key={}, path={:?}, reason={}, result=skip",
-                cache_key, metadata_path, reason
-            );
-            return Ok(());
-        }
-
-        // Load metadata to get range files
-        let metadata = match self.load_metadata_new(cache_key).await {
-            Ok(meta) => meta,
-            Err(e) => {
-                warn!(
-                    "Failed to load metadata for all ranges deletion: key={}, error={}, reason={}, result=skip",
-                    cache_key, e, reason
-                );
-                // Try to delete metadata file anyway
-                let _ = std::fs::remove_file(&metadata_path);
-                return Ok(());
-            }
+        let Some(tracked) = tracker.lookup(cache_key) else {
+            return Ok(None);
         };
-
-        let range_count = metadata.ranges.len();
-        info!(
-            "Deleting {} ranges for object: key={}, reason={}",
-            range_count, cache_key, reason
-        );
-
-        // Delete all .bin files
-        let mut deleted_count = 0;
-        let mut failed_count = 0;
-
-        for range in &metadata.ranges {
-            let range_path = self.cache_dir.join("ranges").join(&range.file_path);
-            if range_path.exists() {
-                match std::fs::remove_file(&range_path) {
-                    Ok(_) => {
-                        debug!(
-                            "Deleted range binary file: key={}, range={}-{}, path={:?}, reason={}",
-                            cache_key, range.start, range.end, range_path, reason
-                        );
-                        deleted_count += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to delete range binary file: key={}, range={}-{}, path={:?}, error={}, reason={}",
-                            cache_key, range.start, range.end, range_path, e, reason
-                        );
-                        failed_count += 1;
-                    }
-                }
-            } else {
-                debug!(
-                    "Range binary file already deleted: key={}, range={}-{}, path={:?}, reason={}",
-                    cache_key, range.start, range.end, range_path, reason
-                );
-            }
+        // A zero `get_ttl` never consults the tracker for a verdict: every read revalidates.
+        if current_get_ttl.is_zero() {
+            return Ok(Some(ObjectExpirationResult::Expired {
+                last_modified: None,
+                etag: None,
+            }));
         }
-
-        info!(
-            "Range binary files deletion summary: key={}, deleted={}, failed={}, total={}, reason={}",
-            cache_key, deleted_count, failed_count, range_count, reason
-        );
-
-        // Delete metadata file
-        match std::fs::remove_file(&metadata_path) {
-            Ok(_) => {
-                info!(
-                    "Deleted metadata file: key={}, path={:?}, reason={}",
-                    cache_key, metadata_path, reason
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to delete metadata file: key={}, path={:?}, error={}, reason={}",
-                    cache_key, metadata_path, e, reason
-                );
-            }
+        let verdict = Self::expiration_verdict(cache_key, &tracked, current_get_ttl);
+        if matches!(verdict, ObjectExpirationResult::Fresh) {
+            tracker.record_hit();
         }
-
-        let total_duration = operation_start.elapsed();
-        info!(
-            "All ranges deletion completed: key={}, ranges_deleted={}, reason={}, total_duration={:.2}ms",
-            cache_key, deleted_count, reason, total_duration.as_secs_f64() * 1000.0
-        );
-
-        Ok(())
+        Ok(Some(verdict))
     }
-
     /// Check if a cached object is expired and needs conditional validation.
     /// Evaluates GET freshness against a caller-supplied TTL (`current_get_ttl`)
     /// rather than the stored `expires_at`. This ensures that a tightened or zeroed
@@ -10199,10 +9005,9 @@ impl DiskCacheManager {
         let ttl_expired = current_get_ttl.is_zero() || age > current_get_ttl;
 
         // A write-through PUT/CompleteMultipartUpload entry with no effective
-        // Last-Modified is a state the rest of the tree treats as an integrity
-        // error (`cache_validator.rs`'s `MissingRequiredField`), and the first GET
+        // Last-Modified is incomplete, and the first GET
         // after such a write is a cache HIT that never reaches S3 — so nothing
-        // ever learns it unless this predicate forces a revalidation. The
+        // ever learns the missing field unless this predicate forces a revalidation. The
         // `is_write_cached` conjunct is load-bearing, not decoration: without it
         // the trigger would also fire on a legitimately-empty read-cache entry an
         // older release may have written, and — more importantly — it is what
@@ -10472,7 +9277,7 @@ impl DiskCacheManager {
     ///
     /// # What it does NOT reach
     ///
-    /// **Not every `.bin` file belonging to the key.** `store_range`'s hybrid arm renames the
+    /// **Not every `.bin` file belonging to the key.** `PreparedRangeFill::finish` renames the
     /// `.bin` visible *before* appending its journal entry — deliberately, so a peer
     /// consolidating the entry finds the file already present — so in that interval the file is
     /// named by nothing and neither enumeration can see it. The same shape is durable rather
@@ -10775,7 +9580,7 @@ impl DiskCacheManager {
     /// Step 2 is not "all range files for the object", which is what this comment claimed until
     /// `range-invalidation-completeness:R1` landed. Two enumerations name the `.bin` files to
     /// delete — the consolidated `.meta` and every instance's unfolded journal `Add` entries —
-    /// and a range can be in neither. `store_range`'s hybrid arm renames the `.bin` visible
+    /// and a range can be in neither. `PreparedRangeFill::finish` renames the `.bin` visible
     /// *before* appending its journal entry, so in that interval the file is named by nothing;
     /// and a journal append that fails after a successful rename leaves it unnamed durably,
     /// until orphan recovery adopts or removes it. A `.bin` in either state survives this call.
@@ -10798,8 +9603,7 @@ impl DiskCacheManager {
     ///
     /// The journal enumeration is taken before the lock (`INVALIDATE-LOCK-HOLD-TIME`): it
     /// is read-only and excludes nothing, so it needs no exclusion. The span covers the range
-    /// removal as well as the `.meta` unlink, for the same reason
-    /// `invalidate_cache_entry` holds it across both: the `.meta` read decides which `.bin`
+    /// removal as well as the `.meta` unlink, because the `.meta` read decides which `.bin`
     /// files go, so a publisher landing between that read and the unlink would leave a `.bin`
     /// no metadata references. It also makes a failed acquisition a clean no-op — the `?`
     /// below returns before anything is removed, rather than leaving the `.bin` files gone
@@ -10874,7 +9678,7 @@ impl DiskCacheManager {
         //
         // The journal enumeration runs BEFORE the lock. It is a `read_dir` plus one
         // read-and-parse per journal file, and it is read-only. Holding the slot lock across it
-        // never froze the journals — `store_range`'s hybrid arm appends without it. Taking
+        // never froze the journals — `PreparedRangeFill::finish` appends without it. Taking
         // the snapshot earlier is equivalent to an `Add` landing just after this call, which the
         // lock never excluded; see `remove_ranges_with_journal_candidates`..
         let journal_candidates = self.enumerate_journal_add_ranges(cache_key).await;
@@ -10981,8 +9785,7 @@ impl DiskCacheManager {
         // Legacy flat `.meta` from pre-sharding full-object caching, best effort. Kept so
         // that switching the line above to the sharded path is a strict superset of what it
         // used to do rather than a trade: on an old flat cache the line above removed this
-        // file, and nothing else on this path would. Same two-tier removal, and same reason,
-        // as `invalidate_cache_entry`'s "OLD FLAT STRUCTURE" block.
+        // file, and nothing else on this path would.
         //
         // Skipped when the two constructions coincide, which they do for a full-object key
         // whose cache key cannot be parsed into bucket and object key — `get_new_metadata_file_path`
@@ -11043,211 +9846,9 @@ impl DiskCacheManager {
         Ok(())
     }
 
-    /// Get object ETag from metadata file
-    /// Implements Requirements 2.1, 4.3
-    ///
-    /// This method:
-    /// 1. Reads only the metadata file (no range data loaded)
-    /// 2. Extracts the ETag from object metadata
-    /// 3. Handles corrupted or missing metadata gracefully
-    /// 4. Caches ETag values within request lifecycle for efficiency
-    /// 5. Returns None if metadata doesn't exist or is corrupted
-    pub async fn get_object_etag(&self, cache_key: &str) -> Result<Option<String>> {
-        let operation_start = std::time::Instant::now();
-        debug!(
-            "Starting ETag retrieval: key={}, operation=get_object_etag",
-            cache_key
-        );
-
-        // Get metadata (this handles all error cases gracefully)
-        let metadata = match self.get_metadata(cache_key).await? {
-            Some(meta) => {
-                debug!(
-                    "Metadata retrieved for ETag: key={}, etag={}",
-                    cache_key, meta.object_metadata.etag
-                );
-                meta
-            }
-            None => {
-                debug!(
-                    "No metadata found for ETag retrieval: key={}, result=none",
-                    cache_key
-                );
-                return Ok(None);
-            }
-        };
-
-        let etag = metadata.object_metadata.etag.clone();
-        let total_duration = operation_start.elapsed();
-
-        debug!(
-            "ETag retrieval completed: key={}, etag={}, duration={:.2}ms",
-            cache_key,
-            etag,
-            total_duration.as_secs_f64() * 1000.0
-        );
-
-        Ok(Some(etag))
-    }
-
     // ============================================================================
     // Enhanced Error Handling and Concurrent Access Safety Methods
     // ============================================================================
-
-    /// Validate metadata file structure and content for corruption detection
-    ///
-    /// This method performs comprehensive validation of metadata files to detect
-    /// various forms of corruption including:
-    /// - JSON parsing errors
-    /// - Missing required fields
-    /// - Invalid field values
-    /// - Inconsistent data structures
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key to validate
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Metadata is valid
-    /// * `Ok(false)` - Metadata is corrupted but recoverable
-    /// * `Err(ProxyError)` - Metadata is corrupted and requires invalidation
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.3
-    pub async fn validate_metadata_integrity(&self, cache_key: &str) -> Result<bool> {
-        let operation_start = std::time::Instant::now();
-        debug!(
-            "[METADATA_VALIDATION] Starting integrity validation: cache_key={}",
-            cache_key
-        );
-
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        // Check if metadata file exists
-        if !metadata_file_path.exists() {
-            debug!(
-                "[METADATA_VALIDATION] Metadata file not found: cache_key={}, path={:?}, result=not_found",
-                cache_key, metadata_file_path
-            );
-            return Ok(true); // No metadata to validate
-        }
-
-        // Read and validate file content
-        let metadata_content = match std::fs::read_to_string(&metadata_file_path) {
-            Ok(content) => {
-                if content.is_empty() {
-                    error!(
-                        "[METADATA_VALIDATION] Empty metadata file detected: cache_key={}, path={:?}",
-                        cache_key, metadata_file_path
-                    );
-                    return Err(ProxyError::CacheError("Empty metadata file".to_string()));
-                }
-                content
-            }
-            Err(e) => {
-                error!(
-                    "[METADATA_VALIDATION] Failed to read metadata file: cache_key={}, path={:?}, error={}",
-                    cache_key, metadata_file_path, e
-                );
-                return Err(ProxyError::CacheError(format!(
-                    "Failed to read metadata: {}",
-                    e
-                )));
-            }
-        };
-
-        // Validate JSON structure
-        let metadata =
-            match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    error!(
-                    "[METADATA_VALIDATION] JSON parsing failed: cache_key={}, path={:?}, error={}",
-                    cache_key, metadata_file_path, e
-                );
-                    return Err(ProxyError::CacheError(format!("Corrupted JSON: {}", e)));
-                }
-            };
-
-        // Validate required fields
-        if metadata.cache_key.is_empty() {
-            error!(
-                "[METADATA_VALIDATION] Empty cache_key field: cache_key={}, path={:?}",
-                cache_key, metadata_file_path
-            );
-            return Err(ProxyError::CacheError("Empty cache_key field".to_string()));
-        }
-
-        if metadata.object_metadata.etag.is_empty() {
-            error!(
-                "[METADATA_VALIDATION] Empty ETag field: cache_key={}, path={:?}",
-                cache_key, metadata_file_path
-            );
-            return Err(ProxyError::CacheError("Empty ETag field".to_string()));
-        }
-
-        // Validate timestamps
-        let now = SystemTime::now();
-        if metadata.created_at > now {
-            warn!(
-                "[METADATA_VALIDATION] Future creation timestamp: cache_key={}, created_at={:?}, now={:?}",
-                cache_key, metadata.created_at, now
-            );
-            // This is suspicious but not necessarily corrupted
-        }
-
-        // Validate range specifications
-        for (i, range_spec) in metadata.ranges.iter().enumerate() {
-            if range_spec.start > range_spec.end {
-                error!(
-                    "[METADATA_VALIDATION] Invalid range boundaries: cache_key={}, range_index={}, start={}, end={}",
-                    cache_key, i, range_spec.start, range_spec.end
-                );
-                return Err(ProxyError::CacheError(format!(
-                    "Invalid range {}: start > end",
-                    i
-                )));
-            }
-
-            if range_spec.file_path.is_empty() {
-                error!(
-                    "[METADATA_VALIDATION] Empty range file path: cache_key={}, range_index={}",
-                    cache_key, i
-                );
-                return Err(ProxyError::CacheError(format!(
-                    "Empty file path for range {}",
-                    i
-                )));
-            }
-
-            // Security (Req 10): reject file_path if unsafe
-            if !is_safe_relative_file_path(&range_spec.file_path) {
-                warn!(
-                    "[METADATA_VALIDATION] Unsafe range file path: cache_key={}, range_index={}, path={:?}",
-                    cache_key, i, range_spec.file_path
-                );
-                return Ok(false);
-            }
-
-            // Validate that the range file exists
-            let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
-            if !range_file_path.exists() {
-                warn!(
-                    "[METADATA_VALIDATION] Missing range file: cache_key={}, range_index={}, path={:?}",
-                    cache_key, i, range_file_path
-                );
-                // Missing range files indicate inconsistency but not necessarily corruption
-                return Ok(false);
-            }
-        }
-
-        let validation_duration = operation_start.elapsed();
-        debug!(
-            "[METADATA_VALIDATION] Validation completed: cache_key={}, ranges={}, duration={:.2}ms, result=valid",
-            cache_key, metadata.ranges.len(), validation_duration.as_secs_f64() * 1000.0
-        );
-
-        Ok(true)
-    }
 }
 
 impl DiskCacheManager {
@@ -11484,25 +10085,14 @@ pub fn get_sharded_path(
     Ok(sharded_path)
 }
 
-/// Which temp-file naming scheme [`write_atomic`] uses.
-///
-/// Not a stylistic choice. A file **any** instance may write needs an instance-suffixed temp
-/// name, or two instances racing share one temp path and the rename publishes a file that is
-/// half of each — a complete, parseable, wrong document with no error anywhere.
-/// `persist_size_state_internal` already does this by hand, and the shard-checkpoint writer and
-/// the pending-file writer in `src/staged_fold.rs` each open-code their own copy of the same
-/// `{file}.tmp.{host}.{pid}` scheme.
-///
-/// Spec: cache-eviction-at-scale § 2.1, § 2 trap 6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shared {
-    /// Any instance on the volume may write this path. Temp name carries hostname and pid.
-    Yes,
-    /// Only this instance writes this path. A plain `.tmp` suffix is enough.
-    No,
-}
-
 /// Atomically replace `path` with `bytes`: write a temp, `sync_all`, rename.
+///
+/// # Why the temp name carries the host and pid
+///
+/// A file **any** instance may write needs an instance-suffixed temp name, or two instances
+/// racing share one temp path and the rename publishes a file that is half of each: a
+/// complete, parseable, wrong document with no error anywhere. Every caller writes such a
+/// file, so the scheme is not a parameter.
 ///
 /// # Why `sync_all` is unconditional
 ///
@@ -11516,16 +10106,12 @@ pub enum Shared {
 ///
 /// Four open-coded `tmp`+rename sites already exist and disagree about durability — the
 /// ledger's compaction and the journal's cleanup `sync_all`, the journal's append and
-/// `persist_size_state_internal` do not. Converting them is unrelated churn with its own red
+/// `SizeStateFile::persist_to_disk` do not. Converting them is unrelated churn with its own red
 /// side (§ 2.1 says so explicitly). This helper exists so the sites added by
 /// `cache-eviction-at-scale` do not become a fifth and sixth inconsistency.
 ///
 /// Spec: cache-eviction-at-scale § 2.1.
-pub(crate) async fn write_atomic(
-    path: &std::path::Path,
-    bytes: &[u8],
-    shared: Shared,
-) -> Result<()> {
+pub(crate) async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
     if let Some(parent) = path.parent() {
@@ -11537,26 +10123,23 @@ pub(crate) async fn write_atomic(
         })?;
     }
 
-    let tmp = match shared {
-        Shared::Yes => {
-            let host = hostname::get()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "unknown".to_string())
-                .replace(['/', '\\'], "_");
-            // Bounded to NAME_MAX: this also stages key-derived `.meta` names (the TTL
-            // refresh after an origin `304`), which reach 205 bytes before the suffix.
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            path.with_file_name(crate::cache::bounded_instance_tmp_name(
-                &name,
-                "",
-                &host,
-                std::process::id(),
-            ))
-        }
-        Shared::No => append_to_file_name(path, ".tmp"),
+    let tmp = {
+        let host = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+            .replace(['/', '\\'], "_");
+        // Bounded to NAME_MAX: this also stages key-derived `.meta` names (the TTL
+        // refresh after an origin `304`), which reach 205 bytes before the suffix.
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        path.with_file_name(crate::cache::bounded_instance_tmp_name(
+            &name,
+            "",
+            &host,
+            std::process::id(),
+        ))
     };
 
     let write_result = async {
@@ -11579,20 +10162,6 @@ pub(crate) async fn write_atomic(
         )));
     }
     Ok(())
-}
-
-/// `path` with `suffix` appended to its file NAME.
-///
-/// Deliberately not `Path::with_extension`, which replaces the existing extension: on
-/// `{XX}.tail` that would yield `{XX}.tmp` and two different partitions in one bucket would
-/// share one temp path. Appending keeps the original name whole.
-fn append_to_file_name(path: &std::path::Path, suffix: &str) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unnamed".to_string());
-    name.push_str(suffix);
-    path.with_file_name(name)
 }
 
 /// Normalize cache key by removing leading slashes and ensuring consistent format
@@ -11827,7 +10396,7 @@ mod lz4_reader_capacity_tests {
             compression_algorithm: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
-        dcm.store_range(
+        dcm.store_range_witnessed(
             "reader-capacity-bucket/template",
             0,
             4095,
@@ -11952,7 +10521,7 @@ mod unledgered_staged_credit_guard_tests {
     ///
     /// # What is being guarded
     ///
-    /// `store_range`'s hybrid arm and `commit_incremental_range` write **no** `Write_Ledger` entry.
+    /// `PreparedRangeFill::finish` and `commit_incremental_range_shared` write **no** `Write_Ledger` entry.
     /// A staged write-cache credit at either would create a staged range the fold's candidate set —
     /// the ledger and nothing else — cannot see, on every write rather than on a failure. That would
     /// be a larger loss mode than any of § 16.6.6's L1-L8.
@@ -11964,7 +10533,7 @@ mod unledgered_staged_credit_guard_tests {
     ///
     /// Arms 1 and 2 assert the guard behaves when reached. Arm 3 asserts the **premise that it is
     /// not reached**: both `ObjectMetadata` constructors every production caller uses must still
-    /// hardcode `is_write_cached: false`. If either default flipped, every `store_range` call in the
+    /// hardcode `is_write_cached: false`. If either default flipped, every `prepare_range_store` call in the
     /// process would start classifying as staged and the guard would go from unreachable to firing
     /// on the hot path. Nothing else in the tree asserts that, and it is the assertion that would
     /// catch the change while it was still a one-line diff.
@@ -12036,7 +10605,7 @@ mod unledgered_staged_credit_guard_tests {
         assert!(
             !crate::cache_types::ObjectMetadata::default().is_write_cached,
             "the guard is unreachable only because ObjectMetadata::default() hardcodes \
-             is_write_cached: false. If this flips, EVERY store_range call in the process \
+             is_write_cached: false. If this flips, EVERY prepare_range_store call in the process \
              classifies as staged, the guard fires on the hot path, and these two sites need a real \
              ledger append rather than a refusal."
         );
@@ -12427,7 +10996,7 @@ mod tests {
         };
         for start in [0u64, 4096] {
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     start + 1023,
@@ -12496,10 +11065,6 @@ mod tests {
                 dir.to_path_buf(),
                 "case50-instance".to_string(),
             )),
-            Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
-                1024 * 1024,
-                100,
-            )),
         );
         dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
         dc
@@ -12539,12 +11104,12 @@ mod tests {
         };
         let ttl = Duration::from_secs(3600);
         let fill_x = mgr_a
-            .prepare_range_store(key, 0, 65535, &x, meta("\"X\""), ttl, false)
+            .prepare_range_store_witnessed(key, 0, 65535, &x, meta("\"X\""), ttl, false)
             .await
             .unwrap()
             .expect("fixture: fill x is prepared");
         let fill_y = mgr_b
-            .prepare_range_store(key, 0, 65535, &y, meta("\"Y\""), ttl, false)
+            .prepare_range_store_witnessed(key, 0, 65535, &y, meta("\"Y\""), ttl, false)
             .await
             .unwrap()
             .expect("fixture: fill y is prepared");
@@ -12580,10 +11145,6 @@ mod tests {
             Arc::new(crate::journal_manager::JournalManager::new(
                 dir.to_path_buf(),
                 instance.to_string(),
-            )),
-            Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
-                1024 * 1024,
-                100,
             )),
         );
         dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
@@ -12641,14 +11202,14 @@ mod tests {
         };
         let ttl = Duration::from_secs(3600);
         let fill_x = mgr_p1
-            .prepare_range_store(key, 0, 65535, &x, meta("\"X\""), ttl, false)
+            .prepare_range_store_witnessed(key, 0, 65535, &x, meta("\"X\""), ttl, false)
             .await
             .unwrap()
             .expect("fixture: fill x is prepared");
         // Without the seam, the two temps' mtimes are kept apart by more than the 1 ms window.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let fill_y = mgr_p2
-            .prepare_range_store(key, 0, 65535, &y, meta("\"Y\""), ttl, false)
+            .prepare_range_store_witnessed(key, 0, 65535, &y, meta("\"Y\""), ttl, false)
             .await
             .unwrap()
             .expect("fixture: fill y is prepared");
@@ -12752,7 +11313,7 @@ mod tests {
         );
         filetime::set_file_mtime(&bin, old).unwrap();
         let fill = dc
-            .prepare_range_store(
+            .prepare_range_store_witnessed(
                 key,
                 0,
                 1023,
@@ -12791,12 +11352,28 @@ mod tests {
         let key = "test-bucket/same-version";
         let ttl = Duration::from_secs(3600);
         let first = dc
-            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[5u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: the first fill is prepared");
         let second = dc
-            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[5u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: the second fill is prepared");
@@ -12866,12 +11443,28 @@ mod tests {
         let key = "test-bucket/open-fails";
         let ttl = Duration::from_secs(3600);
         let first = dc
-            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[5u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: the first fill is prepared");
         let second = dc
-            .prepare_range_store(key, 0, 1023, &[6u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[6u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: the second fill is prepared");
@@ -12913,12 +11506,28 @@ mod tests {
         let key = "test-bucket/marker-older";
         let ttl = Duration::from_secs(3600);
         let first = dc
-            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[5u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: the first fill is prepared");
         let second = dc
-            .prepare_range_store(key, 0, 1023, &[5u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[5u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: the second fill is prepared");
@@ -12969,12 +11578,28 @@ mod tests {
             .replace(['/', '\\'], "_");
         let ttl = Duration::from_secs(3600);
         let a = dc
-            .prepare_range_store(key, 0, 1023, &[1u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[1u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: fill a is prepared");
         let b = dc
-            .prepare_range_store(key, 0, 1023, &[2u8; 1024], object_metadata_a(), ttl, false)
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                1023,
+                &[2u8; 1024],
+                object_metadata_a(),
+                ttl,
+                false,
+            )
             .await
             .unwrap()
             .expect("fixture: fill b is prepared");
@@ -13012,7 +11637,7 @@ mod tests {
         dc.initialize().await.unwrap();
         let key = "test-bucket/r10-replaced";
         let fill = dc
-            .prepare_range_store(
+            .prepare_range_store_witnessed(
                 key,
                 0,
                 1023,
@@ -13056,8 +11681,17 @@ mod tests {
             .expect("the capacity guard admits with an unconfigured floor");
         DiskCacheManager::write_range_chunk(&mut writer, &[3u8; 1024]).unwrap();
         let tmp = writer.tmp_path.clone();
+        let witness = dc
+            .capture_test_fill_witness(key)
+            .await
+            .expect("fixture: the witness is captured");
         let fill = dc
-            .prepare_incremental_commit(writer, object_metadata_a(), Duration::from_secs(3600))
+            .prepare_incremental_commit(
+                writer,
+                object_metadata_a(),
+                Duration::from_secs(3600),
+                witness,
+            )
             .expect("fixture: the fill is prepared");
         let bytes = std::fs::read(&tmp).unwrap();
         let mtime =
@@ -13095,7 +11729,7 @@ mod tests {
             resume.notify_one();
             acquired
         };
-        let fill = dc.store_range(
+        let fill = dc.store_range_witnessed(
             key,
             0,
             1023,
@@ -13130,7 +11764,7 @@ mod tests {
         .unwrap();
         let key = "test-bucket/case50-fill-append-fails";
         let result = dc
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 1023,
@@ -13831,87 +12465,8 @@ mod tests {
     // ============================================================================
 
     // ============================================================================
-    // Tests for store_range() method
+    // Tests for prepare_range_store() method
     // ============================================================================
-
-    /// L4, data before pointer: a range fill syncs the `.bin` temp first, while neither the
-    /// `.meta` nor the `.bin` is published, then the `.meta` temp, while the `.meta` is still
-    /// unpublished. The direct arm renames the `.meta` before the `.bin`, so syncing the
-    /// `.bin` at its own rename would be too late; the order assertion is what pins that.
-    #[tokio::test]
-    async fn range_fill_syncs_bin_then_meta_before_publishing_either() {
-        use crate::cache_types::ObjectMetadata;
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-        let cache_key = "test-bucket/synced-object";
-        let meta_final = cache_manager.get_new_metadata_file_path(cache_key);
-        let bin_final = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
-        let probe = publish_sync_probe::register(temp_dir.path());
-        probe
-            .watched
-            .lock()
-            .unwrap()
-            .extend([meta_final.clone(), bin_final.clone()]);
-
-        cache_manager
-            .store_range(
-                cache_key,
-                0,
-                1023,
-                &vec![7u8; 1024],
-                ObjectMetadata {
-                    etag: "e".to_string(),
-                    content_length: 1024,
-                    ..Default::default()
-                },
-                Duration::from_secs(3600),
-                false,
-            )
-            .await
-            .unwrap();
-
-        let events = probe.events.lock().unwrap().clone();
-        assert_eq!(
-            events.len(),
-            2,
-            "one .bin and one .meta sync, got {:?}",
-            events
-        );
-        let bin_name = bin_final.file_name().unwrap().to_string_lossy().to_string();
-        let meta_name = meta_final
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let name = |e: &publish_sync_probe::SyncEvent| {
-            e.path.file_name().unwrap().to_string_lossy().to_string()
-        };
-        let bin_stem = bin_name.trim_end_matches(".bin");
-        assert!(
-            name(&events[0]).starts_with(&format!("{bin_stem}."))
-                && name(&events[0]).contains(".tmp."),
-            "the .bin temp is synced first, got {:?}",
-            events[0].path
-        );
-        assert!(
-            events[0].finals_present.is_empty(),
-            "nothing may be published before the .bin data is synced, got {:?}",
-            events[0].finals_present
-        );
-        assert!(
-            name(&events[1]).starts_with(&meta_name) && name(&events[1]) != meta_name,
-            "the .meta temp is synced second, got {:?}",
-            events[1].path
-        );
-        assert!(
-            events[1].finals_present.is_empty(),
-            "the .meta is synced before its rename, got {:?}",
-            events[1].finals_present
-        );
-        assert!(meta_final.exists() && bin_final.exists());
-    }
 
     /// An injected publish-sync failure fails the fill and publishes neither file.
     #[tokio::test]
@@ -13925,7 +12480,7 @@ mod tests {
         let probe = publish_sync_probe::register(temp_dir.path());
         probe.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let result = cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -13973,7 +12528,7 @@ mod tests {
 
         // Store range
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -14007,7 +12562,7 @@ mod tests {
 
     /// Spec: compression-followup-fixes Requirement 1.
     /// A manager built via `new_with_shared_stats` must record its write
-    /// compression counters into the shared stats Arc, so a store_range write
+    /// compression counters into the shared stats Arc, so a prepare_range_store write
     /// is observable through the source handler's snapshot (the object the
     /// /metrics endpoint reads).
     #[tokio::test]
@@ -14046,7 +12601,7 @@ mod tests {
         // Highly compressible payload above the 1024 threshold → compressed branch.
         let data = vec![42u8; 4096];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 "shared-stats-bucket/obj",
                 0,
                 4095,
@@ -14064,7 +12619,7 @@ mod tests {
         let after = source.get_stats();
         assert_eq!(
             after.total_objects_compressed, 1,
-            "store_range compression should increment the shared stats Arc"
+            "prepare_range_store compression should increment the shared stats Arc"
         );
         assert!(
             after.total_bytes_before >= 4096,
@@ -14100,7 +12655,7 @@ mod tests {
             let data = vec![i as u8; 1024];
 
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -14131,117 +12686,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_range_etag_mismatch_invalidation() {
-        use crate::cache_types::ObjectMetadata;
-
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let start = 0u64;
-        let end = 1023u64;
-        let data = vec![42u8; 1024];
-
-        let object_metadata = ObjectMetadata {
-            etag: "test-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: 10240,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: 10240,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        // Store first range successfully
-        cache_manager
-            .store_range(
-                cache_key,
-                start,
-                end,
-                &data,
-                object_metadata.clone(),
-                Duration::from_secs(3600),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify first range was stored
-        let metadata_file_path = cache_manager.get_new_metadata_file_path(cache_key);
-        let metadata_content = std::fs::read_to_string(&metadata_file_path).unwrap();
-        let metadata: crate::cache_types::NewCacheMetadata =
-            serde_json::from_str(&metadata_content).unwrap();
-        assert_eq!(metadata.ranges.len(), 1, "Should have 1 range");
-        assert_eq!(metadata.object_metadata.etag, "test-etag");
-
-        // Get the path of the first range file
-        let first_range_path = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
-        assert!(first_range_path.exists(), "First range file should exist");
-
-        // Store with different ETag - should invalidate existing ranges and succeed
-        // Requirement 14.1, 14.2, 14.3: ETag mismatch invalidates existing ranges
-        let different_metadata = ObjectMetadata {
-            etag: "different-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: 10240,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: 10240,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        let result = cache_manager
-            .store_range(
-                cache_key,
-                1024,
-                2047,
-                &data,
-                different_metadata,
-                std::time::Duration::from_secs(3600),
-                true,
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "Should succeed after invalidating old ranges"
-        );
-
-        // Verify the old range file was deleted
-        assert!(
-            !first_range_path.exists(),
-            "Old range file should be deleted on ETag mismatch"
-        );
-
-        // Verify new range was stored with new ETag
-        let new_range_path = cache_manager.get_new_range_file_path(cache_key, 1024, 2047);
-        assert!(new_range_path.exists(), "New range file should exist");
-
-        // Verify metadata was updated with new ETag and only new range
-        let metadata_content = std::fs::read_to_string(&metadata_file_path).unwrap();
-        let metadata: crate::cache_types::NewCacheMetadata =
-            serde_json::from_str(&metadata_content).unwrap();
-
-        assert_eq!(
-            metadata.ranges.len(),
-            1,
-            "Should have only 1 range (the new one)"
-        );
-        assert_eq!(
-            metadata.object_metadata.etag, "different-etag",
-            "ETag should be updated"
-        );
-        assert_eq!(
-            metadata.ranges[0].start, 1024,
-            "Range should be the new one"
-        );
-        assert_eq!(metadata.ranges[0].end, 2047, "Range should be the new one");
-    }
-
-    #[tokio::test]
     async fn test_store_range_invalid_range() {
         use crate::cache_types::ObjectMetadata;
 
@@ -14266,7 +12710,7 @@ mod tests {
 
         // Test start > end
         let result = cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 1024,
                 0,
@@ -14281,7 +12725,7 @@ mod tests {
         // Test data size mismatch (data larger than range)
         // data is 1024 bytes but range 0-511 expects 512 bytes
         let result = cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 511,
@@ -14325,7 +12769,7 @@ mod tests {
 
         // Store range first time
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -14339,7 +12783,7 @@ mod tests {
 
         // Store same range again (update)
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -14390,7 +12834,7 @@ mod tests {
 
         // Store full object as range 0 to content_length-1
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 content_length - 1,
@@ -14448,7 +12892,7 @@ mod tests {
 
         // Store range
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -14524,7 +12968,7 @@ mod tests {
                 let data = vec![i as u8; 1024];
 
                 let mut cm = cache_manager_clone.lock().await;
-                cm.store_range(
+                cm.store_range_witnessed(
                     &cache_key_clone,
                     start,
                     end,
@@ -14574,7 +13018,7 @@ mod tests {
     }
 
     // ============================================================================
-    // Tests for get_metadata() and update_metadata() methods
+    // Tests for get_metadata()
     // ============================================================================
 
     #[tokio::test]
@@ -14620,7 +13064,7 @@ mod tests {
 
         // Store range
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -14673,7 +13117,7 @@ mod tests {
             let data = vec![i as u8; 1024 * 1024]; // 1MB each
 
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -14742,7 +13186,7 @@ mod tests {
         };
 
         // Write expired write-cache metadata directly
-        cache_manager.update_metadata(&metadata).await.unwrap();
+        cache_manager.seed_metadata_for_tests(&metadata);
 
         // Try to get metadata - should return None because write cache is expired
         let result = cache_manager.get_metadata(cache_key).await.unwrap();
@@ -15345,311 +13789,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_metadata_basic() {
-        use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
-
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let now = SystemTime::now();
-
-        let metadata = NewCacheMetadata {
-            cache_key: cache_key.to_string(),
-            object_metadata: ObjectMetadata {
-                etag: "test-etag".to_string(),
-                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                content_length: 10240,
-                content_type: Some("application/octet-stream".to_string()),
-                upload_state: crate::cache_types::UploadState::Complete,
-                cumulative_size: 10240,
-                parts: Vec::new(),
-                ..Default::default()
-            },
-            ranges: vec![RangeSpec::new(
-                0,
-                1023,
-                "test_0-1023.bin".to_string(),
-                crate::compression::CompressionAlgorithm::Lz4,
-                1024,
-                1024,
-            )],
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600),
-            compression_info: CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        // Update metadata
-        cache_manager.update_metadata(&metadata).await.unwrap();
-
-        // Verify file exists
-        let metadata_file_path = cache_manager.get_new_metadata_file_path(cache_key);
-        assert!(metadata_file_path.exists(), "Metadata file should exist");
-
-        // Read and verify
-        let retrieved = cache_manager.get_metadata(cache_key).await.unwrap();
-        assert!(retrieved.is_some());
-
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.cache_key, metadata.cache_key);
-        assert_eq!(
-            retrieved.object_metadata.etag,
-            metadata.object_metadata.etag
-        );
-        assert_eq!(retrieved.ranges.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_update_metadata_atomic() {
-        use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
-
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let now = SystemTime::now();
-
-        // Create initial metadata
-        let metadata1 = NewCacheMetadata {
-            cache_key: cache_key.to_string(),
-            object_metadata: ObjectMetadata {
-                etag: "etag-1".to_string(),
-                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                content_length: 1024,
-                content_type: Some("application/octet-stream".to_string()),
-                upload_state: crate::cache_types::UploadState::Complete,
-                cumulative_size: 1024,
-                parts: Vec::new(),
-                ..Default::default()
-            },
-            ranges: Vec::new(),
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600),
-            compression_info: CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        cache_manager.update_metadata(&metadata1).await.unwrap();
-
-        // Update with new metadata
-        let metadata2 = NewCacheMetadata {
-            cache_key: cache_key.to_string(),
-            object_metadata: ObjectMetadata {
-                etag: "etag-2".to_string(),
-                last_modified: "Thu, 22 Oct 2015 07:28:00 GMT".to_string(),
-                content_length: 2048,
-                content_type: Some("application/octet-stream".to_string()),
-                upload_state: crate::cache_types::UploadState::Complete,
-                cumulative_size: 2048,
-                parts: Vec::new(),
-                ..Default::default()
-            },
-            ranges: Vec::new(),
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600),
-            compression_info: CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        cache_manager.update_metadata(&metadata2).await.unwrap();
-
-        // Verify the update
-        let retrieved = cache_manager
-            .get_metadata(cache_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retrieved.object_metadata.etag, "etag-2");
-        assert_eq!(retrieved.object_metadata.content_length, 2048);
-    }
-
-    #[tokio::test]
-    async fn test_update_metadata_no_tmp_files_left() {
-        use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
-
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let now = SystemTime::now();
-
-        let metadata = NewCacheMetadata {
-            cache_key: cache_key.to_string(),
-            object_metadata: ObjectMetadata {
-                etag: "test-etag".to_string(),
-                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                content_length: 1024,
-                content_type: Some("application/octet-stream".to_string()),
-                upload_state: crate::cache_types::UploadState::Complete,
-                cumulative_size: 1024,
-                parts: Vec::new(),
-                ..Default::default()
-            },
-            ranges: Vec::new(),
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600),
-            compression_info: CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        cache_manager.update_metadata(&metadata).await.unwrap();
-
-        // Check for any .tmp files in metadata directory
-        let metadata_dir = temp_dir.path().join("metadata");
-
-        for entry in std::fs::read_dir(&metadata_dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            assert!(
-                !path.to_string_lossy().ends_with(".tmp"),
-                "No .tmp files should remain"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_update_metadata_creates_directory() {
-        use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
-
-        let temp_dir = TempDir::new().unwrap();
-        // Don't initialize - test that update_metadata creates directories
-        let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-
-        let cache_key = "test-bucket/test-object";
-        let now = SystemTime::now();
-
-        let metadata = NewCacheMetadata {
-            cache_key: cache_key.to_string(),
-            object_metadata: ObjectMetadata {
-                etag: "test-etag".to_string(),
-                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                content_length: 1024,
-                content_type: Some("application/octet-stream".to_string()),
-                upload_state: crate::cache_types::UploadState::Complete,
-                cumulative_size: 1024,
-                parts: Vec::new(),
-                ..Default::default()
-            },
-            ranges: Vec::new(),
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600),
-            compression_info: CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        // Should create metadata directory automatically
-        cache_manager.update_metadata(&metadata).await.unwrap();
-
-        let metadata_file_path = cache_manager.get_new_metadata_file_path(cache_key);
-        assert!(metadata_file_path.exists(), "Metadata file should exist");
-        assert!(
-            metadata_file_path.parent().unwrap().exists(),
-            "Metadata directory should exist"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_and_update_metadata_round_trip() {
-        use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
-
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let now = SystemTime::now();
-
-        // Create metadata with multiple ranges
-        let mut metadata = NewCacheMetadata {
-            cache_key: cache_key.to_string(),
-            object_metadata: ObjectMetadata {
-                etag: "test-etag".to_string(),
-                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                content_length: 10240,
-                content_type: Some("application/octet-stream".to_string()),
-                upload_state: crate::cache_types::UploadState::Complete,
-                cumulative_size: 10240,
-                parts: Vec::new(),
-                ..Default::default()
-            },
-            ranges: vec![
-                RangeSpec::new(
-                    0,
-                    1023,
-                    "test_0-1023.bin".to_string(),
-                    crate::compression::CompressionAlgorithm::Lz4,
-                    512,
-                    1024,
-                ),
-                RangeSpec::new(
-                    1024,
-                    2047,
-                    "test_1024-2047.bin".to_string(),
-                    crate::compression::CompressionAlgorithm::Lz4,
-                    1024,
-                    1024,
-                ),
-            ],
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600),
-            compression_info: CompressionInfo::default(),
-            ..Default::default()
-        };
-
-        // Write metadata
-        cache_manager.update_metadata(&metadata).await.unwrap();
-
-        // Read it back
-        let retrieved = cache_manager
-            .get_metadata(cache_key)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Verify all fields match
-        assert_eq!(retrieved.cache_key, metadata.cache_key);
-        assert_eq!(
-            retrieved.object_metadata.etag,
-            metadata.object_metadata.etag
-        );
-        assert_eq!(retrieved.ranges.len(), 2);
-        assert_eq!(retrieved.ranges[0].start, 0);
-        assert_eq!(retrieved.ranges[0].end, 1023);
-        assert_eq!(retrieved.ranges[1].start, 1024);
-        assert_eq!(retrieved.ranges[1].end, 2047);
-
-        // Modify and update
-        metadata.ranges.push(RangeSpec::new(
-            2048,
-            3071,
-            "test_2048-3071.bin".to_string(),
-            crate::compression::CompressionAlgorithm::Lz4,
-            1024,
-            1024,
-        ));
-
-        cache_manager.update_metadata(&metadata).await.unwrap();
-
-        // Read again and verify the update
-        let retrieved2 = cache_manager
-            .get_metadata(cache_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retrieved2.ranges.len(), 3);
-        assert_eq!(retrieved2.ranges[2].start, 2048);
-    }
-
-    #[tokio::test]
     async fn test_metadata_operations_with_special_characters() {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
@@ -15682,7 +13821,7 @@ mod tests {
         };
 
         // Should handle special characters correctly
-        cache_manager.update_metadata(&metadata).await.unwrap();
+        cache_manager.seed_metadata_for_tests(&metadata);
 
         let retrieved = cache_manager.get_metadata(cache_key).await.unwrap();
         assert!(retrieved.is_some());
@@ -15739,7 +13878,7 @@ mod tests {
                 ..Default::default()
             };
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     0,
                     1023,
@@ -15838,7 +13977,7 @@ mod tests {
 
         // The file holds the other version's bytes ("v2").
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -15961,7 +14100,7 @@ mod tests {
         // Store a range
         let data = vec![42u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -16007,7 +14146,7 @@ mod tests {
         // Store a large range
         let data = vec![42u8; 4096];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 4095,
@@ -16058,7 +14197,7 @@ mod tests {
         let data1 = vec![1u8; 1024];
         let data2 = vec![2u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -16070,7 +14209,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 4096,
                 5119,
@@ -16114,7 +14253,7 @@ mod tests {
         // Store range 0-1023
         let data = vec![42u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -16160,7 +14299,7 @@ mod tests {
         // Store range 1024-2047
         let data = vec![42u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 1024,
                 2047,
@@ -16209,7 +14348,7 @@ mod tests {
             let end = start + 1023;
             let data = vec![i as u8; 1024];
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -16263,7 +14402,7 @@ mod tests {
         let data1 = vec![1u8; 1024];
         let data2 = vec![2u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -16275,7 +14414,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 1024,
                 2047,
@@ -16323,7 +14462,7 @@ mod tests {
         // Store range 1024-2047
         let data = vec![42u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 1024,
                 2047,
@@ -16389,7 +14528,7 @@ mod tests {
         // Store full object as range 0 to content_length-1
         let data = vec![42u8; content_length as usize];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 content_length - 1,
@@ -16461,7 +14600,7 @@ mod tests {
             let end = start + 1024 * 1024 - 1;
             let data = vec![i as u8; 1024 * 1024];
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -16507,7 +14646,7 @@ mod tests {
         // Store ranges in non-sequential order
         let data = vec![42u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 4096,
                 5119,
@@ -16519,7 +14658,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -16531,7 +14670,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 2048,
                 3071,
@@ -16588,7 +14727,7 @@ mod tests {
         // Store range 0-1023
         let data = vec![42u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -16638,7 +14777,7 @@ mod tests {
             let end = start + 1024 * 1024 - 1;
             let data = vec![i as u8; 1024 * 1024];
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -16709,7 +14848,7 @@ mod tests {
         let data_c = vec![3u8; 3000];
 
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 2999,
@@ -16721,7 +14860,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 5000,
                 7999,
@@ -16733,7 +14872,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 9000,
                 11999,
@@ -16804,7 +14943,7 @@ mod tests {
         // Store ranges: 0-999, 3000-3999, 6000-6999
         let data = vec![42u8; 1000];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 999,
@@ -16816,7 +14955,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 3000,
                 3999,
@@ -16828,7 +14967,7 @@ mod tests {
             .await
             .unwrap();
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 6000,
                 6999,
@@ -16890,7 +15029,7 @@ mod tests {
         // Store only a tiny portion: 0-1023 (1KB out of 100KB)
         let data = vec![42u8; 1024];
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 1023,
@@ -16949,7 +15088,7 @@ mod tests {
 
         // Store range
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -17008,7 +15147,7 @@ mod tests {
 
         // Store range (should be compressed)
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -17072,7 +15211,7 @@ mod tests {
 
         // Store range (no compression)
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -17163,7 +15302,7 @@ mod tests {
             let data = vec![i as u8; 1024];
             expected_data.push(data.clone());
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -17219,7 +15358,7 @@ mod tests {
 
         // Store large range
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -17273,7 +15412,7 @@ mod tests {
 
         // Store full object as range 0 to content_length-1
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 0,
                 content_length - 1,
@@ -17335,7 +15474,7 @@ mod tests {
         for (cache_key, original_data) in test_cases {
             // Store range
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     0,
                     2047,
@@ -17395,7 +15534,7 @@ mod tests {
 
         // Store single byte range
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -17453,7 +15592,7 @@ mod tests {
             let data = vec![i as u8; 1024];
             expected_data.push(data.clone());
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -17509,7 +15648,7 @@ mod tests {
             let end = start + 1024 * 1024 - 1;
             let data = vec![i as u8; 1024 * 1024];
             cache_manager
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -17625,7 +15764,7 @@ mod tests {
             cache_manager
                 .lock()
                 .await
-                .store_range(
+                .store_range_witnessed(
                     cache_key,
                     start,
                     end,
@@ -17672,425 +15811,6 @@ mod tests {
     // ============================================================================
     // Tests for Full Object as Range Handling (Task 7)
     // ============================================================================
-
-    #[tokio::test]
-    async fn test_store_full_object_as_range_basic() {
-        use crate::cache_types::ObjectMetadata;
-
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let data = vec![42u8; 10240]; // 10KB object
-
-        let object_metadata = ObjectMetadata {
-            etag: "test-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: data.len() as u64,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: data.len() as u64,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        // Store full object as range
-        cache_manager
-            .store_full_object_as_range(
-                cache_key,
-                &data,
-                object_metadata.clone(),
-                Duration::from_secs(3600),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify it was stored as range 0 to content_length-1
-        let metadata = cache_manager
-            .get_metadata(cache_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(metadata.ranges.len(), 1, "Should have exactly one range");
-        assert_eq!(metadata.ranges[0].start, 0, "Range should start at 0");
-        assert_eq!(
-            metadata.ranges[0].end, 10239,
-            "Range should end at content_length-1"
-        );
-        assert_eq!(
-            metadata.ranges[0].uncompressed_size, 10240,
-            "Uncompressed size should match data length"
-        );
-
-        // Verify range file exists
-        let range_file_path = cache_manager.get_new_range_file_path(cache_key, 0, 10239);
-        assert!(range_file_path.exists(), "Range file should exist");
-    }
-
-    #[tokio::test]
-    async fn test_store_full_object_as_range_empty_object() {
-        use crate::cache_types::ObjectMetadata;
-
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/empty-object";
-        let data = vec![]; // Empty object
-
-        let object_metadata = ObjectMetadata {
-            etag: "empty-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: 0,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: 0,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        // Store empty object
-        cache_manager
-            .store_full_object_as_range(
-                cache_key,
-                &data,
-                object_metadata.clone(),
-                Duration::from_secs(3600),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify metadata exists but has no ranges (empty objects have no data to cache)
-        let metadata = cache_manager
-            .get_metadata(cache_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            metadata.ranges.len(),
-            0,
-            "Empty object should have no ranges"
-        );
-        assert_eq!(
-            metadata.object_metadata.content_length, 0,
-            "Content length should be 0"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_full_object_can_serve_any_range() {
-        use crate::cache_types::ObjectMetadata;
-
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let original_data: Vec<u8> = (0..10240).map(|i| (i % 256) as u8).collect(); // 10KB with pattern
-
-        let object_metadata = ObjectMetadata {
-            etag: "test-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: original_data.len() as u64,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: original_data.len() as u64,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        // Store full object as range
-        cache_manager
-            .store_full_object_as_range(
-                cache_key,
-                &original_data,
-                object_metadata.clone(),
-                Duration::from_secs(3600),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Test that we can serve various range requests from the cached full object
-
-        // Test range at start
-        let ranges = cache_manager
-            .fresh_serve_ranges(cache_key, 0, 1023)
-            .await
-            .unwrap();
-        assert_eq!(ranges.len(), 1, "Should find range covering start");
-        let range_data = cache_manager.load_range_data(&ranges[0]).await.unwrap();
-        assert_eq!(
-            &range_data[0..1024],
-            &original_data[0..1024],
-            "Range data should match"
-        );
-
-        // Test range in middle
-        let ranges = cache_manager
-            .fresh_serve_ranges(cache_key, 5000, 6000)
-            .await
-            .unwrap();
-        assert_eq!(ranges.len(), 1, "Should find range covering middle");
-
-        // Test range at end
-        let ranges = cache_manager
-            .fresh_serve_ranges(cache_key, 9000, 10239)
-            .await
-            .unwrap();
-        assert_eq!(ranges.len(), 1, "Should find range covering end");
-
-        // Test full range
-        let ranges = cache_manager
-            .fresh_serve_ranges(cache_key, 0, 10239)
-            .await
-            .unwrap();
-        assert_eq!(ranges.len(), 1, "Should find range covering entire object");
-        assert_eq!(ranges[0].start, 0, "Range should start at 0");
-        assert_eq!(ranges[0].end, 10239, "Range should end at content_length-1");
-    }
-
-    #[tokio::test]
-    async fn test_full_object_as_range_no_special_casing() {
-        use crate::cache_types::ObjectMetadata;
-
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let full_object_data = vec![42u8; 10240]; // 10KB object
-
-        let object_metadata = ObjectMetadata {
-            etag: "test-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: full_object_data.len() as u64,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: full_object_data.len() as u64,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        // Store full object using store_full_object_as_range
-        cache_manager
-            .store_full_object_as_range(
-                cache_key,
-                &full_object_data,
-                object_metadata.clone(),
-                Duration::from_secs(3600),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Now store a partial range using store_range
-        let cache_key2 = "test-bucket/test-object-2";
-        let partial_data = vec![99u8; 1024];
-        cache_manager
-            .store_range(
-                cache_key2,
-                0,
-                1023,
-                &partial_data,
-                object_metadata.clone(),
-                Duration::from_secs(3600),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Both should be stored in the same way (as ranges in the ranges/ directory)
-        let full_obj_metadata = cache_manager
-            .get_metadata(cache_key)
-            .await
-            .unwrap()
-            .unwrap();
-        let partial_obj_metadata = cache_manager
-            .get_metadata(cache_key2)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Both should have ranges array
-        assert!(
-            !full_obj_metadata.ranges.is_empty(),
-            "Full object should have ranges"
-        );
-        assert!(
-            !partial_obj_metadata.ranges.is_empty(),
-            "Partial range should have ranges"
-        );
-
-        // Both should have range files in ranges/ directory
-        let full_obj_range_path = cache_manager.get_new_range_file_path(cache_key, 0, 10239);
-        let partial_range_path = cache_manager.get_new_range_file_path(cache_key2, 0, 1023);
-
-        assert!(
-            full_obj_range_path.to_string_lossy().contains("ranges/"),
-            "Full object should be in ranges/ directory"
-        );
-        assert!(
-            partial_range_path.to_string_lossy().contains("ranges/"),
-            "Partial range should be in ranges/ directory"
-        );
-
-        // Both should be retrievable using the same mechanisms
-        let full_obj_ranges = cache_manager
-            .fresh_serve_ranges(cache_key, 0, 10239)
-            .await
-            .unwrap();
-        let partial_ranges = cache_manager
-            .fresh_serve_ranges(cache_key2, 0, 1023)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            full_obj_ranges.len(),
-            1,
-            "Full object should have one range"
-        );
-        assert_eq!(
-            partial_ranges.len(),
-            1,
-            "Partial range should have one range"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_store_full_object_size_mismatch() {
-        use crate::cache_types::ObjectMetadata;
-
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-
-        let cache_key = "test-bucket/test-object";
-        let data = vec![42u8; 10240]; // 10KB object
-
-        let object_metadata = ObjectMetadata {
-            etag: "test-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: 5120, // Wrong size!
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: 5120,
-            parts: Vec::new(),
-            ..Default::default()
-        };
-
-        // Try to store with mismatched size - should fail
-        let result = cache_manager
-            .store_full_object_as_range(
-                cache_key,
-                &data,
-                object_metadata.clone(),
-                Duration::from_secs(3600),
-                true,
-            )
-            .await;
-        assert!(
-            result.is_err(),
-            "Should fail when data length doesn't match metadata"
-        );
-    }
-
-    /// One key, one stored range, and a peer holding the key's metadata slot lock.
-    ///
-    /// The range is stored BEFORE the peer takes the slot, because `store_range` acquires
-    /// the same slot and would otherwise wait on the fixture's own peer. Returns the live
-    /// guard so the test decides when the peer releases.
-    async fn slot_contended_entry(
-        cache_manager: &mut DiskCacheManager,
-        cache_key: &str,
-    ) -> (crate::metadata_lock_manager::MetadataLock, PathBuf, PathBuf) {
-        let object_metadata = crate::cache_types::ObjectMetadata {
-            etag: "\"metalock-b1\"".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: 1024,
-            content_type: Some("application/octet-stream".to_string()),
-            upload_state: crate::cache_types::UploadState::Complete,
-            cumulative_size: 1024,
-            ..Default::default()
-        };
-        cache_manager
-            .store_range(
-                cache_key,
-                0,
-                1023,
-                &vec![9u8; 1024],
-                object_metadata,
-                Duration::from_secs(3600),
-                true,
-            )
-            .await
-            .expect("fixture: store_range must succeed");
-
-        let meta_path = cache_manager.get_new_metadata_file_path(cache_key);
-        let bin_path = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
-        assert!(meta_path.exists(), "fixture: .meta must exist");
-        assert!(bin_path.exists(), "fixture: .bin must exist");
-
-        let peer = crate::metadata_lock_manager::try_acquire_slot_lock(
-            &cache_manager.cache_dir,
-            cache_key,
-        )
-        .expect("fixture: the peer must be able to take the slot");
-        assert_eq!(
-            peer.lock_file_path(),
-            crate::metadata_lock_manager::slot_lock_path(&cache_manager.cache_dir, cache_key),
-            "fixture: the peer must hold the SAME slot the function under test acquires"
-        );
-        (peer, meta_path, bin_path)
-    }
-
-    /// Same two-sided shape for `invalidate_cache_entry`. This function has no production
-    /// caller on this tree (its three callers have none of their own), so the assertion
-    /// pins the contract for whatever revives it rather than guarding a live path.
-    #[tokio::test]
-    async fn invalidate_cache_entry_refuses_while_a_peer_holds_the_slot_then_deletes() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        cache_manager.initialize().await.unwrap();
-        let cache_key = "test-bucket/metalock-b1-invalidate-cache-entry";
-        let (peer, meta_path, bin_path) = slot_contended_entry(&mut cache_manager, cache_key).await;
-
-        let contended = cache_manager.invalidate_cache_entry(cache_key).await;
-        assert!(
-            contended.is_err(),
-            "invalidate_cache_entry must fail rather than delete while a peer holds the \
-             key's metadata slot lock. got={contended:?}"
-        );
-        assert!(
-            meta_path.exists() && bin_path.exists(),
-            "the entry was deleted while a peer held the slot — the read-then-delete ran \
-             unlocked. meta_exists={} bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
-
-        drop(peer);
-        cache_manager
-            .invalidate_cache_entry(cache_key)
-            .await
-            .expect("once the slot is free the invalidation must proceed");
-        assert!(
-            !meta_path.exists() && !bin_path.exists(),
-            "positive control: with the slot free the entry must be deleted. meta_exists={} \
-             bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
-    }
 
     // Property-based tests using quickcheck
     use quickcheck::TestResult;
@@ -18900,62 +16620,6 @@ mod tests {
         );
     }
 
-    /// A range file whose bytes are not a valid LZ4 frame is counted in
-    /// `atomic_metadata.range_file_corruption_detected` on both client read paths: the
-    /// buffered `load_range_data` and the streamed `stream_range_data`.
-    ///
-    /// The counter is process-global and another test in this binary also streams a corrupt
-    /// file, so each assertion is a lower bound on this test's own reads rather than an exact
-    /// delta.
-    ///
-    /// # RED SIDE
-    ///
-    /// With either `note_range_file_corruption` call removed, the matching assertion fails
-    /// (run this test alone so the other corrupt-stream test cannot move the counter).
-    #[tokio::test]
-    async fn store_range_over_an_unparseable_meta_counts_a_heal() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut dcm =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-        dcm.initialize().await.unwrap();
-        let cache_key = "heal-bucket/counted-heal.txt";
-        let data = b"healed bytes";
-        let path = dcm.get_new_metadata_file_path(cache_key);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "NOT JSON").unwrap();
-        let object_metadata = crate::cache_types::ObjectMetadata::new(
-            "\"etag-counted-heal\"".to_string(),
-            "Wed, 21 Oct 2025 07:28:00 GMT".to_string(),
-            data.len() as u64,
-            Some("text/plain".to_string()),
-        );
-        let before = metadata_heal_overwrite_total();
-        dcm.store_range(
-            cache_key,
-            0,
-            data.len() as u64 - 1,
-            data,
-            object_metadata,
-            std::time::Duration::from_secs(3600),
-            true,
-        )
-        .await
-        .unwrap();
-        assert!(
-            serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
-                &std::fs::read_to_string(&path).unwrap()
-            )
-            .is_ok(),
-            "PRECONDITION: store_range must have replaced the unparseable .meta"
-        );
-        let after = metadata_heal_overwrite_total();
-        assert!(
-            after > before,
-            "store_range replaced an unparseable .meta but cache.metadata_heal_overwrite_total \
-             did not move ({before} -> {after})"
-        );
-    }
-
     /// range files written by earlier releases declare 4 MiB blocks. The writers now
     /// declare 64 KiB, and those older files must still read back byte-exact on both client
     /// read paths: the buffered `load_range_data` and the streamed `stream_range_data`.
@@ -19215,7 +16879,7 @@ mod tests {
             .collect()
     }
 
-    /// Store `data` as range `start..start+len-1` of `cache_key` through `store_range`, so a
+    /// Store `data` as range `start..start+len-1` of `cache_key` through `prepare_range_store`, so a
     /// real `.meta` lists it, and return the stored `RangeSpec`.
     async fn self_heal_store(
         dcm: &mut DiskCacheManager,
@@ -19231,7 +16895,7 @@ mod tests {
             Some("application/octet-stream".to_string()),
         );
         let end = start + data.len() as u64 - 1;
-        dcm.store_range(
+        dcm.store_range_witnessed(
             cache_key,
             start,
             end,
@@ -19243,7 +16907,7 @@ mod tests {
         .await
         .unwrap();
         self_heal_listed(dcm, cache_key, start, end)
-            .expect("fixture: store_range must list the range")
+            .expect("fixture: prepare_range_store must list the range")
     }
 
     /// The range `start..=end` as the key's `.meta` on disk lists it, if it does.
@@ -19638,8 +17302,9 @@ mod tests {
         );
     }
 
-    /// (c) control: a mark names the file a read found damaged, not the range. A refill of
-    /// the same key and extent publishes a new file, and the next read of it is a hit.
+    /// (c) control: a mark names the file a read found damaged, not the range. After another
+    /// proxy's heal (or an eviction) removes the file, a refill of the same key and extent
+    /// publishes a new file, and the next read of it is a hit.
     ///
     /// # RED SIDE
     ///
@@ -19657,6 +17322,19 @@ mod tests {
         assert!(
             self_heal_stream(&dcm, &spec).await.is_err(),
             "fixture: the streamed read of the damaged file must break"
+        );
+        // A peer proxy healed the range, or eviction removed it: the file and its listing go
+        // under the key's lock, and this proxy's mark of the damaged file stays in the
+        // process-wide mark set. A fill over a listed, present file is dropped, so this is
+        // how a new file reaches the same path.
+        let removal = dcm
+            .batch_delete_ranges_expecting(cache_key, &[(spec.start, spec.end)], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            removal.unlinked_ranges.len(),
+            1,
+            "fixture: the removal must take the damaged file"
         );
         let refilled = self_heal_store(&mut dcm, cache_key, 0, &data, data.len() as u64).await;
         assert!(
@@ -19991,13 +17669,24 @@ mod tests {
         let cache_key = "heal-bucket/self-heal-overwrite.bin";
         let stale = self_heal_store(&mut dcm, cache_key, 0, &data, data.len() as u64).await;
         let newer: Vec<u8> = data.iter().map(|b| b.to_ascii_uppercase()).collect();
+        // The origin's object changed: the revalidation that sees the new version removes the
+        // old version's ranges and `.meta` (a fill of another version over a published
+        // `.meta` is dropped), and the refill publishes the new version at the same path.
+        let removal = dcm
+            .batch_delete_ranges_expecting(cache_key, &[(stale.start, stale.end)], None)
+            .await
+            .unwrap();
+        assert!(
+            removal.meta_unlinked && removal.unlinked_ranges.len() == 1,
+            "fixture: the invalidation must take the old version's range and its .meta"
+        );
         let object_metadata = crate::cache_types::ObjectMetadata::new(
             "\"etag-self-heal-v2\"".to_string(),
             "Thu, 22 Oct 2025 07:28:00 GMT".to_string(),
             newer.len() as u64,
             Some("application/octet-stream".to_string()),
         );
-        dcm.store_range(
+        dcm.store_range_witnessed(
             cache_key,
             0,
             newer.len() as u64 - 1,
@@ -20281,7 +17970,7 @@ mod tests {
         );
     }
 
-    /// Test that commit_incremental_range returns an error when fewer bytes than expected
+    /// Test that commit_incremental_range_witnessed returns an error when fewer bytes than expected
     /// are written, and cleans up both .tmp and .bin files.
     /// Validates: Requirement 2.3
     #[tokio::test]
@@ -20321,7 +18010,7 @@ mod tests {
 
         // Commit should fail due to size mismatch
         let result = cache_manager
-            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .commit_incremental_range_witnessed(writer, object_metadata, Duration::from_secs(3600))
             .await;
         assert!(
             result.is_err(),
@@ -20393,7 +18082,7 @@ mod tests {
             ..Default::default()
         };
         let result = cache_manager
-            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .commit_incremental_range_witnessed(writer, object_metadata, Duration::from_secs(3600))
             .await;
         assert!(
             result.is_ok(),
@@ -20453,7 +18142,11 @@ mod tests {
         DiskCacheManager::write_range_chunk(&mut writer, &vec![0xCDu8; 256]).unwrap();
 
         let result = cache_manager
-            .commit_incremental_range(writer, ObjectMetadata::default(), Duration::from_secs(3600))
+            .commit_incremental_range_witnessed(
+                writer,
+                ObjectMetadata::default(),
+                Duration::from_secs(3600),
+            )
             .await;
         assert!(result.is_err(), "25% prefix below ratio 0.5 must error");
         assert!(format!("{}", result.unwrap_err()).contains("size mismatch"));
@@ -20502,7 +18195,11 @@ mod tests {
         DiskCacheManager::write_range_chunk(&mut writer, &vec![0xEEu8; 768]).unwrap();
 
         let result = cache_manager
-            .commit_incremental_range(writer, ObjectMetadata::default(), Duration::from_secs(3600))
+            .commit_incremental_range_witnessed(
+                writer,
+                ObjectMetadata::default(),
+                Duration::from_secs(3600),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -20552,7 +18249,7 @@ mod tests {
 
         // Commit
         cache_manager
-            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .commit_incremental_range_witnessed(writer, object_metadata, Duration::from_secs(3600))
             .await
             .unwrap();
 
@@ -20769,7 +18466,7 @@ mod tests {
 
     /// After committing an incremental write whose total size is not a multiple
     /// of `batch_size`, the residual bytes in `batch_buf` must be flushed as a
-    /// final LZ4 frame by `commit_incremental_range`, and the resulting `.bin`
+    /// final LZ4 frame by `commit_incremental_range_witnessed`, and the resulting `.bin`
     /// file must decompress to the full input via `load_range_data`.
     /// Validates: Requirements 2.3, 1.3 (byte-identity via round-trip)
     #[tokio::test]
@@ -20847,7 +18544,7 @@ mod tests {
         // Snapshot compressed_bytes_written by re-reading it after commit via
         // the `.bin` file on disk — the writer is consumed by commit.
         cache_manager
-            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .commit_incremental_range_witnessed(writer, object_metadata, Duration::from_secs(3600))
             .await
             .unwrap();
 
@@ -20952,7 +18649,7 @@ mod tests {
 
     /// Producer audit (cache-eviction-at-scale task 29 part 3, see
     /// `CAPACITY-AUTHORITY-PATH-FORWARD.md` § "CORRECTION 2026-09-03"). Pins, for
-    /// `DiskCacheManager::store_range` (`disk_cache.rs:1176`), that the persisted
+    /// `DiskCacheManager::prepare_range_store` (`disk_cache.rs:1176`), that the persisted
     /// `.bin` file's on-disk byte length equals `RangeSpec.compressed_size`
     /// exactly, and that those bytes decode as a valid LZ4 frame — i.e.
     /// `st_size(.bin) == compressed_size` holds by construction, not by
@@ -20987,7 +18684,7 @@ mod tests {
         };
 
         cache_manager
-            .store_range(
+            .store_range_witnessed(
                 cache_key,
                 start,
                 end,
@@ -21016,14 +18713,14 @@ mod tests {
 
         assert_eq!(
             st_size, recorded_compressed_size,
-            "st_size(.bin) must equal RangeSpec.compressed_size for store_range's output"
+            "st_size(.bin) must equal RangeSpec.compressed_size for prepare_range_store's output"
         );
 
         // And the bytes must be a valid, decodable LZ4 frame — never raw passthrough.
         let handler = crate::compression::CompressionHandler::new(10, true);
         let decoded = handler
             .decompress_data(&on_disk)
-            .expect(".bin bytes from store_range must decode as a standard LZ4 frame");
+            .expect(".bin bytes from prepare_range_store must decode as a standard LZ4 frame");
         assert_eq!(decoded, data);
     }
 
@@ -21706,7 +19403,7 @@ mod whole_object_mechanism_tests {
     }
 }
 
-/// Families D (`store_range`) and E1 (`begin_incremental_range_write`) stage under an
+/// Families D (`prepare_range_store`) and E1 (`begin_incremental_range_write`) stage under an
 /// instance-scoped name ending `.tmp.{host}.{pid}`, the shape the dead-instance temp reaper
 /// matches, and never under the old unscoped names.
 #[cfg(test)]
@@ -21778,7 +19475,7 @@ mod range_temp_name_tests {
         let final_a = dc.get_new_range_file_path(key_a, 0, 1023);
         let old_a = final_a.with_extension("bin.tmp");
         std::fs::create_dir_all(&old_a).unwrap();
-        dc.store_range(
+        dc.store_range_witnessed(
             key_a,
             0,
             1023,
@@ -21788,7 +19485,7 @@ mod range_temp_name_tests {
             false,
         )
         .await
-        .expect("store_range must not stage under the old unscoped {key}_{s}-{e}.bin.tmp");
+        .expect("prepare_range_store must not stage under the old unscoped {key}_{s}-{e}.bin.tmp");
         assert!(final_a.is_file(), "the range must be published");
         assert!(old_a.is_dir(), "the old-name entry is untouched");
 
@@ -21804,7 +19501,7 @@ mod range_temp_name_tests {
             .ends_with(&format!(".bin.tmp.{}.{}", my_host(), std::process::id())));
         std::fs::create_dir_all(&shared_b).unwrap();
         let result = dc
-            .store_range(
+            .store_range_witnessed(
                 key_b,
                 0,
                 1023,
@@ -21814,7 +19511,9 @@ mod range_temp_name_tests {
                 false,
             )
             .await;
-        result.expect("store_range must stage under a per-fill name, not the shared one (R10.1)");
+        result.expect(
+            "prepare_range_store must stage under a per-fill name, not the shared one (R10.1)",
+        );
         assert!(final_b.is_file(), "the range must be published");
         assert!(shared_b.is_dir(), "the shared-name entry is untouched");
     }
@@ -21852,7 +19551,10 @@ mod signed_range_try_once_tests {
         n
     }
 
-    async fn store(dcm: &tokio::sync::RwLock<DiskCacheManager>) {
+    async fn store(
+        dcm: &tokio::sync::RwLock<DiskCacheManager>,
+        witness: crate::cache::FillWitness,
+    ) {
         DiskCacheManager::store_range_shared_witnessed(
             dcm,
             KEY,
@@ -21869,7 +19571,7 @@ mod signed_range_try_once_tests {
             },
             Duration::from_secs(3600),
             false,
-            None,
+            witness,
             SlotWait::TryOnce,
         )
         .await
@@ -21883,19 +19585,19 @@ mod signed_range_try_once_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
-        let manager = Arc::new(crate::cache::CacheManager::new_with_eviction_algorithm(
+        let manager = Arc::new(crate::cache::CacheManager::new_with_defaults(
             cache_dir.to_path_buf(),
             false,
             0,
-            crate::cache::CacheEvictionAlgorithm::TinyLFU,
         ));
         let dcm = Arc::new(tokio::sync::RwLock::new(
             manager.create_configured_disk_cache_manager(),
         ));
+        let witness = manager.capture_fill_witness(KEY).await;
         let slot = crate::metadata_lock_manager::try_acquire_slot_lock(cache_dir, KEY)
             .expect("fixture: take the key's slot lock");
         let task_dcm = Arc::clone(&dcm);
-        let task = tokio::spawn(async move { store(&task_dcm).await });
+        let task = tokio::spawn(async move { store(&task_dcm, witness).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
         let started = Instant::now();
         let read = tokio::time::timeout(BOUND, dcm.read()).await;
@@ -21918,7 +19620,7 @@ mod signed_range_try_once_tests {
             "a contended fill is skipped, not published"
         );
         drop(slot);
-        store(&dcm).await;
+        store(&dcm, manager.capture_fill_witness(KEY).await).await;
         assert_eq!(
             bin_count(cache_dir),
             1,
@@ -22020,10 +19722,6 @@ mod identity_less_fill_publish_tests {
                 dir.to_path_buf(),
                 "r12-instance".to_string(),
             )),
-            Arc::new(crate::hybrid_metadata_writer::ConsolidationTrigger::new(
-                1024 * 1024,
-                100,
-            )),
         );
         dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
         dc
@@ -22077,7 +19775,7 @@ mod identity_less_fill_publish_tests {
         let key = "test-bucket/r12-buffered";
         fstat_failure_seam::fail_identity_for(&dc.get_new_range_file_path(key, 0, 4095));
         let _ = dc
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 4095,
@@ -22090,7 +19788,7 @@ mod identity_less_fill_publish_tests {
         assert_nothing_published(&dc, temp.path(), key).await;
     }
 
-    /// `commit_incremental_range` (the streamed fill).
+    /// `commit_incremental_range_witnessed` (the streamed fill).
     #[tokio::test]
     async fn an_incremental_fill_whose_identity_fails_publishes_nothing() {
         let temp = TempDir::new().unwrap();
@@ -22105,7 +19803,11 @@ mod identity_less_fill_publish_tests {
             .expect("the capacity guard admits with an unconfigured floor");
         DiskCacheManager::write_range_chunk(&mut writer, &[0x5au8; 4096]).unwrap();
         let result = dc
-            .commit_incremental_range(writer, object_metadata(), Duration::from_secs(3600))
+            .commit_incremental_range_witnessed(
+                writer,
+                object_metadata(),
+                Duration::from_secs(3600),
+            )
             .await;
         // The streamed write-through callers skip their own log line for
         // this error, so it must reach them recognisable.
@@ -22118,8 +19820,8 @@ mod identity_less_fill_publish_tests {
         assert_nothing_published(&dc, temp.path(), key).await;
     }
     /// A buffered fill whose identity fails logs it once, at `warn!`, with
-    /// the key and the temp file's path, and `store_range` does not also log a failed write.
-    /// Red side: `store_range` logging the identity error as a failed write, as before.
+    /// the key and the temp file's path, and `prepare_range_store` does not also log a failed write.
+    /// Red side: `prepare_range_store` logging the identity error as a failed write, as before.
     #[tokio::test]
     async fn an_identity_failure_logs_one_warning_with_key_and_path() {
         #[derive(Clone)]
@@ -22158,7 +19860,7 @@ mod identity_less_fill_publish_tests {
         let key = "test-bucket/r12-logged-once";
         fstat_failure_seam::fail_identity_for(&dc.get_new_range_file_path(key, 0, 4095));
         let result = dc
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 4095,

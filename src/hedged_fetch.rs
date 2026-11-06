@@ -61,18 +61,18 @@ pub fn get_global_metrics() -> Option<&'static Arc<HedgeMetrics>> {
 /// is admitted only when `(inflight_hedges + 1) / max(inflight_fetches, 1)` does
 /// not exceed the configured fraction. This prevents hedging from amplifying
 /// traffic beyond the operator's cost ceiling during latency spikes.
-pub struct HedgeGovernor {
+pub(crate) struct HedgeGovernor {
     inflight_fetches: AtomicU64,
     inflight_hedges: AtomicU64,
 }
 
 /// RAII guard that increments `inflight_fetches` on creation and decrements on drop.
-pub struct FetchGuard<'a> {
+pub(crate) struct FetchGuard<'a> {
     governor: &'a HedgeGovernor,
 }
 
 /// RAII guard that increments `inflight_hedges` on creation and decrements on drop.
-pub struct HedgeGuard<'a> {
+pub(crate) struct HedgeGuard<'a> {
     governor: &'a HedgeGovernor,
 }
 
@@ -163,7 +163,7 @@ impl<'a> Drop for HedgeGuard<'a> {
 // ---------------------------------------------------------------------------
 
 /// Outcome of [`race_first_byte`].
-pub enum RaceOutcome {
+pub(crate) enum RaceOutcome {
     /// One arm returned a response status (the Winner).
     Winner(S3Response),
     /// Both arms exceeded their `first_byte_timeout` without returning a

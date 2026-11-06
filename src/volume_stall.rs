@@ -49,17 +49,17 @@ pub const TRIP_WINDOW: Duration = Duration::from_secs(10);
 /// not count again. So a trip needs a stall that held waits started across at least
 /// `(TRIP_AFTER - 1) * TRIP_MIN_SPACING`, plus the shortest wait bound
 /// ([`crate::cache::PUT_ROUTER_READ_BOUND`], 250 ms): a pause of about 1.25 s.
-pub const TRIP_MIN_SPACING: Duration = Duration::from_millis(500);
+const TRIP_MIN_SPACING: Duration = Duration::from_millis(500);
 /// Consecutive probe successes that close the breaker.
-pub const CLOSE_AFTER: u32 = 3;
+const CLOSE_AFTER: u32 = 3;
 /// How long one probe may take before it counts as a failure.
-pub const PROBE_BOUND: Duration = Duration::from_millis(250);
+const PROBE_BOUND: Duration = Duration::from_millis(250);
 /// The first wait between failing probes, doubled up to [`PROBE_MAX_BACKOFF`].
-pub const PROBE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const PROBE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 /// The longest wait between failing probes.
-pub const PROBE_MAX_BACKOFF: Duration = Duration::from_secs(5);
+const PROBE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// The wait between probes once one has succeeded.
-pub const PROBE_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
+const PROBE_CONFIRM_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Breakers open now in this process. One per cache manager, so `0` or `1` in production.
 static OPEN_NOW: AtomicU64 = AtomicU64::new(0);

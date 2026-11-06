@@ -66,14 +66,15 @@ fn make_unreadable_parse(cache_dir: &Path) {
     std::fs::write(&p, b"{\"total_size\": 42, this is not json").unwrap();
 }
 
-async fn persist_zeroed(c: &JournalConsolidator) {
-    c.persist_size_state(&SizeState {
+async fn persist_zeroed(cache_dir: &Path) {
+    let p = cache_dir.join("size_tracking").join("size_state.json");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let state = SizeState {
         total_size: 0,
         write_cache_size: 0,
         ..Default::default()
-    })
-    .await
-    .unwrap();
+    };
+    std::fs::write(&p, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +94,7 @@ async fn unreadable_current_size_is_distinguishable_from_a_genuine_zero_io() {
     let c_good = consolidator(good.path());
     let c_bad = consolidator(bad.path());
 
-    persist_zeroed(&c_good).await;
+    persist_zeroed(good.path()).await;
     make_unreadable_io(bad.path());
 
     let genuine_zero = c_good.get_current_size().await;
@@ -117,7 +118,7 @@ async fn unreadable_current_size_is_distinguishable_from_a_genuine_zero_parse() 
     let c_good = consolidator(good.path());
     let c_bad = consolidator(bad.path());
 
-    persist_zeroed(&c_good).await;
+    persist_zeroed(good.path()).await;
     make_unreadable_parse(bad.path());
 
     let genuine_zero = c_good.get_current_size().await;
@@ -144,7 +145,7 @@ async fn unreadable_write_cache_size_is_distinguishable_from_a_genuine_zero() {
     let c_good = consolidator(good.path());
     let c_bad = consolidator(bad.path());
 
-    persist_zeroed(&c_good).await;
+    persist_zeroed(good.path()).await;
     make_unreadable_io(bad.path());
 
     let genuine_zero = c_good.get_write_cache_size().await;
@@ -213,7 +214,7 @@ async fn absent_size_state_is_a_real_zero_not_the_unreadable_sentinel() {
     // A fresh volume and a persisted zero must agree; only unreadability differs.
     let persisted = TempDir::new().unwrap();
     let c_persisted = consolidator(persisted.path());
-    persist_zeroed(&c_persisted).await;
+    persist_zeroed(persisted.path()).await;
 
     assert_eq!(
         c.get_current_size().await,

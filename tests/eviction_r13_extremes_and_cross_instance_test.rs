@@ -63,13 +63,23 @@ fn manager(cache_dir: &Path, max_cache_size: u64) -> CacheManager {
     m
 }
 
+/// Write the `size_tracking/size_state.json` document, as another instance's consolidation
+/// would leave it. The consolidator's `load_size_state` reads this file from disk.
+fn write_size_state_document(
+    cache_dir: &std::path::Path,
+    state: &s3_proxy::journal_consolidator::SizeState,
+) {
+    let p = cache_dir.join("size_tracking").join("size_state.json");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, serde_json::to_string_pretty(state).unwrap()).unwrap();
+}
 /// Install Size_State's total directly, as consolidation would leave it.
 async fn seed_total(m: &CacheManager, total_size: u64) {
     let consolidator = m.get_journal_consolidator().await.expect("consolidator");
     let mut state = consolidator.load_size_state().await.unwrap();
     state.total_size = total_size;
     state.write_cache_size = 0;
-    consolidator.persist_size_state(&state).await.unwrap();
+    write_size_state_document(m.get_cache_dir(), &state);
 }
 
 /// The byte target the pass works to: `current - floor(max * target%)`, the figure

@@ -6,27 +6,27 @@
 //!
 //! # Expected to pass on current code, and what it is therefore for
 //!
-//! `MetadataCache::put_with_mtime`'s eviction is count-based and inspects nothing about the
+//! `MetadataCache::put`'s eviction is count-based and inspects nothing about the
 //! document it evicts, so this passes today. It is a **guard**: `ram-tier-effectiveness:R1.6`'s
 //! task 6 applied one admission rule at eight `metadata_cache.put` sites, and the natural next
-//! refactor is to move that rule inside `put_with_mtime` itself. `ram_admission_permitted`'s own
+//! refactor is to move that rule inside `put` itself. `ram_admission_permitted`'s own
 //! doc comment records `R1.8` — this property — as the first of three reasons that refactor did
 //! not land. So this file is the thing that has to exist before it can.
 //!
 //! # This fixture calls `put` directly, and that is the documented route rather than a shortcut
 //!
 //! `metadata_cache::ram_admission_permitted` (whose whole body is `!metadata.ranges.is_empty()`)
-//! lives **outside** `put_with_mtime`, at each of the eight call sites. A HEAD_Only_Entry
+//! lives **outside** `put`, at each of the eight call sites. A HEAD_Only_Entry
 //! therefore cannot be made resident through any production path — which is
 //! `ram-tier-effectiveness:R1.6` working — and the only way to build the population this
 //! requirement is about is to call the tier's own `put`. That is precisely the case
-//! `ram_admission_permitted`'s doc comment anticipates: *"inside `put_with_mtime` this predicate
+//! `ram_admission_permitted`'s doc comment anticipates: *"inside `put` this predicate
 //! would refuse those entries outright, so that fixture could not be built and the guard the
 //! spec wants before the refactor could never be written."*
 //!
 //! The consequence for how to read a failure here: this file says nothing about admission, and
 //! must not be read as endorsing a resident HEAD_Only_Entry. Admission is
-//! `tests/ram_metadata_masking_regression_test.rs`'s subject, on both of the sites that file
+//! `src/cache/moved_fill_tests/ram_metadata_masking_regression_test.rs`'s subject, on both of the sites that file
 //! covers.
 //!
 //! # Incidental coverage already exists, and that is the reason this file is NOT redundant
@@ -35,7 +35,7 @@
 //! `create_test_metadata`, which builds `ranges: Vec::new()` — so it already evicts
 //! HEAD_Only_Entries, and the red side below reds it too. But its subject is LRU **ordering**,
 //! its name says so, and nothing in it states or asserts that its documents are empty-`ranges`.
-//! Switching it to the sibling helper `ranges_bearing_test_metadata` — a one-word edit, for
+//! Switching it to a sibling helper that returns ranges — a one-word edit, for
 //! reasons having nothing to do with this requirement — would delete the coverage silently and
 //! no assertion anywhere would notice.
 //!
@@ -48,12 +48,12 @@
 //!
 //! `tasks.md` task 11 is explicit that the **eviction** must be asserted, "not merely that
 //! nothing exempts them", so that the test can fail. Four things are read, and each names the
-//! thing `put_with_mtime` actually does:
+//! thing `put` actually does:
 //!
 //! - `len()` rising by exactly one per `put` — the size-accounting half. A HEAD_Only_Entry
 //!   occupies a slot; it is not admitted-and-uncounted.
 //! - `metrics().evictions` rising by exactly one across the over-capacity `put` — the counter
-//!   `put_with_mtime` increments inside the `entries.remove(&victim_key).is_some()` arm, so it
+//!   `put` increments inside the `entries.remove(&victim_key).is_some()` arm, so it
 //!   distinguishes "an entry was removed" from "the loop ran".
 //! - `peek(victim).is_none()` — **which** entry went. `evictions` alone cannot say that, and an
 //!   eviction loop that removed the wrong entry would satisfy it.
@@ -67,7 +67,7 @@
 //!
 //! # Red side
 //!
-//! `put_with_mtime`'s eviction loop made to `continue` past a victim whose `ranges` is empty —
+//! `put`'s eviction loop made to `continue` past a victim whose `ranges` is empty —
 //! a content-dependent path that drains `lru_order` without removing anything, which is the
 //! exact shape task 11 names. See
 //! the investigation record for the verbatim panic, the
@@ -229,7 +229,7 @@ async fn a_tier_full_of_head_only_entries_evicts_the_lru_entry() {
         evictions_before + 1,
         "EVICTION (ram-tier-effectiveness:R3.10c): putting a {}th HEAD_Only_Entry into a tier \
          of max_entries={} did not increment the eviction counter (before={} after={}). That \
-         counter is incremented inside put_with_mtime's `entries.remove(victim).is_some()` arm, \
+         counter is incremented inside put's `entries.remove(victim).is_some()` arm, \
          so a flat reading means no entry was removed — HEAD_Only_Entries are exempt from \
          eviction and the tier is unbounded for them",
         MAX_ENTRIES + 1,

@@ -10,11 +10,11 @@ see different memory use, connection counts, network exposure, or on-disk layout
 binary swap. The tables below list the releases that do one of those things, so you can
 read only the ones between your current version and your target.
 
-For 3.0.0 and 3.0.1, [Upgrading to 3.0.0](#upgrading-to-300), [Upgrading to 3.0.1](#upgrading-to-301) and the guides they link carry the detail, and
+For 3.0.0 to 3.0.2, [Upgrading to 3.0.0](#upgrading-to-300), [Upgrading to 3.0.1](#upgrading-to-301), [Upgrading to 3.0.2](#upgrading-to-302) and the guides they link carry the detail, and
 the [changelog](../CHANGELOG.md) summarizes each release. For every release up to 2.8.4,
 the detail is in the [pre-3.0.0 changelog](../changelog-pre-v3.md).
 
-3.0.0 upgrades in place from any 2.8 release, and 3.0.1 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
+3.0.0 upgrades in place from any 2.8 release, and 3.0.1 and 3.0.2 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
 After 3.0.0, restart a fleet one proxy at a time. Clients that fail over, such as CRT-based ones, retry on another proxy while one restarts, and the cache volume survives restarts.
 Releases from before 1.0.0 are not covered. Upgrading from a pre-1.0.0 build is not a
 supported path; start from a fresh cache directory and a config derived from the
@@ -27,6 +27,7 @@ cannot be read.
 
 | Version | Action |
 |---|---|
+| 3.0.2 | Operators with an allowlist and S3 on private addresses, S3 Select clients, or alarms on removed `/metrics` fields, and code built on the `s3_proxy` library, have a step to take; see [Upgrading to 3.0.2](#upgrading-to-302). |
 | 3.0.1 | Fleets where objects are overwritten in place, and proxies whose clocks may differ from the cache volume's file server by 10 minutes or more, have a step to take; see [Upgrading to 3.0.1](#upgrading-to-301). |
 | 3.0.0 | Operators with their own hardened systemd unit, Docker, health or metrics checks from another host, `cache_rules.json` patterns with special characters, several proxies on one cache volume, or an S3-compatible origin that omits the `Range` total have a step to take; see [Upgrading to 3.0.0](#upgrading-to-300). |
 | 2.6.0 | To keep log files older than the configured retention, copy them off or raise `logging.access_log_retention_days` / `logging.app_log_retention_days` before upgrading; the first cleanup pass now enforces retention across the whole of `access_log_dir` and `app_log_dir`, including on a deployment running with `access_log_enabled: false`, where neither sweep previously ran. |
@@ -83,6 +84,26 @@ corrupted.
 Releases not listed above require no action and change no defaults: internal fixes,
 performance work, additive opt-in features that stay disabled until configured, and
 dependency bumps.
+
+## Upgrading to 3.0.2
+
+3.0.2 upgrades in place from 3.0.1 and needs no configuration change: its one new field, `connection_pool.upstream_write_idle_timeout`, has a default. When upgrading from 3.0.0 or a 2.8 release, take the [3.0.1 steps](#upgrading-to-301) as well. Four kinds of deployment have a step to take before upgrading.
+
+### Before upgrading to 3.0.2
+
+- **An allowlist with S3 on private addresses**: if you set `server.tls.connect_allowlist` and `connection_pool.dns_servers` resolves S3's hostnames to the private addresses of an interface endpoint, list those addresses in `connection_pool.endpoint_overrides` before upgrading ([S3 PrivateLink](CONFIGURATION.md#s3-privatelink-interface-vpc-endpoints)). With an allowlist set, the HTTP forwarding paths connect only to addresses the destination policy accepts, and the policy refuses a private address that `endpoint_overrides` does not list. A host listed in `endpoint_overrides` negotiates TLS 1.2.
+- **S3 Select**: send SelectObjectContent requests to S3 directly. The proxy answers them `501 NotImplemented`. Select requests through a `CONNECT` tunnel or the HTTPS passthrough (port 443) are not inspected, so they reach S3 unchanged.
+- **Dashboards and alarms on removed `/metrics` fields**: remove `cache.cache_etag_mismatches_total`, `cache.cache_range_invalidations_total`, `cache.cache_etag_validations_total`, `cache.cache_orphaned_ranges_cleaned_total` and `cache.cache_cleanup_failures_total`, and the OTLP series `cache.etag_mismatches_total` and `cache.range_invalidations_total`. Each read `0` on every proxy, and 3.0.2 removes them ([Metrics reference](METRICS_REFERENCE.md#cache)).
+- **Code built on the `s3_proxy` library crate**: the crate exports only what the `s3-proxy` binary uses. Types and functions the binary never called are removed, among them the `cache_validator` module, `CacheEntry`, `WriteCacheEntry` and the `CacheManager` methods `get_cached_response`, `get_write_cache_entry`, `check_cache_consistency` and `is_write_cache_entry_expired`. Most other items are now private to the crate. Code that uses a removed item needs changing before it builds against 3.0.2.
+
+### What you will see after upgrading to 3.0.2
+
+- With an allowlist set, a request whose name `connection_pool.dns_servers` resolves only to addresses the policy refuses gets no connection and is answered `502 Bad Gateway`, and the proxy logs a warning naming the host. A name that public DNS already resolves only to refused addresses gets `403 AccessDenied` instead ([Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection)).
+- A SelectObjectContent request gets `501 NotImplemented`, and the proxy logs at most one warning a minute about such refusals.
+- Cached data is fresh for `get_ttl` from when it was fetched. 3.0.1, and possibly earlier releases, counted from the consolidation that recorded it, up to one `consolidation_interval` later, or longer after a consolidation backlog or a restart. Entries now expire that much sooner, so `ttl_revalidations_total` can rise. An entry cached by an earlier release keeps its old expiry until it expires or is revalidated.
+- With `get_ttl: "0s"`, a GET whose lone `If-Match` names the cached ETag is revalidated with S3 and, when S3 answers `304`, served from cache with `X-Cache: HIT`, so `ttl_revalidations_total` rises ([Zero TTL revalidation](CACHING.md#zero-ttl-revalidation)).
+
+Rolling back to 3.0.1 needs no step: 3.0.1 ignores `connection_pool.upstream_write_idle_timeout`.
 
 ## Upgrading to 3.0.1
 

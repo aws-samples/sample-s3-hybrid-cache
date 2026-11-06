@@ -28,12 +28,12 @@
 //!
 //! `JournalManager::new` derives the filename from the instance id, so distinct ids give
 //! distinct files and each instance must `read_dir` a file it did not write. The `Add` is
-//! appended through **production code** — `HybridMetadataWriter::write_range_metadata` with
+//! appended through **production code** — `HybridMetadataWriter::write_range_metadata_witnessed` with
 //! `WriteMode::JournalOnly` — not with `std::fs::write`, so the peer's filename is produced by
 //! the same construction production uses rather than by this file's `format!`.
 //!
 //! **No `src/` test seam was needed.** Every symbol this fixture reaches is already public:
-//! `set_hybrid_metadata_writer`, `set_journal_consolidator`, `write_range_metadata`,
+//! `set_hybrid_metadata_writer`, `set_journal_consolidator`, `write_range_metadata_witnessed`,
 //! `invalidate_all_ranges`, `find_pending_journal_ranges`, `is_shared_storage_mode`.
 //!
 //! # The PARTIAL shape, for the same reason task 5's fixture uses it
@@ -100,7 +100,7 @@
 use s3_proxy::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::DiskCacheManager;
-use s3_proxy::hybrid_metadata_writer::{ConsolidationTrigger, HybridMetadataWriter, WriteMode};
+use s3_proxy::hybrid_metadata_writer::{HybridMetadataWriter, WriteMode};
 use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::{JournalEntry, JournalManager, JournalOperation};
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
@@ -196,7 +196,6 @@ async fn instance(
         cache_dir.to_path_buf(),
         Arc::clone(&lock_manager),
         Arc::clone(&journal_manager),
-        Arc::new(ConsolidationTrigger::new(10 * 1024 * 1024, 1000)),
     )));
     manager.set_hybrid_metadata_writer(Arc::clone(&writer));
 
@@ -316,12 +315,13 @@ async fn seed() -> Fixture {
         peer_writer
             .lock()
             .await
-            .write_range_metadata(
+            .write_range_metadata_witnessed(
                 key,
                 spec,
                 WriteMode::JournalOnly,
                 None,
                 Duration::from_secs(3600),
+                None,
             )
             .await
             .expect("the peer instance must be able to append its journal Add");

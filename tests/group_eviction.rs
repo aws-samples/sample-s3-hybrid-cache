@@ -16,8 +16,6 @@
 //! 58 test files that declare it.
 #![allow(clippy::duplicate_mod)]
 
-#[path = "cache_cleanup_new_format_test.rs"]
-mod cache_cleanup_new_format_test;
 #[path = "cache_size_metrics_test.rs"]
 mod cache_size_metrics_test;
 #[path = "cache_size_tracking_integration_test.rs"]
@@ -26,24 +24,10 @@ mod cache_size_tracking_integration_test;
 mod cache_size_tracking_performance_test;
 #[path = "cache_validation_cleanup_test.rs"]
 mod cache_validation_cleanup_test;
-#[path = "cache_validator_consistency_path_test.rs"]
-mod cache_validator_consistency_path_test;
-#[path = "cache_validator_required_field_shapes_test.rs"]
-mod cache_validator_required_field_shapes_test;
-#[path = "cache_validator_size_consistency_shapes_test.rs"]
-mod cache_validator_size_consistency_shapes_test;
-#[path = "cache_validator_test.rs"]
-mod cache_validator_test;
-#[path = "capacity_guard_publication_boundaries_test.rs"]
-mod capacity_guard_publication_boundaries_test;
-#[path = "capacity_guard_real_floor_test.rs"]
-mod capacity_guard_real_floor_test;
 #[path = "distributed_eviction_lock_error_handling_test.rs"]
 mod distributed_eviction_lock_error_handling_test;
 #[path = "distributed_eviction_lock_property_test.rs"]
 mod distributed_eviction_lock_property_test;
-#[path = "evicted_ranges_bypass_timeout_property_test.rs"]
-mod evicted_ranges_bypass_timeout_property_test;
 #[path = "eviction_activity_set_safety_test.rs"]
 mod eviction_activity_set_safety_test;
 #[path = "eviction_buffer_test.rs"]
@@ -58,8 +42,6 @@ mod eviction_lock_fencing_test;
 mod eviction_pass_witness_test;
 #[path = "eviction_r13_extremes_and_cross_instance_test.rs"]
 mod eviction_r13_extremes_and_cross_instance_test;
-#[path = "eviction_rate_wiring_test.rs"]
-mod eviction_rate_wiring_test;
 #[path = "eviction_target_percentage_property_test.rs"]
 mod eviction_target_percentage_property_test;
 #[path = "eviction_threshold_validation_property_test.rs"]
@@ -80,10 +62,6 @@ mod hash_distribution_test;
 mod ram_metadata_head_only_eviction_test;
 #[path = "range_based_eviction_property_test.rs"]
 mod range_based_eviction_property_test;
-#[path = "slice_read_cost_test.rs"]
-mod slice_read_cost_test;
-#[path = "stale_data_removal_test.rs"]
-mod stale_data_removal_test;
 #[path = "stale_entry_detection_property_test.rs"]
 mod stale_entry_detection_property_test;
 #[path = "temp_file_cleanup_test.rs"]

@@ -94,7 +94,7 @@
 use s3_proxy::cache_types::RangeSpec;
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::DiskCacheManager;
-use s3_proxy::hybrid_metadata_writer::{ConsolidationTrigger, HybridMetadataWriter};
+use s3_proxy::hybrid_metadata_writer::HybridMetadataWriter;
 use s3_proxy::journal_manager::{JournalEntry, JournalOperation};
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
 use std::path::PathBuf;
@@ -149,12 +149,10 @@ async fn seed() -> Fixture {
         cache_dir.clone(),
         INVALIDATING_INSTANCE.to_string(),
     ));
-    let consolidation_trigger = Arc::new(ConsolidationTrigger::new(10 * 1024 * 1024, 1000));
     manager.set_hybrid_metadata_writer(Arc::new(Mutex::new(HybridMetadataWriter::new(
         cache_dir.clone(),
         lock_manager,
         journal_manager,
-        consolidation_trigger,
     ))));
     assert!(
         manager.is_shared_storage_mode(),

@@ -39,16 +39,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The subcommand's name. A compatibility commitment once released.
-pub const SUBCOMMAND: &str = "bench-metadata";
+const SUBCOMMAND: &str = "bench-metadata";
 
 /// Default concurrency sweep, the levels the measurement programme used.
-pub const DEFAULT_CONCURRENCY: &str = "1,4,8,16,32,64,128,256";
-/// Default files read per level.
-pub const DEFAULT_FILES_PER_LEVEL: usize = 2000;
-/// Default cap on L1 shard directories enumerated.
-pub const DEFAULT_MAX_L1_SHARDS: usize = 64;
-/// Default cap on L2 directories enumerated per L1 shard.
-pub const DEFAULT_MAX_L2_PER_SHARD: usize = 512;
+const DEFAULT_CONCURRENCY: &str = "1,4,8,16,32,64,128,256";
 
 /// A parsed `bench-metadata` invocation.
 #[derive(Debug, Clone, PartialEq)]
@@ -606,7 +600,7 @@ pub async fn run(opts: &BenchOptions) -> Result<BenchReport, String> {
 }
 
 /// The human-readable report.
-pub fn render_text(r: &BenchReport) -> String {
+fn render_text(r: &BenchReport) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     let _ = writeln!(
@@ -721,9 +715,9 @@ mod tests {
         assert!(!is_requested(&os(&["s3-proxy", "-c", SUBCOMMAND])));
         let o = parse(&os(&["s3-proxy", SUBCOMMAND, "--cache-dir", "/x"])).unwrap();
         assert_eq!(o.levels, vec![1, 4, 8, 16, 32, 64, 128, 256]);
-        assert_eq!(o.files_per_level, DEFAULT_FILES_PER_LEVEL);
-        assert_eq!(o.max_l1_shards, DEFAULT_MAX_L1_SHARDS);
-        assert_eq!(o.max_l2_per_shard, DEFAULT_MAX_L2_PER_SHARD);
+        assert_eq!(o.files_per_level, 2000);
+        assert_eq!(o.max_l1_shards, 64);
+        assert_eq!(o.max_l2_per_shard, 512);
         assert_eq!(o.max_level_duration, None);
         assert!(!o.json);
         assert!(parse(&os(&["s3-proxy", SUBCOMMAND])).is_err());

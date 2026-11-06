@@ -10,13 +10,14 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Body;
 use hyper::{Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -90,6 +91,157 @@ pub struct UpstreamTransport {
     /// 4), mirroring the GET-path connector. `None` for the default-443 path and the
     /// `TlsUnvalidated`/`Plaintext` modes, which keep the generic-error behaviour.
     pub validated_endpoint: Option<String>,
+    /// Bounds on this attempt's waits on the upstream.
+    pub timeouts: UpstreamTimeouts,
+    /// The in-flight ledger the buffered response is reserved against. `None`
+    /// reserves nothing; the response bound applies either way.
+    pub response_ledger: Option<Arc<crate::inflight_ledger::InflightLedger>>,
+}
+
+/// Bounds on one signed-write attempt's waits on the upstream.
+///
+/// Every deadline is per attempt and inside the forward: nothing here times the
+/// client's request body.
+#[derive(Clone)]
+pub struct UpstreamTimeouts {
+    /// One deadline around the whole connect: every TCP attempt, every TLS
+    /// handshake and the backoff sleeps between them
+    /// (`connection_pool.connection_timeout`).
+    pub connect: Duration,
+    /// How long the upstream may move no byte while the proxy is writing the
+    /// request to it or waiting on its response
+    /// (`connection_pool.upstream_write_idle_timeout`).
+    pub idle: Duration,
+    /// The pool settings applied to the write socket after the TCP connect and
+    /// before TLS: `keepalive_idle_secs`, `keepalive_interval_secs`,
+    /// `keepalive_retries`, `tcp_recv_buffer_size` and `TCP_NODELAY`, as on the
+    /// pooled path ([`crate::https_connector::apply_socket_options`]).
+    pub socket: Arc<crate::config::ConnectionPoolConfig>,
+}
+
+/// The default pool settings, shared so a default [`UpstreamTimeouts`] allocates
+/// nothing.
+static DEFAULT_SOCKET_SETTINGS: LazyLock<Arc<crate::config::ConnectionPoolConfig>> =
+    LazyLock::new(|| Arc::new(crate::config::ConnectionPoolConfig::default()));
+
+impl Default for UpstreamTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_secs(120),
+            socket: Arc::clone(&DEFAULT_SOCKET_SETTINGS),
+        }
+    }
+}
+
+/// What [`send_request`] wrote: when the last request byte was flushed, and how
+/// many body bytes went upstream.
+pub(crate) struct RequestSent {
+    pub(crate) at: Instant,
+    pub(crate) body_bytes: u64,
+}
+
+/// The upstream response of one signed write, read into memory under a bound and
+/// reserved against the in-flight ledger as it grows.
+///
+/// The ledger never refuses this growth. The request has already been sent, so S3 may
+/// have executed the write, and refusing its answer would tell the client the write was
+/// shed when it was not. Every byte read is recorded on the ledger at once, past its
+/// ceiling if need be, so the figure and its peak show what is held; `bound` still caps
+/// the buffer.
+struct ResponseBuffer {
+    bytes: Vec<u8>,
+    bound: usize,
+    reservation: crate::inflight_ledger::Reservation,
+}
+
+impl ResponseBuffer {
+    fn new(bound: usize, ledger: Option<&Arc<crate::inflight_ledger::InflightLedger>>) -> Self {
+        let reservation = ledger.map_or_else(crate::inflight_ledger::Reservation::none, |ledger| {
+            ledger.reserve_unrefused()
+        });
+        Self {
+            bytes: Vec::new(),
+            bound,
+            reservation,
+        }
+    }
+
+    /// Read once from `stream` and append what arrived. Growth past `bound` is refused
+    /// before the append; what is appended is accounted on the ledger even past its
+    /// ceiling. Returns the number of bytes read, 0 at end of stream.
+    async fn read_from<S: AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut S,
+        scratch: &mut [u8],
+        phase: &str,
+    ) -> Result<usize> {
+        let n = stream
+            .read(scratch)
+            .await
+            .map_err(|e| upstream_io_error(e, phase, "Failed to read response"))?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let total = self.bytes.len() + n;
+        if total > self.bound {
+            warn!(
+                bound_bytes = self.bound,
+                "Upstream response to a signed write exceeds the buffered-response bound; refusing it"
+            );
+            return Err(ProxyError::HttpError(format!(
+                "upstream response exceeds the {}-byte bound for a buffered write response",
+                self.bound
+            )));
+        }
+        self.reservation.force_grow(n as u64);
+        self.bytes.extend_from_slice(&scratch[..n]);
+        Ok(n)
+    }
+}
+
+/// A signed write's upstream response, held in memory: its head, its body, and the
+/// in-flight ledger reservation that accounts for it until the response is dropped.
+pub(crate) struct BufferedResponse {
+    pub(crate) parts: hyper::http::response::Parts,
+    pub(crate) body: Bytes,
+    reservation: crate::inflight_ledger::Reservation,
+}
+
+impl BufferedResponse {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.parts.status
+    }
+
+    /// The head, the body, and the reservation, for a caller that reads the body
+    /// and then answers with [`Self::respond`].
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        hyper::http::response::Parts,
+        Bytes,
+        crate::inflight_ledger::Reservation,
+    ) {
+        (self.parts, self.body, self.reservation)
+    }
+
+    /// The client response. It holds the reservation until its body has been sent or
+    /// dropped: the body is served in several frames, so hyper does not drop it at
+    /// the first poll.
+    pub(crate) fn into_response(self) -> Response<BoxBody<Bytes, hyper::Error>> {
+        Self::respond(self.parts, self.body, self.reservation)
+    }
+
+    pub(crate) fn respond(
+        parts: hyper::http::response::Parts,
+        body: Bytes,
+        reservation: crate::inflight_ledger::Reservation,
+    ) -> Response<BoxBody<Bytes, hyper::Error>> {
+        let body =
+            crate::permit_body::PermitBody::new(crate::permit_body::ChunkedBytes::new(body), None)
+                .with_reservation(reservation);
+        Response::from_parts(parts, body.map_err(|never| match never {}).boxed())
+    }
 }
 
 impl UpstreamTransport {
@@ -101,6 +253,8 @@ impl UpstreamTransport {
             port: 443,
             tls: Some(tls_connector),
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         }
     }
 }
@@ -113,7 +267,7 @@ impl UpstreamTransport {
 /// `TcpStream` implement tokio's `AsyncRead`/`AsyncWrite`, so each arm delegates
 /// to its inner stream. The TLS variant is boxed to keep the enum small
 /// (clippy `large_enum_variant`).
-pub enum UpstreamStream {
+pub(crate) enum UpstreamStream {
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
     Plain(TcpStream),
 }
@@ -158,6 +312,155 @@ impl AsyncWrite for UpstreamStream {
     }
 }
 
+/// An upstream stream whose reads, writes and flushes fail once one of them has
+/// waited `idle` without moving a byte.
+///
+/// The timer is armed when an upstream poll returns `Pending` with no timer armed,
+/// and disarmed by every poll that returns `Ready`, which is every poll that moves
+/// a byte. So it measures how long the current upstream operation has waited since
+/// the last byte moved, and it is re-armed by any progress: a large `write_all` to
+/// a slow but steady upstream is never cut off. It runs only inside these polls,
+/// and an awaited upstream operation always ends in a `Ready` before the next
+/// client body frame is read, so the time spent waiting on the client's body is
+/// never counted.
+///
+/// Over TLS this wraps the TLS stream, so a byte means a plaintext byte. A read
+/// poll that receives part of a TLS record, or a write poll that drains part of
+/// the TLS send buffer, returns `Pending` and does not re-arm the timer, so an
+/// upstream that takes longer than `idle` to deliver one whole record is cut off
+/// although TCP bytes moved. An upstream sending small records is timed per record.
+pub(crate) struct IdleBoundStream<S> {
+    inner: S,
+    idle: Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    armed: bool,
+}
+
+/// The `io::Error` payload of an [`IdleBoundStream`] timeout.
+#[derive(Debug)]
+struct IdleElapsed(Duration);
+
+impl std::fmt::Display for IdleElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no byte moved to or from the upstream for {:?}", self.0)
+    }
+}
+
+impl std::error::Error for IdleElapsed {}
+
+impl<S> IdleBoundStream<S> {
+    pub(crate) fn new(inner: S, idle: Duration) -> Self {
+        Self {
+            inner,
+            idle,
+            deadline: Box::pin(tokio::time::sleep(idle)),
+            armed: false,
+        }
+    }
+
+    /// Account for one inner poll's result: disarm on `Ready`; on `Pending`, arm
+    /// the timer if it is not armed and fail once it has expired.
+    fn bound<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        polled: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        if polled.is_ready() {
+            self.armed = false;
+            return polled;
+        }
+        if !self.armed {
+            self.armed = true;
+            let at = tokio::time::Instant::now() + self.idle;
+            self.deadline.as_mut().reset(at);
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.armed = false;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                IdleElapsed(self.idle),
+            )));
+        }
+        Poll::Pending
+    }
+}
+
+/// The idle bound an `io::Error` reports, when it is an [`IdleBoundStream`] timeout.
+fn idle_elapsed(e: &io::Error) -> Option<Duration> {
+    e.get_ref()?.downcast_ref::<IdleElapsed>().map(|i| i.0)
+}
+
+/// Prefix on the message of every error a signed write raises after its whole
+/// request was sent upstream: waiting for or reading the response, refusing it for
+/// size, or parsing it. S3 may have executed the write, so its outcome is unknown.
+const AFTER_SEND: &str = "request sent, outcome unknown: ";
+
+/// Mark `e`, raised after the request was sent, with [`AFTER_SEND`].
+fn after_send(e: ProxyError) -> ProxyError {
+    match e {
+        ProxyError::TimeoutError(m) => ProxyError::TimeoutError(format!("{AFTER_SEND}{m}")),
+        ProxyError::HttpError(m) => ProxyError::HttpError(format!("{AFTER_SEND}{m}")),
+        other => other,
+    }
+}
+
+/// Whether `e` ended a signed write after its whole request was sent upstream, so S3
+/// may have executed the write. A failure before the last request byte was sent
+/// leaves S3 an incomplete request, which it does not commit, and is not one.
+pub(crate) fn write_outcome_unknown(e: &ProxyError) -> bool {
+    matches!(e, ProxyError::TimeoutError(m) | ProxyError::HttpError(m) if m.starts_with(AFTER_SEND))
+}
+
+/// Response extension on a client error response answering a signed write whose
+/// outcome is unknown (see [`write_outcome_unknown`]), for a caller that receives the
+/// response rather than the error.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WriteOutcomeUnknown;
+
+/// Map an upstream I/O error in `phase` to a `TimeoutError` naming the phase when
+/// the idle bound expired, and otherwise to the `HttpError` it always was.
+fn upstream_io_error(e: io::Error, phase: &str, failure: &str) -> ProxyError {
+    match idle_elapsed(&e) {
+        Some(idle) => {
+            warn!("Upstream {} stalled: no byte moved for {:?}", phase, idle);
+            ProxyError::TimeoutError(format!("{}: no byte moved for {:?}", phase, idle))
+        }
+        None => ProxyError::HttpError(format!("{}: {}", failure, e)),
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for IdleBoundStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.bound(cx, polled)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleBoundStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.bound(cx, polled)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.bound(cx, polled)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.bound(cx, polled)
+    }
+}
+
 /// Connect to the upstream per the resolved [`UpstreamTransport`], with retry.
 ///
 /// TLS modes go through [`establish_tls_with_retry`] (TCP + TLS handshake);
@@ -177,9 +480,14 @@ pub(crate) async fn connect_upstream_with_retry(
                 // configuration error that cannot succeed on retry, so it is surfaced
                 // immediately as a non-retryable `UpstreamTlsValidationFailed` naming
                 // the endpoint (Requirement 4) — never retried, never downgraded.
-                let tcp =
-                    connect_tcp_with_retry(transport.ip, transport.port, hostname, max_retries)
-                        .await?;
+                let tcp = connect_tcp_with_retry(
+                    transport.ip,
+                    transport.port,
+                    hostname,
+                    max_retries,
+                    &transport.timeouts.socket,
+                )
+                .await?;
                 let tls = establish_tls(tcp, hostname, connector.as_ref())
                     .await
                     .map_err(|e| ProxyError::UpstreamTlsValidationFailed {
@@ -196,14 +504,21 @@ pub(crate) async fn connect_upstream_with_retry(
                     hostname,
                     connector.as_ref(),
                     max_retries,
+                    &transport.timeouts.socket,
                 )
                 .await?;
                 Ok(UpstreamStream::Tls(Box::new(tls)))
             }
         }
         None => {
-            let tcp =
-                connect_tcp_with_retry(transport.ip, transport.port, hostname, max_retries).await?;
+            let tcp = connect_tcp_with_retry(
+                transport.ip,
+                transport.port,
+                hostname,
+                max_retries,
+                &transport.timeouts.socket,
+            )
+            .await?;
             Ok(UpstreamStream::Plain(tcp))
         }
     }
@@ -218,12 +533,13 @@ async fn connect_tcp_with_retry(
     port: u16,
     hostname: &str,
     max_retries: usize,
+    socket: &crate::config::ConnectionPoolConfig,
 ) -> Result<TcpStream> {
     let mut last_error = None;
     let mut had_failures = false;
 
     for attempt in 0..max_retries {
-        match connect_to_target(target_ip, port).await {
+        match connect_to_target(target_ip, port, socket).await {
             Ok(stream) => {
                 if had_failures {
                     info!(
@@ -396,7 +712,7 @@ pub(crate) fn add_via_for_egress(headers: &mut HashMap<String, String>, uri: &hy
 }
 
 /// Check if a request is signed with AWS Signature Version 4 (or SigV4A)
-pub fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
+pub(crate) fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
     headers
         .get("authorization")
         .or_else(|| headers.get("Authorization"))
@@ -630,6 +946,59 @@ pub(crate) async fn forward_signed_request_streaming_verbatim(
     .await
 }
 
+/// [`forward_signed_request_streaming_verbatim`], returning the buffered response
+/// for a caller that reads its body.
+pub(crate) async fn forward_signed_request_streaming_verbatim_buffered(
+    req: Request<hyper::body::Incoming>,
+    target_host: &str,
+    transport: &UpstreamTransport,
+    proxy_referer: Option<&str>,
+    cap: u64,
+) -> Result<BufferedResponse> {
+    let (parts, body) = req.into_parts();
+    forward_signed_request_streaming_buffered(
+        &parts.method,
+        &parts.uri,
+        &parts.headers,
+        parts.version,
+        body,
+        target_host,
+        transport,
+        proxy_referer,
+        cap,
+        None,
+    )
+    .await
+}
+
+/// [`forward_signed_request_with_body`], returning the buffered response for a
+/// caller that reads its body.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_signed_request_with_body_buffered(
+    method: hyper::Method,
+    uri: hyper::Uri,
+    headers: hyper::HeaderMap,
+    version: hyper::Version,
+    body_bytes: Bytes,
+    target_host: &str,
+    transport: &UpstreamTransport,
+    proxy_referer: Option<&str>,
+) -> Result<BufferedResponse> {
+    forward_signed_request_streaming_buffered(
+        &method,
+        &uri,
+        &headers,
+        version,
+        Full::new(body_bytes),
+        target_host,
+        transport,
+        proxy_referer,
+        u64::MAX,
+        None,
+    )
+    .await
+}
+
 /// Forward a signed request with a pre-buffered body
 ///
 /// This function is similar to `forward_signed_request` but accepts a pre-buffered body
@@ -782,7 +1151,7 @@ fn header_block_advertises_chunked_transfer_encoding(header_block: &[u8]) -> boo
 ///   this channel (incremental decode + `WriteCacheRangeSink`) is wired in a
 ///   later task; this function only owns the send side.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn forward_signed_request_streaming<B>(
+pub(crate) async fn forward_signed_request_streaming_buffered<B>(
     method: &hyper::Method,
     uri: &hyper::Uri,
     headers: &hyper::HeaderMap,
@@ -793,7 +1162,7 @@ pub(crate) async fn forward_signed_request_streaming<B>(
     proxy_referer: Option<&str>,
     cap: u64,
     tee: Option<mpsc::Sender<Bytes>>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>>
+) -> Result<BufferedResponse>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
@@ -815,7 +1184,7 @@ where
     // exceeding the cap, reject with HTTP 413 `EntityTooLarge` *before* reading any
     // body bytes — and before connecting to the upstream, so an oversized upload
     // never opens an upstream connection or streams a single byte. This mirrors the
-    // up-front Content-Length check in `read_request_body_bounded`. The same
+    // up-front Content-Length check of the buffered body reader. The same
     // `RequestBodyTooLarge` variant is mapped to HTTP 413 by the handler error
     // mapping. `cap == u64::MAX` (no-cap callers) can never trip this.
     let content_length_hint = headers
@@ -933,13 +1302,99 @@ where
     // Establish the upstream connection per the resolved transport (unchanged: TLS
     // on the default/validated/unvalidated paths, plaintext for the http override;
     // the UpstreamTlsValidationFailed mapping is preserved inside this call).
-    let mut stream = connect_upstream_with_retry(transport, target_host, 5).await?;
+    let mut stream = IdleBoundStream::new(
+        open_upstream(transport, target_host).await?,
+        transport.timeouts.idle,
+    );
 
-    // Write the request line + headers first.
-    stream
-        .write_all(&header_block)
-        .await
-        .map_err(|e| ProxyError::HttpError(format!("Failed to write request headers: {}", e)))?;
+    let sent = send_request(
+        &mut stream,
+        &header_block,
+        chunked_outbound,
+        body,
+        cap,
+        content_length_hint,
+        tee,
+    )
+    .await?;
+    let received: Result<BufferedResponse> = async {
+        let mut response = ResponseBuffer::new(
+            crate::http_proxy::BUFFERED_OPERATION_BOUND as usize,
+            transport.response_ledger.as_ref(),
+        );
+        let start = await_final_head(&mut stream, &sent, &mut response).await?;
+        read_response_rest(&mut stream, start, &mut response).await?;
+        let ResponseBuffer {
+            bytes, reservation, ..
+        } = response;
+        debug!("Received raw HTTP response: {} bytes", bytes.len());
+
+        let (parts, body) = parse_http_response(bytes, method, path_and_query)?;
+        Ok(BufferedResponse {
+            parts,
+            body,
+            reservation,
+        })
+    }
+    .await;
+    received.map_err(after_send)
+}
+
+/// Connect to the upstream for one signed-write attempt.
+///
+/// `timeouts.connect` is one deadline around the whole of
+/// [`connect_upstream_with_retry`]: every TCP attempt, every TLS handshake and the
+/// backoff between them, so the retries cannot multiply it. No request byte has
+/// been written when it expires.
+async fn open_upstream(transport: &UpstreamTransport, target_host: &str) -> Result<UpstreamStream> {
+    let connect = transport.timeouts.connect;
+    match tokio::time::timeout(
+        connect,
+        connect_upstream_with_retry(transport, target_host, 5),
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(_) => {
+            warn!(
+                "Upstream connect to {} ({}:{}) did not complete within {:?}",
+                target_host, transport.ip, transport.port, connect
+            );
+            Err(ProxyError::TimeoutError(format!(
+                "upstream connect: not connected within {:?}",
+                connect
+            )))
+        }
+    }
+}
+
+/// Write the request head, then the body frame by frame, then the chunked
+/// terminator or trailers, and flush.
+///
+/// The awaited `write_all` is the primary backpressure source: the next client
+/// frame is not pulled until the upstream socket accepts the current one
+/// (Requirement 2.1), and no whole-body buffer is ever materialized.
+async fn send_request<S, B>(
+    stream: &mut S,
+    header_block: &[u8],
+    chunked_outbound: bool,
+    body: B,
+    cap: u64,
+    content_length_hint: Option<u64>,
+    tee: Option<mpsc::Sender<Bytes>>,
+) -> Result<RequestSent>
+where
+    S: AsyncWrite + Unpin,
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    stream.write_all(header_block).await.map_err(|e| {
+        upstream_io_error(
+            e,
+            "upstream request write",
+            "Failed to write request headers",
+        )
+    })?;
 
     // Stream the body frame-by-frame, verbatim. The awaited `write_all` is the
     // primary backpressure source: the next client frame is not pulled until the
@@ -949,7 +1404,7 @@ where
     // `sent` tracks the running count of body bytes forwarded so the Body_Size_Cap
     // is enforced mid-stream without buffering the whole body (Req 8.2, 8.3): on
     // exceeding `cap` we stop reading the client body and fail with the same 413
-    // `EntityTooLarge` behaviour `read_request_body_bounded` produces, before
+    // `EntityTooLarge` behaviour the buffered body reader produces, before
     // writing the offending frame.
     let mut body = body;
     // `tee` is rebound mutable so the channel-closed branch below can drop it
@@ -993,7 +1448,11 @@ where
                     }
                     trailer_bytes.extend_from_slice(b"\r\n");
                     stream.write_all(&trailer_bytes).await.map_err(|e| {
-                        ProxyError::HttpError(format!("Failed to write request trailers: {}", e))
+                        upstream_io_error(
+                            e,
+                            "upstream request write",
+                            "Failed to write request trailers",
+                        )
                     })?;
                     wrote_terminator = true;
                 }
@@ -1055,14 +1514,14 @@ where
                 framed.extend_from_slice(&data);
                 framed.extend_from_slice(b"\r\n");
                 stream.write_all(&framed).await.map_err(|e| {
-                    ProxyError::HttpError(format!("Failed to write request body: {}", e))
+                    upstream_io_error(e, "upstream request write", "Failed to write request body")
                 })?;
             } else {
                 // The awaited `write_all` is the primary backpressure source and
                 // must happen for every forwarded frame regardless of the tee
                 // (Req 4.1, 4.3, 2.1).
                 stream.write_all(&data).await.map_err(|e| {
-                    ProxyError::HttpError(format!("Failed to write request body: {}", e))
+                    upstream_io_error(e, "upstream request write", "Failed to write request body")
                 })?;
             }
             sent = sent.saturating_add(data.len() as u64);
@@ -1131,14 +1590,18 @@ where
     // terminator for that case — do not write a second one.
     if chunked_outbound && !wrote_terminator {
         stream.write_all(b"0\r\n\r\n").await.map_err(|e| {
-            ProxyError::HttpError(format!("Failed to write chunk terminator: {}", e))
+            upstream_io_error(
+                e,
+                "upstream request write",
+                "Failed to write chunk terminator",
+            )
         })?;
     }
 
     stream
         .flush()
         .await
-        .map_err(|e| ProxyError::HttpError(format!("Failed to flush request: {}", e)))?;
+        .map_err(|e| upstream_io_error(e, "upstream request write", "Failed to flush request"))?;
 
     debug!("Streamed signed request to upstream");
 
@@ -1157,12 +1620,99 @@ where
         );
     }
 
-    // Read raw response (unchanged).
-    let response_bytes = read_response(&mut stream).await?;
-    debug!("Received raw HTTP response: {} bytes", response_bytes.len());
+    Ok(RequestSent {
+        at: Instant::now(),
+        body_bytes: sent,
+    })
+}
 
-    // Parse response (unchanged).
-    parse_http_response(&response_bytes, method, path_and_query)
+/// Read until the final (non-1xx) response head is complete, skipping any 1xx
+/// heads before it. Returns where that head starts in `response`, or `None` when the
+/// upstream closed first (`response` then holds everything it sent).
+async fn await_final_head<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    sent: &RequestSent,
+    response: &mut ResponseBuffer,
+) -> Result<Option<usize>> {
+    let mut scratch = vec![0u8; 8192];
+    loop {
+        if let Some(start) = final_head_start(&response.bytes)? {
+            debug!(
+                post_body_wait_ms = sent.at.elapsed().as_millis() as u64,
+                body_bytes = sent.body_bytes,
+                "Upstream final response head received"
+            );
+            return Ok(Some(start));
+        }
+        if response
+            .read_from(stream, &mut scratch, "upstream response head")
+            .await?
+            == 0
+        {
+            return Ok(None);
+        }
+    }
+}
+
+/// Read the rest of the final response under the completeness rules of
+/// [`has_complete_response_from_pos`], leaving the final response alone in
+/// `response`. When the upstream closes first, `response` keeps everything it sent.
+async fn read_response_rest<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    start: Option<usize>,
+    response: &mut ResponseBuffer,
+) -> Result<()> {
+    let Some(start) = start else {
+        return Ok(());
+    };
+    let mut scratch = vec![0u8; 8192];
+    loop {
+        if has_complete_response_from_pos(&response.bytes, start) {
+            response.bytes.drain(..start);
+            return Ok(());
+        }
+        if response
+            .read_from(stream, &mut scratch, "upstream response body")
+            .await?
+            == 0
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// [`forward_signed_request_streaming_buffered`], answered as a client response.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_signed_request_streaming<B>(
+    method: &hyper::Method,
+    uri: &hyper::Uri,
+    headers: &hyper::HeaderMap,
+    version: hyper::Version,
+    body: B,
+    target_host: &str,
+    transport: &UpstreamTransport,
+    proxy_referer: Option<&str>,
+    cap: u64,
+    tee: Option<mpsc::Sender<Bytes>>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    forward_signed_request_streaming_buffered(
+        method,
+        uri,
+        headers,
+        version,
+        body,
+        target_host,
+        transport,
+        proxy_referer,
+        cap,
+        tee,
+    )
+    .await
+    .map(BufferedResponse::into_response)
 }
 
 /// Compute the allocation capacity for a body the buffered path must retain.
@@ -1176,35 +1726,6 @@ fn buffered_body_initial_capacity(content_length_hint: Option<u64>, max_bytes: u
     content_length_hint.unwrap_or(8192).min(max_bytes) as usize
 }
 
-/// Read request body from incoming request with a configurable size cap.
-///
-/// Reads the body frame-by-frame, accumulating bytes up to `max_bytes`.
-/// Returns an error that callers translate to HTTP 413 if the body exceeds the cap.
-///
-/// # Arguments
-/// * `req` - The incoming HTTP request
-/// * `max_bytes` - Maximum number of bytes to buffer
-///
-/// # Requirements
-/// - Requirement 11.1: Configurable cap on request body buffering
-/// - Requirement 11.2: Return HTTP 413 on exceed
-/// - Requirement 11.4: Apply cap at every body.collect() callsite
-///
-/// This is a thin wrapper over [`read_request_body_bounded_with_ledger`] with a
-/// disabled ledger, preserving the exact pre-Phase-D signature and behaviour for
-/// callers (and tests) that don't need Admission_Check coverage.
-pub async fn read_request_body_bounded(
-    req: Request<hyper::body::Incoming>,
-    max_bytes: u64,
-) -> Result<Bytes> {
-    read_request_body_bounded_with_ledger(
-        req,
-        max_bytes,
-        &Arc::new(crate::inflight_ledger::InflightLedger::disabled()),
-    )
-    .await
-}
-
 /// Read the request body up to `max_bytes`, reserving against the in-flight
 /// buffered-byte ledger before allocating.
 ///
@@ -1216,7 +1737,7 @@ pub async fn read_request_body_bounded(
 /// cache write on this path to commit, so "abort" here means returning the
 /// rejection error) rather than continuing to allocate (Requirements 3.2, 3.3,
 /// 3.5). A disabled ledger (`Ledger_Disabled`) reserves nothing and this function
-/// is byte-for-byte the pre-feature `read_request_body_bounded` behaviour.
+/// is byte-for-byte the pre-feature behaviour.
 ///
 /// # Requirements
 /// - Requirement 11.1, 11.2, 11.4 (Body_Size_Cap, unchanged from the original)
@@ -1312,8 +1833,13 @@ pub(crate) async fn read_request_body_bounded_with_ledger(
     Ok(Bytes::from(accumulated))
 }
 
-/// Connect to target IP address
-async fn connect_to_target(ip: IpAddr, port: u16) -> Result<TcpStream> {
+/// Connect to target IP address, then apply the pool's socket settings (keepalive,
+/// receive buffer, `TCP_NODELAY`) before any TLS handshake.
+async fn connect_to_target(
+    ip: IpAddr,
+    port: u16,
+    socket: &crate::config::ConnectionPoolConfig,
+) -> Result<TcpStream> {
     let addr = std::net::SocketAddr::new(ip, port);
 
     debug!("Connecting to {}", addr);
@@ -1322,7 +1848,7 @@ async fn connect_to_target(ip: IpAddr, port: u16) -> Result<TcpStream> {
         ProxyError::ConnectionError(format!("Failed to connect to {}: {}", addr, e))
     })?;
 
-    Ok(tcp_stream)
+    crate::https_connector::apply_socket_options(tcp_stream, socket)
 }
 
 /// Establish TLS connection
@@ -1386,13 +1912,14 @@ pub(crate) async fn establish_tls_with_retry(
     hostname: &str,
     tls_connector: &TlsConnector,
     max_retries: usize,
+    socket: &crate::config::ConnectionPoolConfig,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut last_error = None;
     let mut had_failures = false;
 
     for attempt in 0..max_retries {
         // Connect to target (Requirement 1.1, 1.5)
-        let tcp_stream = match connect_to_target(target_ip, port).await {
+        let tcp_stream = match connect_to_target(target_ip, port, socket).await {
             Ok(stream) => stream,
             Err(e) => {
                 had_failures = true;
@@ -1476,62 +2003,17 @@ pub(crate) async fn establish_tls_with_retry(
     Err(last_error.unwrap_or_else(|| ProxyError::TlsError("All retry attempts failed".to_string())))
 }
 
-/// Read HTTP response from the upstream stream, handling 1xx informational responses
-async fn read_response<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
-    let mut all_bytes = Vec::new();
-    let mut buffer = vec![0u8; 8192];
-
-    // Read until we have the complete final response (non-1xx)
-    loop {
-        match stream.read(&mut buffer).await {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                all_bytes.extend_from_slice(&buffer[..n]);
-
-                // Check if we have a complete response
-                if all_bytes.len() >= 4 {
-                    // Try to find and skip any 1xx responses
-                    if let Some(final_response) = extract_final_response(&all_bytes)? {
-                        return Ok(final_response);
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(ProxyError::HttpError(format!(
-                    "Failed to read response: {}",
-                    e
-                )));
-            }
-        }
-
-        // Safety limit to prevent infinite reading
-        if all_bytes.len() > 100 * 1024 * 1024 {
-            // 100MB limit
-            warn!("Response exceeded 100MB, stopping read");
-            break;
-        }
-    }
-
-    Ok(all_bytes)
-}
-
-/// Extract the final (non-1xx) response from the byte stream, skipping any 1xx responses
-fn extract_final_response(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+/// Where the final (non-1xx) response head starts, once that head is complete.
+/// Any 1xx heads before it are skipped.
+fn final_head_start(bytes: &[u8]) -> Result<Option<usize>> {
     let mut pos = 0;
-
     while pos < bytes.len() {
-        // Find the end of the current response headers
         let header_end = match find_header_end_from_pos(bytes, pos) {
             Some(end_pos) => end_pos,
-            None => return Ok(None), // Headers not complete yet
+            None => return Ok(None),
         };
-
-        // Parse the status line to check if this is a 1xx response
-        let header_section = &bytes[pos..header_end];
-        let header_str = String::from_utf8_lossy(header_section);
-        let mut lines = header_str.lines();
-
-        let status_line = match lines.next() {
+        let header_str = String::from_utf8_lossy(&bytes[pos..header_end]);
+        let status_line = match header_str.lines().next() {
             Some(line) => line,
             None => {
                 return Err(ProxyError::HttpError(
@@ -1539,36 +2021,18 @@ fn extract_final_response(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
                 ))
             }
         };
-
-        // Parse status code
         let status_code = parse_status_code(status_line)?;
-
-        // If this is a 1xx response, skip it and continue looking
-        if status_code.as_u16() >= 100 && status_code.as_u16() < 200 {
+        if status_code.is_informational() {
             info!(
                 "Received informational response: {} - skipping",
                 status_code
             );
-
-            // Skip past this response (headers + any body)
-            let body_start = header_end + 4; // Skip \r\n\r\n
-
-            // For 1xx responses, there should be no body, so move to next response
-            pos = body_start;
+            // A 1xx response has no body: the next response starts after its head.
+            pos = header_end + 4;
             continue;
         }
-
-        // This is a final response (2xx-5xx), check if it's complete
-        if has_complete_response_from_pos(bytes, pos) {
-            // Return the final response starting from pos
-            return Ok(Some(bytes[pos..].to_vec()));
-        } else {
-            // Final response not complete yet
-            return Ok(None);
-        }
+        return Ok(Some(pos));
     }
-
-    // No complete final response found
     Ok(None)
 }
 
@@ -1622,12 +2086,14 @@ fn find_header_end_from_pos(bytes: &[u8], start_pos: usize) -> Option<usize> {
 
 /// Parse raw HTTP response bytes into a Hyper Response
 fn parse_http_response(
-    bytes: &[u8],
+    bytes: Vec<u8>,
     method: &hyper::Method,
     path: &str,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+) -> Result<(hyper::http::response::Parts, Bytes)> {
+    // Owned: the body below is a slice of this buffer, not a copy.
+    let bytes = Bytes::from(bytes);
     // Find end of headers
-    let header_end = find_header_end(bytes).ok_or_else(|| {
+    let header_end = find_header_end(&bytes).ok_or_else(|| {
         ProxyError::HttpError("Invalid HTTP response: no header end found".to_string())
     })?;
 
@@ -1664,19 +2130,27 @@ fn parse_http_response(
 
     // Extract and decode body based on encoding
     let body_bytes = if body_start < bytes.len() {
-        let raw_body = &bytes[body_start..];
+        let raw_body = bytes.slice(body_start..);
 
         if is_chunked {
             debug!("Decoding chunked response body");
-            decode_chunked_body(raw_body)?
+            decode_chunked_body(&raw_body)?
         } else if let Some(length) = content_length {
             // Content-Length specified
             let actual_length = std::cmp::min(length, raw_body.len());
-            Bytes::copy_from_slice(&raw_body[..actual_length])
+            raw_body.slice(..actual_length)
         } else {
             // No encoding specified, use as-is
-            Bytes::copy_from_slice(raw_body)
+            raw_body
         }
+    } else if is_chunked
+        && method != hyper::Method::HEAD
+        && !matches!(status_code.as_u16(), 204 | 304)
+    {
+        // The head promised chunks and none arrived, not even the zero-size one.
+        return Err(ProxyError::from(
+            ChunkedDecodeError::TruncatedBeforeTerminator,
+        ));
     } else {
         Bytes::new()
     };
@@ -1735,22 +2209,19 @@ fn parse_http_response(
         }
     }
 
-    let response = response_builder
-        .body(
-            Full::new(body_bytes)
-                .map_err(|never| match never {})
-                .boxed(),
-        )
+    let (parts, ()) = response_builder
+        .body(())
         .map_err(|e| {
             error!("Failed to build HTTP response: {}", e);
             ProxyError::HttpError(format!("Failed to build response: {}", e))
-        })?;
+        })?
+        .into_parts();
 
     debug!(
         "Successfully built HTTP response with status: {}",
         status_code
     );
-    Ok(response)
+    Ok((parts, body_bytes))
 }
 
 /// Parse HTTP status code from status line
@@ -1779,7 +2250,7 @@ fn parse_status_code(status_line: &str) -> Result<StatusCode> {
 /// Enforces per-chunk and total-body size limits to prevent silent truncation
 /// or unbounded memory consumption from malformed chunked responses.
 #[derive(Debug, Clone)]
-pub struct ChunkedDecodeConfig {
+struct ChunkedDecodeConfig {
     /// Maximum allowed size for a single chunk (default: 16 MiB)
     pub max_chunk_size: usize,
     /// Maximum total decoded body size (default: 100 MiB)
@@ -1800,7 +2271,7 @@ impl Default for ChunkedDecodeConfig {
 /// Callers that receive a `ChunkedDecodeError` must NOT commit the partial body
 /// to the cache and must NOT return it to the client as a 200 response.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChunkedDecodeError {
+enum ChunkedDecodeError {
     /// A single chunk declared a size exceeding the configured maximum.
     ChunkTooLarge { declared: usize, max: usize },
     /// The accumulated decoded body exceeded the configured maximum.
@@ -1875,6 +2346,9 @@ fn decode_chunked_body_bounded(
 ) -> std::result::Result<Bytes, ChunkedDecodeError> {
     let mut decoded = Vec::new();
     let mut pos = 0;
+    // Set only when the zero-size chunk is read. A body that ends at a chunk boundary
+    // without it is cut short, however cleanly the cut falls.
+    let mut terminated = false;
 
     debug!("Decoding chunked body: {} bytes", chunked_data.len());
 
@@ -1902,6 +2376,7 @@ fn decode_chunked_body_bounded(
         // If chunk size is 0, this is the final chunk
         if chunk_size == 0 {
             debug!("Found final chunk, decoding complete");
+            terminated = true;
             break;
         }
 
@@ -1939,6 +2414,9 @@ fn decode_chunked_body_bounded(
         }
     }
 
+    if !terminated {
+        return Err(ChunkedDecodeError::TruncatedBeforeTerminator);
+    }
     debug!("Decoded chunked body: {} bytes total", decoded.len());
     Ok(Bytes::from(decoded))
 }
@@ -2450,6 +2928,159 @@ mod tests {
     }
 
     #[test]
+    fn a_chunked_body_without_the_zero_chunk_is_refused() {
+        // Cut exactly after a chunk's trailing CRLF, and after a whole number of chunks.
+        for cut in [
+            &b"5\r\nHello\r\n"[..],
+            &b"5\r\nHello\r\n6\r\n World\r\n"[..],
+            &b""[..],
+        ] {
+            let result = decode_chunked_body_bounded(cut, &ChunkedDecodeConfig::default());
+            assert_eq!(
+                result,
+                Err(ChunkedDecodeError::TruncatedBeforeTerminator),
+                "body {:?} has no zero-size chunk",
+                String::from_utf8_lossy(cut)
+            );
+        }
+        // The same body with its terminator decodes.
+        let whole = decode_chunked_body_bounded(
+            b"5\r\nHello\r\n0\r\n\r\n",
+            &ChunkedDecodeConfig::default(),
+        );
+        assert_eq!(whole, Ok(Bytes::from("Hello")));
+    }
+    #[test]
+    fn a_chunked_response_with_no_body_bytes_is_refused_except_where_none_is_allowed() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        assert!(parse_http_response(head.clone(), &hyper::Method::POST, "/b/k").is_err());
+        assert!(parse_http_response(head, &hyper::Method::HEAD, "/b/k").is_ok());
+        let no_content = b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        assert!(parse_http_response(no_content, &hyper::Method::DELETE, "/b/k").is_ok());
+    }
+    /// Serve one connection on loopback: read the request head, write `reply`, close.
+    async fn replying_upstream(reply: &'static [u8]) -> UpstreamTransport {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut seen = Vec::new();
+                let mut byte = [0u8; 1];
+                while !seen.ends_with(b"\r\n\r\n") {
+                    if sock.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    seen.push(byte[0]);
+                }
+                let _ = sock.write_all(reply).await;
+            }
+        });
+        UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
+        }
+    }
+    async fn forward_empty_put(transport: &UpstreamTransport) -> Result<StatusCode> {
+        forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            Full::new(Bytes::new()),
+            "example.com",
+            transport,
+            None,
+            100,
+            None,
+        )
+        .await
+        .map(|response| response.status())
+    }
+    /// Every way a forward can fail after its request was sent in full is marked as an
+    /// unknown outcome, and keeps the wording the client-visible 502 and 504 bodies show.
+    /// A failure before that (no connection) is not marked.
+    #[tokio::test]
+    async fn every_exit_after_the_request_was_sent_is_an_unknown_outcome() {
+        let replies: [(&str, &'static [u8]); 4] = [
+            ("closed without a byte", b""),
+            ("closed inside the head", b"HTTP/1.1 200 OK\r\nContent-Le"),
+            ("not a status line", b"garbage\r\n\r\n"),
+            (
+                "chunked body cut at a chunk boundary",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n",
+            ),
+        ];
+        for (what, reply) in replies {
+            let transport = replying_upstream(reply).await;
+            let error = forward_empty_put(&transport).await.expect_err(what);
+            assert!(
+                write_outcome_unknown(&error),
+                "{what}: a failure after the request was sent must be an unknown outcome: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("request sent, outcome unknown: "),
+                "{what}: the client-visible wording must be kept: {error}"
+            );
+        }
+        // Nothing listens: the request was never sent.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let transport = UpstreamTransport {
+            ip: "127.0.0.1".parse().unwrap(),
+            port,
+            tls: None,
+            validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
+        };
+        let error = forward_empty_put(&transport)
+            .await
+            .expect_err("no connection");
+        assert!(
+            !write_outcome_unknown(&error),
+            "a failure before the request was sent is not an unknown outcome: {error}"
+        );
+    }
+    /// A response that arrives when the ledger is at its ceiling is still held in
+    /// memory, so the ledger must show it: the figure and its peak cover every byte read.
+    #[tokio::test]
+    async fn a_response_that_arrives_at_the_ceiling_is_still_accounted() {
+        let ledger = Arc::new(crate::inflight_ledger::InflightLedger::new(1000));
+        let _held = ledger.try_reserve(900).expect("room for the held bytes");
+        let mut buffer = ResponseBuffer::new(4096, Some(&ledger));
+        let mut stream: &[u8] = &[b'x'; 300];
+        let mut scratch = vec![0u8; 8192];
+        let read = buffer
+            .read_from(&mut stream, &mut scratch, "test")
+            .await
+            .unwrap();
+        assert_eq!(read, 300);
+        assert_eq!(
+            ledger.reserved_bytes(),
+            1200,
+            "the 300 bytes held must be on the ledger beside the 900 already reserved"
+        );
+        assert_eq!(
+            ledger.peak_reserved_bytes(),
+            1200,
+            "the peak must cover the bytes held"
+        );
+        drop(buffer);
+        assert_eq!(
+            ledger.reserved_bytes(),
+            900,
+            "dropping the buffer releases them"
+        );
+    }
+    #[test]
     fn test_decode_chunked_body_bounded_chunk_too_large() {
         let config = ChunkedDecodeConfig {
             max_chunk_size: 10,
@@ -2550,6 +3181,8 @@ mod tests {
             port: 1,
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -2606,6 +3239,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         // 200-byte body, cap 100, no Content-Length header → first frame trips.
@@ -2741,6 +3376,8 @@ mod tests {
             port: address.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -2792,6 +3429,8 @@ mod tests {
             port: address.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
         let response = forward_signed_request_streaming_verbatim(
             request,
@@ -2889,6 +3528,8 @@ mod tests {
             port: address.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
         let uri = "/bucket/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=signature";
         let response = forward_signed_request_streaming(
@@ -2948,6 +3589,8 @@ mod tests {
             port: address.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
         let mut headers = hyper::HeaderMap::new();
         for (k, v) in client_headers {
@@ -3155,6 +3798,8 @@ mod tests {
                 port: address.port(),
                 tls: None,
                 validated_endpoint: None,
+                timeouts: UpstreamTimeouts::default(),
+                response_ledger: None,
             };
             let response = forward_signed_request_streaming(
                 &method.parse().unwrap(),
@@ -3214,6 +3859,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3303,6 +3950,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3403,6 +4052,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3492,6 +4143,8 @@ mod tests {
                 port: addr.port(),
                 tls: None,
                 validated_endpoint: None,
+                timeouts: UpstreamTimeouts::default(),
+                response_ledger: None,
             };
 
             let result = forward_signed_request_streaming(
@@ -3629,6 +4282,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3857,6 +4512,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3924,6 +4581,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3968,6 +4627,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4020,6 +4681,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4080,6 +4743,8 @@ mod tests {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4262,5 +4927,502 @@ mod property_tests {
 
         // Should return false because the header is not exactly "range"
         TestResult::from_bool(!result)
+    }
+}
+
+#[cfg(test)]
+mod upstream_timeout_tests {
+    //! Each wait the signed-write path makes on the upstream ends with a
+    //! `TimeoutError` naming its phase, and neither a slow-but-steady upstream nor a
+    //! client pausing between body frames is cut off.
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    /// Bound on every test here, well above any bound the tests configure.
+    const TEST_BOUND: Duration = Duration::from_secs(10);
+
+    fn transport(
+        addr: SocketAddr,
+        tls: Option<Arc<TlsConnector>>,
+        connect: Duration,
+        idle: Duration,
+    ) -> UpstreamTransport {
+        UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls,
+            validated_endpoint: None,
+            timeouts: UpstreamTimeouts {
+                connect,
+                idle,
+                ..UpstreamTimeouts::default()
+            },
+            response_ledger: None,
+        }
+    }
+
+    async fn forward<B>(
+        t: &UpstreamTransport,
+        content_length: usize,
+        body: B,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: std::fmt::Display,
+    {
+        let method = hyper::Method::PUT;
+        let uri: hyper::Uri = "/bucket/key".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("host", "localhost".parse().unwrap());
+        headers.insert(
+            "content-length",
+            content_length.to_string().parse().unwrap(),
+        );
+        let forwarded = tokio::time::timeout(
+            TEST_BOUND,
+            forward_signed_request_streaming(
+                &method,
+                &uri,
+                &headers,
+                hyper::Version::HTTP_11,
+                body,
+                "localhost",
+                t,
+                None,
+                u64::MAX,
+                None,
+            ),
+        )
+        .await;
+        forwarded.expect("the forward must end within the test bound")
+    }
+
+    fn timeout_message(r: Result<Response<BoxBody<Bytes, hyper::Error>>>) -> String {
+        match r {
+            Err(ProxyError::TimeoutError(m)) => m,
+            Err(e) => panic!("expected a TimeoutError, got {e}"),
+            Ok(resp) => panic!("expected a TimeoutError, got status {}", resp.status()),
+        }
+    }
+
+    /// Accept one connection and hand it to `serve`, which keeps it as long as it likes.
+    async fn origin<F, Fut>(serve: F) -> SocketAddr
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                serve(stream).await;
+            }
+        });
+        addr
+    }
+
+    /// Read a request head and `body_len` body bytes.
+    async fn read_request(stream: &mut TcpStream, body_len: usize) {
+        let mut seen = Vec::new();
+        let mut byte = [0u8; 1];
+        while !seen.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                return;
+            }
+            seen.push(byte[0]);
+        }
+        let mut body = vec![0u8; body_len];
+        let _ = stream.read_exact(&mut body).await;
+    }
+
+    #[tokio::test]
+    async fn a_full_accept_backlog_times_out_as_upstream_connect() {
+        use socket2::{Domain, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        socket.bind(&bind.into()).unwrap();
+        socket.listen(0).unwrap();
+        let addr = socket.local_addr().unwrap().as_socket().unwrap();
+        // Nothing accepts, so once the queue holds its one or two connections the
+        // kernel drops further SYNs and a connect waits for retransmissions.
+        let mut queued = Vec::new();
+        for _ in 0..16 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                Ok(s) => queued.push(s),
+                Err(_) => break,
+            }
+        }
+        assert!(queued.len() < 16, "precondition: the accept queue filled");
+        let t = transport(
+            addr,
+            None,
+            Duration::from_millis(300),
+            Duration::from_secs(120),
+        );
+        let started = Instant::now();
+        let msg = timeout_message(forward(&t, 0, Full::new(Bytes::new())).await);
+        assert!(msg.contains("upstream connect"), "{msg}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_client_hello_times_out_as_upstream_connect() {
+        let addr = origin(|stream| async move {
+            let _held = stream;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let cfg = crate::https_connector::build_tls_accept_any_config();
+        let tls = Arc::new(TlsConnector::from(Arc::new(cfg)));
+        let t = transport(
+            addr,
+            Some(tls),
+            Duration::from_millis(300),
+            Duration::from_secs(120),
+        );
+        let msg = timeout_message(forward(&t, 0, Full::new(Bytes::new())).await);
+        assert!(msg.contains("upstream connect"), "{msg}");
+    }
+
+    const IDLE: Duration = Duration::from_millis(300);
+
+    fn idle_transport(addr: SocketAddr) -> UpstreamTransport {
+        transport(addr, None, Duration::from_secs(5), IDLE)
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_stops_reading_times_out_as_request_write() {
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 0).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let body_len = 64 * 1024 * 1024;
+        let body = Full::new(Bytes::from(vec![0u8; body_len]));
+        let msg = timeout_message(forward(&idle_transport(addr), body_len, body).await);
+        assert!(msg.contains("upstream request write"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_never_answers_times_out_as_response_head() {
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 5).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let body = Full::new(Bytes::from_static(b"hello"));
+        let msg = timeout_message(forward(&idle_transport(addr), 5, body).await);
+        assert!(msg.contains("upstream response head"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_stalls_after_its_head_times_out_as_response_body() {
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 5).await;
+            let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+            let _ = stream.write_all(head).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let body = Full::new(Bytes::from_static(b"hello"));
+        let msg = timeout_message(forward(&idle_transport(addr), 5, body).await);
+        assert!(msg.contains("upstream response body"), "{msg}");
+    }
+
+    /// An upstream answering a signed PUT with a 64 MiB body: the proxy refuses it once
+    /// it passes the buffered-operation bound, holding at most the bound plus one read,
+    /// all of it reserved, and releases the reservation.
+    #[tokio::test]
+    async fn an_oversized_write_response_is_refused_within_the_bound_and_accounted() {
+        const BODY: usize = 64 * 1024 * 1024;
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 5).await;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", BODY);
+            let _ = stream.write_all(head.as_bytes()).await;
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..BODY / chunk.len() {
+                if stream.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let ledger = Arc::new(crate::inflight_ledger::InflightLedger::new(1 << 30));
+        let mut t = idle_transport(addr);
+        t.response_ledger = Some(Arc::clone(&ledger));
+        let body = Full::new(Bytes::from_static(b"hello"));
+        let result = forward(&t, 5, body).await;
+        let held = match &result {
+            Ok(r) => format!("a {} response", r.status()),
+            Err(e) => e.to_string(),
+        };
+        let peak = ledger.peak_reserved_bytes();
+        eprintln!("oversized write response: peak reserved {peak} bytes; outcome: {held}");
+        assert!(
+            matches!(&result, Err(ProxyError::HttpError(m)) if m.contains("bound")),
+            "the response must be refused at the bound, got {held}"
+        );
+        let bound = crate::http_proxy::BUFFERED_OPERATION_BOUND;
+        assert!(peak > bound / 2, "the buffer was reserved: peak {peak}");
+        assert!(
+            peak <= bound + 8192,
+            "held at most the bound plus one read: {peak}"
+        );
+        assert_eq!(ledger.reserved_bytes(), 0, "released with the attempt");
+    }
+
+    /// The request has been sent when the response arrives, so S3 may have executed the
+    /// write: a ledger at its ceiling at that moment must not turn S3's answer into a
+    /// shed. The response, larger than the whole ledger, is forwarded whole. The ledger
+    /// records it past its ceiling, since it is held in memory, and releases it with the
+    /// response.
+    #[tokio::test]
+    async fn a_write_response_arriving_at_the_ledger_ceiling_is_forwarded() {
+        const BODY: usize = 2 * 1024 * 1024;
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 5).await;
+            let body = vec![b'x'; BODY];
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        const CEILING: u64 = 1024 * 1024;
+        let ledger = Arc::new(crate::inflight_ledger::InflightLedger::new(CEILING));
+        let pinned = ledger
+            .try_reserve(CEILING)
+            .expect("precondition: fill the ledger");
+        let mut t = idle_transport(addr);
+        t.response_ledger = Some(Arc::clone(&ledger));
+        let result = forward(&t, 5, Full::new(Bytes::from_static(b"hello"))).await;
+        let response = match result {
+            Ok(r) => r,
+            Err(e) => panic!("S3's answer must be forwarded, got: {e}"),
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            ledger.reserved_bytes() >= CEILING + BODY as u64,
+            "the response held in memory is on the ledger: {}",
+            ledger.reserved_bytes()
+        );
+        assert!(
+            ledger.peak_reserved_bytes() >= CEILING + BODY as u64,
+            "and so is the peak: {}",
+            ledger.peak_reserved_bytes()
+        );
+        drop(pinned);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), BODY);
+        assert_eq!(ledger.reserved_bytes(), 0, "released with the response");
+    }
+
+    /// A second signed write whose request finishes sending while the first write's
+    /// response holds the ledger past its ceiling. S3 has the whole second request, so
+    /// its answer is forwarded, not refused as a shed.
+    #[tokio::test]
+    async fn a_write_sent_while_the_ledger_is_past_its_ceiling_is_answered() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const BODY: usize = 2 * 1024 * 1024;
+        let first = origin(|mut stream| async move {
+            read_request(&mut stream, 5).await;
+            let body = vec![b'x'; BODY];
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let read_in_full = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&read_in_full);
+        let second = origin(move |mut stream| async move {
+            read_request(&mut stream, 5).await;
+            seen.store(true, Ordering::SeqCst);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        const CEILING: u64 = 1024 * 1024;
+        let ledger = Arc::new(crate::inflight_ledger::InflightLedger::new(CEILING));
+        let pinned = ledger
+            .try_reserve(CEILING)
+            .expect("precondition: fill the ledger");
+        let mut t1 = idle_transport(first);
+        t1.response_ledger = Some(Arc::clone(&ledger));
+        let held = forward(&t1, 5, Full::new(Bytes::from_static(b"hello")))
+            .await
+            .expect("precondition: the first write's answer is forwarded");
+        assert!(
+            ledger.reserved_bytes() > CEILING,
+            "precondition: the first response holds the ledger past its ceiling: {}",
+            ledger.reserved_bytes()
+        );
+        let rejected_before = ledger.rejected_total();
+        let mut t2 = idle_transport(second);
+        t2.response_ledger = Some(Arc::clone(&ledger));
+        match forward(&t2, 5, Full::new(Bytes::from_static(b"hello"))).await {
+            Ok(response) => assert_eq!(response.status(), StatusCode::OK),
+            Err(e) => panic!(
+                "a write sent in full was refused after sending: {e} (outcome unknown: {})",
+                write_outcome_unknown(&e)
+            ),
+        }
+        assert!(
+            read_in_full.load(Ordering::SeqCst),
+            "precondition: the second origin read the whole request"
+        );
+        assert_eq!(
+            ledger.rejected_total(),
+            rejected_before,
+            "nothing was refused after the request was sent"
+        );
+        drop(held);
+        drop(pinned);
+        assert_eq!(ledger.reserved_bytes(), 0, "released with the responses");
+    }
+
+    /// A response within the bound is reserved until the client response is dropped.
+    #[tokio::test]
+    async fn a_buffered_write_response_holds_its_reservation_until_dropped() {
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 5).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd")
+                .await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let ledger = Arc::new(crate::inflight_ledger::InflightLedger::new(1 << 30));
+        let mut t = idle_transport(addr);
+        t.response_ledger = Some(Arc::clone(&ledger));
+        let response = forward(&t, 5, Full::new(Bytes::from_static(b"hello")))
+            .await
+            .expect("a small response is forwarded");
+        assert!(ledger.reserved_bytes() > 0, "held while the response lives");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"abcd");
+        assert_eq!(ledger.reserved_bytes(), 0, "released with the response");
+    }
+
+    /// Control: an upstream that sends one byte every `IDLE / 2`, for longer than
+    /// `2 x IDLE` in all, is never cut off.
+    #[tokio::test]
+    async fn a_slow_but_steady_upstream_is_not_cut_off() {
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 5).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n")
+                .await;
+            for byte in b"abcdef" {
+                tokio::time::sleep(IDLE / 2).await;
+                let _ = stream.write_all(&[*byte]).await;
+            }
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let started = Instant::now();
+        let body = Full::new(Bytes::from_static(b"hello"));
+        let response = forward(&idle_transport(addr), 5, body)
+            .await
+            .expect("a steady upstream completes");
+        assert!(started.elapsed() > IDLE * 2, "{:?}", started.elapsed());
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"abcdef");
+    }
+
+    /// Control over TLS: an upstream sending one small TLS record every `IDLE / 2`,
+    /// for longer than `2 x IDLE` in all, is never cut off.
+    #[tokio::test]
+    async fn a_slow_but_steady_tls_upstream_is_not_cut_off() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let addr = origin(move |stream| async move {
+            let Ok(mut tls) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                if tls.read(&mut byte).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                seen.push(byte[0]);
+            }
+            let mut body = [0u8; 5];
+            let _ = tls.read_exact(&mut body).await;
+            let _ = tls
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n")
+                .await;
+            let _ = tls.flush().await;
+            for byte in b"abcdef" {
+                tokio::time::sleep(IDLE / 2).await;
+                let _ = tls.write_all(&[*byte]).await;
+                let _ = tls.flush().await;
+            }
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let cfg = crate::https_connector::build_tls_accept_any_config();
+        let tls = Arc::new(TlsConnector::from(Arc::new(cfg)));
+        let t = transport(addr, Some(tls), Duration::from_secs(5), IDLE);
+        let started = Instant::now();
+        let body = Full::new(Bytes::from_static(b"hello"));
+        let response = forward(&t, 5, body)
+            .await
+            .expect("a steady TLS upstream completes");
+        assert!(started.elapsed() > IDLE * 2, "{:?}", started.elapsed());
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"abcdef");
+    }
+
+    /// Control: a client that pauses `2 x IDLE` between two body frames is never cut
+    /// off, because the timer does not run while the proxy waits on the client.
+    #[tokio::test]
+    async fn a_client_pausing_between_body_frames_is_not_cut_off() {
+        let addr = origin(|mut stream| async move {
+            read_request(&mut stream, 6).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let frames = futures::stream::unfold(0u8, |step| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::io::Error>(hyper::body::Frame::data(Bytes::from_static(b"abc"))),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(IDLE * 2).await;
+                    Some((Ok(hyper::body::Frame::data(Bytes::from_static(b"def"))), 2))
+                }
+                _ => None,
+            }
+        });
+        let body = http_body_util::StreamBody::new(Box::pin(frames));
+        let started = Instant::now();
+        let response = forward(&idle_transport(addr), 6, body)
+            .await
+            .expect("a pausing client completes");
+        assert!(started.elapsed() >= IDLE * 2, "{:?}", started.elapsed());
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

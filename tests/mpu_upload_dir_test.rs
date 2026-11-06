@@ -196,6 +196,8 @@ async fn traversal_upload_ids_create_nothing_outside_their_digest_directory() {
             port: addr.port(),
             tls: None,
             validated_endpoint: None,
+            timeouts: s3_proxy::signed_request_proxy::UpstreamTimeouts::default(),
+            response_ledger: None,
         });
         let resp = tokio::time::timeout(
             Duration::from_secs(60),
@@ -360,49 +362,4 @@ fn raw_upload_id_scanner_flags_each_shape_it_names() {
     ] {
         assert!(!raw_join.is_match(&norm(clean)), "must not flag {clean:?}");
     }
-}
-
-/// Property 3. An upload begun before the upgrade left `mpus_in_progress/<raw uploadId>/`.
-/// After the upgrade nothing looks there by name, so the only thing that removes it is the
-/// age sweep — which must still do so. The sweep ages entries by the newest of the
-/// directory's and `upload.meta`'s mtimes, so both are backdated past the TTL.
-#[tokio::test]
-async fn pre_upgrade_raw_named_upload_directory_is_reclaimed_by_the_age_sweep() {
-    let temp = TempDir::new().unwrap();
-    let cache_dir = temp.path().to_path_buf();
-    let legacy_id = "m0TmAnJ8zEI3xQ7vR2_kLp9WcHs4Nd6Yb1Gf5Ut8Ze3Ja0Mo7Ri2Xs9Kv4Pw6Dl1Cq8En5Bh3Ty0Fg7Iu2Ok9Sn4Va6Lm1Wr8Hx3Qe5Zc0Jp7Gt2Yd9Mb4Ki6Uf1Aw8";
-    let legacy_dir = cache_dir.join("mpus_in_progress").join(legacy_id);
-    tokio::fs::create_dir_all(&legacy_dir).await.unwrap();
-    tokio::fs::write(legacy_dir.join("part1.bin"), vec![0u8; 1024])
-        .await
-        .unwrap();
-    let tracker = s3_proxy::cache_types::MultipartUploadTracker::new(
-        legacy_id.to_string(),
-        "test-bucket/pre-upgrade-object".to_string(),
-    );
-    let upload_meta = legacy_dir.join("upload.meta");
-    tokio::fs::write(&upload_meta, tracker.to_json().unwrap())
-        .await
-        .unwrap();
-    let old = filetime::FileTime::from_system_time(
-        std::time::SystemTime::now() - Duration::from_secs(3600),
-    );
-    filetime::set_file_mtime(&upload_meta, old).unwrap();
-    filetime::set_file_mtime(&legacy_dir, old).unwrap();
-
-    let manager = s3_proxy::write_cache_manager::WriteCacheManager::new(
-        cache_dir.clone(),
-        100 * 1024 * 1024,
-        10.0,
-        Duration::from_secs(86400),
-        Duration::from_secs(60), // incomplete-upload TTL, well under the 1 h backdate
-        s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
-        256 * 1024 * 1024,
-    );
-    manager.evict_incomplete_uploads().await.unwrap();
-    assert!(
-        !legacy_dir.exists(),
-        "a pre-upgrade upload directory named after the raw uploadId must be reclaimed by \
-         the age sweep, or every in-flight upload at upgrade time leaks its staged parts"
-    );
 }

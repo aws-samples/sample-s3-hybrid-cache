@@ -20,6 +20,7 @@
 //! records no identity and holds an extent at 0 shorter than the object before it sends the
 //! request under test, and the controls include the adjacent shape the rule serves (a
 //! whole-object extent, one byte longer than the shortest refused one).
+mod common;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -37,7 +38,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Semaphore};
 
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
-use s3_proxy::cache_types::{ObjectMetadata, RangeLookupPurpose};
+use s3_proxy::cache_types::RangeLookupPurpose;
 use s3_proxy::config::{Config, UpstreamOverrideConfig, UpstreamScheme};
 use s3_proxy::disk_cache::DiskCacheManager;
 use s3_proxy::http_proxy::HttpProxy;
@@ -242,6 +243,8 @@ struct Harness {
     proxy: SocketAddr,
     disk: Arc<tokio::sync::RwLock<DiskCacheManager>>,
     cache_manager: Arc<CacheManager>,
+    /// The consolidation loop runs, so a fill reaches its `.meta`; off, it stays a journal `Add`.
+    folds: bool,
 }
 
 /// `consolidate` runs the fold on a tight loop, which is what turns a fill's journal `Add`
@@ -406,6 +409,7 @@ async fn harness_with(consolidate: bool, full_object_check_threshold: Option<u64
         proxy,
         disk: serve_disk,
         cache_manager: kept_cache_manager,
+        folds: consolidate,
     }
 }
 
@@ -472,14 +476,17 @@ impl Harness {
         .0
     }
 
-    /// Plant one extent through the real store path, with the `ObjectMetadata` the
-    /// production extractor builds from the `206` the fill arrived in: `content_length` is
-    /// the total read out of `Content-Range`, the header map retains the header, and
-    /// `cumulative_size` is what the streaming range-fill arm sets — the total, for a
-    /// correct fill and a shifted one alike.
+    /// Plant one extent. The fill is the production one: a ranged GET for
+    /// `header_start..=header_end` that misses, forwarded to the origin and stored by the range
+    /// fill the request path starts, so the stored headers, lengths and file identity are what
+    /// a 3.0.0 writer leaves.
     ///
-    /// `(header_start, header_end)` describe what S3 answered; `extent_start` is the offset
-    /// the listing claims. A shifted entry is `extent_start == 0` with `header_start > 0`.
+    /// `extent_start` is the offset the listing claims. When it differs from `header_start`
+    /// the listing is then rewritten to the shape a release before 3.0.0 wrote for an
+    /// open-ended or suffix range: the extent at `extent_start` whose file holds the bytes
+    /// from `header_start`. No writer produces that shape any more, so it is the one edit made
+    /// by hand here, to the `.meta` when the fill has been folded and to the pending journal
+    /// `Add` when it has not. A shifted entry is `extent_start == 0` with `header_start > 0`.
     async fn plant(
         &self,
         key: &str,
@@ -488,45 +495,145 @@ impl Harness {
         extent_start: u64,
         object: &Bytes,
     ) {
-        let cache_key = format!("{}/{}", BUCKET, key);
-        let body = object.slice(header_start..=header_end);
-        let om = ObjectMetadata {
-            etag: etag_of(key),
-            last_modified: String::from("Wed, 01 Jan 2025 00:00:00 GMT"),
-            content_length: object.len() as u64,
-            cumulative_size: object.len() as u64,
-            content_type: Some(String::from("application/octet-stream")),
-            response_headers: HashMap::from([
-                (
-                    String::from("content-range"),
-                    format!("bytes {}-{}/{}", header_start, header_end, object.len()),
-                ),
-                (String::from("content-length"), body.len().to_string()),
-                (String::from("etag"), etag_of(key)),
-                (
-                    String::from("last-modified"),
-                    String::from("Wed, 01 Jan 2025 00:00:00 GMT"),
-                ),
-                (String::from("accept-ranges"), String::from("bytes")),
-            ]),
-            ..Default::default()
-        };
-        self.disk
-            .write()
-            .await
-            .store_range(
-                &cache_key,
-                extent_start,
-                extent_start + body.len() as u64 - 1,
-                &body,
-                om,
-                TTL,
-                false,
+        let raw = format!("/{}/{}", BUCKET, key);
+        let (status, body) = self
+            .send(
+                "GET",
+                &raw,
+                &[
+                    ("authorization", AUTH.to_string()),
+                    ("range", format!("bytes={}-{}", header_start, header_end)),
+                ],
             )
-            .await
-            .expect("plant the extent");
+            .await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "plant {key}");
+        assert_eq!(body, object.slice(header_start..=header_end), "plant {key}");
+        let (hs, he) = (header_start as u64, header_end as u64);
+        self.wait_for_fill(key, hs, he).await;
+        if extent_start != hs {
+            self.shift_listing(key, hs, he, extent_start).await;
+        }
     }
-
+    /// Wait until the fill of `start..=end` is listed: in the `.meta` when the harness folds, else
+    /// as a pending journal `Add`.
+    async fn wait_for_fill(&self, key: &str, start: u64, end: u64) {
+        let until = tokio::time::Instant::now() + STEP;
+        loop {
+            let listed = if self.folds {
+                self.meta_doc(key, Duration::from_millis(1))
+                    .await
+                    .is_some_and(|d| extents(&d).iter().any(|(s, e, _)| (*s, *e) == (start, end)))
+            } else {
+                self.journal_adds(key)
+                    .iter()
+                    .any(|(s, e)| (*s, *e) == (start, end))
+            };
+            if listed {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "the fill of {key} {start}-{end} was not listed within {STEP:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    /// `(start, end)` of every pending journal `Add` of the key.
+    fn journal_adds(&self, key: &str) -> Vec<(u64, u64)> {
+        let want = format!("{}/{}", BUCKET, key);
+        let journals = self.dir.path().join("metadata").join("_journals");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&journals).into_iter().flatten().flatten() {
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            for line in content.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if value.get("cache_key").and_then(|k| k.as_str()) == Some(want.as_str())
+                    && value.get("operation").and_then(|o| o.as_str()) == Some("Add")
+                {
+                    if let (Some(s), Some(e)) = (
+                        value.pointer("/range_spec/start").and_then(|v| v.as_u64()),
+                        value.pointer("/range_spec/end").and_then(|v| v.as_u64()),
+                    ) {
+                        out.push((s, e));
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// Re-list the fill of `hs..=he` as `new_start..` (same length): move its file to the name
+    /// that extent would have had and rewrite the listing to match.
+    async fn shift_listing(&self, key: &str, hs: u64, he: u64, new_start: u64) {
+        let cache_key = format!("{}/{}", BUCKET, key);
+        let new_end = new_start + (he - hs);
+        let (old_path, new_path, relative) = {
+            let disk = self.disk.read().await;
+            let old_path = disk.get_new_range_file_path(&cache_key, hs, he);
+            let new_path = disk.get_new_range_file_path(&cache_key, new_start, new_end);
+            let relative = new_path
+                .strip_prefix(self.dir.path().join("ranges"))
+                .expect("range file under ranges/")
+                .to_string_lossy()
+                .to_string();
+            (old_path, new_path, relative)
+        };
+        std::fs::rename(&old_path, &new_path).expect("move the file to the shifted name");
+        let edit_spec = |spec: &mut serde_json::Value| {
+            let spec = spec.as_object_mut().expect("range spec");
+            spec.insert("start".into(), new_start.into());
+            spec.insert("end".into(), new_end.into());
+            spec.insert("file_path".into(), relative.clone().into());
+        };
+        if self.folds {
+            self.rewrite_meta(key, |doc| {
+                let spec = doc["ranges"]
+                    .as_array_mut()
+                    .expect("ranges")
+                    .iter_mut()
+                    .find(|r| r["start"] == hs && r["end"] == he)
+                    .expect("the fill's listing");
+                edit_spec(spec);
+            })
+            .await;
+        } else {
+            let journals = self.dir.path().join("metadata").join("_journals");
+            let mut rewritten = 0;
+            for entry in std::fs::read_dir(&journals)
+                .expect("journals dir")
+                .flatten()
+            {
+                let path = entry.path();
+                let content = std::fs::read_to_string(&path).unwrap();
+                let mut out = String::new();
+                for line in content.lines() {
+                    let mut value: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            out.push_str(line);
+                            out.push('\n');
+                            continue;
+                        }
+                    };
+                    if value.get("cache_key").and_then(|k| k.as_str()) == Some(cache_key.as_str())
+                        && value.get("operation").and_then(|o| o.as_str()) == Some("Add")
+                        && value.pointer("/range_spec/start") == Some(&serde_json::json!(hs))
+                        && value.pointer("/range_spec/end") == Some(&serde_json::json!(he))
+                    {
+                        edit_spec(&mut value["range_spec"]);
+                        rewritten += 1;
+                    }
+                    out.push_str(&serde_json::to_string(&value).unwrap());
+                    out.push('\n');
+                }
+                std::fs::write(&path, out).unwrap();
+            }
+            assert_eq!(rewritten, 1, "exactly one pending Add of the fill");
+        }
+    }
     /// The planted key's `.meta` as JSON, once one exists.
     async fn meta_doc(&self, key: &str, deadline: Duration) -> Option<serde_json::Value> {
         let want = format!("{}/{}", BUCKET, key);

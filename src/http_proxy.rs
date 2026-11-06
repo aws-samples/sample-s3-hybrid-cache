@@ -317,7 +317,7 @@ pub(crate) fn empty_boxed_body() -> BoxBody<Bytes, hyper::Error> {
 /// Result of evaluating client conditional headers against cached metadata
 /// in Mode B (`evaluate_conditions_from_cache = true`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConditionalEvalResult {
+enum ConditionalEvalResult {
     /// All preconditions passed; caller should serve from cache.
     Fresh,
     /// 304 Not Modified — caller should return 304 with appropriate headers.
@@ -327,44 +327,6 @@ pub enum ConditionalEvalResult {
     /// Cache data insufficient to decide (missing ETag or Last-Modified, unparseable
     /// date, etc.). Caller should fall back to Mode A (forward to S3).
     FallbackToForward,
-}
-
-/// Strong ETag comparison per RFC 7232 §2.3.2.
-///
-/// Strong match requires both tags to be strong (not prefixed with `W/`) and to
-/// match character-by-character. `*` matches any current representation.
-///
-/// Tolerance note: RFC 7232 requires etags on the wire to be quoted
-/// (`"opaque"`), but some clients (notably AWS CLI v2's `--if-match` /
-/// `--if-none-match` flags) strip the quotes before sending the header. We
-/// normalize by stripping a single pair of surrounding double-quotes from
-/// either side before comparison, so a client-supplied `abc` matches a cached
-/// `"abc"` and vice versa.
-pub fn etag_strong_match(client: &str, cached: &str) -> bool {
-    let client_trim = client.trim();
-    if client_trim == "*" {
-        return true;
-    }
-    // Strong requires no W/ prefix on either side
-    if client_trim.starts_with("W/") || cached.starts_with("W/") {
-        return false;
-    }
-    strip_etag_quotes(client_trim) == strip_etag_quotes(cached)
-}
-
-/// Weak ETag comparison per RFC 7232 §2.3.2.
-///
-/// Weak match compares opaque-tag values, ignoring the `W/` prefix on either side.
-/// `*` matches any current representation. Surrounding double-quotes are stripped
-/// on both sides (see `etag_strong_match` for tolerance rationale).
-pub fn etag_weak_match(client: &str, cached: &str) -> bool {
-    let client_trim = client.trim();
-    if client_trim == "*" {
-        return true;
-    }
-    let client_opaque = client_trim.strip_prefix("W/").unwrap_or(client_trim);
-    let cached_opaque = cached.strip_prefix("W/").unwrap_or(cached);
-    strip_etag_quotes(client_opaque) == strip_etag_quotes(cached_opaque)
 }
 
 /// Render a STORED ETag as an `ETag` response-header value.
@@ -431,7 +393,7 @@ pub(crate) fn strip_etag_quotes(s: &str) -> &str {
 
 /// A parsed ETag entry from a comma-separated header value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ETagEntry {
+enum ETagEntry {
     /// A strong ETag: `"opaque-tag"` (no W/ prefix, properly quoted).
     Strong(String),
     /// A weak ETag: `W/"opaque-tag"`.
@@ -479,7 +441,7 @@ impl ETagEntry {
 /// Each entry is trimmed and classified as Strong, Weak, or Invalid.
 ///
 /// Requirements: 6.2, 6.5, 6.6
-pub fn parse_etag_list(header_value: &str) -> Vec<ETagEntry> {
+fn parse_etag_list(header_value: &str) -> Vec<ETagEntry> {
     let mut entries = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -1632,42 +1594,6 @@ impl HttpProxy {
             config.server.max_inflight_buffer_bytes,
         ));
 
-        // Create S3 client (metrics will be set later via set_metrics_manager)
-        let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(
-            S3Client::new(&config.connection_pool, None)?
-                .with_inflight_ledger(Arc::clone(&inflight_ledger)),
-        );
-
-        // Create disk cache manager for new range storage architecture with atomic metadata writes support
-        let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-            cache_manager.create_configured_disk_cache_manager(),
-        ));
-
-        let range_handler = Arc::new(RangeHandler::new(
-            Arc::clone(&cache_manager),
-            Arc::clone(&disk_cache_manager),
-        ));
-        let request_semaphore = Arc::new(Semaphore::new(config.server.max_concurrent_requests));
-        let active_connections = Arc::new(AtomicUsize::new(0));
-
-        // Build proxy identification Referer header value at startup
-        let proxy_referer = if config.server.add_referer_header {
-            let hostname = gethostname::gethostname().to_string_lossy().to_string();
-            let referer = format!(
-                "Hybrid Cache for Amazon S3/{} ({})",
-                env!("CARGO_PKG_VERSION"),
-                hostname
-            );
-            info!(
-                "Proxy identification enabled: Referer header will be set to \"{}\"",
-                referer
-            );
-            Some(referer)
-        } else {
-            info!("Proxy identification headers are disabled (add_referer_header = false)");
-            None
-        };
-
         // Build destination policy for the HTTP forwarding path if connect_allowlist
         // is configured. This gates the SSRF protection so operators using the proxy
         // as a general forward proxy can opt out by not configuring an allowlist.
@@ -1726,6 +1652,48 @@ impl HttpProxy {
                 debug!("HTTP-path destination policy disabled (no connect_allowlist configured)");
                 (None, None)
             }
+        };
+
+        // Create S3 client (metrics will be set later via set_metrics_manager). With an
+        // allowlist its pool keeps only the addresses the policy accepts, so a connection
+        // cannot dial one the pre-flight check refused.
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(
+            S3Client::new_with_dial_policy(
+                &config.connection_pool,
+                None,
+                destination_policy.clone(),
+            )?
+            .with_inflight_ledger(Arc::clone(&inflight_ledger)),
+        );
+
+        // Create disk cache manager for new range storage architecture with atomic metadata writes support
+        let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
+            cache_manager.create_configured_disk_cache_manager(),
+        ));
+
+        let range_handler = Arc::new(RangeHandler::new(
+            Arc::clone(&cache_manager),
+            Arc::clone(&disk_cache_manager),
+        ));
+        let request_semaphore = Arc::new(Semaphore::new(config.server.max_concurrent_requests));
+        let active_connections = Arc::new(AtomicUsize::new(0));
+
+        // Build proxy identification Referer header value at startup
+        let proxy_referer = if config.server.add_referer_header {
+            let hostname = gethostname::gethostname().to_string_lossy().to_string();
+            let referer = format!(
+                "Hybrid Cache for Amazon S3/{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                hostname
+            );
+            info!(
+                "Proxy identification enabled: Referer header will be set to \"{}\"",
+                referer
+            );
+            Some(referer)
+        } else {
+            info!("Proxy identification headers are disabled (add_referer_header = false)");
+            None
         };
 
         // Initialize global bandwidth QoS limiter (disabled by default when max_bytes_per_sec = 0).
@@ -2374,10 +2342,11 @@ impl HttpProxy {
             match policy.check(&host, check_port, resolver).await {
                 Ok(_validated_ips) => {
                     // Destination passes policy — proceed with forwarding.
-                    // Note: the S3Client performs its own DNS resolution via the connection
-                    // pool, so we cannot directly reuse these IPs for the connection.
-                    // The policy check still provides SSRF protection by rejecting
-                    // prohibited destinations before any request is sent.
+                    // The S3Client resolves the name again through the connection pool,
+                    // so these IPs are not reused. With an allowlist set the pool filters
+                    // its answer through this same policy, so the connection dials only
+                    // addresses the policy accepts (`endpoint_overrides` addresses
+                    // excepted, which the policy carves out).
                 }
                 Err(reason) => {
                     warn!(
@@ -2481,32 +2450,52 @@ impl HttpProxy {
                 (resp, from_cache)
             }
             Method::PUT => {
-                let resp = Self::handle_put_request(
-                    req,
-                    host,
-                    config.clone(),
-                    cache_manager,
-                    s3_client,
-                    metrics_manager,
-                    &proxy_referer,
-                    Some(permit),
-                )
-                .await?;
+                // A write runs in its own task. hyper drops this future when the client
+                // closes the connection while the response is pending, and a write S3 may
+                // have executed must still reach its invalidation.
+                let config = config.clone();
+                let task = tokio::spawn(async move {
+                    Self::handle_put_request(
+                        req,
+                        host,
+                        config,
+                        cache_manager,
+                        s3_client,
+                        metrics_manager,
+                        &proxy_referer,
+                        Some(permit),
+                    )
+                    .await
+                });
+                (Self::await_write_task(task).await, false)
+            }
+            Method::POST if Self::is_select_object_content(&uri) => {
+                Self::warn_select_refused_rate_limited(client_addr, uri.path());
+                let resp = Self::build_error_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    "SelectObjectContent is not supported through this proxy. Send the request to S3 directly.",
+                    None,
+                );
                 (resp, false)
             }
             Method::POST | Method::DELETE => {
-                let resp = Self::handle_other_request(
-                    req,
-                    host,
-                    config.clone(),
-                    cache_manager,
-                    s3_client,
-                    metrics_manager,
-                    &proxy_referer,
-                    Some(permit),
-                )
-                .await?;
-                (resp, false)
+                // In its own task, as the PUT arm, for the same reason.
+                let config = config.clone();
+                let task = tokio::spawn(async move {
+                    Self::handle_other_request(
+                        req,
+                        host,
+                        config,
+                        cache_manager,
+                        s3_client,
+                        metrics_manager,
+                        &proxy_referer,
+                        Some(permit),
+                    )
+                    .await
+                });
+                (Self::await_write_task(task).await, false)
             }
             _ => {
                 debug!("Unsupported method: {}", method);
@@ -2810,7 +2799,14 @@ impl HttpProxy {
 
     /// Parse a Host header value into its hostname component, stripping any port.
     ///
-    /// Handles all RFC 7230 / RFC 3986 forms:
+    /// `Host` is `uri-host [ ":" port ]` (RFC 9110 section 7.2). The host must be an
+    /// RFC 3986 section 3.2.2 `reg-name` (unreserved, sub-delims and `%HH`; a dotted IPv4
+    /// address is one), or a bracketed IPv6 literal that parses as `Ipv6Addr`; the port, when
+    /// present, is decimal digits that fit a `u16`. The rule follows RFC 3986, not DNS: upper
+    /// case, `_`, `~`, a trailing dot and `%HH` pass, a space, `"`, a control character or an
+    /// IPv6 zone ID does not.
+    ///
+    /// Accepted forms:
     ///   example.com
     ///   example.com:8080
     ///   127.0.0.1:80
@@ -2836,6 +2832,9 @@ impl HttpProxy {
             if host.is_empty() {
                 return Err("empty bracketed host");
             }
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err("invalid IPv6 literal in Host header");
+            }
             // After ']', either nothing or ':<port>' is permitted.
             let after = &rest[end + 1..];
             if !after.is_empty() && !after.starts_with(':') {
@@ -2844,7 +2843,7 @@ impl HttpProxy {
             // Port validation is best-effort: reject obviously broken port strings
             // so a bad Host header doesn't masquerade as a valid bracketed host.
             if let Some(port_str) = after.strip_prefix(':') {
-                if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                if !Self::is_host_port(port_str) {
                     return Err("invalid port in Host header");
                 }
             }
@@ -2857,18 +2856,72 @@ impl HttpProxy {
 
         // No brackets. At most one colon is allowed (hostname:port or ipv4:port).
         // Unbracketed IPv6 is not legal in a Host header.
-        match value.rsplit_once(':') {
+        let host = match value.rsplit_once(':') {
             Some((host, port_str)) => {
                 if host.contains(':') {
                     return Err("unbracketed IPv6 in Host header");
                 }
-                if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                if !Self::is_host_port(port_str) {
                     return Err("invalid port in Host header");
                 }
-                Ok(host)
+                host
             }
-            None => Ok(value),
+            None => value,
+        };
+        if host.is_empty() {
+            return Err("empty host in Host header");
         }
+        if !Self::is_reg_name(host) {
+            return Err("invalid character in Host header");
+        }
+        Ok(host)
+    }
+
+    /// A `Host` port: one or more ASCII digits that fit a `u16`.
+    fn is_host_port(port: &str) -> bool {
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+    }
+
+    /// RFC 3986 section 3.2.2 `reg-name`: unreserved, sub-delims and `%HH`.
+    fn is_reg_name(host: &str) -> bool {
+        let bytes = host.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'%' {
+                if !(i + 2 < bytes.len()
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit())
+                {
+                    return false;
+                }
+                i += 3;
+                continue;
+            }
+            let ok = b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                );
+            if !ok {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Extract the explicit port from the request's `Host` header.
@@ -2924,7 +2977,7 @@ impl HttpProxy {
                 Ok(raw) => match Self::parse_host_header(raw) {
                     Ok(host) => Ok(host.to_string()),
                     Err(reason) => {
-                        warn!("Invalid Host header: {} ({})", raw, reason);
+                        warn!("Invalid Host header: {:?} ({})", raw, reason);
                         Err(Self::build_error_response(
                             StatusCode::BAD_REQUEST,
                             "InvalidRequest",
@@ -3270,7 +3323,14 @@ impl HttpProxy {
     /// case `expired-entry-revalidation` R4.4 exists for. The distinction is deliberate
     /// and both sides are pinned:
     /// `mode_b_if_match_on_stored_fresh_entry_still_serves_from_cache` (60s TTL, serves)
-    /// and `mode_b_if_match_with_get_ttl_zero_must_revalidate` (zero TTL, forwards).
+    /// and `mode_b_if_match_with_get_ttl_zero_must_revalidate` (zero TTL, contacts S3).
+    ///
+    /// "Forwards" at a zero `get_ttl` means the request reaches S3 and S3 judges the
+    /// caller. It does not always mean the client's request is relayed as sent: a GET
+    /// whose `If-Match` names the cached ETag takes the ordinary revalidation instead
+    /// (`zero_ttl_if_match_revalidates`), where the proxy adds its own `If-None-Match`
+    /// and S3 answers an unchanged object with a bodyless `304`. A HEAD, and a GET whose
+    /// `If-Match` names another version, are relayed to S3 as sent.
     fn mode_b_if_match_eligible(
         mode_b: bool,
         has_if_match: bool,
@@ -3278,6 +3338,33 @@ impl HttpProxy {
         get_ttl: Duration,
     ) -> bool {
         mode_b && has_if_match && !other_conditional && !get_ttl.is_zero()
+    }
+
+    /// Whether a pure-`If-Match` GET on a `get_ttl: 0` key may revalidate the cached
+    /// copy instead of being relayed to S3. The caller also requires the client's
+    /// `If-Match` to strong-match the cached ETag; one naming any other version is left
+    /// for S3 alone to judge. A HEAD never takes this path: it carries no body to save,
+    /// so it is relayed to S3 as sent, as in 3.0.1.
+    ///
+    /// `mode_b_if_match_eligible` never allows a local serve at a zero `get_ttl`,
+    /// but relaying the request is more than that rule needs. A passing `If-Match`
+    /// makes S3 return the body, so every ranged part of a transfer manager's split
+    /// download (s3transfer and the CRT put `If-Match` on each) crossed from S3
+    /// however often the cache had served it. The ordinary revalidation sends S3 the
+    /// client's own request, `If-Match` and signature intact, plus the proxy's
+    /// `If-None-Match` for the cached ETag. S3 still judges the client's
+    /// precondition and permission, and answers an unchanged object with a bodyless
+    /// `304`. Measured against real S3, a request signed over `Range` and `If-Match`,
+    /// with an unsigned `If-None-Match` added, gets `304` for the current ETag,
+    /// `412` for a stale `If-Match`, and `403` without credentials.
+    fn zero_ttl_if_match_revalidates(
+        method: &Method,
+        mode_b: bool,
+        has_if_match: bool,
+        other_conditional: bool,
+        get_ttl: Duration,
+    ) -> bool {
+        *method == Method::GET && mode_b && has_if_match && !other_conditional && get_ttl.is_zero()
     }
 
     /// Detect the conditional headers relevant to a Range request: `If-Range`,
@@ -3811,6 +3898,35 @@ impl HttpProxy {
                 // Requirements: 1.3, 3.3
                 let cache_key = CacheManager::generate_cache_key(path, Some(&host));
 
+                // This bypass branch returns early and never reaches the main
+                // read-cache gate, so resolve once here (still one resolve per
+                // logical request). Requirement 8.2.
+                let resolved_settings = cache_manager.resolve_settings(&cache_key).await;
+
+                // A key whose resolved settings turn read caching off, by a rule or by
+                // the global default, is never filled: forward and stream it. The main
+                // gate does the same; this arm returned before reaching it, so a
+                // `no-cache` request stored what the rules exclude. Nothing is stored
+                // or invalidated here, and no origin marker is read or claimed.
+                if !resolved_settings.read_cache_enabled {
+                    debug!(
+                        "Read caching disabled for path={}, source={:?}: forwarding the \
+                         no-cache request without filling the cache",
+                        path, resolved_settings.source
+                    );
+                    return Self::forward_get_head_to_s3_without_caching(
+                        method,
+                        uri,
+                        host,
+                        forwarded_headers,
+                        s3_client,
+                        Some("read_cache_disabled"),
+                        proxy_referer,
+                        permit,
+                    )
+                    .await;
+                }
+
                 // Origin guard on the no-cache-directive WRITE arm. This branch returns
                 // early and never reaches the main gate below, so it needs its own check:
                 // it is the one bypass-header path that still populates the cache, and
@@ -3840,10 +3956,6 @@ impl HttpProxy {
                     .await;
                 }
 
-                // This bypass branch returns early and never reaches the main
-                // read-cache gate, so resolve once here for the cache-write path
-                // (still one resolve per logical request). Requirement 8.2.
-                let resolved_settings = cache_manager.resolve_settings(&cache_key).await;
                 return Self::forward_get_head_to_s3_and_cache(
                     method,
                     uri,
@@ -4274,6 +4386,13 @@ impl HttpProxy {
         //       not refreshed).
         //     → forward_to_s3 = true   when no cache entry, ETag mismatch, or not fully cached
         //       (S3 returns 412 or a cacheable 200/206).
+        //   Mode B + pure If-Match, GET, zero `get_ttl`:
+        //     → forward_to_s3 = false  when the cached ETag strong-matches the If-Match list:
+        //       the ordinary cache path revalidates with the client's request plus the proxy's
+        //       If-None-Match, so S3 judges the client and answers an unchanged object with a
+        //       bodyless 304 (`zero_ttl_if_match_revalidates`). Never a local serve.
+        //     → forward_to_s3 = true   when the If-Match names another version, and for every
+        //       HEAD: the client's request reaches S3 as sent.
         //   Mode B + pure If-Range:
         //     → forward_to_s3 = false  only when the cached ETag strong-matches the
         //       validator (Range honoured from cache; no TTL bypass — see the branch).
@@ -4488,13 +4607,43 @@ impl HttpProxy {
                     "Mode B: pure If-Range, cached_etag={:?}, forward_to_s3={}: cache_key={}",
                     cached_etag, forward_to_s3, cache_key
                 );
+            } else if Self::zero_ttl_if_match_revalidates(
+                &method,
+                mode_b,
+                if_match_header.is_some(),
+                other_conditional,
+                resolved_settings.get_ttl,
+            ) && {
+                let cached_etag = cache_manager
+                    .get_metadata_cached(&cache_key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|meta| meta.object_metadata.etag);
+                match (if_match_header.as_deref(), cached_etag.as_deref()) {
+                    (Some(if_match), Some(etag)) if !etag.is_empty() => {
+                        etag_list_strong_match(if_match, etag)
+                    }
+                    _ => false,
+                }
+            } {
+                // Zero get_ttl + pure If-Match naming the cached ETag: the ordinary cache
+                // path, which at a zero get_ttl revalidates every read with the client's
+                // request plus the proxy's If-None-Match (`zero_ttl_if_match_revalidates`).
+                debug!(
+                    "Zero get_ttl: If-Match names the cached ETag; revalidating rather than relaying: cache_key={}",
+                    cache_key
+                );
+                forward_to_s3 = false;
+                mode_b_if_match_serve = false;
             } else {
                 // Mode A (default) OR Mode B with If-None-Match / If-Modified-Since /
                 // If-Unmodified-Since OR mixed conditional (If-Match + other) OR a pure
-                // If-Match on a key whose resolved `get_ttl` is 0 (see
-                // `mode_b_if_match_eligible`): always forward to S3 so S3 evaluates the
-                // precondition — and, for the zero-TTL case, the caller's authorization
-                // (fixes T6/T8).
+                // If-Match on a key whose resolved `get_ttl` is 0 that names another
+                // version than the cached one (see `mode_b_if_match_eligible` and
+                // `zero_ttl_if_match_revalidates`): always forward to S3 so S3 evaluates
+                // the precondition — and, for the zero-TTL case, the caller's
+                // authorization (fixes T6/T8).
                 debug!(
                     "Conditional request: forwarding to S3 for evaluation: cache_key={} mode_b={} has_if_match={} other_conditional={}",
                     cache_key,
@@ -6065,6 +6214,30 @@ impl HttpProxy {
         }
     }
 
+    /// The answer of a write handler that `handle_request` spawned. A panic in the handler
+    /// is resumed here, so the connection ends as it did when the handler ran inline. A
+    /// cancellation happens only when the runtime shuts down, and is answered as an
+    /// internal error.
+    async fn await_write_task(
+        task: tokio::task::JoinHandle<
+            std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible>,
+        >,
+    ) -> Response<BoxBody<Bytes, hyper::Error>> {
+        match task.await {
+            Ok(Ok(response)) => response,
+            Ok(Err(never)) => match never {},
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => {
+                error!("Write task ended without an answer: {}", e);
+                Self::build_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "The write was cancelled in the proxy",
+                    None,
+                )
+            }
+        }
+    }
     /// Handle PUT requests with write-through caching - Requirements 10.1, 10.4
     #[allow(clippy::too_many_arguments)]
     async fn handle_put_request(
@@ -6121,7 +6294,7 @@ impl HttpProxy {
                 crate::signed_request_proxy::STREAMED_BODY_CAP,
             )
             .await?;
-            if response.status().is_success() {
+            if Self::write_may_have_executed(&response) {
                 let cache_key = CacheManager::generate_cache_key(path, Some(&host_for_cache));
                 let spelling =
                     Self::request_spelling_write_key(&method, &uri, &host_for_cache, &cache_key);
@@ -6500,17 +6673,29 @@ impl HttpProxy {
                     ))
                 }
                 Err(e @ crate::ProxyError::InflightCeilingExceeded { .. }) => {
-                    // Ledger rejection happens before any upstream connection is
-                    // opened (Requirement IMA 2.5), so this is not a forwarding
-                    // failure — do not log via `log_s3_forward_error`.
+                    // A ledger rejection on this path refuses the request's own body
+                    // before any of it is sent (Requirement IMA 2.5). The upstream
+                    // response is accounted without being refused, so a write S3 may
+                    // have executed is never answered as a shed. Not a forwarding
+                    // failure, so not logged via `log_s3_forward_error`.
                     Ok(Self::proxy_error_to_response(&e))
                 }
                 Err(e) => {
                     Self::log_s3_forward_error(&uri, &"PUT", &e);
+                    // The handler has invalidated the key itself when S3 may have
+                    // executed the write; the request's other spelling goes too.
+                    if crate::signed_request_proxy::write_outcome_unknown(&e) {
+                        Self::invalidate_request_spelling(&cache_manager, spelling, &budget).await;
+                    }
                     // A TlsValidated upstream override whose certificate failed
                     // verification is a non-retryable config error → 400
-                    // UpstreamTLSValidationFailed (Requirement 4), never a 5xx.
-                    if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+                    // UpstreamTLSValidationFailed (Requirement 4), never a 5xx. An
+                    // upstream timeout is 504 GatewayTimeout.
+                    if matches!(
+                        e,
+                        crate::ProxyError::UpstreamTlsValidationFailed { .. }
+                            | crate::ProxyError::TimeoutError(_)
+                    ) {
                         Ok(Self::proxy_error_to_response(&e))
                     } else {
                         Ok(Self::build_error_response(
@@ -6539,7 +6724,8 @@ impl HttpProxy {
         }
     }
 
-    /// Forward a signed write to S3 uncached and, on success, invalidate the key's cached copy
+    /// Forward a signed write to S3 uncached and, when S3 may have executed it (see
+    /// [`Self::write_may_have_executed`]), invalidate the key's cached copy
     /// and its request-spelling entry. The `write_cache_enabled: false` arm of
     /// [`Self::handle_put_request`], shared with the two arms that decline caching because a
     /// pre-handler read did not finish within `PUT_ROUTER_READ_BOUND`, so all three
@@ -6571,8 +6757,8 @@ impl HttpProxy {
         )
         .await?;
 
-        // If PUT was successful, invalidate cache
-        if response.status().is_success() {
+        // If S3 may have executed the PUT, invalidate cache
+        if Self::write_may_have_executed(&response) {
             if let Err(e) = cache_manager
                 .invalidate_acknowledged_write_within(cache_key, "PUT", budget)
                 .await
@@ -6595,7 +6781,8 @@ impl HttpProxy {
     }
 
     /// The unsigned counterpart of [`Self::forward_signed_write_uncached`]: stream the PUT
-    /// verbatim to `transport` and, on success, invalidate the key's cached copy and its
+    /// verbatim to `transport` and, on success or an unknown outcome, invalidate the key's
+    /// cached copy and its
     /// request-spelling entry. Shared by the `write_cache_enabled: false` arm of
     /// [`Self::handle_unsigned_put_request`] and its two `PUT_ROUTER_READ_BOUND` arms.
     // Eight arguments, as `forward_signed_write_uncached`: the request plus router state.
@@ -6635,12 +6822,27 @@ impl HttpProxy {
                 }
                 Ok(response)
             }
-            Err(e) => Ok(Self::s3_forward_error_response(
-                uri,
-                &Method::PUT,
-                &e,
-                "Failed to forward unsigned PUT request to S3",
-            )),
+            Err(e) => {
+                // S3 may have stored the object: do not leave the old one servable.
+                if crate::signed_request_proxy::write_outcome_unknown(&e) {
+                    if let Err(e) = cache_manager
+                        .invalidate_acknowledged_write_within(cache_key, "PUT", budget)
+                        .await
+                    {
+                        warn!(
+                            "Failed to invalidate cache after unsigned PUT with an unknown outcome: cache_key={}, error={}",
+                            cache_key, e
+                        );
+                    }
+                    Self::invalidate_request_spelling(cache_manager, spelling, budget).await;
+                }
+                Ok(Self::s3_forward_error_response(
+                    uri,
+                    &Method::PUT,
+                    &e,
+                    "Failed to forward unsigned PUT request to S3",
+                ))
+            }
         }
     }
 
@@ -6923,12 +7125,19 @@ impl HttpProxy {
                     None,
                 ))
             }
-            Err(e) => Ok(Self::s3_forward_error_response(
-                &uri,
-                &Method::PUT,
-                &e,
-                "Failed to forward unsigned PUT request to S3",
-            )),
+            Err(e) => {
+                // The handler has invalidated the key itself when S3 may have stored
+                // the object; the request's other spelling goes too.
+                if crate::signed_request_proxy::write_outcome_unknown(&e) {
+                    Self::invalidate_request_spelling(&cache_manager, spelling, &budget).await;
+                }
+                Ok(Self::s3_forward_error_response(
+                    &uri,
+                    &Method::PUT,
+                    &e,
+                    "Failed to forward unsigned PUT request to S3",
+                ))
+            }
         }
     }
 
@@ -7053,7 +7262,7 @@ impl HttpProxy {
                     crate::signed_request_proxy::BUFFERED_BODY_BOUND,
                 )
                 .await?;
-                if response.status().is_success() {
+                if Self::write_may_have_executed(&response) {
                     let cache_key = CacheManager::generate_cache_key(&path, Some(&host_for_cache));
                     // ORIGIN GUARD on the signed DELETE. The DELETE reaches S3 either way —
                     // this only decides whether the proxy also deletes a local entry, and on
@@ -7194,12 +7403,20 @@ impl HttpProxy {
                     }
                     Ok(response)
                 }
-                Err(e) => Ok(Self::s3_forward_error_response(
-                    &uri,
-                    &method,
-                    &e,
-                    "Failed to forward unsigned POST request to S3",
-                )),
+                Err(e) => {
+                    // The request was sent in full and its answer never came: S3 may have
+                    // published the object, as the signed arm assumes.
+                    if is_completion && crate::signed_request_proxy::write_outcome_unknown(&e) {
+                        Self::invalidate_completed_multipart_upload(&uri, &host, &cache_manager)
+                            .await;
+                    }
+                    Ok(Self::s3_forward_error_response(
+                        &uri,
+                        &method,
+                        &e,
+                        "Failed to forward unsigned POST request to S3",
+                    ))
+                }
             };
         }
 
@@ -7256,67 +7473,90 @@ impl HttpProxy {
         let context =
             build_s3_request_context(method.clone(), uri.clone(), headers, body_bytes, host);
 
-        match s3_client.forward_request(context).await {
+        // Whether any attempt, retries included, was sent decides a DELETE's invalidation.
+        let (forwarded, request_sent) =
+            crate::s3_client::forward_noting_sent(s3_client.as_ref(), context).await;
+        match forwarded {
             Ok(s3_response) => {
                 debug!("Successfully forwarded request to S3");
 
-                // For DELETE operations, invalidate cache if the operation was successful
-                if method == Method::DELETE && s3_response.status.is_success() {
-                    let path = uri.path();
-                    let cache_key = CacheManager::generate_cache_key(path, Some(&host_for_cache));
-
-                    // ORIGIN GUARD on the unsigned/generic DELETE — same reasoning as the
-                    // signed arm above: suppress the invalidation only, never the forward.
-                    // Spec: public-security-review-readiness R2.4.
-                    // this write's cache-delay budget. The marker wait is capped at
-                    // `PUT_ROUTER_READ_BOUND`, and an `Unresolved` verdict (the marker was not read in
-                    // time) invalidates, as the PUT router's does: only a recorded different origin
-                    // suppresses it.
-                    let budget = cache_manager.write_delay_budget();
-                    let origin = cache_manager
-                        .origin_verdict_budgeted(&cache_key, &host_for_cache, &budget)
+                // For DELETE operations, invalidate cache if the operation was successful,
+                // or if an earlier attempt was sent and its outcome is unknown.
+                if method == Method::DELETE && (s3_response.status.is_success() || request_sent) {
+                    Self::invalidate_after_unsigned_delete(&uri, &host_for_cache, &cache_manager)
                         .await;
-                    if !origin.permits_cache()
-                        && origin != crate::origin_identity::OriginVerdict::Unresolved
-                    {
-                        origin.record_bypass();
-                        debug!(
-                            "DELETE ({}): not invalidating — the cached entry for this key \
-                             belongs to a different origin: cache_key={}",
-                            origin.bypass_reason(),
-                            cache_key
-                        );
-                    }
-                    // Invalidate all cache layers after successful DELETE (Requirements 11.1, 11.4)
-                    else {
-                        if let Err(e) = cache_manager
-                            .invalidate_acknowledged_write_within(&cache_key, "DELETE", &budget)
-                            .await
-                        {
-                            // Log warning but don't fail the request
-                            warn!(
-                                "Failed to invalidate cache after DELETE: cache_key={}, error={}",
-                                cache_key, e
-                            );
-                        }
-                        let spelling = Self::request_spelling_write_key(
-                            &Method::DELETE,
-                            &uri,
-                            &host_for_cache,
-                            &cache_key,
-                        );
-                        Self::invalidate_request_spelling(&cache_manager, spelling, &budget).await;
-                    }
                 }
 
                 Self::convert_s3_response_to_http(s3_response, permit)
             }
-            Err(e) => Ok(Self::s3_forward_error_response(
-                &uri,
-                &method,
-                &e,
-                "Failed to forward request to S3",
-            )),
+            Err(e) => {
+                // An error after the request head went out leaves the outcome unknown, and
+                // so does any earlier attempt that was sent before a retry failed to
+                // connect. Only when no attempt was sent did the request not reach S3,
+                // and the cached copy stays.
+                let may_have_reached_s3 =
+                    request_sent || crate::s3_client::request_may_have_reached_s3(&e);
+                if method == Method::DELETE && may_have_reached_s3 {
+                    Self::invalidate_after_unsigned_delete(&uri, &host_for_cache, &cache_manager)
+                        .await;
+                }
+                Ok(Self::s3_forward_error_response(
+                    &uri,
+                    &method,
+                    &e,
+                    "Failed to forward request to S3",
+                ))
+            }
+        }
+    }
+
+    /// Drop the cached copy of the key an unsigned (presigned or anonymous) DELETE names,
+    /// unless the entry belongs to a different origin. Called after a 2xx, and after a
+    /// error after the request was sent: a DELETE is idempotent, so invalidating on an
+    /// unknown outcome costs one cache miss.
+    async fn invalidate_after_unsigned_delete(
+        uri: &Uri,
+        host_for_cache: &str,
+        cache_manager: &Arc<CacheManager>,
+    ) {
+        let path = uri.path();
+        let cache_key = CacheManager::generate_cache_key(path, Some(host_for_cache));
+
+        // ORIGIN GUARD on the unsigned/generic DELETE — same reasoning as the
+        // signed arm above: suppress the invalidation only, never the forward.
+        // Spec: public-security-review-readiness R2.4.
+        // this write's cache-delay budget. The marker wait is capped at
+        // `PUT_ROUTER_READ_BOUND`, and an `Unresolved` verdict (the marker was not read in
+        // time) invalidates, as the PUT router's does: only a recorded different origin
+        // suppresses it.
+        let budget = cache_manager.write_delay_budget();
+        let origin = cache_manager
+            .origin_verdict_budgeted(&cache_key, host_for_cache, &budget)
+            .await;
+        if !origin.permits_cache() && origin != crate::origin_identity::OriginVerdict::Unresolved {
+            origin.record_bypass();
+            debug!(
+                "DELETE ({}): not invalidating — the cached entry for this key \
+                     belongs to a different origin: cache_key={}",
+                origin.bypass_reason(),
+                cache_key
+            );
+        }
+        // Invalidate all cache layers after successful DELETE (Requirements 11.1, 11.4)
+        else {
+            if let Err(e) = cache_manager
+                .invalidate_acknowledged_write_within(&cache_key, "DELETE", &budget)
+                .await
+            {
+                // Log warning but don't fail the request
+                warn!(
+                    "Failed to invalidate cache after DELETE: cache_key={}, error={}",
+                    cache_key, e
+                );
+            }
+            let spelling =
+                Self::request_spelling_write_key(&Method::DELETE, uri, host_for_cache, &cache_key);
+            Self::invalidate_request_spelling(cache_manager, spelling, &budget).await;
         }
     }
 
@@ -7365,6 +7605,49 @@ impl HttpProxy {
                     count
                 );
             }
+        }
+    }
+
+    /// Whether a request's query names the `select` subresource, which only
+    /// SelectObjectContent (`POST /{key}?select&select-type=2`) uses. The parameter name is
+    /// percent-decoded and compared ASCII case-insensitively, so `sel%65ct` and `SELECT`
+    /// match; a value (`x-id=select`) or a longer name (`selection`) does not.
+    fn is_select_object_content(uri: &Uri) -> bool {
+        uri.query().is_some_and(|query| {
+            query.split('&').any(|pair| {
+                let name = pair.split('=').next().unwrap_or("");
+                percent_encoding::percent_decode_str(name)
+                    .decode_utf8_lossy()
+                    .eq_ignore_ascii_case("select")
+            })
+        })
+    }
+
+    /// At most one WARN per minute for refused SelectObjectContent requests, so a client
+    /// that retries in a loop cannot flood the log.
+    fn warn_select_refused_rate_limited(client_addr: SocketAddr, path: &str) {
+        static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        const INTERVAL_SECS: u64 = 60;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if now_secs >= last + INTERVAL_SECS
+            && LAST_WARN_SECS
+                .compare_exchange(
+                    last,
+                    now_secs,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            warn!(
+                client = %client_addr,
+                path = %path,
+                "Refused SelectObjectContent with 501 NotImplemented; the proxy does not support it (at most one of these lines per minute)"
+            );
         }
     }
 
@@ -7420,6 +7703,8 @@ impl HttpProxy {
     ///   certificate fails verification is a configuration error that cannot succeed
     ///   on retry, so it is surfaced as a non-retryable 4xx (never a 5xx) and the
     ///   proxy never falls back to plaintext/unvalidated TLS (Requirements 4.1-4.4).
+    /// - `TimeoutError` → HTTP 504 `GatewayTimeout`: a wait on the upstream ran out
+    ///   before any response byte was sent to the client.
     /// - All other variants → HTTP 500 `InternalError` as a safe default.
     fn proxy_error_to_response(err: &crate::ProxyError) -> Response<BoxBody<Bytes, hyper::Error>> {
         use crate::ProxyError;
@@ -7477,6 +7762,12 @@ impl HttpProxy {
                     Some("5"),
                 )
             }
+            ProxyError::TimeoutError(msg) => Self::build_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "GatewayTimeout",
+                &format!("Timed out waiting for the upstream: {msg}"),
+                None,
+            ),
             other => Self::build_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -7494,7 +7785,8 @@ impl HttpProxy {
     /// 4.1-4.4) via [`Self::proxy_error_to_response`] — never a 5xx, and never with a
     /// fallback to plaintext/unvalidated TLS. The connector already logged the
     /// verification error with the endpoint, so this path does not re-log it (avoids
-    /// double noise). Every other forwarding error keeps the existing rate-limited
+    /// double noise). An upstream timeout is logged and answered 504
+    /// `GatewayTimeout`. Every other forwarding error keeps the existing rate-limited
     /// log plus 502 `BadGateway` behaviour, with the caller's `fallback_message`.
     fn s3_forward_error_response(
         uri: &impl std::fmt::Display,
@@ -7514,6 +7806,9 @@ impl HttpProxy {
             return Self::proxy_error_to_response(err);
         }
         Self::log_s3_forward_error(uri, method, err);
+        if matches!(err, crate::ProxyError::TimeoutError(_)) {
+            return Self::proxy_error_to_response(err);
+        }
         Self::build_error_response(
             StatusCode::BAD_GATEWAY,
             "BadGateway",
@@ -7524,7 +7819,7 @@ impl HttpProxy {
 
     /// Read request body into bytes with a size cap (Requirement 11.4)
     ///
-    /// Returns the `Bytes` produced by `read_request_body_bounded` directly. It
+    /// Returns the `Bytes` of the buffered request body directly. It
     /// previously returned `Vec<u8>` via `.to_vec()`, which memcpy'd the whole body
     /// and left both copies resident for the caller's lifetime — the buffered path
     /// peaked at 2x body size for no benefit, since every consumer only needs
@@ -7593,7 +7888,7 @@ impl HttpProxy {
         resolved: &crate::bucket_settings::ResolvedSettings,
         coordination_guard: Option<FetchGuard>,
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-        fill_witness: Option<crate::cache::FillWitness>,
+        fill_witness: crate::cache::FillWitness,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // A 206 is filed under `range_spec`; see `content_range_fits_range_spec`. On a
         // refusal the client gets S3's response unchanged and nothing is cached.
@@ -7687,10 +7982,7 @@ impl HttpProxy {
                         )
                         .await
                     {
-                        Ok(Some(mut w)) => {
-                            w.set_fill_witness(fill_witness.clone());
-                            w
-                        }
+                        Ok(Some(w)) => w,
                         // The danger-band publication guard declined this fill on capacity
                         // grounds (cache-eviction-at-scale task 36). Not a failure: the
                         // client's response is already streaming and only the cache copy is
@@ -7787,6 +8079,7 @@ impl HttpProxy {
                         writer,
                         object_metadata,
                         get_ttl,
+                        fill_witness.clone(),
                     )
                     .await
                     {
@@ -8029,17 +8322,21 @@ impl HttpProxy {
             return None;
         }
 
-        let live_ttl_expired = {
+        // `live_ttl_checked` tells `fill_page`'s RAM arm whether this check judged a `.meta`.
+        let (live_ttl_expired, live_ttl_checked) = {
             let disk_cache = range_handler.get_disk_cache_manager();
             let guard = disk_cache.read().await;
             match guard.get_metadata(cache_key).await {
-                Ok(Some(_)) => matches!(
-                    guard
-                        .check_object_expiration(cache_key, resolved.get_ttl)
-                        .await,
-                    Ok(crate::cache_types::ObjectExpirationResult::Expired { .. })
+                Ok(Some(_)) => (
+                    matches!(
+                        guard
+                            .check_object_expiration(cache_key, resolved.get_ttl)
+                            .await,
+                        Ok(crate::cache_types::ObjectExpirationResult::Expired { .. })
+                    ),
+                    true,
                 ),
-                _ => false,
+                _ => (false, false),
             }
         };
         if live_ttl_expired {
@@ -8114,6 +8411,7 @@ impl HttpProxy {
                         metrics_manager,
                         proxy_referer,
                         permit,
+                        live_ttl_checked,
                     )
                     .await,
                 )
@@ -8151,12 +8449,10 @@ impl HttpProxy {
             .cloned();
         maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
         // The fill's version witness, before the S3 request.
-        let fill_witness = Some(
-            range_handler
-                .get_cache_manager()
-                .capture_fill_witness(cache_key)
-                .await,
-        );
+        let fill_witness = range_handler
+            .get_cache_manager()
+            .capture_fill_witness(cache_key)
+            .await;
         let mut context =
             build_s3_request_context(Method::GET, uri.clone(), headers, None, host.to_string());
         context.allow_streaming = false; // We need to buffer to slice + learn the size.
@@ -8267,7 +8563,7 @@ impl HttpProxy {
         metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         proxy_referer: &Option<String>,
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-        fill_witness: Option<crate::cache::FillWitness>,
+        fill_witness: crate::cache::FillWitness,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let status = s3_response.status;
 
@@ -8477,6 +8773,7 @@ impl HttpProxy {
         metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         proxy_referer: &Option<String>,
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+        live_ttl_checked: bool,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Fill each overlapping Page one at a time (see the loop below). Each
         // fill resolves to the Page's full byte buffer, built from cached +
@@ -8555,6 +8852,7 @@ impl HttpProxy {
                 max_inflight_fraction,
                 detach_promotion,
                 response_etag.as_deref(),
+                live_ttl_checked,
                 &mut page_from_cache,
             )
             .await;
@@ -8999,6 +9297,7 @@ impl HttpProxy {
         max_inflight_fraction: f64,
         detach_promotion: bool,
         pin_etag: Option<&str>,
+        live_ttl_checked: bool,
         served_from_cache: &mut bool,
     ) -> Result<(Bytes, String, u64)> {
         *served_from_cache = false;
@@ -9109,7 +9408,40 @@ impl HttpProxy {
                         })
                         .await
                 };
-                if verified {
+                // Live `get_ttl`. `try_widened_range_request` judged it once for the request
+                // against the key's `.meta` when one existed (`live_ttl_checked`). With none, a
+                // RAM page was promoted from a journal-pending page and nothing has judged it,
+                // so it is judged here: the key's document against the resolved TTL, where a
+                // tracked fill of this instance is judged from the tracker and no `.meta` with
+                // no tracked fill reads as expired. An expired page falls through to the
+                // journal arm, which judges each extent from its own fetch time. A RAM page
+                // records when it was promoted, not when its bytes were fetched, so it cannot
+                // be its own anchor. Past the TTL is not a version mismatch, so the page stays.
+                let live_fresh = verified
+                    && (live_ttl_checked || {
+                        let disk_cache = range_handler.get_disk_cache_manager();
+                        let guard = disk_cache.read().await;
+                        // With a `.meta`, or a streamed fill of the key this instance holds,
+                        // no cycle has folded yet and the tracker still accepts, the expiration
+                        // check judges the document (the tracked fill's, when there is no
+                        // `.meta`). With neither, the page is not fresh and nothing is logged.
+                        // One call, so the tracker's lookup runs once.
+                        matches!(
+                            guard
+                                .check_object_expiration_when_documented(
+                                    cache_key,
+                                    resolved.get_ttl
+                                )
+                                .await,
+                            Ok(Some(ObjectExpirationResult::Fresh))
+                        )
+                    });
+                if verified && !live_fresh {
+                    debug!(
+                        "[page-widening] RAM page past get_ttl, falling through to disk: cache_key={}, page={}-{}",
+                        cache_key, page_start, page_end
+                    );
+                } else if verified {
                     debug!(
                         "[page-widening] RAM page hit: cache_key={}, page={}-{}",
                         cache_key, page_start, page_end
@@ -9120,16 +9452,17 @@ impl HttpProxy {
                     cache_manager.queue_ram_page_access(cache_key, page_start, page_end);
                     *served_from_cache = true;
                     return Ok((hit.data, hit.etag, hit.content_length));
-                }
-                debug!(
-                    "[page-widening] RAM page etag mismatch (ram={}, current={:?}) — invalidating and falling through: cache_key={}, page={}-{}",
-                    hit.etag, current_etag, cache_key, page_start, page_end
-                );
-                if let Err(e) = cache_manager.invalidate_ram_ranges(cache_key).await {
-                    warn!(
-                        "[page-widening] failed to invalidate RAM ranges for {} after etag mismatch: {}",
-                        cache_key, e
+                } else {
+                    debug!(
+                        "[page-widening] RAM page etag mismatch (ram={}, current={:?}) — invalidating and falling through: cache_key={}, page={}-{}",
+                        hit.etag, current_etag, cache_key, page_start, page_end
                     );
+                    if let Err(e) = cache_manager.invalidate_ram_ranges(cache_key).await {
+                        warn!(
+                            "[page-widening] failed to invalidate RAM ranges for {} after etag mismatch: {}",
+                            cache_key, e
+                        );
+                    }
                 }
             }
         }
@@ -9145,8 +9478,15 @@ impl HttpProxy {
                 0,
             )
         } else {
-            Self::find_page_overlap(cache_key, &page_range, current_etag, range_handler, origin)
-                .await?
+            Self::find_page_overlap(
+                cache_key,
+                &page_range,
+                current_etag,
+                range_handler,
+                origin,
+                resolved.get_ttl,
+            )
+            .await?
         };
 
         if overlap.can_serve_from_cache {
@@ -9219,6 +9559,7 @@ impl HttpProxy {
                                 current_etag,
                                 range_handler,
                                 origin,
+                                resolved.get_ttl,
                             )
                             .await?;
                             if overlap.can_serve_from_cache {
@@ -9260,6 +9601,7 @@ impl HttpProxy {
                                             current_etag,
                                             range_handler,
                                             origin,
+                                            resolved.get_ttl,
                                         )
                                         .await?;
                                         if overlap.can_serve_from_cache {
@@ -9361,12 +9703,10 @@ impl HttpProxy {
         }
 
         // The fill's version witness, before any S3 request this fill comes from.
-        let fill_witness = Some(
-            range_handler
-                .get_cache_manager()
-                .capture_fill_witness(cache_key)
-                .await,
-        );
+        let fill_witness = range_handler
+            .get_cache_manager()
+            .capture_fill_witness(cache_key)
+            .await;
         let fetched_ranges = if overlap.missing_ranges.is_empty() {
             Vec::new()
         } else {
@@ -9522,6 +9862,7 @@ impl HttpProxy {
         current_etag: Option<&str>,
         range_handler: &Arc<RangeHandler>,
         origin: crate::origin_identity::OriginVerdict,
+        get_ttl: std::time::Duration,
     ) -> Result<(crate::range_handler::RangeOverlap, u64)> {
         // The origin guard, as a REQUIRED argument rather than a caller convention — the
         // same reason `CacheManager::lookup_part` takes one. This function receives neither
@@ -9547,15 +9888,12 @@ impl HttpProxy {
                 0,
             ));
         }
-        // FreshServe. Page widening applies no live-TTL gate: `fill_page`
-        // consults the RAM tier before this function is reached, and the disk arm
-        // below is bounded by stored expiry alone. Requirement 1.3 keeps it that
-        // way, and this spec deliberately does not absorb the widened path's
-        // freshness work — that is owned by
-        // the page widening freshness feature (its R1 and R2), which is a live
-        // violation in this same area. Do not "improve" this to
-        // RevalidationCandidate: there is no gate here to revalidate behind, so
-        // an expired candidate would be served directly.
+        // FreshServe. The `.meta` arm is bounded by stored expiry, which the fold
+        // stamps from the fetch of the bytes the `.meta` lists. The journal arm below
+        // applies the live `get_ttl` to each pending extent from its own fetch time, and
+        // `fill_page`'s RAM arm, reached before this function, applies it to the key's
+        // document. Do not "improve" this to RevalidationCandidate: there is no gate here
+        // to revalidate behind, so an expired candidate would be served directly.
         // The `.meta` is read once here and handed to the lookup as its document, so
         // the extents the lookup returns can be told apart. One the `.meta` lists was
         // folded under the `.meta`'s version. One it does not list came from the journal
@@ -9617,10 +9955,25 @@ impl HttpProxy {
             .await?;
         drop(disk_cache);
 
+        // A journal `Add` carries no expiry, so the live `get_ttl` is applied to each extent
+        // from its range's `created_at`, stamped when the fill committed, by the rule
+        // `check_object_expiration` applies to a document: fresh while the age is at most a
+        // non-zero TTL, and an anchor in the future is age 0. An expired extent is missing.
+        let now = std::time::SystemTime::now();
         let mut label = expected_etag;
         let mut journal_ranges: Vec<crate::cache_types::RangeSpec> = Vec::new();
         for (range, etag) in pending {
             if etag.is_empty() {
+                continue;
+            }
+            let age = now
+                .duration_since(range.created_at)
+                .unwrap_or(std::time::Duration::ZERO);
+            if get_ttl.is_zero() || age > get_ttl {
+                debug!(
+                    "[page-widening] journal-pending extent is past get_ttl ({:?} > {:?}), not coverage: cache_key={}, range={}-{}",
+                    age, get_ttl, cache_key, range.start, range.end
+                );
                 continue;
             }
             match &label {
@@ -9691,9 +10044,8 @@ impl HttpProxy {
             cached_ranges,
             missing_ranges,
             can_serve_from_cache,
-            // Journal records carry no expiry, so none can have passed. This
-            // branch's staleness is bounded by neither mechanism — a pre-existing
-            // gap owned by `page-widening-freshness`, not introduced here.
+            // Journal records carry no expiry, so none can have passed. Every extent
+            // listed here passed the live `get_ttl` check above.
             stored_freshness: crate::cache_types::StoredFreshness::Fresh,
         };
         Ok((overlap, object_size))
@@ -11672,7 +12024,7 @@ impl HttpProxy {
                     }
                 }
             }
-            RangeParseResult::MultipleRanges(_) => {
+            RangeParseResult::MultipleRanges => {
                 // S3 serves no multi-range request: it answers `200` with the whole object.
                 // Forward it uncached so the client gets exactly that.
                 debug!(
@@ -11722,16 +12074,6 @@ impl HttpProxy {
                     permit,
                 )
                 .await
-            }
-            RangeParseResult::None => {
-                // This shouldn't happen since we checked for range header
-                warn!("No range found in range header");
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidRange",
-                    "No range specification found.",
-                    None,
-                ))
             }
         }
     }
@@ -14328,6 +14670,13 @@ impl HttpProxy {
                         )
                         .await);
                     }
+                    Err(error @ crate::ProxyError::TimeoutError(_)) => {
+                        error!(
+                            "Failed to recover partially covered cached range: {}",
+                            error
+                        );
+                        return Err(Self::proxy_error_to_response(&error));
+                    }
                     Err(error) => {
                         error!(
                             "Failed to recover partially covered cached range: {}",
@@ -14521,8 +14870,7 @@ impl HttpProxy {
                                 }
                             };
 
-                        let fill_witness =
-                            Some(cache_manager.capture_fill_witness(cache_key).await);
+                        let fill_witness = cache_manager.capture_fill_witness(cache_key).await;
                         let s3_response = match s3_client.forward_request(context).await {
                             Ok(resp) => resp,
                             Err(e) => {
@@ -14973,7 +15321,7 @@ impl HttpProxy {
         bytes: &[u8],
         response_headers: &HashMap<String, String>,
         metadata: &CacheMetadata,
-        fill_witness: Option<crate::cache::FillWitness>,
+        fill_witness: crate::cache::FillWitness,
     ) -> std::result::Result<(), String> {
         // Parse query parameters to check for partNumber
         let query_params: HashMap<String, String> = uri
@@ -15296,7 +15644,11 @@ impl HttpProxy {
                             re_subscribe_count += 1;
 
                             if re_subscribe_count > max_resubscriptions {
-                                // Requirement 7.5: Fail with gateway timeout after max re-subscriptions
+                                // The wait budget is spent and the fill is still running:
+                                // fetch from S3 as an uncoalesced request does. The fetch
+                                // registers no flight and holds no guard, so it neither
+                                // waits on the fill it gave up on nor makes later
+                                // arrivals wait on it.
                                 if let Some(ref mm) = metrics_manager {
                                     let mm_guard = mm.read().await;
                                     mm_guard
@@ -15309,14 +15661,25 @@ impl HttpProxy {
                                     cache_key = %cache_key,
                                     re_subscribe_count = re_subscribe_count,
                                     max_resubscriptions = max_resubscriptions,
-                                    "Download coordination: waiter exceeded max re-subscriptions, returning 504"
+                                    "Download coordination: waiter exceeded max re-subscriptions, fetching from S3 itself"
                                 );
 
-                                let response = Response::builder()
-                                    .status(hyper::StatusCode::GATEWAY_TIMEOUT)
-                                    .body(crate::http_proxy::empty_boxed_body())
-                                    .unwrap();
-                                return Ok(response);
+                                return Self::forward_get_head_to_s3_and_cache(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    cache_manager,
+                                    s3_client,
+                                    range_handler.clone(),
+                                    config.clone(),
+                                    resolved,
+                                    proxy_referer,
+                                    None,
+                                    permit,
+                                )
+                                .await;
                             }
 
                             // Check if FetchGuard still exists under the same lock guard
@@ -15373,7 +15736,7 @@ impl HttpProxy {
     /// requests for the same part of the same object.
     /// Requirements: 12.4, 15.3, 17.1-17.4
     #[allow(clippy::too_many_arguments)]
-    pub async fn forward_part_with_coordination(
+    pub(crate) async fn forward_part_with_coordination(
         method: Method,
         uri: hyper::Uri,
         host: String,
@@ -16162,7 +16525,7 @@ impl HttpProxy {
         }
 
         // The fill's version witness, before the revalidation request.
-        let fill_witness = Some(cache_manager.capture_fill_witness(&cache_key).await);
+        let fill_witness = cache_manager.capture_fill_witness(&cache_key).await;
         let context = build_s3_request_context(
             method.clone(),
             uri.clone(),
@@ -16644,7 +17007,8 @@ impl HttpProxy {
     }
 
     /// The response a `get_ttl: "0s"` waiter gets when its revalidation request to S3 did
-    /// not complete: `502`, as a non-coalesced request's forwarding failure gets.
+    /// not complete: `502`, whatever the cause. A non-coalesced request gets `502` for a
+    /// forwarding failure and `504` for an upstream timeout.
     fn waiter_upstream_failure_response() -> Response<BoxBody<Bytes, hyper::Error>> {
         Self::build_error_response(
             StatusCode::BAD_GATEWAY,
@@ -17456,7 +17820,7 @@ impl HttpProxy {
     /// Preserves whatever variant the caller sent (part-number query or
     /// part-range header) and injects the validator headers.
     #[allow(clippy::too_many_arguments)]
-    pub async fn serve_cached_part_validated(
+    pub(crate) async fn serve_cached_part_validated(
         method: Method,
         uri: hyper::Uri,
         host: String,
@@ -17896,7 +18260,7 @@ impl HttpProxy {
             .cloned();
         maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
         // The fill's version witness, before the S3 request.
-        let fill_witness = Some(cache_manager.capture_fill_witness(&cache_key).await);
+        let fill_witness = cache_manager.capture_fill_witness(&cache_key).await;
 
         // Build S3 request context
         // Pre-first-byte timeout + retry (Req 5, Task 10).
@@ -18320,10 +18684,7 @@ impl HttpProxy {
                                         )
                                         .await
                                     {
-                                        Ok(Some(mut w)) => {
-                                            w.set_fill_witness(fill_witness.clone());
-                                            w
-                                        }
+                                        Ok(Some(w)) => w,
                                         // Declined by the danger-band publication guard
                                         // (task 36) — the response is unaffected, only the
                                         // cache copy is skipped.
@@ -18411,7 +18772,8 @@ impl HttpProxy {
                                     // Commit incremental write
                                     //
                                     // Uses a read lock (not write) on the DiskCacheManager:
-                                    // `commit_incremental_range` now takes `&self`, and all
+                                    // `commit_incremental_range_shared` holds it only for its
+                                    // prepare step, and all
                                     // internal mutation is already serialized by finer-grained
                                     // locks (HybridMetadataWriter mutex, SizeAccumulator atomics).
                                     // Concurrent commits of distinct ranges proceed in parallel.
@@ -18425,6 +18787,7 @@ impl HttpProxy {
                                             writer,
                                             object_metadata,
                                             get_ttl,
+                                            fill_witness.clone(),
                                         )
                                         .await
                                     {
@@ -18796,12 +19159,10 @@ impl HttpProxy {
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // The fill's version witness, before the S3 request.
-        let fill_witness = Some(
-            range_handler
-                .get_cache_manager()
-                .capture_fill_witness(&cache_key)
-                .await,
-        );
+        let fill_witness = range_handler
+            .get_cache_manager()
+            .capture_fill_witness(&cache_key)
+            .await;
         let perf_s3_start = Instant::now();
         debug!(
             "Forwarding signed range request to S3: range={}-{} missing_ranges={} cache_key={}",
@@ -18995,6 +19356,9 @@ impl HttpProxy {
                 last_error
             ),
         );
+        if let Some(e @ crate::ProxyError::TimeoutError(_)) = &last_error {
+            return Ok(Self::proxy_error_to_response(e));
+        }
         Ok(Self::build_error_response(
             StatusCode::BAD_GATEWAY,
             "BadGateway",
@@ -19017,7 +19381,7 @@ impl HttpProxy {
         resolved: &crate::bucket_settings::ResolvedSettings,
         coordination_guard: Option<FetchGuard>,
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-        fill_witness: Option<crate::cache::FillWitness>,
+        fill_witness: crate::cache::FillWitness,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let status = s3_response.status;
         // Settings are resolved once per logical request and threaded in; the
@@ -19109,10 +19473,7 @@ impl HttpProxy {
                                 )
                                 .await
                             {
-                                Ok(Some(mut w)) => {
-                                    w.set_fill_witness(fill_witness.clone());
-                                    w
-                                }
+                                Ok(Some(w)) => w,
                                 // Declined by the danger-band publication guard (task 36).
                                 Ok(None) => {
                                     debug!(
@@ -19205,6 +19566,7 @@ impl HttpProxy {
                                 writer,
                                 object_metadata,
                                 get_ttl,
+                                fill_witness.clone(),
                             )
                             .await
                             {
@@ -19506,7 +19868,7 @@ impl HttpProxy {
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // The fill's version witness, before the S3 request.
-        let fill_witness = Some(cache_manager.capture_fill_witness(&cache_key).await);
+        let fill_witness = cache_manager.capture_fill_witness(&cache_key).await;
         // Consume the synthesized-Range sentinel here, on the one function
         // every non-signed route into the merge path passes through, so it cannot travel
         // any further — every upstream fetch below is issued from this `headers` map or a
@@ -20022,7 +20384,7 @@ impl HttpProxy {
                         };
 
                         // Partial-cache path: response is built from buffered data,
-                        // background store_range_new_storage tasks are best-effort.
+                        // background range-fill tasks are best-effort.
                         // Complete the coordination guard now.
                         if let Some(guard) = coordination_guard {
                             guard.complete_success();
@@ -20153,12 +20515,10 @@ impl HttpProxy {
         full_object: bool,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // The fill's version witness, before the S3 request.
-        let fill_witness = Some(
-            range_handler
-                .get_cache_manager()
-                .capture_fill_witness(&cache_key)
-                .await,
-        );
+        let fill_witness = range_handler
+            .get_cache_manager()
+            .capture_fill_witness(&cache_key)
+            .await;
         debug!(
             "Streaming range {}-{} from S3 with background caching: cache_key={}",
             range_spec.start, range_spec.end, cache_key
@@ -20405,12 +20765,10 @@ impl HttpProxy {
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // The fill's version witness, before the S3 request.
-        let fill_witness = Some(
-            range_handler
-                .get_cache_manager()
-                .capture_fill_witness(&cache_key)
-                .await,
-        );
+        let fill_witness = range_handler
+            .get_cache_manager()
+            .capture_fill_witness(&cache_key)
+            .await;
         debug!(
             "Fetching complete range {}-{} from S3 as fallback",
             range_spec.start, range_spec.end
@@ -20663,12 +21021,17 @@ impl HttpProxy {
     }
 
     /// The client response for a failed signed forward (or its body read).
+    ///
+    /// When the write's outcome is unknown, the response carries
+    /// [`crate::signed_request_proxy::WriteOutcomeUnknown`], which
+    /// [`Self::write_may_have_executed`] reads.
     fn signed_forward_error_response(
         req_uri: &Uri,
         req_method: &Method,
         e: crate::ProxyError,
     ) -> Response<BoxBody<Bytes, hyper::Error>> {
-        match e {
+        let unknown = crate::signed_request_proxy::write_outcome_unknown(&e);
+        let mut response = match e {
             e @ crate::ProxyError::InflightCeilingExceeded { .. } => {
                 Self::proxy_error_to_response(&e)
             }
@@ -20694,8 +21057,13 @@ impl HttpProxy {
                 Self::log_s3_forward_error(req_uri, req_method, &e);
                 // A TlsValidated upstream override whose certificate failed
                 // verification is a non-retryable config error → 400
-                // UpstreamTLSValidationFailed (Requirement 4), never a 5xx.
-                if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+                // UpstreamTLSValidationFailed (Requirement 4), never a 5xx. An
+                // upstream timeout is 504 GatewayTimeout.
+                if matches!(
+                    e,
+                    crate::ProxyError::UpstreamTlsValidationFailed { .. }
+                        | crate::ProxyError::TimeoutError(_)
+                ) {
                     Self::proxy_error_to_response(&e)
                 } else {
                     Self::build_error_response(
@@ -20706,9 +21074,26 @@ impl HttpProxy {
                     )
                 }
             }
+        };
+        if unknown {
+            response
+                .extensions_mut()
+                .insert(crate::signed_request_proxy::WriteOutcomeUnknown);
         }
+        response
     }
 
+    /// Whether S3 may have executed the signed write `response` answers: it succeeded,
+    /// or it is the error response for a write whose request was sent in full and
+    /// whose answer never arrived or was refused. Either way the key's cached copy must
+    /// not stay servable.
+    fn write_may_have_executed(response: &Response<BoxBody<Bytes, hyper::Error>>) -> bool {
+        response.status().is_success()
+            || response
+                .extensions()
+                .get::<crate::signed_request_proxy::WriteOutcomeUnknown>()
+                .is_some()
+    }
     /// Invalidate and stamp, as a single-object write does, the cache key of each of
     /// `object_keys` in the bucket behind `bucket_prefix`.
     /// `operation` is `"DELETE"` or `"PUT"`, both of which stamp the write-order marker;
@@ -21161,6 +21546,12 @@ impl HttpProxy {
                 Some(Ok(frame)) => {
                     let len = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
                     let fits = frame.is_data() && total + len <= bound && reservation.try_grow(len);
+                    if !fits && frame.is_data() {
+                        // The frame is already in memory and is replayed to the client,
+                        // so it cannot be refused here; account it so the figure and its
+                        // peak are true to what is held.
+                        reservation.force_grow(len);
+                    }
                     total += len;
                     frames.push(frame);
                     if !fits {
@@ -21170,7 +21561,8 @@ impl HttpProxy {
                 }
             }
         }
-        drop(reservation);
+        // The reservation rides on the replayed body, a multi-frame one so that hyper's
+        // first poll does not drop it, and ends when the body is dropped.
         if complete {
             let mut joined = Vec::with_capacity(total as usize);
             for frame in &frames {
@@ -21179,13 +21571,17 @@ impl HttpProxy {
                 }
             }
             let bytes = Bytes::from(joined);
-            let replay = Full::new(bytes.clone())
-                .map_err(|never| match never {})
-                .boxed();
+            let replay = crate::permit_body::PermitBody::new(
+                crate::permit_body::ChunkedBytes::new(bytes.clone())
+                    .map_err(|never| match never {}),
+                None,
+            )
+            .with_reservation(reservation)
+            .boxed();
             return (Response::from_parts(parts, replay), Some(bytes));
         }
         let prefix = futures::stream::iter(frames.into_iter().map(Ok));
-        let replay: BoxBody<Bytes, hyper::Error> = match failure {
+        let inner: BoxBody<Bytes, hyper::Error> = match failure {
             Some(e) => BodyExt::boxed(StreamBody::new(futures::StreamExt::chain(
                 prefix,
                 futures::stream::once(async move { Err(e) }),
@@ -21195,6 +21591,9 @@ impl HttpProxy {
                 http_body_util::BodyStream::new(body),
             ))),
         };
+        let replay = crate::permit_body::PermitBody::new(inner, None)
+            .with_reservation(reservation)
+            .boxed();
         (Response::from_parts(parts, replay), None)
     }
 
@@ -21222,10 +21621,13 @@ impl HttpProxy {
     /// wrote before responding. The file's content is never retained.
     ///
     /// Invalidates on `2xx` and `3xx` (`success_action_redirect`), and on a `5xx` or a
-    /// failed forward, where S3 may have stored the object; not on a `4xx`. When the key
-    /// could not be read from the form, the object named by S3's `Location` header is
-    /// invalidated ([`crate::bulk_write_invalidation::form_post_response_cache_key`]); a
-    /// `5xx` or failed forward with no readable key is logged at ERROR. The forward and
+    /// forward that failed after the request was sent
+    /// ([`crate::signed_request_proxy::write_outcome_unknown`]), where S3 may have stored
+    /// the object; not on a `4xx`, and not on a failure before the request was sent, such
+    /// as a client that cut the upload off. When the key could not be read from the form,
+    /// the object named by S3's `Location` header is invalidated
+    /// ([`crate::bulk_write_invalidation::form_post_response_cache_key`]); a `5xx` or
+    /// failed forward with no readable key is logged at ERROR. The forward and
     /// the invalidation run in their own task, so a client disconnect does not cancel them.
     #[allow(clippy::too_many_arguments)]
     async fn forward_form_post(
@@ -21305,7 +21707,9 @@ impl HttpProxy {
                 let s = response.status();
                 s.is_success() || s.is_redirection() || s.is_server_error()
             }
-            Err(_) => true,
+            // Only a failure after the request was sent in full: a client that cuts the
+            // upload off leaves S3 an incomplete request, which it does not commit.
+            Err(e) => crate::signed_request_proxy::write_outcome_unknown(e),
         };
         if may_have_written {
             let outcome = scanner
@@ -21399,8 +21803,8 @@ impl HttpProxy {
                     ip
                 } else {
                     let pool = s3_client.get_connection_pool();
-                    let pm = pool.read().await;
-                    pm.resolve_endpoint(host).await.ok()?.into_iter().next()?
+                    let lookup = pool.read().await.lookup();
+                    lookup.resolve(host).await.ok()?.into_iter().next()?
                 };
 
                 let tls = match mode {
@@ -21433,6 +21837,8 @@ impl HttpProxy {
                     port: authority_port,
                     tls,
                     validated_endpoint,
+                    timeouts: s3_client.upstream_timeouts(),
+                    response_ledger: Some(s3_client.get_inflight_ledger()),
                 }))
             }
             None => {
@@ -21465,8 +21871,8 @@ impl HttpProxy {
                         // first, then DNS — as both the override arm above and
                         // `CustomHttpsConnector` do. For an overridden host that is
                         // the entry's first listed IP, not a public S3 address.
-                        let pm = pool.read().await;
-                        pm.resolve_endpoint(host).await.ok()?.into_iter().next()?
+                        let lookup = pool.read().await.lookup();
+                        lookup.resolve(host).await.ok()?.into_iter().next()?
                     }
                 };
                 let root_store = crate::tls_trust_store::root_cert_store().ok()?;
@@ -21475,7 +21881,11 @@ impl HttpProxy {
                     crate::https_connector::build_tls_config_for_host(host, root_store, &pm)
                 };
                 let tls = Arc::new(tokio_rustls::TlsConnector::from(Arc::new(cfg)));
-                Some(Arc::new(UpstreamTransport::verified_tls_443(ip, tls)))
+                Some(Arc::new(UpstreamTransport {
+                    timeouts: s3_client.upstream_timeouts(),
+                    response_ledger: Some(s3_client.get_inflight_ledger()),
+                    ..UpstreamTransport::verified_tls_443(ip, tls)
+                }))
             }
         }
     }
@@ -21484,6 +21894,74 @@ impl HttpProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The Select predicate matches a `select` parameter name however it is written, and
+    /// nothing else.
+    #[test]
+    fn select_predicate_matches_the_subresource_name_only() {
+        let matches = |q: &str| {
+            HttpProxy::is_select_object_content(&format!("/b/k?{q}").parse::<Uri>().unwrap())
+        };
+        assert!(matches("select&select-type=2"));
+        assert!(matches("select"));
+        assert!(matches("sel%65ct"));
+        assert!(matches("SELECT&select-type=2"));
+        assert!(matches("select-type=2&select="));
+        assert!(!matches("x-id=select"));
+        assert!(!matches("selection"));
+        assert!(!matches("select-type=2"));
+        assert!(!matches("uploads"));
+        assert!(!matches("delete"));
+        assert!(!HttpProxy::is_select_object_content(
+            &"/b/k".parse::<Uri>().unwrap()
+        ));
+    }
+    /// Every forward-failure mapper answers an upstream timeout `504 GatewayTimeout`
+    /// with an S3 XML body, and keeps `502` for other forwarding failures.
+    #[tokio::test]
+    async fn every_forward_failure_mapper_answers_an_upstream_timeout_504() {
+        let uri: Uri = "/bucket/key".parse().unwrap();
+        let timeout =
+            || crate::ProxyError::TimeoutError("upstream response head: no byte moved".to_string());
+        let answers = vec![
+            (
+                "proxy_error_to_response",
+                HttpProxy::proxy_error_to_response(&timeout()),
+            ),
+            (
+                "s3_forward_error_response",
+                HttpProxy::s3_forward_error_response(&uri, &"PUT", &timeout(), "fallback"),
+            ),
+            (
+                "signed_forward_error_response",
+                HttpProxy::signed_forward_error_response(&uri, &Method::PUT, timeout()),
+            ),
+        ];
+        let mut statuses = Vec::new();
+        for (mapper, response) in answers {
+            let status = response.status().as_u16();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let code = String::from_utf8_lossy(&body).contains("<Code>GatewayTimeout</Code>");
+            statuses.push((mapper, status, code));
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                ("proxy_error_to_response", 504, true),
+                ("s3_forward_error_response", 504, true),
+                ("signed_forward_error_response", 504, true),
+            ]
+        );
+        let other = crate::ProxyError::HttpError("connection reset".to_string());
+        assert_eq!(
+            HttpProxy::s3_forward_error_response(&uri, &"PUT", &other, "fallback").status(),
+            StatusCode::BAD_GATEWAY,
+            "control: other forwarding failures stay 502"
+        );
+        assert_eq!(
+            HttpProxy::signed_forward_error_response(&uri, &Method::PUT, other).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
     #[test]
     fn names_a_part_only_for_a_real_part_number_parameter() {
         let names = |uri: &str| HttpProxy::names_a_part(&uri.parse::<hyper::Uri>().unwrap());
@@ -21669,6 +22147,43 @@ mod tests {
         );
     }
 
+    /// Only a GET revalidates a zero-`get_ttl` pure `If-Match`; a HEAD is relayed to S3 as sent.
+    /// Mutation that must break this: replace the `*method == Method::GET` term in
+    /// `zero_ttl_if_match_revalidates` with `true`.
+    #[test]
+    fn zero_ttl_if_match_revalidation_is_for_a_get_only() {
+        assert!(HttpProxy::zero_ttl_if_match_revalidates(
+            &Method::GET,
+            true,
+            true,
+            false,
+            Duration::ZERO
+        ));
+        assert!(
+            !HttpProxy::zero_ttl_if_match_revalidates(
+                &Method::HEAD,
+                true,
+                true,
+                false,
+                Duration::ZERO
+            ),
+            "a HEAD must be relayed to S3 as sent"
+        );
+        assert!(!HttpProxy::zero_ttl_if_match_revalidates(
+            &Method::GET,
+            true,
+            true,
+            false,
+            Duration::from_secs(60)
+        ));
+        assert!(!HttpProxy::zero_ttl_if_match_revalidates(
+            &Method::GET,
+            true,
+            true,
+            true,
+            Duration::ZERO
+        ));
+    }
     /// The shed builder must record the rejection itself.
     ///
     /// This is the regression guard for a specific silent failure: extracting the 503
@@ -21840,6 +22355,69 @@ mod tests {
             transport.tls.is_some(),
             "the no-override default must stay TLS — the cold-start fix must not downgrade transport security"
         );
+    }
+
+    /// The transport the signed-write path would dial for `host`, with the seam
+    /// answering `[127.0.0.1, 192.0.2.10]`.
+    async fn signed_write_transport_ip(
+        host: &str,
+        authority_port: u16,
+        config: crate::config::ConnectionPoolConfig,
+        allowlisted: bool,
+    ) -> std::net::IpAddr {
+        let policy = allowlisted.then(|| {
+            Arc::new(DestinationPolicy::new(
+                80,
+                Some(vec![host.to_string()]),
+                HashSet::new(),
+            ))
+        });
+        let client = Arc::new(
+            crate::s3_client::S3Client::new_with_dial_policy(&config, None, policy)
+                .expect("client builds"),
+        );
+        client
+            .get_connection_pool()
+            .read()
+            .await
+            .seed_dns_answer_for_test(
+                host,
+                vec!["127.0.0.1".parse().unwrap(), "192.0.2.10".parse().unwrap()],
+            );
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> = client;
+        HttpProxy::resolve_signed_upstream_transport(host, authority_port, &s3_client)
+            .await
+            .expect("the name resolves")
+            .ip
+    }
+
+    /// The default signed-write arm dials only an address the policy accepts.
+    #[tokio::test]
+    async fn signed_write_default_arm_dials_only_an_accepted_address() {
+        let ip =
+            signed_write_transport_ip("allowlisted.example.test", 443, Default::default(), true)
+                .await;
+        assert_eq!(ip, "192.0.2.10".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    /// The `upstream_overrides` signed-write arm dials only an address the policy accepts.
+    #[tokio::test]
+    async fn signed_write_override_arm_dials_only_an_accepted_address() {
+        let host = "allowlisted.example.test";
+        let mut config = crate::config::ConnectionPoolConfig::default();
+        config.upstream_overrides.insert(
+            format!("{host}:8080"),
+            crate::config::UpstreamOverrideConfig {
+                scheme: crate::config::UpstreamScheme::Http,
+                validate_tls: false,
+            },
+        );
+        let ip = signed_write_transport_ip(host, 8080, config.clone(), true).await;
+        assert_eq!(ip, "192.0.2.10".parse::<std::net::IpAddr>().unwrap());
+
+        // Control: without a policy the same arm takes the first address, loopback.
+        let ip = signed_write_transport_ip(host, 8080, config, false).await;
+        assert_eq!(ip, "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
     }
 
     #[test]
@@ -22094,49 +22672,6 @@ mod tests {
             Some("Wed, 21 Oct 2015 07:28:00 GMT"),
         );
         assert_eq!(r, ConditionalEvalResult::Fresh);
-    }
-
-    #[test]
-    fn etag_strong_match_helper() {
-        assert!(super::etag_strong_match("\"abc\"", "\"abc\""));
-        assert!(!super::etag_strong_match("\"abc\"", "W/\"abc\""));
-        assert!(!super::etag_strong_match("W/\"abc\"", "\"abc\""));
-        assert!(super::etag_strong_match("*", "\"whatever\""));
-        assert!(!super::etag_strong_match("\"abc\"", "\"xyz\""));
-    }
-
-    #[test]
-    fn etag_weak_match_helper() {
-        assert!(super::etag_weak_match("\"abc\"", "\"abc\""));
-        assert!(super::etag_weak_match("\"abc\"", "W/\"abc\""));
-        assert!(super::etag_weak_match("W/\"abc\"", "\"abc\""));
-        assert!(super::etag_weak_match("W/\"abc\"", "W/\"abc\""));
-        assert!(super::etag_weak_match("*", "\"anything\""));
-        assert!(!super::etag_weak_match("\"abc\"", "\"xyz\""));
-    }
-
-    #[test]
-    fn etag_strong_match_tolerates_unquoted_client_etag() {
-        // AWS CLI v2 strips surrounding quotes from --if-match before sending.
-        // The cached etag from S3 is stored with quotes. These must match.
-        assert!(super::etag_strong_match("abc", "\"abc\""));
-        assert!(super::etag_strong_match("\"abc\"", "abc"));
-        assert!(super::etag_strong_match("abc", "abc"));
-        assert!(!super::etag_strong_match("abc", "\"xyz\""));
-        // W/ prefix still disqualifies a strong match.
-        assert!(!super::etag_strong_match("W/abc", "\"abc\""));
-        assert!(!super::etag_strong_match("abc", "W/\"abc\""));
-    }
-
-    #[test]
-    fn etag_weak_match_tolerates_unquoted_client_etag() {
-        // Same tolerance for weak matches.
-        assert!(super::etag_weak_match("abc", "\"abc\""));
-        assert!(super::etag_weak_match("\"abc\"", "abc"));
-        assert!(super::etag_weak_match("abc", "W/\"abc\""));
-        assert!(super::etag_weak_match("W/abc", "\"abc\""));
-        assert!(super::etag_weak_match("abc", "abc"));
-        assert!(!super::etag_weak_match("abc", "\"xyz\""));
     }
 
     #[test]
@@ -23340,6 +23875,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_host_header_accepts_rfc3986_reg_names() {
+        for (raw, host) in [
+            ("My_Bucket.s3.amazonaws.com", "My_Bucket.s3.amazonaws.com"),
+            ("MINIO:9000", "MINIO"),
+            ("minio_1:9000", "minio_1"),
+            ("[::1]:8081", "::1"),
+            ("[2001:db8::1]:443", "2001:db8::1"),
+            ("s3.amazonaws.com.", "s3.amazonaws.com."),
+            ("a%20b.example", "a%20b.example"),
+            ("host~1", "host~1"),
+        ] {
+            assert_eq!(HttpProxy::parse_host_header(raw), Ok(host), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_host_header_rejects_characters_outside_reg_name() {
+        for raw in [
+            "a b",
+            "a\"b",
+            "a\tb",
+            "[a\"b]",
+            "[fe80::1%eth0]",
+            "[not-an-address]",
+            "a<b",
+            "a%2",
+            "a%zz",
+            "a/b",
+            "a@b",
+            "host:+80",
+            "host:8 0",
+            ":80",
+        ] {
+            assert!(HttpProxy::parse_host_header(raw).is_err(), "{raw:?}");
+        }
+    }
+
+    #[test]
     fn test_parse_host_header_hostname_only() {
         // Validates: Requirements 6.10 (well-formed non-colon hostname)
         assert_eq!(
@@ -23865,7 +24438,6 @@ mod head_listing_one_read_tests {
     //! offset `i`. Each extent is over `BUFFERED_OPERATION_BOUND`, so a refused extent is
     //! answered from S3 (a stub that is unreachable here), never by the buffered serve.
     use super::*;
-    use crate::cache::CacheEvictionAlgorithm;
     use crate::cache_types::{ObjectMetadata, StoredFreshness, UploadState};
     use crate::s3_client::{S3RequestContext, S3Response};
     use async_trait::async_trait;
@@ -23976,12 +24548,8 @@ mod head_listing_one_read_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(dir.path().join(sub)).unwrap();
         }
-        let mut manager = CacheManager::new_with_eviction_algorithm(
-            dir.path().to_path_buf(),
-            true,
-            64 * 1024 * 1024,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let mut manager =
+            CacheManager::new_with_defaults(dir.path().to_path_buf(), true, 64 * 1024 * 1024);
         manager.set_ram_cache_verification_interval(Duration::from_secs(3600));
         let manager = Arc::new(manager);
         let dcm = Arc::new(tokio::sync::RwLock::new(
@@ -23996,7 +24564,7 @@ mod head_listing_one_read_tests {
         for &(start, end) in extents {
             manager
                 .create_configured_disk_cache_manager()
-                .store_range(
+                .store_range_witnessed(
                     key,
                     start,
                     end,
@@ -24035,8 +24603,12 @@ mod head_listing_one_read_tests {
         );
         (dir, manager, rh)
     }
-    fn ram_hits(manager: &CacheManager) -> u64 {
-        manager.get_ram_cache_stats().expect("RAM stats").hit_count
+    async fn ram_hits(manager: &CacheManager) -> u64 {
+        manager
+            .ram_cache_stats()
+            .await
+            .expect("RAM stats")
+            .hit_count
     }
     async fn hit_updates_recorded(manager: &CacheManager) -> u64 {
         manager
@@ -24109,7 +24681,7 @@ mod head_listing_one_read_tests {
         let key = "test-bucket/range/exact.bin";
         let (dir, manager, rh) = ram_access_fixture(key, &[(0, 1023)], (100, 199)).await;
         let recorded_before = hit_updates_recorded(&manager).await;
-        let hits_before = ram_hits(&manager);
+        let hits_before = ram_hits(&manager).await;
         let mut config = Config::default();
         config.cache.ram_cache_enabled = true;
         let resolved = crate::bucket_settings::ResolvedSettings {
@@ -24152,7 +24724,7 @@ mod head_listing_one_read_tests {
             "precondition: the read was served from RAM (the disk copy is b'D' and its .bin is gone)"
         );
         assert_eq!(
-            ram_hits(&manager) - hits_before,
+            ram_hits(&manager).await - hits_before,
             1,
             "precondition: one RAM hit"
         );
@@ -24173,7 +24745,7 @@ mod head_listing_one_read_tests {
         let key = "test-bucket/range/page.bin";
         let (dir, manager, rh) = ram_access_fixture(key, &[(0, 511), (512, 1023)], (0, 1023)).await;
         let recorded_before = hit_updates_recorded(&manager).await;
-        let hits_before = ram_hits(&manager);
+        let hits_before = ram_hits(&manager).await;
         let resolved = crate::bucket_settings::ResolvedSettings {
             page_widening: true,
             page_size: 1024,
@@ -24204,6 +24776,7 @@ mod head_listing_one_read_tests {
             1.0,
             false,
             None,
+            true,
             &mut served_from_cache,
         )
         .await
@@ -24213,7 +24786,7 @@ mod head_listing_one_read_tests {
             "precondition: the Page was served from RAM"
         );
         assert_eq!(
-            ram_hits(&manager) - hits_before,
+            ram_hits(&manager).await - hits_before,
             1,
             "precondition: one RAM hit"
         );
@@ -24236,7 +24809,7 @@ mod head_listing_one_read_tests {
         let (dir, manager, rh) =
             ram_access_fixture(key, &[(0, 1023), (512, 1535)], (0, 1023)).await;
         let recorded_before = hit_updates_recorded(&manager).await;
-        let hits_before = ram_hits(&manager);
+        let hits_before = ram_hits(&manager).await;
         let resolved = crate::bucket_settings::ResolvedSettings {
             page_widening: true,
             page_size: 1024,
@@ -24267,6 +24840,7 @@ mod head_listing_one_read_tests {
             1.0,
             false,
             None,
+            true,
             &mut served_from_cache,
         )
         .await
@@ -24276,7 +24850,7 @@ mod head_listing_one_read_tests {
             "precondition: the Page was served from RAM"
         );
         assert_eq!(
-            ram_hits(&manager) - hits_before,
+            ram_hits(&manager).await - hits_before,
             1,
             "precondition: one RAM hit"
         );
@@ -24296,7 +24870,7 @@ mod head_listing_one_read_tests {
         let key = "test-bucket/range/tiered.bin";
         let (dir, manager, rh) = ram_access_fixture(key, &[(0, 1023)], (0, 1023)).await;
         let recorded_before = hit_updates_recorded(&manager).await;
-        let hits_before = ram_hits(&manager);
+        let hits_before = ram_hits(&manager).await;
         let mut overlap = overlap_of(0, 1023, ETAG_V1);
         let range = overlap.cached_ranges.remove(0);
         let (data, is_ram_hit) = manager
@@ -24308,7 +24882,7 @@ mod head_listing_one_read_tests {
             "precondition: the range was served from RAM"
         );
         assert_eq!(
-            ram_hits(&manager) - hits_before,
+            ram_hits(&manager).await - hits_before,
             1,
             "precondition: one RAM hit"
         );
@@ -24326,12 +24900,7 @@ mod head_listing_one_read_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        let manager = Arc::new(CacheManager::new_with_eviction_algorithm(
-            dir.to_path_buf(),
-            false,
-            0,
-            CacheEvictionAlgorithm::TinyLFU,
-        ));
+        let manager = Arc::new(CacheManager::new_with_defaults(dir.to_path_buf(), false, 0));
         let dcm = Arc::new(tokio::sync::RwLock::new(
             manager.create_configured_disk_cache_manager(),
         ));
@@ -24353,7 +24922,7 @@ mod head_listing_one_read_tests {
     async fn fill(manager: &CacheManager, key: &str, start: u64, v: u8, etag: &str) {
         manager
             .create_configured_disk_cache_manager()
-            .store_range(
+            .store_range_witnessed(
                 key,
                 start,
                 start + LEN - 1,
@@ -25121,12 +25690,8 @@ mod head_listing_one_read_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(dir.path().join(sub)).unwrap();
         }
-        let mut manager = CacheManager::new_with_eviction_algorithm(
-            dir.path().to_path_buf(),
-            true,
-            64 * 1024 * 1024,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let mut manager =
+            CacheManager::new_with_defaults(dir.path().to_path_buf(), true, 64 * 1024 * 1024);
         manager.set_ram_cache_verification_interval(Duration::from_millis(50));
         let manager = Arc::new(manager);
         let dcm = Arc::new(tokio::sync::RwLock::new(
@@ -25198,6 +25763,7 @@ mod head_listing_one_read_tests {
             1.0,
             false,
             None,
+            true,
             &mut served_from_cache,
         )
         .await;
@@ -25218,12 +25784,8 @@ mod head_listing_one_read_tests {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(dir.path().join(sub)).unwrap();
         }
-        let mut manager = CacheManager::new_with_eviction_algorithm(
-            dir.path().to_path_buf(),
-            true,
-            64 * 1024 * 1024,
-            CacheEvictionAlgorithm::TinyLFU,
-        );
+        let mut manager =
+            CacheManager::new_with_defaults(dir.path().to_path_buf(), true, 64 * 1024 * 1024);
         manager.set_ram_cache_verification_interval(Duration::from_millis(50));
         let manager = Arc::new(manager);
         let dcm = Arc::new(tokio::sync::RwLock::new(
@@ -25302,6 +25864,7 @@ mod head_listing_one_read_tests {
             1.0,
             false,
             None,
+            true,
             &mut served_from_cache,
         )
         .await;
@@ -25402,7 +25965,7 @@ mod head_listing_one_read_tests {
             let (manager, rh) = setup(temp.path());
             manager
                 .create_configured_disk_cache_manager()
-                .store_range(
+                .store_range_witnessed(
                     key,
                     0,
                     EXTENT - 1,
@@ -25527,7 +26090,7 @@ mod head_listing_one_read_tests {
             async move {
                 manager
                     .create_configured_disk_cache_manager()
-                    .store_range(
+                    .store_range_witnessed(
                         key,
                         0,
                         SMALL - 1,
@@ -25697,7 +26260,7 @@ mod head_listing_one_read_tests {
         let (manager, rh) = setup(dir);
         manager
             .create_configured_disk_cache_manager()
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 len - 1,
@@ -26832,7 +27395,7 @@ mod head_listing_one_read_tests {
         let (manager, rh) = setup(dir);
         manager
             .create_configured_disk_cache_manager()
-            .store_range(
+            .store_range_witnessed(
                 key,
                 0,
                 len - 1,
@@ -27399,6 +27962,64 @@ mod streamed_hit_frames_tests {
         assert!(
             !ran.load(Ordering::SeqCst),
             "SA1: PROMOTION RAN AFTER A STREAM THAT ENDED SHORT OF ITS LENGTH"
+        );
+    }
+}
+
+/// `buffer_bounded_response` accounts every data frame it holds, including the one that
+/// did not fit under the ledger's ceiling, for as long as the replayed body is alive.
+#[cfg(test)]
+mod buffer_bounded_response_tests {
+    use super::*;
+    #[tokio::test]
+    async fn the_frame_that_does_not_fit_stays_accounted_until_the_replay_body_is_gone() {
+        let ledger = Arc::new(crate::inflight_ledger::InflightLedger::new(100));
+        let body = Full::new(Bytes::from(vec![7u8; 1000]))
+            .map_err(|never| match never {})
+            .boxed();
+        let response = Response::builder().status(200).body(body).unwrap();
+        let (response, buffered) =
+            HttpProxy::buffer_bounded_response(response, 1 << 20, &ledger).await;
+        assert!(buffered.is_none(), "1000 bytes cannot fit a ceiling of 100");
+        assert_eq!(
+            ledger.peak_reserved_bytes(),
+            1000,
+            "the frame held in memory must reach the ledger's peak"
+        );
+        assert_eq!(
+            ledger.reserved_bytes(),
+            1000,
+            "the reservation must be held while the replay body is alive"
+        );
+        let replayed = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(replayed.len(), 1000);
+        assert_eq!(
+            ledger.reserved_bytes(),
+            0,
+            "and be released once the replay body is consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_result_stays_accounted_until_the_replay_body_is_dropped() {
+        let ledger = Arc::new(crate::inflight_ledger::InflightLedger::new(1 << 20));
+        let body = Full::new(Bytes::from(vec![7u8; 1000]))
+            .map_err(|never| match never {})
+            .boxed();
+        let response = Response::builder().status(200).body(body).unwrap();
+        let (response, buffered) =
+            HttpProxy::buffer_bounded_response(response, 1 << 20, &ledger).await;
+        assert_eq!(buffered.map(|b| b.len()), Some(1000));
+        assert_eq!(
+            ledger.reserved_bytes(),
+            1000,
+            "the reservation must be held while the replay body is alive"
+        );
+        drop(response);
+        assert_eq!(
+            ledger.reserved_bytes(),
+            0,
+            "and be released when the replay body is dropped"
         );
     }
 }

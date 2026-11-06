@@ -163,7 +163,7 @@ impl InflightLedger {
 
     /// Cumulative bytes granted since construction.
     #[inline]
-    pub fn granted_bytes_total(&self) -> u64 {
+    pub(crate) fn granted_bytes_total(&self) -> u64 {
         self.granted_bytes_total.load(Ordering::Relaxed)
     }
 
@@ -224,6 +224,24 @@ impl InflightLedger {
             }
         }
     }
+    /// A zero-byte reservation on this ledger, granted without the ceiling check.
+    ///
+    /// For a buffer that must not be refused: a signed write's response, reserved after
+    /// the request was sent, when S3 may already have executed the write. `try_reserve(0)`
+    /// would refuse whenever the figure is past the ceiling, which `force_grow` allows, and
+    /// so answer a write S3 executed as a shed. The bytes are added as they arrive through
+    /// [`Reservation::force_grow`]. A disabled ledger gives a reservation that accounts
+    /// nothing, as `try_reserve` does. Counted as a grant of 0 bytes, as `try_reserve(0)` is.
+    pub(crate) fn reserve_unrefused(self: &Arc<Self>) -> Reservation {
+        if self.ceiling.load(Ordering::Relaxed) == 0 {
+            return Reservation::none();
+        }
+        self.record_grant(0);
+        Reservation {
+            ledger: Some(Arc::clone(self)),
+            bytes: 0,
+        }
+    }
 
     /// Internal: release `bytes` previously granted by `try_reserve`/`try_grow`.
     /// Called only from `Reservation::drop`.
@@ -276,6 +294,20 @@ impl InflightLedger {
         }
     }
 
+    /// Internal: grow an existing reservation by `additional` bytes past the ceiling.
+    /// Called only from `Reservation::force_grow`. Records the bytes in the figure, the
+    /// peak and the grant counters, and never refuses.
+    fn force_grow(&self, additional: u64) {
+        if additional == 0 || self.ceiling.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let new_total = self
+            .reserved
+            .fetch_add(additional, Ordering::AcqRel)
+            .saturating_add(additional);
+        self.peak.fetch_max(new_total, Ordering::Relaxed);
+        self.record_grant(additional);
+    }
     /// Record an aborted Unknown_Size_Site accumulation (Requirement 8.5).
     /// Call sites abort when `Reservation::try_grow` returns `false`.
     pub(crate) fn record_aborted_accumulation(&self) {
@@ -322,7 +354,9 @@ impl InflightLedger {
                     None
                 }
             }
-            None => self.try_reserve(bytes).map(BufferClaim::Held),
+            None => self
+                .try_reserve(bytes)
+                .map(|guard| BufferClaim::Held { _guard: guard }),
         }
     }
 }
@@ -332,9 +366,9 @@ impl InflightLedger {
 /// `Held` must be kept alive for the buffer's lifetime; `CoveredByCaller`
 /// carries nothing because the enclosing caller's reservation already does.
 #[must_use]
-pub enum BufferClaim {
+pub(crate) enum BufferClaim {
     /// A fresh reservation this call site owns.
-    Held(Reservation),
+    Held { _guard: Reservation },
     /// Accounted for by a caller-held reservation covering the same bytes.
     CoveredByCaller,
 }
@@ -383,7 +417,7 @@ impl Reservation {
     /// A no-op ledger (`ledger: None`, i.e. Ledger_Disabled or
     /// [`Reservation::none`]) always succeeds and grows unconditionally,
     /// preserving pre-feature unbounded behaviour when disabled.
-    pub fn try_grow(&mut self, additional: u64) -> bool {
+    pub(crate) fn try_grow(&mut self, additional: u64) -> bool {
         match &self.ledger {
             Some(ledger) => {
                 if ledger.try_grow(additional) {
@@ -401,6 +435,19 @@ impl Reservation {
     }
 }
 
+impl Reservation {
+    /// Grow this reservation by `additional` bytes even when that takes the ledger past
+    /// its ceiling. For bytes already in memory that cannot be refused: a signed write's
+    /// response arrives after the request was sent, so S3 may have executed the write and
+    /// shedding its answer would misreport it. Admission (`try_reserve`) stays the only
+    /// place that refuses; this keeps the figure and its peak true to what is held.
+    pub(crate) fn force_grow(&mut self, additional: u64) {
+        if let Some(ledger) = &self.ledger {
+            ledger.force_grow(additional);
+        }
+        self.bytes += additional;
+    }
+}
 impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(ledger) = &self.ledger {
@@ -666,7 +713,7 @@ mod tests {
         let claim = ledger
             .claim_overlapping(600, None)
             .expect("600 fits under 1000");
-        assert!(matches!(claim, BufferClaim::Held(_)));
+        assert!(matches!(claim, BufferClaim::Held { .. }));
         assert_eq!(ledger.reserved_bytes(), 600);
         assert!(
             ledger.claim_overlapping(600, None).is_none(),

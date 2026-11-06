@@ -11,7 +11,7 @@ use tracing::warn;
 
 /// At most one accept-error `warn!` per listener per this interval; the line carries how many
 /// errors were suppressed since the previous one.
-pub const ACCEPT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const ACCEPT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Pause after an accept error that is not about one connection.
 ///
@@ -19,7 +19,7 @@ pub const ACCEPT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// leaves the pending connection in the backlog, so the next `accept` fails at once and an
 /// unpaused loop spins a core. 100 ms caps that at ten attempts a second and delays recovery by
 /// at most 100 ms once a descriptor frees.
-pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How long to wait before the next accept after `e`. `None` means retry immediately.
 ///

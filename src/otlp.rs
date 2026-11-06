@@ -115,8 +115,6 @@ struct Instruments {
 
     cache_metadata_read_stale_handles_total: Gauge<u64>,
     cache_metadata_read_stale_handle_misses_total: Gauge<u64>,
-    cache_etag_mismatches_total: Gauge<u64>,
-    cache_range_invalidations_total: Gauge<u64>,
     cache_incomplete_uploads_evicted: Gauge<u64>,
     // -- cache: capacity-authority divergence gauges (observability only) --
     cache_consumed_bytes: Gauge<u64>,
@@ -774,8 +772,6 @@ impl OtlpExporter {
             cache_metadata_read_stale_handle_misses_total: g_u64!(
                 "cache.metadata_read_stale_handle_misses_total"
             ),
-            cache_etag_mismatches_total: g_u64!("cache.etag_mismatches_total"),
-            cache_range_invalidations_total: g_u64!("cache.range_invalidations_total"),
             cache_incomplete_uploads_evicted: g_u64!("cache.incomplete_uploads_evicted"),
             // cache: capacity-authority divergence gauges
             cache_consumed_bytes: g_u64!("cache.consumed_bytes"),
@@ -1377,10 +1373,6 @@ impl OtlpExporter {
                 .record(c.metadata_read_stale_handles_total, a);
             i.cache_metadata_read_stale_handle_misses_total
                 .record(c.metadata_read_stale_handle_misses_total, a);
-            i.cache_etag_mismatches_total
-                .record(c.cache_etag_mismatches_total, a);
-            i.cache_range_invalidations_total
-                .record(c.cache_range_invalidations_total, a);
             i.cache_incomplete_uploads_evicted
                 .record(c.incomplete_uploads_evicted, a);
             // capacity-authority divergence gauges
@@ -3451,11 +3443,6 @@ mod tests {
                 write_stamp_pending_declined_total: 0,
                 volume_stall_breaker_open: 0,
                 volume_stall_breaker_trips_total: 0,
-                cache_etag_validations_total: 0,
-                cache_etag_mismatches_total: 0,
-                cache_range_invalidations_total: 0,
-                cache_orphaned_ranges_cleaned_total: 0,
-                cache_cleanup_failures_total: 0,
                 cache_part_hits: 0,
                 cache_part_misses: 0,
                 cache_part_stores: 0,

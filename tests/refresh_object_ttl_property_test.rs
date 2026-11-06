@@ -8,6 +8,8 @@
 //!
 //! **Validates: Requirements 1.3, 3.1**
 
+mod common;
+use common::SeedMetadata as _;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use s3_proxy::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 use s3_proxy::compression::CompressionAlgorithm;
@@ -124,9 +126,7 @@ fn prop_ttl_refresh_uses_resolved_ttl(input: ArbitraryTtlRefreshInput) -> TestRe
             ..Default::default()
         };
 
-        if cache_manager.update_metadata(&metadata).await.is_err() {
-            return TestResult::discard();
-        }
+        cache_manager.seed_metadata(&metadata);
 
         let before_refresh = SystemTime::now();
 

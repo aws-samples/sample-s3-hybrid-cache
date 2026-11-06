@@ -86,8 +86,9 @@ configuration:
   access count halves for every `TINYLFU_HALF_LIFE_SECS` of idle time.
 - The RAM cache picks its victim with `shard_find_tinylfu_victim` in `src/ram_cache.rs`, reading
   each entry's `access_count` and `last_accessed` atomics at eviction time.
-- The disk cache sorts candidates with `sort_range_candidates_for_tinylfu`, after expiry and
-  compressed size.
+- The disk cache orders candidates with `CacheManager::byte_dimension_priority` in
+  `src/cache.rs`: expired ranges first, then larger compressed size, then the decayed
+  frequency, then `last_accessed`.
 - Counting uses per-entry counters, not a probabilistic sketch.
 
 [Eviction algorithms](EVICTION.md#eviction-algorithms) gives the full ordering for each cache.
@@ -140,7 +141,7 @@ lists when a part request is and is not cached.
 ### RAM metadata cache
 
 `src/metadata_cache.rs` keeps `NewCacheMetadata` objects in RAM for both HEAD and GET. Each
-`MetadataCacheEntry` records `loaded_at`, `disk_mtime` and `last_accessed` beside the metadata.
+`MetadataCacheEntry` records `loaded_at` and `last_accessed` beside the metadata.
 
 - **One `.meta` for HEAD and GET, with independent TTLs.** HEAD freshness uses
   `head_expires_at` and GET freshness the object-level `expires_at`. A HEAD expiry does not delete
@@ -149,8 +150,7 @@ lists when a part request is and is not cached.
   frequency scoring adds nothing; eviction pops the front of `lru_order`.
 - **No per-key lock on the request path.** `CacheManager::get_metadata_cached` checks the RAM
   cache and, on a miss, reads the `.meta` without a lock, so concurrent misses for one key each
-  read the file. `MetadataCache::get_or_load`, which does lock per key, has no caller on the
-  request path.
+  read the file.
 - **Stale file handle recovery for NFS.** The `.meta` reader retries `ESTALE` up to 3 times
   (after 50, 100 and 150 ms). A read still stale after that is a cache miss, and the `.meta` is
   not deleted.
@@ -196,9 +196,7 @@ Keys are path-only (no hostname) with no leading slash; `normalize_cache_key` st
 ```
 
 - Full object: `my-bucket/path/to/object.txt` (`CacheManager::generate_cache_key`)
-- Range, disk form: `my-bucket/path/to/object.txt:range:0-8388607` (`generate_range_cache_key`)
-- Range, RAM form: `my-bucket/path/to/object.txt:range:0:8388607` (`generate_ram_range_key`)
-- Part: `my-bucket/path/to/object.txt:part:1` (`generate_part_cache_key`)
+- Range in the RAM cache: `my-bucket/path/to/object.txt:range:0:8388607` (`generate_ram_range_key`)
 
 For a virtual-hosted or access-point request, `generate_cache_key` prefixes the bucket or
 access-point name taken from the `Host` header, so path-style and virtual-hosted requests for the

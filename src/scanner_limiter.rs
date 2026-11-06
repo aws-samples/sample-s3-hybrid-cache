@@ -32,23 +32,23 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// EWMA weight of a new per-visit rate sample (K2 step 3).
-pub const ALPHA: f64 = 0.25;
+const ALPHA: f64 = 0.25;
 
 /// A level needs this many kept samples before the argmax may consider it (K2 step 5, `N_min`).
-pub const N_MIN_SAMPLES: u64 = 3;
+const N_MIN_SAMPLES: u64 = 3;
 
 /// A level must beat the current level's `Â` by more than this fraction to move `k` (K2 `γ`).
 pub const MARGIN: f64 = 0.10;
 
 /// At most one change of `k` per this many passes. Applies to argmax moves and probes alike.
-pub const HOLD_DOWN_PASSES: u32 = 4;
+const HOLD_DOWN_PASSES: u32 = 4;
 
 /// Per-pass probability of probing `k + 1` when the argmax did not move `k` (K2 step 6).
-pub const PROBE_PROBABILITY: f64 = 0.125;
+const PROBE_PROBABILITY: f64 = 0.125;
 
 /// Why the most recent [`ScannerLimiter::end_pass`] left `k` where it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdjustReason {
+pub(crate) enum AdjustReason {
     /// `k` moved to a level whose `Â` beat the current level's by more than [`MARGIN`].
     Argmax,
     /// `k` moved to `k + 1` on the injected draw.
@@ -84,7 +84,7 @@ struct Level {
 
 /// The K2 controller for one scan kind on one instance. See the module docs.
 #[derive(Debug, Clone)]
-pub struct ScannerLimiter {
+pub(crate) struct ScannerLimiter {
     k: u32,
     k_max: u32,
     levels: BTreeMap<u32, Level>,
@@ -111,7 +111,7 @@ impl ScannerLimiter {
     /// Update the ceiling (the number of distinct instances that published a scanner document
     /// within one lease). Lowering it below `k` clamps `k` at once; raising it leaves `k` where it
     /// is, and the probe climbs toward it.
-    pub fn set_k_max(&mut self, k_max: u32) {
+    pub(crate) fn set_k_max(&mut self, k_max: u32) {
         self.k_max = k_max;
         self.k = self.k.min(k_max).max(1);
     }
@@ -119,7 +119,13 @@ impl ScannerLimiter {
     /// Record one shard visit. `n_start` and `n_end` are the live peer-scanner counts read at the
     /// visit's start and end. A visit whose `n` changed is discarded and counted. A visit with zero
     /// elapsed time carries no rate and is ignored without being counted.
-    pub fn record_visit(&mut self, n_start: u32, n_end: u32, metas_read: u64, elapsed: Duration) {
+    pub(crate) fn record_visit(
+        &mut self,
+        n_start: u32,
+        n_end: u32,
+        metas_read: u64,
+        elapsed: Duration,
+    ) {
         if n_start != n_end {
             self.samples_discarded = self.samples_discarded.saturating_add(1);
             return;
@@ -140,7 +146,7 @@ impl ScannerLimiter {
 
     /// Close a pass and return the `k` for the next one. `draw` is a uniform draw in `[0, 1)`;
     /// the probe fires when `draw < PROBE_PROBABILITY`.
-    pub fn end_pass(&mut self, draw: f64) -> u32 {
+    pub(crate) fn end_pass(&mut self, draw: f64) -> u32 {
         self.passes_since_change = self.passes_since_change.saturating_add(1);
         if self.k_max == 0 {
             self.k = 1;
@@ -177,18 +183,13 @@ impl ScannerLimiter {
         self.k
     }
 
-    /// The ceiling last set by [`ScannerLimiter::new`] or [`ScannerLimiter::set_k_max`].
-    pub fn k_max(&self) -> u32 {
-        self.k_max
-    }
-
     /// Visits discarded because `n` changed across them.
-    pub fn samples_discarded(&self) -> u64 {
+    pub(crate) fn samples_discarded(&self) -> u64 {
         self.samples_discarded
     }
 
     /// Why the most recent [`ScannerLimiter::end_pass`] chose its `k`.
-    pub fn last_adjust_reason(&self) -> AdjustReason {
+    pub(crate) fn last_adjust_reason(&self) -> AdjustReason {
         self.last_reason
     }
 
@@ -202,12 +203,12 @@ impl ScannerLimiter {
     }
 
     /// Kept samples at `level`.
-    pub fn samples_at(&self, level: u32) -> u64 {
+    pub(crate) fn samples_at(&self, level: u32) -> u64 {
         self.levels.get(&level).map_or(0, |l| l.samples)
     }
 
     /// Every level holding at least one kept sample, ascending, as `(level, ρ̂, samples)`.
-    pub fn sampled_levels(&self) -> impl Iterator<Item = (u32, f64, u64)> + '_ {
+    pub(crate) fn sampled_levels(&self) -> impl Iterator<Item = (u32, f64, u64)> + '_ {
         self.levels
             .iter()
             .filter(|(_, l)| l.samples > 0)
@@ -218,7 +219,7 @@ impl ScannerLimiter {
     ///
     /// The estimated fleet-wide read rate at `level` concurrent scanners: the curve `k` is the
     /// argmax of, published as `scanner_aggregate_estimate_by_level_{fold,repair}`.
-    pub fn aggregate_estimate(&self, level: u32) -> Option<f64> {
+    pub(crate) fn aggregate_estimate(&self, level: u32) -> Option<f64> {
         self.levels
             .get(&level)
             .filter(|l| l.samples >= N_MIN_SAMPLES)
@@ -289,7 +290,7 @@ mod tests {
         let mut ks = Vec::with_capacity(passes);
         for _ in 0..passes {
             let k = lim.k();
-            let k_max = lim.k_max().max(1);
+            let k_max = lim.k_max.max(1);
             for _ in 0..VISITS_PER_PASS {
                 let j_start = if rng.uniform() < 0.5 { k } else { rng.level(k) };
                 let mut j_end = j_start;

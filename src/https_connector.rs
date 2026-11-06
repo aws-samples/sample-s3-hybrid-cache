@@ -147,7 +147,7 @@ pub fn build_tls_accept_any_config() -> rustls::ClientConfig {
 /// The `Tls` payload is boxed because `TlsStream` is far larger than a bare
 /// `TcpStream`; boxing keeps the enum small (clippy `large_enum_variant`) at the cost
 /// of one allocation per (long-lived, pooled) connection.
-pub enum HttpsStreamKind {
+enum HttpsStreamKind {
     Tls(Box<TlsStream<TcpStream>>),
     Plain(TcpStream),
 }
@@ -171,7 +171,7 @@ pub struct HttpsStream {
 /// connection is. This is what makes `connection_pool.max_lifetime` enforceable:
 /// hyper's pool builder has no maximum-age option of its own.
 #[derive(Clone, Copy, Debug)]
-pub struct ConnectionEstablished(pub Instant);
+struct ConnectionEstablished(pub Instant);
 
 impl HttpsStream {
     /// Wrap a completed TLS stream, stamped as established now.
@@ -326,7 +326,7 @@ pub fn retire_if_over_max_lifetime(
 /// Applies TCP keepalive and receive buffer options via socket2 on new connections.
 /// Records connection failures in IpHealthTracker for automatic IP exclusion.
 /// Uses [`build_tls_config_for_host`] to select the correct TLS version per host.
-pub struct CustomHttpsConnector {
+pub(crate) struct CustomHttpsConnector {
     pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     /// Root certificate store for building per-host TLS configurations.
     root_store: Arc<rustls::RootCertStore>,
@@ -503,7 +503,7 @@ async fn record_connection_created_if_keyable(
 /// Apply TCP socket options (keepalive + receive buffer) via socket2.
 /// Converts TcpStream → socket2::Socket → apply options → convert back.
 /// Errors are logged as warnings and do not fail the connection.
-fn apply_socket_options(
+pub(crate) fn apply_socket_options(
     tcp: TcpStream,
     config: &ConnectionPoolConfig,
 ) -> std::result::Result<TcpStream, ProxyError> {
@@ -537,7 +537,9 @@ fn apply_socket_options(
         ))
     })?;
 
-    tcp.set_nodelay(true).ok();
+    if let Err(e) = tcp.set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY: {}", e);
+    }
 
     Ok(tcp)
 }
@@ -752,10 +754,8 @@ impl Service<Uri> for CustomHttpsConnector {
                     "[HTTPS_CONNECTOR] Resolving hostname via configured DNS: {}",
                     uri_host
                 );
-                let ips = {
-                    let pm = pool_manager.read().await;
-                    pm.resolve_endpoint(uri_host).await?
-                };
+                let lookup = pool_manager.read().await.lookup();
+                let ips = lookup.resolve(uri_host).await?;
                 let ip = *ips.first().ok_or_else(|| {
                     ProxyError::ConnectionError(format!("No addresses found for {}", uri_host))
                 })?;

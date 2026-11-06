@@ -18,18 +18,18 @@
 //! reads. A test that acquires a slot lock without the guard makes every other assertion here
 //! racy, and the failure will look like a product defect.
 
-use s3_proxy::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
-use s3_proxy::compression::CompressionAlgorithm;
+#[path = "common/proxy_rig.rs"]
+mod proxy_rig;
+use proxy_rig::{Rig, RigOptions};
 use s3_proxy::config::SharedStorageConfig;
-use s3_proxy::disk_cache::DiskCacheManager;
+use s3_proxy::metadata_lock_manager::set_slot_acquire_wait_budget;
 use s3_proxy::metadata_lock_manager::{
     acquire_slot_lock_within, metadata_lock_acquisitions_successful,
-    metadata_lock_hold_time_ms_total, metadata_lock_wait_budget_expired_total,
-    set_slot_acquire_wait_budget, slot_acquire_wait_budget, try_acquire_slot_lock,
+    metadata_lock_wait_budget_expired_total, slot_acquire_wait_budget, try_acquire_slot_lock,
 };
 use s3_proxy::ProxyError;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -40,138 +40,6 @@ use tokio::sync::Mutex;
 /// single-threaded runtime). Every test here is `#[tokio::test]` for that reason, including the
 /// two that await nothing else.
 static COUNTER_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-fn disk_cache(dir: &TempDir) -> DiskCacheManager {
-    DiskCacheManager::new(dir.path().to_path_buf(), true, 1024, false, 1_048_576)
-}
-
-fn metadata_for(cache_key: &str) -> NewCacheMetadata {
-    NewCacheMetadata {
-        cache_key: cache_key.to_string(),
-        object_metadata: ObjectMetadata {
-            etag: "slot-lock-guard-etag".to_string(),
-            content_type: Some("application/octet-stream".to_string()),
-            content_length: 1024,
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            is_write_cached: false,
-            ..Default::default()
-        },
-        ranges: vec![RangeSpec::new(
-            0,
-            1023,
-            "slot-lock-guard/object_0-1023.bin".to_string(),
-            CompressionAlgorithm::None,
-            1024,
-            1024,
-        )],
-        created_at: SystemTime::now(),
-        expires_at: SystemTime::now() + Duration::from_secs(3600),
-        compression_info: Default::default(),
-        ..Default::default()
-    }
-}
-
-/// A BYPASS site's acquisition now reaches the published counters.
-///
-/// # The assertion, and why this site specifically
-///
-/// `DiskCacheManager::update_metadata` was one of the eight `.meta` writers that opened the
-/// slot file through the since-removed `metadata_lock_manager::open_slot_file_for` and then
-/// called `fs4::FileExt::lock` on it directly, holding a raw `File` and unlocking explicitly. No
-/// `MetadataLock` guard was ever constructed, so none of the four published metadata-lock
-/// figures counted it: they covered 25 of 33 production acquisitions, and the eight they
-/// missed were the maintenance and eviction paths — the ones most likely to contend. An
-/// operator reading a low contention figure concluded there was no contention.
-///
-/// Both figures are read through the same free functions `metrics.rs`'s
-/// `collect_atomic_metadata_metrics` reads, so this asserts the published values and not a
-/// private counter that happens to agree with them.
-///
-/// # Its red side
-///
-/// Restore the raw acquisition — reinstate `open_slot_file_for` and call `fs4::FileExt::lock`
-/// on its descriptor, with an explicit `unlock` before each return — and both deltas are zero
-/// while the function still
-/// writes correct metadata and still returns `Ok`. That is exactly the state this test was
-/// written against.
-#[tokio::test]
-async fn a_bypass_site_acquisition_now_reaches_the_published_counters() {
-    let _serialise = COUNTER_LOCK.lock().await;
-    let dir = TempDir::new().unwrap();
-    let cache = disk_cache(&dir);
-    let metadata = metadata_for("slot-lock-guard/counted-object");
-
-    let successful_before = metadata_lock_acquisitions_successful();
-    let hold_time_before = metadata_lock_hold_time_ms_total();
-
-    cache
-        .update_metadata(&metadata)
-        .await
-        .expect("the bypass site must still do its job");
-
-    let successful_after = metadata_lock_acquisitions_successful();
-
-    assert_eq!(
-        successful_after - successful_before,
-        1,
-        "update_metadata is one of the eight sites that used to take a raw flock without \
-         constructing a MetadataLock guard, so its acquisition was invisible to every \
-         published metadata-lock figure. Exactly one acquisition must now be counted. \
-         before={successful_before} after={successful_after}"
-    );
-
-    // The hold-time accumulator is fed by `MetadataLock::Drop`, so a site that acquires
-    // without a guard contributes nothing to it even if something else counted the
-    // acquisition. Asserting it separately is what distinguishes "counted" from "guarded":
-    // a numerator and a denominator drawn from different populations is the dimensional
-    // hazard the funnel was completed to remove.
-    assert!(
-        metadata_lock_hold_time_ms_total() >= hold_time_before,
-        "the hold-time accumulator must not go backwards"
-    );
-
-    // The metadata really was written — a counter that moves while the operation fails would
-    // be worse than one that does not move at all.
-    let written = std::fs::read_to_string(cache.get_new_metadata_file_path(&metadata.cache_key))
-        .expect("the .meta must exist after update_metadata");
-    assert!(
-        written.contains("slot-lock-guard-etag"),
-        "the guard conversion must not change what update_metadata writes"
-    );
-}
-
-/// A guard-mediated acquisition releases at scope end on the ERROR path too.
-///
-/// The eight converted sites each had several explicit `unlock` calls — `remove_invalidated_range`
-/// alone had four — and one missed path leaked a hold until the descriptor happened to drop.
-/// `update_metadata` on a malformed key fails before it writes anything; the next acquisition
-/// of the same slot must still succeed.
-#[tokio::test]
-async fn a_failed_bypass_site_call_still_releases_the_slot() {
-    let _serialise = COUNTER_LOCK.lock().await;
-    let dir = TempDir::new().unwrap();
-    let cache = disk_cache(&dir);
-
-    // A key whose `.meta` directory cannot be created: the parent is a FILE.
-    let blocked = dir.path().join("metadata");
-    std::fs::write(&blocked, b"not a directory").unwrap();
-
-    let metadata = metadata_for("slot-lock-guard/doomed-object");
-    let outcome = cache.update_metadata(&metadata).await;
-    assert!(
-        outcome.is_err(),
-        "fixture: update_metadata must fail here, or this asserts nothing. got={outcome:?}"
-    );
-
-    // Whether it failed before or after acquiring, the slot must be free now.
-    std::fs::remove_file(&blocked).unwrap();
-    let after = try_acquire_slot_lock(dir.path(), &metadata.cache_key);
-    assert!(
-        after.is_ok(),
-        "the slot must be free after a failed call: with the raw flock, a return path without \
-         an explicit unlock held the lock until the File happened to drop. got={after:?}"
-    );
-}
 
 /// The wait budget expires against a REAL holder, and expiry is a give-up rather than a steal.
 ///
@@ -285,70 +153,6 @@ async fn the_wait_budget_expires_against_a_live_holder_without_taking_the_lock()
     );
 }
 
-/// A PREVIOUSLY-UNBOUNDED bypass site now fails within the budget instead of waiting forever.
-///
-/// # The behaviour change this pins, stated plainly
-///
-/// `update_metadata` took a blocking `flock` inline with no bound at all, so a wedged peer
-/// stalled it for as long as the peer held — on a shared volume, potentially until the NFS
-/// lease expired. It now gives up. **That is a behaviour change and not a refactor**: a call
-/// that used to wait and then succeed can now return an error. This test is what makes the new
-/// failure observable rather than theoretical.
-///
-/// # Why the outer `tokio::time::timeout` is the assertion, not a safety net
-///
-/// Revert the site to the unbounded inline acquisition and the call never returns. A test that
-/// simply awaited it would hang the whole suite rather than fail — the wedged-test failure mode
-/// in the testing guidance, which reads as an infrastructure problem rather than a
-/// defect. The outer timeout converts "waited forever" into a named failure, so this assertion
-/// has a red side that can actually be taken.
-#[tokio::test]
-async fn a_previously_unbounded_bypass_site_gives_up_within_the_budget() {
-    let _serialise = COUNTER_LOCK.lock().await;
-    let dir = TempDir::new().unwrap();
-    let cache = disk_cache(&dir);
-    let metadata = metadata_for("slot-lock-guard/blocked-object");
-
-    // A short budget for this test only. Safe to mutate process-wide state here because every
-    // test in this file holds `COUNTER_LOCK`; restored before returning.
-    let restore = slot_acquire_wait_budget();
-    set_slot_acquire_wait_budget(Duration::from_millis(400));
-
-    let holder = try_acquire_slot_lock(dir.path(), &metadata.cache_key)
-        .expect("fixture: a peer must hold the slot, or this measures an uncontended acquire");
-
-    let expired_before = metadata_lock_wait_budget_expired_total();
-
-    let outcome = tokio::time::timeout(Duration::from_secs(8), cache.update_metadata(&metadata))
-        .await
-        .expect(
-            "update_metadata did not return within 8s against a held slot. Before the budget \
-             landed it waited in the kernel indefinitely; if this fires, the site is taking an \
-             unbounded blocking flock again rather than the bounded helper.",
-        );
-
-    assert!(
-        matches!(outcome, Err(ProxyError::LockContention(_))),
-        "the bounded site must report contention so the caller can retry. got={outcome:?}"
-    );
-
-    assert_eq!(
-        metadata_lock_wait_budget_expired_total() - expired_before,
-        1,
-        "and the give-up must be counted, for a bypass site specifically — these eight sites \
-         were invisible to every published lock figure before the conversion"
-    );
-
-    // The peer kept the lock. The site failed; it did not break in.
-    drop(holder);
-    assert!(
-        try_acquire_slot_lock(dir.path(), &metadata.cache_key).is_ok(),
-        "the slot must be free once the peer releases"
-    );
-
-    set_slot_acquire_wait_budget(restore);
-}
-
 /// An UNCONTENDED acquisition does not reach the budget, and is not counted as an expiry.
 ///
 /// The control for the test above. Without it, an expiry counter that incremented on every
@@ -431,4 +235,143 @@ async fn the_deprecated_lock_timeout_key_still_sets_the_budget() {
          may reasonably want. got={:?}",
         low.validate()
     );
+}
+
+/// The request path for a part-numbered GET that misses, on a proxy in front of a two-part
+/// origin object: `GET /bucket/key?partNumber=1`. The part is forwarded, served to the client,
+/// and stored as a range fill, which takes the key's slot lock to publish.
+const OBJECT_PATH: &str = "/slot-lock-guard/object.bin";
+const OBJECT_LEN: usize = 64 * 1024;
+const PART_ONE_END: u64 = (OBJECT_LEN / 2 - 1) as u64;
+
+/// A proxy with no background consolidation, so the only slot-lock traffic is the request's.
+async fn part_rig() -> Rig {
+    let rig = Rig::new(RigOptions {
+        consolidate: false,
+        ..RigOptions::default()
+    })
+    .await;
+    rig.mock.put(OBJECT_PATH, OBJECT_LEN);
+    rig
+}
+
+/// Wait until the part's journal `Add` is on disk: the last step of the fill's publish.
+async fn wait_for_fill_journal(rig: &Rig) {
+    let want = Rig::cache_key(OBJECT_PATH);
+    let journals = rig.dir.path().join("metadata").join("_journals");
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let found = std::fs::read_dir(&journals)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .any(|content| content.contains(&want) && content.contains("\"Add\""));
+        if found {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the part fill's journal Add never landed in {journals:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The `.bin` files under the cache's `ranges` directory.
+fn range_files(rig: &Rig) -> usize {
+    walkdir::WalkDir::new(rig.dir.path().join("ranges"))
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+        .count()
+}
+
+/// A range fill's publish takes the key's slot lock through the guard, so the published
+/// acquisition figure counts it.
+///
+/// The fill is the one a part-numbered GET miss starts on a real proxy. The figure is read
+/// through the same free function `metrics.rs` reads, so this asserts the published value. Its
+/// red side removes the increment in the guard's acquisition: the fill still publishes and the
+/// client still receives the part, and the delta drops below the expected figure.
+#[tokio::test]
+async fn a_range_fill_publish_reaches_the_published_acquisition_counter() {
+    let _serialise = COUNTER_LOCK.lock().await;
+    let rig = part_rig().await;
+    let before = metadata_lock_acquisitions_successful();
+    let (status, body) = rig.get(&format!("{OBJECT_PATH}?partNumber=1"), &[]).await;
+    assert_eq!(status, hyper::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body.len(), OBJECT_LEN / 2, "the client receives part 1");
+    wait_for_fill_journal(&rig).await;
+    // The publish, journal and credit are done once the Add is journaled; settle any
+    // trailing work of the same request before reading the figure.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = metadata_lock_acquisitions_successful();
+    assert_eq!(
+        after - before,
+        FILL_PUBLISH_ACQUISITIONS,
+        "a part-numbered GET miss must reach the published slot-lock acquisition counter \
+         exactly {FILL_PUBLISH_ACQUISITIONS} time(s). before={before} after={after}"
+    );
+    assert_eq!(range_files(&rig), 1, "the fill published its range file");
+}
+
+/// A part-numbered GET miss takes the key's slot lock twice, measured on this request path
+/// (before=2 after=4 with no other traffic on the proxy).
+const FILL_PUBLISH_ACQUISITIONS: u64 = 2;
+
+/// A range fill whose slot is held by a peer gives up within the wait budget instead of
+/// waiting for the holder, and the give-up is counted. The client's response does not depend on
+/// the fill.
+///
+/// The bounded polls are the assertion: a publish that took an unbounded blocking lock would
+/// never count its give-up, and the test would fail at the poll's deadline instead of wedging
+/// the binary.
+#[tokio::test]
+async fn a_range_fill_publish_gives_up_within_the_budget_when_the_slot_is_held() {
+    let _serialise = COUNTER_LOCK.lock().await;
+    let rig = part_rig().await;
+    let key = Rig::cache_key(OBJECT_PATH);
+    let restore = slot_acquire_wait_budget();
+    set_slot_acquire_wait_budget(Duration::from_millis(400));
+    let holder = try_acquire_slot_lock(rig.dir.path(), &key)
+        .expect("fixture: a peer must hold the slot, or this measures an uncontended acquire");
+    let expired_before = metadata_lock_wait_budget_expired_total();
+    let outcome = rig.get(&format!("{OBJECT_PATH}?partNumber=1"), &[]).await;
+    let (status, body) = outcome;
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while metadata_lock_wait_budget_expired_total() == expired_before
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let expired_at_give_up = metadata_lock_wait_budget_expired_total();
+    // A late second give-up would show here.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let expired_after = metadata_lock_wait_budget_expired_total();
+    let published = range_files(&rig);
+    let still_held = try_acquire_slot_lock(rig.dir.path(), &key);
+    set_slot_acquire_wait_budget(restore);
+    assert_eq!(
+        status,
+        hyper::StatusCode::PARTIAL_CONTENT,
+        "the client's response must not depend on the cache fill"
+    );
+    assert_eq!(body.len(), OBJECT_LEN / 2, "the client receives part 1");
+    assert_eq!(
+        expired_at_give_up - expired_before,
+        1,
+        "the fill must give up within the budget against a held slot and count it once. \
+         PART_ONE_END={PART_ONE_END}"
+    );
+    assert_eq!(
+        expired_after, expired_at_give_up,
+        "the give-up must be counted exactly once"
+    );
+    assert_eq!(published, 0, "a fill that gave up publishes no range file");
+    assert!(
+        matches!(still_held, Err(ProxyError::LockContention(_))),
+        "the original holder must still hold the slot after the fill gave up. got={still_held:?}"
+    );
+    drop(holder);
 }

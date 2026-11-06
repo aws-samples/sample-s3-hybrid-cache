@@ -13,10 +13,14 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, StatusCode};
 
-use common::expired_fixture::{signed_authorization_without_range, Fixture};
+use common::expired_fixture::{
+    signed_authorization_without_range, Fixture, SeedSpec, StoredExpiry,
+};
 use common::{StubResponse, StubS3Client};
-use s3_proxy::cache_types::{ObjectMetadata, UploadState};
+use s3_proxy::cache_types::{ObjectMetadata, RangeSpec, UploadState};
+use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::config::Config;
+use s3_proxy::journal_manager::{JournalEntry, JournalManager, JournalOperation};
 
 const MIB: u64 = 1024 * 1024;
 const OBJECT_LEN: u64 = 16 * MIB;
@@ -55,50 +59,34 @@ fn apply_override(config: &Config) {
     s3_proxy::disk_cache::set_trust_unverified_ranges(config.cache.trust_unverified_ranges);
 }
 
-fn object_metadata() -> ObjectMetadata {
-    ObjectMetadata {
-        etag: ETAG.to_string(),
-        content_length: OBJECT_LEN,
-        last_modified: LAST_MODIFIED.to_string(),
-        upload_state: UploadState::Complete,
-        cumulative_size: OBJECT_LEN,
-        ..Default::default()
-    }
+/// Lay down `data` at `start` as a single listed range with a file and no file identity, the
+/// shape a 2.x writer left on the volume (a 3.x writer records an identity, so production no
+/// longer produces this state; a listing written before an upgrade still persists).
+fn lay_down_identity_less_range(fixture: &Fixture, key: &str, start: u64, data: &[u8]) {
+    let end = start + data.len() as u64 - 1;
+    fixture.seed(
+        key,
+        &SeedSpec {
+            extents: vec![(start, end)],
+            etag: ETAG.to_string(),
+            last_modified: LAST_MODIFIED.to_string(),
+            content_length: OBJECT_LEN,
+            stored_expiry: StoredExpiry::Fresh,
+            created_age: Duration::ZERO,
+            is_write_cached: Some(false),
+        },
+    );
+    std::fs::write(fixture.bin_path(key, start, end), data).expect("fixture: write the .bin");
 }
-
-/// Write `data` at `start` through the incremental writer with compression off, consolidate,
-/// then strip the listing's file identity, as a 2.x writer (or a 2.8 consolidator) leaves it.
+/// An identity-less listing in the key's `.meta`, as a 2.x writer (or a 2.8 consolidator)
+/// leaves it.
 async fn identity_less_listing(fixture: &Fixture, key: &str, start: u64, data: &[u8]) {
-    let dcm = fixture.cache_manager.create_configured_disk_cache_manager();
-    let mut writer = dcm
-        .begin_incremental_range_write(key, start, start + data.len() as u64 - 1, false)
-        .await
-        .expect("begin incremental write")
-        .expect("the write is admitted");
-    for chunk in data.chunks(64 * 1024) {
-        s3_proxy::disk_cache::DiskCacheManager::write_range_chunk(&mut writer, chunk)
-            .expect("write chunk");
-    }
-    dcm.commit_incremental_range(writer, object_metadata(), Duration::from_secs(3600))
-        .await
-        .expect("commit");
-    fixture
-        .cache_manager
-        .get_journal_consolidator()
-        .await
-        .expect("journal consolidator must be configured")
-        .consolidate_object(key)
-        .await
-        .expect("consolidation");
+    lay_down_identity_less_range(fixture, key, start, data);
     let path = fixture.meta_path(key);
     let mut doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("the .meta")).unwrap();
     let ranges = doc["ranges"].as_array_mut().expect("ranges");
     assert_eq!(ranges.len(), 1, "fixture: one listing");
-    assert!(
-        ranges[0].get("file_identity").is_some_and(|v| !v.is_null()),
-        "fixture: the writer recorded an identity"
-    );
     ranges[0].as_object_mut().unwrap().remove("file_identity");
     std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
     fixture.invalidate_metadata_cache(key).await;
@@ -111,67 +99,6 @@ async fn identity_less_listing(fixture: &Fixture, key: &str, start: u64, data: &
         start
     );
 }
-
-/// Write `data` at `start` through the incremental writer with compression off, leaving its
-/// journal `Add` unconsolidated, and strip the `Add`'s file identity, as a 2.x writer leaves it.
-async fn identity_less_journal_add(fixture: &Fixture, key: &str, start: u64, data: &[u8]) {
-    let dcm = fixture.cache_manager.create_configured_disk_cache_manager();
-    let mut writer = dcm
-        .begin_incremental_range_write(key, start, start + data.len() as u64 - 1, false)
-        .await
-        .expect("begin incremental write")
-        .expect("the write is admitted");
-    for chunk in data.chunks(64 * 1024) {
-        s3_proxy::disk_cache::DiskCacheManager::write_range_chunk(&mut writer, chunk)
-            .expect("write chunk");
-    }
-    dcm.commit_incremental_range(writer, object_metadata(), Duration::from_secs(3600))
-        .await
-        .expect("commit");
-    let journals = fixture
-        .cache_manager
-        .get_cache_dir()
-        .join("metadata")
-        .join("_journals");
-    let mut stripped = 0;
-    for dirent in std::fs::read_dir(&journals).expect("the journal directory") {
-        let path = dirent.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("journal") {
-            continue;
-        }
-        let mut out = String::new();
-        for line in std::fs::read_to_string(&path).unwrap().lines() {
-            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
-            if v["cache_key"] == key && v["operation"] == "Add" {
-                assert!(
-                    !v["range_spec"]["file_identity"].is_null(),
-                    "fixture: the writer recorded an identity"
-                );
-                v["range_spec"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("file_identity");
-                stripped += 1;
-            }
-            out.push_str(&v.to_string());
-            out.push('\n');
-        }
-        std::fs::write(&path, out).unwrap();
-    }
-    assert_eq!(stripped, 1, "fixture: the fill's one Add lost its identity");
-}
-
-async fn consolidate(fixture: &Fixture, key: &str) {
-    fixture
-        .cache_manager
-        .get_journal_consolidator()
-        .await
-        .expect("journal consolidator must be configured")
-        .consolidate_object(key)
-        .await
-        .expect("consolidation");
-}
-
 fn listed_bin(fixture: &Fixture, key: &str) -> std::path::PathBuf {
     let meta = fixture.read_meta(key).expect("the key is listed");
     fixture
@@ -289,8 +216,78 @@ async fn an_identity_less_listing_is_served_with_the_override_on() {
     .expect("the case must finish inside its bound");
 }
 
-/// With the override on, a journal `Add` with no file
-/// identity is folded into a `.meta`, as 3.0.0 folded it. Red side: the fold's predicate
+/// A journal `Add` as a 2.x writer left it: the range fill's `.bin` at the path the consolidator
+/// checks for it, the `Add` with no file identity and no version witness, and the object's
+/// metadata carried on the entry. Returns nothing; the `Add` is appended to the key's journal.
+async fn journal_a_2x_add(fixture: &Fixture, key: &str, start: u64, data: &[u8]) {
+    let end = start + data.len() as u64 - 1;
+    let ranges_dir = fixture.cache_manager.get_cache_dir().join("ranges");
+    let bin =
+        s3_proxy::disk_cache::get_sharded_path(&ranges_dir, key, &format!("_{start}-{end}.bin"))
+            .expect("the sharded path");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, data).expect("fixture: write the .bin");
+    let relative = bin
+        .strip_prefix(&ranges_dir)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let now = std::time::SystemTime::now();
+    let entry = JournalEntry {
+        timestamp: now,
+        instance_id: "peer-2x".to_string(),
+        cache_key: key.to_string(),
+        range_spec: RangeSpec {
+            start,
+            end,
+            file_path: relative.clone(),
+            compression_algorithm: CompressionAlgorithm::None,
+            compressed_size: data.len() as u64,
+            uncompressed_size: data.len() as u64,
+            created_at: now,
+            last_accessed: now,
+            access_count: 1,
+            staged: None,
+            unservable: false,
+            file_identity: None,
+        },
+        operation: JournalOperation::Add,
+        range_file_path: relative,
+        metadata_version: 1,
+        new_ttl_secs: None,
+        object_ttl_secs: Some(3600),
+        access_increment: None,
+        object_metadata: Some(ObjectMetadata {
+            etag: ETAG.to_string(),
+            content_length: OBJECT_LEN,
+            last_modified: LAST_MODIFIED.to_string(),
+            upload_state: UploadState::Complete,
+            cumulative_size: OBJECT_LEN,
+            ..Default::default()
+        }),
+        fill_witness: None,
+    };
+    JournalManager::new(
+        fixture.cache_manager.get_cache_dir().to_path_buf(),
+        "peer-2x".to_string(),
+    )
+    .append_range_entry(key, entry)
+    .await
+    .expect("append the journal Add");
+}
+
+/// What the fold listed for `key`: `(start, end, has_identity)` per range, or `None` with no `.meta`.
+fn listed(fixture: &Fixture, key: &str) -> Option<Vec<(u64, u64, bool)>> {
+    fixture.read_meta(key).map(|m| {
+        m.ranges
+            .iter()
+            .map(|r| (r.start, r.end, r.file_identity.is_some()))
+            .collect()
+    })
+}
+
+/// With the override on, a journal `Add` with no file identity, written as a 2.x proxy wrote it,
+/// is folded into a new `.meta`, as 3.0.0 folded it. Red side: the fold's predicate
 /// (`entry_lists_unverified_range`) without its override check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_identity_less_journal_add_is_folded_with_the_override_on() {
@@ -299,19 +296,65 @@ async fn an_identity_less_journal_add_is_folded_with_the_override_on() {
         apply_override(&config);
         let key = "test-bucket/override-fold.bin";
         let fixture = Fixture::new(config).await;
-        identity_less_journal_add(&fixture, key, OFF, &object_bytes(OFF, OFF + MIB)).await;
-        consolidate(&fixture, key).await;
-        fixture.invalidate_metadata_cache(key).await;
-        let listed: Option<Vec<(u64, u64, bool)>> = fixture.read_meta(key).map(|m| {
-            m.ranges
-                .iter()
-                .map(|r| (r.start, r.end, r.file_identity.is_some()))
-                .collect()
-        });
+        journal_a_2x_add(&fixture, key, OFF, &object_bytes(OFF, OFF + MIB)).await;
+        let result = fixture
+            .cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("journal consolidator must be configured")
+            .consolidate_object(key)
+            .await
+            .expect("consolidation");
         assert_eq!(
-            listed,
-            Some(vec![(OFF, OFF + MIB - 1, false)]),
+            (result.entries_processed, result.entries_consolidated),
+            (1, 1),
             "R13.2: WITH THE OVERRIDE ON, AN IDENTITY-LESS JOURNAL ADD WAS NOT FOLDED"
+        );
+        fixture.invalidate_metadata_cache(key).await;
+        assert_eq!(
+            listed(&fixture, key),
+            Some(vec![(OFF, OFF + MIB - 1, false)]),
+            "R13.2: WITH THE OVERRIDE ON, THE FOLD DID NOT LIST THE IDENTITY-LESS RANGE"
+        );
+    })
+    .await
+    .expect("the case must finish inside its bound");
+}
+
+/// The same fold into a key that already has a `.meta`: the new range is listed beside the old.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identity_less_journal_add_is_folded_into_an_existing_meta_with_the_override_on() {
+    tokio::time::timeout(TEST_BOUND, async {
+        let config = config();
+        apply_override(&config);
+        let key = "test-bucket/override-fold-existing.bin";
+        let fixture = Fixture::new(config).await;
+        let first = object_bytes(2 * OFF, 2 * OFF + MIB);
+        identity_less_listing(&fixture, key, 2 * OFF, &first).await;
+        journal_a_2x_add(&fixture, key, OFF, &object_bytes(OFF, OFF + MIB)).await;
+        let result = fixture
+            .cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("journal consolidator must be configured")
+            .consolidate_object(key)
+            .await
+            .expect("consolidation");
+        assert_eq!(
+            (result.entries_processed, result.entries_consolidated),
+            (1, 1),
+            "R13.2: WITH THE OVERRIDE ON, AN IDENTITY-LESS JOURNAL ADD WAS NOT FOLDED"
+        );
+        fixture.invalidate_metadata_cache(key).await;
+        let mut got = listed(&fixture, key).expect("the .meta");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (OFF, OFF + MIB - 1, false),
+                (2 * OFF, 2 * OFF + MIB - 1, false)
+            ],
+            "R13.2: WITH THE OVERRIDE ON, THE FOLD DID NOT LIST THE IDENTITY-LESS RANGE"
         );
     })
     .await
@@ -371,32 +414,6 @@ async fn an_identity_less_listing_verifies_a_ram_copy_with_the_override_on() {
             ),
             "R13.2: WITH THE OVERRIDE ON, AN IDENTITY-LESS LISTING DOES NOT COVER A RAM COPY: {:?}",
             check
-        );
-    })
-    .await
-    .expect("the case must finish inside its bound");
-}
-
-/// The whole-object lookup (`CacheManager::get_cached_response`, its
-/// `get_from_disk_cache` arm, the part lookup): with the override on,
-/// an identity-less listing of the whole object is returned. Red side: that arm without the
-/// override check.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_identity_less_whole_object_listing_is_returned_with_the_override_on() {
-    tokio::time::timeout(TEST_BOUND, async {
-        let config = config();
-        apply_override(&config);
-        let key = "test-bucket/override-whole-object.bin";
-        let fixture = Fixture::new(config).await;
-        identity_less_listing(&fixture, key, 0, &object_bytes(0, OBJECT_LEN)).await;
-        let entry = fixture
-            .cache_manager
-            .get_cached_response(key)
-            .await
-            .expect("the lookup");
-        assert!(
-            entry.is_some(),
-            "R13.2: WITH THE OVERRIDE ON, AN IDENTITY-LESS WHOLE-OBJECT LISTING WAS NOT RETURNED"
         );
     })
     .await

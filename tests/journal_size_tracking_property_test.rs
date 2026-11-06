@@ -288,12 +288,12 @@ fn prop_crash_recovery_validation_correction(
         let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
         // Set an initial (potentially incorrect) size
-        // We'll use update_size_from_validation to correct it
+        // We'll use update_size_from_validation_with_kind to correct it
         let correct_size = correct_size as u64;
         let write_cache_size = write_cache_size as u64;
 
         // The write-cache figure is a SUBSET of the total, and
-        // `update_size_from_validation` clamps it to the total with a WARN rather than
+        // `update_size_from_validation_with_kind` clamps it to the total with a WARN rather than
         // storing an impossible state (write-cache-accounting-and-eviction R6.4). The
         // generator freely produces `write_cache_size > correct_size` (e.g. `(0, 0, 1)`),
         // so the expected value is the clamped one.
@@ -306,7 +306,12 @@ fn prop_crash_recovery_validation_correction(
 
         // Update size from validation (simulating what CacheSizeTracker does after a scan)
         consolidator
-            .update_size_from_validation(correct_size, Some(write_cache_size), None)
+            .update_size_from_validation_with_kind(
+                correct_size,
+                Some(write_cache_size),
+                None,
+                s3_proxy::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
             .await;
 
         // Property: size should be corrected by validation

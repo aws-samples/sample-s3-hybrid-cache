@@ -25,7 +25,7 @@ use tokio::sync::broadcast;
 
 /// Result type for fetch completion notification.
 /// `Ok(())` indicates success, `Err(String)` contains the error message.
-pub type FetchResult = Result<(), String>;
+type FetchResult = Result<(), String>;
 
 /// Channel capacity for broadcast sender.
 /// Only needs to hold one message (the completion notification).
@@ -139,11 +139,6 @@ impl InFlightTracker {
         self.pending.get(flight_key).map(|entry| entry.subscribe())
     }
 
-    /// Returns the number of in-flight fetches currently being tracked.
-    pub fn in_flight_count(&self) -> usize {
-        self.pending.len()
-    }
-
     /// Creates a flight key for a full object GET request.
     ///
     /// # Arguments
@@ -233,7 +228,7 @@ impl FetchGuard {
     ///
     /// - 16.2: Broadcast error notification to all waiters
     /// - 16.3: Remove flight key entry on completion
-    pub fn complete_error(mut self, error: String) {
+    pub(crate) fn complete_error(mut self, error: String) {
         self.completed = true;
         // Broadcast error - ignore send errors (no receivers is fine)
         let _ = self.sender.send(Err(error));
@@ -262,6 +257,15 @@ impl Drop for FetchGuard {
     }
 }
 
+/// How many of `keys` have a flight registered, read through `try_resubscribe`, the lookup a
+/// waiter makes.
+#[cfg(test)]
+pub(crate) fn registered(tracker: &InFlightTracker, keys: &[&str]) -> usize {
+    keys.iter()
+        .filter(|k| tracker.try_resubscribe(k).is_some())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,7 +280,7 @@ mod tests {
             FetchRole::Waiter(_) => panic!("Expected Fetcher, got Waiter"),
         };
 
-        assert_eq!(tracker.in_flight_count(), 1);
+        assert_eq!(registered(&tracker, &[flight_key]), 1);
     }
 
     #[test]
@@ -296,7 +300,7 @@ mod tests {
             FetchRole::Waiter(_) => {} // Expected
         }
 
-        assert_eq!(tracker.in_flight_count(), 1);
+        assert_eq!(registered(&tracker, &[flight_key]), 1);
     }
 
     #[test]
@@ -309,11 +313,11 @@ mod tests {
             FetchRole::Waiter(_) => panic!("Expected Fetcher"),
         };
 
-        assert_eq!(tracker.in_flight_count(), 1);
+        assert_eq!(registered(&tracker, &[flight_key]), 1);
 
         guard.complete_success();
 
-        assert_eq!(tracker.in_flight_count(), 0);
+        assert_eq!(registered(&tracker, &[flight_key]), 0);
     }
 
     #[test]
@@ -326,11 +330,11 @@ mod tests {
             FetchRole::Waiter(_) => panic!("Expected Fetcher"),
         };
 
-        assert_eq!(tracker.in_flight_count(), 1);
+        assert_eq!(registered(&tracker, &[flight_key]), 1);
 
         guard.complete_error("S3 error".to_string());
 
-        assert_eq!(tracker.in_flight_count(), 0);
+        assert_eq!(registered(&tracker, &[flight_key]), 0);
     }
 
     #[test]
@@ -344,11 +348,11 @@ mod tests {
                 FetchRole::Waiter(_) => panic!("Expected Fetcher"),
             };
 
-            assert_eq!(tracker.in_flight_count(), 1);
+            assert_eq!(registered(&tracker, &[flight_key]), 1);
             // guard dropped here without calling complete_*
         }
 
-        assert_eq!(tracker.in_flight_count(), 0);
+        assert_eq!(registered(&tracker, &[flight_key]), 0);
     }
 
     #[test]
@@ -494,7 +498,13 @@ mod tests {
             FetchRole::Waiter(_) => panic!("Expected Fetcher for part key"),
         };
 
-        assert_eq!(tracker.in_flight_count(), 3);
+        assert_eq!(
+            registered(
+                &tracker,
+                &[cache_key, range_key.as_str(), part_key.as_str()]
+            ),
+            3
+        );
     }
 
     #[test]
@@ -514,7 +524,7 @@ mod tests {
             FetchRole::Waiter(_) => panic!("Expected Fetcher for key2"),
         };
 
-        assert_eq!(tracker.in_flight_count(), 2);
+        assert_eq!(registered(&tracker, &[key1.as_str(), key2.as_str()]), 2);
     }
 
     #[test]
@@ -535,7 +545,7 @@ mod tests {
             FetchRole::Waiter(_) => panic!("Expected Fetcher for range 1001-2000"),
         };
 
-        assert_eq!(tracker.in_flight_count(), 2);
+        assert_eq!(registered(&tracker, &[key1.as_str(), key2.as_str()]), 2);
     }
 
     // =========================================================================
@@ -865,7 +875,7 @@ mod property_tests {
         }
 
         // Count should still be 1 (only one entry for this key)
-        if tracker.in_flight_count() != 1 {
+        if registered(&tracker, &[flight_key.as_str()]) != 1 {
             return TestResult::failed();
         }
 
@@ -893,7 +903,7 @@ mod property_tests {
                 FetchRole::Waiter(_) => return TestResult::failed(),
             };
 
-            if tracker.in_flight_count() != 1 {
+            if registered(&tracker, &[flight_key.as_str()]) != 1 {
                 return TestResult::failed();
             }
 
@@ -901,7 +911,7 @@ mod property_tests {
         }
 
         // Entry should be removed
-        if tracker.in_flight_count() != 0 {
+        if registered(&tracker, &[flight_key.as_str()]) != 0 {
             return TestResult::failed();
         }
 
@@ -1000,7 +1010,11 @@ mod property_tests {
             }
         }
 
-        if tracker.in_flight_count() != unique_keys.len() {
+        if registered(
+            &tracker,
+            &unique_keys.iter().map(String::as_str).collect::<Vec<_>>(),
+        ) != unique_keys.len()
+        {
             return TestResult::failed();
         }
 
@@ -1009,7 +1023,11 @@ mod property_tests {
             guard.complete_success();
         }
 
-        if tracker.in_flight_count() != 0 {
+        if registered(
+            &tracker,
+            &unique_keys.iter().map(String::as_str).collect::<Vec<_>>(),
+        ) != 0
+        {
             return TestResult::failed();
         }
 

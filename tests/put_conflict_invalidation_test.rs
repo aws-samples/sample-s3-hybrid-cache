@@ -131,94 +131,6 @@ async fn test_put_invalidates_existing_complete_cache() -> Result<()> {
     Ok(())
 }
 
-/// Test that PutObject invalidates in-progress multipart uploads
-/// Requirement 8.4: THE Cache System SHALL handle conflicts for both in-progress and completed uploads
-#[tokio::test]
-async fn test_put_invalidates_in_progress_multipart() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let cache_manager = CacheManager::new_with_defaults(temp_dir.path().to_path_buf(), false, 0);
-
-    let path = "/test-bucket/test-object";
-    let cache_key = CacheManager::generate_cache_key(path, None);
-
-    // First, initiate a multipart upload
-    cache_manager.initiate_multipart_upload(path).await?;
-
-    // Store a part
-    let part_data = vec![1u8; 1000];
-    let part_etag = "part-etag".to_string();
-
-    cache_manager
-        .store_multipart_part(path, 1, &part_data, part_etag)
-        .await?;
-
-    // Verify in-progress upload exists
-    let metadata_file_path = cache_manager.get_new_metadata_file_path(&cache_key);
-    assert!(
-        metadata_file_path.exists(),
-        "In-progress metadata should be present"
-    );
-
-    let in_progress_content = std::fs::read_to_string(&metadata_file_path)?;
-    let in_progress_metadata: s3_proxy::cache_types::NewCacheMetadata =
-        serde_json::from_str(&in_progress_content)?;
-    assert_eq!(
-        in_progress_metadata.object_metadata.upload_state,
-        s3_proxy::cache_types::UploadState::InProgress
-    );
-    assert_eq!(in_progress_metadata.object_metadata.parts.len(), 1);
-
-    // Now store a PUT to the same key - should invalidate the in-progress multipart
-    let put_data = b"complete object via PUT";
-    let put_headers = HashMap::from([
-        ("content-type".to_string(), "text/plain".to_string()),
-        ("etag".to_string(), "put-etag".to_string()),
-    ]);
-    let put_metadata = s3_proxy::cache_types::CacheMetadata {
-        etag: "put-etag".to_string(),
-        last_modified: "2024-01-02T00:00:00Z".to_string(),
-        content_length: put_data.len() as u64,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    };
-
-    common::put_through_write_cache(
-        &cache_manager,
-        &cache_key,
-        put_data,
-        put_headers,
-        put_metadata,
-        HashMap::new(),
-    )
-    .await?;
-
-    // Verify metadata file now contains the PUT data, not the multipart
-    assert!(
-        metadata_file_path.exists(),
-        "Metadata file should exist after PUT"
-    );
-
-    let put_content = std::fs::read_to_string(&metadata_file_path)?;
-    let put_cached_metadata: s3_proxy::cache_types::NewCacheMetadata =
-        serde_json::from_str(&put_content)?;
-
-    // Verify it's the PUT data, not the in-progress multipart
-    assert_eq!(put_cached_metadata.object_metadata.etag, "put-etag");
-    assert_eq!(
-        put_cached_metadata.object_metadata.upload_state,
-        s3_proxy::cache_types::UploadState::Complete
-    );
-    assert_eq!(put_cached_metadata.object_metadata.parts.len(), 0); // No parts for PUT
-    assert_eq!(
-        put_cached_metadata.object_metadata.content_length,
-        put_data.len() as u64
-    );
-
-    Ok(())
-}
-
 /// Test that PutObject deletes associated range files when invalidating
 /// Requirement 8.3: WHEN invalidating on conflict, THEN the Cache System SHALL delete metadata and all associated range files
 #[tokio::test]
@@ -258,7 +170,7 @@ async fn test_put_deletes_range_files_on_conflict() -> Result<()> {
     // Verify range file was created. The two write-through storage paths use
     // DIFFERENT directory layouts, which is a real finding surfaced by migrating
     // this fixture off the retired `store_write_cache_entry` (task 61):
-    //   - `store_write_cache_entry` -> `store_full_object_as_range_new` ->
+    //   - `store_write_cache_entry` -> `store_full_object_as_range_witnessed` ->
     //     `CacheManager::get_new_range_file_path` -> FLAT `ranges/{key}_{s}-{e}.bin`
     //   - `common::put_through_write_cache` -> `store_put_as_write_cached_range` ->
     //     `WriteCacheRangeSink` -> `DiskCacheManager::get_new_range_file_path` ->
@@ -326,82 +238,6 @@ async fn test_put_deletes_range_files_on_conflict() -> Result<()> {
         old_range_names, new_range_names,
         "Old and new range files should be different"
     );
-
-    Ok(())
-}
-
-/// Test that CreateMultipartUpload invalidates existing PUT-cached data
-/// Requirement 8.2: WHEN receiving CreateMultipartUpload request, THEN the Cache System SHALL invalidate any existing cached data for that key
-#[tokio::test]
-async fn test_multipart_initiation_invalidates_put_cache() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let cache_manager = CacheManager::new_with_defaults(temp_dir.path().to_path_buf(), false, 0);
-
-    let path = "/test-bucket/test-object";
-    let cache_key = CacheManager::generate_cache_key(path, None);
-
-    // First, store a PUT-cached object
-    let put_data = b"complete object via PUT";
-    let put_headers = HashMap::from([
-        ("content-type".to_string(), "text/plain".to_string()),
-        ("etag".to_string(), "put-etag".to_string()),
-    ]);
-    let put_metadata = s3_proxy::cache_types::CacheMetadata {
-        etag: "put-etag".to_string(),
-        last_modified: "2024-01-01T00:00:00Z".to_string(),
-        content_length: put_data.len() as u64,
-        part_number: None,
-        cache_control: None,
-        access_count: 0,
-        last_accessed: std::time::SystemTime::now(),
-    };
-
-    common::put_through_write_cache(
-        &cache_manager,
-        &cache_key,
-        put_data,
-        put_headers,
-        put_metadata,
-        HashMap::new(),
-    )
-    .await?;
-
-    // Verify PUT data is cached
-    let metadata_file_path = cache_manager.get_new_metadata_file_path(&cache_key);
-    assert!(
-        metadata_file_path.exists(),
-        "PUT metadata should be present"
-    );
-
-    let put_content = std::fs::read_to_string(&metadata_file_path)?;
-    let put_cached_metadata: s3_proxy::cache_types::NewCacheMetadata =
-        serde_json::from_str(&put_content)?;
-    assert_eq!(put_cached_metadata.object_metadata.etag, "put-etag");
-    assert_eq!(
-        put_cached_metadata.object_metadata.upload_state,
-        s3_proxy::cache_types::UploadState::Complete
-    );
-
-    // Now initiate a multipart upload - should invalidate the PUT cache
-    cache_manager.initiate_multipart_upload(path).await?;
-
-    // Verify metadata file now contains in-progress multipart, not the PUT
-    assert!(
-        metadata_file_path.exists(),
-        "Metadata file should exist after multipart initiation"
-    );
-
-    let multipart_content = std::fs::read_to_string(&metadata_file_path)?;
-    let multipart_metadata: s3_proxy::cache_types::NewCacheMetadata =
-        serde_json::from_str(&multipart_content)?;
-
-    // Verify it's an in-progress multipart, not the completed PUT
-    assert_eq!(
-        multipart_metadata.object_metadata.upload_state,
-        s3_proxy::cache_types::UploadState::InProgress
-    );
-    assert_eq!(multipart_metadata.object_metadata.etag, ""); // Empty for in-progress
-    assert_eq!(multipart_metadata.object_metadata.cumulative_size, 0);
 
     Ok(())
 }

@@ -5,14 +5,12 @@
 //! Includes per-key locking to prevent concurrent disk reads and stale file handle recovery.
 
 use crate::cache_types::NewCacheMetadata;
-use crate::{ProxyError, Result};
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Configuration for the MetadataCache
 #[derive(Debug, Clone)]
@@ -37,31 +35,28 @@ impl Default for MetadataCacheConfig {
 
 /// A single entry in the metadata cache
 #[derive(Debug, Clone)]
-pub struct MetadataCacheEntry {
+struct MetadataCacheEntry {
     /// The cached metadata
     pub metadata: NewCacheMetadata,
     /// When this entry was loaded from disk
     pub loaded_at: Instant,
-    /// Disk file modification time when loaded (for shared storage coherency)
-    pub disk_mtime: Option<SystemTime>,
     /// When this entry was last accessed in RAM
     pub last_accessed: Instant,
 }
 
 impl MetadataCacheEntry {
     /// Create a new cache entry
-    pub fn new(metadata: NewCacheMetadata, disk_mtime: Option<SystemTime>) -> Self {
+    pub fn new(metadata: NewCacheMetadata) -> Self {
         let now = Instant::now();
         Self {
             metadata,
             loaded_at: now,
-            disk_mtime,
             last_accessed: now,
         }
     }
 
     /// Check if this entry is stale based on refresh interval
-    pub fn is_stale(&self, refresh_interval: Duration) -> bool {
+    pub(crate) fn is_stale(&self, refresh_interval: Duration) -> bool {
         self.loaded_at.elapsed() >= refresh_interval
     }
 
@@ -73,7 +68,7 @@ impl MetadataCacheEntry {
 
 /// Metrics for the metadata cache
 #[derive(Debug, Default)]
-pub struct MetadataCacheMetrics {
+struct MetadataCacheMetrics {
     /// Number of cache hits (found in RAM, not stale) — GET path
     pub hits: AtomicU64,
     /// Number of cache misses (key not in RAM) — GET path
@@ -82,8 +77,8 @@ pub struct MetadataCacheMetrics {
     pub stale_refreshes: AtomicU64,
     /// Number of evictions
     pub evictions: AtomicU64,
-    // REMOVED: `stale_handle_errors`. Its one increment was in `load_with_retry`, reached only
-    // through `get_or_load`, which has no production caller, so it read `0` whatever the volume
+    // REMOVED: `stale_handle_errors`. Its one increment sat in a loader with no production
+    // caller, so it read `0` whatever the volume
     // did. Stale file handles are counted where they actually occur, in
     // `disk_cache::read_and_parse_metadata_blocking` — see
     // `crate::disk_cache::metadata_read_stale_handles_total`.
@@ -162,7 +157,7 @@ impl MetadataTtls {
     /// Deliberately `&&`, not `||`. If you are here because HEAD got slower for a
     /// `get_ttl: "0s"` key, that is the bug this predicate exists to prevent — read
     /// the type docs above rather than changing the operator.
-    pub fn forbids_admission(&self) -> bool {
+    pub(crate) fn forbids_admission(&self) -> bool {
         self.get_ttl.is_zero() && self.head_ttl.is_zero()
     }
 }
@@ -187,14 +182,14 @@ impl MetadataTtls {
 /// coarse proxy for "this entry is likely to be superseded soon", and a future refactor must
 /// not be justified on the grounds that it preserves a subset check.
 ///
-/// # This deliberately lives OUTSIDE `MetadataCache::put_with_mtime`
+/// # This deliberately lives OUTSIDE `MetadataCache::put`
 ///
 /// Moving it inside, beside [`MetadataTtls::forbids_admission`], is the obvious refactor and
 /// `ram-tier-effectiveness` task 6 weighed it. Three reasons it did not land:
 ///
 /// - **`ram-tier-effectiveness:R1.8` asks for its guard first.** The size-accounting and
 ///   eviction test owed by R3.10c fills the tier with HEAD-only entries and asserts eviction;
-///   inside `put_with_mtime` this predicate would refuse those entries outright, so that
+///   inside `put` this predicate would refuse those entries outright, so that
 ///   fixture could not be built and the guard the spec wants *before* the refactor could never
 ///   be written.
 /// - **An existing test depends on admitting a ranges-free document directly**, to seed a known
@@ -202,11 +197,11 @@ impl MetadataTtls {
 ///   (`tests/page_aligned_range_widening_test.rs`). That is a legitimate use of the tier by a
 ///   caller that is not a cache-coherency consumer, and a chokepoint cannot distinguish it.
 /// - **Census row 4 declines by a different mechanism** —
-///   `CacheManager::store_head_cache_entry_unified`'s `create_head_only_metadata` arm yields
+///   `CacheManager::store_head_cache_entry_unified_witnessed`'s `create_head_only_metadata` arm yields
 ///   `None` so no `put` is reached at all — and a chokepoint would make that arm read as
 ///   redundant when it is not.
 ///
-/// **So the default for a new caller of `put`/`put_with_mtime` is UNGUARDED.** That is the cost
+/// **So the default for a new caller of `put` is UNGUARDED.** That is the cost
 /// of this choice, stated rather than hidden: a comment cannot enforce a contract a future
 /// caller can omit. What this function buys instead is that the rule exists **once** and every
 /// site that applies it is findable:
@@ -258,22 +253,22 @@ impl MetadataCache {
         }
     }
     /// Check if the cache is enabled
-    pub fn is_enabled(&self) -> bool {
+    pub(crate) fn is_enabled(&self) -> bool {
         self.config.enabled
     }
 
     /// Record a disk hit (RAM miss but found on disk) — GET path
-    pub fn record_disk_hit(&self) {
+    pub(crate) fn record_disk_hit(&self) {
         self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a HEAD RAM hit
-    pub fn record_head_hit(&self) {
+    pub(crate) fn record_head_hit(&self) {
         self.metrics.head_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a HEAD RAM miss (reached disk lookup)
-    pub fn record_head_miss(&self) {
+    pub(crate) fn record_head_miss(&self) {
         self.metrics.head_misses.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -335,19 +330,12 @@ impl MetadataCache {
         None
     }
 
-    /// Store metadata in cache
+    /// Store metadata in the cache.
     ///
-    /// If cache is at capacity, evicts the least recently used entry.
+    /// If the cache is at capacity, evicts the least recently used entry.
     ///
-    /// `ttls` are the key's **resolved** TTLs — see [`MetadataTtls`] for why both are
+    /// `ttls` are the key's **resolved** TTLs; see [`MetadataTtls`] for why both are
     /// required and why admission is refused only when both are zero.
-    pub async fn put(&self, cache_key: &str, metadata: NewCacheMetadata, ttls: MetadataTtls) {
-        self.put_with_mtime(cache_key, metadata, None, ttls).await;
-    }
-
-    /// Store metadata in cache with disk modification time
-    ///
-    /// The disk_mtime is used for shared storage coherency checks.
     ///
     /// # The prior decision this changes, and why its justification no longer holds
     ///
@@ -389,13 +377,7 @@ impl MetadataCache {
     /// The control is the lookup-side gate. See
     /// `CacheManager::get_range_from_ram_cache_hit`, which takes the resolved
     /// `get_ttl` as a required parameter.
-    pub async fn put_with_mtime(
-        &self,
-        cache_key: &str,
-        metadata: NewCacheMetadata,
-        disk_mtime: Option<SystemTime>,
-        ttls: MetadataTtls,
-    ) {
+    pub async fn put(&self, cache_key: &str, metadata: NewCacheMetadata, ttls: MetadataTtls) {
         if !self.config.enabled {
             return;
         }
@@ -433,7 +415,7 @@ impl MetadataCache {
         }
 
         // Insert new entry
-        let entry = MetadataCacheEntry::new(metadata, disk_mtime);
+        let entry = MetadataCacheEntry::new(metadata);
         entries.insert(cache_key.to_string(), entry);
         lru_order.push_back(cache_key.to_string());
 
@@ -458,140 +440,6 @@ impl MetadataCache {
                 "MetadataCache invalidated entry"
             );
         }
-    }
-
-    /// Check if an entry is stale
-    pub async fn is_stale(&self, cache_key: &str) -> bool {
-        let entries = self.entries.read().await;
-        match entries.get(cache_key) {
-            Some(entry) => entry.is_stale(self.config.refresh_interval),
-            None => true, // Missing entries are considered stale
-        }
-    }
-
-    /// Get or load metadata with per-key locking
-    ///
-    /// This method ensures that only one disk read occurs for a given cache_key,
-    /// even if multiple concurrent requests arrive for the same key.
-    ///
-    /// The loader function is called only if:
-    /// - Entry doesn't exist in cache, OR
-    /// - Entry is stale
-    ///
-    /// Includes stale file handle recovery with retry logic.
-    ///
-    /// `ttls` is threaded through purely so the admission gate in `put_with_mtime`
-    /// applies here too. This function has NO production caller — its only caller
-    /// repo-wide is its own test (established 2026-09-01, searching `src/`, `tests/`
-    /// and `examples/` separately) — so the parameter is a compile-time guard against
-    /// a future production caller bypassing the gate, not a live path.
-    pub async fn get_or_load<F, Fut>(
-        &self,
-        cache_key: &str,
-        loader: F,
-        ttls: MetadataTtls,
-    ) -> Result<NewCacheMetadata>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(NewCacheMetadata, Option<SystemTime>)>>,
-    {
-        if !self.config.enabled {
-            // Cache disabled, just call the loader
-            let (metadata, _mtime) = loader().await?;
-            return Ok(metadata);
-        }
-
-        // First, try to get from cache
-        if let Some(metadata) = self.get(cache_key).await {
-            return Ok(metadata);
-        }
-
-        // Need to load from disk - acquire per-key lock
-        let lock = self.get_or_create_pending_lock(cache_key).await;
-        let _guard = lock.lock().await;
-
-        // Double-check after acquiring lock (another request may have loaded it)
-        if let Some(metadata) = self.get(cache_key).await {
-            return Ok(metadata);
-        }
-
-        // Load from disk with stale handle retry
-        let result = self.load_with_retry(cache_key, loader, ttls).await?;
-
-        // Clean up pending lock
-        self.remove_pending_lock(cache_key).await;
-
-        Ok(result)
-    }
-
-    /// Load metadata with stale file handle retry logic
-    async fn load_with_retry<F, Fut>(
-        &self,
-        cache_key: &str,
-        loader: F,
-        ttls: MetadataTtls,
-    ) -> Result<NewCacheMetadata>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(NewCacheMetadata, Option<SystemTime>)>>,
-    {
-        // For the initial load, we just call the loader once
-        // Retry logic is handled by wrapping the loader in a retry loop
-        match loader().await {
-            Ok((metadata, disk_mtime)) => {
-                // Census row 9, and a CONTRACT PIN rather than a fix: `get_or_load` has no
-                // production caller — its only caller repo-wide is this module's own
-                // `#[cfg(test)]` block — so nothing in the shipped binary reaches this line and
-                // no live masking is being closed here. The guard exists so that whatever
-                // revives `get_or_load` inherits the rule instead of rediscovering it, at the
-                // severity zero production callers support. `ram-tier-effectiveness:R1.6`.
-                if ram_admission_permitted(&metadata) {
-                    self.put_with_mtime(cache_key, metadata.clone(), disk_mtime, ttls)
-                        .await;
-                }
-                Ok(metadata)
-            }
-            Err(e) => {
-                if Self::is_stale_file_handle(&e) {
-                    warn!(
-                        cache_key = %cache_key,
-                        error = %e,
-                        "Stale file handle error during metadata load"
-                    );
-                }
-                Err(e)
-            }
-        }
-    }
-    /// Check if an error is a stale file handle error (ESTALE)
-    fn is_stale_file_handle(error: &ProxyError) -> bool {
-        match error {
-            ProxyError::IoError(msg) => {
-                // Check for ESTALE (error code 116 on Linux)
-                msg.contains("stale file handle")
-                    || msg.contains("ESTALE")
-                    || msg.contains("os error 116")
-            }
-            ProxyError::CacheError(msg) => {
-                msg.contains("stale file handle") || msg.contains("ESTALE")
-            }
-            _ => false,
-        }
-    }
-
-    /// Get or create a per-key lock for preventing concurrent disk reads
-    async fn get_or_create_pending_lock(&self, cache_key: &str) -> Arc<Mutex<()>> {
-        let mut pending = self.pending_reads.write().await;
-        pending
-            .entry(cache_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    /// Remove a per-key lock after loading is complete
-    async fn remove_pending_lock(&self, cache_key: &str) {
-        let mut pending = self.pending_reads.write().await;
-        pending.remove(cache_key);
     }
 
     /// Update LRU order for a cache key (move to back = most recently used)
@@ -682,24 +530,8 @@ mod tests {
         }
     }
 
-    /// `create_test_metadata` with one range, i.e. a document
-    /// [`ram_admission_permitted`] accepts. Needed by any test whose subject is what the
-    /// tier does with an entry it has **admitted** — `create_test_metadata` builds
-    /// `ranges: Vec::new()`, and the sites that apply the ranges rule refuse that.
-    fn ranges_bearing_test_metadata(cache_key: &str) -> NewCacheMetadata {
-        let mut metadata = create_test_metadata(cache_key);
-        metadata.ranges.push(crate::cache_types::RangeSpec::new(
-            0,
-            1023,
-            format!("{}_0-1023.bin", cache_key),
-            crate::compression::CompressionAlgorithm::Lz4,
-            1024,
-            1024,
-        ));
-        metadata
-    }
     fn create_test_metadata(cache_key: &str) -> NewCacheMetadata {
-        let now = SystemTime::now();
+        let now = std::time::SystemTime::now();
         NewCacheMetadata {
             cache_key: cache_key.to_string(),
             object_metadata: ObjectMetadata::new(
@@ -831,79 +663,6 @@ mod tests {
         assert!(cache.peek(key).await.is_some());
     }
 
-    /// Test concurrent get_or_load ensures single disk read
-    ///
-    /// The loader returns a **ranges-bearing** document, and that is load-bearing rather
-    /// than incidental.
-    ///
-    /// `ram-tier-effectiveness:R1.6` added the ranges rule to `load_with_retry`, so a
-    /// rangeless document is no longer admitted — and coalescing here is *implemented by*
-    /// admission: the post-lock double-check calls `get`, so if the first loader's result
-    /// was refused, every waiting caller misses and loads too. With
-    /// `create_test_metadata`'s rangeless document this test therefore measured 10 loads
-    /// rather than 1. That consequence is real and applies to whatever revives
-    /// `get_or_load` (which has no production caller today); it is recorded in
-    /// the investigation record. The subject here is
-    /// coalescing, so the fixture is the admitted case.
-    #[tokio::test]
-    async fn test_concurrent_get_or_load() {
-        use std::sync::atomic::AtomicUsize;
-
-        let config = MetadataCacheConfig {
-            enabled: true,
-            refresh_interval: Duration::from_secs(60),
-            max_entries: 100,
-        };
-        let cache = Arc::new(MetadataCache::new(config));
-
-        let key = "concurrent-test-key";
-        let load_count = Arc::new(AtomicUsize::new(0));
-
-        // Spawn multiple concurrent requests for the same key
-        let mut handles = Vec::new();
-        for _ in 0..10 {
-            let cache_clone = cache.clone();
-            let load_count_clone = load_count.clone();
-            let key_clone = key.to_string();
-
-            handles.push(tokio::spawn(async move {
-                cache_clone
-                    .get_or_load(
-                        &key_clone,
-                        || {
-                            let load_count = load_count_clone.clone();
-                            let key = key_clone.clone();
-                            async move {
-                                // Simulate disk read delay
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                                load_count.fetch_add(1, Ordering::SeqCst);
-                                Ok((ranges_bearing_test_metadata(&key), None))
-                            }
-                        },
-                        generous_ttls(),
-                    )
-                    .await
-            }));
-        }
-
-        // Wait for all requests to complete
-        for handle in handles {
-            let result = handle.await.unwrap();
-            assert!(result.is_ok());
-        }
-
-        // Verify only one disk read occurred
-        let actual_loads = load_count.load(Ordering::SeqCst);
-        assert_eq!(
-            actual_loads, 1,
-            "Expected exactly 1 disk read, got {}",
-            actual_loads
-        );
-
-        // Verify entry is in cache
-        assert!(cache.get(key).await.is_some());
-    }
-
     /// Test disabled cache behavior
     #[tokio::test]
     async fn test_disabled_cache() {
@@ -996,7 +755,7 @@ mod tests {
 
         // And the same four corners through the real admission path, so the predicate
         // is shown to be WIRED rather than merely correct — a unit test on the
-        // predicate alone would pass with the check absent from `put_with_mtime`.
+        // predicate alone would pass with the check absent from `put`.
         let cache = MetadataCache::new(MetadataCacheConfig::default());
         for (i, (g, h, expect_present)) in [
             (zero, zero, false),
@@ -1021,7 +780,7 @@ mod tests {
             assert_eq!(
                 cache.peek(&key).await.is_some(),
                 *expect_present,
-                "put_with_mtime admission for get_ttl={:?} head_ttl={:?}",
+                "put admission for get_ttl={:?} head_ttl={:?}",
                 g,
                 h
             );
@@ -1032,11 +791,11 @@ mod tests {
     ///
     /// Two corners, and the negative one is the rule: an empty `ranges` array must be
     /// refused. This asserts the predicate only — it deliberately does NOT assert that
-    /// `put_with_mtime` applies it, because it does not and must not (see
+    /// `put` applies it, because it does not and must not (see
     /// `ram_admission_permitted`'s own docs for why the check is per-site). The wiring at
     /// each of the eight call sites is asserted from
-    /// `tests/ram_metadata_admission_unification_test.rs` and
-    /// `tests/ram_metadata_masking_regression_test.rs`, which drive the production
+    /// `src/cache/moved_fill_tests/ram_metadata_admission_unification_test.rs` and
+    /// `src/cache/moved_fill_tests/ram_metadata_masking_regression_test.rs`, which drive the production
     /// functions and read residency.
     #[test]
     fn ram_admission_requires_at_least_one_range() {

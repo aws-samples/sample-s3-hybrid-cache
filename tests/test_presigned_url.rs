@@ -332,7 +332,6 @@ fn expired_presigned_url_reports_is_expired() {
     };
 
     assert!(info.is_expired());
-    assert!(info.time_until_expiration().is_none());
     assert!(info.time_since_expiration().is_some());
 }
 
@@ -351,7 +350,6 @@ fn valid_presigned_url_reports_not_expired() {
     };
 
     assert!(!info.is_expired());
-    assert!(info.time_until_expiration().is_some());
     assert!(info.time_since_expiration().is_none());
 }
 

@@ -184,7 +184,7 @@ async fn test_validation_metadata_persistence() {
 
     // Write validation metadata
     tracker
-        .write_validation_metadata(
+        .write_validation_metadata_with_write_cache(
             1000000, // scanned_size
             1000500, // tracked_size
             -500,    // drift
@@ -193,6 +193,9 @@ async fn test_validation_metadata_persistence() {
             5,     // cache_expired
             1,     // cache_skipped
             0,     // cache_errors
+            0,
+            0,
+            0,
         )
         .await
         .unwrap();
@@ -206,70 +209,6 @@ async fn test_validation_metadata_persistence() {
     assert_eq!(metadata.scan_duration_ms, 120000);
     assert_eq!(metadata.cache_entries_expired, 5);
     assert_eq!(metadata.cache_entries_skipped, 1);
-}
-
-#[tokio::test]
-async fn test_actively_remove_cached_data_flag_behavior() {
-    let temp_dir = TempDir::new().unwrap();
-    let cache_dir = temp_dir.path().to_path_buf();
-
-    // Test with flag disabled
-    {
-        let cache_manager = Arc::new(CacheManager::new_with_all_ttls(
-            cache_dir.clone(),
-            false,
-            0,
-            s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
-            1024,
-            true,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-            false, // actively_remove_cached_data = false
-        ));
-
-        // Initialize the disk cache manager FIRST - this creates the consolidator
-        let _disk_cache = cache_manager.create_configured_disk_cache_manager();
-
-        // Now initialize the cache manager (which requires the consolidator to exist)
-        cache_manager.initialize().await.unwrap();
-
-        cache_manager.set_cache_manager_in_tracker().await;
-
-        let tracker = cache_manager.get_size_tracker().await.unwrap();
-        assert!(!tracker.is_active_expiration_enabled());
-
-        // coordinate_cleanup should return 0 immediately
-        let cleaned = cache_manager.coordinate_cleanup().await.unwrap();
-        assert_eq!(cleaned, 0, "Should not clean when flag is false");
-    }
-
-    // Test with flag enabled
-    {
-        let cache_manager = Arc::new(CacheManager::new_with_all_ttls(
-            cache_dir.clone(),
-            false,
-            0,
-            s3_proxy::cache::CacheEvictionAlgorithm::TinyLFU,
-            1024,
-            true,
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-            true, // actively_remove_cached_data = true
-        ));
-
-        // Initialize the disk cache manager FIRST - this creates the consolidator
-        let _disk_cache = cache_manager.create_configured_disk_cache_manager();
-
-        // Now initialize the cache manager (which requires the consolidator to exist)
-        cache_manager.initialize().await.unwrap();
-
-        cache_manager.set_cache_manager_in_tracker().await;
-
-        let tracker = cache_manager.get_size_tracker().await.unwrap();
-        assert!(tracker.is_active_expiration_enabled());
-    }
 }
 
 #[tokio::test]
@@ -782,7 +721,7 @@ async fn test_validation_scan_corrects_drift() {
     let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
     // Manually set an incorrect size (simulating drift)
-    // We'll use update_size_from_validation to correct it
+    // We'll use update_size_from_validation_with_kind to correct it
     let _incorrect_size = 10000;
     let correct_size = 5000;
 
@@ -791,7 +730,12 @@ async fn test_validation_scan_corrects_drift() {
 
     // Update size from validation (simulating what CacheSizeTracker does after a scan)
     consolidator
-        .update_size_from_validation(correct_size, Some(500), None)
+        .update_size_from_validation_with_kind(
+            correct_size,
+            Some(500),
+            None,
+            s3_proxy::cache_size_tracker::ValidationSampleKind::FullScan,
+        )
         .await;
 
     // Verify size was corrected

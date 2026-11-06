@@ -43,7 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
 
 /// The log's file name inside the configured directory.
-pub const LOG_FILE_NAME: &str = "pending-stamps.log";
+pub(crate) const LOG_FILE_NAME: &str = "pending-stamps.log";
 const TMP_FILE_NAME: &str = "pending-stamps.log.tmp";
 const LOCK_FILE_NAME: &str = "pending-stamps.lock";
 /// Fewest `landed` records that trigger a rewrite while keys are still pending.

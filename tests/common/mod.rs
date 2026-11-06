@@ -611,6 +611,37 @@ impl S3ClientApi for StubS3Client {
     }
 }
 
+/// Folds the key's journal entries into its `.meta`, as the consolidation cycle does, so the
+/// fill is visible to a `.meta` read at once.
+pub async fn consolidate(
+    cache_manager: &s3_proxy::cache::CacheManager,
+    cache_key: &str,
+) -> Result<()> {
+    if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
+        consolidator.consolidate_object(cache_key).await?;
+    }
+    Ok(())
+}
+
+/// Writes a `NewCacheMetadata` as the key's `.meta` document, creating its directory. It
+/// takes no slot lock and journals nothing, so it is for single-threaded fixtures.
+pub trait SeedMetadata {
+    fn seed_metadata(&self, metadata: &s3_proxy::cache_types::NewCacheMetadata);
+}
+
+impl SeedMetadata for s3_proxy::disk_cache::DiskCacheManager {
+    fn seed_metadata(&self, metadata: &s3_proxy::cache_types::NewCacheMetadata) {
+        let path = self.get_new_metadata_file_path(&metadata.cache_key);
+        std::fs::create_dir_all(path.parent().expect("a .meta path has a parent"))
+            .expect("create the metadata directory");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(metadata).expect("serialize the metadata"),
+        )
+        .expect("write the .meta document");
+    }
+}
+
 /// Placeholder helper that returns `None` — the stub harness does not need
 /// TLS to reach real S3. Present because Task 0 explicitly requests it;
 /// later tests that stand up a real `TlsProxyListener` can swap in a concrete
@@ -691,7 +722,7 @@ pub fn seed_validation_metadata(cache_dir: &std::path::Path) {
 ///
 /// `CacheManager::store_write_cache_entry` was the production write-through entry
 /// point once — the unified range write cache feature records rewiring it
-/// onto `store_full_object_as_range` — and production later moved to
+/// onto `store_full_object_as_range_witnessed` — and production later moved to
 /// `SignedPutHandler` without the tests following, so most of the write-cache suite
 /// asserted things about a path customers never took. **It has since been deleted**
 /// (task 61 of `write-cache-accounting-and-eviction`, 2026-08-26): every `tests/`
@@ -702,7 +733,7 @@ pub fn seed_validation_metadata(cache_dir: &std::path::Path) {
 /// | | Production (`SignedPutHandler`) | Retired `store_write_cache_entry` |
 /// |---|---|---|
 /// | Pre-store invalidation | `invalidate_cache_unified_for_operation` → `invalidate_cache_hierarchy` (ranges, `.meta`, RAM, multipart fields, granular range keys) | its own inline loop (ranges + `.meta` only) |
-/// | Store | `store_put_as_write_cached_range` → sink → `store_new_metadata` + `credit_staged_range` | `store_full_object_as_range_new` |
+/// | Store | `store_put_as_write_cached_range` → sink → `store_new_metadata` + `credit_staged_range` | `store_full_object_as_range_witnessed` |
 /// | Range file layout | `DiskCacheManager::get_new_range_file_path` — **sharded** (`ranges/{bucket}/{XX}/{YYY}/...`) | `CacheManager::get_new_range_file_path` — **flat** (`ranges/{key}_{s}-{e}.bin`) |
 /// | Size accounting | credits and debits | **neither** |
 ///
@@ -755,4 +786,68 @@ pub async fn put_through_write_cache(
             response_headers,
         )
         .await
+}
+
+/// An object read back from the disk tier by [`StoredObjectRead::read_stored_object`].
+#[derive(Debug, Clone)]
+pub struct StoredObject {
+    pub cache_key: String,
+    pub body: Option<Vec<u8>>,
+    pub metadata: s3_proxy::cache_types::CacheMetadata,
+    pub expires_at: std::time::SystemTime,
+}
+
+/// Reads a stored object back through the APIs the proxy uses.
+#[allow(async_fn_in_trait)]
+pub trait StoredObjectRead {
+    /// Read a stored object back from the disk tier through the APIs the proxy uses: the
+    /// `.meta` (`CacheManager::get_metadata_from_disk`) and the range files
+    /// (`DiskCacheManager::load_range_data`). The returned entry is the object's full body,
+    /// or `None` for a missing, expired, or partially cached object. Nothing here touches
+    /// the RAM tier.
+    async fn read_stored_object(&self, cache_key: &str) -> s3_proxy::Result<Option<StoredObject>>;
+}
+
+impl StoredObjectRead for s3_proxy::cache::CacheManager {
+    async fn read_stored_object(&self, cache_key: &str) -> s3_proxy::Result<Option<StoredObject>> {
+        let Some(meta) = self.get_metadata_from_disk(cache_key).await? else {
+            return Ok(None);
+        };
+        if std::time::SystemTime::now() > meta.expires_at {
+            return Ok(None);
+        }
+        let content_length = meta.object_metadata.content_length;
+        let disk = self.create_configured_disk_cache_manager();
+        let mut ranges = meta.ranges.clone();
+        ranges.sort_by_key(|r| r.start);
+        let mut body = Vec::new();
+        for range in &ranges {
+            match disk.load_range_data(range).await {
+                Ok(data) => body.extend_from_slice(&data),
+                Err(_) => return Ok(None),
+            }
+        }
+        if body.len() as u64 != content_length {
+            return Ok(None);
+        }
+        let first = ranges.first();
+        Ok(Some(StoredObject {
+            cache_key: cache_key.to_string(),
+            body: Some(body),
+            metadata: s3_proxy::cache_types::CacheMetadata {
+                etag: meta.object_metadata.etag.clone(),
+                last_modified: meta.object_metadata.last_modified.clone(),
+                content_length,
+                part_number: None,
+                cache_control: meta
+                    .object_metadata
+                    .response_headers
+                    .get("cache-control")
+                    .cloned(),
+                access_count: first.map_or(0, |r| r.access_count),
+                last_accessed: first.map_or_else(std::time::SystemTime::now, |r| r.last_accessed),
+            },
+            expires_at: meta.expires_at,
+        }))
+    }
 }

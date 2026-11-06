@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
 /// Red-side lever (a): restore the whole-file read-modify-write append (read the
 /// journal, write `.journal.tmp`, rename over it).
@@ -230,13 +230,13 @@ fn scan_lines_for_key(
 /// Where discovery found one key's journal lines, file by file. Built by the consolidator's
 /// discovery pass and read by [`JournalManager::get_entries_at_offsets`] under the key's lock.
 #[derive(Debug, Clone, Default)]
-pub struct KeyLines {
+pub(crate) struct KeyLines {
     pub files: Vec<FileLines>,
 }
 
 /// One journal file's share of a [`KeyLines`].
 #[derive(Debug, Clone)]
-pub struct FileLines {
+pub(crate) struct FileLines {
     /// Shared by every key with lines in the file: one allocation per file per cycle.
     pub path: Arc<Path>,
     /// (device, inode) when discovery opened the file.
@@ -598,286 +598,19 @@ pub enum JournalOperation {
 pub struct JournalManager {
     cache_dir: PathBuf,
     instance_id: String,
-    cleanup_integration: Option<Arc<MultipartCleanupIntegration>>,
     /// Mutex to serialize journal append operations within this instance.
     /// Prevents concurrent appends from overwriting each other (Bug 4 fix).
     append_mutex: Mutex<()>,
 }
 
-/// Integration with multipart upload cleanup system
-pub struct MultipartCleanupIntegration {
-    cache_dir: PathBuf,
-}
-
-impl MultipartCleanupIntegration {
-    /// Create a new multipart cleanup integration
-    pub fn new(cache_dir: PathBuf) -> Self {
-        Self { cache_dir }
-    }
-
-    /// Clean up journal entries for a specific cache key during multipart upload cleanup
-    pub(crate) async fn cleanup_journal_entries_for_cache_key(
-        &self,
-        cache_key: &str,
-    ) -> Result<u64> {
-        debug!(
-            "Starting journal cleanup for multipart upload: cache_key={}",
-            cache_key
-        );
-
-        let mut removed_count = 0;
-        let journals_dir = self.cache_dir.join("metadata").join("_journals");
-
-        if !journals_dir.exists() {
-            debug!(
-                "No journal directory exists during cleanup: cache_key={}",
-                cache_key
-            );
-            return Ok(0);
-        }
-
-        // Find all per-instance journal files in the flat _journals directory
-        let entries = match std::fs::read_dir(&journals_dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(
-                    "Failed to read journal directory during cleanup: cache_key={}, error={}",
-                    cache_key, e
-                );
-                return Ok(0);
-            }
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        "Failed to read journal directory entry: cache_key={}, error={}",
-                        cache_key, e
-                    );
-                    continue;
-                }
-            };
-
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            // Check if this is a per-instance journal file
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if file_name.ends_with(".journal") {
-                    // Remove journal entries for this cache key from this instance journal file
-                    match self
-                        .remove_entries_from_journal_file(&path, cache_key)
-                        .await
-                    {
-                        Ok(count) => {
-                            removed_count += count;
-                            if count > 0 {
-                                debug!(
-                                    "Removed {} journal entries from instance journal: cache_key={}, file={:?}",
-                                    count, cache_key, path
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to remove journal entries from instance journal: cache_key={}, file={:?}, error={}",
-                                cache_key, path, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        info!(
-            "Completed journal cleanup for multipart upload: cache_key={}, removed_entries={}",
-            cache_key, removed_count
-        );
-
-        Ok(removed_count)
-    }
-
-    /// Remove entries for a specific cache key from a journal file.
-    ///
-    /// Reachable only from [`JournalManager::cleanup_for_multipart`], which nothing in the
-    /// production request path calls; it is kept for the tests that drive it. It still obeys
-    /// the journal protocol: the read, filter and rewrite happen under the journal's
-    /// `.journal.lock` (blocking, off the runtime), and the rewrite is a temp file renamed
-    /// over the journal, so an append holding the lock is never overwritten and a crash
-    /// never leaves a half-written journal. Lines are kept verbatim, including ones this
-    /// build cannot parse.
-    async fn remove_entries_from_journal_file(
-        &self,
-        journal_path: &Path,
-        cache_key: &str,
-    ) -> Result<u64> {
-        let path = journal_path.to_path_buf();
-        let key = cache_key.to_string();
-        tokio::task::spawn_blocking(move || Ok(remove_entries_under_lock(&path, &key)))
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Journal rewrite task failed: {}", e)))?
-    }
-}
-
-/// The body of [`MultipartCleanupIntegration::remove_entries_from_journal_file`], run on a
-/// blocking thread while it holds the journal's flock. Returns the number of lines removed;
-/// every failure is logged and counts as zero, as before.
-fn remove_entries_under_lock(journal_path: &Path, cache_key: &str) -> u64 {
-    if !journal_path.exists() {
-        return 0;
-    }
-    let lock_path = journal_path.with_extension("journal.lock");
-    let _lock = match lock_journal_lock_file(&lock_path, true) {
-        Ok(Some(f)) => f,
-        Ok(None) => {
-            debug!(
-                "Journal lock kept being unlinked during cleanup: file={:?}",
-                journal_path
-            );
-            return 0;
-        }
-        Err(e) => {
-            debug!(
-                "Failed to lock journal file during cleanup: file={:?}, error={}",
-                journal_path, e
-            );
-            return 0;
-        }
-    };
-
-    // Read under the lock, so no append can land between this read and the rename below.
-    let content = match std::fs::read_to_string(journal_path) {
-        Ok(c) => c,
-        Err(e) => {
-            // Stale file handle and other transient errors are expected on shared storage
-            debug!(
-                "Failed to read journal file during cleanup: file={:?}, error={}",
-                journal_path, e
-            );
-            return 0;
-        }
-    };
-
-    let mut kept = String::with_capacity(content.len());
-    let mut removed = 0u64;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JournalEntry>(line) {
-            Ok(entry) if entry.cache_key == cache_key => removed += 1,
-            Ok(_) => {
-                kept.push_str(line);
-                kept.push('\n');
-            }
-            Err(e) => {
-                // Kept verbatim: a newer build's entry, or a torn tail.
-                debug!(
-                    "Unparseable journal line kept during cleanup: file={:?}, error={}",
-                    journal_path, e
-                );
-                kept.push_str(line);
-                kept.push('\n');
-            }
-        }
-    }
-    if removed == 0 {
-        return 0;
-    }
-
-    let is_fresh_journal = journal_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(crate::eviction_worklist::is_fresh_journal_name);
-    if kept.is_empty() && is_fresh_journal {
-        // A fresh journal is never appended to again; remove it outright.
-        if let Err(e) = std::fs::remove_file(journal_path) {
-            warn!(
-                "Failed to remove empty journal file: file={:?}, error={}",
-                journal_path, e
-            );
-        }
-        return removed;
-    }
-
-    if kept.is_empty() {
-        // Truncate the emptied primary in place and keep it, so the lock file never outlives
-        // its journal and its instance stays in the readiness roster. Appenders write only
-        // under the lock held here, so no append lands between the read above and this
-        // truncate. No `.journal.tmp` is created: a peer's orphan evidence reads one as
-        // indeterminate.
-        let truncate = (|| -> std::io::Result<()> {
-            let f = std::fs::OpenOptions::new().write(true).open(journal_path)?;
-            f.set_len(0)?;
-            f.sync_all()
-        })();
-        if let Err(e) = truncate {
-            warn!(
-                "Failed to truncate emptied journal file: file={:?}, error={}",
-                journal_path, e
-            );
-        }
-        return removed;
-    }
-    // Primary journals are kept so the lock file never outlives its journal.
-    let tmp_path = journal_path.with_extension("journal.tmp");
-    let rewrite = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(kept.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp_path, journal_path)
-    })();
-    if let Err(e) = rewrite {
-        crate::disk_cache::note_disk_full(&e, "journal.rewrite");
-        warn!(
-            "Failed to write filtered journal file: file={:?}, error={}",
-            journal_path, e
-        );
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    removed
-}
-
 impl JournalManager {
     /// Create a new journal manager
     pub fn new(cache_dir: PathBuf, instance_id: String) -> Self {
-        let cleanup_integration = Some(Arc::new(MultipartCleanupIntegration::new(
-            cache_dir.clone(),
-        )));
-
         Self {
             cache_dir,
             instance_id,
-            cleanup_integration,
             append_mutex: Mutex::new(()),
         }
-    }
-
-    /// Get journal file path for this instance (single per-instance journal)
-    ///
-    /// All journal entries from this instance go to a single file:
-    /// `metadata/_journals/{instance_id}.journal`
-    ///
-    /// This matches the format used by CacheHitUpdateBuffer and simplifies
-    /// journal consolidation by avoiding per-object journal files.
-    pub(crate) fn get_journal_path(&self, _cache_key: &str) -> Result<PathBuf> {
-        let journal_path = self
-            .cache_dir
-            .join("metadata")
-            .join("_journals")
-            .join(format!("{}.journal", self.instance_id));
-
-        debug!(
-            "Journal path constructed: instance_id={}, path={:?}",
-            self.instance_id, journal_path
-        );
-
-        Ok(journal_path)
     }
 
     /// Append complete, newline-terminated `lines` to the primary journal at `journal_path`.
@@ -1152,49 +885,6 @@ impl JournalManager {
         Ok(())
     }
 
-    /// Get all pending journal entries for a cache key
-    pub async fn get_pending_entries(&self, cache_key: &str) -> Result<Vec<JournalEntry>> {
-        let journal_path = self.get_journal_path(cache_key)?;
-
-        if !journal_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content = tokio::fs::read_to_string(&journal_path)
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Failed to read journal file: {}", e)))?;
-
-        let mut entries = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<JournalEntry>(line) {
-                Ok(entry) => {
-                    if entry.cache_key == cache_key {
-                        entries.push(entry);
-                    }
-                }
-                Err(e) => {
-                    // Parse errors can occur during concurrent writes on shared storage
-                    debug!(
-                        "Failed to parse journal entry: cache_key={}, line={}, error={}",
-                        cache_key, line, e
-                    );
-                }
-            }
-        }
-
-        debug!(
-            "Retrieved {} pending journal entries: cache_key={}, path={:?}",
-            entries.len(),
-            cache_key,
-            journal_path
-        );
-
-        Ok(entries)
-    }
-
     /// Find all per-instance journal files that may contain entries for a cache key
     ///
     /// Since we now use per-instance journals (not per-object), this returns all
@@ -1237,21 +927,6 @@ impl JournalManager {
         );
 
         Ok(journal_files)
-    }
-
-    /// Clean up journal entries for a multipart upload
-    pub async fn cleanup_for_multipart(&self, cache_key: &str) -> Result<()> {
-        if let Some(cleanup_integration) = &self.cleanup_integration {
-            cleanup_integration
-                .cleanup_journal_entries_for_cache_key(cache_key)
-                .await?;
-        } else {
-            warn!(
-                "No cleanup integration available for journal cleanup: cache_key={}",
-                cache_key
-            );
-        }
-        Ok(())
     }
 
     /// Get all journal entries from all instances for a cache key
@@ -2028,7 +1703,11 @@ mod tests {
         let jm = JournalManager::new(temp.path().to_path_buf(), "case61".to_string());
         let key = "bkt/case61/in-place";
         jm.append_range_entry(key, entry_a(key, 0)).await.unwrap();
-        let path = jm.get_journal_path(key).unwrap();
+        let path = jm
+            .cache_dir
+            .join("metadata")
+            .join("_journals")
+            .join(format!("{}.journal", jm.instance_id));
         let ino = std::fs::metadata(&path).unwrap().ino();
         for i in 1..200u64 {
             let entry = entry_a(key, i * 100);
@@ -2045,54 +1724,10 @@ mod tests {
             assert_eq!(meta.len(), before + line_len, "append {} length", i);
         }
         assert!(!path.with_extension("journal.tmp").exists());
-        assert_eq!(jm.get_pending_entries(key).await.unwrap().len(), 200);
-    }
-
-    /// The multipart rewrite waits for an appender holding `.journal.lock`, then reads the
-    /// journal including that append, so the appended line survives the rewrite. Before
-    /// the rewrite took no lock and a `tokio::fs::write` could overwrite the append.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn multipart_rewrite_racing_an_append_loses_no_line() {
-        let temp = TempDir::new().unwrap();
-        let jm = JournalManager::new(temp.path().to_path_buf(), "case38".to_string());
-        let gone = "bkt/case38/gone";
-        let kept = "bkt/case38/kept";
-        jm.append_range_entry(gone, entry_a(gone, 0)).await.unwrap();
-        let path = jm.get_journal_path(gone).unwrap();
-        let lock_path = path.with_extension("journal.lock");
-
-        // An appender holds the lock and has not written yet.
-        let held = lock_journal_lock_file(&lock_path, true)
-            .unwrap()
-            .expect("fixture: the appender must take the lock");
-        let integration = MultipartCleanupIntegration::new(temp.path().to_path_buf());
-        let rewrite_path = path.clone();
-        let rewrite = tokio::spawn(async move {
-            integration
-                .remove_entries_from_journal_file(&rewrite_path, gone)
-                .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            !rewrite.is_finished(),
-            "the rewrite ran while an appender held the journal lock"
+        assert_eq!(
+            jm.get_all_entries_for_cache_key(key).await.unwrap().len(),
+            200
         );
-
-        // The appender's write, under its hold, then release.
-        let line = format!("{}\n", serde_json::to_string(&entry_a(kept, 0)).unwrap());
-        JournalManager::append_lines_to_primary(&path, &line)
-            .await
-            .unwrap();
-        drop(held);
-
-        assert_eq!(rewrite.await.unwrap().unwrap(), 1, "removed count");
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            content.contains(kept),
-            "the append racing the rewrite was lost"
-        );
-        assert!(!content.contains(gone), "the target key must be removed");
-        assert!(!path.with_extension("journal.tmp").exists());
     }
 
     /// Torn-line tolerance: a partial last line is skipped by every reader in this
@@ -2105,7 +1740,11 @@ mod tests {
         let jm = JournalManager::new(temp.path().to_path_buf(), "case61".to_string());
         let key = "bkt/case61/torn";
         jm.append_range_entry(key, entry_a(key, 0)).await.unwrap();
-        let path = jm.get_journal_path(key).unwrap();
+        let path = jm
+            .cache_dir
+            .join("metadata")
+            .join("_journals")
+            .join(format!("{}.journal", jm.instance_id));
         let raw_append = |s: &str| {
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
@@ -2116,7 +1755,7 @@ mod tests {
         async fn counts(jm: &JournalManager, key: &str, path: &Path) -> (usize, usize, usize) {
             let files = vec![path.to_path_buf()];
             (
-                jm.get_pending_entries(key).await.unwrap().len(),
+                jm.get_all_entries_for_cache_key(key).await.unwrap().len(),
                 jm.get_all_entries_for_cache_key(key).await.unwrap().len(),
                 jm.get_entries_from_files(key, &files).await.unwrap().len(),
             )
@@ -2168,7 +1807,11 @@ mod tests {
         let mut mention = entry_a("bkt/other", 0);
         mention.range_file_path = plain.to_string();
 
-        let path = jm.get_journal_path(plain).unwrap();
+        let path = jm
+            .cache_dir
+            .join("metadata")
+            .join("_journals")
+            .join(format!("{}.journal", jm.instance_id));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut f = std::fs::File::create(&path).unwrap();
         let mut line = |bytes: &[u8]| {
@@ -2339,7 +1982,7 @@ mod tests {
 
         // Test get pending entries
         let entries = journal_manager
-            .get_pending_entries(cache_key)
+            .get_all_entries_for_cache_key(cache_key)
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -2352,75 +1995,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal_files.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_multipart_cleanup_integration() {
-        let temp_dir = TempDir::new().unwrap();
-        let cache_key = "test-bucket/test-object";
-        // `JournalManager::new` wires a `MultipartCleanupIntegration` for this cache_dir.
-        let journal_manager =
-            JournalManager::new(temp_dir.path().to_path_buf(), "test-instance".to_string());
-
-        // Add some journal entries
-        let range_spec = create_test_range_spec();
-        let entry1 = JournalEntry {
-            timestamp: SystemTime::now(),
-            instance_id: "test-instance".to_string(),
-            cache_key: cache_key.to_string(),
-            range_spec: range_spec.clone(),
-            operation: JournalOperation::Add,
-            range_file_path: "test_range_0-8388607.bin".to_string(),
-            metadata_version: 1,
-            new_ttl_secs: None,
-            object_ttl_secs: Some(3600),
-            access_increment: None,
-            object_metadata: None,
-            fill_witness: None,
-        };
-
-        let entry2 = JournalEntry {
-            timestamp: SystemTime::now(),
-            instance_id: "test-instance".to_string(),
-            cache_key: "test-bucket/other-object".to_string(),
-            range_spec,
-            operation: JournalOperation::Add,
-            range_file_path: "other_range_0-8388607.bin".to_string(),
-            metadata_version: 1,
-            new_ttl_secs: None,
-            object_ttl_secs: Some(3600),
-            access_increment: None,
-            object_metadata: None,
-            fill_witness: None,
-        };
-
-        journal_manager
-            .append_range_entry(cache_key, entry1)
-            .await
-            .unwrap();
-        journal_manager
-            .append_range_entry("test-bucket/other-object", entry2)
-            .await
-            .unwrap();
-
-        // Test cleanup for multipart
-        journal_manager
-            .cleanup_for_multipart(cache_key)
-            .await
-            .unwrap();
-
-        // Verify that entries for cache_key are removed but others remain
-        let remaining_entries = journal_manager
-            .get_pending_entries(cache_key)
-            .await
-            .unwrap();
-        assert_eq!(remaining_entries.len(), 0);
-
-        let other_entries = journal_manager
-            .get_pending_entries("test-bucket/other-object")
-            .await
-            .unwrap();
-        assert_eq!(other_entries.len(), 1);
     }
 
     // Property-based tests using quickcheck
@@ -2531,35 +2105,5 @@ mod tests {
         }
 
         TestResult::passed()
-    }
-    /// Removing a key's last entries truncates a primary journal in place, keeping its file and
-    /// inode with no `.journal.tmp`, and deletes a fresh journal outright.
-    #[test]
-    fn removing_the_last_entries_truncates_a_primary_in_place_and_deletes_a_fresh_journal() {
-        use std::os::unix::fs::MetadataExt;
-        let temp = TempDir::new().unwrap();
-        let journals = temp.path().join("metadata").join("_journals");
-        std::fs::create_dir_all(&journals).unwrap();
-        let key = "bkt/emptied";
-        let line = format!("{}\n", serde_json::to_string(&entry_a(key, 0)).unwrap());
-        let primary = journals.join("host-a:42.journal");
-        let fresh = journals.join("host-a:42:1700000000000000000.journal");
-        std::fs::write(&primary, &line).unwrap();
-        std::fs::write(&fresh, &line).unwrap();
-        let inode = std::fs::metadata(&primary).unwrap().ino();
-        assert_eq!(remove_entries_under_lock(&primary, key), 1);
-        assert_eq!(remove_entries_under_lock(&fresh, key), 1);
-        let after = std::fs::metadata(&primary).expect("the emptied primary journal is kept");
-        assert_eq!(after.len(), 0, "the primary journal is emptied");
-        assert_eq!(
-            after.ino(),
-            inode,
-            "the primary journal is truncated in place, not replaced"
-        );
-        assert!(
-            !primary.with_extension("journal.tmp").exists(),
-            "no .journal.tmp is left"
-        );
-        assert!(!fresh.exists(), "a fresh journal is deleted");
     }
 }
