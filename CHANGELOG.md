@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
-## [3.0.2] - 2026-11-06
+## [3.0.2] - 2026-11-07
 
 3.0.2 bounds every wait on the origin during an upload, answers upstream timeouts with `504`, and drops the cached copy of an object when a write's outcome is unknown. It fixes a multipart race that could cache a part body S3 did not keep, and counts `get_ttl` from when data was fetched. At `get_ttl: "0s"`, a GET whose `If-Match` names the cached ETag is now revalidated with S3 and served from the cache. It removes S3 Select support, which was incomplete: a SelectObjectContent request now gets `501 NotImplemented`. It also hardens how the proxy handles malformed requests and what it writes to its logs, and with an allowlist set it connects only to addresses the destination policy accepts. Five `/metrics` fields that always read `0`, and the library crate's exports that the binary does not use, are removed.
 
