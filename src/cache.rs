@@ -12067,10 +12067,25 @@ impl CacheManager {
     /// the non-staged remainder, `R > total_size` and a sample taken in that window sees the
     /// identity fail.
     ///
-    /// # The fallback direction is the safe one, and it is a choice rather than an accident
+    /// # A recent complete fold figure comes before the incumbent
     ///
     /// The fold's figure is [`None`] when a shard checkpoint is unreadable, when no fold has
-    /// completed, when a `.pending` file is unreadable, or when `P` is unreadable. Falling
+    /// completed, when a `.pending` file is unreadable, or when `P` is unreadable. The common
+    /// case is the third, and it is transient: one `{instance}.pending.lock` not acquired within
+    /// its 100 ms bound under write load, which the authority memo then holds for one TTL. In it
+    /// the last complete fold figure is served while it is at most
+    /// `staged_fold::RECENT_AUTHORITY_MAX_AGE_SECS` old, which bounds its under-count to the
+    /// bytes staged since it was taken.
+    ///
+    /// The incumbent is the worse stand-in at epoch 1, where graduation writes no debit: between
+    /// validation scans it counts every byte staged since the last one, read or not, so its
+    /// over-statement has no bound. On one production volume it read 1,313 GB against a census
+    /// of 0.48 GB, and a staging pass that read it in a lock-timeout window evicted unread
+    /// uploads down to its target.
+    ///
+    /// # The fallback direction is the safe one, and it is a choice rather than an accident
+    ///
+    /// Past that age the fold has been unreadable for longer than a lock wait. Falling
     /// back to the incumbent then is deliberate: the incumbent's measured failure is a
     /// directional **over**-count of 4.28x-11.17x, so the trigger fires early at worst.
     /// Reporting zero would be an under-count, and § 16.6.2's whole direction-safety argument
@@ -12098,8 +12113,16 @@ impl CacheManager {
     async fn staged_authority_with(&self, project_incumbent: bool) -> Option<StagedFigure> {
         let consolidator = self.journal_consolidator.read().await.clone()?;
         if crate::staged_authority::fold_authority_active(&self.cache_dir) {
-            if let Some(figure) = crate::staged_fold::staged_authority_figure(&self.cache_dir).await
+            if let Some((figure, reused_age_secs)) =
+                crate::staged_fold::staged_authority_figure_or_recent(&self.cache_dir).await
             {
+                if let Some(age_secs) = reused_age_secs {
+                    debug!(
+                        "Staged authority: the fold's figure is unreadable for this read, \
+                         serving the last complete one, {}s old",
+                        age_secs
+                    );
+                }
                 return Some(StagedFigure {
                     resident_staged_bytes: figure.resident_staged_bytes,
                     in_progress_part_bytes: figure.in_progress_part_bytes,
@@ -12107,8 +12130,9 @@ impl CacheManager {
                 });
             }
             debug!(
-                "Staged authority: the epoch is active but the fold's figure is unreadable, \
-                 falling back to the incumbent counter for this read. On a 3.0.0-only \
+                "Staged authority: the epoch is active but the fold's figure is unreadable and \
+                 no complete one is recent, falling back to the incumbent counter for this \
+                 read. On a 3.0.0-only \
                  fleet the incumbent OVER-states, so the trigger fires early rather than \
                  late; while a binary older than 3.0.0 writes the volume it under-counts and \
                  the trigger fires late. \
@@ -35337,10 +35361,11 @@ mod total_cache_size_definition_tests {
         // read below would be served the pre-breakage figure and the fallback arm would never be
         // reached — the assertion would fail against 500 rather than exercising the fallback.
         //
-        // The production consequence has the same shape and is bounded: for up to one memo TTL
-        // after a staged input becomes unreadable, the last complete FOLD figure is served rather
-        // than the incumbent. That is within the direction the TTL's own reasoning permits, since
-        // the fold's figure is the more accurate of the two.
+        // The production consequence has the same shape and is bounded: for up to
+        // `RECENT_AUTHORITY_MAX_AGE_SECS` after a staged input becomes unreadable, the last
+        // complete FOLD figure is served rather than the incumbent
+        // (`after_activation_a_held_pending_lock_serves_the_last_complete_fold_figure`). The clear
+        // drops that figure too, so this read reaches the incumbent.
         crate::staged_fold::invalidate_authority_snapshot_for_tests(temp.path());
         // And the walk itself: a decider composes on a kept walk up to
         // `PUBLISHED_WALK_BASE_MAX_AGE` old plus the published per-proxy growth since it, and the
@@ -35376,6 +35401,101 @@ mod total_cache_size_definition_tests {
             sizes.read_cache_size + sizes.write_cache_size,
             "the identity must hold in the FALLBACK arm too — that is what makes T51k need \
              no in-flight exclusion"
+        );
+    }
+
+    /// A `.pending` lock held through a derivation must not hand the staging trigger, or the
+    /// published composites, the incumbent while a complete fold figure is recent. Once that
+    /// figure is older than `RECENT_AUTHORITY_MAX_AGE_SECS`, the incumbent fallback applies as
+    /// before.
+    ///
+    /// The held lock is the production shape of the failure: every write-through upload appends
+    /// to its instance's `.pending` file under that lock, and a reader that cannot take it within
+    /// 100 ms reports the file unreadable. The incumbent is set far above the fold's figure, as it
+    /// stands at epoch 1 between validation scans, so a build that falls back to it is visible.
+    ///
+    /// A failure implicates `CacheManager::staged_authority`'s fold arm or
+    /// `staged_fold::staged_authority_figure_or_recent`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_activation_a_held_pending_lock_serves_the_last_complete_fold_figure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let manager = setup(dir);
+
+        const F_BYTES: u64 = 500;
+        const INCUMBENT_BYTES: u64 = 3_141_592_653;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = DISK_BYTES;
+        state.write_cache_size = INCUMBENT_BYTES;
+        consolidator.persist_size_state(&state).await.unwrap();
+
+        crate::staged_fold::seed_shard_figure_for_tests(dir, "test-bucket", "3f", F_BYTES, 2);
+        // A peer's pending file, so a derivation has a lock to take.
+        let (pending_path, lock_path) =
+            crate::staged_fold::pending_paths_for_tests(dir, "peer-host:4242");
+        std::fs::create_dir_all(pending_path.parent().unwrap()).unwrap();
+        std::fs::write(&pending_path, b"").unwrap();
+        assert!(crate::staged_authority::activate(dir, "host:test").unwrap());
+
+        // With nothing held the fold answers, and this derivation is the last complete one.
+        assert_eq!(
+            manager.get_staging_resident_bytes().await,
+            Some(F_BYTES),
+            "fixture: the fold must answer before the lock is taken"
+        );
+
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&holder).expect("the test must own the pending lock");
+        assert!(
+            !crate::staged_fold::pending_read_all_complete_for_tests(dir).await,
+            "fixture: the held lock must make the pending term unreadable"
+        );
+
+        // One TTL on, the memo has expired, so the next read re-derives, cannot read the pending
+        // file, and memoises `None`.
+        crate::staged_fold::age_authority_snapshot_for_tests(
+            dir,
+            crate::staged_fold::AUTHORITY_SNAPSHOT_TTL_SECS,
+        );
+        let within = manager.get_staging_resident_bytes().await;
+        let published = manager
+            .get_cache_size_stats()
+            .await
+            .unwrap()
+            .sizes
+            .expect("get_cache_size_stats must always populate CacheSizes")
+            .write_cache_size;
+
+        // Still held, and the last complete figure is now older than the bound.
+        crate::staged_fold::age_authority_snapshot_for_tests(
+            dir,
+            crate::staged_fold::RECENT_AUTHORITY_MAX_AGE_SECS,
+        );
+        let beyond = manager.get_staging_resident_bytes().await;
+        let _ = fs4::FileExt::unlock(&holder);
+
+        assert_eq!(
+            within,
+            Some(F_BYTES),
+            "one lock timeout must not size staging eviction from the incumbent: at epoch 1 it \
+             counts every byte staged since the last validation scan, read or not, and a pass \
+             sized from it evicts unread uploads down to its target"
+        );
+        assert_eq!(
+            published, F_BYTES,
+            "the published composite reads the same resolution point as the trigger"
+        );
+        assert_eq!(
+            beyond,
+            Some(INCUMBENT_BYTES),
+            "past RECENT_AUTHORITY_MAX_AGE_SECS the incumbent fallback applies as before, so a \
+             fold that stays unreadable still over-states rather than under-states"
         );
     }
 

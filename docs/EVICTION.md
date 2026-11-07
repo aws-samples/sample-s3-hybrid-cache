@@ -632,6 +632,13 @@ Two consequences for an operator:
   counter's accumulated error. Nothing is evicted and nothing is lost; the recomputed figure is
   the correct one. On a volume only 3.0.0 proxies write, the figure between recomputations can only
   overstate, so the eviction trigger fires early at worst and never late.
+- **When the recomputed figure cannot be read**, most often because a proxy appending to its
+  pending-credit file held that file's lock for more than 100 ms (`pending_lock_timeouts_total`),
+  the proxy uses the last figure it recomputed, for up to 60 s. That figure can understate by
+  what was staged since. Past 60 s it uses the event-maintained counter. At epoch 1 that counter
+  is no longer debited when an object graduates, so it overstates by everything staged since
+  the last full validation scan, read or not, and write cache reclamation that reads it removes
+  staged objects early.
 
 **Rolling back to a release without the recomputed figure is not supported once the epoch reads
 `1`.** To roll back after that point, move the fleet to a fresh cache volume as

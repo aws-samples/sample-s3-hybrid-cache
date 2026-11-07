@@ -931,6 +931,10 @@ struct AuthoritySnapshot {
     derived_at_secs: u64,
     /// `None` is UNREADABLE, never a zero.
     figure: Option<StagedAuthorityFigure>,
+    /// The newest derivation that produced a figure, with its `taken_at_secs`. Carried across a
+    /// derivation that produces `None`, and kept when the memo is expired, so
+    /// [`staged_authority_figure_or_recent`] can serve it while it is recent.
+    last_complete: Option<(u64, StagedAuthorityFigure)>,
 }
 
 /// Calls served from the memo, and calls that re-derived it, since process start.
@@ -1009,7 +1013,7 @@ pub(crate) fn invalidate_authority_snapshot_for_tests(cache_dir: &Path) {
 }
 
 /// Move `cache_dir`'s memoised authority figure `secs` into the past, so it is present but
-/// expired. `false` when there is no memo to age.
+/// expired. Its last complete figure moves with it. `false` when there is no memo to age.
 ///
 /// Distinct from [`invalidate_authority_snapshot_for_tests`]: an absent memo and an expired one are
 /// different states for a reader that may serve a stale figure rather than re-derive it.
@@ -1020,6 +1024,9 @@ pub(crate) fn age_authority_snapshot_for_tests(cache_dir: &Path, secs: u64) -> b
         Some(snapshot) => {
             snapshot.taken_at_secs = snapshot.taken_at_secs.saturating_sub(secs);
             snapshot.derived_at_secs = snapshot.derived_at_secs.saturating_sub(secs);
+            if let Some((at, _)) = snapshot.last_complete.as_mut() {
+                *at = at.saturating_sub(secs);
+            }
             true
         }
         None => false,
@@ -5425,6 +5432,45 @@ fn spawn_authority_refresh(cache_dir: &Path) {
     });
 }
 
+/// How old the last complete figure may be for [`staged_authority_figure_or_recent`] to serve it
+/// in place of a figure that is unknown now.
+///
+/// The figure is most often unknown because one `{instance}.pending.lock` was not acquired within
+/// [`PENDING_LOCK_WAIT_BOUND`]: every write-through upload appends to its instance's file under
+/// that lock, and the memo then holds the `None` for [`AUTHORITY_SNAPSHOT_TTL_SECS`]. Served in
+/// that window, a figure this old can under-state by the bytes staged since it was taken, and by
+/// nothing else: a graduation, a DELETE or an eviction since then only makes it over-state.
+///
+/// 60 s, because the reads that decide on the figure re-derive it often while the staging trigger
+/// is near. The consolidation loop nudges a staging pass whenever its projected figure is over the
+/// trigger, every pass reads the figure before taking the eviction lock, and a pass that frees
+/// nothing defers the next nudge by `INLOOP_TRIGGER_BARREN_INTERVALS` (2) intervals. At the default
+/// 5 s interval that is a derivation every 15 s at the latest, so a figure older than 60 s means
+/// several consecutive derivations failed. That is not a lock wait, and the caller's fallback
+/// then applies.
+pub(crate) const RECENT_AUTHORITY_MAX_AGE_SECS: u64 = 60;
+
+/// [`staged_authority_figure`], or, when that is unknown, the last complete figure while it is no
+/// older than [`RECENT_AUTHORITY_MAX_AGE_SECS`], paired with its age in seconds. `None` when
+/// neither exists.
+///
+/// The second element is `None` for a figure derived or memoised now, and the reused figure's age
+/// otherwise.
+pub(crate) async fn staged_authority_figure_or_recent(
+    cache_dir: &Path,
+) -> Option<(StagedAuthorityFigure, Option<u64>)> {
+    if let Some(figure) = staged_authority_figure(cache_dir).await {
+        return Some((figure, None));
+    }
+    let (taken_at_secs, figure) = AUTHORITY_SNAPSHOT
+        .lock()
+        .ok()?
+        .get(&dir_tag(cache_dir))?
+        .last_complete?;
+    let age_secs = unix_secs().saturating_sub(taken_at_secs);
+    (age_secs <= RECENT_AUTHORITY_MAX_AGE_SECS).then_some((figure, Some(age_secs)))
+}
+
 /// The staged figure the trigger and the published composites read, or `None` when it is
 /// unknown.
 ///
@@ -5511,16 +5557,35 @@ async fn rederive_authority_snapshot(
         if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
             map.clear();
         }
+        let last_complete = last_complete_after(map.get(&tag), fresh, now_secs);
         map.insert(
             tag,
             AuthoritySnapshot {
                 taken_at_secs: now_secs,
                 derived_at_secs: now_secs,
                 figure: fresh,
+                last_complete,
             },
         );
     }
     fresh
+}
+
+/// The `last_complete` a memo entry carries once a derivation taken at `taken_at_secs` has
+/// produced `fresh`: `fresh` when it is a figure and no older than the one `previous` carries,
+/// otherwise `previous`'s.
+fn last_complete_after(
+    previous: Option<&AuthoritySnapshot>,
+    fresh: Option<StagedAuthorityFigure>,
+    taken_at_secs: u64,
+) -> Option<(u64, StagedAuthorityFigure)> {
+    let kept = previous.and_then(|s| s.last_complete);
+    match fresh {
+        Some(figure) if kept.is_none_or(|(at, _)| taken_at_secs >= at) => {
+            Some((taken_at_secs, figure))
+        }
+        _ => kept,
+    }
 }
 
 /// A scrape's derivation: [`rederive_authority_snapshot`] with `P` from the last walk of
@@ -5556,22 +5621,26 @@ async fn rederive_authority_snapshot_from_kept_walk(
     let fresh = staged_authority_figure_from(cache_dir, Some(kept.walk)).await;
 
     if let Ok(mut map) = AUTHORITY_SNAPSHOT.lock() {
-        if map
-            .get(&tag)
-            .is_some_and(|current| current.taken_at_secs > taken_at_secs)
+        if let Some(current) = map
+            .get_mut(&tag)
+            .filter(|current| current.taken_at_secs > taken_at_secs)
         {
+            // Not installed, but a complete figure newer than the entry's last one still is.
+            current.last_complete = last_complete_after(Some(current), fresh, taken_at_secs);
             return fresh;
         }
         // The same bound as the deciding derivation; see there.
         if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
             map.clear();
         }
+        let last_complete = last_complete_after(map.get(&tag), fresh, taken_at_secs);
         map.insert(
             tag,
             AuthoritySnapshot {
                 taken_at_secs,
                 derived_at_secs: now_secs,
                 figure: fresh,
+                last_complete,
             },
         );
     }
@@ -8231,6 +8300,45 @@ mod tests {
             "one shard past Max_Authority_Age makes the rotation incomplete: an authority \
              is only as fresh as its stalest component, so this must read the MAXIMUM over \
              shards and not the minimum"
+        );
+    }
+
+    /// The last complete figure a memo entry carries: a derivation that produced no figure keeps
+    /// the previous one, a newer complete one replaces it, and an older one does not. The older
+    /// case is a scrape's refresh, dated by the walk it composes on, arriving after a deciding
+    /// reader's own derivation.
+    #[test]
+    fn a_derivation_without_a_figure_keeps_the_last_complete_one() {
+        let figure = |bytes| StagedAuthorityFigure {
+            resident_staged_bytes: bytes,
+            in_progress_part_bytes: 0,
+        };
+        let previous = AuthoritySnapshot {
+            taken_at_secs: 100,
+            derived_at_secs: 100,
+            figure: None,
+            last_complete: Some((90, figure(1))),
+        };
+
+        assert_eq!(last_complete_after(None, None, 100), None);
+        assert_eq!(
+            last_complete_after(None, Some(figure(1)), 100),
+            Some((100, figure(1)))
+        );
+        assert_eq!(
+            last_complete_after(Some(&previous), None, 100),
+            Some((90, figure(1))),
+            "an unreadable derivation must keep the last complete figure, or the fallback it \
+             exists for never has one to serve"
+        );
+        assert_eq!(
+            last_complete_after(Some(&previous), Some(figure(2)), 100),
+            Some((100, figure(2)))
+        );
+        assert_eq!(
+            last_complete_after(Some(&previous), Some(figure(2)), 80),
+            Some((90, figure(1))),
+            "a figure dated before the kept one must not replace it"
         );
     }
 
