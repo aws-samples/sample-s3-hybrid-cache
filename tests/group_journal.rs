@@ -46,6 +46,8 @@ mod staged_authority_activation_blocker_wire_test;
 mod staged_authority_activation_holder_count_wire_test;
 #[path = "staged_range_predicate_test.rs"]
 mod staged_range_predicate_test;
+#[path = "staging_pass_pending_lock_timeout_test.rs"]
+mod staging_pass_pending_lock_timeout_test;
 #[path = "staging_tier_fail_open_and_read_tier_coverage_test.rs"]
 mod staging_tier_fail_open_and_read_tier_coverage_test;
 #[path = "write_ledger_append_throughput_test.rs"]

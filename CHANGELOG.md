@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [Unreleased]
+
+### Fixed
+
+- At `write_cache.staged_authority_epoch` `1`, a staging eviction pass that ran while one pending-credit file's lock was held for more than 100 ms sized itself from the event-maintained write-cache counter, and evicted staged objects nobody had read down to its target (public 3.0.0 to 3.0.1). At epoch 1 that counter is not debited when an object graduates, so between full validation scans it counts everything staged since the last one. On a contributor's proxy, 12 such passes in 90 minutes evicted 67,894 unread uploads (127.9 GB) while about 100 GB was staged against a 1,135 GB trigger. While the recomputed figure cannot be read, the proxy now uses the last one it recomputed, for up to 60 s, before it falls back to the counter. See [Which computation is in force](docs/EVICTION.md#which-computation-is-in-force), by [@akash-polybee](https://github.com/akash-polybee).
+
 ## [3.0.1] - 2026-11-03
 
 3.0.1 lowers the memory that consolidation and streamed cache hits hold, and lets cache hits that revalidate with S3 run concurrently. It also closes cases where a read could return one object version's bytes under another version's ETag and headers. 3.0.0's line "Range, part and conditional reads never mix bytes of two versions" did not hold in those cases. Each needed an object overwritten in place outside the proxy, except an error reply that a 2.x release cached as object data. By default, 3.0.1 fetches from S3 again any cached range that records no file identity, which includes every range a 2.x release cached.
