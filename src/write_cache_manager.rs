@@ -211,6 +211,9 @@ pub struct WriteCacheManager {
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
     graduations_total: Arc<AtomicU64>,
+    /// Staging passes that removed nothing by size because the sizing figure was unknown,
+    /// cumulative for this process. **Per-proxy.**
+    staging_figure_unknown_passes_total: Arc<AtomicU64>,
 
     /// Incomplete upload TTL (default: 1 day)
     incomplete_upload_ttl: Duration,
@@ -293,6 +296,7 @@ impl WriteCacheManager {
             staging_evictions_total: Arc::new(AtomicU64::new(0)),
             staging_eviction_bytes_total: Arc::new(AtomicU64::new(0)),
             graduations_total: Arc::new(AtomicU64::new(0)),
+            staging_figure_unknown_passes_total: Arc::new(AtomicU64::new(0)),
             incomplete_upload_ttl,
             eviction_algorithm,
             cache_dir,
@@ -422,6 +426,18 @@ impl WriteCacheManager {
     /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
     pub(crate) fn graduations_total(&self) -> u64 {
         self.graduations_total.load(Ordering::Relaxed)
+    }
+    /// Cumulative count of staging passes that took the eviction lock and could not read their
+    /// sizing figure, for this process. Read by `/metrics` as
+    /// `write_cache.staging_figure_unknown_passes_total`.
+    pub(crate) fn staging_figure_unknown_passes_total(&self) -> u64 {
+        self.staging_figure_unknown_passes_total
+            .load(Ordering::Relaxed)
+    }
+    /// Count one staging pass that took the eviction lock and could not derive its sizing figure.
+    pub(crate) fn increment_staging_figure_unknown_passes(&self) {
+        self.staging_figure_unknown_passes_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment the cumulative graduation counter. Called once per graduation this
@@ -578,52 +594,6 @@ impl WriteCacheManager {
         }
     }
 
-    /// Directly release capacity (for internal eviction use only).
-    ///
-    /// Uses saturating subtraction to prevent underflow. Emits a rate-limited
-    /// warning if underflow would have occurred.
-    ///
-    /// This method is NOT part of the public API for callers performing uploads.
-    /// Upload callers use `WriteReservation` (RAII drop) for release.
-    /// This is used internally by eviction paths that track sizes independently.
-    fn release_capacity_internal(&self, compressed_size: u64) {
-        if compressed_size == 0 {
-            return;
-        }
-
-        self.current_size
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                if current < compressed_size {
-                    // Underflow — rate-limited warning
-                    let now_secs = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let last = LAST_UNDERFLOW_WARN.load(Ordering::Relaxed);
-                    if now_secs.saturating_sub(last) >= UNDERFLOW_WARN_INTERVAL_SECS
-                        && LAST_UNDERFLOW_WARN
-                            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        warn!(
-                            release_size = compressed_size,
-                            current_size = current,
-                            "Write cache capacity underflow detected in eviction: \
-                             release_size ({}) > current_size ({}), saturating to 0",
-                            compressed_size,
-                            current
-                        );
-                    }
-                    Some(0)
-                } else {
-                    Some(current - compressed_size)
-                }
-            })
-            .ok();
-
-        debug!("Write cache released (internal): size={}", compressed_size);
-    }
-
     // =========================================================================
     // Eviction Methods
     //
@@ -691,14 +661,11 @@ impl WriteCacheManager {
     ///   and `collect_and_apply_deltas` under the global consolidation lock. See the
     ///   equivalent warning in `CacheManager::enforce_disk_cache_limits_internal`.
     ///
-    /// `release_capacity_internal` is still called and is **not** a direct subtraction
-    /// in the R5.3 sense: it moves this instance's in-flight admission counter
-    /// (`current_size`, exposed as `/metrics write_cache.inflight_bytes`), which is a
-    /// different quantity from `SizeState::write_cache_size` (exposed as
-    /// `resident_bytes`). The two are updated by different mechanisms with different
-    /// visibility and are expected to be able to diverge — see the steering note on
-    /// treating two figures that agree to the byte as a symptom rather than as
-    /// corroboration.
+    /// This instance's in-flight counter (`current_size`, exposed as
+    /// `/metrics write_cache.inflight_bytes`) is not moved either. It holds upload
+    /// reservations still in flight, and a staged object's bytes left it when its upload's
+    /// reservation was dropped, so releasing the freed bytes from it saturated it to zero
+    /// under any live upload and made that upload's own release underflow again.
     ///
     /// # The graduation race, and why the write-cache debit is conditional
     ///
@@ -952,11 +919,11 @@ impl WriteCacheManager {
             }
         }
 
-        // Update current size via internal saturating release
-        self.release_capacity_internal(total_freed);
+        // `current_size` is not touched: it holds in-flight upload reservations only, and the
+        // staged bytes freed here left it when their upload's reservation was dropped.
+        //
         // Best-effort staged-entry gauge: this entry is no longer staged — but only
-        // if it was staged to begin with. This call has no production caller today
-        // (see the doc comment above), but a caller evicting an already-graduated
+        // if it was staged to begin with. A caller evicting an already-graduated
         // read-cache entry must not decrement a gauge it was never counted in.
         // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
         if metadata.object_metadata.is_write_cached {
@@ -1598,22 +1565,6 @@ mod tests {
         let object_size = 4096u64;
         seed_staged_object(temp_dir.path(), cache_key, object_size).await;
 
-        // Historical note: the removed `evict_to_target` only walked candidates when
-        // `current_size` exceeded
-        // the target — it tracks in-flight/committed reservations, not what's
-        // actually on disk. Reserve to match the object we just seeded so the
-        // eviction path has something to reduce toward the target=0 below,
-        // mirroring how `try_reserve`'s slow path arrives at this call. The
-        // reservation is intentionally leaked (never dropped): eviction
-        // releases the same bytes via `release_capacity_internal`, and
-        // letting the `WriteReservation` also drop would release them a
-        // second time, tripping the underflow-warning path for an unrelated
-        // reason.
-        let reservation = manager.try_reserve(object_size).await.unwrap();
-        std::mem::forget(reservation);
-
-        // Evict everything (target 0) via the public entry point, same path
-        // `try_reserve`'s slow path uses.
         let freed = manager.evict_write_cached_object(cache_key).await.unwrap();
         assert_eq!(freed, object_size, "eviction should report bytes freed");
 

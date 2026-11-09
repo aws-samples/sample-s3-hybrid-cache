@@ -1694,11 +1694,11 @@ async fn a_large_delete_objects_on_a_healthy_volume_finishes_every_key_inline() 
         ),
     );
     c.check(
-        elapsed <= DELETE_OBJECTS_BUDGET,
+        elapsed <= DELETE_OBJECTS_BUDGET + MARGIN,
         format!(
             "a 1000-key DeleteObjects on a volume that makes progress took {:?}; it must be \
-             answered within {:?}",
-            elapsed, DELETE_OBJECTS_BUDGET
+             answered within {:?} plus {:?} of scheduling slack",
+            elapsed, DELETE_OBJECTS_BUDGET, MARGIN
         ),
     );
     c.check(

@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [3.0.3] - 2026-11-09
+
+3.0.3 fixes two faults in write cache reclamation and reports when reclamation cannot size itself. A reclamation pass that could not read the staged figure could remove uploads nobody had read, and `write_cache.inflight_bytes` could read `0` after a pass while uploads were in flight.
+
+### Added
+
+- `write_cache.staging_figure_unknown_seconds` on `/metrics` and OTLP shows how long a proxy has been unable to recompute the staged figure that write cache reclamation sizes itself from. `write_cache.staging_figure_unknown_passes_total` counts the reclamation passes that removed nothing by size because of it. When a recomputation fails after the figure has been unknown for 60 s, the proxy logs an error, at most every 10 minutes. [When the recomputed figure cannot be read](docs/EVICTION.md#which-computation-is-in-force) states what bounds staged bytes meanwhile, where to set an alert on the gauge, and what to do.
+
+### Fixed
+
+- At `write_cache.staged_authority_epoch` `1`, a write cache reclamation pass that ran while a pending-credit file's lock was held over 100 ms sized itself from a counter that overstates at that epoch (public 3.0.0 to 3.0.2). The counter is not reduced when an object is first read, so the pass removed staged objects nobody had read down to its target. On a contributor's proxy, 12 such passes in 90 minutes removed 67,894 unread uploads (127.9 GB) while about 100 GB was staged against a 1,135 GB trigger. A pass now recomputes the staged figure after it takes the eviction lock and removes nothing by size when it cannot. When they cannot recompute it, the checks that start a pass, and `/metrics`, now use the last figure the proxy recomputed, whatever its age. `/metrics` shows the counter only until the proxy has recomputed one. See [Which computation is in force](docs/EVICTION.md#which-computation-is-in-force) and [GitHub PR #27](https://github.com/aws-samples/sample-s3-hybrid-cache/pull/27), by [@akash-polybee](https://github.com/akash-polybee).
+- After a write cache reclamation pass removed staged objects, `write_cache.inflight_bytes` could read lower than the uploads in flight, down to `0`, and the proxy logged a write cache capacity underflow warning (public 2.7.0 to 3.0.2). It now counts the uploads in flight and nothing else.
+
 ## [3.0.2] - 2026-11-07
 
 3.0.2 bounds every wait on the origin during an upload, answers upstream timeouts with `504`, and drops the cached copy of an object when a write's outcome is unknown. It fixes a multipart race that could cache a part body S3 did not keep, and counts `get_ttl` from when data was fetched. At `get_ttl: "0s"`, a GET whose `If-Match` names the cached ETag is now revalidated with S3 and served from the cache. It removes S3 Select support, which was incomplete: a SelectObjectContent request now gets `501 NotImplemented`. It also hardens how the proxy handles malformed requests and what it writes to its logs, and with an allowlist set it connects only to addresses the destination policy accepts. Five `/metrics` fields that always read `0`, and the library crate's exports that the binary does not use, are removed.

@@ -1883,6 +1883,18 @@ pub struct WriteCacheMetrics {
     /// never that caching was refused.
     #[serde(default)]
     pub pending_lock_timeouts_total: u64,
+    /// Seconds this process has been unable to derive the staged byte figure: `0` while its most
+    /// recent derivation produced one, otherwise the time since its newest complete figure was
+    /// taken, or since its first attempt when it has none. A derivation still running after 60 s
+    /// also counts. Every derivation updates it, and the metrics collector attempts one every
+    /// `collection_interval` whether or not a staging pass runs, so it lags the volume by at most
+    /// that interval plus one derivation. **Per-instance.**
+    #[serde(default)]
+    pub staging_figure_unknown_seconds: u64,
+    /// Staging passes that removed nothing by size because the fresh staged figure could not be
+    /// derived, since this process started. **Per-instance.**
+    #[serde(default)]
+    pub staging_figure_unknown_passes_total: u64,
     /// Why the staged-authority epoch has not activated, as the gate's stable blocker label
     /// (`ledger_without_ready_record`, `no_fresh_ready_records`, `rotation_incomplete`, ...).
     ///
@@ -3052,8 +3064,10 @@ impl MetricsManager {
         //
         // Fixed as a gauge change rather than a doc change because the doc describes the
         // behaviour that was designed and the alarm is only meaningful against the authority.
-        // `get_staging_resident_bytes` returns `None` only when there is no consolidator, in
-        // which case the incumbent read above is 0 too.
+        // `get_staging_resident_bytes` returns `None` when there is no consolidator, in which
+        // case the incumbent read above is 0 too, and at epoch 1 before this process's first
+        // complete derivation, when the incumbent is the stand-in `get_cache_size_stats`
+        // publishes as well.
         let resident_bytes = cache_manager
             .get_staging_resident_bytes()
             .await
@@ -3063,6 +3077,7 @@ impl MetricsManager {
         let (staging_evictions_total, staging_eviction_bytes_total) =
             cache_manager.get_write_cache_eviction_counters().await;
         let graduations_total = cache_manager.get_write_cache_graduations_total().await;
+        let staging_figure_unknown = cache_manager.get_staging_figure_unknown().await;
         // `count_entries` FIRST, then the age — in that order, because the count may take a fresh
         // observation and an age read first would describe the figure that was replaced. This is
         // an observation of bounded age rather than a scrape-time count; see
@@ -3241,6 +3256,8 @@ impl MetricsManager {
             pending_lock_waits_total: crate::staged_fold::pending_lock_wait_stats().0,
             pending_lock_wait_ms_total: crate::staged_fold::pending_lock_wait_stats().1,
             pending_lock_timeouts_total: crate::staged_fold::pending_lock_wait_stats().2,
+            staging_figure_unknown_seconds: staging_figure_unknown.0,
+            staging_figure_unknown_passes_total: staging_figure_unknown.1,
             // In-memory, like the epoch latch above: the consolidator records the verdict it
             // evaluated, so a scrape pays no shared-storage read.
             staged_authority_activation_blocker: activation_blocker.0,

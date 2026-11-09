@@ -8039,10 +8039,8 @@ impl JournalConsolidator {
         }
         self.idle_eviction_reads.fetch_add(1, Ordering::Relaxed);
         // Fail open on an unreadable document (R7.5), as `maybe_trigger_eviction` does.
-        let (total_size, write_cache_size) = match self.load_size_state().await {
-            Ok(s) => (s.total_size, s.write_cache_size),
-            Err(_) => (0, 0),
-        };
+        let state = self.load_size_state().await.ok();
+        let total_size = state.as_ref().map_or(0, |s| s.total_size);
         // The PROJECTED figure decides, as at every other trigger site since the change: `size_state`
         // omits every delta file flushed since the last consolidation-lock winner collected one,
         // so on this path it omits a peer's debit or credit that landed in the window between
@@ -8056,9 +8054,10 @@ impl JournalConsolidator {
             // short-circuited away. See [`Self::clear_read_tier_barren`].
             self.clear_read_tier_barren();
         }
-        let staging_over = self
-            .staging_byte_trigger()
-            .is_some_and(|trigger| write_cache_size > trigger);
+        let staging_over = match self.staging_byte_trigger() {
+            Some(trigger) => self.staging_idle_nudge_due(trigger, state.as_ref()).await,
+            None => false,
+        };
         if !bytes_over && !staging_over {
             if let Ok(mut memo) = self.idle_eviction_memo.lock() {
                 *memo = Some(std::time::Instant::now());
@@ -8280,6 +8279,48 @@ impl JournalConsolidator {
         triggered
     }
 
+    /// The staging byte arm's verdict at epoch 1 for the two consolidation-loop nudge sites:
+    /// the fold's memoised figure of any age, else this process's last complete one, against the
+    /// trigger, and never a derivation, which reads every shard checkpoint and would hold the
+    /// loop for its duration. `Some(false)` when this process holds no figure yet, so that path
+    /// does not nudge; the end-of-cycle nudge and the pass's own pre-lock read then decide.
+    /// `None` at epoch 0.
+    async fn staging_fold_nudge_verdict(&self) -> Option<bool> {
+        if !crate::staged_authority::fold_authority_active(&self.cache_dir) {
+            return None;
+        }
+        let cm = self
+            .cache_manager
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
+        Some(match cm {
+            Some(cm) => cm
+                .staging_byte_arm_over_trigger_memo_only()
+                .await
+                .unwrap_or(false),
+            None => false,
+        })
+    }
+
+    /// Whether the in-loop check nudges the staging tier: [`Self::staging_fold_nudge_verdict`]
+    /// at epoch 1, the projected counter from `projected` at epoch 0.
+    async fn staging_inloop_nudge_due(&self, trigger: u64, projected: Option<(u64, u64)>) -> bool {
+        match self.staging_fold_nudge_verdict().await {
+            Some(over) => over,
+            None => projected.is_some_and(|(_, write_cache)| write_cache > trigger),
+        }
+    }
+
+    /// Whether the idle cycle nudges the staging tier: [`Self::staging_fold_nudge_verdict`] at
+    /// epoch 1, the counter in `state` at epoch 0.
+    async fn staging_idle_nudge_due(&self, trigger: u64, state: Option<&SizeState>) -> bool {
+        match self.staging_fold_nudge_verdict().await {
+            Some(over) => over,
+            None => state.is_some_and(|s| s.write_cache_size > trigger),
+        }
+    }
+
     /// The staging tier's byte trigger, or `None` when no cache manager is wired or the tier
     /// has no byte bound. No I/O.
     fn staging_byte_trigger(&self) -> Option<u64> {
@@ -8379,16 +8420,15 @@ impl JournalConsolidator {
     /// Past the gates a check pays one `size_tracking/` listing and the `size_state.json` reads
     /// of [`Self::projected_sizes`], at most once per interval, shared with the staging tier.
     ///
-    /// # The staging tier: its own figure, and it lags the same way
+    /// # The staging tier: the fold's figure at epoch 1, the counter at epoch 0
     ///
-    /// The staging check compares the projected `write_cache_size` against
-    /// `CacheManager::get_staging_eviction_thresholds`' trigger. The projection matters here for
-    /// the same reason it does for bytes: `size_state.write_cache_size` omits every
-    /// `write_cache_delta` flushed since this cycle's `collect_deltas`, which under a write
-    /// burst is a cycle's worth of staging. It also omits this cycle's own graduation debits,
-    /// which are applied after the loop, so the in-loop figure reads **high** by that much and
-    /// errs toward nudging a pass that then finds little to evict. Gated on the pass-in-flight
-    /// flag so a barren check costs one atomic load and no read of its own.
+    /// At epoch 1 the staging check compares the fold's memoised figure, or this process's last
+    /// complete one, against `CacheManager::get_staging_eviction_thresholds`' trigger, and never
+    /// derives it ([`Self::staging_inloop_nudge_due`]). With no figure in this process it does
+    /// not nudge. At epoch 0 it compares the projected `write_cache_size`: the projection
+    /// matters for the same reason it does for bytes, since `size_state.write_cache_size` omits
+    /// every `write_cache_delta` flushed since this cycle's `collect_deltas`. Gated on the
+    /// pass-in-flight flag so a barren check costs one atomic load and no read of its own.
     ///
     /// # Barren passes: both other tiers back off like gate 3
     ///
@@ -8442,8 +8482,8 @@ impl JournalConsolidator {
         // One read for both tiers: `projected_sizes` returns the pair, and reading it twice would
         // double a check's shared-volume cost for no extra freshness.
         self.inloop_projected_reads.fetch_add(1, Ordering::Relaxed);
-        let (projected_total, projected_write_cache) =
-            self.projected_sizes().await.unwrap_or((0, 0));
+        let projected = self.projected_sizes().await;
+        let projected_total = projected.map_or(0, |(total, _)| total);
 
         let mut triggered = false;
         if read_tier_due {
@@ -8463,7 +8503,11 @@ impl JournalConsolidator {
                 self.note_read_tier_spawn(progress_before);
             }
         }
-        if staging_trigger.is_some_and(|trigger| projected_write_cache > trigger) {
+        let staging_over = match staging_trigger {
+            Some(trigger) => self.staging_inloop_nudge_due(trigger, projected).await,
+            None => false,
+        };
+        if staging_over {
             let freed_before = self.staging_eviction_bytes_total().await;
             let nudges_before = self.staging_trigger_nudges.load(Ordering::Relaxed);
             self.maybe_trigger_staging_eviction().await;
@@ -9034,7 +9078,9 @@ impl JournalConsolidator {
         // must be drained by a background pass rather than by the next upload. An idle
         // cycle nudges it when `write_cache_size` is over the staging byte trigger, and the
         // in-loop check nudges it when the projected staging figure is over it, so this call
-        // is the backstop rather than the only one. Unconditional here: it costs one
+        // is the backstop rather than the only one. That compares the counters at epoch 0
+        // only; at epoch 1 both nudges compare the last complete fold figure and never the
+        // counter. Unconditional here: it costs one
         // compare-exchange when a pass is already in flight, and `evict_staging_tier` is
         // where the figure is read on this path.
         // Requirements 3.1, 3.2
@@ -16393,6 +16439,151 @@ mod tests {
             "and the trigger is evaluated at once"
         );
         wait_staging_idle(&cache_manager).await;
+    }
+
+    /// The epoch-1 state for the two nudge sites: one shard figure of `fold_bytes`, the memo
+    /// derived from it, and the counter at `counter`. The epoch is activated by the caller.
+    async fn epoch_1_nudge_state(tmp: &TempDir, fold_bytes: u64, counter: u64) {
+        crate::staged_fold::seed_shard_figure_for_tests(
+            tmp.path(),
+            "test-bucket",
+            "3f",
+            fold_bytes,
+            1,
+        );
+        crate::staged_fold::invalidate_authority_snapshot_for_tests(tmp.path());
+        let figure = crate::staged_fold::authority_figure_for_tests(tmp.path())
+            .await
+            .expect("FIXTURE: the fold answers");
+        assert_eq!(
+            figure.resident_staged_bytes, fold_bytes,
+            "FIXTURE: the memo holds the seeded shard figure"
+        );
+        write_size_state_fields(tmp, 0, counter, 0);
+    }
+
+    /// Seed the first shard figure and activate the staged-authority epoch.
+    fn activate_epoch_1_for_nudges(tmp: &TempDir) {
+        crate::staged_fold::seed_shard_figure_for_tests(tmp.path(), "test-bucket", "3f", 1, 1);
+        assert!(
+            crate::staged_authority::activate(tmp.path(), "host:test").unwrap(),
+            "FIXTURE: epoch 1"
+        );
+    }
+
+    /// T2a: at epoch 1 the in-loop staging check follows the fold's figure, never the counter.
+    /// The counter over the 950-byte trigger with the fold under it does not nudge; the fold over
+    /// with the counter under does.
+    ///
+    /// Red side: the check comparing the projected counter, as it did before.
+    #[tokio::test]
+    async fn at_epoch_1_the_inloop_nudge_follows_the_fold_figure_not_the_counter() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager, cache_manager) = staging_inloop_fixture(&tmp);
+        activate_epoch_1_for_nudges(&tmp);
+        let mut state = InloopTriggerState::default();
+
+        epoch_1_nudge_state(&tmp, 500, 1_000).await;
+        consolidator.inloop_eviction_check(&mut state).await;
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            0,
+            "at epoch 1 a counter over the trigger (1,000 > 950) with the fold's figure under it \
+             (500) must not nudge"
+        );
+
+        epoch_1_nudge_state(&tmp, 1_000, 0).await;
+        consolidator.inloop_eviction_check(&mut state).await;
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            1,
+            "at epoch 1 the fold's figure over the trigger (1,000 > 950) must nudge whatever the \
+             counter (0) says"
+        );
+        wait_staging_idle(&cache_manager).await;
+    }
+
+    /// T2b: at epoch 1 the idle cycle follows the fold's figure. Under the trigger by the fold
+    /// (counter over), the idle path records its memo, the only path that writes it, and does
+    /// not nudge; over it by the fold (counter under), it nudges once.
+    ///
+    /// Red side: the idle path comparing the unprojected counter, as it did before. It takes
+    /// the cycle lock and nudges in the first state, and leaves the memo unset.
+    #[tokio::test]
+    async fn at_epoch_1_an_idle_cycle_follows_the_fold_figure() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager, cache_manager) = staging_inloop_fixture(&tmp);
+        activate_epoch_1_for_nudges(&tmp);
+
+        epoch_1_nudge_state(&tmp, 500, 1_000).await;
+        let reads_before = consolidator.idle_eviction_reads.load(Ordering::Relaxed);
+        consolidator.maybe_evict_on_idle_cycle().await;
+        assert_eq!(
+            consolidator.idle_eviction_reads.load(Ordering::Relaxed),
+            reads_before + 1,
+            "FIXTURE: the idle path reached its read"
+        );
+        assert!(
+            consolidator.idle_eviction_memo.lock().unwrap().is_some(),
+            "under the trigger by the fold's figure (500 < 950) the idle path must record its \
+             memo whatever the counter (1,000) says"
+        );
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            0,
+            "and must not nudge"
+        );
+
+        *consolidator.idle_eviction_memo.lock().unwrap() = None;
+        epoch_1_nudge_state(&tmp, 1_000, 0).await;
+        consolidator.maybe_evict_on_idle_cycle().await;
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            1,
+            "over the trigger by the fold's figure (1,000 > 950) the idle path must nudge once \
+             whatever the counter (0) says"
+        );
+        wait_staging_idle(&cache_manager).await;
+    }
+
+    /// T2f: the in-loop and idle checks never derive the authority figure.
+    /// With the memo expired they answer from it rather than re-reading every shard checkpoint
+    /// on the consolidation loop. The predicate is this directory's checkpoint-read tally, which
+    /// every derivation moves, rather than the process-global recompute counter, which parallel
+    /// tests in this binary also move.
+    ///
+    /// Red side: the nudge accessor deriving the figure instead of reading the memo.
+    #[tokio::test]
+    async fn the_inloop_and_idle_checks_never_derive_the_authority() {
+        let tmp = TempDir::new().unwrap();
+        let (consolidator, _journal_manager, _cache_manager) = staging_inloop_fixture(&tmp);
+        activate_epoch_1_for_nudges(&tmp);
+        epoch_1_nudge_state(&tmp, 500, 0).await;
+        assert!(
+            crate::staged_fold::age_authority_snapshot_for_tests(tmp.path(), 60),
+            "FIXTURE: the memo is present, and now expired"
+        );
+        let reads_before = crate::staged_fold::shard_checkpoint_reads_for_tests(tmp.path());
+
+        let mut state = InloopTriggerState::default();
+        consolidator.inloop_eviction_check(&mut state).await;
+        consolidator.maybe_evict_on_idle_cycle().await;
+
+        assert_eq!(
+            crate::staged_fold::shard_checkpoint_reads_for_tests(tmp.path()),
+            reads_before,
+            "the in-loop and idle checks must not derive the staged figure: each derivation \
+             reads every shard checkpoint, on the consolidation loop"
+        );
+        assert_eq!(
+            consolidator.staging_trigger_nudges(),
+            0,
+            "FIXTURE: under the trigger, so no pass was spawned to derive"
+        );
+        assert!(
+            consolidator.idle_eviction_memo.lock().unwrap().is_some(),
+            "the idle check answered (under the trigger) from the expired memo"
+        );
     }
 
     /// **Feature: consolidation-throughput, Property 1: All discovered keys are submitted for processing**

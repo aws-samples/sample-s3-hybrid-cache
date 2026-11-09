@@ -273,6 +273,14 @@ measured. These are the single-proxy and fleet figures of the table in
 [Sizing the metadata rate](AWS_DEPLOYMENT.md#sizing-the-metadata-rate), which owns them and their
 caveats.
 
+A write cache reclamation pass also recomputes the staged figure after it takes the eviction
+lock. The recomputation reads every shard checkpoint one at a time, up to 256 for each bucket,
+so its time grows with the number of buckets. A probe reading checkpoints the same way took a
+median of 56 to 78 s for 25,600 checkpoints (100 buckets) on EFS, and at most 108 s. On FSx for
+OpenZFS the median was 21 s and the maximum 27 s. The proxy's own recomputation reads more than
+the checkpoints and has not been timed at that size. On EFS with about 1,900 checkpoints, a
+whole metrics collection, which reads every checkpoint at least once, took 8 to 16 s.
+
 ### How the fleet shares the work
 
 When the work list is in use, one proxy selects and every proxy deletes, each working up to four
@@ -457,12 +465,14 @@ a pass, and both use the same `eviction_trigger_percent` and `eviction_target_pe
 hysteresis.
 
 A pass starts from the consolidation cycle, both while the cycle works through journal keys and
-once after it, so a write burst that fills the write cache during a long cycle is reclaimed
-within one `cache.shared_storage.consolidation_interval` rather than at the end of the cycle.
-The byte figure the in-cycle comparison reads is the recorded staging size plus every change the
-fleet has recorded and no cycle has applied. It reads slightly high while a cycle's own
-graduations are pending, so the effect is a pass that starts and finds little to reclaim, never a
-pass that is missed.
+once after it. A write burst that fills the write cache during a long cycle is then reclaimed
+within one `cache.shared_storage.consolidation_interval`, not at the end of the cycle.
+At `write_cache.staged_authority_epoch` `0`, the byte figure the in-cycle comparison reads is the
+recorded staging size plus every change the fleet has recorded and no cycle has applied. It reads
+slightly high while a cycle's own graduations are pending, so the effect is a pass that starts and
+finds little to reclaim, never a pass that is missed. At epoch `1` the comparison reads the last
+figure this proxy recomputed, without recomputing it, so it can start a pass late by that
+figure's age. The comparison after the cycle recomputes the figure when it is more than 5 s old.
 
 The count trigger matters because different workloads reach the two bounds. A workload of small
 uploads reaches the count limit with the byte allocation nearly empty, and once the limit is
@@ -541,8 +551,13 @@ persistent gap between them means entries are being lost or reclamation is not k
 ### Coordination across proxies
 
 Write cache reclamation takes the same eviction lock as read cache eviction, so only one proxy
-reclaims at a time, and it re-reads the staged total after taking the lock in case another
-proxy has already brought the write cache under its trigger.
+reclaims at a time. After taking the lock it re-reads the staged total, in case another proxy
+has already brought the write cache under its trigger. The holder keeps the lock until its
+pass ends, and a peer cannot take it over from a live holder; the exception is a holder whose
+NFS lease expires ([Distributed eviction](SHARED_STORAGE.md#distributed-eviction)). On EFS, a
+pass that removed about 4,800 staged objects held it for about 275 s. A peer that finds the lock older than
+`eviction_lock_timeout` logs `Eviction lock is stale` at `info`, tries once more, and skips its
+pass when the holder still has it.
 `eviction_coordination.staging_evictions_skipped_lock_held` counts passes skipped because the
 lock was held. The decision to reclaim is taken from shared state because the deletes land on
 the cache volume; a proxy acting on a private view of usage could delete data another proxy had
@@ -620,7 +635,7 @@ At epoch 1, `cache.write_cache_size` is recomputed from the cache's own `.meta` 
 rolling per-shard schedule. There is no debit to lose, so there is no drift to converge, and the
 daily scan is not the figure's only recovery.
 
-Two consequences for an operator:
+What this means for an operator:
 
 - **`write_cache.staged_authority_epoch` on `/metrics` says which computation is in force.**
   `0` is the event-maintained figure described above; `1` is the recomputed one. The transition
@@ -630,8 +645,71 @@ Two consequences for an operator:
 - **Expect a one-time step in `cache.write_cache_size` at the transition**, to the recomputed
   figure, possibly by a large factor. The step can go up or down: its size and sign are the old
   counter's accumulated error. Nothing is evicted and nothing is lost; the recomputed figure is
-  the correct one. On a volume only 3.0.0 proxies write, the figure between recomputations can only
-  overstate, so the eviction trigger fires early at worst and never late.
+  the correct one. Between recomputations the figure can overstate, so the eviction trigger can
+  fire early and a pass can remove more than it needs; the last item below gives the bound. It
+  can also understate, as the next item describes.
+- **When the recomputed figure cannot be read**, write cache reclamation removes nothing by size
+  on that pass. This happens most often when a proxy appending to its pending-credit file holds
+  that file's lock for more than 100 ms (`pending_lock_timeouts_total`). A pass recomputes the figure
+  after it takes the eviction lock and sizes itself from that alone. The staged range count limit
+  reads the same pending-credit files, so it can stop removing staged ranges in that pass too.
+  The check that decides whether to start a pass reads the last figure the proxy recomputed,
+  whatever its age, and so do the consolidation cycle's checks that start a pass. That figure can
+  understate by up to what was staged since, so a pass can start late by that interval. Before
+  the proxy has recomputed any figure, these checks start no pass by size. `/metrics` shows the
+  same last figure. Before the first one, it shows the event-maintained counter, which at epoch
+  1 is not debited when an object graduates, so it overstates by everything staged since the
+  last full validation scan, read or not. At epoch 1 no decision reads that counter.
+  A single failed pass only delays reclamation to a later pass. Several in a row point to a
+  persistent cause.
+  While neither limit removes staged objects, staged bytes can grow until the proxy stops caching
+  new uploads at `max_cache_size` ([Staying within `max_cache_size`](#staying-within-max_cache_size)).
+  Read caching is displaced on the way. The daily validation scan removes staged objects older
+  than `put_ttl`; in rolling mode it reaches each directory once per rotation, which can take
+  several days on a large cache. Uploads are still forwarded to S3 and reads are still served.
+  `write_cache.staging_figure_unknown_seconds` shows how long the proxy has been unable to
+  recompute the figure, counted from the last figure it recomputed. The metrics collector
+  recomputes it every `metrics.collection_interval` whether or not a pass runs, so the gauge
+  rises, or returns to `0`, within that interval plus one recomputation of the cause appearing
+  or clearing. The collector runs while `/metrics`, OTLP or the dashboard is enabled. With all
+  three off, only write cache reclamation and `/health` requests recompute the figure.
+  The gauge also reads above `0` while a recomputation has been running for 60 s or more, which
+  is how one that never finishes shows on `/metrics`. OTLP records the gauge only when a
+  collection finishes, so a collection stuck in its own recomputation leaves OTLP at its last
+  value. A recomputation's time grows with the number of buckets
+  ([What a pass reads](#what-a-pass-reads)). Where one takes 60 s or more, the gauge reads above
+  `0` for the rest of it in normal operation, so set any alert above the values it shows on
+  your volume.
+  The proxy logs an error when a recomputation finishes without a figure and the figure has
+  been unknown for 60 s or more. It repeats it at most every 10 minutes until a recomputation
+  produces a figure. A recomputation that never finishes logs no error. The usual persistent
+  cause is a damaged line in a file under
+  `metadata/_shard_state/staged_pending/`. A line is damaged when it is blank, or when it is not
+  a JSON record with the fields of a pending credit (`seq`, `bucket`, `l1` and `bytes`).
+  `jq -c . <file> > /dev/null` finds a line that is not valid JSON, but it stops at the first
+  such line, so repeat it after each removal until it is silent. It does not find a blank line
+  or a line of valid JSON that is not a pending credit, so compare any line that looks
+  different from its neighbors. Stop the proxy whose id is in the file name, remove only the
+  damaged lines, and start it again. Deleting the whole file also drops its
+  valid credits, and the staged figure then understates those bytes until the fold visits their
+  shards. The other cause is a proxy holding its pending-credit lock without releasing it, as
+  when its I/O on the volume has hung.
+- **After a pass removes objects, it recomputes the figure for the shards it removed from.** A
+  pass that starts after that recomputation sizes itself from the new figure. When the
+  recomputation cannot install a shard, that shard keeps its figure from before the removal until
+  a later recomputation reaches it. The next pass on any proxy can then size itself from that
+  figure and remove unread uploads a second time. A shard can fail to install for several
+  reasons. For example, another proxy holds it, a pending-credit file lock times out, or a ledger
+  file or a checkpoint cannot be read or written. The removing proxy visits that
+  shard first in its next periodic recomputation. The cost is lost unread uploads, never wrong
+  bytes served.
+- **A pass can remove more than it needs to.** The recomputed figure still counts an object read
+  for the first time, deleted or replaced since its shard was last recomputed. The proxy that
+  read, deleted or replaced it recomputes that shard in its next periodic recomputation,
+  normally within about 300 s. After a restart of that proxy, the shard waits for the periodic
+  rotation, up to about 24 hours. A pass sized meanwhile can take staged bytes below its target
+  by up to those bytes, removing unread uploads it did not need to. The cost is lost unread
+  uploads, never wrong bytes served.
 
 **Rolling back to a release without the recomputed figure is not supported once the epoch reads
 `1`.** To roll back after that point, move the fleet to a fresh cache volume as

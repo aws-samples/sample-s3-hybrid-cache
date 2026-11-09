@@ -10,11 +10,11 @@ see different memory use, connection counts, network exposure, or on-disk layout
 binary swap. The tables below list the releases that do one of those things, so you can
 read only the ones between your current version and your target.
 
-For 3.0.0 to 3.0.2, [Upgrading to 3.0.0](#upgrading-to-300), [Upgrading to 3.0.1](#upgrading-to-301), [Upgrading to 3.0.2](#upgrading-to-302) and the guides they link carry the detail, and
+For 3.0.0 to 3.0.3, [Upgrading to 3.0.0](#upgrading-to-300), [Upgrading to 3.0.1](#upgrading-to-301), [Upgrading to 3.0.2](#upgrading-to-302), [Upgrading to 3.0.3](#upgrading-to-303) and the guides they link carry the detail, and
 the [changelog](../CHANGELOG.md) summarizes each release. For every release up to 2.8.4,
 the detail is in the [pre-3.0.0 changelog](../changelog-pre-v3.md).
 
-3.0.0 upgrades in place from any 2.8 release, and 3.0.1 and 3.0.2 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
+3.0.0 upgrades in place from any 2.8 release, and 3.0.1, 3.0.2 and 3.0.3 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
 After 3.0.0, restart a fleet one proxy at a time. Clients that fail over, such as CRT-based ones, retry on another proxy while one restarts, and the cache volume survives restarts.
 Releases from before 1.0.0 are not covered. Upgrading from a pre-1.0.0 build is not a
 supported path; start from a fresh cache directory and a config derived from the
@@ -48,6 +48,7 @@ corrupted.
 
 | Version | Change on a binary-only upgrade |
 |---|---|
+| 3.0.3 | Write cache reclamation removes nothing by size while the recomputed staged figure cannot be read, and `write_cache.inflight_bytes` counts only uploads in flight; see [Upgrading to 3.0.3](#upgrading-to-303). |
 | 3.0.1 | Ranges a 2.x release cached, and part layouts recorded before 3.0.1, are fetched from S3 once, on first read; see [Upgrading to 3.0.1](#upgrading-to-301). |
 | public 2.8.2 | The first GET of an object cached by a PUT or multipart upload now makes one extra round trip to S3 (a conditional request) before serving, where previously it was served straight from cache with no S3 contact. Subsequent reads of the same object are unaffected. |
 | 2.8.0 | Expired GETs, including byte-range reads, revalidate with a conditional S3 request and serve cached bytes on `304`, so body transfers fall and `ttl_revalidations_total` rises; a lowered `get_ttl` applies to ranged reads of cached objects; orphan range files are no longer swept at startup; four log lines change fields. |
@@ -85,8 +86,19 @@ Releases not listed above require no action and change no defaults: internal fix
 performance work, additive opt-in features that stay disabled until configured, and
 dependency bumps.
 
-## Upgrading to 3.0.2
+## Upgrading to 3.0.3
 
+3.0.3 upgrades in place from 3.0.2 and needs no configuration change and no manual step. When upgrading from 3.0.1 or earlier, take the 3.0.2 (and 3.0.1) steps as well. It changes how write cache reclamation sizes itself, what the write cache figures on `/metrics` show while the staged figure cannot be recomputed, and what `write_cache.inflight_bytes` reports.
+
+### What you will see after upgrading to 3.0.3
+
+- While a pass cannot recompute the staged figure, write cache reclamation removes nothing by size, and the staged range count limit, which reads the same files, can stop removing ranges too. Staged bytes can then grow until the proxy stops caching new uploads at `max_cache_size`, displacing read caching ([When the recomputed figure cannot be read](EVICTION.md#which-computation-is-in-force)). Reclamation by size resumes on the first pass that can recompute the figure.
+- The new `write_cache.staging_figure_unknown_seconds` shows how long the proxy has been unable to recompute the figure, and the new `write_cache.staging_figure_unknown_passes_total` counts the passes that removed nothing by size. When a recomputation fails after the figure has been unknown for 60 s, the proxy logs an error, at most every 10 minutes.
+- The gauge also reads above `0` while a recomputation has run for 60 s or more, which on a cache volume with many buckets can happen in normal operation ([What a pass reads](EVICTION.md#what-a-pass-reads)). An alert on `> 0` then fires on a healthy proxy, so set its threshold above the values the gauge shows on your volume.
+- At `write_cache.staged_authority_epoch` `1`, while the staged figure cannot be recomputed, `cache.write_cache_size`, `cache.read_cache_size` and `write_cache.resident_bytes` come from the last figure the proxy recomputed, whatever its age. Until the proxy has recomputed one, `cache.write_cache_size` and `write_cache.resident_bytes` show the event-maintained counter, which overstates at that epoch.
+- During a rolling upgrade, a 3.0.2 proxy that cannot read the recomputed figure sizes a pass from its event-maintained counter at once. That counter overstates at epoch 1, so a 3.0.2 proxy can remove unread uploads a 3.0.3 proxy would keep. The difference ends when the last proxy is upgraded.
+- `write_cache.inflight_bytes` counts only uploads in flight, as its [reference entry](METRICS_REFERENCE.md#write_cache) describes. A dashboard that saw it read `0` after a reclamation pass now sees a figure that falls to `0` only when no upload is in flight.
+## Upgrading to 3.0.2
 3.0.2 upgrades in place from 3.0.1 and needs no configuration change: its one new field, `connection_pool.upstream_write_idle_timeout`, has a default. When upgrading from 3.0.0 or a 2.8 release, take the [3.0.1 steps](#upgrading-to-301) as well. Four kinds of deployment have a step to take before upgrading.
 
 ### Before upgrading to 3.0.2

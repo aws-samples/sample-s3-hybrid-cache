@@ -153,6 +153,8 @@ struct Instruments {
     pending_lock_waits_total: Gauge<u64>,
     pending_lock_wait_ms_total: Gauge<u64>,
     pending_lock_timeouts_total: Gauge<u64>,
+    staging_figure_unknown_seconds: Gauge<u64>,
+    staging_figure_unknown_passes_total: Gauge<u64>,
     staged_authority_snapshot_hits_total: Gauge<u64>,
     staged_authority_snapshot_recomputes_total: Gauge<u64>,
     ledger_repair_rotation_reachable: Gauge<u64>,
@@ -821,6 +823,10 @@ impl OtlpExporter {
             pending_lock_waits_total: g_u64!("write_cache.pending_lock_waits_total"),
             pending_lock_wait_ms_total: g_u64!("write_cache.pending_lock_wait_ms_total"),
             pending_lock_timeouts_total: g_u64!("write_cache.pending_lock_timeouts_total"),
+            staging_figure_unknown_seconds: g_u64!("write_cache.staging_figure_unknown_seconds"),
+            staging_figure_unknown_passes_total: g_u64!(
+                "write_cache.staging_figure_unknown_passes_total"
+            ),
             staged_authority_snapshot_hits_total: g_u64!(
                 "write_cache.staged_authority_snapshot_hits_total"
             ),
@@ -1475,6 +1481,10 @@ impl OtlpExporter {
                 .record(wc.pending_lock_wait_ms_total, a);
             i.pending_lock_timeouts_total
                 .record(wc.pending_lock_timeouts_total, a);
+            i.staging_figure_unknown_seconds
+                .record(wc.staging_figure_unknown_seconds, a);
+            i.staging_figure_unknown_passes_total
+                .record(wc.staging_figure_unknown_passes_total, a);
             i.staged_authority_snapshot_hits_total
                 .record(s.authority_snapshot_hits_total, a);
             i.staged_authority_snapshot_recomputes_total

@@ -11113,67 +11113,135 @@ impl CacheManager {
     /// the non-staged remainder, `R > total_size` and a sample taken in that window sees the
     /// identity fail.
     ///
-    /// # The fallback direction is the safe one, and it is a choice rather than an accident
+    /// # At epoch 1, the last complete fold figure of any age, and never the incumbent
     ///
     /// The fold's figure is [`None`] when a shard checkpoint is unreadable, when no fold has
-    /// completed, when a `.pending` file is unreadable, or when `P` is unreadable. Falling
-    /// back to the incumbent then is deliberate: the incumbent's measured failure is a
-    /// directional **over**-count of 4.28x-11.17x, so the trigger fires early at worst.
-    /// Reporting zero would be an under-count, and § 16.6.2's whole direction-safety argument
-    /// is that an under-count makes the trigger fire LATE — the direction that fills a
-    /// volume rather than the direction that wastes space.
+    /// completed, when a `.pending` file is unreadable, or when `P` is unreadable. The common
+    /// case is the third, and it is transient: one `{instance}.pending.lock` not acquired within
+    /// its 100 ms bound under write load, which the authority memo then holds for one TTL. This
+    /// process's last complete fold figure is then served whatever its age, and
+    /// `write_cache.staging_figure_unknown_seconds` says how old it is.
     ///
-    /// This premise fails while a binary older than 3.0.0 writes the volume: it applies
-    /// Graduation debits the fold epoch skips, so the incumbent under-counts and this arm's
-    /// trigger fires late.
+    /// That figure under-states by the bytes staged since it was taken and over-states by
+    /// whatever a graduation, a DELETE or an eviction removed since then, so it never sizes an
+    /// eviction. The staging pass sizes itself from [`Self::staging_pass_sizing_figure`], a fresh
+    /// derivation, and frees nothing on bytes when that has no figure. What reads this figure is
+    /// the pass's pre-lock trigger check, which only decides whether to take the eviction lock,
+    /// and the published composites.
     ///
-    /// Returns [`None`] only when there is no consolidator at all, i.e. neither figure
-    /// exists. Callers treat that as **fail open** exactly as before.
+    /// With neither, before this process's first complete derivation, this returns [`None`] at
+    /// epoch 1. The incumbent is never the answer there: graduation writes no debit at epoch 1,
+    /// so between validation scans it counts every byte staged since the last one, read or not
+    /// (measured at 1,313 GB against a fold figure of 0.48 GB). A decider skips the byte arm on
+    /// [`None`], and [`Self::get_cache_size_stats`] publishes the incumbent as a stand-in, marked
+    /// not fold-derived.
+    ///
+    /// At epoch 0 this returns [`None`] only when there is no consolidator, i.e. neither figure
+    /// exists. Callers treat [`None`] as **fail open**.
     ///
     /// Spec: cache-eviction-at-scale §§ 16.6.2, 16.6.6.
     pub(crate) async fn staged_authority(&self) -> Option<StagedFigure> {
-        self.staged_authority_with(false).await
-    }
-
-    /// [`Self::staged_authority`], with the incumbent arm optionally projected forward by the
-    /// pending delta files (`JournalConsolidator::projected_sizes`). Only the staging pass's
-    /// post-lock re-read projects: a previous pass flushed its write-cache debit to a delta
-    /// file before releasing the eviction lock, and `size_state` alone does not carry it until
-    /// a cycle collects it. The fold arm needs no projection: the pass re-folds every shard it
-    /// evicted from before it releases the lock.
-    async fn staged_authority_with(&self, project_incumbent: bool) -> Option<StagedFigure> {
         let consolidator = self.journal_consolidator.read().await.clone()?;
         if crate::staged_authority::fold_authority_active(&self.cache_dir) {
-            if let Some(figure) = crate::staged_fold::staged_authority_figure(&self.cache_dir).await
-            {
-                return Some(StagedFigure {
-                    resident_staged_bytes: figure.resident_staged_bytes,
-                    in_progress_part_bytes: figure.in_progress_part_bytes,
-                    fold_derived: true,
-                });
+            let (figure, reused_age_secs) =
+                crate::staged_fold::staged_authority_figure_or_recent(&self.cache_dir).await?;
+            if let Some(age_secs) = reused_age_secs {
+                debug!(
+                    "Staged authority: the fold's figure is unreadable for this read, \
+                     serving the last complete one, {}s old",
+                    age_secs
+                );
             }
-            debug!(
-                "Staged authority: the epoch is active but the fold's figure is unreadable, \
-                 falling back to the incumbent counter for this read. On a 3.0.0-only \
-                 fleet the incumbent OVER-states, so the trigger fires early rather than \
-                 late; while a binary older than 3.0.0 writes the volume it under-counts and \
-                 the trigger fires late. \
-                 staged_shard_authority_age_secs is the gauge that shows how long this has \
-                 been true."
-            );
+            return Some(StagedFigure {
+                resident_staged_bytes: figure.resident_staged_bytes,
+                in_progress_part_bytes: figure.in_progress_part_bytes,
+                fold_derived: true,
+            });
         }
         Some(StagedFigure {
             // `unwrap_or(0)` flattens the UNREADABLE sentinel to the permissive value:
             // pre-existing fail-open behaviour, logged at `warn!` in the getter.
-            resident_staged_bytes: if project_incumbent {
-                consolidator.get_projected_write_cache_size().await
-            } else {
-                consolidator.get_write_cache_size().await
-            }
-            .unwrap_or(0),
+            resident_staged_bytes: consolidator.get_write_cache_size().await.unwrap_or(0),
             in_progress_part_bytes: 0,
             fold_derived: false,
         })
+    }
+
+    /// `(staging_figure_unknown_seconds, staging_figure_unknown_passes_total)`.
+    ///
+    /// The seconds are a function of this process's authority derivations
+    /// (`staged_fold::authority_unknown_seconds`), which the metrics collector drives every
+    /// `collection_interval` whether or not a staging pass runs. The count is the locked passes
+    /// whose fresh derivation failed, `0` when `WriteCacheManager` is not initialized.
+    pub(crate) async fn get_staging_figure_unknown(&self) -> (u64, u64) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let seconds = crate::staged_fold::authority_unknown_seconds(&self.cache_dir, now_secs);
+        let passes = match self.write_cache_manager.read().await.as_ref() {
+            Some(wcm) => wcm.read().await.staging_figure_unknown_passes_total(),
+            None => 0,
+        };
+        (seconds, passes)
+    }
+
+    /// The staged figure a staging pass sizes itself from, read with the global eviction lock
+    /// held (R7.3).
+    ///
+    /// At epoch 1 it is the fold's figure derived now (`staged_fold::staged_authority_figure_fresh`):
+    /// never the memo, and never the last complete figure [`Self::staged_authority`] may serve.
+    /// Either can predate an eviction it does not account for, by this instance or a peer, and a
+    /// pass sized from it evicts the same band of unread uploads again. The derivation reads the
+    /// shard checkpoints from shared storage, and every pass re-folds the shards it evicted from
+    /// before it releases the lock, so it sees every earlier pass's re-fold that installed.
+    ///
+    /// `None` at epoch 1 when that derivation produces no figure, most often because one
+    /// `.pending` lock was not acquired within its bound. The pass then frees nothing on bytes:
+    /// the R7.5 fail-open rule [`Self::evict_staging_tier`] applies to an unreadable pre-lock
+    /// figure. The count arm reads the same pending-credit files, so it can stop in the same pass.
+    /// The pass never falls back to the incumbent, which at epoch 1
+    /// is not debited at graduation and so counts every byte staged since the last validation
+    /// scan, read or not.
+    ///
+    /// At epoch 0 it is the incumbent projected forward by the pending delta files
+    /// (`JournalConsolidator::projected_sizes`): a previous pass flushed its write-cache debit to
+    /// a delta file before releasing the eviction lock, and `size_state` alone does not carry it
+    /// until a cycle collects it. `None` then only when there is no consolidator.
+    async fn staging_pass_sizing_figure(&self) -> Option<u64> {
+        let consolidator = self.journal_consolidator.read().await.clone()?;
+        if crate::staged_authority::fold_authority_active(&self.cache_dir) {
+            let Some(figure) =
+                crate::staged_fold::staged_authority_figure_fresh(&self.cache_dir).await
+            else {
+                // `debug!`: each timeout is already logged at WARN where it happens, and the
+                // derivation logs an `error!` once the figure has stayed unknown for a minute.
+                debug!(
+                    "Staging eviction: the fold's staged figure could not be derived after \
+                     taking the eviction lock, so this pass removes nothing by size (fail-open). \
+                     The count arm reads the same pending-credit files and can stop removing \
+                     staged ranges in the same pass."
+                );
+                if let Some(wcm) = self.write_cache_manager.read().await.as_ref() {
+                    wcm.read().await.increment_staging_figure_unknown_passes();
+                }
+                return None;
+            };
+            return Some(
+                StagedFigure {
+                    resident_staged_bytes: figure.resident_staged_bytes,
+                    in_progress_part_bytes: figure.in_progress_part_bytes,
+                    fold_derived: true,
+                }
+                .write_cache_size(),
+            );
+        }
+        Some(
+            consolidator
+                .get_projected_write_cache_size()
+                .await
+                .unwrap_or(0),
+        )
     }
 
     /// Resident_Bytes: the staged figure the Staging_Bound is enforced against (R7.1).
@@ -11197,6 +11265,29 @@ impl CacheManager {
     /// Spec: cache-eviction-at-scale § 16.6.2.
     pub async fn get_staging_resident_bytes(&self) -> Option<u64> {
         Some(self.staged_authority().await?.write_cache_size())
+    }
+
+    /// Whether the staging byte arm is over its trigger by the fold's figure, for the
+    /// consolidation loop's in-loop and idle nudges at epoch 1.
+    ///
+    /// Reads the authority memo's figure of any age, else this process's last complete one, and
+    /// never derives: a derivation reads every shard checkpoint on shared storage, and these
+    /// checks run on the consolidation loop every interval. `None` when this process holds no
+    /// figure yet or the tier has no byte trigger; the caller then does not nudge, and the
+    /// end-of-cycle nudge and the pass's own pre-lock read decide. Epoch 1 only: at epoch 0 the
+    /// caller compares the counter it already read.
+    pub(crate) async fn staging_byte_arm_over_trigger_memo_only(&self) -> Option<bool> {
+        let (trigger, _target) = self.get_staging_eviction_thresholds();
+        if trigger == 0 {
+            return None;
+        }
+        let figure = crate::staged_fold::authority_memo_or_last_complete(&self.cache_dir)?;
+        let staged = StagedFigure {
+            resident_staged_bytes: figure.resident_staged_bytes,
+            in_progress_part_bytes: figure.in_progress_part_bytes,
+            fold_derived: true,
+        };
+        Some(staged.write_cache_size() > trigger)
     }
 
     /// The Staging_Bound: `write_cache_percent` of `max_cache_size`.
@@ -11505,11 +11596,21 @@ impl CacheManager {
                     resident > trigger
                 }
                 None => {
-                    warn!(
-                        "Staging eviction: Resident_Bytes unreadable from Size_State, skipping \
-                         the byte arm of this pass (fail-open). Write-through caching continues \
-                         unaffected."
-                    );
+                    if crate::staged_authority::fold_authority_active(&self.cache_dir) {
+                        // Epoch 1 with no figure derived yet in this process.
+                        // `write_cache.staging_figure_unknown_seconds` and the derivation's
+                        // `error!` carry the signal.
+                        debug!(
+                            "Staging eviction: no staged figure has been derived yet, skipping \
+                             the byte arm of this pass (fail-open)"
+                        );
+                    } else {
+                        warn!(
+                            "Staging eviction: Resident_Bytes unreadable from Size_State, \
+                             skipping the byte arm of this pass (fail-open). Write-through \
+                             caching continues unaffected."
+                        );
+                    }
                     false
                 }
             }
@@ -11535,6 +11636,11 @@ impl CacheManager {
         }
 
         // R7.3 / R7.4: exactly one instance evicts at a time, and a skip is counted.
+        // A live holder's `flock` blocks any takeover: `try_acquire_global_eviction_lock` treats
+        // an old lockfile as stale only if its second `try_lock` succeeds, and that fails while
+        // the holder's descriptor is open. So passes are serialised fleet-wide for as long as
+        // the holder lives, however long its sizing derivation takes. The one exception is a
+        // holder whose NFS lease expires.
         match self.try_acquire_global_eviction_lock().await {
             Ok(true) => {}
             Ok(false) => {
@@ -11597,14 +11703,13 @@ impl CacheManager {
         // while we waited, in which case there is nothing left to do and proceeding
         // would delete data that is now within bound.
         //
-        // Both arms are re-read, and neither one's re-read may abort the other's pass.
-        // Projected in Phase L: see `staged_authority_with`.
+        // Both arms are re-read, and neither one's re-read may abort the other's pass. The byte
+        // arm's re-read is a fresh derivation at epoch 1 and the projected incumbent in Phase L:
+        // see `staging_pass_sizing_figure`.
         let resident = if trigger == 0 {
             None
         } else {
-            self.staged_authority_with(true)
-                .await
-                .map(|f| f.write_cache_size())
+            self.staging_pass_sizing_figure().await
         };
         let bytes_to_free = match resident {
             Some(r) if r > trigger => r.saturating_sub(target),
@@ -11650,8 +11755,8 @@ impl CacheManager {
         // anything while logging a reassuring message about upgrades.
         //
         // The figure driving eviction is NOT decided here: `resident` above is
-        // `get_staging_resident_bytes`, which is the incumbent Size_State figure in Phase L and
-        // the fold's figure once the staged-authority epoch is 1 (`Self::staged_authority`).
+        // `staging_pass_sizing_figure`, which is the projected incumbent Size_State figure in
+        // Phase L and a fresh derivation of the fold's figure once the staged-authority epoch is 1.
         // What this read changed is the failure path only.
         //
         // New failure behaviour: an unreadable file, a discarded line, or a
@@ -16565,6 +16670,11 @@ impl CacheManager {
             resident_staged_bytes = staged.resident_staged_bytes;
             in_progress_part_bytes = staged.in_progress_part_bytes;
             fold_derived = staged.fold_derived;
+        } else if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
+            // Epoch 1 before this process's first complete derivation: `staged_authority` has no
+            // fold figure, and the incumbent is the stand-in, published as not fold-derived. No
+            // decision reads it.
+            resident_staged_bytes = consolidator.get_write_cache_size().await.unwrap_or(0);
         } else if let Some(write_cache_manager) = self.write_cache_manager.read().await.as_ref() {
             // No consolidator at all, so neither the fold nor the incumbent exists. The
             // per-instance in-flight counter is the only figure left; it was the fallback
@@ -32321,7 +32431,7 @@ mod total_cache_size_definition_tests {
     /// pins that the two halves compose — a legacy part record makes `P` unknown, which makes
     /// the fold's figure unknown, which falls back rather than under-counting.
     ///
-    /// A failure implicates `CacheManager::staged_authority`'s fallback arm.
+    /// A failure implicates `CacheManager::get_cache_size_stats`' no-figure arm.
     #[tokio::test(flavor = "multi_thread")]
     async fn after_activation_an_unreadable_fold_falls_back_to_the_incumbent_not_to_zero() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -32370,10 +32480,10 @@ mod total_cache_size_definition_tests {
         // read below would be served the pre-breakage figure and the fallback arm would never be
         // reached — the assertion would fail against 500 rather than exercising the fallback.
         //
-        // The production consequence has the same shape and is bounded: for up to one memo TTL
-        // after a staged input becomes unreadable, the last complete FOLD figure is served rather
-        // than the incumbent. That is within the direction the TTL's own reasoning permits, since
-        // the fold's figure is the more accurate of the two.
+        // The production consequence has the same shape: while a staged input stays unreadable,
+        // the last complete FOLD figure is served rather than the incumbent
+        // (`after_activation_a_held_pending_lock_serves_the_last_complete_fold_figure`). The clear
+        // drops that figure too, so this read reaches the incumbent.
         crate::staged_fold::invalidate_authority_snapshot_for_tests(temp.path());
         // And the walk itself: a decider composes on a kept walk up to
         // `PUBLISHED_WALK_BASE_MAX_AGE` old plus the published per-proxy growth since it, and the
@@ -32409,6 +32519,160 @@ mod total_cache_size_definition_tests {
             sizes.read_cache_size + sizes.write_cache_size,
             "the identity must hold in the FALLBACK arm too — that is what makes T51k need \
              no in-flight exclusion"
+        );
+    }
+
+    /// A `.pending` lock held through a derivation must not hand the staging trigger, or the
+    /// published composites, the incumbent while this process holds a complete fold figure, of
+    /// any age.
+    ///
+    /// The held lock is the production shape of the failure: every write-through upload appends
+    /// to its instance's `.pending` file under that lock, and a reader that cannot take it within
+    /// 100 ms reports the file unreadable. The incumbent is set far above the fold's figure, as it
+    /// stands at epoch 1 between validation scans, so a build that falls back to it is visible.
+    ///
+    /// A failure implicates `CacheManager::staged_authority`'s fold arm or
+    /// `staged_fold::staged_authority_figure_or_recent`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_activation_a_held_pending_lock_serves_the_last_complete_fold_figure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let manager = setup(dir);
+
+        const F_BYTES: u64 = 500;
+        const INCUMBENT_BYTES: u64 = 3_141_592_653;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = DISK_BYTES;
+        state.write_cache_size = INCUMBENT_BYTES;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+
+        crate::staged_fold::seed_shard_figure_for_tests(dir, "test-bucket", "3f", F_BYTES, 2);
+        // A peer's pending file, so a derivation has a lock to take.
+        let (pending_path, lock_path) =
+            crate::staged_fold::pending_paths_for_tests(dir, "peer-host:4242");
+        std::fs::create_dir_all(pending_path.parent().unwrap()).unwrap();
+        std::fs::write(&pending_path, b"").unwrap();
+        assert!(crate::staged_authority::activate(dir, "host:test").unwrap());
+
+        // With nothing held the fold answers, and this derivation is the last complete one.
+        assert_eq!(
+            manager.get_staging_resident_bytes().await,
+            Some(F_BYTES),
+            "fixture: the fold must answer before the lock is taken"
+        );
+
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&holder).expect("the test must own the pending lock");
+        assert!(
+            !crate::staged_fold::pending_read_all_complete_for_tests(dir).await,
+            "fixture: the held lock must make the pending term unreadable"
+        );
+
+        // One TTL on, the memo has expired, so the next read re-derives, cannot read the pending
+        // file, and memoises `None`.
+        crate::staged_fold::age_authority_snapshot_for_tests(
+            dir,
+            crate::staged_fold::AUTHORITY_SNAPSHOT_TTL_SECS,
+        );
+        let within = manager.get_staging_resident_bytes().await;
+        let published = manager
+            .get_cache_size_stats()
+            .await
+            .unwrap()
+            .sizes
+            .expect("get_cache_size_stats must always populate CacheSizes")
+            .write_cache_size;
+
+        // Still held, and the last complete figure is now 61 s older.
+        crate::staged_fold::age_authority_snapshot_for_tests(dir, 61);
+        let beyond = manager.get_staging_resident_bytes().await;
+        let _ = fs4::FileExt::unlock(&holder);
+
+        assert_eq!(
+            within,
+            Some(F_BYTES),
+            "one lock timeout must not size staging eviction from the incumbent: at epoch 1 it \
+             counts every byte staged since the last validation scan, read or not, and a pass \
+             sized from it evicts unread uploads down to its target"
+        );
+        assert_eq!(
+            published, F_BYTES,
+            "the published composite reads the same resolution point as the trigger"
+        );
+        assert_eq!(
+            beyond,
+            Some(F_BYTES),
+            "61 s on, the last complete fold figure is still served: at epoch 1 the incumbent \
+             is never the answer, of any age"
+        );
+    }
+
+    /// T2e: at epoch 1, before this process's first complete derivation, the composites publish
+    /// the incumbent as a stand-in, not the per-instance in-flight figure. A peer's pending lock
+    /// is held from the start, so no derivation in this process has produced a figure.
+    ///
+    /// Red side: the no-figure arm of `get_cache_size_stats` publishing
+    /// `WriteCacheManager::current_usage()` whenever `staged_authority` returns `None`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn before_the_first_complete_derivation_the_composites_publish_the_counter() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let manager = setup(dir);
+        const INCUMBENT_BYTES: u64 = 3_141_592_653;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = DISK_BYTES;
+        state.write_cache_size = INCUMBENT_BYTES;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+        crate::staged_fold::seed_shard_figure_for_tests(dir, "test-bucket", "3f", 500, 2);
+        let (pending_path, lock_path) =
+            crate::staged_fold::pending_paths_for_tests(dir, "peer-host:4242");
+        std::fs::create_dir_all(pending_path.parent().unwrap()).unwrap();
+        std::fs::write(&pending_path, b"").unwrap();
+        assert!(crate::staged_authority::activate(dir, "host:test").unwrap());
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&holder).expect("the test must own the pending lock");
+        crate::staged_fold::invalidate_authority_snapshot_for_tests(dir);
+
+        let resident = manager.get_staging_resident_bytes().await;
+        let sizes = manager
+            .get_cache_size_stats()
+            .await
+            .unwrap()
+            .sizes
+            .expect("get_cache_size_stats must always populate CacheSizes");
+        let _ = fs4::FileExt::unlock(&holder);
+
+        assert_eq!(
+            resident, None,
+            "FIXTURE: with no figure derived yet, no decider is handed one at epoch 1"
+        );
+        assert_eq!(
+            sizes.write_cache_size, INCUMBENT_BYTES,
+            "before the first complete derivation the published write_cache_size is the \
+             incumbent, the stand-in, not the per-instance in-flight figure"
+        );
+        assert_eq!(
+            sizes.total_cache_size,
+            sizes.read_cache_size + sizes.write_cache_size,
+            "the identity holds in the stand-in arm"
         );
     }
 
@@ -51749,3 +52013,152 @@ mod full_object_recheck_tests {
 
 #[cfg(test)]
 mod moved_fill_tests;
+
+/// I4 of the 3.0.3 capacity design: no epoch-1 decision reads the write-cache counter
+/// (`size_state.write_cache_size`). At epoch 1 graduation writes no debit, so the counter holds
+/// every byte staged since the last validation scan, read or not, and its error is unbounded in
+/// both directions.
+#[cfg(test)]
+mod epoch_one_counter_guard {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// `body` with every `#[cfg(test)] mod name { ... }` block removed, as `(line number, line)`.
+    /// Braces are counted outside `//` comments; the production files this reads keep them
+    /// balanced inside string literals.
+    fn production_lines(body: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = body.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let next_is_mod = lines.get(i + 1).is_some_and(|l| {
+                let t = l.trim_start();
+                let t = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
+                t.starts_with("mod ") && t.trim_end().ends_with('{')
+            });
+            if lines[i].trim() == "#[cfg(test)]" && next_is_mod {
+                let mut depth: i64 = 0;
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let code = lines[j].split("//").next().unwrap_or("");
+                    let opens = code.matches('{').count() as i64;
+                    let closes = code.matches('}').count() as i64;
+                    depth += opens - closes;
+                    if depth <= 0 && j > i + 1 {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j + 1;
+                continue;
+            }
+            out.push((i + 1, lines[i].to_string()));
+            i += 1;
+        }
+        out
+    }
+
+    /// The function a line belongs to: the name after the nearest preceding `fn `.
+    fn fn_name(code: &str) -> Option<String> {
+        let at = code.find("fn ")?;
+        if at > 0 && code[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let name: String = code[at + 3..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let rest = code[at + 3 + name.len()..].trim_start();
+        (!name.is_empty() && (rest.starts_with('(') || rest.starts_with('<'))).then_some(name)
+    }
+
+    /// `(file, enclosing fn, line, code)` for every production line of `src/*.rs`, comments
+    /// stripped.
+    fn production_code() -> Vec<(String, String, usize, String)> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut paths: Vec<_> = std::fs::read_dir(&src)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            let mut current = String::from("<top>");
+            for (n, line) in production_lines(&std::fs::read_to_string(&path).unwrap()) {
+                let code = line.split("//").next().unwrap_or("").to_string();
+                if let Some(name) = fn_name(&code) {
+                    current = name;
+                }
+                out.push((file.clone(), current.clone(), n, code));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_epoch_one_decision_reads_the_write_cache_counter() {
+        let code = production_code();
+
+        // Rule 2: the two consolidation-loop nudge sites read no counter at all. Their epoch-0
+        // comparison goes through `staging_inloop_nudge_due` and `staging_idle_nudge_due`, which
+        // read the counter only after `staging_fold_nudge_verdict` says epoch 0, so a counter
+        // token in either body is an epoch-1 read. Checked first so a red side names the sites.
+        const NUDGE_SITES: [&str; 2] = ["inloop_eviction_check", "maybe_evict_on_idle_cycle"];
+        const COUNTER_TOKENS: [&str; 3] = ["write_cache", "projected.1", ").1"];
+        let offenders: Vec<String> = code
+            .iter()
+            .filter(|(file, func, _, _)| {
+                file == "journal_consolidator.rs" && NUDGE_SITES.contains(&func.as_str())
+            })
+            .filter(|(_, _, _, line)| COUNTER_TOKENS.iter().any(|t| line.contains(t)))
+            .map(|(file, func, n, line)| format!("{file}:{n} in {func}: {}", line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a consolidation-loop nudge site reads the write-cache counter outside the epoch-0 \
+             helpers: {offenders:#?}"
+        );
+
+        // Rule 1: every production caller of the consolidator's counter getters, by function.
+        let callers: BTreeSet<String> = code
+            .iter()
+            .filter(|(_, _, _, line)| {
+                (line.contains("get_write_cache_size(")
+                    || line.contains("get_projected_write_cache_size("))
+                    && !line.contains("fn get_write_cache_size")
+                    && !line.contains("fn get_projected_write_cache_size")
+            })
+            .map(|(file, func, _, _)| format!("{file}::{func}"))
+            .collect();
+        let expected: BTreeSet<String> = [
+            // The epoch-0 arm, after `fold_authority_active` returns at epoch 1.
+            "cache.rs::staged_authority",
+            // The epoch-0 arm of the post-lock sizing read.
+            "cache.rs::staging_pass_sizing_figure",
+            // Publication before this process's first complete derivation (a stand-in, never a
+            // decision).
+            "cache.rs::get_cache_size_stats",
+            // The validation census and its metrics.
+            "cache_initialization_coordinator.rs::cross_validate_subsystems",
+            "cache_size_tracker.rs::get_metrics",
+            "cache_size_tracker.rs::get_write_cache_size",
+            "cache_size_tracker.rs::perform_full_validation",
+            // The projection itself, read at epoch 0 by the in-loop helper and the sizing read.
+            "journal_consolidator.rs::projected_sizes",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            callers, expected,
+            "the production callers of get_write_cache_size / get_projected_write_cache_size \
+             changed; a new one must be an epoch-0 arm, the census, or pre-first-derivation \
+             publication, and be added here with its reason"
+        );
+    }
+}

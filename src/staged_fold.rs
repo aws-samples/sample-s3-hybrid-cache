@@ -931,6 +931,10 @@ struct AuthoritySnapshot {
     derived_at_secs: u64,
     /// `None` is UNREADABLE, never a zero.
     figure: Option<StagedAuthorityFigure>,
+    /// The newest derivation that produced a figure, with its `taken_at_secs`. Carried across a
+    /// derivation that produces `None`, and kept when the memo is expired, so
+    /// [`staged_authority_figure_or_recent`] can serve it.
+    last_complete: Option<(u64, StagedAuthorityFigure)>,
 }
 
 /// Calls served from the memo, and calls that re-derived it, since process start.
@@ -943,6 +947,175 @@ struct AuthoritySnapshot {
 /// shared-volume reads it exists to remove are still being paid.
 static AUTHORITY_SNAPSHOT_HITS: AtomicU64 = AtomicU64::new(0);
 static AUTHORITY_SNAPSHOT_RECOMPUTES: AtomicU64 = AtomicU64::new(0);
+
+/// How long this process must have been unable to derive the staged byte figure before an
+/// `error!` is logged. Contention alone does not sustain it: at the measured 4% to 9% per-attempt
+/// failure rate, six failures in a row (30 s at one attempt per 5 s) are expected less than once in
+/// a hundred days. A minute is twice that, so a run this long points at a persistent cause.
+pub(crate) const STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS: u64 = 60;
+/// Minimum seconds between two of those `error!` lines.
+pub(crate) const STAGING_FIGURE_UNKNOWN_ERROR_INTERVAL_SECS: u64 = 600;
+
+/// This process's record of its authority derivations for one cache directory: the state
+/// `write_cache.staging_figure_unknown_seconds` is a function of ([`authority_unknown_seconds`]).
+///
+/// Every derivation writes it, from both memo installers, so it does not depend on whether a
+/// staging pass runs: the metrics collector derives every `collection_interval` on every proxy.
+///
+/// Kept beside [`AUTHORITY_SNAPSHOT`], keyed the same way, rather than inside it: an attempt is
+/// recorded before its first read, and a memo entry created then would hold no figure, which a
+/// scrape serves instead of deriving inline before this process's first derivation. Never touched
+/// by [`expire_authority_snapshot`].
+#[derive(Debug, Clone, Default)]
+struct AuthorityAttempts {
+    /// When this process first began a derivation for the directory.
+    first_attempt_at_secs: u64,
+    /// When the most recent derivation finished, by the wall clock rather than the walk-dated
+    /// `taken_at_secs` of a scrape's refresh. `0` until one has finished.
+    last_attempt_at_secs: u64,
+    /// Whether that derivation produced a figure.
+    last_attempt_complete: bool,
+    /// `taken_at_secs` of the newest derivation that produced a figure, as the memo's
+    /// `last_complete` carries it. `0` when none has.
+    last_complete_at_secs: u64,
+    /// When the sustained-unknown `error!` was last logged, `0` since the last complete
+    /// derivation.
+    last_error_at_secs: u64,
+    /// Start time of each derivation still in flight, by attempt id, so a derivation that never
+    /// returns (a holder stuck in shared-storage I/O) still shows as unknown.
+    in_flight: BTreeMap<u64, u64>,
+}
+
+static AUTHORITY_ATTEMPTS: Mutex<BTreeMap<u64, AuthorityAttempts>> = Mutex::new(BTreeMap::new());
+static AUTHORITY_ATTEMPT_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// One derivation in flight. Dropping it removes it from its record, which also covers a
+/// derivation whose future is dropped before it finishes.
+struct AuthorityAttemptGuard {
+    tag: u64,
+    id: u64,
+}
+
+impl Drop for AuthorityAttemptGuard {
+    fn drop(&mut self) {
+        let mut map = AUTHORITY_ATTEMPTS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = map.get_mut(&self.tag) {
+            record.in_flight.remove(&self.id);
+        }
+    }
+}
+
+/// Record that a derivation for `tag` begins now, before its first read.
+fn begin_authority_attempt(tag: u64, now_secs: u64) -> AuthorityAttemptGuard {
+    let id = AUTHORITY_ATTEMPT_IDS.fetch_add(1, Ordering::Relaxed);
+    let mut map = AUTHORITY_ATTEMPTS.lock().unwrap_or_else(|p| p.into_inner());
+    // The memo's bound, for the memo's reason; only a test binary reaches it.
+    if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
+        map.clear();
+    }
+    let record = map.entry(tag).or_default();
+    if record.first_attempt_at_secs == 0 {
+        record.first_attempt_at_secs = now_secs;
+    }
+    record.in_flight.insert(id, now_secs);
+    AuthorityAttemptGuard { tag, id }
+}
+
+/// Record a finished derivation whose inputs date from `taken_at_secs`. Returns the seconds to
+/// report when the sustained-unknown `error!` is due now; the caller logs it after this returns,
+/// so it is never logged under a lock.
+fn finish_authority_attempt(
+    tag: u64,
+    now_secs: u64,
+    taken_at_secs: u64,
+    complete: bool,
+) -> Option<u64> {
+    let mut map = AUTHORITY_ATTEMPTS.lock().unwrap_or_else(|p| p.into_inner());
+    let record = map.entry(tag).or_default();
+    if record.first_attempt_at_secs == 0 {
+        record.first_attempt_at_secs = now_secs;
+    }
+    record.last_attempt_at_secs = now_secs;
+    record.last_attempt_complete = complete;
+    if complete {
+        record.last_complete_at_secs = record.last_complete_at_secs.max(taken_at_secs);
+        record.last_error_at_secs = 0;
+        return None;
+    }
+    let unknown_for = unknown_error_due(record, now_secs)?;
+    record.last_error_at_secs = now_secs;
+    Some(unknown_for)
+}
+
+/// The time from which this process has published a stale figure or none: its newest complete
+/// figure, or its first attempt when that is later (a process started during a wedge).
+fn known_until(record: &AuthorityAttempts) -> u64 {
+    record
+        .last_complete_at_secs
+        .max(record.first_attempt_at_secs)
+}
+
+/// `write_cache.staging_figure_unknown_seconds` over one record: `0` with no record and no
+/// finished attempt, `0` while the most recent finished attempt produced a figure, and otherwise
+/// `now - known_until`. A derivation in flight for at least
+/// [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS`] also reads as unknown, whatever the last finished
+/// one found.
+fn unknown_seconds_of(record: Option<&AuthorityAttempts>, now_secs: u64) -> u64 {
+    let Some(record) = record else {
+        return 0;
+    };
+    let stuck = record.in_flight.values().min().is_some_and(|&started| {
+        now_secs.saturating_sub(started) >= STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS
+    });
+    if stuck {
+        return now_secs.saturating_sub(known_until(record));
+    }
+    if record.last_attempt_at_secs == 0 || record.last_attempt_complete {
+        return 0;
+    }
+    now_secs.saturating_sub(known_until(record))
+}
+
+/// Whether the sustained-unknown `error!` is due at `now_secs`: the most recent attempt failed,
+/// the figure has been unknown for at least [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS`], and none
+/// was logged in the last [`STAGING_FIGURE_UNKNOWN_ERROR_INTERVAL_SECS`]. The seconds unknown when
+/// due.
+fn unknown_error_due(record: &AuthorityAttempts, now_secs: u64) -> Option<u64> {
+    if record.last_attempt_at_secs == 0 || record.last_attempt_complete {
+        return None;
+    }
+    let unknown_for = now_secs.saturating_sub(known_until(record));
+    if unknown_for < STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS {
+        return None;
+    }
+    if record.last_error_at_secs != 0
+        && now_secs.saturating_sub(record.last_error_at_secs)
+            < STAGING_FIGURE_UNKNOWN_ERROR_INTERVAL_SECS
+    {
+        return None;
+    }
+    Some(unknown_for)
+}
+
+/// Seconds this process has been unable to derive `cache_dir`'s staged byte figure, as
+/// `write_cache.staging_figure_unknown_seconds` publishes it. See [`unknown_seconds_of`].
+pub(crate) fn authority_unknown_seconds(cache_dir: &Path, now_secs: u64) -> u64 {
+    let map = AUTHORITY_ATTEMPTS.lock().unwrap_or_else(|p| p.into_inner());
+    unknown_seconds_of(map.get(&dir_tag(cache_dir)), now_secs)
+}
+
+/// The sustained-unknown `error!`, at most once per [`STAGING_FIGURE_UNKNOWN_ERROR_INTERVAL_SECS`].
+fn log_staging_figure_unknown(unknown_for: u64) {
+    tracing::error!(
+        "The staged byte figure could not be derived for {unknown_for} s. While it cannot, \
+         staging eviction removes nothing by size and the count limit removes nothing either, \
+         so staged bytes can grow until caching of new uploads stops at max_cache_size. Likely \
+         causes: a malformed or unreadable file in metadata/_shard_state/staged_pending, an \
+         unreadable shard checkpoint, an unreadable in-progress multipart part record, or a \
+         proxy holding its pending-credit lock without releasing it. See docs/EVICTION.md, \
+         \"When the recomputed figure cannot be read\"."
+    );
+}
 
 /// Expire the memoised authority figure for `cache_dir` without dropping it.
 ///
@@ -1009,7 +1182,8 @@ pub(crate) fn invalidate_authority_snapshot_for_tests(cache_dir: &Path) {
 }
 
 /// Move `cache_dir`'s memoised authority figure `secs` into the past, so it is present but
-/// expired. `false` when there is no memo to age.
+/// expired. Its last complete figure moves with it, and so does the attempt record
+/// `staging_figure_unknown_seconds` reads. `false` when there is no memo to age.
 ///
 /// Distinct from [`invalidate_authority_snapshot_for_tests`]: an absent memo and an expired one are
 /// different states for a reader that may serve a stale figure rather than re-derive it.
@@ -1020,6 +1194,25 @@ pub(crate) fn age_authority_snapshot_for_tests(cache_dir: &Path, secs: u64) -> b
         Some(snapshot) => {
             snapshot.taken_at_secs = snapshot.taken_at_secs.saturating_sub(secs);
             snapshot.derived_at_secs = snapshot.derived_at_secs.saturating_sub(secs);
+            if let Some((at, _)) = snapshot.last_complete.as_mut() {
+                *at = at.saturating_sub(secs);
+            }
+            let mut attempts = AUTHORITY_ATTEMPTS.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(record) = attempts.get_mut(&dir_tag(cache_dir)) {
+                for at in [
+                    &mut record.first_attempt_at_secs,
+                    &mut record.last_attempt_at_secs,
+                    &mut record.last_complete_at_secs,
+                    &mut record.last_error_at_secs,
+                ] {
+                    if *at != 0 {
+                        *at = at.saturating_sub(secs);
+                    }
+                }
+                for started in record.in_flight.values_mut() {
+                    *started = started.saturating_sub(secs);
+                }
+            }
             true
         }
         None => false,
@@ -5391,6 +5584,56 @@ fn spawn_authority_refresh(cache_dir: &Path) {
     });
 }
 
+/// [`staged_authority_figure`], or, when that is unknown, this process's last complete figure of
+/// any age, paired with its age in seconds. `None` when neither exists.
+///
+/// The second element is `None` for a figure derived or memoised now, and the reused figure's age
+/// otherwise. A reused figure can under-state by the bytes staged since it was taken and
+/// over-state by whatever was removed since; neither sizes an eviction, which reads
+/// [`staged_authority_figure_fresh`]. Its age is what `write_cache.staging_figure_unknown_seconds`
+/// publishes.
+pub(crate) async fn staged_authority_figure_or_recent(
+    cache_dir: &Path,
+) -> Option<(StagedAuthorityFigure, Option<u64>)> {
+    if let Some(figure) = staged_authority_figure(cache_dir).await {
+        return Some((figure, None));
+    }
+    let (taken_at_secs, figure) = AUTHORITY_SNAPSHOT
+        .lock()
+        .ok()?
+        .get(&dir_tag(cache_dir))?
+        .last_complete?;
+    Some((figure, Some(unix_secs().saturating_sub(taken_at_secs))))
+}
+
+/// The memo's figure of any age, else this process's last complete figure, and never a
+/// derivation. `None` when this process holds neither.
+///
+/// For the consolidation loop's in-loop and idle staging nudges at epoch 1
+/// (`CacheManager::staging_byte_arm_over_trigger_memo_only`): a derivation reads every shard
+/// checkpoint on shared storage, and those checks run on the loop every interval.
+pub(crate) fn authority_memo_or_last_complete(cache_dir: &Path) -> Option<StagedAuthorityFigure> {
+    let map = AUTHORITY_SNAPSHOT.lock().ok()?;
+    let snapshot = map.get(&dir_tag(cache_dir))?;
+    snapshot
+        .figure
+        .or_else(|| snapshot.last_complete.map(|(_, figure)| figure))
+}
+
+/// [`staged_authority_figure`] derived now: never served from the memo, and never the last
+/// complete figure. The result is installed in the memo as any deciding derivation's is.
+///
+/// The staging pass's post-lock read sizes an eviction from this
+/// (`CacheManager::staging_pass_sizing_figure`). A memoised or last complete figure can predate
+/// an eviction, by this instance or a peer, that it does not account for, and sizing from it
+/// evicts the same band again. The shard checkpoints this reads are re-folded by the evicting
+/// pass before it releases the eviction lock.
+pub(crate) async fn staged_authority_figure_fresh(
+    cache_dir: &Path,
+) -> Option<StagedAuthorityFigure> {
+    rederive_authority_snapshot(cache_dir, dir_tag(cache_dir), unix_secs()).await
+}
+
 /// The staged figure the trigger and the published composites read, or `None` when it is
 /// unknown.
 ///
@@ -5398,8 +5641,9 @@ fn spawn_authority_refresh(cache_dir: &Path) {
 /// completed on this volume, when a `.pending` file is unreadable, or when `P` is unreadable.
 /// Every one of those states is indistinguishable from an empty staging tier if reported as
 /// `0`, and an empty staging tier is the healthiest possible reading: it would silently stop
-/// staging eviction. The caller's obligation on `None` is to fall back to a figure that
-/// **over**-states rather than under-states — see `CacheManager::staged_authority`.
+/// staging eviction. On `None` a deciding caller skips the byte arm, serving this process's last
+/// complete figure where it has one (`CacheManager::staged_authority`), and a pass sizing an
+/// eviction frees nothing on bytes (`CacheManager::staging_pass_sizing_figure`).
 ///
 /// Shares its inputs with [`collect_staged_fold_gauges`] and computes the same terms, but is
 /// a separate entry point on purpose: the gauge collector also computes the incumbent gap,
@@ -5467,6 +5711,7 @@ async fn rederive_authority_snapshot(
     now_secs: u64,
 ) -> Option<StagedAuthorityFigure> {
     AUTHORITY_SNAPSHOT_RECOMPUTES.fetch_add(1, Ordering::Relaxed);
+    let attempt = begin_authority_attempt(tag, unix_secs());
     let fresh = staged_authority_figure_uncached(cache_dir).await;
 
     if let Ok(mut map) = AUTHORITY_SNAPSHOT.lock() {
@@ -5477,16 +5722,40 @@ async fn rederive_authority_snapshot(
         if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
             map.clear();
         }
+        let last_complete = last_complete_after(map.get(&tag), fresh, now_secs);
         map.insert(
             tag,
             AuthoritySnapshot {
                 taken_at_secs: now_secs,
                 derived_at_secs: now_secs,
                 figure: fresh,
+                last_complete,
             },
         );
     }
+    let due = finish_authority_attempt(tag, unix_secs(), now_secs, fresh.is_some());
+    drop(attempt);
+    if let Some(unknown_for) = due {
+        log_staging_figure_unknown(unknown_for);
+    }
     fresh
+}
+
+/// The `last_complete` a memo entry carries once a derivation taken at `taken_at_secs` has
+/// produced `fresh`: `fresh` when it is a figure and no older than the one `previous` carries,
+/// otherwise `previous`'s.
+fn last_complete_after(
+    previous: Option<&AuthoritySnapshot>,
+    fresh: Option<StagedAuthorityFigure>,
+    taken_at_secs: u64,
+) -> Option<(u64, StagedAuthorityFigure)> {
+    let kept = previous.and_then(|s| s.last_complete);
+    match fresh {
+        Some(figure) if kept.is_none_or(|(at, _)| taken_at_secs >= at) => {
+            Some((taken_at_secs, figure))
+        }
+        _ => kept,
+    }
 }
 
 /// A scrape's derivation: [`rederive_authority_snapshot`] with `P` from the last walk of
@@ -5519,27 +5788,38 @@ async fn rederive_authority_snapshot_from_kept_walk(
         .saturating_add(u64::from(walk_age.subsec_nanos() > 0));
     let taken_at_secs = now_secs.saturating_sub(walk_age_secs);
     AUTHORITY_SNAPSHOT_RECOMPUTES.fetch_add(1, Ordering::Relaxed);
+    let attempt = begin_authority_attempt(tag, unix_secs());
     let fresh = staged_authority_figure_from(cache_dir, Some(kept.walk)).await;
 
     if let Ok(mut map) = AUTHORITY_SNAPSHOT.lock() {
-        if map
-            .get(&tag)
-            .is_some_and(|current| current.taken_at_secs > taken_at_secs)
+        if let Some(current) = map
+            .get_mut(&tag)
+            .filter(|current| current.taken_at_secs > taken_at_secs)
         {
-            return fresh;
+            // Not installed, but a complete figure newer than the entry's last one still is.
+            current.last_complete = last_complete_after(Some(current), fresh, taken_at_secs);
+        } else {
+            // The same bound as the deciding derivation; see there.
+            if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
+                map.clear();
+            }
+            let last_complete = last_complete_after(map.get(&tag), fresh, taken_at_secs);
+            map.insert(
+                tag,
+                AuthoritySnapshot {
+                    taken_at_secs,
+                    derived_at_secs: now_secs,
+                    figure: fresh,
+                    last_complete,
+                },
+            );
         }
-        // The same bound as the deciding derivation; see there.
-        if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
-            map.clear();
-        }
-        map.insert(
-            tag,
-            AuthoritySnapshot {
-                taken_at_secs,
-                derived_at_secs: now_secs,
-                figure: fresh,
-            },
-        );
+    }
+    // An attempt either way, installed or not: the derivation ran and found what it found.
+    let due = finish_authority_attempt(tag, unix_secs(), taken_at_secs, fresh.is_some());
+    drop(attempt);
+    if let Some(unknown_for) = due {
+        log_staging_figure_unknown(unknown_for);
     }
     fresh
 }
@@ -5548,7 +5828,7 @@ async fn rederive_authority_snapshot_from_kept_walk(
 /// reads, keyed by [`dir_tag`]. Tests only: it is how a fixture puts a peer's install and the
 /// credit owner's pending GC inside the reader's window, which in production is a race.
 #[cfg(test)]
-type AuthorityBetweenReadsHook =
+pub(crate) type AuthorityBetweenReadsHook =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 #[cfg(test)]
@@ -5558,7 +5838,10 @@ static AUTHORITY_BETWEEN_READS_HOOK: Mutex<BTreeMap<u64, AuthorityBetweenReadsHo
 /// Register `hook` to run once, between the next authority derivation's two reads for
 /// `cache_dir`.
 #[cfg(test)]
-fn set_authority_between_reads_hook_for_tests(cache_dir: &Path, hook: AuthorityBetweenReadsHook) {
+pub(crate) fn set_authority_between_reads_hook_for_tests(
+    cache_dir: &Path,
+    hook: AuthorityBetweenReadsHook,
+) {
     AUTHORITY_BETWEEN_READS_HOOK
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -8196,6 +8479,45 @@ mod tests {
             "one shard past Max_Authority_Age makes the rotation incomplete: an authority \
              is only as fresh as its stalest component, so this must read the MAXIMUM over \
              shards and not the minimum"
+        );
+    }
+
+    /// The last complete figure a memo entry carries: a derivation that produced no figure keeps
+    /// the previous one, a newer complete one replaces it, and an older one does not. The older
+    /// case is a scrape's refresh, dated by the walk it composes on, arriving after a deciding
+    /// reader's own derivation.
+    #[test]
+    fn a_derivation_without_a_figure_keeps_the_last_complete_one() {
+        let figure = |bytes| StagedAuthorityFigure {
+            resident_staged_bytes: bytes,
+            in_progress_part_bytes: 0,
+        };
+        let previous = AuthoritySnapshot {
+            taken_at_secs: 100,
+            derived_at_secs: 100,
+            figure: None,
+            last_complete: Some((90, figure(1))),
+        };
+
+        assert_eq!(last_complete_after(None, None, 100), None);
+        assert_eq!(
+            last_complete_after(None, Some(figure(1)), 100),
+            Some((100, figure(1)))
+        );
+        assert_eq!(
+            last_complete_after(Some(&previous), None, 100),
+            Some((90, figure(1))),
+            "an unreadable derivation must keep the last complete figure, or the fallback it \
+             exists for never has one to serve"
+        );
+        assert_eq!(
+            last_complete_after(Some(&previous), Some(figure(2)), 100),
+            Some((100, figure(2)))
+        );
+        assert_eq!(
+            last_complete_after(Some(&previous), Some(figure(2)), 80),
+            Some((90, figure(1))),
+            "a figure dated before the kept one must not replace it"
         );
     }
 
@@ -13323,5 +13645,130 @@ mod warn_remedy_tests {
         // 512 visits per pass x (86,400 / 300) passes: the figure docs/CONFIGURATION.md quotes.
         assert_eq!(shards_reachable_per_instance(), 147_456);
         assert!(shards_per_pass(147_456) <= SHARD_VISITS_PER_PASS_CEILING);
+    }
+}
+
+/// The unknown-figure signal of the 3.0.3 design (§ 3): a function of this process's derivation
+/// attempts, never of staging-pass events.
+#[cfg(test)]
+mod authority_unknown_tests {
+    use super::*;
+
+    fn record(first: u64, complete_at: u64, attempt_at: u64, complete: bool) -> AuthorityAttempts {
+        AuthorityAttempts {
+            first_attempt_at_secs: first,
+            last_attempt_at_secs: attempt_at,
+            last_attempt_complete: complete,
+            last_complete_at_secs: complete_at,
+            ..AuthorityAttempts::default()
+        }
+    }
+
+    /// T1a: the gauge over constructed records.
+    #[test]
+    fn authority_unknown_seconds_is_a_function_of_the_memo() {
+        assert_eq!(
+            unknown_seconds_of(Some(&record(100, 100, 150, false)), 200),
+            100,
+            "a failed attempt after a complete figure taken at 100 reads now - 100"
+        );
+        assert_eq!(
+            unknown_seconds_of(Some(&record(100, 210, 210, true)), 211),
+            0,
+            "a complete most recent attempt reads 0"
+        );
+        assert_eq!(
+            unknown_seconds_of(Some(&record(100, 0, 150, false)), 200),
+            100,
+            "with no complete figure ever, the gauge counts from the first attempt"
+        );
+        assert_eq!(unknown_seconds_of(None, 200), 0, "no record reads 0");
+        assert_eq!(
+            unknown_seconds_of(Some(&record(100, 0, 0, false)), 200),
+            0,
+            "an attempt begun recently and not finished reads 0"
+        );
+    }
+
+    /// T1c: the `error!` is due at 60 s, then not again for 600 s, and a complete derivation
+    /// restarts the clock.
+    #[test]
+    fn the_error_is_due_at_sixty_seconds_and_every_six_hundred() {
+        let tag = u64::MAX - 0x7731;
+        AUTHORITY_ATTEMPTS
+            .lock()
+            .unwrap()
+            .insert(tag, record(1_000, 1_000, 1_000, true));
+        let due = |now: u64| finish_authority_attempt(tag, now, now, false);
+        assert_eq!(due(1_059), None, "not due at 59 s");
+        assert_eq!(due(1_060), Some(60), "due at 60 s");
+        assert_eq!(due(1_065), None, "not again inside 600 s");
+        assert_eq!(due(1_660), Some(660), "due again 600 s after the last");
+        assert_eq!(
+            finish_authority_attempt(tag, 1_661, 1_661, true),
+            None,
+            "a complete derivation logs nothing"
+        );
+        assert_eq!(due(1_720), None, "a new run is not due at 59 s");
+        assert_eq!(due(1_721), Some(60), "a new run is due at 60 s again");
+        AUTHORITY_ATTEMPTS.lock().unwrap().remove(&tag);
+    }
+
+    /// T1e: a derivation that never returns installs nothing, and still
+    /// shows as unknown once it has been in flight for the `error!` threshold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_derivation_that_never_returns_shows_as_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (pending, _) = pending_paths_for_tests(&dir, "t1e-host:1");
+        std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&parked);
+        set_authority_between_reads_hook_for_tests(
+            &dir,
+            Box::new(move || {
+                Box::pin(async move {
+                    flag.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await
+                })
+            }),
+        );
+        let task = {
+            let d = dir.clone();
+            tokio::spawn(async move { staged_authority_figure_fresh(&d).await })
+        };
+        // Waits on the hook, not on the record under test, so a missing in-flight record reads
+        // as the assertion below failing rather than as a fixture failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !parked.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "FIXTURE: the derivation never reached its hook"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "FIXTURE: the derivation is parked in its hook"
+        );
+        let now = unix_secs();
+        let at_start = authority_unknown_seconds(&dir, now);
+        let later = authority_unknown_seconds(&dir, now + 61);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            at_start, 0,
+            "an attempt in flight under the threshold reads 0"
+        );
+        assert!(
+            later >= 60,
+            "a derivation in flight for 61 s must read as unknown (read {later})"
+        );
+        assert_eq!(
+            authority_unknown_seconds(&dir, now + 61),
+            0,
+            "a dropped derivation leaves nothing in flight and recorded no attempt"
+        );
     }
 }
