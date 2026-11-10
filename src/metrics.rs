@@ -1883,6 +1883,11 @@ pub struct WriteCacheMetrics {
     /// never that caching was refused.
     #[serde(default)]
     pub pending_lock_timeouts_total: u64,
+    /// Pending-credit lines this process moved to a `{instance}.pending.torn` file, from its own
+    /// file or a retired instance's, since it started. **Per-instance.** Each one is a credit that
+    /// left the pending term; its bytes return when the fold next reads that object's `.meta`.
+    #[serde(default)]
+    pub pending_lines_quarantined_total: u64,
     /// Seconds this process has been unable to derive the staged byte figure: `0` while its most
     /// recent derivation produced one, otherwise the time since its newest complete figure was
     /// taken, or since its first attempt when it has none. A derivation still running after 60 s
@@ -1959,6 +1964,13 @@ pub struct WriteCacheMetrics {
 /// `HttpProxy::shed_request`'s `CONCURRENCY_LAST_LOG` — one `warn!` per
 /// window rather than one per `/metrics` poll or per consolidation cycle.
 const OVER_BOUND_WARN_INTERVAL_SECS: u64 = 60;
+
+#[cfg(test)]
+thread_local! {
+    /// Calls to the `over_bound` WARN on this thread, before its rate limit. Per thread, so a
+    /// current-thread test reads only its own calls.
+    static OVER_BOUND_WARN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Unix timestamp (seconds) of the last rate-limited `over_bound` WARN.
 /// Process-wide: `collect_write_cache_metrics` is called from every
@@ -2483,6 +2495,7 @@ fn staged_fold_from_snapshot(
             staged_fold_bytes: s.staged_fold_bytes,
             staged_fold_byte_sum: s.staged_fold_byte_sum,
             staged_fold_pending_bytes: s.staged_fold_pending_bytes,
+            staged_removal_debit_bytes: s.staged_removal_debit_bytes,
             staged_fold_in_progress_part_bytes: s.staged_fold_in_progress_part_bytes,
             staged_fold_gap_bytes: s.staged_fold_gap_bytes,
             staged_authority_age_secs: aged(s.staged_authority_age_secs, since_collection_secs),
@@ -2552,7 +2565,21 @@ pub fn spawn_background_collector(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let _ = metrics_manager.read().await.collect_metrics().await;
+                    let manager = metrics_manager.read().await;
+                    let bound = collection_stall_bound(period);
+                    let _ = await_collection_watched(manager.collect_metrics(), bound, async {
+                        tracing::error!(
+                            "Background metrics collection has not returned after {} s. A \
+                             collection reads the shared cache volume: the pending-credit files, \
+                             the shard checkpoints and mpus_in_progress/. Until it returns, OTLP \
+                             is recorded from the figures a /metrics request reads, and \
+                             write_cache.staging_figure_unknown_seconds counts a staged-figure \
+                             derivation in flight for over 60 s as unknown.",
+                            bound.as_secs()
+                        );
+                        manager.export_current_to_otlp().await;
+                    })
+                    .await;
                 }
                 _ = shutdown.wait_for_shutdown() => {
                     info!("Background metrics collector received shutdown signal");
@@ -2561,6 +2588,37 @@ pub fn spawn_background_collector(
             }
         }
     })
+}
+
+/// How many times a stalled background collection has made the collector record the current
+/// figures for OTLP, in a test binary.
+#[cfg(test)]
+static COLLECTION_STALL_EXPORTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How long a background collection may run before the collector logs an `error!`: two
+/// collection intervals, and never less than the 60 s after which the unknown-figure gauge counts
+/// a derivation in flight as unknown. A collection past it has missed at least one tick; one that
+/// is merely slow is reported by the collection-duration WARN.
+fn collection_stall_bound(interval: Duration) -> Duration {
+    interval.saturating_mul(2).max(Duration::from_secs(
+        crate::staged_fold::STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS,
+    ))
+}
+
+/// Await `collection`; if it has not returned after `bound`, run `on_stall` once and keep waiting.
+async fn await_collection_watched<T>(
+    collection: impl std::future::Future<Output = T>,
+    bound: Duration,
+    on_stall: impl std::future::Future<Output = ()>,
+) -> T {
+    tokio::pin!(collection);
+    tokio::select! {
+        out = &mut collection => return out,
+        _ = tokio::time::sleep(bound) => {}
+    }
+    on_stall.await;
+    collection.await
 }
 
 /// Internal request statistics tracking
@@ -3068,10 +3126,8 @@ impl MetricsManager {
         // case the incumbent read above is 0 too, and at epoch 1 before this process's first
         // complete derivation, when the incumbent is the stand-in `get_cache_size_stats`
         // publishes as well.
-        let resident_bytes = cache_manager
-            .get_staging_resident_bytes()
-            .await
-            .unwrap_or(incumbent_write_cache_size);
+        let staged_resident_bytes = cache_manager.get_staging_resident_bytes().await;
+        let resident_bytes = staged_resident_bytes.unwrap_or(incumbent_write_cache_size);
         let staging_bound_bytes = cache_manager.get_write_cache_capacity();
         let (inflight_bytes, staged_entries) = cache_manager.get_write_cache_manager_gauges().await;
         let (staging_evictions_total, staging_eviction_bytes_total) =
@@ -3201,7 +3257,9 @@ impl MetricsManager {
         let activation_blocker =
             crate::staged_authority::activation_blocker(cache_manager.get_cache_dir());
 
-        if over_bound {
+        // No WARN on the stand-in: at epoch 1 before this process's first complete fold figure,
+        // `resident_bytes` is the incumbent counter, which over-states there and decides nothing.
+        if over_bound && staged_resident_bytes.is_some() {
             Self::log_over_bound_rate_limited(resident_bytes, staging_bound_bytes);
         }
 
@@ -3256,6 +3314,7 @@ impl MetricsManager {
             pending_lock_waits_total: crate::staged_fold::pending_lock_wait_stats().0,
             pending_lock_wait_ms_total: crate::staged_fold::pending_lock_wait_stats().1,
             pending_lock_timeouts_total: crate::staged_fold::pending_lock_wait_stats().2,
+            pending_lines_quarantined_total: crate::staged_fold::pending_lines_quarantined_total(),
             staging_figure_unknown_seconds: staging_figure_unknown.0,
             staging_figure_unknown_passes_total: staging_figure_unknown.1,
             // In-memory, like the epoch latch above: the consolidator records the verdict it
@@ -3372,6 +3431,8 @@ impl MetricsManager {
     /// discipline elsewhere in this codebase — an AtomicU64 storing the last
     /// logged unix-second timestamp, checked-and-swapped to gate the line.
     fn log_over_bound_rate_limited(resident_bytes: u64, staging_bound_bytes: u64) {
+        #[cfg(test)]
+        OVER_BOUND_WARN_CALLS.with(|c| c.set(c.get() + 1));
         let now_secs = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3507,52 +3568,63 @@ impl MetricsManager {
         // The staged-fold gauges need the `.pending` files as well, and reading them after the
         // checkpoint set (inside the collector, as until the change) let a peer install plus the credit
         // owner's GC between the two reads drop every credit between the old and new cut from both
-        // sources. `read_gauge_inputs` reads pending, then the checkpoint set on the blocking pool,
-        // and owns the `JoinError` handling: a failed traversal yields the default set, which both
-        // consumers publish as the unreadable sentinel rather than a zero.
-        let (pending, shard_checkpoints) = match self.cache_manager.as_ref() {
-            Some(cache_manager) => {
-                crate::staged_fold::read_gauge_inputs(cache_manager.get_cache_dir()).await
-            }
-            None => Default::default(),
-        };
-
-        // `P`, walked ONCE for the whole collection, after the pending files and the checkpoint
-        // set, the order the staged-fold gauges have always read them in. The cache section and
-        // the staged-fold gauge set both publish this one figure, and a `/metrics` request or a
-        // dashboard refresh serves it from this collection with its age, so neither walks.
-        // `observe_in_progress` runs the walk on the blocking pool, spread over its own threads,
-        // and joins a deciding reader's walk if one is already running.
-        let part_bytes = match self.cache_manager.as_ref() {
-            Some(cache_manager) => {
-                let observation = crate::signed_put_handler::observe_in_progress(
-                    cache_manager.get_cache_dir(),
-                    Duration::ZERO,
-                )
-                .await;
-                // The reconciliation, here and only here: this walk against the figure the
-                // previous walk's composition supports. It reads no volume state, only the two
-                // kept walks, and it is what arms the verdict that sends deciders back to the
-                // walk when a published counter has missed an update.
-                let reconciliation = crate::signed_put_handler::reconcile_in_progress_figures(
-                    cache_manager.get_cache_dir(),
-                );
-                PartBytesReading {
-                    bytes: observation.walk.bytes,
-                    age_secs: observation.walk.bytes.map(|_| observation.age_secs()),
-                    drift_bytes: reconciliation.drift_bytes,
+        // sources. `collector_derivation` reads pending, then the checkpoint set off the runtime,
+        // then walks `mpus_in_progress/`, and installs the staged authority figure and the budget
+        // count from those inputs, so the cache and write-cache sections below read that memo
+        // instead of deriving the figure a second time. A derivation that does not complete yields
+        // an unreadable checkpoint set, which both consumers publish as the unreadable sentinel
+        // rather than a zero.
+        //
+        // `P` is walked ONCE for the whole collection, inside that derivation, after the pending
+        // files and the checkpoint set. The cache section and the staged-fold gauge set both
+        // publish this one figure, and a `/metrics` request or a dashboard refresh serves it from
+        // this collection with its age, so neither walks.
+        let (pending, shard_checkpoints, part_bytes, collection_figure) =
+            match self.cache_manager.as_ref() {
+                Some(cache_manager) => {
+                    let inputs =
+                        crate::staged_fold::collector_derivation(cache_manager.get_cache_dir())
+                            .await;
+                    let part_bytes = match inputs.observation {
+                        Some(observation) => {
+                            // The reconciliation, here and only here: this walk against the figure the
+                            // previous walk's composition supports. It reads no volume state, only the
+                            // two kept walks, and it is what arms the verdict that sends deciders back
+                            // to the walk when a published counter has missed an update.
+                            let reconciliation =
+                                crate::signed_put_handler::reconcile_in_progress_figures(
+                                    cache_manager.get_cache_dir(),
+                                );
+                            PartBytesReading {
+                                bytes: observation.walk.bytes,
+                                age_secs: observation.walk.bytes.map(|_| observation.age_secs()),
+                                drift_bytes: reconciliation.drift_bytes,
+                            }
+                        }
+                        None => PartBytesReading::default(),
+                    };
+                    (
+                        inputs.pending,
+                        inputs.checkpoints,
+                        part_bytes,
+                        inputs.figure,
+                    )
                 }
-            }
-            None => PartBytesReading::default(),
-        };
+                None => Default::default(),
+            };
 
-        let mut metrics = self
-            .assemble(VolumeSource::Fresh(
-                &shard_checkpoints,
-                &pending,
-                part_bytes,
-            ))
-            .await;
+        // A figure the collector's derivation produced is the one every section of this
+        // collection publishes, even when a fold install made its memo entry unusable to
+        // deciders: re-deriving here would read the volume a second time inside one collection.
+        let assembly = self.assemble(VolumeSource::Fresh(
+            &shard_checkpoints,
+            &pending,
+            part_bytes,
+        ));
+        let mut metrics = match collection_figure {
+            Some(figure) => crate::staged_fold::with_collection_figure(figure, assembly).await,
+            None => assembly.await,
+        };
         metrics.volume_snapshot = VolumeSnapshotGauges {
             collected_at_unix_secs: Some(
                 metrics
@@ -3589,6 +3661,19 @@ impl MetricsManager {
         }
 
         metrics
+    }
+
+    /// Record [`Self::current_metrics`] into the OTLP instruments, for a collection that has not
+    /// returned: the request path's figures read no shared-volume state that can wait on it.
+    async fn export_current_to_otlp(&self) {
+        #[cfg(test)]
+        COLLECTION_STALL_EXPORTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(otlp_exporter) = &self.otlp_exporter {
+            let metrics = self.current_metrics().await;
+            if let Err(e) = otlp_exporter.read().await.export_metrics(&metrics).await {
+                warn!("Failed to export metrics to OTLP: {}", e);
+            }
+        }
     }
 
     /// The metrics a `/metrics` request or dashboard refresh returns: every in-process section
@@ -5857,7 +5942,8 @@ mod tests {
     /// has expired, that re-derives the figure on the request: a locked read of every `.pending`
     /// file (`PendingStore::read_all`, an exclusive `fs4` lock per file with no timeout), then a
     /// synchronous traversal of the whole checkpoint set on the tokio worker. On the fleet that is
-    /// ~1,500 shard documents on EFS plus a lock whose holder can be another proxy. A scrape that
+    /// 1,869 shard documents on the verification fleet's EFS volume (2026-11-09) plus a lock whose
+    /// holder can be another proxy. A scrape that
     /// arrived more than 5 s after the last authority read — the normal case for a suite that reads
     /// `/metrics` between fixtures — paid all of it.
     ///
@@ -5976,6 +6062,270 @@ mod tests {
             metrics.cache.as_ref().map(|c| c.write_cache_size),
             Some(F_BYTES),
             "cache.write_cache_size must come from the same memoised figure"
+        );
+    }
+
+    /// A fixture for the one-derivation tests: epoch 1, one seeded shard, no memo.
+    async fn one_derivation_fixture() -> (Arc<CacheManager>, tempfile::TempDir, MetricsManager) {
+        let (cache_manager, temp_dir) =
+            build_cache_manager_with_write_cache(10_000_000_000, 50.0).await;
+        let dir = temp_dir.path();
+        crate::staged_fold::seed_shard_figure_for_tests(dir, "test-bucket", "3f", 4_444_444, 9);
+        assert!(
+            crate::staged_authority::activate(dir, "host:test").unwrap(),
+            "fixture: activation must flip the epoch"
+        );
+        crate::staged_fold::invalidate_authority_snapshot_for_tests(dir);
+        let mut metrics_manager = MetricsManager::new();
+        metrics_manager.set_cache_manager(cache_manager.clone());
+        (cache_manager, temp_dir, metrics_manager)
+    }
+
+    /// One metrics collection reads the checkpoint set once: the collector's own read installs the
+    /// authority figure, so assembling the cache and write-cache sections derives nothing again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_collection_reads_the_checkpoint_set_once() {
+        let (_cm, temp_dir, metrics_manager) = one_derivation_fixture().await;
+        let dir = temp_dir.path();
+        let before = crate::staged_fold::shard_checkpoint_reads_for_tests(dir);
+        let metrics =
+            tokio::time::timeout(Duration::from_secs(30), metrics_manager.collect_metrics())
+                .await
+                .expect("the collection did not finish within 30 s");
+        let reads = crate::staged_fold::shard_checkpoint_reads_for_tests(dir) - before;
+        println!("ONE-DERIVATION collection: checkpoint_reads={reads}");
+        assert_eq!(
+            metrics.write_cache.resident_bytes, 4_444_444,
+            "fixture: the collection publishes the fold figure"
+        );
+        assert_eq!(
+            reads, 1,
+            "one metrics collection read the checkpoint set {reads} times: it derived the \
+             authority figure again after reading the same inputs for its gauges"
+        );
+    }
+
+    /// A collection does not wait on a derivation of its own after its gauge read: with the
+    /// authority derivation stalled, the collection still returns, and its unknown-figure gauge is
+    /// read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_collection_returns_while_an_authority_derivation_would_stall() {
+        let (_cm, temp_dir, metrics_manager) = one_derivation_fixture().await;
+        let dir = temp_dir.path();
+        crate::staged_fold::set_authority_between_reads_hook_for_tests(
+            dir,
+            Box::new(|| Box::pin(std::future::pending::<()>())),
+        );
+        let collected =
+            tokio::time::timeout(Duration::from_secs(10), metrics_manager.collect_metrics()).await;
+        let metrics = collected.expect(
+            "the collection did not return within 10 s while an authority derivation was \
+             stalled: it derives the figure inline after its own read, so its gauges, and the \
+             OTLP sample taken from them, wait on that derivation",
+        );
+        assert_eq!(metrics.write_cache.resident_bytes, 4_444_444);
+        assert_eq!(metrics.write_cache.staging_figure_unknown_seconds, 0);
+    }
+
+    /// A fold install during a collection must not cause a second derivation: the install moves
+    /// the generation, the collector's memo entry is installed expired, and the assembly of the same
+    /// collection took the decider path and read the volume again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fold_install_during_a_collection_does_not_cause_a_second_derivation() {
+        let (_cm, temp_dir, metrics_manager) = one_derivation_fixture().await;
+        let dir = temp_dir.path();
+        let installing = dir.to_path_buf();
+        crate::staged_fold::set_gauge_between_reads_hook_for_tests(
+            dir,
+            Box::new(move || {
+                Box::pin(async move {
+                    crate::staged_fold::expire_authority_snapshot_for_tests(&installing);
+                })
+            }),
+        );
+        let before = crate::staged_fold::shard_checkpoint_reads_for_tests(dir);
+        let metrics =
+            tokio::time::timeout(Duration::from_secs(30), metrics_manager.collect_metrics())
+                .await
+                .expect("the collection did not finish within 30 s");
+        let reads = crate::staged_fold::shard_checkpoint_reads_for_tests(dir) - before;
+        println!("ONE-DERIVATION install mid-collection: checkpoint_reads={reads}");
+        assert_eq!(
+            metrics.write_cache.resident_bytes, 4_444_444,
+            "fixture: the collection publishes the figure its own derivation read"
+        );
+        assert_eq!(
+            reads, 1,
+            "a fold install during a collection made it read the checkpoint set {reads} times: the \
+             assembly derived the figure again after the collector's derivation installed it expired"
+        );
+    }
+
+    /// A scrape returns while the collector's own read of the shared volume is stalled, with the
+    /// unknown-figure gauge readable: the request path waits on no collection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scrape_returns_while_the_collectors_own_read_is_stalled() {
+        let (_cm, temp_dir, metrics_manager) = one_derivation_fixture().await;
+        let dir = temp_dir.path();
+        crate::staged_fold::set_gauge_between_reads_hook_for_tests(
+            dir,
+            Box::new(|| Box::pin(std::future::pending::<()>())),
+        );
+        let metrics_manager = Arc::new(metrics_manager);
+        let collector = {
+            let m = Arc::clone(&metrics_manager);
+            tokio::spawn(async move { m.collect_metrics().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !crate::staged_fold::derivation_in_flight_for_tests(dir) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fixture: the collector's derivation starts");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            metrics_manager.current_metrics(),
+        )
+        .await
+        .expect("a scrape did not return within 10 s while the collector's own read was stalled");
+        assert!(
+            !collector.is_finished(),
+            "fixture: the collector is still stalled"
+        );
+        assert_eq!(
+            served.write_cache.staging_figure_unknown_seconds, 0,
+            "the unknown-figure gauge is readable and a derivation in flight for seconds is not yet \
+             unknown"
+        );
+        collector.abort();
+    }
+
+    /// The watchdog is wired into the background collector: a collection that never returns makes
+    /// the collector record the current figures for OTLP, and the collector keeps waiting.
+    #[tokio::test(start_paused = true)]
+    async fn the_background_collector_reports_a_collection_that_never_returns() {
+        let (_cm, temp_dir, metrics_manager) = one_derivation_fixture().await;
+        let dir = temp_dir.path();
+        crate::staged_fold::set_gauge_between_reads_hook_for_tests(
+            dir,
+            Box::new(|| Box::pin(std::future::pending::<()>())),
+        );
+        let manager = Arc::new(RwLock::new(metrics_manager));
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let before = COLLECTION_STALL_EXPORTS.load(std::sync::atomic::Ordering::SeqCst);
+        let handle = spawn_background_collector(
+            manager,
+            Duration::from_secs(10),
+            crate::shutdown::ShutdownSignal::new(rx),
+        );
+        let mut waited = 0u32;
+        while COLLECTION_STALL_EXPORTS.load(std::sync::atomic::Ordering::SeqCst) == before {
+            assert!(
+                waited < 600,
+                "no stall report within 600 virtual seconds of a collection that never returns"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            waited += 1;
+        }
+        assert!(
+            !handle.is_finished(),
+            "the collector keeps waiting for the collection after reporting it"
+        );
+        handle.abort();
+        drop(tx);
+    }
+
+    /// `over_bound` does not WARN at epoch 1 before this process's first complete fold figure:
+    /// `resident_bytes` is then the incumbent stand-in, which over-states at epoch 1.
+    #[tokio::test]
+    async fn over_bound_does_not_warn_at_epoch_1_before_the_first_complete_figure() {
+        let (cache_manager, temp_dir) = build_cache_manager_with_write_cache(1_000_000, 10.0).await;
+        let dir = temp_dir.path();
+        let consolidator = cache_manager.get_journal_consolidator().await.unwrap();
+        consolidator
+            .atomic_update_size_delta(150_000, 150_000)
+            .await
+            .unwrap();
+        assert!(crate::staged_authority::activate(dir, "host:test").unwrap());
+        assert!(
+            crate::staged_authority::fold_authority_active(dir),
+            "fixture: epoch 1 is active"
+        );
+        crate::staged_fold::invalidate_authority_snapshot_for_tests(dir);
+        let mut metrics_manager = MetricsManager::new();
+        metrics_manager.set_cache_manager(cache_manager.clone());
+        let before = OVER_BOUND_WARN_CALLS.with(|c| c.get());
+        let metrics = metrics_manager.collect_metrics().await;
+        let calls = OVER_BOUND_WARN_CALLS.with(|c| c.get()) - before;
+        println!(
+            "OVER-BOUND epoch 1: resident={} bound={} over_bound={} warn_calls={calls}",
+            metrics.write_cache.resident_bytes,
+            metrics.write_cache.staging_bound_bytes,
+            metrics.write_cache.over_bound
+        );
+        assert_eq!(
+            metrics.write_cache.resident_bytes, 150_000,
+            "fixture: with no fold figure yet the incumbent stands in"
+        );
+        assert_eq!(
+            calls, 0,
+            "the over_bound WARN fired at epoch 1 on the incumbent stand-in, before any fold \
+             figure existed"
+        );
+    }
+
+    /// The background collector reports a collection that has not returned within its bound, once,
+    /// and still returns the collection's result; a collection inside the bound reports nothing.
+    #[tokio::test(start_paused = true)]
+    async fn collection_watchdog_reports_a_collection_that_does_not_return() {
+        assert_eq!(
+            collection_stall_bound(Duration::from_secs(60)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            collection_stall_bound(Duration::from_secs(10)),
+            Duration::from_secs(60),
+            "never under the 60 s after which the unknown-figure gauge reads a derivation in \
+             flight as unknown"
+        );
+        let reports = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let r = Arc::clone(&reports);
+        let out = await_collection_watched(
+            async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                7
+            },
+            collection_stall_bound(Duration::from_secs(60)),
+            async move {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(out, 7, "the collection's own result is returned");
+        assert_eq!(
+            reports.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a collection that ran 600 s against a 120 s bound must be reported exactly once"
+        );
+        let r = Arc::clone(&reports);
+        let quick = await_collection_watched(
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                8
+            },
+            collection_stall_bound(Duration::from_secs(60)),
+            async move {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(quick, 8);
+        assert_eq!(
+            reports.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 30 s collection is inside the bound and must not be reported"
         );
     }
 

@@ -11,6 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [3.0.4] - 2026-11-10
+
+3.0.4 stops write cache reclamation from removing unread uploads it does not need to, recovers on its own from a torn `.pending` line or damaged shard checkpoint, and keeps completed multipart uploads for `put_ttl`.
+
+**Upgrade impact:** Operators who cache multipart uploads, read the write cache figures on `/metrics` or OTLP, or upgrade a fleet from 3.0.3 one proxy at a time should read [Upgrading to 3.0.4](docs/UPGRADING.md#upgrading-to-304) before upgrading.
+
+### Fixed
+
+- Previously, in public 3.0.0 to 3.0.3, a write cache reclamation pass could remove more unread uploads for bytes the previous pass had already freed, when that pass's recomputation could not re-read a shard. This affected proxies that report `write_cache.staged_authority_epoch` `1`. Each proxy now records on the cache volume what it removes from each shard, and every proxy subtracts it until that shard is recomputed.
+- Previously, in public 3.0.0 to 3.0.3, an object read for the first time, deleted or replaced stayed in the staged figure until its shard was next recomputed. A reclamation pass sized meanwhile could remove more unread uploads than it needed to, on proxies that report `write_cache.staged_authority_epoch` `1`. The removal now leaves the figure within one `consolidation_interval`, and at once on the proxy that made it.
+- Previously, a completed multipart upload stayed in the write cache for a day, whatever `put_ttl` said. It now stays for the key's `put_ttl`, as a single-part upload does, so with the default `1h` an unread one leaves after an hour; entries already cached keep their expiry. Thanks to [@cameronbraid](https://github.com/cameronbraid) for [GitHub PR #28](https://github.com/aws-samples/sample-s3-hybrid-cache/pull/28).
+- Previously, a blank or torn line in a proxy's `.pending` file, its record of recent uploads, stopped the staged figure until an operator removed the line. The proxy now moves such a line to `{instance}.pending.torn` at its next periodic recomputation and counts it in `write_cache.pending_lines_quarantined_total`. Another proxy does the same for a stopped proxy's file after a grace period of 15 minutes to 24 hours.
+- Previously, a shard checkpoint that did not parse kept the staged figure unknown. The proxy now keeps its bytes in `{XX}.json.torn` and replaces it by recomputing that shard. A checkpoint that cannot be read, or that a newer release wrote, is left in place.
+- Previously, at `write_cache.staged_authority_epoch` `1`, a full validation scan reported the bytes graduated since the last scan as write cache drift, in `cache_size.accounting_drift` and as a log warning. It now marks that figure not evaluable, with reason `staged_authority_epoch_1`, and both validation log lines say which figures they compared. Thanks to [@cameronbraid](https://github.com/cameronbraid) for [GitHub issue #29](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/29).
+
+### Changed
+
+- The decisions that need the staged figure now share one recomputation in each proxy, which reads shard checkpoints 64 at a time, and a metrics collection reads them once. `write_cache.staged_authority_snapshot_recomputes_total` counts recomputations rather than reads, and `write_cache.staged_authority_snapshot_age_secs` can exceed 5 s by a recomputation's read time.
+- A metrics collection that has not returned after twice `metrics.collection_interval`, or 60 s if that is longer, now logs an error, and OTLP then records the figures a `/metrics` request reads.
+- At `write_cache.staged_authority_epoch` `0`, `write_cache.staging_figure_unknown_seconds` and its error log now also report a staged figure the proxy cannot recompute, although reclamation then sizes itself from the event-maintained counter.
+- At `write_cache.staged_authority_epoch` `1`, the warning that `write_cache.resident_bytes` is over its bound is no longer logged before the proxy has recomputed its first staged figure.
+
+### Added
+
+- `write_cache.staged_removal_debit_bytes` shows the staged bytes subtracted for removals that their shards' figures do not yet include. See [Coordination across proxies](docs/EVICTION.md#coordination-across-proxies).
+- `write_cache.pending_lines_quarantined_total` counts the lines moved from a `.pending` file to its `.pending.torn` file.
+
 ## [3.0.3] - 2026-11-09
 
 3.0.3 stops write cache cleanup from deleting uploads that nobody has read, corrects the `write_cache.inflight_bytes` figure, and adds a gauge that shows when cleanup cannot work out how much to remove.

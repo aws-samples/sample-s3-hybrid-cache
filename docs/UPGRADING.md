@@ -48,6 +48,7 @@ corrupted.
 
 | Version | Change on a binary-only upgrade |
 |---|---|
+| 3.0.4 | Deployments that cache multipart uploads keep an unread completed one for `put_ttl` (default `1h`) instead of a day, and some write cache metrics change meaning; see [Upgrading to 3.0.4](#upgrading-to-304). |
 | 3.0.3 | Write cache reclamation removes nothing by size while the recomputed staged figure cannot be read, and `write_cache.inflight_bytes` counts only uploads in flight; see [Upgrading to 3.0.3](#upgrading-to-303). |
 | 3.0.1 | Ranges a 2.x release cached, and part layouts recorded before 3.0.1, are fetched from S3 once, on first read; see [Upgrading to 3.0.1](#upgrading-to-301). |
 | public 2.8.2 | The first GET of an object cached by a PUT or multipart upload now makes one extra round trip to S3 (a conditional request) before serving, where previously it was served straight from cache with no S3 contact. Subsequent reads of the same object are unaffected. |
@@ -86,17 +87,42 @@ Releases not listed above require no action and change no defaults: internal fix
 performance work, additive opt-in features that stay disabled until configured, and
 dependency bumps.
 
+## Upgrading to 3.0.4
+
+3.0.4 upgrades in place from 3.0.3 and needs no configuration change and no manual step. When upgrading from 3.0.2 or earlier, take those releases' steps as well. It stops write cache reclamation from removing more unread uploads than it needs to, recovers on its own from a torn `.pending` line or damaged shard checkpoint, and keeps completed multipart uploads for `put_ttl`.
+
+### What you will see after upgrading to 3.0.4
+
+- With the default `put_ttl` of `1h`, an unread completed multipart upload leaves the write cache after an hour instead of a day, as a single-part upload does. Entries already cached keep their expiry, and a cache rule that sets `put_ttl` applies to multipart uploads too.
+- `write_cache.staged_removal_debit_bytes` shows the staged bytes subtracted for removals that their shards' figures do not yet include, and `write_cache.staged_fold_bytes` is net of them ([Coordination across proxies](EVICTION.md#coordination-across-proxies)).
+- A blank or non-JSON line in a `.pending` file is moved to `{instance}.pending.torn` and counted by `write_cache.pending_lines_quarantined_total`, and the staged figure recovers without an operator. A shard checkpoint that does not parse is kept in `{XX}.json.torn` and replaced by recomputing that shard ([When the recomputed figure cannot be read](EVICTION.md#when-the-recomputed-figure-cannot-be-read)).
+- `write_cache.staged_authority_snapshot_recomputes_total` counts recomputations of the staged figure, not reads. A reader that waits for a recomputation already running counts in neither it nor `staged_authority_snapshot_hits_total`, so the two no longer give a per-read hit rate.
+- `write_cache.staged_authority_snapshot_age_secs` is the age of the figure's inputs, and can exceed 5 s by the recomputation's read time.
+- When a metrics collection has not returned after twice `metrics.collection_interval`, or 60 s if that is longer, the proxy logs an error and records OTLP once from the figures `/metrics` reads. The line begins `Background metrics collection has not returned`, so an alert on error lines fires on it.
+- At `write_cache.staged_authority_epoch` `0`, `write_cache.staging_figure_unknown_seconds` and its error line now also report a staged figure the proxy cannot recompute. Reclamation then still sizes itself from the event-maintained counter.
+- At `write_cache.staged_authority_epoch` `1`, a full validation scan no longer reports graduated bytes as write cache drift. `cache_size.accounting_drift` marks the write cache figure not evaluable with reason `staged_authority_epoch_1`, and the scan's log line names the two figures it compared instead of warning about drift.
+- At `write_cache.staged_authority_epoch` `1`, the warning that `write_cache.resident_bytes` is over `staging_bound_bytes` is not logged before the proxy has recomputed its first staged figure.
+
+### During a rolling upgrade to 3.0.4
+
+These differences last until the last 3.0.3 proxy is upgraded, so upgrade the fleet in one pass.
+
+- 3.0.3 proxies size their passes as 3.0.3 does, and a 3.0.4 proxy cannot subtract the bytes a 3.0.3 proxy's passes remove. Either can then remove more unread uploads than it needs to.
+- 3.0.4 proxies keep writing the `eviction_reclaims/` documents 3.0.3 proxies read, and subtract the ones 3.0.3 proxies write. A 3.0.4 proxy can subtract a 3.0.3 document after it has already recomputed the shard, so the count limit can act late.
+- A torn line in a running 3.0.3 proxy's own `.pending` file still stops the staged figure on every proxy until that proxy is upgraded. The upgraded proxy then clears it after 15 minutes, or another proxy after 24 hours where several proxies share a hostname.
+- Multipart uploads a 3.0.3 proxy completes still stay in the write cache for a day.
+
 ## Upgrading to 3.0.3
 
 3.0.3 upgrades in place from 3.0.2 and needs no configuration change and no manual step. When upgrading from 3.0.1 or earlier, take the 3.0.2 (and 3.0.1) steps as well. It changes how write cache reclamation sizes itself, what the write cache figures on `/metrics` show while the staged figure cannot be recomputed, and what `write_cache.inflight_bytes` reports.
 
 ### What you will see after upgrading to 3.0.3
 
-- While a pass cannot recompute the staged figure, write cache reclamation removes nothing by size, and the staged range count limit, which reads the same files, can stop removing ranges too. Staged bytes can then grow until the proxy stops caching new uploads at `max_cache_size`, displacing read caching ([When the recomputed figure cannot be read](EVICTION.md#which-computation-is-in-force)). Reclamation by size resumes on the first pass that can recompute the figure.
+- While a pass cannot recompute the staged figure, write cache reclamation removes nothing by size, and the staged range count limit, which reads the same files, can stop removing ranges too. Staged bytes can then grow until the proxy stops caching new uploads at `max_cache_size`, displacing read caching ([When the recomputed figure cannot be read](EVICTION.md#when-the-recomputed-figure-cannot-be-read)). Reclamation by size resumes on the first pass that can recompute the figure.
 - The new `write_cache.staging_figure_unknown_seconds` shows how long the proxy has been unable to recompute the figure, and the new `write_cache.staging_figure_unknown_passes_total` counts the passes that removed nothing by size. When a recomputation fails after the figure has been unknown for 60 s, the proxy logs an error, at most every 10 minutes.
 - The gauge also reads above `0` while a recomputation has run for 60 s or more, which on a cache volume with many buckets can happen in normal operation ([What a pass reads](EVICTION.md#what-a-pass-reads)). An alert on `> 0` then fires on a healthy proxy, so set its threshold above the values the gauge shows on your volume.
-- At `write_cache.staged_authority_epoch` `1`, while the staged figure cannot be recomputed, `cache.write_cache_size`, `cache.read_cache_size` and `write_cache.resident_bytes` come from the last figure the proxy recomputed, whatever its age. Until the proxy has recomputed one, `cache.write_cache_size` and `write_cache.resident_bytes` show the event-maintained counter, which overstates at that epoch.
-- During a rolling upgrade, a 3.0.2 proxy that cannot read the recomputed figure sizes a pass from its event-maintained counter at once. That counter overstates at epoch 1, so a 3.0.2 proxy can remove unread uploads a 3.0.3 proxy would keep. The difference ends when the last proxy is upgraded.
+- At `write_cache.staged_authority_epoch` `1`, while the staged figure cannot be recomputed, `cache.write_cache_size`, `cache.read_cache_size` and `write_cache.resident_bytes` come from the last figure the proxy recomputed, whatever its age. Until the proxy has recomputed one, `cache.write_cache_size` and `write_cache.resident_bytes` show the event-maintained counter, whose error at that epoch can run in either direction.
+- During a rolling upgrade, a 3.0.2 proxy that cannot read the recomputed figure sizes a pass from its event-maintained counter at once. That counter can read high at epoch 1, so a 3.0.2 proxy can remove unread uploads a 3.0.3 proxy would keep. The difference ends when the last proxy is upgraded.
 - `write_cache.inflight_bytes` counts only uploads in flight, as its [reference entry](METRICS_REFERENCE.md#write_cache) describes. A dashboard that saw it read `0` after a reclamation pass now sees a figure that falls to `0` only when no upload is in flight.
 ## Upgrading to 3.0.2
 3.0.2 upgrades in place from 3.0.1 and needs no configuration change: its one new field, `connection_pool.upstream_write_idle_timeout`, has a default. When upgrading from 3.0.0 or a 2.8 release, take the [3.0.1 steps](#upgrading-to-301) as well. Four kinds of deployment have a step to take before upgrading.

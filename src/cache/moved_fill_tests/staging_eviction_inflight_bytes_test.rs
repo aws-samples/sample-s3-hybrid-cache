@@ -55,6 +55,7 @@ async fn a_staging_eviction_leaves_a_held_upload_reservation_in_inflight_bytes()
     metrics_manager.set_cache_manager(Arc::clone(&m));
 
     const HELD: u64 = 1024 * 1024;
+    let underflows_before = m.write_cache_underflows_for_tests().await;
     let reservation = m
         .try_reserve_write_cache(HELD)
         .await
@@ -80,6 +81,7 @@ async fn a_staging_eviction_leaves_a_held_upload_reservation_in_inflight_bytes()
     drop(reservation);
     let after_release = m.get_write_cache_manager_gauges().await.0;
     let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let underflows = m.write_cache_underflows_for_tests().await - underflows_before;
 
     assert_eq!(
         (gauge, published),
@@ -91,6 +93,11 @@ async fn a_staging_eviction_leaves_a_held_upload_reservation_in_inflight_bytes()
     assert_eq!(
         after_release, 0,
         "the upload's own release must return the figure to zero"
+    );
+    assert_eq!(
+        underflows, 0,
+        "a staging eviction and a reservation release underflowed the capacity counter, \
+         whether or not the rate-limited WARN fired"
     );
     assert!(
         !logged.contains("capacity underflow"),

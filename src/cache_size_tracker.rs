@@ -1874,6 +1874,11 @@ const DRIFT_REASON_FIGURE_NOT_SUPPLIED: &str = "figure_not_supplied";
 /// the persisted counter, so the difference is the correction term rather than a disagreement
 /// between two producers.
 pub const DRIFT_REASON_REFERENCE_IS_EXTRAPOLATION: &str = "reference_is_extrapolation";
+/// `unevaluable_reason` for the write-cache figure of a full scan at staged-authority epoch 1:
+/// the scan's census is compared with the event-maintained counter, which is no longer the
+/// authority and is not debited at graduation, so the difference is the graduated bytes and not
+/// a disagreement between two producers.
+pub const DRIFT_REASON_WRITE_CACHE_AT_FOLD_EPOCH: &str = "staged_authority_epoch_1";
 /// `unevaluable_reason` for the RATIO only: the reference figure is zero, so there is no
 /// denominator. The absolute `drift` is still published.
 const DRIFT_REASON_REFERENCE_ZERO: &str = "reference_zero";
@@ -2022,6 +2027,14 @@ impl AccountingDriftSample {
             write_cache_size: AccountingDriftGauge::new(guard(p_write), r_write, blanket),
             cached_objects: AccountingDriftGauge::new(guard(p_objects), r_objects, blanket),
         }
+    }
+
+    /// Publish the write-cache figure as not evaluable for `reason`, whatever the comparison
+    /// found. The terms stay; the difference and its ratio are withdrawn.
+    pub fn mark_write_cache_not_evaluable(&mut self, reason: &'static str) {
+        self.write_cache_size.drift = None;
+        self.write_cache_size.drift_ratio = None;
+        self.write_cache_size.unevaluable_reason = Some(reason.to_string());
     }
 
     /// `{cache_dir}/metadata/_shard_state/accounting_drift_sample.json`.
@@ -3646,7 +3659,18 @@ impl CacheSizeTracker {
         // accounting leak observable in the logs — before this, `write_cache_size` was
         // never corrected at all (the call below passed `None`), so a leak accumulated
         // silently and indefinitely while `total_size` was reconciled every scan.
-        if staged_drift != 0 {
+        if staged_drift != 0 && crate::staged_authority::fold_authority_active(&self.cache_dir) {
+            // At staged-authority epoch 1 the staged figure is the fold's. This scan's census is
+            // compared with the event-maintained counter, which graduation does not debit, so the
+            // difference includes the graduated bytes and is not drift.
+            info!(
+                "Cache validation: write-cache census {} compared with the event-maintained \
+                 write_cache_size {} (staged authority epoch 1: the difference includes graduated \
+                 bytes, which that counter does not debit, so it is not reported as drift)",
+                format_bytes_human(census_staged_size),
+                format_bytes_human(tracked_staged_size)
+            );
+        } else if staged_drift != 0 {
             warn!(
                 "Cache validation: write-cache drift corrected: tracked {} -> scanned {} ({}{}), \
                  recomputed from {} .meta files",
@@ -9838,6 +9862,122 @@ mod write_cache_expiry_revival_tests {
             .expect("fixture: initialize() must have built a size tracker")
     }
 
+    /// Collects formatted log lines, for the thread that installs the subscriber.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn take(&self) -> String {
+            let mut bytes = self.0.lock().unwrap();
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            bytes.clear();
+            text
+        }
+    }
+
+    /// GitHub issue 29, the WARN half. At staged-authority epoch 1 a full scan's census is
+    /// compared with the event-maintained write-cache counter, which graduation does not debit,
+    /// so its difference is the graduated bytes. The scan must not log it as drift at WARN. At
+    /// epoch 0 the WARN is unchanged.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the epoch check removed from `perform_full_validation`, the epoch-1 scan logs
+    /// `write-cache drift corrected`.
+    #[tokio::test]
+    async fn an_epoch_1_full_scan_logs_no_write_cache_drift_warning() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = Arc::new(setup(&dir).await);
+        let key = "epoch1-warn-bucket/staged.bin";
+        let (meta_path, _bin) = seed_write_cached(&manager, key, false).await;
+        // The publish records no staging membership on the range, and the fold and the scan
+        // count a range as staged by it; record it, as a write-through store does.
+        let mut staged_meta = read_meta(&manager, key);
+        for range in staged_meta.ranges.iter_mut() {
+            range.staged = Some(true);
+        }
+        std::fs::write(&meta_path, serde_json::to_string(&staged_meta).unwrap()).unwrap();
+        let census: u64 = read_meta(&manager, key)
+            .ranges
+            .iter()
+            .map(|r| r.compressed_size)
+            .sum();
+        assert!(census > 0, "FIXTURE: the object holds bytes");
+        let tracker = production_tracker(&manager).await;
+        let consolidator = tracker.consolidator.clone();
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        let ground = || async {
+            consolidator
+                .update_size_from_validation_with_kind(
+                    census,
+                    Some(0),
+                    Some(1),
+                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
+                .await;
+        };
+        // Epoch 0: the census (staged) against a tracked counter of 0 is drift, logged at WARN.
+        ground().await;
+        tokio::time::timeout(Duration::from_secs(60), tracker.perform_full_validation())
+            .await
+            .expect("the full scan must finish inside 60 s")
+            .unwrap();
+        let epoch_0 = capture.take();
+        assert!(
+            epoch_0.contains("write-cache drift corrected"),
+            "FIXTURE: an epoch-0 scan must log the drift it corrects; got: {epoch_0}"
+        );
+        // Epoch 1: the same difference is the graduated bytes.
+        crate::staged_fold::seed_shard_figure_for_tests(&dir, "test-bucket", "3f", 4_444_444, 9);
+        assert!(
+            crate::staged_authority::activate(&dir, "host:test").unwrap(),
+            "FIXTURE: activation must flip the epoch"
+        );
+        ground().await;
+        tokio::time::timeout(Duration::from_secs(60), tracker.perform_full_validation())
+            .await
+            .expect("the full scan must finish inside 60 s")
+            .unwrap();
+        let epoch_1 = capture.take();
+        let warn_lines: Vec<&str> = epoch_1
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("write-cache drift"))
+            .collect();
+        println!("ISSUE-29 epoch 1 full scan WARN lines: {warn_lines:?}");
+        assert!(
+            warn_lines.is_empty(),
+            "an epoch-1 full scan logged the graduated bytes as write-cache drift: {warn_lines:?}"
+        );
+        assert!(
+            epoch_1.contains("staged authority epoch 1"),
+            "the scan must say what it compared at epoch 1; got: {epoch_1}"
+        );
+    }
+
     /// Publish a real cached object, then mark it write-cached with `write_cache_expires_at`
     /// at `expires_in_the_past`. Returns the `.meta` path and its one range file.
     ///
@@ -11976,6 +12116,72 @@ mod validation_scheduler_fleet_tests {
             "INSTALL-RACE: total_size must be the scanned 1200 plus the post-scan 50. 1450 means \
              the install landed inside the cycle's collect-to-apply window and the pre-scan +200 \
              was counted twice"
+        );
+    }
+
+    /// GitHub issue 29, on the path production takes: the full scan's relative install. At
+    /// staged-authority epoch 1 its census is compared with the event-maintained write-cache
+    /// counter, which graduation does not debit, so the difference is the graduated bytes. The
+    /// sample publishes no numeric write-cache drift and names the epoch; the total's drift is
+    /// unchanged.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `at_fold_epoch` forced to `false` in `install_full_scan_figures`'s closure,
+    /// `write_cache_size.drift` reads `Some(-3000000)`.
+    #[tokio::test]
+    async fn a_full_scan_at_epoch_1_publishes_no_numeric_write_cache_drift() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (tracker, consolidator) = tracker_on(&dir, "issue29-tracker").await;
+        crate::staged_fold::seed_shard_figure_for_tests(&dir, "test-bucket", "3f", 4_444_444, 9);
+        assert!(
+            crate::staged_authority::activate(&dir, "host:test").unwrap(),
+            "FIXTURE: activation must flip the epoch"
+        );
+        consolidator
+            .update_size_from_validation_with_kind(
+                20_000_000,
+                Some(8_000_000),
+                Some(10),
+                crate::cache_size_tracker::ValidationSampleKind::FullScan,
+            )
+            .await;
+        let installed = tracker
+            .install_full_scan_figures(
+                20_000_000,
+                5_000_000,
+                10,
+                crate::journal_consolidator::ValidationBaseline {
+                    total_size: 20_000_000,
+                    write_cache_size: 8_000_000,
+                    cached_objects: 10,
+                    state_unreadable: false,
+                },
+                3,
+                Duration::from_millis(10),
+            )
+            .await;
+        assert!(installed, "FIXTURE: the install must happen");
+        let sample = AccountingDriftSample::load(&dir).expect("the scan published a drift sample");
+        println!(
+            "ISSUE-29 epoch 1 relative install: write_cache drift={:?} reason={:?} total drift={:?}",
+            sample.write_cache_size.drift,
+            sample.write_cache_size.unevaluable_reason,
+            sample.total_size.drift
+        );
+        assert_eq!(
+            sample.write_cache_size.drift, None,
+            "an epoch-1 scan published the graduated bytes as write-cache drift"
+        );
+        assert_eq!(
+            sample.write_cache_size.unevaluable_reason.as_deref(),
+            Some("staged_authority_epoch_1")
+        );
+        assert_eq!(
+            sample.total_size.drift,
+            Some(0),
+            "the total's drift is unchanged"
         );
     }
 

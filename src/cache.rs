@@ -2284,9 +2284,9 @@ pub struct CacheSizes {
     pub total_cache_size: u64,
     /// Non-staged bytes on the shared cache volume: `total_size − resident_staged_bytes`.
     ///
-    /// Fleet-wide — every instance sharing the volume reports the same figure — and
-    /// **disjoint** from [`Self::write_cache_size`], so the two sum to
-    /// [`Self::total_cache_size`] exactly.
+    /// The same on every instance that shares the cache volume (a proxy with its own cache
+    /// directory reports its own), and **disjoint** from [`Self::write_cache_size`], so the two
+    /// sum to [`Self::total_cache_size`] exactly.
     ///
     /// Before 2026-08-26 this carried the whole-cache total including the staged subset,
     /// so anything adding it to `write_cache_size` counted the staged bytes twice.
@@ -2312,12 +2312,14 @@ pub struct CacheSizes {
     #[serde(default)]
     pub read_cache_size_inverted_secs: u64,
     /// Staged write-cache bytes: objects written through the cache and not yet read, plus the
-    /// bytes of multipart parts currently in flight. Fleet-wide, and disjoint from
+    /// bytes of multipart parts currently in flight. The same on every instance that shares the
+    /// cache volume, and disjoint from
     /// [`Self::read_cache_size`] — an entry leaves this figure and joins that one when it
     /// graduates on its first read, with no change to [`Self::total_cache_size`].
     ///
     /// **Derivation changed at § 16.6.2.** Once the staged-authority epoch is active this is
-    /// recomputed from verified `.meta` ground truth — `F` + post-cut pending credits + `P` —
+    /// recomputed from verified `.meta` ground truth — `F` + post-cut pending credits − the
+    /// removal debits no fold has yet seen + `P` —
     /// rather than maintained by `Graduation` debit events, whose measured loss rate
     /// over-stated it by 4.28x-11.17x. Before activation it is the incumbent event-sourced
     /// counter, unchanged, which is what makes a mixed-version fleet safe. Expect a one-time
@@ -2359,7 +2361,7 @@ pub(crate) struct StagedFigure {
 }
 
 impl StagedFigure {
-    /// `write_cache_size`: `F + post-cut pending + P`, C's equation.
+    /// `write_cache_size`: `F + post-cut pending − applied removal debits + P`.
     pub(crate) fn write_cache_size(&self) -> u64 {
         self.resident_staged_bytes
             .saturating_add(self.in_progress_part_bytes)
@@ -10194,12 +10196,11 @@ impl CacheManager {
         // Whether this removal drops staged bytes, through the same shared predicate the debit
         // below and the fold use. A read-tier-only removal leaves the staged figure alone and
         // needs no early fold visit.
-        let drops_staged_bytes = new_metadata.ranges.iter().any(|range_spec| {
-            crate::cache_types::is_staged_range_spec(
-                range_spec,
-                new_metadata.object_metadata.is_write_cached,
-            )
-        });
+        let staged_removal = crate::staged_fold::StagedRemoval {
+            bytes: new_metadata.staged_compressed_size(),
+            ranges: new_metadata.staged_range_count(),
+        };
+        let drops_staged_bytes = staged_removal.ranges > 0;
 
         // Decrement size accumulator for invalidated ranges
         // This ensures size tracking remains accurate when cache entries are invalidated
@@ -10245,7 +10246,12 @@ impl CacheManager {
         // Spec: cache-eviction-at-scale § 16.6.9, "Dirty shards first".
         if drops_staged_bytes {
             if let Some(instance_id) = &sinks.instance_id {
-                crate::staged_fold::mark_shard_dirty(cache_dir, instance_id, cache_key);
+                crate::staged_fold::mark_shard_dirty(
+                    cache_dir,
+                    instance_id,
+                    cache_key,
+                    staged_removal,
+                );
             }
         }
 
@@ -11012,6 +11018,15 @@ impl CacheManager {
         }
     }
 
+    /// Capacity underflows this cache's write-cache counter has detected, for tests.
+    #[cfg(test)]
+    pub(crate) async fn write_cache_underflows_for_tests(&self) -> u64 {
+        match self.write_cache_manager.read().await.as_ref() {
+            Some(wcm_arc) => wcm_arc.read().await.underflows_for_tests(),
+            None => 0,
+        }
+    }
+
     /// Increment the write cache's cumulative graduation counter. Call once per
     /// graduation performed by this instance.
     ///
@@ -11625,7 +11640,6 @@ impl CacheManager {
         // applied to the count budget instead of the byte bound.
         let count_verdict = crate::staged_fold::count_eviction_verdict(
             &self.cache_dir,
-            &self.staging_instance_id().await,
             self.eviction_trigger_percent,
             self.eviction_target_percent,
         )
@@ -11678,24 +11692,20 @@ impl CacheManager {
         freed
     }
 
-    /// The identity this instance's count-eviction reclaim document is published under: the
-    /// write ledger's, which is also what the staged fold's install retires it by. `{host}:{pid}`
-    /// when the consolidator is not wired, the same form the ledger uses.
-    async fn staging_instance_id(&self) -> String {
-        match self.journal_consolidator.read().await.as_ref() {
-            Some(c) => c.write_ledger().instance_id().to_string(),
-            None => format!(
-                "{}:{}",
-                gethostname::gethostname().to_string_lossy(),
-                std::process::id()
-            ),
-        }
-    }
-
     /// The body of a staging eviction pass, run with the global eviction lock held.
     ///
     /// Separate from [`Self::evict_staging_tier`] so every early return here is covered by
     /// that function's single release, rather than needing one release per branch.
+    #[cfg(test)]
+    pub(crate) fn set_before_staging_refold_hook_for_tests(
+        cache_dir: &std::path::Path,
+        hook: Box<dyn FnOnce() + Send>,
+    ) {
+        BEFORE_STAGING_REFOLD_HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((cache_dir.to_path_buf(), hook));
+    }
     async fn evict_staging_tier_locked(&self, trigger: u64, target: u64) -> u64 {
         use crate::write_ledger::StagedCandidateVerdict;
 
@@ -11717,7 +11727,6 @@ impl CacheManager {
         };
         let count_verdict = crate::staged_fold::count_eviction_verdict(
             &self.cache_dir,
-            &self.staging_instance_id().await,
             self.eviction_trigger_percent,
             self.eviction_target_percent,
         )
@@ -11852,6 +11861,12 @@ impl CacheManager {
         // The shards this pass removed staged objects from, re-folded at the end of the pass.
         let mut evicted_shards: std::collections::BTreeSet<crate::staged_fold::Shard> =
             std::collections::BTreeSet::new();
+        // What this pass removed from each shard, from the same `.meta` read each eviction acted
+        // on: published as this instance's removal debits before the re-fold.
+        let mut evicted_debits: std::collections::BTreeMap<
+            crate::staged_fold::Shard,
+            crate::staged_fold::StagedRemoval,
+        > = std::collections::BTreeMap::new();
 
         for candidate in &ordered {
             // BOTH arms have to be satisfied before the walk stops. A count-driven pass has
@@ -11924,7 +11939,12 @@ impl CacheManager {
                             if let Some((bucket, l1)) =
                                 crate::staged_fold::shard_of(&candidate.cache_key)
                             {
-                                evicted_shards.insert(crate::staged_fold::Shard::new(bucket, l1));
+                                let shard = crate::staged_fold::Shard::new(bucket, l1);
+                                let debit = evicted_debits.entry(shard.clone()).or_default();
+                                debit.bytes = debit.bytes.saturating_add(assessment.staged_bytes);
+                                debit.ranges =
+                                    debit.ranges.saturating_add(assessment.staged_range_count);
+                                evicted_shards.insert(shard);
                             }
                         }
                         Err(e) => {
@@ -12022,6 +12042,25 @@ impl CacheManager {
         // comes from the shard checkpoints and does not move until a fold installs, so an
         // undebited pass would drain the tier at the consolidation interval.
         // =====================================================================
+        //
+        // The debit is the removal debits published here, per shard, before the re-fold below and
+        // before anything else can read the figure: a re-fold visit begins after them, so each
+        // shard it installs makes its entry inert, and a shard it cannot install (a peer's claim,
+        // any retain) keeps its debit for every reader on the volume until a visit that began
+        // after this re-installs it. A crash between the evictions and this write leaves those
+        // shards undebited until they re-install, the behaviour before debits existed.
+        if let Err(e) = crate::staged_fold::publish_removal_debits(
+            &self.cache_dir,
+            ledger.instance_id(),
+            &evicted_debits,
+        ) {
+            warn!(
+                "Staging eviction: could not publish the removal debits for {} shard(s) ({}); \
+                 until they re-fold, later passes size from a figure that still holds these bytes",
+                evicted_debits.len(),
+                e
+            );
+        }
         if let crate::staged_fold::CountEvictionVerdict::Needed {
             count,
             observed_count,
@@ -12077,6 +12116,8 @@ impl CacheManager {
             }
         }
 
+        #[cfg(test)]
+        run_before_staging_refold_hook(&self.cache_dir);
         // Re-fold the shards this pass evicted from, while the global eviction lock is still
         // held (cache-eviction-at-scale § 16.6.2).
         //
@@ -12087,14 +12128,12 @@ impl CacheManager {
         // far over its trigger as before these objects were freed and evicts again, down past
         // the target. The count arm has the same exposure and is covered by the same visit.
         //
-        // AFTER `record_count_eviction_pass`, deliberately: an install clears that pass's
-        // count debit, which is correct only once the figure it stood in for has been
-        // re-derived. Recording the debit after the re-fold would subtract the same ranges
-        // twice until the next install — an under-count, the late direction.
+        // AFTER the removal debits are published, deliberately: a visit that began after them
+        // makes the entry of each shard it installs inert, so nothing is subtracted twice.
         //
-        // Best-effort. A shard a peer holds, or a pass the fold refuses, leaves that shard's
-        // figure pre-eviction until the periodic pass reaches it — the behaviour before this
-        // existed, not a new failure.
+        // Best-effort. A shard a peer holds, or a pass the fold refuses, keeps its pre-eviction
+        // checkpoint until a later visit, and its removal debit stands in for the eviction until
+        // then.
         if !evicted_shards.is_empty() {
             let outcome = crate::staged_fold::run_staged_fold_over_shards(
                 &self.cache_dir,
@@ -12538,12 +12577,12 @@ impl CacheManager {
             .await;
 
         // NOTE: Do NOT subtract bytes_freed directly here!
-        // Eviction writes Remove journal entries via write_eviction_journal_entries().
-        // Consolidation processes those Remove entries and subtracts from size_state.
+        // Eviction already debited the size accumulator for what it unlinked
+        // (`account_evicted`), and the consolidation cycle applies that delta to
+        // size_state. The Remove journal entries eviction also writes move no figure.
         // Direct subtraction here would cause DOUBLE SUBTRACTION.
         //
-        // The journal-based approach ensures single-writer pattern where consolidation
-        // is the only component that updates size_state.json.
+        // Consolidation stays the only component that writes size_state.json.
         if let Ok(bytes_freed) = &eviction_result {
             if *bytes_freed > 0 {
                 info!(
@@ -16350,7 +16389,14 @@ impl CacheManager {
         // Spec: cache-eviction-at-scale § 16.6.9, "Dirty shards first".
         let meta_changed = deletion.meta_unlinked || deletion.meta_writes > 0;
         if meta_changed && deletion.staged_stripped {
-            self.mark_staged_shard_dirty(cache_key).await;
+            let removed = deletion.unlinked_ranges.iter().filter(|u| u.staged).fold(
+                crate::staged_fold::StagedRemoval::default(),
+                |acc, u| crate::staged_fold::StagedRemoval {
+                    bytes: acc.bytes.saturating_add(u.compressed_size),
+                    ranges: acc.ranges + 1,
+                },
+            );
+            self.mark_staged_shard_dirty(cache_key, removed).await;
         }
 
         debug!(
@@ -16860,8 +16906,7 @@ impl CacheManager {
         //   consolidation lock to apply the fleet's collected accumulator deltas — the
         //   incremental writer;
         // - `update_size_from_validation_with_kind`, the re-grounding write, reached from the
-        //   startup scan (`CacheInitializationCoordinator` → `CacheSizeTracker::update_size_from_scan`)
-        //   and from the tracker's validation scans (`perform_full_validation`,
+        //   cache size tracker's validation scans (`perform_full_validation`,
         //   `write_phase_locked`).
         //
         // The `st_size` fold (`crate::st_size_fold::run_st_size_fold`) is NOT a writer of it:
@@ -16889,7 +16934,7 @@ impl CacheManager {
         //
         // `ram_cache_size` is deliberately NOT part of it. It counts promoted COPIES of
         // bytes already on disk plus per-entry overhead, so adding it would double-count;
-        // and it is per-instance where these two are fleet-wide, so including it made
+        // and it is per-instance where these two are volume-wide, so including it made
         // three proxies sharing one cache report three different "totals". Measured
         // 2026-08-26, one instant, before that summand was dropped: the shared on-disk
         // figure was identical at 20,767,307,686 on all three proxies while the reported
@@ -21321,17 +21366,24 @@ impl CacheManager {
     /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
     /// Record `cache_key`'s shard as dirty for this instance's next staged fold pass.
     ///
-    /// Called by the removals that drop staged bytes, after the `.meta` change is published. An
-    /// in-process map insert; no shared-storage I/O. Without a wired consolidator there is no
-    /// instance id and no periodic fold to visit the shard, so nothing is recorded.
+    /// Called by the removals that drop staged bytes, after the `.meta` change is published, with
+    /// the staged bytes and ranges the change removed: they become this instance's removal debit
+    /// at its next consolidation cycle. An in-process map insert; no shared-storage I/O. Without a
+    /// wired consolidator there is no instance id and no periodic fold to visit the shard, so
+    /// nothing is recorded.
     ///
     /// Spec: cache-eviction-at-scale § 16.6.9, "Dirty shards first".
-    async fn mark_staged_shard_dirty(&self, cache_key: &str) {
+    async fn mark_staged_shard_dirty(
+        &self,
+        cache_key: &str,
+        removed: crate::staged_fold::StagedRemoval,
+    ) {
         if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
             crate::staged_fold::mark_shard_dirty(
                 &self.cache_dir,
                 consolidator.write_ledger().instance_id(),
                 cache_key,
+                removed,
             );
         }
     }
@@ -21392,6 +21444,7 @@ impl CacheManager {
 
         let mut total_debited = 0u64;
         let mut staged_debited = 0u64;
+        let mut staged_ranges = 0u64;
         for range in removed {
             // `subtract_range`, not `subtract`: the range's dedup entry has to go with
             // its bytes, or the re-publish a few lines later is deduplicated away and
@@ -21409,6 +21462,7 @@ impl CacheManager {
                     .size_accumulator()
                     .subtract_write_cache(range.compressed_size);
                 staged_debited += range.compressed_size;
+                staged_ranges += 1;
             }
         }
         // Staged ranges were dereferenced by an overwrite: the next fold pass visits the shard
@@ -21421,6 +21475,10 @@ impl CacheManager {
                 cache_dir,
                 consolidator.write_ledger().instance_id(),
                 cache_key,
+                crate::staged_fold::StagedRemoval {
+                    bytes: staged_debited,
+                    ranges: staged_ranges,
+                },
             );
         }
 
@@ -22659,6 +22717,7 @@ impl CacheManager {
         let was_write_cached = metadata.object_metadata.is_write_cached;
         if was_write_cached {
             let staged_compressed_size = metadata.staged_compressed_size();
+            let staged_range_count = metadata.staged_range_count();
             metadata.object_metadata.is_write_cached = false;
             metadata.object_metadata.write_cache_expires_at = None;
             metadata.object_metadata.write_cache_created_at = None;
@@ -22694,7 +22753,14 @@ impl CacheManager {
             // instance's next fold pass visits the shard instead of waiting for the rotation
             // (§ 16.6.9, "Dirty shards first"; saw this path leave no mark on the fleet).
             if staged_compressed_size > 0 {
-                self.mark_staged_shard_dirty(cache_key).await;
+                self.mark_staged_shard_dirty(
+                    cache_key,
+                    crate::staged_fold::StagedRemoval {
+                        bytes: staged_compressed_size,
+                        ranges: staged_range_count,
+                    },
+                )
+                .await;
             }
             // Then the epoch gate: once the fold is authoritative the `.meta` transition above IS
             // the accounting (§ 16.6.1, "Debits: none"), so no journal entry is written and a
@@ -23041,6 +23107,7 @@ impl CacheManager {
         // predicate consults it.
         // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
         let staged_compressed_size = metadata.staged_compressed_size();
+        let staged_range_count = metadata.staged_range_count();
 
         // Transition from write-cached (PUT_TTL) to read-cached (GET_TTL)
         // This should only happen once when the object is first accessed via GET
@@ -23114,7 +23181,14 @@ impl CacheManager {
         // below), and without the mark it waits for the rotation to reach the shard.
         // Spec: cache-eviction-at-scale § 16.6.9, "Dirty shards first".
         if staged_compressed_size > 0 {
-            self.mark_staged_shard_dirty(cache_key).await;
+            self.mark_staged_shard_dirty(
+                cache_key,
+                crate::staged_fold::StagedRemoval {
+                    bytes: staged_compressed_size,
+                    ranges: staged_range_count,
+                },
+            )
+            .await;
         }
 
         // R1.1/1.2/1.3: record the decrement for the consolidator to apply under the
@@ -24511,7 +24585,7 @@ async fn budget_refusal_off_the_request_path(cache_dir: &Path) -> Option<&'stati
             // branch that serves the memo with no wait and refreshes it in the background. The
             // The abandoned derivation is not wasted either — but that is true only as of the change,
             // and the comment this replaces asserted it one unit early. Until
-            // `staged_fold::budget_derivation` existed the derivation was awaited INLINE inside
+            // the count was derived on its own task, the derivation was awaited INLINE inside
             // this `tokio::time::timeout`, so expiry dropped the future, the derivation was
             // cancelled at its next await point, and nothing was installed: the I/O already
             // done was thrown away and the next caller paid for it again. It now runs on a
@@ -40953,7 +41027,7 @@ mod write_cache_count_eviction_tests {
         );
         crate::staged_fold::invalidate_budget_snapshot_for_tests(dir);
         assert!(
-            crate::staged_fold::count_eviction_verdict(dir, &m.staging_instance_id().await, 95, 80)
+            crate::staged_fold::count_eviction_verdict(dir, 95, 80)
                 .await
                 .is_needed(),
             "fixture: the count trigger must be over, or the pass has nothing to be driven by"
@@ -41093,7 +41167,7 @@ mod write_cache_count_eviction_tests {
         );
         crate::staged_fold::invalidate_budget_snapshot_for_tests(dir);
         assert!(
-            crate::staged_fold::count_eviction_verdict(dir, &m.staging_instance_id().await, 95, 80)
+            crate::staged_fold::count_eviction_verdict(dir, 95, 80)
                 .await
                 .is_needed(),
             "fixture: the count trigger must be over, or no eviction runs"
@@ -52013,6 +52087,28 @@ mod full_object_recheck_tests {
 
 #[cfg(test)]
 mod moved_fill_tests;
+/// One-shot hooks run by a staging pass on the named directory after its evictions and before its
+/// re-fold, so a test can make the re-fold retain (a held pending lock, a legacy ledger file).
+#[cfg(test)]
+#[allow(clippy::type_complexity)] // a test-only registry; a named alias would be used once
+static BEFORE_STAGING_REFOLD_HOOKS: std::sync::Mutex<
+    Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>,
+> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn run_before_staging_refold_hook(cache_dir: &std::path::Path) {
+    let hook = {
+        let mut hooks = BEFORE_STAGING_REFOLD_HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        hooks
+            .iter()
+            .position(|(d, _)| d == cache_dir)
+            .map(|i| hooks.remove(i).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// I4 of the 3.0.3 capacity design: no epoch-1 decision reads the write-cache counter
 /// (`size_state.write_cache_size`). At epoch 1 graduation writes no debit, so the counter holds

@@ -621,11 +621,14 @@ cache_dir/
 │   │   └── {instance_id}.ledger.mark           # Per-proxy record-sequence floor
 │   └── _shard_state/          # Write-cache size accounting and eviction coordination
 │       ├── checkpoints/{bucket}/{XX}.json       # Per-shard write-cache figure and its cut
+│       ├── checkpoints/{bucket}/{XX}.json.torn  # Checkpoints that did not parse, kept when replaced
 │       ├── staged_authority_epoch.json          # Which producer owns the figure on this volume
 │       ├── staged_pending/{instance_id}.pending # Credits that landed after their shard's cut
+│       ├── staged_pending/{instance_id}.pending.torn # Blank or non-JSON lines moved out of it
+│       ├── staged_debits/{instance_id}.json     # Staged bytes and ranges each proxy removed, per shard
 │       ├── in_progress_parts/{instance_id}.inprog # Multipart part bytes each proxy has written
 │       ├── eviction_worklist/, eviction_claims/, eviction_generation.json  # Shared eviction work list
-│       ├── eviction_reclaims/{instance_id}.json # What each proxy's count-driven passes reclaimed
+│       ├── eviction_reclaims/{instance_id}.json # Count-eviction reclaims in the form a 3.0.3 proxy reads
 │       └── claims/, ready/                      # Shard leases, readiness records
 ├── ranges/                     # All cached data, stored as binary ranges
 │   ├── {bucket}/              # S3 bucket name (first level)
@@ -1355,8 +1358,8 @@ from the one that uploaded the parts.
 
 **The fold never subtracts.** A shard's figure changes only when a visit recomputes it from that
 shard's `.meta` files. So a DELETE, a first read that graduates an object out of the write cache,
-or a re-PUT that supersedes ranges does not move `cache.write_cache_size` when it happens. The
-bytes stay in the figure until that shard's next visit.
+or a re-PUT that supersedes ranges does not move that shard's figure when it happens. The bytes
+stay in it until that shard's next visit.
 
 The proxy that removed the bytes records the shard it touched and brings it forward, which
 usually gets it into the next pass: it takes the pass budget's spare slots first, and up to 128
@@ -1364,14 +1367,22 @@ extra visits a pass beyond them. A shard a peer holds a lease on waits for the v
 and if more than 128 shards are waiting, the rest wait for later passes. The bound is one
 rotation, 288 passes of 300 seconds: 24 hours.
 
-**This lag is an overstatement, and that direction is chosen.** A figure that is too high fires
-write cache reclamation early; a figure that is too low fires it late or not at all. So a
-`cache.write_cache_size` that has not dropped after a delete means the accounting has not reached
-that shard yet, not that the delete failed. Confirm it against the shard-age figures below before
-treating it as a fault.
+**`cache.write_cache_size` subtracts the removal before that visit.** The removing proxy records
+the bytes and ranges it removed from the shard on the cache volume at its next consolidation
+cycle. Every proxy subtracts them until a visit begun after the removal installs
+([Coordination across proxies](EVICTION.md#coordination-across-proxies)). The removing proxy
+subtracts them from its own figure at once. The count limit subtracts the removed ranges the
+same way. The published `staged_range_count` and admission's range budget do not subtract them.
 
-Count-driven write cache reclamation corrects for the same lag in its own figure; see
-[Coordination across proxies](EVICTION.md#coordination-across-proxies).
+**What is left is mostly an overstatement, and that direction is chosen.** A figure that is too
+high fires write cache reclamation early; a figure that is too low fires it late or not at all. A
+proxy that restarts before recording a removal loses the record, and the bytes stay in the figure
+until the shard's visit. So a `cache.write_cache_size` that has not dropped within one
+`consolidation_interval` of a delete usually means the removal was not recorded, as after a
+restart of the proxy that made it, not that the delete failed. Confirm it against the shard-age
+figures below before treating it as a fault. A visit that began before a removal and read the
+shard after it can leave the bytes subtracted twice, which understates the figure by them until
+the shard's next visit.
 
 ### Reading the fold's own figures
 

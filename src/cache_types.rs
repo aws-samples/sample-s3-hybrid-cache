@@ -1208,6 +1208,14 @@ impl NewCacheMetadata {
             .sum()
     }
 
+    /// The number of ranges behind [`Self::staged_compressed_size`], by the same predicate.
+    pub fn staged_range_count(&self) -> u64 {
+        self.ranges
+            .iter()
+            .filter(|r| is_staged_range_spec(r, self.object_metadata.is_write_cached))
+            .count() as u64
+    }
+
     /// Refresh the object-level TTL by setting `expires_at = now + ttl`.
     pub fn refresh_object_ttl(&mut self, ttl: Duration) {
         self.expires_at = safe_expiry(SystemTime::now(), ttl);

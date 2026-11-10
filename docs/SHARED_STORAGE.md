@@ -395,9 +395,9 @@ mean a live holder was displaced, and it counts the eviction lock only: the meta
 figures under `atomic_metadata` cannot record a takeover, because that lock is never taken from
 its holder.
 
-The lock serializes passes. A pass triggered by the count of staged ranges also needs to know
-what earlier passes on other proxies freed, because the count it reads lags the deletes, so each
-proxy publishes what its passes reclaimed under `metadata/_shard_state/eviction_reclaims/`. See
+The lock serializes passes. A pass also needs to know what other proxies removed, because the
+staged figure and the staged range count it reads lag the deletes, so each proxy publishes its
+removals per shard under `metadata/_shard_state/staged_debits/`. See
 [Coordination across proxies](EVICTION.md#coordination-across-proxies).
 
 ## Size tracking

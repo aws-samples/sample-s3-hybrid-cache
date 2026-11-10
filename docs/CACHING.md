@@ -692,7 +692,10 @@ cache:
 
 The proxy invalidates a key's cached entry when:
 
-1. S3 reports a different ETag or Last-Modified for it.
+1. A HEAD, or a revalidation after `get_ttl`, gets a different ETag or Last-Modified from S3, or S3
+   returns another version while the proxy fills a gap in a partly cached range. A cache-miss GET
+   that receives another version serves it to the client but does not cache it, and leaves the
+   cached entry in place until one of these checks runs.
 2. A PUT to the key arrives: the new upload replaces the old entry (see
    [Conflict handling](#conflict-handling)).
 3. A CompleteMultipartUpload to the key completes: the completed object replaces the old entry.

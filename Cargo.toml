@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "3.0.3"
+version = "3.0.4"
 edition = "2021"
 # MSRV. `time` and `hickory-{resolver,proto,net}` declare rust-version = "1.88", so the floor
 # cannot go below 1.88 whatever this crate does. 1.89 is retained rather than lowered to 1.88:

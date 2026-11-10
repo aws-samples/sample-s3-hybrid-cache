@@ -5,7 +5,7 @@ security model the software assumes, the risks that model leaves with you, and t
 yourself against this repository.
 
 
-**Applies to release 3.0.3. Last reviewed 2026-11-09.**
+**Applies to release 3.0.4. Last reviewed 2026-11-10.**
 
 Confirm the release you are reading with `grep '^version' Cargo.toml`. If it does not match the release
 named above, this document was written against a different release than the code in front of you.

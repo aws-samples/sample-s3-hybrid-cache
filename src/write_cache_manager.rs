@@ -32,6 +32,15 @@ const UNDERFLOW_WARN_INTERVAL_SECS: u64 = 60;
 /// Shared across all `WriteReservation` drops within the process.
 static LAST_UNDERFLOW_WARN: AtomicU64 = AtomicU64::new(0);
 
+/// Underflows detected per counter, in a test binary, keyed by the counter's address.
+///
+/// The WARN above is limited to one a minute for the whole process, so a test that asserts the
+/// absence of the WARN can pass because a neighbour's WARN used the minute. This counts every
+/// detection, before the rate limit, and per manager, so a neighbour's underflow cannot move it.
+#[cfg(test)]
+static UNDERFLOWS: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// Which staged object a `.meta` describes: its ETag and the time it was published staged.
 ///
 /// Every staged writer stamps `write_cache_created_at` with the publish time, so a replacing
@@ -103,6 +112,14 @@ impl Drop for WriteReservation {
             self.current_size
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                     if current < self.size {
+                        #[cfg(test)]
+                        {
+                            *UNDERFLOWS
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .entry(Arc::as_ptr(&self.current_size) as usize)
+                                .or_insert(0) += 1;
+                        }
                         // Underflow detected — emit rate-limited warning
                         let now_secs = SystemTime::now()
                             .duration_since(SystemTime::UNIX_EPOCH)
@@ -372,6 +389,17 @@ impl WriteCacheManager {
     /// Implements Requirement 6.3
     pub(crate) fn current_usage(&self) -> u64 {
         self.current_size.load(Ordering::SeqCst)
+    }
+
+    /// Underflows detected on this manager's counter by reservation releases, WARN or not.
+    #[cfg(test)]
+    pub(crate) fn underflows_for_tests(&self) -> u64 {
+        UNDERFLOWS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(Arc::as_ptr(&self.current_size) as usize))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Get the live (approximate) count of staged (write-cached, ungraduated)
@@ -2131,6 +2159,28 @@ mod tests {
         }
 
         assert_eq!(manager.current_usage(), 0);
+    }
+
+    /// An underflow is counted when its WARN is suppressed by the process-wide rate limit, so a
+    /// test of "no underflow" cannot pass because a neighbour used the minute.
+    #[tokio::test]
+    async fn an_underflow_is_counted_when_its_warn_is_suppressed() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new_with_defaults(temp_dir.path().to_path_buf(), 1 << 30);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        LAST_UNDERFLOW_WARN.store(now, Ordering::Relaxed);
+        let reservation = manager.try_reserve(100).await.unwrap();
+        manager.current_size.store(10, Ordering::SeqCst);
+        assert_eq!(manager.underflows_for_tests(), 0);
+        drop(reservation);
+        assert_eq!(
+            manager.underflows_for_tests(),
+            1,
+            "a release of 100 bytes against 10 must be counted with its WARN suppressed"
+        );
     }
 
     #[tokio::test]

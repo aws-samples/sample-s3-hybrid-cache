@@ -88,20 +88,30 @@ const CHECKPOINTS_DIR: &str = "checkpoints";
 /// Directory under `_shard_state/` holding the § 16.2 shard claims.
 const CLAIMS_DIR: &str = "claims";
 
-/// Directory under `_shard_state/` holding the per-instance count-eviction reclaim documents,
-/// one per instance at `eviction_reclaims/{instance_id}.json`. See [`ReclaimDocument`].
-const EVICTION_RECLAIMS_DIR: &str = "eviction_reclaims";
+/// Directory under `_shard_state/` holding the per-instance removal-debit documents, one per
+/// instance at `staged_debits/{instance_id}.json`. See [`RemovalDebitDocument`].
+const STAGED_DEBITS_DIR: &str = "staged_debits";
 
-/// Schema of a [`ReclaimDocument`]. An unknown version is read as absent.
+/// Schema of a [`RemovalDebitDocument`]. An unknown version is read as absent.
+const REMOVAL_DEBIT_SCHEMA: u32 = 1;
+/// Directory under `_shard_state/` holding the count-eviction reclaim documents a 3.0.3 proxy
+/// reads, one per instance at `eviction_reclaims/{instance_id}.json`. See [`ReclaimDocument`].
+const EVICTION_RECLAIMS_DIR: &str = "eviction_reclaims";
+/// Schema of a [`ReclaimDocument`]: the one a 3.0.3 proxy accepts.
 const RECLAIM_DOCUMENT_SCHEMA: u32 = 1;
 
-/// Age past which a peer's [`ReclaimDocument`] is no longer debited, seconds.
+/// Entries one [`RemovalDebitDocument`] holds before its owner merges each shard's entries.
+const REMOVAL_DEBIT_MAX_ENTRIES: usize = 4_096;
+
+/// Age past which a removal debit leaves its owner's document, seconds; twice it, past which a
+/// reader removes a document whose every entry is that old.
 ///
 /// `MAX_AUTHORITY_AGE_SECS + CLAIM_LEASE_SECS`. Every shard's staged figure is re-folded within
 /// `MAX_AUTHORITY_AGE_SECS` (§ 16.6.4's criterion), and a visit that installs is bounded by its
-/// claim lease, so a reclaim this old is reflected in every shard checkpoint by a visit that
-/// began after it. Debiting it past that point would subtract it twice. This is what retires
-/// the document of an instance that stopped before its next fold install.
+/// claim lease, so a removal this old is reflected in every shard checkpoint by a visit that
+/// began after it, and its entry is inert by the reader rule. A reader does not use the age to
+/// decide whether to apply an entry; the rule does. The age only bounds what is kept, which is
+/// what retires the document of an instance that stopped.
 pub(crate) const RECLAIM_DOCUMENT_MAX_AGE_SECS: u64 = MAX_AUTHORITY_AGE_SECS + CLAIM_LEASE_SECS;
 
 /// Extension for a shard claim file.
@@ -404,16 +414,26 @@ static DIRTY_SHARDS: Mutex<DirtyShardMarks> = Mutex::new(BTreeMap::new());
 /// `(dir_tag, instance_id) -> shard -> mark nanos`. See [`DIRTY_SHARDS`].
 type DirtyShardMarks = BTreeMap<(u64, String), BTreeMap<Shard, u64>>;
 
-/// Record that this instance removed staged bytes belonging to `cache_key`'s shard.
+/// Record that this instance removed `removed` staged bytes and ranges from `cache_key`'s shard.
 ///
 /// Call it AFTER the `.meta` change that removed them is published: a later visit clears the mark
 /// only if the visit began after it, and that is what makes "began after the mark" imply "saw the
-/// removal". A key no shard can be derived from is ignored — its `.meta` is in no shard's figure.
-pub(crate) fn mark_shard_dirty(cache_dir: &Path, instance_id: &str, cache_key: &str) {
+/// removal". The same holds for the removal debit recorded beside the mark, which is stamped now
+/// and reaches the shared volume at this instance's next consolidation cycle
+/// ([`flush_removal_debits`]). A key no shard can be derived from is ignored: its `.meta` is in no
+/// shard's figure.
+pub(crate) fn mark_shard_dirty(
+    cache_dir: &Path,
+    instance_id: &str,
+    cache_key: &str,
+    removed: StagedRemoval,
+) {
     let Some((bucket, l1)) = shard_of(cache_key) else {
         return;
     };
-    mark_dirty_shard(cache_dir, instance_id, Shard::new(bucket, l1));
+    let shard = Shard::new(bucket, l1);
+    accumulate_removal(cache_dir, instance_id, shard.clone(), removed);
+    mark_dirty_shard(cache_dir, instance_id, shard);
 }
 
 /// [`mark_shard_dirty`] for a caller that already holds the shard: staging eviction, for the
@@ -468,6 +488,620 @@ pub(crate) fn dirty_shard_count(cache_dir: &Path) -> u64 {
         .filter(|((t, _), _)| *t == tag)
         .map(|(_, marks)| marks.len() as u64)
         .sum()
+}
+
+/// Staged bytes and ranges one removal took out of a shard's figure.
+///
+/// Built by each removal site from the `.meta` it changed: the staged ranges it unlinked, stripped
+/// or graduated, through the shared staged-range predicate the fold also counts with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StagedRemoval {
+    pub bytes: u64,
+    pub ranges: u64,
+}
+
+impl StagedRemoval {
+    fn is_empty(&self) -> bool {
+        self.bytes == 0 && self.ranges == 0
+    }
+}
+
+/// One removal debit: staged bytes and ranges removed from shard `(bucket, l1)`, the latest of
+/// them at `removed_at_unix_nanos` on the remover's clock.
+///
+/// # The reader rule
+///
+/// A reader applies an entry while the shard's checkpoint began its visit before the removal
+/// (`staged_visit_started_at < removed_at_unix_nanos`), or the shard has no checkpoint. A visit
+/// that began after the removal read the changed `.meta`, so its figure already excludes the
+/// bytes and the entry is inert. A visit that began before and installed after (the straddle)
+/// may have read either version; the rule applies the debit, which under-states the figure by at
+/// most the entry until the shard's next install, so the staging trigger can fire late but a pass
+/// never re-evicts the band. No reader deletes an entry; inert entries cost only their bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemovalDebitEntry {
+    pub bucket: String,
+    pub l1: String,
+    pub removed_at_unix_nanos: u64,
+    pub bytes: u64,
+    pub ranges: u64,
+}
+
+impl RemovalDebitEntry {
+    fn shard(&self) -> Shard {
+        Shard::new(self.bucket.clone(), self.l1.clone())
+    }
+}
+
+/// One instance's removal debits, at `_shard_state/staged_debits/{instance_id}.json`.
+///
+/// # Why this exists
+///
+/// The fold never subtracts: a shard's figure moves only when a visit re-reads its `.meta`s. So
+/// between installs every byte removed from a shard (a staging eviction whose re-fold did not
+/// install the shard, a graduation, a DELETE, an overwrite, a heal, an expiry) stays in every
+/// proxy's figure, and a staging pass sized from it evicts unread uploads again. Each instance
+/// publishes what it removed here, per shard and stamped with the time, and every reader applies
+/// the entries by [`RemovalDebitEntry`]'s rule. Keyed to the shard's checkpoint rather than to the
+/// owner's installs, so a pass that evicts from S1 and S2 and re-installs only S1 keeps S2's debit.
+///
+/// # Lifecycle
+///
+/// - Written by its owner only, atomically (instance-suffixed temp, `sync_all`, rename), by
+///   read-merge-write under a process-wide lock: by a staging pass after its evictions and before
+///   its re-fold ([`publish_removal_debits`]), and by the consolidation cycle for every other
+///   removal ([`flush_removal_debits`]).
+/// - The owner drops an entry once its own fold installed the entry's shard from a visit that
+///   began at or after the removal, entries older than [`RECLAIM_DOCUMENT_MAX_AGE_SECS`] (every
+///   shard re-folds within it), and removes the file when nothing is left. At more than
+///   [`REMOVAL_DEBIT_MAX_ENTRIES`] entries it merges each shard's entries into one with the
+///   latest time, which only widens the set a reader applies (the under-count direction).
+/// - A reader removes a document only when its mtime and every entry are older than twice
+///   [`RECLAIM_DOCUMENT_MAX_AGE_SECS`]: an instance that stopped never rewrites its own.
+/// - No `staged_debits/` directory, an unparseable document or another schema contributes
+///   nothing, which is the behaviour before debits existed (a 3.0.3 proxy writes none).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RemovalDebitDocument {
+    schema: u32,
+    instance_id: String,
+    entries: Vec<RemovalDebitEntry>,
+}
+
+impl RemovalDebitDocument {
+    fn dir(cache_dir: &Path) -> PathBuf {
+        cache_dir
+            .join("metadata")
+            .join(SHARD_STATE_DIR)
+            .join(STAGED_DEBITS_DIR)
+    }
+
+    fn path(cache_dir: &Path, instance_id: &str) -> PathBuf {
+        Self::dir(cache_dir).join(format!("{}.json", instance_id))
+    }
+
+    fn parse(body: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(body)
+            .ok()
+            .filter(|d| d.schema == REMOVAL_DEBIT_SCHEMA)
+    }
+
+    fn install(&self, cache_dir: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let path = Self::path(cache_dir, &self.instance_id);
+        std::fs::create_dir_all(Self::dir(cache_dir))?;
+        let body = serde_json::to_string(self)
+            .map_err(|e| std::io::Error::other(format!("serialize removal debits: {e}")))?;
+        let tmp = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            hostname_for_tmp(),
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)
+    }
+}
+
+/// The count arm's reclaim document, written so a 3.0.3 proxy sharing the volume during a
+/// rolling upgrade keeps debiting this instance's count reclaims.
+///
+/// Same fields and cumulative meaning as 3.0.3 wrote: ranges reclaimed since this instance's last
+/// fold install, and the time of the latest. Removed by the install, as 3.0.3 did. It adds
+/// `writer`, which a 3.0.3 reader ignores: this release's removal debits already carry the same
+/// ranges, so [`peer_303_reclaimed_ranges`] skips every document that has it and counts only the
+/// ones a 3.0.3 proxy wrote. Remove this type, [`COMPAT_RECLAIMED_RANGES`], the reader and their
+/// call sites in the release after the first one whose upgrade notes no longer allow a 3.0.3
+/// proxy beside a newer one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ReclaimDocument {
+    schema: u32,
+    instance_id: String,
+    generation: u64,
+    ranges_reclaimed: u64,
+    recorded_at_unix_nanos: u64,
+    writer: &'static str,
+}
+
+/// The `writer` value of a reclaim document this release wrote.
+const COMPAT_RECLAIM_WRITER: &str = "removal-debits";
+
+impl ReclaimDocument {
+    fn dir(cache_dir: &Path) -> PathBuf {
+        cache_dir
+            .join("metadata")
+            .join(SHARD_STATE_DIR)
+            .join(EVICTION_RECLAIMS_DIR)
+    }
+
+    fn path(cache_dir: &Path, instance_id: &str) -> PathBuf {
+        Self::dir(cache_dir).join(format!("{}.json", instance_id))
+    }
+
+    fn install(&self, cache_dir: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let path = Self::path(cache_dir, &self.instance_id);
+        std::fs::create_dir_all(Self::dir(cache_dir))?;
+        let body = serde_json::to_string(self)
+            .map_err(|e| std::io::Error::other(format!("serialize reclaim document: {e}")))?;
+        let tmp = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            hostname_for_tmp(),
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)
+    }
+}
+
+/// Count-arm ranges reclaimed since the last fold install, per directory tag: what the
+/// [`ReclaimDocument`] carries. Not read by any decision in this release.
+static COMPAT_RECLAIMED_RANGES: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Removals not yet in this instance's document: `(dir_tag, instance) -> shard -> removal`, with
+/// the latest removal time. Filled beside each dirty mark (no I/O on the request path), drained by
+/// [`flush_removal_debits`] once per consolidation cycle. A restart loses at most one cycle of it.
+type UnflushedDebits = BTreeMap<(u64, String), BTreeMap<Shard, (StagedRemoval, u64)>>;
+static UNFLUSHED_DEBITS: Mutex<UnflushedDebits> = Mutex::new(BTreeMap::new());
+
+/// This instance's own installs since its last debit write: `(dir_tag, instance) -> shard -> the
+/// visit's start`. What lets the owner drop entries a later install of their shard made inert,
+/// without reading any checkpoint.
+type OwnInstalls = BTreeMap<(u64, String), BTreeMap<Shard, u64>>;
+static OWN_INSTALLS: Mutex<OwnInstalls> = Mutex::new(BTreeMap::new());
+
+/// Serialises this process's read-merge-writes of debit documents: the staging pass and the
+/// consolidation cycle write the same file from different tasks.
+static DEBIT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Flushes of [`UNFLUSHED_DEBITS`] under way, and flushes finished, in this process. A flush moves
+/// an entry from the map into the instance's document in two steps a reader cannot see as one, so
+/// [`read_removal_debits`] reads both and takes the reads again when a flush overlapped them.
+static FLUSHES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static FLUSHES_COMPLETED: AtomicU64 = AtomicU64::new(0);
+
+/// Marks a flush as under way for as long as it lives.
+struct FlushWindow;
+
+impl FlushWindow {
+    fn open() -> Self {
+        FLUSHES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        FlushWindow
+    }
+}
+
+impl Drop for FlushWindow {
+    fn drop(&mut self) {
+        FLUSHES_COMPLETED.fetch_add(1, Ordering::SeqCst);
+        FLUSHES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long [`read_removal_debits`] keeps taking its reads again while a flush overlaps them. A
+/// flush is one small document write, and its duration on a shared volume is unmeasured. A flush
+/// stalled in I/O holds every read in this process for this long, and
+/// `a_read_during_a_stalled_flush_returns_at_its_time_cap` measures that. At the cap the reads are
+/// returned as they are, which can miss a debit and over-state the figure.
+const READ_CONSISTENT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A function a test can install to stop a code path at a named point: `dir_tag -> hook`.
+#[cfg(test)]
+type TestHooks = Mutex<BTreeMap<u64, std::sync::Arc<dyn Fn() + Send + Sync>>>;
+/// Fires between a flush taking the unflushed removals and writing them.
+#[cfg(test)]
+static FLUSH_HOOKS: TestHooks = Mutex::new(BTreeMap::new());
+/// Fires inside [`read_removal_debits`], between the document read and the map read.
+#[cfg(test)]
+static READ_BETWEEN_HOOKS: TestHooks = Mutex::new(BTreeMap::new());
+/// Fires inside [`publish_compat_reclaim`], after the cumulative count is taken and before the
+/// document is written.
+#[cfg(test)]
+static COMPAT_PUBLISH_HOOKS: TestHooks = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn fire_test_hook(hooks: &TestHooks, tag: u64) {
+    let hook = hooks
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&tag)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Add `removed` to this instance's unflushed debits for `shard`, stamped now.
+fn accumulate_removal(cache_dir: &Path, instance_id: &str, shard: Shard, removed: StagedRemoval) {
+    if removed.is_empty() {
+        return;
+    }
+    let now = now_nanos();
+    let mut guard = UNFLUSHED_DEBITS.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = guard
+        .entry((dir_tag(cache_dir), instance_id.to_string()))
+        .or_default()
+        .entry(shard)
+        .or_insert((StagedRemoval::default(), now));
+    slot.0.bytes = slot.0.bytes.saturating_add(removed.bytes);
+    slot.0.ranges = slot.0.ranges.saturating_add(removed.ranges);
+    slot.1 = slot.1.max(now);
+}
+
+/// Record that this instance's fold installed `shard` from a visit that began at `visit_started`.
+fn note_own_install(cache_dir: &Path, instance_id: &str, shard: &Shard, visit_started: u64) {
+    let mut guard = OWN_INSTALLS.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = guard
+        .entry((dir_tag(cache_dir), instance_id.to_string()))
+        .or_default()
+        .entry(shard.clone())
+        .or_insert(visit_started);
+    *slot = (*slot).max(visit_started);
+}
+
+/// Merge `new` into `instance_id`'s document, drop what is inert to this instance's own installs
+/// or past the age bound, cap it, and write it (or remove it when empty).
+fn write_removal_debits(
+    cache_dir: &Path,
+    instance_id: &str,
+    new: Vec<RemovalDebitEntry>,
+) -> std::io::Result<()> {
+    let _write = DEBIT_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (dir_tag(cache_dir), instance_id.to_string());
+    let installs = OWN_INSTALLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&key)
+        .unwrap_or_default();
+    let path = RemovalDebitDocument::path(cache_dir, instance_id);
+    let mut entries = match std::fs::read_to_string(&path) {
+        Ok(body) => RemovalDebitDocument::parse(&body)
+            .map(|d| d.entries)
+            .unwrap_or_default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            restore_own_installs(&key, installs);
+            return Err(e);
+        }
+    };
+    if entries.is_empty() && new.is_empty() {
+        return Ok(());
+    }
+    entries.extend(new);
+    let floor =
+        now_nanos().saturating_sub(RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(1_000_000_000));
+    entries.retain(|e| {
+        e.removed_at_unix_nanos >= floor
+            && installs
+                .get(&e.shard())
+                .is_none_or(|&visit_started| e.removed_at_unix_nanos > visit_started)
+    });
+    if entries.len() > REMOVAL_DEBIT_MAX_ENTRIES {
+        entries = merged_per_shard(entries);
+    }
+    if entries.len() > REMOVAL_DEBIT_MAX_ENTRIES {
+        // More shards than the cap carry debits. Drop the oldest: an over-count of their bytes
+        // until their shards re-install, the behaviour before debits existed.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.removed_at_unix_nanos));
+        let dropped = entries.len() - REMOVAL_DEBIT_MAX_ENTRIES;
+        entries.truncate(REMOVAL_DEBIT_MAX_ENTRIES);
+        warn!(
+            "Removal debits for {} cover more than {} shards; dropped the {} oldest",
+            instance_id, REMOVAL_DEBIT_MAX_ENTRIES, dropped
+        );
+    }
+    let result = if entries.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        RemovalDebitDocument {
+            schema: REMOVAL_DEBIT_SCHEMA,
+            instance_id: instance_id.to_string(),
+            entries,
+        }
+        .install(cache_dir)
+    };
+    if result.is_err() {
+        restore_own_installs(&key, installs);
+    }
+    result
+}
+
+fn restore_own_installs(key: &(u64, String), installs: BTreeMap<Shard, u64>) {
+    if installs.is_empty() {
+        return;
+    }
+    let mut guard = OWN_INSTALLS.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = guard.entry(key.clone()).or_default();
+    for (shard, visit_started) in installs {
+        let v = slot.entry(shard).or_insert(visit_started);
+        *v = (*v).max(visit_started);
+    }
+}
+
+/// One entry per shard, summing its entries at the latest removal time. Raising an entry's time
+/// only widens the set a reader applies: the under-count direction.
+fn merged_per_shard(entries: Vec<RemovalDebitEntry>) -> Vec<RemovalDebitEntry> {
+    let mut by_shard: BTreeMap<Shard, RemovalDebitEntry> = BTreeMap::new();
+    for e in entries {
+        match by_shard.get_mut(&e.shard()) {
+            Some(m) => {
+                m.bytes = m.bytes.saturating_add(e.bytes);
+                m.ranges = m.ranges.saturating_add(e.ranges);
+                m.removed_at_unix_nanos = m.removed_at_unix_nanos.max(e.removed_at_unix_nanos);
+            }
+            None => {
+                by_shard.insert(e.shard(), e);
+            }
+        }
+    }
+    by_shard.into_values().collect()
+}
+
+/// A staging pass's evictions, published as this instance's debits before its re-fold.
+///
+/// Stamped now, after every eviction's `.meta` change, so a re-fold visit (which begins after this)
+/// makes each entry it installs inert. Also expires this directory's memos, so the next decision
+/// in this process derives with the debit rather than from a figure taken before the pass.
+pub(crate) fn publish_removal_debits(
+    cache_dir: &Path,
+    instance_id: &str,
+    removed: &BTreeMap<Shard, StagedRemoval>,
+) -> std::io::Result<()> {
+    let now = now_nanos();
+    let new: Vec<RemovalDebitEntry> = removed
+        .iter()
+        .filter(|(_, r)| !r.is_empty())
+        .map(|(shard, r)| RemovalDebitEntry {
+            bucket: shard.bucket.clone(),
+            l1: shard.l1.clone(),
+            removed_at_unix_nanos: now,
+            bytes: r.bytes,
+            ranges: r.ranges,
+        })
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let result = write_removal_debits(cache_dir, instance_id, new);
+    if result.is_err() {
+        // The pass's evictions are done and its debits did not reach the volume. Queue them
+        // for the consolidation cycle's flush, which retries, and which this process's own
+        // reads already add: dropping them would size the next pass from bytes just freed.
+        for (shard, r) in removed.iter().filter(|(_, r)| !r.is_empty()) {
+            accumulate_removal(cache_dir, instance_id, shard.clone(), *r);
+        }
+    }
+    invalidate_budget_snapshot(cache_dir);
+    expire_authority_snapshot(cache_dir);
+    result
+}
+
+/// Write this instance's unflushed removals into its document. Called once per consolidation
+/// cycle; writes nothing when nothing was removed and no own install can prune. A failed write
+/// keeps the removals for the next cycle.
+pub(crate) fn flush_removal_debits(cache_dir: &Path, instance_id: &str) {
+    let _window = FlushWindow::open();
+    let key = (dir_tag(cache_dir), instance_id.to_string());
+    let taken = UNFLUSHED_DEBITS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&key)
+        .unwrap_or_default();
+    let has_installs = OWN_INSTALLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(&key);
+    if taken.is_empty() && !has_installs {
+        return;
+    }
+    let new: Vec<RemovalDebitEntry> = taken
+        .iter()
+        .map(|(shard, (r, at))| RemovalDebitEntry {
+            bucket: shard.bucket.clone(),
+            l1: shard.l1.clone(),
+            removed_at_unix_nanos: *at,
+            bytes: r.bytes,
+            ranges: r.ranges,
+        })
+        .collect();
+    #[cfg(test)]
+    fire_test_hook(&FLUSH_HOOKS, key.0);
+    if let Err(e) = write_removal_debits(cache_dir, instance_id, new) {
+        warn!(
+            "Could not publish removal debits for {} ({}); kept for the next cycle",
+            instance_id, e
+        );
+        let mut guard = UNFLUSHED_DEBITS.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = guard.entry(key).or_default();
+        for (shard, (r, at)) in taken {
+            let s = slot.entry(shard).or_insert((StagedRemoval::default(), at));
+            s.0.bytes = s.0.bytes.saturating_add(r.bytes);
+            s.0.ranges = s.0.ranges.saturating_add(r.ranges);
+            s.1 = s.1.max(at);
+        }
+    }
+}
+
+/// Every instance's removal debits on the volume.
+///
+/// Read AFTER the pending files and BEFORE the checkpoints, and carried in the pending read. The
+/// owner drops an entry only after an install of its shard from a visit that began after the
+/// removal; read before the checkpoints, a dropped entry's install is one the checkpoint read
+/// then sees, so the entry would have been inert anyway. Read after them, the reader could pair
+/// the old checkpoint with a document that no longer holds the entry, and over-count.
+async fn read_removal_debits(cache_dir: &Path) -> Vec<RemovalDebitEntry> {
+    // This process's removals not yet in its document are read AFTER the documents. A flush that
+    // moves an entry from the map into the document between the two reads would hide it from
+    // this read: the document read missed it and the map no longer holds it. A missing debit
+    // leaves the figure over-stated, which is the direction in which a pass evicts bytes that
+    // were already freed. Read in the other order the same flush would show the entry twice,
+    // and a double debit under-states the figure. So the flush counters bracket both reads, and
+    // a read a flush overlapped is taken again.
+    let deadline = std::time::Instant::now() + READ_CONSISTENT_WAIT;
+    loop {
+        let completed = FLUSHES_COMPLETED.load(Ordering::SeqCst);
+        let quiet = FLUSHES_IN_FLIGHT.load(Ordering::SeqCst) == 0;
+        if !quiet && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            continue;
+        }
+        let mut out = read_published_removal_debits(cache_dir).await;
+        #[cfg(test)]
+        fire_test_hook(&READ_BETWEEN_HOOKS, dir_tag(cache_dir));
+        {
+            let tag = dir_tag(cache_dir);
+            let guard = UNFLUSHED_DEBITS.lock().unwrap_or_else(|p| p.into_inner());
+            for ((t, _), shards) in guard.iter() {
+                if *t != tag {
+                    continue;
+                }
+                for (shard, (r, at)) in shards {
+                    out.push(RemovalDebitEntry {
+                        bucket: shard.bucket.clone(),
+                        l1: shard.l1.clone(),
+                        removed_at_unix_nanos: *at,
+                        bytes: r.bytes,
+                        ranges: r.ranges,
+                    });
+                }
+            }
+        }
+        let undisturbed = quiet
+            && FLUSHES_IN_FLIGHT.load(Ordering::SeqCst) == 0
+            && FLUSHES_COMPLETED.load(Ordering::SeqCst) == completed;
+        if undisturbed || std::time::Instant::now() >= deadline {
+            return out;
+        }
+    }
+}
+
+/// The removal debit documents on the volume.
+async fn read_published_removal_debits(cache_dir: &Path) -> Vec<RemovalDebitEntry> {
+    let Ok(mut listing) = tokio::fs::read_dir(RemovalDebitDocument::dir(cache_dir)).await else {
+        return Vec::new();
+    };
+    let now = now_nanos();
+    let retire_nanos = RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(2_000_000_000);
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = listing.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Temps are `{instance}.json.tmp.{host}.{pid}`, so `.json` as the suffix excludes them.
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(body) = tokio::fs::read_to_string(entry.path()).await else {
+            continue;
+        };
+        let Some(doc) = RemovalDebitDocument::parse(&body) else {
+            continue;
+        };
+        let wholly_stale = doc
+            .entries
+            .iter()
+            .all(|e| now.saturating_sub(e.removed_at_unix_nanos) > retire_nanos);
+        if wholly_stale {
+            let stale_on_disk = std::fs::metadata(entry.path())
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| SystemTime::now().duration_since(m).ok())
+                .is_some_and(|d| d.as_secs() > RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(2));
+            if stale_on_disk {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+        }
+        out.extend(doc.entries);
+    }
+    out
+}
+
+/// What the removal debits take off a figure composed from `pending` and `checkpoints`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AppliedDebit {
+    pub bytes: u64,
+    pub ranges: u64,
+}
+
+impl PendingReadOutcome {
+    /// The removal debits this read carries, applied by [`RemovalDebitEntry`]'s rule against
+    /// `checkpoints`, and clamped per shard to that shard's figure (`F_s` plus its post-cut
+    /// pending term), so a debit can never take a shard below zero.
+    pub(crate) fn applied_debit(&self, checkpoints: &ShardCheckpointSet) -> AppliedDebit {
+        if self.removal_debits.is_empty() {
+            return AppliedDebit::default();
+        }
+        let mut applied: HashMap<Shard, (u64, u64)> = HashMap::new();
+        for e in &self.removal_debits {
+            let shard = e.shard();
+            let applies = checkpoints
+                .get(&shard)
+                .is_none_or(|c| c.visit_started_at() < e.removed_at_unix_nanos);
+            if applies {
+                let slot = applied.entry(shard).or_default();
+                slot.0 = slot.0.saturating_add(e.bytes);
+                slot.1 = slot.1.saturating_add(e.ranges);
+            }
+        }
+        if applied.is_empty() {
+            return AppliedDebit::default();
+        }
+        let mut pending_by_shard: HashMap<Shard, (u64, u64)> = HashMap::new();
+        for c in self.post_cut(checkpoints) {
+            let slot = pending_by_shard.entry(c.shard()).or_default();
+            slot.0 = slot.0.saturating_add(c.bytes);
+            slot.1 = slot.1.saturating_add(1);
+        }
+        let mut total = AppliedDebit::default();
+        for (shard, (bytes, ranges)) in applied {
+            let (pend_bytes, pend_ranges) = pending_by_shard.get(&shard).copied().unwrap_or((0, 0));
+            let (f_bytes, f_ranges) = checkpoints
+                .get(&shard)
+                .map(|c| (c.staged_byte_sum, c.staged_range_count))
+                .unwrap_or((0, 0));
+            total.bytes = total
+                .bytes
+                .saturating_add(bytes.min(f_bytes.saturating_add(pend_bytes)));
+            total.ranges = total
+                .ranges
+                .saturating_add(ranges.min(f_ranges.saturating_add(pend_ranges)));
+        }
+        total
+    }
+}
+
+/// Every removal debit this process can read for `cache_dir`: the published documents and this
+/// process's own unflushed removals.
+#[cfg(test)]
+pub(crate) async fn removal_debits_for_tests(cache_dir: &Path) -> Vec<RemovalDebitEntry> {
+    read_removal_debits(cache_dir).await
 }
 
 /// The published staged figure (`F + post-cut pending + P`), for a test in a file that may not
@@ -734,43 +1368,6 @@ static BUDGET_SNAPSHOT_DIR: AtomicU64 = AtomicU64::new(0);
 /// recorded, and it fired here on the first run.
 #[derive(Default, Clone, Copy)]
 struct CountEvictionState {
-    /// Ranges reclaimed by count-driven eviction since the last fold install.
-    ///
-    /// # Without this the count trigger over-evicts, and the reason is the count's own latency
-    ///
-    /// The count comes from the per-shard checkpoints, which move only when a fold installs. The
-    /// consolidation cycle evaluates the trigger every `consolidation_interval` (5 s by
-    /// default), so between two installs the same stale count would be observed repeatedly and
-    /// each evaluation would ask for `count − target` ranges again. That is a drain of the whole
-    /// write tier at a rate set by the eviction candidate cap rather than by the overshoot, and
-    /// it is a worse defect than the wedge the count trigger exists to fix.
-    ///
-    /// So a count-driven pass debits what it provably reclaimed, and the trigger compares
-    /// `observed − reclaimed_since_fold`. Two properties make that sound rather than a guess:
-    ///
-    /// - It is **measured, not estimated** — the figure is the summed `staged_range_count` of
-    ///   the `.meta`s this pass actually evicted, from the same assessment the eviction acted
-    ///   on.
-    /// - It is reset by exactly the event that makes it redundant, a fold install, at the same
-    ///   site as [`invalidate_budget_snapshot`]. It can therefore never double-count a reclaim
-    ///   the installed figure already reflects.
-    ///
-    /// The direction is deliberate and it is the safe one. Subtracting **under**-states the
-    /// count, so the count trigger fires late; admission's [`budget_verdict`] is untouched and
-    /// still reads the raw figure, so the decline backstop stays conservative. Eviction erring
-    /// late and admission erring early is the pair that cannot over-delete.
-    ///
-    /// # Peers see it through a document, not through this field
-    ///
-    /// The checkpoint figure is shared, so a reclaim here over-states the count for every
-    /// instance on the volume, not only this one. [`record_count_eviction_pass`] therefore also
-    /// publishes this figure as this instance's [`ReclaimDocument`], and
-    /// [`count_eviction_verdict`] subtracts the peers' documents as well as this field.
-    reclaimed_since_fold: u64,
-    /// This instance's fold installs against this directory, counting from zero at process
-    /// start. The generation a published [`ReclaimDocument`] counts against; bumped by the same
-    /// install that zeroes `reclaimed_since_fold`.
-    generation: u64,
     /// Set when a count-driven pass reclaimed **nothing**, cleared by the next fold install.
     ///
     /// # Without this the count trigger takes the fleet eviction lock every consolidation cycle
@@ -786,7 +1383,7 @@ struct CountEvictionState {
     /// A pass that reclaimed nothing has established that the population is empty, which is
     /// exactly the decline arm's correct firing condition. Re-establishing it cannot yield a
     /// different answer until the inputs change, and the inputs change at a fold install — the
-    /// same event that clears the reclaim debit, for the same reason.
+    /// same event that makes a removal debit inert, for the same reason.
     ///
     /// **Not** set by a pass that reclaimed something, however little: partial progress means
     /// the population was non-empty, so the next cycle has real work to do.
@@ -921,20 +1518,47 @@ const AUTHORITY_SNAPSHOT_MAX_KEYS: usize = 64;
 /// One memoised derivation: when it was taken, and what it found.
 #[derive(Debug, Clone, Copy)]
 struct AuthoritySnapshot {
-    /// No input of `figure` is older than this. A deciding reader accepts the memo while it is
-    /// younger than [`AUTHORITY_SNAPSHOT_TTL_SECS`].
+    /// No input of `figure` is older than this: the derivation's start, or for a scrape's
+    /// refresh the start of the walk its `P` came from. See [`Self::fresh_for_decider`].
     taken_at_secs: u64,
-    /// When `F` and the pending term were read. Equal to `taken_at_secs` for a deciding reader's
-    /// derivation; later for a scrape's refresh, whose `P` is the last walk this process kept
-    /// (see [`rederive_authority_snapshot_from_kept_walk`]). A scrape accepts the memo while
-    /// this is younger than the TTL, which is what limits scrape refreshes to one per TTL.
+    /// When `F` and the pending term began to be read. Equal to `taken_at_secs` for a deciding
+    /// reader's derivation; later for a scrape's refresh, whose `P` is the last walk this process
+    /// kept (see [`rederive_authority_snapshot_from_kept_walk`]).
     derived_at_secs: u64,
+    /// When the figure was installed, at the derivation's end. A scrape accepts the memo while
+    /// this is younger than the TTL, which is what limits scrape refreshes to one per TTL. `0`
+    /// for a figure from a derivation that began before a fold install expired the memo, which
+    /// no reader accepts.
+    installed_at_secs: u64,
     /// `None` is UNREADABLE, never a zero.
     figure: Option<StagedAuthorityFigure>,
     /// The newest derivation that produced a figure, with its `taken_at_secs`. Carried across a
     /// derivation that produces `None`, and kept when the memo is expired, so
     /// [`staged_authority_figure_or_recent`] can serve it.
     last_complete: Option<(u64, StagedAuthorityFigure)>,
+}
+
+impl AuthoritySnapshot {
+    /// Whether a deciding reader may use this memo at `now_secs`.
+    ///
+    /// Its inputs may be [`AUTHORITY_SNAPSHOT_TTL_SECS`] plus the derivation's own read time old.
+    /// A derivation the reader started itself would return inputs one read time old, so a memo it
+    /// accepts is never more than the TTL older than its own derivation would be, however long the
+    /// read takes. Dating the allowance by the read of `F` and the pending term, rather than by
+    /// the install, keeps a scrape refresh's walk-dated `P` to the same rule: that walk must be
+    /// younger than the TTL plus the refresh's own read.
+    fn fresh_for_decider(&self, now_secs: u64) -> bool {
+        let read_secs = self.installed_at_secs.saturating_sub(self.derived_at_secs);
+        self.installed_at_secs != 0
+            && now_secs.saturating_sub(self.taken_at_secs)
+                < AUTHORITY_SNAPSHOT_TTL_SECS.saturating_add(read_secs)
+    }
+
+    /// Whether a scrape may serve this memo without starting a refresh: installed within the TTL.
+    fn fresh_for_scrape(&self, now_secs: u64) -> bool {
+        self.installed_at_secs != 0
+            && now_secs.saturating_sub(self.installed_at_secs) < AUTHORITY_SNAPSHOT_TTL_SECS
+    }
 }
 
 /// Calls served from the memo, and calls that re-derived it, since process start.
@@ -1117,6 +1741,36 @@ fn log_staging_figure_unknown(unknown_for: u64) {
     );
 }
 
+/// Fold installs seen per cache directory, keyed by [`dir_tag`]. A derivation records the value at
+/// its start; one that began before an install installs its figure already expired and is not
+/// joined, so no reader is served a figure the install has just changed.
+static AUTHORITY_GENERATIONS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// `tag`'s install generation.
+fn authority_generation(tag: u64) -> u64 {
+    AUTHORITY_GENERATIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&tag)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Count one install for `cache_dir`.
+fn bump_authority_generation(cache_dir: &Path) {
+    let tag = dir_tag(cache_dir);
+    let mut map = AUTHORITY_GENERATIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // The memo's bound, for the memo's reason; only a test binary reaches it. A cleared entry
+    // reads as a new generation to a derivation in flight, which then installs expired.
+    if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
+        map.clear();
+    }
+    let generation = map.entry(tag).or_insert(0);
+    *generation = generation.wrapping_add(1);
+}
+
 /// Expire the memoised authority figure for `cache_dir` without dropping it.
 ///
 /// Every reader that decides on the figure re-derives it next time, exactly as if the entry had
@@ -1124,10 +1778,12 @@ fn log_staging_figure_unknown(unknown_for: u64) {
 /// (see [`as_scrape`]); removing the entry would make the first scrape after every fold install
 /// re-derive inline, which is the wait `as_scrape` exists to remove.
 fn expire_authority_snapshot(cache_dir: &Path) {
+    bump_authority_generation(cache_dir);
     if let Ok(mut map) = AUTHORITY_SNAPSHOT.lock() {
         if let Some(snapshot) = map.get_mut(&dir_tag(cache_dir)) {
             snapshot.taken_at_secs = 0;
             snapshot.derived_at_secs = 0;
+            snapshot.installed_at_secs = 0;
         }
     }
 }
@@ -1171,6 +1827,125 @@ pub(crate) fn shard_checkpoint_reads_for_tests(cache_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Per-directory observation of checkpoint file loads: how many ran at once, and on which threads.
+///
+/// Exists so "the checkpoint read runs in parallel, off the calling thread" is an assertion. A
+/// registered probe also sleeps `delay` inside each load, so concurrency is observable on a local
+/// temp directory where a load otherwise takes microseconds.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointLoadProbe {
+    delay: std::time::Duration,
+    in_flight: AtomicUsizeForTests,
+    peak: AtomicUsizeForTests,
+    loads: AtomicUsizeForTests,
+    threads: Mutex<Vec<std::thread::ThreadId>>,
+}
+
+#[cfg(test)]
+type AtomicUsizeForTests = std::sync::atomic::AtomicUsize;
+
+#[cfg(test)]
+impl CheckpointLoadProbe {
+    /// The most loads that were in flight at once.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+    /// Loads observed.
+    pub(crate) fn loads(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+    /// Whether any load ran on thread `id`.
+    pub(crate) fn ran_on(&self, id: std::thread::ThreadId) -> bool {
+        self.threads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&id)
+    }
+}
+
+#[cfg(test)]
+static CHECKPOINT_LOAD_PROBES: Mutex<BTreeMap<u64, std::sync::Arc<CheckpointLoadProbe>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Observe every checkpoint load for `cache_dir` from now on, each held for `delay`.
+#[cfg(test)]
+pub(crate) fn register_checkpoint_load_probe_for_tests(
+    cache_dir: &Path,
+    delay: std::time::Duration,
+) -> std::sync::Arc<CheckpointLoadProbe> {
+    let probe = std::sync::Arc::new(CheckpointLoadProbe {
+        delay,
+        ..CheckpointLoadProbe::default()
+    });
+    CHECKPOINT_LOAD_PROBES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir_tag(cache_dir), std::sync::Arc::clone(&probe));
+    probe
+}
+
+/// One load in flight under a probe; dropping it ends the load.
+#[cfg(test)]
+struct CheckpointLoadGuard(Option<std::sync::Arc<CheckpointLoadProbe>>);
+
+#[cfg(test)]
+impl Drop for CheckpointLoadGuard {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.0 {
+            probe.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Enter one checkpoint load for `cache_dir`: tally it on the directory's probe, if any, and hold
+/// it for the probe's delay.
+#[cfg(test)]
+fn checkpoint_load_probe_enter(cache_dir: &Path) -> CheckpointLoadGuard {
+    let probe = CHECKPOINT_LOAD_PROBES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&dir_tag(cache_dir))
+        .cloned();
+    if let Some(p) = &probe {
+        let now = p.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        p.peak.fetch_max(now, Ordering::SeqCst);
+        p.loads.fetch_add(1, Ordering::SeqCst);
+        p.threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(std::thread::current().id());
+        std::thread::sleep(p.delay);
+    }
+    CheckpointLoadGuard(probe)
+}
+
+/// Seconds to date the next authority derivation for a directory before its real start, keyed by
+/// [`dir_tag`]. One-shot.
+#[cfg(test)]
+static DERIVATION_BACKDATE: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Make the next authority derivation for `cache_dir` look as if it began `secs` before it did,
+/// which is how a test states "this derivation took `secs`" without sleeping: the ageing helpers
+/// age an installed memo, and cannot express a derivation's own duration.
+#[cfg(test)]
+pub(crate) fn backdate_next_derivation_for_tests(cache_dir: &Path, secs: u64) {
+    DERIVATION_BACKDATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir_tag(cache_dir), secs);
+}
+
+/// Consume `tag`'s backdate, `0` when none is registered.
+#[cfg(test)]
+fn take_derivation_backdate(tag: u64) -> u64 {
+    DERIVATION_BACKDATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&tag)
+        .unwrap_or(0)
+}
+
 /// [`invalidate_authority_snapshot`], reachable from another module's tests.
 ///
 /// Same reason as [`invalidate_budget_snapshot_for_tests`]: a test that changes staged state and
@@ -1179,6 +1954,19 @@ pub(crate) fn shard_checkpoint_reads_for_tests(cache_dir: &Path) -> u64 {
 #[cfg(test)]
 pub(crate) fn invalidate_authority_snapshot_for_tests(cache_dir: &Path) {
     invalidate_authority_snapshot(cache_dir);
+}
+
+/// A fold install's effect on the memo, for another module's tests: the generation moves, and
+/// a derivation in flight installs its figure expired.
+#[cfg(test)]
+pub(crate) fn expire_authority_snapshot_for_tests(cache_dir: &Path) {
+    expire_authority_snapshot(cache_dir);
+}
+
+/// Whether a derivation of the current generation is in flight for `cache_dir`.
+#[cfg(test)]
+pub(crate) fn derivation_in_flight_for_tests(cache_dir: &Path) -> bool {
+    derivation_in_flight(dir_tag(cache_dir))
 }
 
 /// Move `cache_dir`'s memoised authority figure `secs` into the past, so it is present but
@@ -1194,6 +1982,9 @@ pub(crate) fn age_authority_snapshot_for_tests(cache_dir: &Path, secs: u64) -> b
         Some(snapshot) => {
             snapshot.taken_at_secs = snapshot.taken_at_secs.saturating_sub(secs);
             snapshot.derived_at_secs = snapshot.derived_at_secs.saturating_sub(secs);
+            if snapshot.installed_at_secs != 0 {
+                snapshot.installed_at_secs = snapshot.installed_at_secs.saturating_sub(secs);
+            }
             if let Some((at, _)) = snapshot.last_complete.as_mut() {
                 *at = at.saturating_sub(secs);
             }
@@ -1237,17 +2028,19 @@ pub(crate) fn pending_paths_for_tests(cache_dir: &Path, instance_id: &str) -> (P
     (path, lock)
 }
 
-/// Age of `cache_dir`'s memoised authority figure in seconds, or `None` when there is no live
-/// memo.
+/// Age in seconds of the inputs of `cache_dir`'s memoised authority figure, or `None` when no
+/// deciding reader would accept the memo.
 ///
 /// `None` covers both "never taken" and "expired", which are the two states in which the next
-/// read pays full price.
+/// deciding read derives. The age can exceed [`AUTHORITY_SNAPSHOT_TTL_SECS`] by the derivation's
+/// own read time; see [`AuthoritySnapshot::fresh_for_decider`].
 pub(crate) fn authority_snapshot_age_secs(cache_dir: &Path) -> Option<u64> {
     let now_secs = unix_secs();
     let map = AUTHORITY_SNAPSHOT.lock().ok()?;
     let snapshot = map.get(&dir_tag(cache_dir))?;
-    let age = now_secs.saturating_sub(snapshot.taken_at_secs);
-    (age < AUTHORITY_SNAPSHOT_TTL_SECS).then_some(age)
+    snapshot
+        .fresh_for_decider(now_secs)
+        .then(|| now_secs.saturating_sub(snapshot.taken_at_secs))
 }
 
 /// `(staged_authority_snapshot_hits_total, staged_authority_snapshot_recomputes_total)`.
@@ -1285,168 +2078,124 @@ fn record_shard_duration(elapsed: std::time::Duration) {
 
 /// Drop the memoised budget input, so the next admission re-reads it.
 ///
-/// Also clears [`CountEvictionState`]'s `reclaimed_since_fold` and `found_nothing`: both are
-/// derived from the same input, and a reclaim debit that outlived the install reflecting it would
-/// be subtracted twice. The cumulative `passes_total` / `ranges_freed_total` are deliberately
-/// NOT cleared — they are what make "this is not the first reclaim" readable.
-///
-/// Test-only: production installs go through [`invalidate_budget_snapshot_retiring`], which
-/// also retires the installing instance's [`ReclaimDocument`].
-#[cfg(test)]
+/// Also clears [`CountEvictionState`]'s `found_nothing`, which was established against the input
+/// a fold install has just changed. The cumulative `passes_total` / `ranges_freed_total` are
+/// deliberately NOT cleared: they are what make "this is not the first reclaim" readable. Keyed by
+/// `cache_dir`, like the state: an install against one directory has not re-derived another's
+/// figure.
 fn invalidate_budget_snapshot(cache_dir: impl AsRef<Path>) {
-    invalidate_budget_snapshot_retiring(cache_dir.as_ref(), None);
-}
-
-/// [`invalidate_budget_snapshot`], and at a fold install also retire this instance's
-/// [`ReclaimDocument`] under the same lock.
-///
-/// Under the same lock because [`record_count_eviction_pass`] writes the document under it: a
-/// reclaim recorded between zeroing the field and removing the file would otherwise be lost to
-/// peers while still debited here. A removal that fails leaves a document the install has
-/// superseded; peers keep debiting it until [`RECLAIM_DOCUMENT_MAX_AGE_SECS`] or this
-/// instance's next reclaim rewrites it, which is the late direction.
-///
-/// Keyed by `cache_dir`, like the state: an install against one directory has not re-derived
-/// another's figure. Production has one directory; parallel test fixtures have many.
-fn invalidate_budget_snapshot_retiring(cache_dir: &Path, own_instance: Option<&str>) {
     BUDGET_SNAPSHOT_AT_SECS.store(0, Ordering::Relaxed);
     if let Ok(mut states) = COUNT_EVICTION_STATE.lock() {
-        if let Some(state) = states.get_mut(&dir_tag(cache_dir)) {
-            state.reclaimed_since_fold = 0;
+        if let Some(state) = states.get_mut(&dir_tag(cache_dir.as_ref())) {
             state.found_nothing = false;
-            state.generation = state.generation.saturating_add(1);
-        }
-        if let Some(instance_id) = own_instance {
-            let path = ReclaimDocument::path(cache_dir, instance_id);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => debug!(
-                    "Staged fold: could not retire reclaim document {:?} ({}); peers debit it \
-                     until it ages out",
-                    path, e
-                ),
-            }
         }
     }
 }
 
-/// One instance's count-eviction reclaims since its last fold install, on the shared volume.
-///
-/// # Why this exists
-///
-/// The count trigger reads the shard checkpoints, which move only when a fold installs. Between
-/// installs, an instance that evicted staged ranges debits them from its own verdict
-/// ([`CountEvictionState`]'s `reclaimed_since_fold`) so it does not re-ask for them. That debit
-/// was process-local, and the checkpoint figure is not: a peer's reclaim over-stated the count
-/// for every other instance, which could then evict again for ranges already gone. Each
-/// instance now publishes its debit here, and [`count_eviction_verdict`] subtracts every
-/// peer's document as well as its own field. O(instances) small reads per verdict.
-///
-/// # Lifecycle
-///
-/// - Written by [`record_count_eviction_pass`] whenever the debit changes, atomically
-///   (instance-suffixed temp, `sync_all`, rename), carrying the cumulative debit since this
-///   instance's last install, the install `generation` it counts against, and the time of the
-///   latest reclaim in it.
-/// - Removed by this instance's own fold install, the event that zeroes the debit.
-/// - Ignored by readers once older than [`RECLAIM_DOCUMENT_MAX_AGE_SECS`], and removed by a
-///   reader once twice that old. This is what retires a stopped instance's document: it never
-///   installs again, so nothing else would.
-/// - A volume with no `eviction_reclaims/` directory, or a document that does not parse or
-///   carries another schema, contributes nothing, which is the behaviour before documents
-///   existed. Binaries older than this one do not write documents; epoch 1 already forbids
-///   running them on one volume with this one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ReclaimDocument {
-    schema: u32,
-    instance_id: String,
-    /// The owner's install generation this debit counts against.
-    generation: u64,
-    /// Ranges reclaimed by count-driven eviction since that install.
-    ranges_reclaimed: u64,
-    /// Unix nanoseconds of the latest reclaim included, so the age bound errs late.
-    recorded_at_unix_nanos: u64,
+/// A stall after the collector's checkpoint read, standing in for a long `mpus_in_progress/`
+/// walk, keyed by directory tag.
+#[cfg(test)]
+static COLLECTOR_WALK_STALLS: Mutex<BTreeMap<u64, std::time::Duration>> =
+    Mutex::new(BTreeMap::new());
+#[cfg(test)]
+pub(crate) fn set_collector_walk_stall_for_tests(cache_dir: &Path, stall: std::time::Duration) {
+    COLLECTOR_WALK_STALLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir_tag(cache_dir), stall);
 }
-
-impl ReclaimDocument {
-    fn dir(cache_dir: &Path) -> PathBuf {
-        cache_dir
-            .join("metadata")
-            .join(SHARD_STATE_DIR)
-            .join(EVICTION_RECLAIMS_DIR)
-    }
-
-    fn path(cache_dir: &Path, instance_id: &str) -> PathBuf {
-        Self::dir(cache_dir).join(format!("{}.json", instance_id))
-    }
-
-    fn install(&self, cache_dir: &Path) -> std::io::Result<()> {
-        use std::io::Write;
-        let path = Self::path(cache_dir, &self.instance_id);
-        std::fs::create_dir_all(Self::dir(cache_dir))?;
-        let body = serde_json::to_string(self)
-            .map_err(|e| std::io::Error::other(format!("serialize reclaim document: {e}")))?;
-        let tmp = path.with_extension(format!(
-            "json.tmp.{}.{}",
-            hostname_for_tmp(),
-            std::process::id()
-        ));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(body.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)
+#[cfg(test)]
+async fn collector_walk_stall_hook(cache_dir: &Path) {
+    let stall = COLLECTOR_WALK_STALLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&dir_tag(cache_dir));
+    if let Some(stall) = stall {
+        tokio::time::sleep(stall).await;
     }
 }
-
-/// Σ `ranges_reclaimed` over peers' live [`ReclaimDocument`]s, excluding `instance_id`'s own.
-///
-/// Own is excluded because [`CountEvictionState`] already carries it, and a write failure must
-/// not lose the local debit. Missing directory, unreadable file and foreign schema all read as
-/// zero. A document past twice [`RECLAIM_DOCUMENT_MAX_AGE_SECS`] is removed, but only if its
-/// mtime is that old too, so a peer that has just rewritten it keeps it.
-async fn peer_reclaims_ranges(cache_dir: &Path, instance_id: &str) -> u64 {
-    let Ok(mut entries) = tokio::fs::read_dir(ReclaimDocument::dir(cache_dir)).await else {
-        return 0;
+/// Where in one claimed fold visit a [`set_visit_hook_for_tests`] hook runs.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum VisitHookPhase {
+    /// After the visit's start time is taken and before its ledger and `.meta` reads.
+    Started,
+    /// After every read of the visit and before its checkpoint is built and installed.
+    BeforeInstall,
+}
+/// One-shot hooks for [`VisitHookPhase`], keyed by directory tag and phase.
+#[cfg(test)]
+type VisitHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static VISIT_HOOKS: Mutex<BTreeMap<(u64, VisitHookPhase), VisitHook>> = Mutex::new(BTreeMap::new());
+/// Run `hook` once inside the next fold visit on `cache_dir`, at `phase`: a removal made from it
+/// lands inside a visit's window, which is the straddle the removal debit's reader rule decides.
+#[cfg(test)]
+pub(crate) fn set_visit_hook_for_tests(cache_dir: &Path, phase: VisitHookPhase, hook: VisitHook) {
+    VISIT_HOOKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((dir_tag(cache_dir), phase), hook);
+}
+#[cfg(test)]
+fn run_visit_hook(cache_dir: &Path, phase: VisitHookPhase) {
+    let hook = VISIT_HOOKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&(dir_tag(cache_dir), phase));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+/// Record that `instance_id` removed `bytes` staged bytes in `ranges` ranges from shard
+/// `(bucket, l1)`, as a removal site does, for another module's tests. `removed_at_nanos` overrides
+/// the removal time, which is how a test states a remover whose clock differs from the folder's.
+#[cfg(test)]
+pub(crate) fn record_shard_debit_for_tests(
+    cache_dir: &Path,
+    instance_id: &str,
+    bucket: &str,
+    l1: &str,
+    bytes: u64,
+    ranges: u64,
+    removed_at_nanos: Option<u64>,
+) {
+    let entry = RemovalDebitEntry {
+        bucket: bucket.to_string(),
+        l1: l1.to_string(),
+        removed_at_unix_nanos: removed_at_nanos.unwrap_or_else(now_nanos),
+        bytes,
+        ranges,
     };
-    let now = now_nanos();
-    let max_age_nanos = RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(1_000_000_000);
-    let own_name = format!("{}.json", instance_id);
-    let mut total: u64 = 0;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Temps are `{instance}.json.tmp.{host}.{pid}`, so `.json` as the suffix excludes them.
-        if !name.ends_with(".json") || name == own_name {
-            continue;
-        }
-        let Ok(body) = tokio::fs::read_to_string(entry.path()).await else {
-            continue;
-        };
-        let Ok(doc) = serde_json::from_str::<ReclaimDocument>(&body) else {
-            continue;
-        };
-        if doc.schema != RECLAIM_DOCUMENT_SCHEMA || doc.instance_id == instance_id {
-            continue;
-        }
-        let age = now.saturating_sub(doc.recorded_at_unix_nanos);
-        if age <= max_age_nanos {
-            total = total.saturating_add(doc.ranges_reclaimed);
-            continue;
-        }
-        if age > max_age_nanos.saturating_mul(2) {
-            let stale_on_disk = std::fs::metadata(entry.path())
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| SystemTime::now().duration_since(m).ok())
-                .is_some_and(|d| d.as_secs() > RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(2));
-            if stale_on_disk {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    total
+    write_removal_debits(cache_dir, instance_id, vec![entry])
+        .expect("test fixture must be able to write a removal debit");
+    invalidate_budget_snapshot(cache_dir);
+    expire_authority_snapshot(cache_dir);
+}
+/// A fold install of `(bucket, l1)` by `instance_id` with the given figure, for another module's
+/// tests: the checkpoint, and every in-process consequence of an install.
+#[cfg(test)]
+pub(crate) fn fold_installed_for_tests(
+    cache_dir: &Path,
+    instance_id: &str,
+    bucket: &str,
+    l1: &str,
+    bytes: u64,
+    ranges: u64,
+) {
+    let shard = Shard::new(bucket, l1);
+    let visit_started = now_nanos();
+    let mut c = StagedShardCheckpoint::empty(&shard);
+    c.staged_byte_sum = bytes;
+    c.staged_range_count = ranges;
+    c.staged_visit_started_at = visit_started;
+    c.staged_scanned_at = now_nanos();
+    c.staged_scanned_by = instance_id.to_string();
+    c.install(cache_dir)
+        .expect("test fixture must be able to install a shard checkpoint");
+    note_own_install(cache_dir, instance_id, &shard, visit_started);
+    invalidate_budget_snapshot(cache_dir);
+    expire_authority_snapshot(cache_dir);
 }
 
 /// Install a synthetic shard figure, for another module's tests.
@@ -1585,6 +2334,15 @@ pub(crate) async fn budget_verdict(cache_dir: &Path) -> BudgetVerdict {
 /// form of the very defect that unit fixes; and the input is a readdir plus a locked read of
 /// every `.pending` file, so it is worth reading once.
 async fn budget_snapshot_count(cache_dir: &Path) -> u64 {
+    budget_snapshot_count_and_debit(cache_dir).await.0
+}
+
+/// The range half of the removal debits the memoised count's derivation applied. See
+/// [`count_eviction_verdict`]; admission does not subtract it.
+static BUDGET_SNAPSHOT_RANGE_DEBIT: AtomicU64 = AtomicU64::new(0);
+
+/// [`budget_snapshot_count`] and the range debit from the same derivation.
+async fn budget_snapshot_count_and_debit(cache_dir: &Path) -> (u64, u64) {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1595,90 +2353,25 @@ async fn budget_snapshot_count(cache_dir: &Path) -> u64 {
         && now_secs.saturating_sub(taken_at) < BUDGET_SNAPSHOT_TTL_SECS
         && BUDGET_SNAPSHOT_DIR.load(Ordering::Relaxed) == tag;
     if fresh_enough {
-        return BUDGET_SNAPSHOT_COUNT.load(Ordering::Relaxed);
-    }
-    // Single-flight. Before this, k concurrent callers in one cold window each ran the
-    // whole derivation and serialised against each other on the same `.pending` flocks.
-    let mut rx = budget_derivation(cache_dir);
-    // `Err` is the sender dropped without a value, i.e. the derivation task panicked or the
-    // runtime is shutting down; the inner `None` cannot occur past `wait_for`. Both collapse to
-    // the UNREADABLE sentinel, which `budget_verdict` fails open on — the same direction as an
-    // unreadable input and the only safe one for an admission gate.
-    let joined = rx.wait_for(|v| v.is_some()).await.ok().and_then(|v| *v);
-    joined.unwrap_or(u64::MAX)
-}
-
-/// The in-flight budget-count derivation per cache directory, single-flight.
-///
-/// `Some(count)` once the derivation has finished, with `u64::MAX` as the UNREADABLE sentinel;
-/// the entry is removed from the map as soon as the memo is installed, so the next cold window
-/// starts a new derivation.
-type BudgetDerivation = tokio::sync::watch::Receiver<Option<u64>>;
-static BUDGET_DERIVATIONS: Mutex<BTreeMap<u64, BudgetDerivation>> = Mutex::new(BTreeMap::new());
-
-/// Join `cache_dir`'s budget-count derivation, starting it if none is running.
-///
-/// # Why this is the `Absent` path's mechanism rather than a new one
-///
-/// `cache::first_budget_derivation` already single-flights the *verdict* derivation this way —
-/// a `tokio::sync::watch` per cache directory, held in a map, joined by every later caller and
-/// removed by the derivation itself. This is the identical shape one layer down, and it is a
-/// second *instance* rather than a second *mechanism* for two reasons that rule out sharing the
-/// static itself:
-///
-/// * The value types differ. `FIRST_BUDGET_DERIVATIONS` carries a verdict
-///   (`Option<Option<&'static str>>`) and this carries the count the verdict is derived from.
-///   The count is also the figure [`count_eviction_verdict`] reads, which is the whole point of
-///   § 16.6.12 point 5 — admission and eviction must see one figure, not two snapshots.
-/// * The layering forbids it. `cache.rs` depends on `staged_fold`, not the reverse, and
-///   `count_eviction_verdict` reaches [`budget_snapshot_count`] **without** passing through
-///   `cache.rs` at all. A single-flight hosted up there would leave that caller unprotected.
-///
-/// # What a second caller receives
-///
-/// The **first** derivation's count, from the same `watch` — not a second derivation, and not a
-/// stale memo. Its I/O is one shard-checkpoint traversal and one locked read per `.pending`
-/// file for the whole cohort instead of k of each.
-///
-/// # And what an abandoned caller leaves behind
-///
-/// The derivation runs on a `tokio::spawn`ed task, so a caller that stops waiting — the
-/// `FRESH_BUDGET_REDERIVE_WAIT` timeout in `cache::budget_refusal_off_the_request_path` — drops
-/// only its receiver. **That is what makes the earlier comment true.** Before this change the
-/// derivation was awaited inline inside that `tokio::time::timeout`, so expiry *dropped the
-/// future* and the derivation was cancelled at its next await point with nothing installed: the
-/// I/O already done was wasted and the next caller paid for it again. Now the task outlives the
-/// timeout and installs its count.
-fn budget_derivation(cache_dir: &Path) -> BudgetDerivation {
-    let tag = dir_tag(cache_dir);
-    let mut guard = BUDGET_DERIVATIONS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(rx) = guard.get(&tag) {
-        return rx.clone();
-    }
-    let (tx, rx) = tokio::sync::watch::channel(None);
-    guard.insert(tag, rx.clone());
-    drop(guard);
-    let dir = cache_dir.to_path_buf();
-    tokio::spawn(async move {
-        let stored = staged_range_count_now(&dir).await.unwrap_or(u64::MAX);
-        // Install the memo BEFORE releasing the map entry, so a caller that arrives between
-        // the two finds a fresh memo rather than starting a redundant derivation.
-        BUDGET_SNAPSHOT_COUNT.store(stored, Ordering::Relaxed);
-        BUDGET_SNAPSHOT_DIR.store(tag, Ordering::Relaxed);
-        BUDGET_SNAPSHOT_AT_SECS.store(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            Ordering::Relaxed,
+        return (
+            BUDGET_SNAPSHOT_COUNT.load(Ordering::Relaxed),
+            BUDGET_SNAPSHOT_RANGE_DEBIT.load(Ordering::Relaxed),
         );
-        BUDGET_DERIVATIONS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&tag);
-        let _ = tx.send(Some(stored));
-    });
-    rx
+    }
+    // Single-flight with the byte figure: wait for the authority derivation in flight, or start
+    // one. The count comes from the same read of the pending files and the checkpoints as the
+    // byte figure, and that derivation installs this memo on its own task, so a caller that stops
+    // waiting (the request path's 300 ms bound) cancels nothing. No count is the UNREADABLE
+    // sentinel, which `budget_verdict` fails open on: the only safe direction for an admission
+    // gate.
+    // A derivation in flight that has already read the inputs is not waited for: its count is
+    // the one it will install, and the rest of its work (the walk composing `P`) is not an
+    // input to it.
+    if let Some(early) = early_budget_count(tag) {
+        return early;
+    }
+    let figures = joined_derivation(cache_dir, Join::Any).await;
+    (figures.count.unwrap_or(u64::MAX), figures.count_debit)
 }
 
 /// `Σ staged_range_count` over shards plus the post-cut pending count — the figure the budget
@@ -1688,24 +2381,21 @@ fn budget_derivation(cache_dir: &Path) -> BudgetDerivation {
 /// exists on disk and is not yet in any shard's `staged_range_count`. Omitting it would let a
 /// burst between two folds admit an unbounded number of ranges, which is the count the budget
 /// exists to bound.
-async fn staged_range_count_now(cache_dir: &Path) -> Option<u64> {
-    #[cfg(test)]
-    count_derivation_stall_hook(cache_dir).await;
-    // Pending first, then checkpoints, for the reason `staged_authority_figure_uncached` states:
-    // the other order can miss a credit a peer's install and its owner's GC moved between them,
-    // and an under-count here admits past the budget.
-    let pending = PendingStore::new(cache_dir.to_path_buf()).read_all().await;
-    if !pending.is_complete() {
-        return None;
-    }
-    let checkpoints = read_shard_checkpoints(cache_dir);
-    if !checkpoints.is_complete() {
+///
+/// The inputs must have been read pending first, then checkpoints, for the reason
+/// [`derive_figures`] states: the other order can miss a credit a peer's install and its owner's
+/// GC moved between them, and an under-count here admits past the budget.
+fn staged_range_count_of(
+    pending: &PendingReadOutcome,
+    checkpoints: &ShardCheckpointSet,
+) -> Option<u64> {
+    if !pending.is_complete() || !checkpoints.is_complete() {
         return None;
     }
     Some(
         checkpoints
             .staged_range_count()
-            .saturating_add(pending.post_cut(&checkpoints).len() as u64),
+            .saturating_add(pending.post_cut(checkpoints).len() as u64),
     )
 }
 
@@ -1775,6 +2465,13 @@ pub(crate) async fn pending_read_all_complete_for_tests(cache_dir: &Path) -> boo
         .is_complete()
 }
 
+/// Pending-credit lines moved to a `{instance}.pending.torn` file since process start.
+static PENDING_LINES_QUARANTINED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Pending-credit lines this process has moved to a `{instance}.pending.torn` file since it
+/// started, from its own file or a retired instance's. **Per-instance.**
+pub(crate) fn pending_lines_quarantined_total() -> u64 {
+    PENDING_LINES_QUARANTINED_TOTAL.load(Ordering::Relaxed)
+}
 /// Waits, summed wait milliseconds, and timeouts on `{instance}.pending.lock` since process
 /// start. **Per-instance.**
 pub(crate) fn pending_lock_wait_stats() -> (u64, u64, u64) {
@@ -1880,43 +2577,124 @@ pub(crate) fn count_eviction_thresholds(trigger_percent: u8, target_percent: u8)
     (trigger, target)
 }
 
-/// Record a count-driven pass's reclaim, so the next evaluation does not re-ask for it.
+/// Publish the count arm's cumulative reclaim as `instance_id`'s [`ReclaimDocument`], for a
+/// 3.0.3 proxy on the same volume. A failed write is logged and costs only that proxy an
+/// over-eviction until the next pass. This release's reader, [`peer_303_reclaimed_ranges`],
+/// skips the document by its `writer` field.
+fn publish_compat_reclaim(cache_dir: &Path, instance_id: &str, ranges_reclaimed: u64) {
+    // Held through the write, as 3.0.3 held its state lock: an install's retirement then cannot
+    // land between the cumulative count and the document and leave a document the install
+    // superseded.
+    let mut guard = COMPAT_RECLAIMED_RANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let slot = guard.entry(dir_tag(cache_dir)).or_insert(0);
+    *slot = slot.saturating_add(ranges_reclaimed);
+    let cumulative = *slot;
+    let document = ReclaimDocument {
+        schema: RECLAIM_DOCUMENT_SCHEMA,
+        instance_id: instance_id.to_string(),
+        generation: 0,
+        ranges_reclaimed: cumulative,
+        recorded_at_unix_nanos: now_nanos(),
+        writer: COMPAT_RECLAIM_WRITER,
+    };
+    #[cfg(test)]
+    fire_test_hook(&COMPAT_PUBLISH_HOOKS, dir_tag(cache_dir));
+    if let Err(e) = document.install(cache_dir) {
+        warn!(
+            "Could not publish the count-eviction reclaim document for {} ({}); a 3.0.3 \
+             proxy on this volume will not debit these {} range(s)",
+            instance_id, e, ranges_reclaimed
+        );
+    }
+}
+
+/// A fold install supersedes the reclaim document: zero its count and remove the file, whether or
+/// not this process wrote it (a document a predecessor on the same name left is superseded too).
+/// Under the lock [`publish_compat_reclaim`] holds across its write.
+fn retire_compat_reclaim(cache_dir: &Path, instance_id: &str) {
+    let mut guard = COMPAT_RECLAIMED_RANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    guard.remove(&dir_tag(cache_dir));
+    if let Err(e) = std::fs::remove_file(ReclaimDocument::path(cache_dir, instance_id)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "Could not remove the count-eviction reclaim document for {} ({})",
+                instance_id, e
+            );
+        }
+    }
+}
+
+/// What a 3.0.3 proxy's reclaim document holds that this release needs: the fields it reads, and
+/// `writer`, which only this release writes.
+#[derive(Deserialize)]
+struct PeerReclaimDocument {
+    schema: u32,
+    ranges_reclaimed: u64,
+    recorded_at_unix_nanos: u64,
+    #[serde(default)]
+    writer: Option<String>,
+}
+
+/// Σ `ranges_reclaimed` over the live reclaim documents a 3.0.3 proxy wrote.
 ///
-/// See [`COUNT_RECLAIMED_SINCE_FOLD`] for why this exists and why the direction is safe.
-/// Returns the process totals `(passes_total, ranges_freed_total)` after recording, which the
-/// pass publishes.
+/// A 3.0.3 proxy publishes no removal debits, so during a rolling upgrade its count reclaims reach
+/// this release only as its `eviction_reclaims/` document, which it removes at its own fold
+/// install. A document with `writer` was written by this release and its ranges are already in the
+/// removal debits, so counting it would debit them twice. A missing directory, an unreadable file,
+/// another schema and a document past [`RECLAIM_DOCUMENT_MAX_AGE_SECS`] read as zero. Nothing is
+/// removed here: the 3.0.3 owner retires its own, and a stopped one's ages out by the bound.
+async fn peer_303_reclaimed_ranges(cache_dir: &Path) -> u64 {
+    let Ok(mut listing) = tokio::fs::read_dir(ReclaimDocument::dir(cache_dir)).await else {
+        return 0;
+    };
+    let now = now_nanos();
+    let max_age_nanos = RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(1_000_000_000);
+    let mut total: u64 = 0;
+    while let Ok(Some(entry)) = listing.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Temps are `{instance}.json.tmp.{host}.{pid}`, so `.json` as the suffix excludes them.
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(body) = tokio::fs::read_to_string(entry.path()).await else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<PeerReclaimDocument>(&body) else {
+            continue;
+        };
+        if doc.schema != RECLAIM_DOCUMENT_SCHEMA || doc.writer.is_some() {
+            continue;
+        }
+        if now.saturating_sub(doc.recorded_at_unix_nanos) <= max_age_nanos {
+            total = total.saturating_add(doc.ranges_reclaimed);
+        }
+    }
+    total
+}
+
+/// Record a count-driven pass: its totals, and the latch when it reclaimed nothing.
 ///
-/// Also publishes the debit as `instance_id`'s [`ReclaimDocument`], so peers' verdicts debit it
-/// too. Written under the state lock, so an install's retirement cannot interleave. A write that
-/// fails is logged and leaves peers blind to this reclaim until the next one, which is the
-/// behaviour before documents existed; the local debit is unaffected.
+/// The ranges it reclaimed are not debited here. The staging pass publishes them per shard as
+/// removal debits ([`publish_removal_debits`]) before its re-fold, and [`count_eviction_verdict`]
+/// applies them, on this instance and on every peer. Returns the process totals
+/// `(passes_total, ranges_freed_total)` after recording, which the pass publishes.
 pub(crate) fn record_count_eviction_pass(
     cache_dir: &Path,
     instance_id: &str,
     ranges_reclaimed: u64,
 ) -> (u64, u64) {
     let tag = dir_tag(cache_dir);
+    if ranges_reclaimed > 0 {
+        publish_compat_reclaim(cache_dir, instance_id, ranges_reclaimed);
+    }
     let Ok(mut states) = COUNT_EVICTION_STATE.lock() else {
         return (0, 0);
     };
     let state = states.entry(tag).or_default();
-    state.reclaimed_since_fold = state.reclaimed_since_fold.saturating_add(ranges_reclaimed);
-    if ranges_reclaimed > 0 {
-        let document = ReclaimDocument {
-            schema: RECLAIM_DOCUMENT_SCHEMA,
-            instance_id: instance_id.to_string(),
-            generation: state.generation,
-            ranges_reclaimed: state.reclaimed_since_fold,
-            recorded_at_unix_nanos: now_nanos(),
-        };
-        if let Err(e) = document.install(cache_dir) {
-            warn!(
-                "Could not publish the count-eviction reclaim document for {} ({}); peers will \
-                 not debit these {} range(s)",
-                instance_id, e, ranges_reclaimed
-            );
-        }
-    }
     // Latch only on a pass that reclaimed NOTHING. Partial progress means the population was
     // non-empty, so the next cycle has real work to do. See `found_nothing`.
     if ranges_reclaimed == 0 {
@@ -1941,12 +2719,12 @@ pub(crate) fn record_count_eviction_pass(
 /// epoch, so a count trigger gated on the epoch would leave the wedge live in Phase L. Both read
 /// the shard checkpoints directly.
 ///
-/// The debit is this instance's `reclaimed_since_fold` plus every peer's live
-/// [`ReclaimDocument`]; `instance_id` names this instance so its own document is not counted
-/// twice.
+/// The debit is the range half of every instance's removal debits ([`RemovalDebitDocument`]),
+/// applied shard by shard: an entry counts while its shard's checkpoint began its visit before the
+/// removal, so a pass that evicted from S1 and S2 and re-installed only S1 still debits S2.
+/// Admission's [`budget_verdict`] reads the raw count, so it declines early rather than late.
 pub(crate) async fn count_eviction_verdict(
     cache_dir: &Path,
-    instance_id: &str,
     trigger_percent: u8,
     target_percent: u8,
 ) -> CountEvictionVerdict {
@@ -1962,14 +2740,13 @@ pub(crate) async fn count_eviction_verdict(
     if state.found_nothing {
         return CountEvictionVerdict::NotNeeded;
     }
-    let observed_count = budget_snapshot_count(cache_dir).await;
+    let (observed_count, debit) = budget_snapshot_count_and_debit(cache_dir).await;
     if observed_count == u64::MAX {
         return CountEvictionVerdict::NotNeeded;
     }
-    let peers = peer_reclaims_ranges(cache_dir, instance_id).await;
     let count = observed_count
-        .saturating_sub(state.reclaimed_since_fold)
-        .saturating_sub(peers);
+        .saturating_sub(debit)
+        .saturating_sub(peer_303_reclaimed_ranges(cache_dir).await);
     if count <= trigger {
         return CountEvictionVerdict::NotNeeded;
     }
@@ -2361,6 +3138,10 @@ pub(crate) struct PendingReadOutcome {
     /// Lines discarded by the parser, blank lines included — a blank line in an
     /// append-only JSONL file is what a torn append looks like.
     pub malformed_lines: usize,
+    /// Every instance's removal debits, read right after the pending files and before the
+    /// checkpoints, by a reader that composes a figure. Empty for the fold's own read. See
+    /// [`read_removal_debits`] for why the order matters.
+    pub removal_debits: Vec<RemovalDebitEntry>,
 }
 
 impl PendingReadOutcome {
@@ -2469,9 +3250,11 @@ async fn run_pending_before_write_hook(cache_dir: &Path) {
 
 /// Per-instance append-only store of pending credits, on the shared volume.
 ///
-/// Only the owning instance ever rewrites its own file, which is a strict improvement on
-/// the ledger's shared-rewrite shape: a peer's fold reads these files but never writes
-/// them.
+/// The owning instance rewrites its own file. Another instance rewrites it in two cases only,
+/// each under the file's lock: once the instance is retired, to quarantine its torn lines
+/// ([`PendingStore::quarantine_torn_lines`]), and the ledger repair's byte-exact removal of
+/// credits it surveyed ([`PendingStore::drop_lines`]). A peer's fold otherwise reads these files
+/// and never writes them.
 pub(crate) struct PendingStore {
     cache_dir: PathBuf,
 }
@@ -2632,6 +3415,133 @@ impl PendingStore {
     pub async fn append(&self, instance_id: &str, credit: &PendingCredit) -> std::io::Result<()> {
         self.append_batch(instance_id, std::slice::from_ref(credit))
             .await
+    }
+
+    /// Move the torn lines of `instance_id`'s own file, and of every file whose instance is
+    /// retired, to `{instance}.pending.torn`, each under that file's own lock. Returns the number
+    /// of lines moved.
+    ///
+    /// A torn line is blank or not JSON at all ([`is_torn_pending_line`]). A line that is JSON but
+    /// not a credit this build reads is kept: a newer build may parse it, and readers stay strict,
+    /// so it keeps refusing the figure rather than losing a credit.
+    ///
+    /// Retired is [`crate::journal_consolidator::instance_retired`] with the pending reaper's
+    /// graces and the file's mtime: an own-host pid that reads dead and has been quiet for
+    /// [`crate::journal_consolidator::DEAD_INSTANCE_TEMP_GRACE`], or another host's file quiet for
+    /// [`crate::journal_consolidator::FOREIGN_PENDING_REAP_GRACE`]. A live peer's file is never
+    /// rewritten here; its owner quarantines it on its own pass.
+    ///
+    /// A moved line's credit leaves the pending term. Its ledger entry was written before it, so
+    /// the bytes return to the figure when the fold next reads that object's `.meta`.
+    pub(crate) async fn quarantine_torn_lines(&self, instance_id: &str) -> usize {
+        let Ok(files) = self.files() else {
+            return 0;
+        };
+        let hosts = own_hostnames();
+        let pid = std::process::id();
+        let now = SystemTime::now();
+        let mut moved = 0usize;
+        for path in files {
+            let instance = instance_of(&path);
+            if instance != instance_id {
+                let Ok(quiet_since) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if !pending_owner_retired(&instance, quiet_since, &hosts, pid, now) {
+                    continue;
+                }
+            }
+            let task_path = path.clone();
+            match tokio::task::spawn_blocking(move || {
+                Self::quarantine_torn_lines_blocking(&task_path)
+            })
+            .await
+            {
+                Ok(Ok(n)) => moved += n,
+                Ok(Err(e)) => warn!(
+                    "Could not quarantine torn lines in {:?}: {}. The file stays unreadable to \
+                     every reader until a later pass moves them.",
+                    path, e
+                ),
+                Err(e) => warn!("Pending quarantine task failed for {:?}: {}", path, e),
+            }
+        }
+        moved
+    }
+
+    /// [`Self::quarantine_torn_lines`] for one file, under its lock.
+    fn quarantine_torn_lines_blocking(path: &Path) -> std::io::Result<usize> {
+        let lock_path = Self::lock_path_for(path);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        Self::lock_with_bound(&lock_file, PENDING_LOCK_WAIT_BOUND, &lock_path)?;
+        let result = (|| -> std::io::Result<usize> {
+            let content = match std::fs::read(path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(e) => return Err(e),
+            };
+            Self::quarantine_torn_locked(path, &content).map(|(_, moved)| moved)
+        })();
+        let _ = fs4::FileExt::unlock(&lock_file);
+        result
+    }
+
+    /// Move `content`'s torn lines out of `path`, whose lock the caller holds: append them to
+    /// `{path}.torn` and `sync_all` it, then write the kept lines to a temp file and rename it over
+    /// `path`, the shape [`Self::gc`] uses. The quarantine is durable before the rewrite, so a
+    /// failure between the two leaves the line in both files, never in neither. Returns the kept
+    /// content and the number of lines moved.
+    fn quarantine_torn_locked(path: &Path, content: &[u8]) -> std::io::Result<(Vec<u8>, usize)> {
+        use std::io::Write;
+        let mut lines: Vec<&[u8]> = content.split(|b| *b == b'\n').collect();
+        if lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let mut kept = Vec::with_capacity(content.len());
+        let mut torn = Vec::new();
+        let mut moved = 0usize;
+        for line in lines {
+            let target = if is_torn_pending_line(line) {
+                moved += 1;
+                &mut torn
+            } else {
+                &mut kept
+            };
+            target.extend_from_slice(line);
+            target.push(b'\n');
+        }
+        if moved == 0 {
+            return Ok((content.to_vec(), 0));
+        }
+        let mut torn_name = path.file_name().unwrap_or_default().to_os_string();
+        torn_name.push(".torn");
+        let torn_path = path.with_file_name(torn_name);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&torn_path)?;
+            f.write_all(&torn)?;
+            f.sync_all()?;
+        }
+        let tmp = path.with_extension("pending.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&kept)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        PENDING_LINES_QUARANTINED_TOTAL.fetch_add(moved as u64, Ordering::Relaxed);
+        warn!(
+            "Moved {} torn pending-credit line(s) from {:?} to {:?}. Their credits leave the \
+             staged figure until the fold next reads those objects' .meta; inspect that file.",
+            moved, path, torn_path
+        );
+        Ok((kept, moved))
     }
 
     /// Every pending file, listed.
@@ -3067,11 +3977,15 @@ impl PendingStore {
             .open(&lock_path)?;
         Self::lock_with_bound(&lock_file, PENDING_LOCK_WAIT_BOUND, &lock_path)?;
         let result = (|| -> std::io::Result<Option<u64>> {
-            let content = match std::fs::read_to_string(path) {
+            let content = match std::fs::read(path) {
                 Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 Err(e) => return Err(e),
             };
+            // The caller judged this instance dead, so its torn lines may be moved aside here as
+            // the fold pass would; what is left is judged as before. Every kept line is UTF-8.
+            let (content, _) = Self::quarantine_torn_locked(path, &content)?;
+            let content = String::from_utf8_lossy(&content).into_owned();
             let removable = if content.is_empty() {
                 true
             } else if empty_only {
@@ -3131,6 +4045,50 @@ fn instance_of(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Whether a `.pending` line is torn: blank, not UTF-8, or not JSON at all.
+///
+/// Every credit line ends in `}` and a newline, so a torn append leaves either a whole record or
+/// a fragment that is not valid JSON: a head with no newline runs into the next record, and a
+/// zero-filled region is not JSON. A line that is valid JSON is never torn by this test, even if
+/// this build cannot read it as a credit.
+fn is_torn_pending_line(line: &[u8]) -> bool {
+    match std::str::from_utf8(line) {
+        Ok(s) => s.trim().is_empty() || serde_json::from_str::<serde::de::IgnoredAny>(s).is_err(),
+        Err(_) => true,
+    }
+}
+
+/// This host's names as instance ids carry them, raw and with path separators replaced, as the
+/// dead-instance reaper builds them.
+fn own_hostnames() -> Vec<String> {
+    let raw = gethostname::gethostname().to_string_lossy().to_string();
+    let sanitized = raw.replace(['/', '\\'], "_");
+    let mut hosts = vec![raw];
+    if !hosts.contains(&sanitized) {
+        hosts.push(sanitized);
+    }
+    hosts
+}
+
+/// Whether another instance's `.pending` may be rewritten: the pending reaper's liveness rule.
+fn pending_owner_retired(
+    instance: &str,
+    quiet_since: SystemTime,
+    hosts: &[String],
+    my_pid: u32,
+    now: SystemTime,
+) -> bool {
+    crate::journal_consolidator::instance_retired(
+        instance,
+        quiet_since,
+        hosts,
+        my_pid,
+        crate::journal_consolidator::DEAD_INSTANCE_TEMP_GRACE,
+        crate::journal_consolidator::FOREIGN_PENDING_REAP_GRACE,
+        now,
+    )
 }
 
 /// The `(bucket, l1)` shard of a cache key, per design § 3.1.
@@ -3252,6 +4210,14 @@ pub struct StagedShardCheckpoint {
     /// Which instance folded it.
     pub staged_scanned_by: String,
 
+    /// When the visit that installed this figure began, nanoseconds since the epoch: taken after
+    /// the shard's claim and before its ledger and `.meta` reads. The removal debit's reader rule
+    /// compares an entry's removal time with this, not with `staged_scanned_at`, because a visit
+    /// that read a `.meta` before a removal and installed after it counts the removed bytes.
+    /// 0 in a document written before this field existed; readers then use `staged_scanned_at`.
+    #[serde(default)]
+    pub staged_visit_started_at: u64,
+
     /// The monotone per-instance `Ledger_Seq` cut, keyed by `instance_id`.
     ///
     /// Monotone at two independent levels, which is deliberate rather than redundant:
@@ -3320,6 +4286,16 @@ impl StagedShardCheckpoint {
         Shard::new(self.bucket.clone(), self.l1.clone())
     }
 
+    /// When the visit behind this figure began, for the removal debit's reader rule. A document
+    /// without `staged_visit_started_at` reads as its install time, which is no earlier.
+    fn visit_started_at(&self) -> u64 {
+        if self.staged_visit_started_at != 0 {
+            self.staged_visit_started_at
+        } else {
+            self.staged_scanned_at
+        }
+    }
+
     /// A document for a shard **this fold** has not visited, for the *other* producer to fill
     /// its own fields into.
     ///
@@ -3349,6 +4325,7 @@ impl StagedShardCheckpoint {
             staged_range_count: 0,
             staged_scanned_at: 0,
             staged_scanned_by: String::new(),
+            staged_visit_started_at: 0,
             staged_fold_cut: BTreeMap::new(),
             other: serde_json::Map::new(),
         }
@@ -3492,13 +4469,24 @@ pub(crate) fn lock_checkpoint_document(cache_dir: &Path, shard: &Shard) -> Optio
 /// The `other` map already on `checkpoint` is the FALLBACK, used only when the re-read finds no
 /// document or cannot read one — in which case the pass's own earlier copy is the best
 /// available, and is what the code did before this fold existed.
+///
+/// `replace_damaged` is set for a shard whose document this pass read as damaged
+/// ([`checkpoint_bytes_are_torn`]). If the document under the lock is still damaged, its bytes are
+/// appended to `{XX}.json.torn` and synced, and the new document is renamed over it, so the
+/// shard's document is never absent. If a peer has replaced it since, the install proceeds as for
+/// any other shard.
 fn install_preserving_foreign_fields(
     cache_dir: &Path,
     mut checkpoint: StagedShardCheckpoint,
+    replace_damaged: bool,
 ) -> std::io::Result<()> {
     let fallback_other = checkpoint.other.clone();
     // Held until the end of the function, which is after the install.
     let _lock = lock_checkpoint_document(cache_dir, &checkpoint.shard());
+    if replace_damaged && keep_damaged_checkpoint_bytes(cache_dir, &checkpoint.shard())? {
+        checkpoint.other = fallback_other;
+        return checkpoint.install(cache_dir);
+    }
     checkpoint.other = match StagedShardCheckpoint::load(cache_dir, &checkpoint.shard()) {
         Ok(Some(current)) => current.other,
         Ok(None) => fallback_other,
@@ -3641,11 +4629,98 @@ impl ShardCheckpointSet {
 pub fn read_shard_checkpoints(cache_dir: &Path) -> ShardCheckpointSet {
     #[cfg(test)]
     note_shard_checkpoint_read(cache_dir);
+    let (mut set, paths) = list_shard_checkpoints(cache_dir);
+    for path in paths {
+        #[cfg(test)]
+        let _probe = checkpoint_load_probe_enter(cache_dir);
+        let loaded = StagedShardCheckpoint::load_path(&path);
+        record_checkpoint_load(&mut set, &path, loaded);
+    }
+    set
+}
+
+/// How many checkpoint documents [`read_shard_checkpoints_bounded`] loads at once.
+///
+/// 64 because that is where the measured rate was taken: on the fleet's EFS volume small-file
+/// reads ran at 3,801 per second with 64 in flight against 175 per second with one, and 25,600
+/// checkpoint-shaped documents were read in 4.4 s at 64. The ceiling was per NFS client, so a
+/// larger bound buys nothing on EFS while holding more of tokio's blocking pool (512 threads by
+/// default).
+pub(crate) const CHECKPOINT_READ_CONCURRENCY: usize = 64;
+
+/// [`read_shard_checkpoints`] off the runtime and in parallel: the listing on the blocking pool,
+/// then each document loaded on its own blocking task, at most [`CHECKPOINT_READ_CONCURRENCY`] at
+/// once. The set is built in listing order, so it is the set the sequential reader builds.
+///
+/// Every authority derivation reads through this. Read sequentially, one document costs about
+/// 1.1 ms on EFS from an idle proxy (2.2 s for the fleet's 1,869 documents, about 28 s at
+/// 25,600), and on a runtime worker that read blocked the worker throughout.
+pub(crate) async fn read_shard_checkpoints_bounded(cache_dir: &Path) -> ShardCheckpointSet {
+    use futures::StreamExt;
+    #[cfg(test)]
+    note_shard_checkpoint_read(cache_dir);
+    let dir = cache_dir.to_path_buf();
+    let (mut set, paths) =
+        match tokio::task::spawn_blocking(move || list_shard_checkpoints(&dir)).await {
+            Ok(listing) => listing,
+            Err(e) => {
+                warn!(
+                    "Staged fold: listing the checkpoint directory did not complete: {}. The \
+                     global staged figure is unknown rather than zero.",
+                    e
+                );
+                return ShardCheckpointSet {
+                    files_expected: 1,
+                    files_unreadable: 1,
+                    ..ShardCheckpointSet::default()
+                };
+            }
+        };
+    let mut loaded: Vec<(
+        usize,
+        PathBuf,
+        std::io::Result<Option<StagedShardCheckpoint>>,
+    )> = futures::stream::iter(paths.into_iter().enumerate())
+        .map(|(index, path)| {
+            #[cfg(test)]
+            let probe_dir = cache_dir.to_path_buf();
+            async move {
+                let load = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    let _probe = checkpoint_load_probe_enter(&probe_dir);
+                    StagedShardCheckpoint::load_path(&load)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(std::io::Error::other(format!(
+                        "checkpoint load did not complete: {e}"
+                    )))
+                });
+                (index, path, result)
+            }
+        })
+        .buffer_unordered(CHECKPOINT_READ_CONCURRENCY)
+        .collect()
+        .await;
+    loaded.sort_by_key(|(index, _, _)| *index);
+    for (_, path, result) in loaded {
+        record_checkpoint_load(&mut set, &path, result);
+    }
+    set
+}
+
+/// The checkpoint documents under `checkpoints/{bucket}/`, with every listing failure already
+/// counted into the returned set as unreadable.
+///
+/// **`.json` only**; see [`read_shard_checkpoints`].
+fn list_shard_checkpoints(cache_dir: &Path) -> (ShardCheckpointSet, Vec<PathBuf>) {
     let root = checkpoints_dir(cache_dir);
     let mut set = ShardCheckpointSet::default();
+    let mut paths = Vec::new();
     let buckets = match std::fs::read_dir(&root) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return set,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (set, paths),
         Err(e) => {
             warn!(
                 "Staged fold: could not list the checkpoint directory {:?}: {}. The global \
@@ -3654,7 +4729,7 @@ pub fn read_shard_checkpoints(cache_dir: &Path) -> ShardCheckpointSet {
             );
             set.files_expected = 1;
             set.files_unreadable = 1;
-            return set;
+            return (set, paths);
         }
     };
     for bucket_entry in buckets.flatten() {
@@ -3686,26 +4761,108 @@ pub fn read_shard_checkpoints(cache_dir: &Path) -> ShardCheckpointSet {
                 continue;
             }
             set.files_expected += 1;
-            match StagedShardCheckpoint::load_path(&path) {
-                Ok(Some(c)) => {
-                    set.files_read += 1;
-                    set.by_shard.insert(c.shard(), c);
-                }
-                // Vanished between the listing and the read — a peer's rename cannot produce
-                // this, but a cleanup could. Counted as unreadable so the sum is unknown
-                // rather than short.
-                Ok(None) | Err(_) => {
-                    set.files_unreadable += 1;
-                    warn!(
-                        "Staged fold: shard checkpoint {:?} could not be read; the global \
-                         staged figure is unknown rather than short by one shard",
-                        path
-                    );
-                }
-            }
+            paths.push(path);
         }
     }
-    set
+    (set, paths)
+}
+
+/// Whether a shard checkpoint's bytes are damaged rather than unreadable or newer: not JSON, or
+/// JSON that is not a readable document of this build's schema. A document whose `schema` is
+/// above this build's is a newer release's and is not damaged by this test.
+fn checkpoint_bytes_are_torn(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return true;
+    };
+    let schema = value.get("schema").and_then(serde_json::Value::as_u64);
+    if schema.is_some_and(|s| s > u64::from(STAGED_FOLD_SCHEMA)) {
+        return false;
+    }
+    !(schema == Some(u64::from(STAGED_FOLD_SCHEMA))
+        && serde_json::from_value::<StagedShardCheckpoint>(value).is_ok())
+}
+
+/// [`read_shard_checkpoints`], also naming the shards whose document is damaged
+/// ([`checkpoint_bytes_are_torn`]). A damaged document is still counted unreadable in the set, so
+/// the set reads exactly as it does for every reader; the names are what let the fold pass fold
+/// those shards fresh. A document whose bytes cannot be read is not named: an I/O error is
+/// transient, and folding over it would abandon a cut that is still on disk.
+fn read_shard_checkpoints_naming_damaged(
+    cache_dir: &Path,
+) -> (ShardCheckpointSet, BTreeSet<Shard>) {
+    let (mut set, paths) = list_shard_checkpoints(cache_dir);
+    let mut damaged = BTreeSet::new();
+    for path in paths {
+        let loaded = StagedShardCheckpoint::load_path(&path);
+        if loaded.is_err() && std::fs::read(&path).is_ok_and(|b| checkpoint_bytes_are_torn(&b)) {
+            let bucket = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string());
+            let l1 = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".json"))
+                .map(str::to_string);
+            if let (Some(bucket), Some(l1)) = (bucket, l1) {
+                damaged.insert(Shard::new(bucket, l1));
+            }
+        }
+        record_checkpoint_load(&mut set, &path, loaded);
+    }
+    (set, damaged)
+}
+/// Under the caller's document lock: if `shard`'s document is still damaged, append its bytes to
+/// `{XX}.json.torn` and sync, and return `true` so the caller renames a fresh document over it.
+/// `false` when the document is gone or now parses. The bytes are kept before the document is
+/// replaced, so a crash in between leaves a duplicate in `.torn` rather than nothing.
+fn keep_damaged_checkpoint_bytes(cache_dir: &Path, shard: &Shard) -> std::io::Result<bool> {
+    use std::io::Write;
+    let path = StagedShardCheckpoint::path(cache_dir, shard);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !checkpoint_bytes_are_torn(&bytes) {
+        return Ok(false);
+    }
+    let torn_path = path.with_extension("json.torn");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&torn_path)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    warn!(
+        "Staged fold: shard checkpoint {:?} did not parse; kept its bytes in {:?} and replacing \
+         it with a fresh fold of the shard. Inspect that file.",
+        path, torn_path
+    );
+    Ok(true)
+}
+/// Count one loaded checkpoint document into `set`.
+fn record_checkpoint_load(
+    set: &mut ShardCheckpointSet,
+    path: &Path,
+    loaded: std::io::Result<Option<StagedShardCheckpoint>>,
+) {
+    match loaded {
+        Ok(Some(c)) => {
+            set.files_read += 1;
+            set.by_shard.insert(c.shard(), c);
+        }
+        // Vanished between the listing and the read — a peer's rename cannot produce this, but a
+        // cleanup could. Counted as unreadable so the sum is unknown rather than short.
+        Ok(None) | Err(_) => {
+            set.files_unreadable += 1;
+            warn!(
+                "Staged fold: shard checkpoint {:?} could not be read; the global staged figure \
+                 is unknown rather than short by one shard",
+                path
+            );
+        }
+    }
 }
 
 /// A § 16.2 shard claim: an **efficiency** mechanism and never load-bearing for correctness.
@@ -3946,8 +5103,19 @@ async fn run_staged_fold_scoped(
     // against, so an unreadable checkpoint is a refusal rather than a fresh start. Read as a
     // set rather than per shard because selection needs every shard's age anyway (§ 16.3:
     // "selection adds no read that the pass was not making").
-    let previous = read_shard_checkpoints(cache_dir);
+    // A damaged document's shard is folded fresh and the document replaced in place, under the
+    // shard's claim (see `install_preserving_foreign_fields`), so readers see that shard as
+    // unknown until its new document is installed, never as absent. A damaged shard this pass
+    // does not visit (a peer holds its claim, the budget ran out, or a scoped pass was not
+    // named it) keeps its document. An unreadable or newer document still refuses the pass.
+    let mut previous = read_shard_checkpoints(cache_dir);
+    let mut damaged: BTreeSet<Shard> = BTreeSet::new();
     if !previous.is_complete() {
+        (previous, damaged) = read_shard_checkpoints_naming_damaged(cache_dir);
+    }
+    if previous.files_unreadable != damaged.len()
+        || previous.files_read + previous.files_unreadable != previous.files_expected
+    {
         warn!(
             "Staged fold: {} of {} shard checkpoint(s) could not be read. Retaining them \
              rather than installing over cuts we cannot see.",
@@ -3985,11 +5153,15 @@ async fn run_staged_fold_scoped(
     };
 
     let pending = PendingStore::new(cache_dir.to_path_buf());
-    let pending_read = pending.read_all().await;
+    let mut pending_read = pending.read_all().await;
+    // Torn lines in this instance's own file or a retired instance's are moved aside and the
+    // files read again. Readers stay strict, so anything left still refuses the pass.
+    if !pending_read.is_complete() && pending.quarantine_torn_lines(instance_id).await > 0 {
+        pending_read = pending.read_all().await;
+    }
     if !pending_read.is_complete() {
         return retain(FoldRetainReason::PendingUnreadable);
     }
-
     // `P`. `None` is the UNREADABLE sentinel, not a zero. The guard reads `P` only to refuse
     // installing while it is UNREADABLE, so it needs the composed figure's **readability** and
     // nothing else: the last full walk plus the published per-proxy growth terms. Readability is
@@ -4060,6 +5232,8 @@ async fn run_staged_fold_scoped(
         .collect();
     selection.extend(pending_read.shards());
     selection.extend(previous.shards());
+    // And shards whose document is damaged, which `previous` does not hold.
+    selection.extend(damaged.iter().cloned());
     let mut ordered: Vec<Shard> = selection.into_iter().collect();
     ordered.sort_by_key(|s| {
         (
@@ -4194,7 +5368,8 @@ async fn run_staged_fold_scoped(
         // Before any of this visit's reads: a dirty mark older than this is a removal whose
         // `.meta` change the reads below will see, so the install may clear it.
         let visit_started_nanos = now_nanos();
-
+        #[cfg(test)]
+        run_visit_hook(cache_dir, VisitHookPhase::Started);
         // THIS shard's ledger files, and nothing else: one `readdir` plus one file per instance
         // that has ever credited this shard. Read after the claim, so a shard a peer holds costs
         // nothing beyond the claim attempt.
@@ -4442,7 +5617,6 @@ async fn run_staged_fold_scoped(
                 *slot = *observed;
             }
         }
-
         // Foreign fields. See `StagedShardCheckpoint::other`: the `st_size` fold owns the rest
         // of this record. The copy from `previous` is only the FALLBACK — the live value is
         // re-read under the document lock at install time, because the `st_size` fold may have
@@ -4452,6 +5626,8 @@ async fn run_staged_fold_scoped(
             .get(shard)
             .map(|c| c.other.clone())
             .unwrap_or_default();
+        #[cfg(test)]
+        run_visit_hook(cache_dir, VisitHookPhase::BeforeInstall);
 
         let checkpoint = StagedShardCheckpoint {
             schema: STAGED_FOLD_SCHEMA,
@@ -4461,10 +5637,15 @@ async fn run_staged_fold_scoped(
             staged_range_count,
             staged_scanned_at: now_nanos(),
             staged_scanned_by: instance_id.to_string(),
+            staged_visit_started_at: visit_started_nanos,
             staged_fold_cut,
             other,
         };
-        if let Err(e) = install_preserving_foreign_fields(cache_dir, checkpoint.clone()) {
+        if let Err(e) = install_preserving_foreign_fields(
+            cache_dir,
+            checkpoint.clone(),
+            damaged.contains(shard),
+        ) {
             warn!(
                 "Staged fold: could not install the checkpoint for shard {}: {}. That \
                  shard's previous figure and cut are both still on disk.",
@@ -4491,6 +5672,7 @@ async fn run_staged_fold_scoped(
         // reads began, so a peer visit that read the `.meta` before the removal would look like
         // it had seen it. § 16.6.9, "Dirty shards first", point 3.
         clear_dirty_mark(cache_dir, instance_id, shard, visit_started_nanos);
+        note_own_install(cache_dir, instance_id, shard, visit_started_nanos);
         // The visit is over, so the claim has nothing left to protect. Left in place it made the
         // shard `Busy` to every peer for the rest of `CLAIM_LEASE_SECS`, including a peer that
         // has the shard dirty — saw that hold a DELETE in the figure for an extra pass.
@@ -4539,9 +5721,9 @@ async fn run_staged_fold_scoped(
     // The budget's input changed, so the memo must not outlive the change by its TTL. The
     // authority figure's inputs changed in the same install, for the same reason — a fold that
     // has just moved `staged_byte_sum` must not be shadowed by a figure taken before it.
-    // This instance's reclaim document is superseded by the same install, for the same reason.
-    invalidate_budget_snapshot_retiring(cache_dir, Some(instance_id));
+    invalidate_budget_snapshot(cache_dir);
     expire_authority_snapshot(cache_dir);
+    retire_compat_reclaim(cache_dir, instance_id);
 
     info!(
         "Staged fold installed {} shard(s) ({} busy, {} retained): staged_byte_sum={}, \
@@ -4831,6 +6013,10 @@ pub struct StagedFoldGauges {
     /// compressed on-disk bytes. `null` if any input was unreadable or no fold has
     /// completed yet.
     pub staged_fold_bytes: Option<u64>,
+    /// Staged bytes the removal debits took off `staged_fold_bytes`: bytes removed (by a staging
+    /// eviction, a graduation, a DELETE, an overwrite, a heal or an expiry) from shards whose
+    /// checkpoints were folded before the removal. `null` when `staged_fold_bytes` is.
+    pub staged_removal_debit_bytes: Option<u64>,
 
     /// `F` alone: the installed `staged_byte_sum`.
     pub staged_fold_byte_sum: Option<u64>,
@@ -5274,30 +6460,20 @@ impl StagedFoldGauges {
 /// set is the collection's ONE traversal of `checkpoints/`, shared with the `st_size` fold's
 /// gauges (`MetricsManager::collect_metrics`).
 ///
-/// The checkpoint read runs on the blocking pool: it is synchronous `std::fs` over hundreds of
-/// small files, and inline it would block a tokio worker for the whole traversal. A `JoinError`
-/// yields the default set, which both consumers publish as the unreadable sentinel rather than a
-/// zero; it is logged because "the task panicked" and "no checkpoints" have different owners.
+/// The checkpoint read is [`read_shard_checkpoints_bounded`]: off the runtime and in parallel, and
+/// a listing that does not complete yields an unreadable set, which both consumers publish as the
+/// unreadable sentinel rather than a zero. The metrics collector reads through here inside its
+/// derivation ([`collector_derivation`]).
 pub(crate) async fn read_gauge_inputs(
     cache_dir: &Path,
 ) -> (PendingReadOutcome, ShardCheckpointSet) {
-    let pending = PendingStore::new(cache_dir.to_path_buf()).read_all().await;
+    let mut pending = PendingStore::new(cache_dir.to_path_buf()).read_all().await;
+    if pending.is_complete() {
+        pending.removal_debits = read_removal_debits(cache_dir).await;
+    }
     #[cfg(test)]
     run_gauge_between_reads_hook(cache_dir).await;
-    let dir = cache_dir.to_path_buf();
-    let checkpoints = match tokio::task::spawn_blocking(move || read_shard_checkpoints(&dir)).await
-    {
-        Ok(set) => set,
-        Err(e) => {
-            warn!(
-                "Reading the per-shard checkpoint set failed to complete: {}. The staged-fold and \
-                 size-fold gauges will report the unreadable sentinel for this collection rather \
-                 than a zero, which would be indistinguishable from an empty staging tier.",
-                e
-            );
-            ShardCheckpointSet::default()
-        }
-    };
+    let checkpoints = read_shard_checkpoints_bounded(cache_dir).await;
     (pending, checkpoints)
 }
 
@@ -5407,10 +6583,14 @@ pub(crate) async fn collect_staged_fold_gauges(
         .fold(0u64, |acc, c| acc.saturating_add(c.bytes));
     let awaiting = post_cut.len() as u64;
     let p = p.unwrap_or(0);
-    let total = byte_sum.saturating_add(pending_bytes).saturating_add(p);
-
+    let debit = pending.applied_debit(checkpoints).bytes;
+    let total = byte_sum
+        .saturating_add(pending_bytes)
+        .saturating_sub(debit)
+        .saturating_add(p);
     StagedFoldGauges {
         staged_fold_bytes: Some(total),
+        staged_removal_debit_bytes: Some(debit),
         staged_fold_byte_sum: Some(byte_sum),
         staged_fold_pending_bytes: Some(pending_bytes),
         staged_fold_in_progress_part_bytes: Some(p),
@@ -5482,11 +6662,37 @@ pub(crate) struct StagedAuthorityFigure {
     /// `P`: summed `compressed_size` over `mpus_in_progress/*/part{N}.json` — bytes on the
     /// volume that `total_size` does **not** count.
     pub in_progress_part_bytes: u64,
+    /// The removal debits already subtracted from `resident_staged_bytes`: staged bytes removed
+    /// from shards whose checkpoints predate the removal. Published as
+    /// `write_cache.staged_removal_debit_bytes`.
+    pub removal_debit_bytes: u64,
 }
 
 tokio::task_local! {
     /// Set for the duration of an observability read by [`as_scrape`].
     static SCRAPE_READ: ();
+}
+
+tokio::task_local! {
+    /// The staged figure the metrics collector's own derivation produced, for the assembly of
+    /// that one collection. See [`with_collection_figure`].
+    static COLLECTION_FIGURE: Option<StagedAuthorityFigure>;
+}
+
+/// Run `fut`, the assembly of one metrics collection, with `figure` as the staged figure every
+/// read in it returns.
+///
+/// The collector's derivation installs its figure in the memo, but installs it already expired
+/// when a fold install moved the generation during the collection, so a deciding read in the
+/// assembly would find the memo unusable and derive a second time inside the collection. The
+/// collection's gauges are built from the collector's own inputs, so its other sections take
+/// the figure from the same read. Task-local, like [`as_scrape`], so it reaches through
+/// `CacheManager` without widening a signature, and does not cross `tokio::spawn`.
+pub(crate) async fn with_collection_figure<F: std::future::Future>(
+    figure: Option<StagedAuthorityFigure>,
+    fut: F,
+) -> F::Output {
+    COLLECTION_FIGURE.scope(figure, fut).await
 }
 
 /// Run `fut` as a scrape: an observability read (`/metrics`, the dashboard, `/health`) that must
@@ -5504,14 +6710,16 @@ tokio::task_local! {
 ///   refresh re-reads `F` and the pending term and takes `P` from the last walk this process kept
 ///   (the metrics collector's or a deciding reader's); see
 ///   [`rederive_authority_snapshot_from_kept_walk`]. With no memo at all a scrape derives the
-///   same way inline, and with no kept walk either it gets `None`, the incumbent fallback.
+///   same way inline, unless a derivation is in flight, which it does not wait for. Then, and
+///   with no kept walk either, it gets `None`, the incumbent fallback.
 ///
 /// # Why a scrape must not re-derive
 ///
 /// The derivation is a locked read of every `.pending` file (an exclusive `fs4` lock per file,
-/// whose holder can be another proxy, with no timeout) followed by a synchronous traversal of the
-/// whole checkpoint set on the calling tokio worker — about 1,500 shard documents on the fleet's
-/// EFS volume. A scrape that arrived more than 5 s after the last authority read paid all of it,
+/// whose holder can be another proxy) followed by a read of the whole checkpoint set: 1,869 shard
+/// documents on the verification fleet's EFS volume on 2026-11-09, which one idle proxy read in
+/// about 2.2 s and the live fleet in about twice that. A scrape that arrived more than 5 s after
+/// the last authority read paid all of it,
 /// and a suite that reads `/metrics` between fixtures arrives that way nearly every time. The
 /// whole body is one serialisation, so a scrape that outran its client's deadline lost every
 /// series, not only the staged ones.
@@ -5557,6 +6765,11 @@ impl Drop for AuthorityRefreshGuard {
 /// Start one background re-derivation of `cache_dir`'s authority figure, unless one is running.
 fn spawn_authority_refresh(cache_dir: &Path) {
     let tag = dir_tag(cache_dir);
+    // A derivation in flight installs a figure when it ends; a refresh behind it would read the
+    // same files again.
+    if derivation_in_flight(tag) {
+        return;
+    }
     if !AUTHORITY_REFRESH_INFLIGHT
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -5628,10 +6841,15 @@ pub(crate) fn authority_memo_or_last_complete(cache_dir: &Path) -> Option<Staged
 /// an eviction, by this instance or a peer, that it does not account for, and sizing from it
 /// evicts the same band again. The shard checkpoints this reads are re-folded by the evicting
 /// pass before it releases the eviction lock.
+///
+/// It may wait only for a derivation begun after this call, and none can be in flight when it
+/// checks, so it always starts its own; readers arriving after it join that one.
 pub(crate) async fn staged_authority_figure_fresh(
     cache_dir: &Path,
 ) -> Option<StagedAuthorityFigure> {
-    rederive_authority_snapshot(cache_dir, dir_tag(cache_dir), unix_secs()).await
+    joined_derivation(cache_dir, Join::StartedAfter(std::time::Instant::now()))
+        .await
+        .figure
 }
 
 /// The staged figure the trigger and the published composites read, or `None` when it is
@@ -5662,7 +6880,14 @@ pub(crate) async fn staged_authority_figure_fresh(
 /// Inside [`as_scrape`] an expired figure is served and refreshed in the background instead of
 /// re-derived; an absent one (before the process's first derivation) is still derived inline.
 /// Neither walks `mpus_in_progress/`: both take `P` from the last kept walk.
+///
+/// Past the memo a deciding reader waits for the derivation in flight rather than starting its
+/// own (see [`joined_derivation`]), and a scrape with no memo does not wait for one: it gets
+/// `None` while a derivation is in flight.
 pub(crate) async fn staged_authority_figure(cache_dir: &Path) -> Option<StagedAuthorityFigure> {
+    if let Ok(figure) = COLLECTION_FIGURE.try_with(|f| *f) {
+        return figure;
+    }
     let now_secs = unix_secs();
     let tag = dir_tag(cache_dir);
 
@@ -5671,12 +6896,12 @@ pub(crate) async fn staged_authority_figure(cache_dir: &Path) -> Option<StagedAu
     let mut expired: Option<AuthoritySnapshot> = None;
     if let Ok(map) = AUTHORITY_SNAPSHOT.lock() {
         if let Some(snapshot) = map.get(&tag) {
-            let fresh_for_reader = if scrape {
-                snapshot.derived_at_secs
+            let fresh = if scrape {
+                snapshot.fresh_for_scrape(now_secs)
             } else {
-                snapshot.taken_at_secs
+                snapshot.fresh_for_decider(now_secs)
             };
-            if now_secs.saturating_sub(fresh_for_reader) < AUTHORITY_SNAPSHOT_TTL_SECS {
+            if fresh {
                 AUTHORITY_SNAPSHOT_HITS.fetch_add(1, Ordering::Relaxed);
                 return snapshot.figure;
             }
@@ -5688,32 +6913,373 @@ pub(crate) async fn staged_authority_figure(cache_dir: &Path) -> Option<StagedAu
     // serves the expired one and starts one background refresh that takes `P` from the last kept
     // walk. See [`as_scrape`] for why. With no memo at all (only before this process's first
     // derivation, which the background collector performs at startup) there is nothing to serve,
-    // so it derives inline the same way, without a walk.
+    // so it derives inline the same way, without a walk, unless a derivation is in flight: that
+    // one installs a memo when it ends, and a scrape does not wait for it.
     if scrape {
         if let Some(snapshot) = expired {
             spawn_authority_refresh(cache_dir);
             return snapshot.figure;
         }
+        if derivation_in_flight(tag) {
+            return None;
+        }
         return rederive_authority_snapshot_from_kept_walk(cache_dir, tag, now_secs).await;
     }
 
-    rederive_authority_snapshot(cache_dir, tag, now_secs).await
+    joined_derivation(cache_dir, Join::Any).await.figure
 }
 
-/// Derive `cache_dir`'s authority figure from shared storage and install it in the memo as taken
-/// at `now_secs`. One of two places a figure is installed in the memo; the other is
-/// [`rederive_authority_snapshot_from_kept_walk`], which builds the figure from the walk the
-/// background collector kept instead of walking the volume. `expire_authority_snapshot` also
-/// mutates the memo, but only zeroes the timestamps of a figure already there.
-async fn rederive_authority_snapshot(
+/// What one authority derivation found: the byte figure and the budget count, from one read of
+/// the pending files and the shard checkpoints. `None` in either is UNREADABLE.
+///
+/// One read for both because they read the same inputs in the same order (pending, then
+/// checkpoints) and differ only in which per-shard field and which pending term they sum. Two
+/// reads a moment apart could straddle an install, so admission and the staging trigger could
+/// see two different volumes; one read cannot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DerivedFigures {
+    figure: Option<StagedAuthorityFigure>,
+    count: Option<u64>,
+    /// The removal debits' range half, which the count verdict subtracts and admission does not.
+    count_debit: u64,
+}
+
+/// Which derivation in flight a reader may wait for instead of starting its own.
+#[derive(Debug, Clone, Copy)]
+enum Join {
+    /// Any of the current generation: every reader except the post-lock sizing read. Its figure
+    /// is dated by that derivation's start, which is no earlier than this reader's call minus one
+    /// derivation, so on return its inputs are no older than a derivation of its own would be.
+    Any,
+    /// Only one begun at or after this instant. The post-lock sizing read passes the time of its
+    /// call, which is after it took the eviction lock, so it never waits for a read begun before
+    /// the lock: that read can predate the re-fold the previous holder installed before releasing.
+    StartedAfter(std::time::Instant),
+}
+
+/// Whose derivation it is, which decides how `P` is read and what is handed back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivationKind {
+    /// A deciding reader's: `P` composed from the last kept walk and the published documents.
+    Decider,
+    /// The metrics collector's: it walks `mpus_in_progress/` itself and returns the inputs it
+    /// read, so the collection publishes its gauges from the same read.
+    Collector,
+}
+
+/// The inputs the metrics collector's derivation read, for its gauges.
+pub(crate) struct CollectorInputs {
+    pub(crate) pending: PendingReadOutcome,
+    pub(crate) checkpoints: ShardCheckpointSet,
+    /// The collector's walk of `mpus_in_progress/`; `None` when the derivation did not complete.
+    pub(crate) observation: Option<crate::signed_put_handler::InProgressObservation>,
+    /// The staged figure this derivation found (`Some(None)` is unreadable); `None` when the
+    /// derivation did not complete, so no figure was produced to hand to the collection.
+    pub(crate) figure: Option<Option<StagedAuthorityFigure>>,
+}
+
+/// The derivation in flight for one cache directory.
+struct InFlightDerivation {
+    id: u64,
+    started: std::time::Instant,
+    generation: u64,
+    rx: tokio::sync::watch::Receiver<Option<DerivedFigures>>,
+}
+
+/// The newest-started derivation in flight per cache directory, keyed by [`dir_tag`].
+///
+/// Single-flight for every reader of the figure: the deciding readers, the budget count and the
+/// count arm wait for the one in flight, and a scrape's refresh does not start while one is. The
+/// derivation runs on its own task and removes itself when it has installed, so a reader that
+/// stops waiting cancels nothing.
+///
+/// The cost is shared waiting: a derivation stuck in shared-storage I/O holds every reader that
+/// joined it. Those readers would have read the same files, so they would have waited anyway.
+static AUTHORITY_DERIVATIONS: Mutex<BTreeMap<u64, InFlightDerivation>> =
+    Mutex::new(BTreeMap::new());
+static AUTHORITY_DERIVATION_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// Removes a finished derivation from [`AUTHORITY_DERIVATIONS`], including by panic, unless a newer
+/// one has taken its place.
+struct DerivationSlotGuard {
+    tag: u64,
+    id: u64,
+}
+
+/// The budget count a collector derivation read, published before it composes `P`:
+/// `tag -> (derivation id, generation, count, range debit)`.
+///
+/// Admission's inline re-derivation gives up after 300 ms and fails open, and the collector's
+/// derivation can spend longer than that walking `mpus_in_progress/` after its reads. The count
+/// needs only the reads, so it is readable from here while the walk runs. Removed when the
+/// derivation ends, whatever the end, and ignored once a fold install has moved the generation.
+static EARLY_BUDGET_COUNT: Mutex<BTreeMap<u64, (u64, u64, u64, u64)>> = Mutex::new(BTreeMap::new());
+
+fn publish_early_budget_count(
+    tag: u64,
+    id: u64,
+    generation: u64,
+    pending: &PendingReadOutcome,
+    checkpoints: &ShardCheckpointSet,
+) {
+    let Some(count) = staged_range_count_of(pending, checkpoints) else {
+        return;
+    };
+    let debit = pending.applied_debit(checkpoints).ranges;
+    EARLY_BUDGET_COUNT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(tag, (id, generation, count, debit));
+}
+
+/// The count a derivation in flight has already read, if it is of the current generation.
+fn early_budget_count(tag: u64) -> Option<(u64, u64)> {
+    let (_, generation, count, debit) = *EARLY_BUDGET_COUNT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&tag)?;
+    (generation == authority_generation(tag)).then_some((count, debit))
+}
+
+impl Drop for DerivationSlotGuard {
+    fn drop(&mut self) {
+        {
+            let mut early = EARLY_BUDGET_COUNT.lock().unwrap_or_else(|p| p.into_inner());
+            if early.get(&self.tag).is_some_and(|e| e.0 == self.id) {
+                early.remove(&self.tag);
+            }
+        }
+        let mut map = AUTHORITY_DERIVATIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if map.get(&self.tag).is_some_and(|d| d.id == self.id) {
+            map.remove(&self.tag);
+        }
+    }
+}
+
+/// Whether a derivation of the current generation is in flight for `tag`.
+fn derivation_in_flight(tag: u64) -> bool {
+    let generation = authority_generation(tag);
+    AUTHORITY_DERIVATIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&tag)
+        .is_some_and(|d| d.generation == generation)
+}
+
+/// Start a derivation of `kind` and make it the one later readers join.
+fn start_derivation(
+    map: &mut BTreeMap<u64, InFlightDerivation>,
     cache_dir: &Path,
     tag: u64,
-    now_secs: u64,
-) -> Option<StagedAuthorityFigure> {
+    generation: u64,
+    kind: DerivationKind,
+) -> (
+    tokio::sync::watch::Receiver<Option<DerivedFigures>>,
+    tokio::task::JoinHandle<Option<CollectorInputs>>,
+) {
+    let id = AUTHORITY_DERIVATION_IDS.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    map.insert(
+        tag,
+        InFlightDerivation {
+            id,
+            started: std::time::Instant::now(),
+            generation,
+            rx: rx.clone(),
+        },
+    );
+    let dir = cache_dir.to_path_buf();
+    let handle = tokio::spawn(run_derivation(dir, tag, generation, id, kind, tx));
+    (rx, handle)
+}
+
+/// Wait for `cache_dir`'s derivation in flight, if `join` allows it, or start one.
+async fn joined_derivation(cache_dir: &Path, join: Join) -> DerivedFigures {
+    let tag = dir_tag(cache_dir);
+    let generation = authority_generation(tag);
+    let mut rx = {
+        let mut map = AUTHORITY_DERIVATIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let joinable = map
+            .get(&tag)
+            .filter(|d| {
+                d.generation == generation
+                    && match join {
+                        Join::Any => true,
+                        Join::StartedAfter(not_before) => d.started >= not_before,
+                    }
+            })
+            .map(|d| d.rx.clone());
+        match joinable {
+            Some(rx) => rx,
+            None => {
+                start_derivation(
+                    &mut map,
+                    cache_dir,
+                    tag,
+                    generation,
+                    DerivationKind::Decider,
+                )
+                .0
+            }
+        }
+    };
+    // `Err` is the sender dropped without a value: the derivation task panicked or the runtime is
+    // shutting down. Both read as UNREADABLE, the fail-open value for every reader.
+    rx.wait_for(|v| v.is_some())
+        .await
+        .ok()
+        .and_then(|v| *v)
+        .unwrap_or_default()
+}
+
+/// The metrics collector's derivation: pending, then the checkpoint set, then a walk of
+/// `mpus_in_progress/`, installed in the memo like any derivation and joined by deciding readers
+/// while it runs. Returns what it read, so the collection's gauges and the figure deciders use
+/// come from one read.
+///
+/// The collector never joins a derivation in flight: it needs the raw sets for its gauges and its
+/// own walk, which keeps the walk every deciding derivation composes `P` from fresh.
+pub(crate) async fn collector_derivation(cache_dir: &Path) -> CollectorInputs {
+    let tag = dir_tag(cache_dir);
+    let generation = authority_generation(tag);
+    let handle = {
+        let mut map = AUTHORITY_DERIVATIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        start_derivation(
+            &mut map,
+            cache_dir,
+            tag,
+            generation,
+            DerivationKind::Collector,
+        )
+        .1
+    };
+    match handle.await {
+        Ok(Some(inputs)) => inputs,
+        other => {
+            warn!(
+                "The metrics collection's read of the shared volume did not complete ({:?}). The \
+                 staged-fold and size-fold gauges report the unreadable sentinel for this \
+                 collection rather than a zero, which would be indistinguishable from an empty \
+                 staging tier.",
+                other.err()
+            );
+            let checkpoints = ShardCheckpointSet {
+                files_expected: 1,
+                files_unreadable: 1,
+                ..ShardCheckpointSet::default()
+            };
+            CollectorInputs {
+                pending: PendingReadOutcome::default(),
+                checkpoints,
+                observation: None,
+                figure: None,
+            }
+        }
+    }
+}
+
+/// One derivation, on its own task: read, install the authority memo and the budget memo, record
+/// the attempt, then hand the figures to every reader waiting on it.
+///
+/// One derivation is one attempt for `write_cache.staging_figure_unknown_seconds`, however many
+/// readers wait on it: begun here before the first read, finished here after the install. A
+/// derivation that never returns stays in the attempt record's `in_flight` and reads as unknown
+/// after [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS`], whoever is waiting.
+async fn run_derivation(
+    dir: PathBuf,
+    tag: u64,
+    generation: u64,
+    id: u64,
+    kind: DerivationKind,
+    tx: tokio::sync::watch::Sender<Option<DerivedFigures>>,
+) -> Option<CollectorInputs> {
+    let slot = DerivationSlotGuard { tag, id };
+    // `now` at the START, so the installed figure never claims to be younger than its inputs.
+    let now_secs = unix_secs();
+    #[cfg(test)]
+    let now_secs = now_secs.saturating_sub(take_derivation_backdate(tag));
     AUTHORITY_SNAPSHOT_RECOMPUTES.fetch_add(1, Ordering::Relaxed);
     let attempt = begin_authority_attempt(tag, unix_secs());
-    let fresh = staged_authority_figure_uncached(cache_dir).await;
+    // How long the reads a decider's own derivation also makes took: the allowance a decider
+    // gives this memo past the TTL. `None` dates it from the install, which is right for a
+    // decider's derivation (it makes no other read) and wrong for the collector's, which walks
+    // `mpus_in_progress/` after its checkpoint read.
+    let mut read_secs: Option<u64> = None;
+    let (figures, inputs) = match kind {
+        DerivationKind::Decider => {
+            #[cfg(test)]
+            count_derivation_stall_hook(&dir).await;
+            (derive_figures(&dir, None).await, None)
+        }
+        DerivationKind::Collector => {
+            let (pending, checkpoints) = read_gauge_inputs(&dir).await;
+            read_secs = Some(unix_secs().saturating_sub(now_secs));
+            publish_early_budget_count(tag, id, generation, &pending, &checkpoints);
+            #[cfg(test)]
+            collector_walk_stall_hook(&dir).await;
+            let observation =
+                crate::signed_put_handler::observe_in_progress(&dir, std::time::Duration::ZERO)
+                    .await;
+            let p = if figure_inputs_complete(&pending, &checkpoints) {
+                crate::signed_put_handler::compose_in_progress_part_bytes(
+                    &dir,
+                    crate::signed_put_handler::PUBLISHED_WALK_BASE_MAX_AGE,
+                )
+                .await
+                .bytes
+            } else {
+                None
+            };
+            let figures = DerivedFigures {
+                figure: figure_of(&pending, &checkpoints, p),
+                count: staged_range_count_of(&pending, &checkpoints),
+                count_debit: pending.applied_debit(&checkpoints).ranges,
+            };
+            (
+                figures,
+                Some(CollectorInputs {
+                    pending,
+                    checkpoints,
+                    observation: Some(observation),
+                    figure: Some(figures.figure),
+                }),
+            )
+        }
+    };
+    install_derived(tag, generation, now_secs, read_secs, figures);
+    let due = finish_authority_attempt(tag, unix_secs(), now_secs, figures.figure.is_some());
+    drop(attempt);
+    // Out of the slot before the figures go out, so a reader that arrives after them finds the
+    // memo rather than a finished derivation.
+    drop(slot);
+    let _ = tx.send(Some(figures));
+    if let Some(unknown_for) = due {
+        log_staging_figure_unknown(unknown_for);
+    }
+    inputs
+}
 
+/// Install one derivation's figures, read from inputs dated `taken_at_secs`.
+///
+/// The authority memo is replaced unless it holds a derivation that began later, whose figure
+/// stays (a newer complete figure is still carried as `last_complete`). A derivation that began
+/// before a fold install expired the memo installs its figure already expired, and leaves the
+/// budget memo as the install left it.
+fn install_derived(
+    tag: u64,
+    generation: u64,
+    taken_at_secs: u64,
+    read_secs: Option<u64>,
+    figures: DerivedFigures,
+) {
+    let current = authority_generation(tag) == generation;
+    let mut installed = false;
     if let Ok(mut map) = AUTHORITY_SNAPSHOT.lock() {
         // Only a test binary can reach this bound, and clearing rather than evicting is
         // deliberate: there is no useful eviction order over one-entry-per-fixture, and a bounded
@@ -5722,23 +7288,37 @@ async fn rederive_authority_snapshot(
         if map.len() >= AUTHORITY_SNAPSHOT_MAX_KEYS && !map.contains_key(&tag) {
             map.clear();
         }
-        let last_complete = last_complete_after(map.get(&tag), fresh, now_secs);
-        map.insert(
-            tag,
-            AuthoritySnapshot {
-                taken_at_secs: now_secs,
-                derived_at_secs: now_secs,
-                figure: fresh,
-                last_complete,
-            },
-        );
+        let previous = map.get(&tag).copied();
+        let last_complete = last_complete_after(previous.as_ref(), figures.figure, taken_at_secs);
+        if previous.is_some_and(|p| p.taken_at_secs > taken_at_secs) {
+            if let Some(newer) = map.get_mut(&tag) {
+                newer.last_complete = last_complete;
+            }
+        } else {
+            let installed_at_secs = if current { unix_secs() } else { 0 };
+            map.insert(
+                tag,
+                AuthoritySnapshot {
+                    taken_at_secs,
+                    // `installed_at - derived_at` is the decider's allowance; see `read_secs`.
+                    derived_at_secs: match read_secs {
+                        Some(r) if current => installed_at_secs.saturating_sub(r),
+                        _ => taken_at_secs,
+                    },
+                    installed_at_secs,
+                    figure: figures.figure,
+                    last_complete,
+                },
+            );
+            installed = true;
+        }
     }
-    let due = finish_authority_attempt(tag, unix_secs(), now_secs, fresh.is_some());
-    drop(attempt);
-    if let Some(unknown_for) = due {
-        log_staging_figure_unknown(unknown_for);
+    if current && installed {
+        BUDGET_SNAPSHOT_COUNT.store(figures.count.unwrap_or(u64::MAX), Ordering::Relaxed);
+        BUDGET_SNAPSHOT_RANGE_DEBIT.store(figures.count_debit, Ordering::Relaxed);
+        BUDGET_SNAPSHOT_DIR.store(tag, Ordering::Relaxed);
+        BUDGET_SNAPSHOT_AT_SECS.store(unix_secs(), Ordering::Relaxed);
     }
-    fresh
 }
 
 /// The `last_complete` a memo entry carries once a derivation taken at `taken_at_secs` has
@@ -5758,7 +7338,7 @@ fn last_complete_after(
     }
 }
 
-/// A scrape's derivation: [`rederive_authority_snapshot`] with `P` from the last walk of
+/// A scrape's derivation: [`run_derivation`] with `P` from the last walk of
 /// `mpus_in_progress/` this process kept, so a scrape never starts one.
 ///
 /// # A deciding reader is never handed an older figure than it accepts
@@ -5787,9 +7367,15 @@ async fn rederive_authority_snapshot_from_kept_walk(
         .as_secs()
         .saturating_add(u64::from(walk_age.subsec_nanos() > 0));
     let taken_at_secs = now_secs.saturating_sub(walk_age_secs);
+    let generation = authority_generation(tag);
     AUTHORITY_SNAPSHOT_RECOMPUTES.fetch_add(1, Ordering::Relaxed);
     let attempt = begin_authority_attempt(tag, unix_secs());
-    let fresh = staged_authority_figure_from(cache_dir, Some(kept.walk)).await;
+    let fresh = derive_figures(cache_dir, Some(kept.walk)).await.figure;
+    let installed_at_secs = if authority_generation(tag) == generation {
+        unix_secs()
+    } else {
+        0
+    };
 
     if let Ok(mut map) = AUTHORITY_SNAPSHOT.lock() {
         if let Some(current) = map
@@ -5809,6 +7395,7 @@ async fn rederive_authority_snapshot_from_kept_walk(
                 AuthoritySnapshot {
                     taken_at_secs,
                     derived_at_secs: now_secs,
+                    installed_at_secs,
                     figure: fresh,
                     last_complete,
                 },
@@ -5869,7 +7456,10 @@ static GAUGE_BETWEEN_READS_HOOK: Mutex<BTreeMap<u64, AuthorityBetweenReadsHook>>
 
 /// Register `hook` to run once, between the next gauge collection's two reads for `cache_dir`.
 #[cfg(test)]
-fn set_gauge_between_reads_hook_for_tests(cache_dir: &Path, hook: AuthorityBetweenReadsHook) {
+pub(crate) fn set_gauge_between_reads_hook_for_tests(
+    cache_dir: &Path,
+    hook: AuthorityBetweenReadsHook,
+) {
     GAUGE_BETWEEN_READS_HOOK
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -5888,17 +7478,39 @@ async fn run_gauge_between_reads_hook(cache_dir: &Path) {
     }
 }
 
-/// [`staged_authority_figure`] without the memo — the derivation itself.
-async fn staged_authority_figure_uncached(cache_dir: &Path) -> Option<StagedAuthorityFigure> {
-    staged_authority_figure_from(cache_dir, None).await
+/// Whether `pending` and `checkpoints` can carry a byte figure: both read completely, and at
+/// least one fold has installed a shard.
+fn figure_inputs_complete(pending: &PendingReadOutcome, checkpoints: &ShardCheckpointSet) -> bool {
+    pending.is_complete() && checkpoints.is_complete() && !checkpoints.shards().is_empty()
 }
 
-/// The derivation, with `P` from `kept` when given (a scrape's refresh) or from a walk of its own,
-/// or the one in flight, when not (every deciding reader).
-async fn staged_authority_figure_from(
+/// The byte figure from one read of the pending files and the checkpoint set, with `P`; `None`
+/// when any of the three is unknown.
+fn figure_of(
+    pending: &PendingReadOutcome,
+    checkpoints: &ShardCheckpointSet,
+    in_progress_part_bytes: Option<u64>,
+) -> Option<StagedAuthorityFigure> {
+    if !figure_inputs_complete(pending, checkpoints) {
+        return None;
+    }
+    let debit = pending.applied_debit(checkpoints).bytes;
+    Some(StagedAuthorityFigure {
+        resident_staged_bytes: checkpoints
+            .staged_byte_sum()
+            .saturating_add(pending.post_cut_bytes(checkpoints))
+            .saturating_sub(debit),
+        in_progress_part_bytes: in_progress_part_bytes?,
+        removal_debit_bytes: debit,
+    })
+}
+
+/// The derivation, with `P` from `kept` when given (a scrape's refresh) or composed from the last
+/// kept walk and the published documents when not (every deciding reader).
+async fn derive_figures(
     cache_dir: &Path,
     kept: Option<crate::signed_put_handler::InProgressWalk>,
-) -> Option<StagedAuthorityFigure> {
+) -> DerivedFigures {
     // PENDING FIRST, then checkpoints. The order is the correctness argument, not a style choice.
     //
     // A credit leaves a `.pending` file only through its owner's GC, and only once an installed
@@ -5910,15 +7522,22 @@ async fn staged_authority_figure_from(
     // cut. The reverse order took the OLD cut and the NEW pending file, so every credit between
     // the two cuts was in neither source and the figure under-stated — the direction that makes
     // the staging trigger fire late (`a_peer_install_between_the_authority_reads_never_under_counts`).
-    let pending = PendingStore::new(cache_dir.to_path_buf()).read_all().await;
+    let mut pending = PendingStore::new(cache_dir.to_path_buf()).read_all().await;
     if !pending.is_complete() {
-        return None;
+        return DerivedFigures::default();
     }
+    pending.removal_debits = read_removal_debits(cache_dir).await;
     #[cfg(test)]
     run_authority_between_reads_hook(cache_dir).await;
-    let checkpoints = read_shard_checkpoints(cache_dir);
-    if !checkpoints.is_complete() || checkpoints.shards().is_empty() {
-        return None;
+    let checkpoints = read_shard_checkpoints_bounded(cache_dir).await;
+    let count = staged_range_count_of(&pending, &checkpoints);
+    let count_debit = pending.applied_debit(&checkpoints).ranges;
+    if !figure_inputs_complete(&pending, &checkpoints) {
+        return DerivedFigures {
+            figure: None,
+            count,
+            count_debit,
+        };
     }
     // `P`: a full walk no older than `PUBLISHED_WALK_BASE_MAX_AGE` plus every instance's
     // published growth since that walk began, which in the steady state is the metrics
@@ -5938,22 +7557,21 @@ async fn staged_authority_figure_from(
     // walk, and its memo entry is dated by that walk so no decider takes it past the TTL (see
     // `rederive_authority_snapshot_from_kept_walk`).
     let p = match kept {
-        Some(walk) => walk.bytes?,
+        Some(walk) => walk.bytes,
         None => {
             crate::signed_put_handler::compose_in_progress_part_bytes(
                 cache_dir,
                 crate::signed_put_handler::PUBLISHED_WALK_BASE_MAX_AGE,
             )
             .await
-            .bytes?
+            .bytes
         }
     };
-    Some(StagedAuthorityFigure {
-        resident_staged_bytes: checkpoints
-            .staged_byte_sum()
-            .saturating_add(pending.post_cut_bytes(&checkpoints)),
-        in_progress_part_bytes: p,
-    })
+    DerivedFigures {
+        figure: figure_of(&pending, &checkpoints, p),
+        count,
+        count_debit,
+    }
 }
 
 /// Whether this volume's staged fold has completed one full rotation, with every shard it
@@ -6009,6 +7627,107 @@ fn age_secs(scanned_at_nanos: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test oracles: one read of the production derivation, without the memo or the
+    /// single-flight, so a test can compare what a reader got with what the volume says now.
+    /// They call the production readers (`derive_figures`, `staged_range_count_of`) and add no
+    /// logic of their own, so nothing in production is kept alive by them.
+    async fn staged_authority_figure_uncached(cache_dir: &Path) -> Option<StagedAuthorityFigure> {
+        derive_figures(cache_dir, None).await.figure
+    }
+
+    async fn staged_range_count_now(cache_dir: &Path) -> Option<u64> {
+        let pending = PendingStore::new(cache_dir.to_path_buf()).read_all().await;
+        if !pending.is_complete() {
+            return None;
+        }
+        staged_range_count_of(&pending, &read_shard_checkpoints(cache_dir))
+    }
+
+    /// Budget admission reads its count while the metrics collector's derivation is still walking
+    /// `mpus_in_progress/`. Admission's inline re-derivation gives up after 300 ms and fails open,
+    /// so a count that arrives only when the walk ends lets staging past the range budget for as
+    /// long as the walk runs. The count needs only the reads that precede the walk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn budget_admission_does_not_wait_on_the_collectors_walk() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        seed_shard_figure(dir, &Shard::new("bucket", "5e"), 1_000, 7, 0);
+        set_collector_walk_stall_for_tests(dir, std::time::Duration::from_secs(3));
+        let walking = dir.to_path_buf();
+        let collector = tokio::spawn(async move { collector_derivation(&walking).await });
+        let tag = dir_tag(dir);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !derivation_in_flight(tag) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fixture: the collector's derivation starts");
+        // Its reads are done long before the 3 s walk stall ends.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            derivation_in_flight(tag),
+            "fixture: the derivation is still walking"
+        );
+        let started = std::time::Instant::now();
+        let (count, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            budget_snapshot_count_and_debit(dir),
+        )
+        .await
+        .expect("the budget read returns");
+        let waited = started.elapsed();
+        println!(
+            "BUDGET-WAIT: waited_ms={} count={count}",
+            waited.as_millis()
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(300),
+            "budget admission waited {} ms for a derivation that had already read its inputs and \
+             was walking mpus_in_progress/; its caller gives up after 300 ms and fails open",
+            waited.as_millis()
+        );
+        assert_eq!(count, 7, "the count the derivation read");
+        collector.await.unwrap();
+    }
+
+    /// A collector derivation whose `mpus_in_progress/` walk outlasts the TTL installs a memo a
+    /// decider may use for the TTL plus the collector's checkpoint read only, not plus its walk:
+    /// a decider's own derivation runs no walk, so the walk is no part of its bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_collector_memo_gives_deciders_no_allowance_for_its_walk() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        seed_shard_figure(dir, &Shard::new("bucket", "5e"), 1_000, 1, 0);
+        set_collector_walk_stall_for_tests(dir, std::time::Duration::from_secs(3));
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            collector_derivation(dir),
+        )
+        .await
+        .expect("the collector derivation returns");
+        assert!(
+            age_authority_snapshot_for_tests(dir, 4),
+            "fixture: the collector installed a memo"
+        );
+        // The volume moves; a decider that re-derives sees it, one that takes the memo does not.
+        seed_shard_figure(dir, &Shard::new("bucket", "6f"), 2_000, 1, 0);
+        let figure = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            staged_authority_figure(dir),
+        )
+        .await
+        .expect("the decider returns")
+        .map(|f| f.resident_staged_bytes);
+        println!("COLLECTOR-ALLOWANCE: figure={figure:?}");
+        assert_eq!(
+            figure,
+            Some(3_000),
+            "a decider accepted a collector memo older than the TTL plus the collector's checkpoint \
+             read: the collector's walk was counted in the allowance"
+        );
+    }
 
     /// The authority figure's `P` is composed on a kept walk of `mpus_in_progress/` that
     /// STARTED less than `PUBLISHED_WALK_BASE_MAX_AGE` ago, plus every proxy's published growth
@@ -6412,6 +8131,7 @@ mod tests {
                 .expect("a record without a range identity must still parse");
         assert_eq!(legacy.range, None);
         let outcome = PendingReadOutcome {
+            removal_debits: Vec::new(),
             credits: vec![
                 ("host:a".to_string(), credit(1, 512, range("bucket/x"))),
                 ("host:b".to_string(), credit(1, 600, range("bucket/x"))),
@@ -6678,6 +8398,7 @@ mod tests {
         // `collect_staged_fold_gauges` branches on, rather than the total it derives.
         let (b_bucket, b_l1) = shard_of("bucket/b.bin").unwrap();
         let one_record = |bucket: &str, l1: &str| PendingReadOutcome {
+            removal_debits: Vec::new(),
             credits: vec![(
                 "host:1".to_string(),
                 PendingCredit {
@@ -7832,6 +9553,476 @@ mod tests {
     }
 
     // =====================================================================
+    // Quarantine of torn pending lines and unparseable checkpoints
+    // =====================================================================
+
+    /// `{instance}.pending` under `dir`.
+    fn pending_file_of(dir: &Path, instance: &str) -> PathBuf {
+        PendingStore::new(dir.to_path_buf())
+            .dir()
+            .join(format!("{instance}.pending"))
+    }
+
+    /// Append `text` to `path` as it stands, creating it if needed.
+    fn append_raw(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// Move `path`'s mtime `by` into the past: the ageing helper the liveness rule reads.
+    fn age_mtime(path: &Path, by: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - by)
+            .unwrap();
+    }
+
+    /// `path` with `suffix` appended to its file name.
+    fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        path.with_file_name(name)
+    }
+
+    /// A blank line and a truncated JSON line in the owner's own file: the fold pass moves both to
+    /// `{instance}.pending.torn` and installs, the valid credits stay, and readers see a complete
+    /// file again.
+    ///
+    /// # RED SIDE
+    ///
+    /// Before the quarantine the pass retains `pending_unreadable` and the figure stays unknown.
+    #[tokio::test]
+    async fn the_owner_quarantines_its_own_torn_line_before_folding() {
+        const TORN: &str = "{\"seq\":99,\"bucket\":\"buck";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        publish_staged_range(dir, &ledger, "bucket/t6a-one.bin", 4096).await;
+        publish_staged_range(dir, &ledger, "bucket/t6a-two.bin", 512).await;
+        assert_ne!(
+            shard_for("bucket/t6a-one.bin"),
+            shard_for("bucket/t6a-two.bin"),
+            "fixture precondition: two shards, so one pass leaves one credit uncut"
+        );
+        let own = pending_file_of(dir, "host:1");
+        append_raw(&own, "\n");
+        append_raw(&own, &format!("{TORN}\n"));
+        let damaged = PendingStore::new(dir.to_path_buf()).read_all().await;
+        assert_eq!(
+            damaged.malformed_lines, 2,
+            "fixture precondition: two torn lines"
+        );
+        assert_eq!(
+            staged_authority_figure_uncached(dir).await,
+            None,
+            "fixture precondition: the torn lines wedge the figure"
+        );
+        let counted_before = pending_lines_quarantined_total();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        installed(&outcome);
+        let after = PendingStore::new(dir.to_path_buf()).read_all().await;
+        assert!(
+            after.is_complete(),
+            "the owner's file must read complete after its pass: {after:?}"
+        );
+        let torn = std::fs::read_to_string(with_suffix(&own, ".torn")).unwrap_or_default();
+        assert_eq!(
+            torn,
+            format!("\n{TORN}\n"),
+            "the .pending.torn file must hold exactly the two moved lines"
+        );
+        // A lower bound only: the counter is process-global and other tests move lines too.
+        assert!(
+            pending_lines_quarantined_total() >= counted_before + 2,
+            "the two moved lines must be counted"
+        );
+        assert_eq!(
+            published_figure_for_tests(dir).await,
+            Some(4096 + 512),
+            "both valid credits survive: one folded into F, the other still in the pending term"
+        );
+    }
+
+    /// A torn line in the file of a peer the liveness rule judges dead stops wedging the figure
+    /// after the next fold pass of any instance.
+    ///
+    /// # RED SIDE
+    ///
+    /// Before the quarantine the pass retains `pending_unreadable` and the figure stays `None`.
+    #[tokio::test]
+    async fn a_dead_peers_torn_file_is_healed_by_the_next_pass() {
+        const TORN: &str = "{\"seq\":7,\"bu";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        publish_staged_range(dir, &ledger, "bucket/t6b.bin", 4096).await;
+        let peer = pending_file_of(dir, "peer-host:4242");
+        append_raw(&peer, &format!("{TORN}\n"));
+        // Another host's pid cannot be tested, so the rule is quiet for a day.
+        age_mtime(&peer, Duration::from_secs(25 * 60 * 60));
+        assert_eq!(
+            staged_authority_figure_uncached(dir).await,
+            None,
+            "fixture precondition: the dead peer's torn line wedges the figure"
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        installed(&outcome);
+        assert!(
+            staged_authority_figure_uncached(dir).await.is_some(),
+            "after any instance's pass the figure must be derivable again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(with_suffix(&peer, ".torn")).unwrap_or_default(),
+            format!("{TORN}\n"),
+            "the dead peer's torn line is kept in its .pending.torn"
+        );
+    }
+
+    /// A peer the liveness rule does not judge dead keeps its file byte for byte, torn line
+    /// included, and the reader stays strict: the pass retains.
+    ///
+    /// # RED SIDE
+    ///
+    /// The dead-instance predicate dropped from the reaper step: the live peer's file is
+    /// rewritten.
+    #[tokio::test]
+    async fn a_live_peers_file_is_never_rewritten_by_another_instance() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        publish_staged_range(dir, &ledger, "bucket/t6c.bin", 4096).await;
+        let peer = pending_file_of(dir, "peer-host:4243");
+        append_raw(&peer, "{\"seq\":3,\"bucket\":\"b\n");
+        let before = std::fs::read(&peer).unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        assert_eq!(
+            std::fs::read(&peer).unwrap(),
+            before,
+            "a live peer's file was rewritten by another instance"
+        );
+        assert!(
+            !with_suffix(&peer, ".torn").exists(),
+            "a live peer's lines were quarantined by another instance"
+        );
+        assert_eq!(
+            outcome.retain_reason(),
+            Some(FoldRetainReason::PendingUnreadable),
+            "readers stay strict: a live peer's torn line still refuses the install"
+        );
+    }
+
+    /// A shard checkpoint that does not parse is kept in `{XX}.json.torn` and replaced by a fresh
+    /// fold of the shard in the same pass.
+    ///
+    /// # RED SIDE
+    ///
+    /// Before the quarantine every pass retains `previous_checkpoint_unreadable`.
+    #[tokio::test]
+    async fn an_unparseable_checkpoint_is_quarantined_and_the_shard_folded_fresh() {
+        const GARBAGE: &str = "{\"schema\":1,\"bucket\":\"buck";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        publish_staged_range(dir, &ledger, "bucket/t6d.bin", 4096).await;
+        installed(&run_staged_fold_sampled(dir, &ledger, "host:1", None).await);
+        let shard = shard_for("bucket/t6d.bin");
+        let doc = StagedShardCheckpoint::path(dir, &shard);
+        std::fs::write(&doc, GARBAGE).unwrap();
+        assert!(
+            !read_shard_checkpoints(dir).is_complete(),
+            "fixture precondition: the checkpoint set is incomplete"
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        installed(&outcome);
+        assert_eq!(
+            std::fs::read_to_string(with_suffix(&doc, ".torn")).unwrap_or_default(),
+            GARBAGE,
+            "the unparseable document is kept in {{XX}}.json.torn"
+        );
+        let set = read_shard_checkpoints(dir);
+        assert!(set.is_complete(), "the set reads complete again");
+        assert_eq!(
+            set.get(&shard).map(|c| c.staged_byte_sum),
+            Some(4096),
+            "the shard is folded fresh from its .meta"
+        );
+        assert_eq!(published_figure_for_tests(dir).await, Some(4096));
+    }
+
+    /// Two shards folded by host:1, then one shard's document damaged. Returns the damaged
+    /// shard, the other shard, and the damaged document's path.
+    async fn two_shards_one_damaged(dir: &Path, ledger: &WriteLedger) -> (Shard, Shard, PathBuf) {
+        const DAMAGED_KEY: &str = "bucket/t7-damaged.bin";
+        let damaged = shard_for(DAMAGED_KEY);
+        let other_key = (0u32..)
+            .map(|i| format!("bucket/t7-other-{i}.bin"))
+            .find(|k| shard_for(k) != damaged)
+            .expect("fixture precondition: a key in another shard");
+        publish_staged_range(dir, ledger, DAMAGED_KEY, 4096).await;
+        publish_staged_range(dir, ledger, &other_key, 512).await;
+        fold_to_convergence(dir, ledger, "host:1", 4).await;
+        assert_eq!(
+            published_figure_for_tests(dir).await,
+            Some(4096 + 512),
+            "fixture precondition: both shards folded"
+        );
+        let doc = StagedShardCheckpoint::path(dir, &damaged);
+        std::fs::write(&doc, DAMAGED_CHECKPOINT).unwrap();
+        (damaged, shard_for(&other_key), doc)
+    }
+    const DAMAGED_CHECKPOINT: &str = "{\"schema\":1,\"bucket\":\"buck";
+    /// A damaged checkpoint whose shard a peer has claimed stays in place, so readers report the
+    /// figure as unknown rather than a sum missing that shard.
+    ///
+    /// # RED SIDE
+    ///
+    /// The damaged document moved aside before its shard is claimed: the pass finds the claim
+    /// busy, no document is left for the shard, and readers publish the other shard alone.
+    #[tokio::test]
+    async fn a_damaged_checkpoint_whose_claim_a_peer_holds_reads_unknown_not_short() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        let (damaged, _, doc) = two_shards_one_damaged(dir, &ledger).await;
+        assert_eq!(
+            claim_shard(dir, &damaged, "host:2").await,
+            ClaimOutcome::Claimed,
+            "fixture precondition: a peer holds the damaged shard's claim"
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        println!(
+            "busy damaged shard: retain={:?} published={:?}",
+            outcome.retain_reason(),
+            published_figure_for_tests(dir).await
+        );
+        assert_eq!(
+            published_figure_for_tests(dir).await,
+            None,
+            "a damaged shard a peer holds must read unknown, not short by that shard"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&doc).unwrap_or_default(),
+            DAMAGED_CHECKPOINT,
+            "the damaged document stays in place until a fresh one replaces it"
+        );
+        assert!(!with_suffix(&doc, ".torn").exists());
+    }
+    /// An eviction-scoped pass folds only the shards it was named, so a damaged checkpoint in a
+    /// shard it was not named stays in place and readers keep reporting unknown.
+    ///
+    /// # RED SIDE
+    ///
+    /// Every damaged document moved aside at the start of the pass, whatever its scope.
+    #[tokio::test]
+    async fn an_eviction_scoped_pass_leaves_a_damaged_shard_it_was_not_named_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        let (_, other, doc) = two_shards_one_damaged(dir, &ledger).await;
+        let only: BTreeSet<Shard> = [other].into_iter().collect();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_over_shards(dir, &ledger, "host:1", &only),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        installed(&outcome);
+        assert_eq!(
+            std::fs::read_to_string(&doc).unwrap_or_default(),
+            DAMAGED_CHECKPOINT,
+            "a damaged document in a shard the pass was not named stays in place"
+        );
+        assert!(!with_suffix(&doc, ".torn").exists());
+        assert_eq!(
+            published_figure_for_tests(dir).await,
+            None,
+            "and readers still report unknown"
+        );
+    }
+    /// A document from a newer release and one that cannot be read are both left in place: the
+    /// first may be valid to the binary that wrote it, the second is transient.
+    ///
+    /// # RED SIDE
+    ///
+    /// The quarantine taking any load error, not only a parse failure of our own schema.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_newer_or_unreadable_checkpoint_is_left_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        publish_staged_range(dir, &ledger, "bucket/t6e-new.bin", 4096).await;
+        publish_staged_range(dir, &ledger, "bucket/t6e-eio.bin", 512).await;
+        let newer = StagedShardCheckpoint::path(dir, &shard_for("bucket/t6e-new.bin"));
+        let unreadable = StagedShardCheckpoint::path(dir, &shard_for("bucket/t6e-eio.bin"));
+        assert_ne!(newer, unreadable, "fixture precondition: two shards");
+        for p in [&newer, &unreadable] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&newer, "{\"schema\":99,\"bucket\":\"bucket\"}").unwrap();
+        std::fs::write(&unreadable, "{}").unwrap();
+        let restore = std::fs::metadata(&unreadable).unwrap().permissions();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read(&unreadable).is_ok();
+
+        let outcome = run_staged_fold_sampled(dir, &ledger, "host:1", None).await;
+        std::fs::set_permissions(&unreadable, restore).unwrap();
+        assert!(newer.exists(), "a newer release's checkpoint was moved");
+        assert!(!with_suffix(&newer, ".torn").exists());
+        if readable_anyway {
+            println!("APPARATUS: running as a user that reads mode 000; the I/O arm is unchecked");
+        } else {
+            assert!(unreadable.exists(), "an unreadable checkpoint was moved");
+            assert!(!with_suffix(&unreadable, ".torn").exists());
+        }
+        assert_eq!(
+            outcome.retain_reason(),
+            Some(FoldRetainReason::PreviousCheckpointUnreadable)
+        );
+    }
+
+    /// A drained instance's credits are cut once when a shard is folded fresh. host:2's only entry
+    /// in the shard is retired by compaction once its object is deleted, which leaves its ledger
+    /// file header-only while its credit is still pending. After the shard's checkpoint is damaged
+    /// and folded fresh, the header's `max_seq_ever` is what puts host:2 in the new cut, so the
+    /// credit is not counted on top of `F`.
+    ///
+    /// # RED SIDE
+    ///
+    /// The cut computed without the header's `max_seq_ever` (`ParsedLedgerFile::max_seq_ever`
+    /// reading entries only): host:2 is absent from the cut and its credit is counted again.
+    #[tokio::test]
+    async fn a_drained_header_only_file_cuts_its_instances_credits_once_when_a_shard_is_folded_fresh(
+    ) {
+        const BYTES: u64 = 8192;
+        const KEPT: &str = "bucket/t6-kept.bin";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let shard = shard_for(KEPT);
+        let drained_key = (0u32..)
+            .map(|i| format!("bucket/t6-drained-{i}.bin"))
+            .find(|k| shard_for(k) == shard)
+            .expect("fixture precondition: a second key in the same shard");
+        let a = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        let x = WriteLedger::new(dir.to_path_buf(), "host:2".to_string());
+        let x_seq = publish_staged_range(dir, &x, &drained_key, BYTES).await;
+        publish_staged_range(dir, &a, KEPT, BYTES).await;
+        installed(&run_staged_fold_sampled(dir, &a, "host:1", None).await);
+        assert_eq!(published_figure_for_tests(dir).await, Some(2 * BYTES));
+        // host:2's object is deleted, and compaction retires its entry as terminal.
+        std::fs::remove_file(
+            crate::disk_cache::get_sharded_path(&dir.join("metadata"), &drained_key, ".meta")
+                .unwrap(),
+        )
+        .unwrap();
+        let retire: std::collections::HashSet<_> = x
+            .read_for_authority(0)
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.cache_key == drained_key && e.instance_id == "host:2")
+            .map(|e| e.identity())
+            .collect();
+        assert_eq!(
+            retire.len(),
+            1,
+            "fixture precondition: host:2 had one entry"
+        );
+        x.retire_identities(&retire).await.unwrap();
+        let x_file = WriteLedger::shard_ledger_path(dir, &shard.bucket, &shard.l1, "host:2");
+        assert!(
+            x_file.is_file(),
+            "fixture precondition: the drained file survives, header-only"
+        );
+        let shard_read = a
+            .read_shard_for_authority(&shard.bucket, &shard.l1, 0)
+            .await
+            .unwrap();
+        assert!(
+            shard_read.entries.iter().all(|e| e.instance_id != "host:2"),
+            "fixture precondition: host:2 has no entry left in the shard"
+        );
+        let x_credits = PendingStore::new(dir.to_path_buf())
+            .read_all()
+            .await
+            .credits
+            .iter()
+            .filter(|(i, c)| i == "host:2" && c.shard() == shard)
+            .count();
+        assert_eq!(
+            x_credits, 1,
+            "fixture precondition: host:2's credit is still pending"
+        );
+        std::fs::write(StagedShardCheckpoint::path(dir, &shard), "{\"schema\":1,").unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &a, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        installed(&outcome);
+        let set = read_shard_checkpoints(dir);
+        let cut = set
+            .get(&shard)
+            .map(|c| c.staged_fold_cut.clone())
+            .unwrap_or_default();
+        println!(
+            "drained header-only: cut={:?} F={}",
+            cut,
+            set.staged_byte_sum()
+        );
+        assert_eq!(set.staged_byte_sum(), BYTES, "F counts host:1's range only");
+        assert_eq!(
+            cut.get("host:2"),
+            Some(&x_seq),
+            "host:2's header-only file must set its cut"
+        );
+        assert_eq!(
+            published_figure_for_tests(dir).await,
+            Some(BYTES),
+            "host:2's credit must be cut, not counted on top of F"
+        );
+    }
+    // =====================================================================
     // § 16.6.4 / § 16.6.9 — the age signal
     // =====================================================================
 
@@ -8491,10 +10682,12 @@ mod tests {
         let figure = |bytes| StagedAuthorityFigure {
             resident_staged_bytes: bytes,
             in_progress_part_bytes: 0,
+            removal_debit_bytes: 0,
         };
         let previous = AuthoritySnapshot {
             taken_at_secs: 100,
             derived_at_secs: 100,
+            installed_at_secs: 100,
             figure: None,
             last_complete: Some((90, figure(1))),
         };
@@ -9398,7 +11591,7 @@ mod tests {
     ///    instance's identity and sequence. `host:1`'s new credit is filtered by the cut that
     ///    read its line; `host:2`'s stale credit is not.
     /// 5. `PendingReadOutcome::post_cut` therefore returns the stale credit forever, and
-    ///    `staged_authority_figure_from` adds it to a `staged_byte_sum` that already counts the
+    ///    `derive_figures` adds it to a `staged_byte_sum` that already counts the
     ///    `.meta`. § 16.6.1's counted-by-both.
     ///
     /// Direction and permanence: the figure is **over** truth by one credit's bytes, which makes
@@ -9886,7 +12079,7 @@ mod tests {
     /// forces all eight into the cold window together, which is the state a cold fleet volume
     /// puts them in for real. Measured red on unchanged code at `reads == 8`.
     ///
-    /// A failure implicates [`budget_derivation`]'s single-flight map, not the memo: an
+    /// A failure implicates [`joined_derivation`]'s single-flight map, not the memo: an
     /// unkeyed or per-caller derivation reports `k`, and a broken join reports `0` verdicts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_budget_callers_derive_the_count_once() {
@@ -11963,7 +14156,7 @@ mod tests {
         // ---- The assertion the defect fails.
         let (want_trigger, want_target) = count_eviction_thresholds(95, 80);
         assert_eq!(
-            count_eviction_verdict(dir, "host:1", 95, 80).await,
+            count_eviction_verdict(dir, 95, 80).await,
             CountEvictionVerdict::Needed {
                 count: STAGED_RANGE_BUDGET,
                 observed_count: STAGED_RANGE_BUDGET,
@@ -12049,7 +14242,7 @@ mod tests {
         seed_shard_figure(dir, &shard, 4_096, in_band, 5);
         invalidate_budget_snapshot(dir);
         assert_eq!(
-            count_eviction_verdict(dir, "host:1", 95, 80).await,
+            count_eviction_verdict(dir, 95, 80).await,
             CountEvictionVerdict::NotNeeded,
             "inside the hysteresis band nothing evicts — otherwise every upload near the \
              boundary pays for an eviction pass"
@@ -12059,9 +14252,7 @@ mod tests {
         seed_shard_figure(dir, &shard, 4_096, trigger + 1, 5);
         invalidate_budget_snapshot(dir);
         assert!(
-            count_eviction_verdict(dir, "host:1", 95, 80)
-                .await
-                .is_needed(),
+            count_eviction_verdict(dir, 95, 80).await.is_needed(),
             "one range past the trigger must fire, or the boundary is off by one in the \
              direction that never evicts"
         );
@@ -12077,10 +14268,9 @@ mod tests {
     /// would observe the same stale count and re-ask for `count − target` ranges on every
     /// cycle — draining the whole write tier at a rate set by the eviction candidate cap.
     ///
-    /// A failure implicates `record_count_eviction_pass`'s `fetch_add`, the
-    /// `observed_count.saturating_sub(reclaimed)` in [`count_eviction_verdict`], or the
-    /// `COUNT_RECLAIMED_SINCE_FOLD.store(0, ..)` in [`invalidate_budget_snapshot`] — all in
-    /// `staged_fold.rs`.
+    /// A failure implicates the removal debit's write ([`write_removal_debits`]) or its reader
+    /// rule ([`PendingReadOutcome::applied_debit`]), or the `observed_count.saturating_sub(debit)`
+    /// in [`count_eviction_verdict`], all in `staged_fold.rs`.
     #[tokio::test]
     async fn a_count_pass_debits_its_own_reclaim_until_the_next_fold_install() {
         let tmp = TempDir::new().unwrap();
@@ -12090,7 +14280,7 @@ mod tests {
 
         seed_shard_figure(dir, &shard, 4_096, STAGED_RANGE_BUDGET, 5);
         invalidate_budget_snapshot(dir);
-        let first = count_eviction_verdict(dir, "host:1", 95, 80).await;
+        let first = count_eviction_verdict(dir, 95, 80).await;
         let CountEvictionVerdict::Needed { ranges_to_free, .. } = first else {
             panic!("fixture: the trigger must fire before a debit can be tested, got {first:?}");
         };
@@ -12098,14 +14288,23 @@ mod tests {
 
         // The pass reclaimed exactly what it asked for. The checkpoint is UNCHANGED, which is
         // the production state until the next fold — so only the debit can quiet the trigger.
-        let (passes, freed) = record_count_eviction_pass(dir, "host:1", ranges_to_free);
+        record_shard_debit_for_tests(
+            dir,
+            "host:1",
+            &shard.bucket,
+            &shard.l1,
+            0,
+            ranges_to_free,
+            None,
+        );
+        let (passes, freed) = record_count_eviction_pass(dir, "hostA:1", ranges_to_free);
         // Per-directory, so these are this fixture's own figures rather than the process's —
         // which is what makes an exact assertion safe here at all. An unkeyed cumulative
         // counter would be the process-global-counter trap, and it fired on the first run of
         // this test before the state was keyed.
         assert_eq!((passes, freed), (1, ranges_to_free));
         assert_eq!(
-            count_eviction_verdict(dir, "host:1", 95, 80).await,
+            count_eviction_verdict(dir, 95, 80).await,
             CountEvictionVerdict::NotNeeded,
             "the next evaluation must NOT re-ask for the same ranges. Without the debit the \
              trigger re-fires every consolidation cycle against an unmoved figure, which \
@@ -12115,8 +14314,15 @@ mod tests {
         // A fold install resets the debit. The checkpoint here still says budget-full, so the
         // trigger must come back — which is what proves the reset happened rather than the
         // debit being permanent.
-        invalidate_budget_snapshot(dir);
-        let after_install = count_eviction_verdict(dir, "host:1", 95, 80).await;
+        fold_installed_for_tests(
+            dir,
+            "host:1",
+            &shard.bucket,
+            &shard.l1,
+            4_096,
+            STAGED_RANGE_BUDGET,
+        );
+        let after_install = count_eviction_verdict(dir, 95, 80).await;
         assert!(
             after_install.is_needed(),
             "a fold install clears the debit, so an unmoved checkpoint triggers again. \
@@ -12141,6 +14347,38 @@ mod tests {
         );
     }
 
+    /// T4g. A count pass reclaims ranges from shards S1 and S2, and its re-fold installs only S1.
+    /// The count verdict must still debit S2's ranges: the debit is the shard's, retired only by an
+    /// install of that shard, not by any install of the instance.
+    #[tokio::test]
+    async fn the_count_debit_survives_a_partial_re_fold() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let (s1, s2) = (Shard::new("bucket", "1a"), Shard::new("bucket", "2b"));
+        let half = STAGED_RANGE_BUDGET / 2;
+        let (d1, d2) = (STAGED_RANGE_BUDGET / 100, STAGED_RANGE_BUDGET / 100);
+        let (trigger, _) = count_eviction_thresholds(95, 80);
+        assert!(
+            STAGED_RANGE_BUDGET - d1 - d2 > trigger,
+            "fixture: still over the trigger"
+        );
+        seed_shard_figure(dir, &s1, 4_096, half, 5);
+        seed_shard_figure(dir, &s2, 4_096, STAGED_RANGE_BUDGET - half, 5);
+        record_shard_debit_for_tests(dir, "host:1", &s1.bucket, &s1.l1, 1, d1, None);
+        record_shard_debit_for_tests(dir, "host:1", &s2.bucket, &s2.l1, 1, d2, None);
+        // The re-fold installs S1 only, with S1's reclaim folded into its figure.
+        fold_installed_for_tests(dir, "host:1", &s1.bucket, &s1.l1, 4_096, half - d1);
+        let verdict = count_eviction_verdict(dir, 95, 80).await;
+        println!("T4g partial re-fold: verdict={verdict:?} d1={d1} d2={d2}");
+        assert!(
+            matches!(verdict, CountEvictionVerdict::Needed { count, .. }
+                if count == STAGED_RANGE_BUDGET - d1 - d2),
+            "the count verdict lost S2's debit when the re-fold installed only S1: expected count \
+             {}, got {verdict:?}",
+            STAGED_RANGE_BUDGET - d1 - d2
+        );
+    }
+
     /// Two instances each reclaim; the second instance's verdict must count **both**.
     ///
     /// # The defect this closes
@@ -12158,8 +14396,8 @@ mod tests {
     /// above the trigger on purpose, so the assertion is on the exact arithmetic rather than on
     /// a `NotNeeded` that a larger debit from either side alone could also produce.
     ///
-    /// A failure implicates the peer-document sum in [`count_eviction_verdict`] or the reader
-    /// [`peer_reclaims_ranges`], both in `staged_fold.rs`.
+    /// A failure implicates the debit sum in [`count_eviction_verdict`] or the reader
+    /// [`read_removal_debits`], both in `staged_fold.rs`.
     #[tokio::test]
     async fn a_peers_reclaim_is_debited_by_this_instances_count_verdict() {
         let tmp = TempDir::new().unwrap();
@@ -12176,20 +14414,31 @@ mod tests {
         // fresh fixture cannot hit it, and the unkeyed reset would clear a parallel test's state.
         seed_shard_figure(dir, &shard, 4_096, STAGED_RANGE_BUDGET, 5);
 
-        let reclaims = dir.join("metadata/_shard_state/eviction_reclaims");
-        std::fs::create_dir_all(&reclaims).unwrap();
+        let debits = dir.join("metadata/_shard_state/staged_debits");
+        std::fs::create_dir_all(&debits).unwrap();
         std::fs::write(
-            reclaims.join("hostA:1.json"),
+            debits.join("hostA:1.json"),
             format!(
-                "{{\"schema\":1,\"instance_id\":\"hostA:1\",\"generation\":0,\
-                 \"ranges_reclaimed\":{peer_reclaimed},\"recorded_at_unix_nanos\":{}}}",
+                "{{\"schema\":1,\"instance_id\":\"hostA:1\",\"entries\":[{{\"bucket\":\"{}\",\
+                 \"l1\":\"{}\",\"removed_at_unix_nanos\":{},\"bytes\":0,\"ranges\":{peer_reclaimed}}}]}}",
+                shard.bucket,
+                shard.l1,
                 now_nanos()
             ),
         )
         .unwrap();
 
-        record_count_eviction_pass(dir, "hostB:2", own_reclaimed);
-        let verdict = count_eviction_verdict(dir, "hostB:2", 95, 80).await;
+        record_shard_debit_for_tests(
+            dir,
+            "hostB:2",
+            &shard.bucket,
+            &shard.l1,
+            0,
+            own_reclaimed,
+            None,
+        );
+        record_count_eviction_pass(dir, "hostA:1", own_reclaimed);
+        let verdict = count_eviction_verdict(dir, 95, 80).await;
         assert!(
             matches!(
                 verdict,
@@ -12204,93 +14453,467 @@ mod tests {
         );
     }
 
-    /// The reclaim document's lifecycle: published by the reclaim, counted by peers and not by
-    /// its owner, retired by its owner's fold install, and ignored once past the age bound.
+    /// A 3.0.3 proxy sharing the volume reads `eviction_reclaims/{instance}.json` for its count
+    /// arm and over-evicts without it. This release keeps writing that document, with the
+    /// cumulative meaning 3.0.3 gave it, and removes it at the instance's next fold install.
     ///
-    /// Read through [`peer_reclaims_ranges`] rather than the verdict so the assertions do not
-    /// depend on the process-wide [`CountEvictionState`], which parallel tests reset.
-    ///
-    /// A failure implicates [`record_count_eviction_pass`]'s publish,
-    /// [`invalidate_budget_snapshot_retiring`]'s removal, or the own-exclusion, schema and
-    /// age checks in [`peer_reclaims_ranges`], all in `staged_fold.rs`.
+    /// A failure implicates [`publish_compat_reclaim`] or [`retire_compat_reclaim`].
     #[tokio::test]
-    async fn a_reclaim_document_is_published_retired_and_aged_out() {
+    async fn the_count_pass_still_writes_the_reclaim_document_a_303_proxy_reads() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
+        let path = dir.join("metadata/_shard_state/eviction_reclaims/hostA:1.json");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("no reclaim document for a 3.0.3 reader at {path:?}: {e}")
+            }))
+            .unwrap()
+        };
 
-        // Fresh volume: no `eviction_reclaims/` directory at all reads as nothing to debit.
-        assert_eq!(peer_reclaims_ranges(dir, "hostC:3").await, 0);
-
-        record_count_eviction_pass(dir, "hostB:2", 7);
-        let path = ReclaimDocument::path(dir, "hostB:2");
-        let doc: ReclaimDocument =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc.schema, RECLAIM_DOCUMENT_SCHEMA);
-        assert_eq!(doc.instance_id, "hostB:2");
-        assert!(
-            doc.ranges_reclaimed >= 7,
-            "cumulative since the install: {doc:?}"
-        );
+        record_count_eviction_pass(dir, "hostA:1", 5);
+        let first = read();
         assert_eq!(
-            peer_reclaims_ranges(dir, "hostC:3").await,
-            doc.ranges_reclaimed,
-            "a peer debits the owner's document"
+            (
+                first["schema"].as_u64(),
+                first["instance_id"].as_str(),
+                first["ranges_reclaimed"].as_u64()
+            ),
+            (Some(1), Some("hostA:1"), Some(5))
         );
+        assert!(first["generation"].is_u64() && first["recorded_at_unix_nanos"].is_u64());
+
+        record_count_eviction_pass(dir, "hostA:1", 3);
         assert_eq!(
-            peer_reclaims_ranges(dir, "hostB:2").await,
-            0,
-            "the owner does not debit its own document, which its in-memory field already holds"
+            read()["ranges_reclaimed"].as_u64(),
+            Some(8),
+            "the document is cumulative since the last install, as 3.0.3 wrote it"
         );
 
-        // The owner's install retires it.
-        invalidate_budget_snapshot_retiring(dir, Some("hostB:2"));
+        record_count_eviction_pass(dir, "hostA:1", 0);
+        assert_eq!(
+            read()["ranges_reclaimed"].as_u64(),
+            Some(8),
+            "a pass that reclaimed nothing leaves it"
+        );
+
+        retire_compat_reclaim(dir, "hostA:1");
         assert!(
             !path.exists(),
-            "the owner's fold install must remove its document"
+            "a fold install supersedes the document, so it is removed"
         );
-        assert_eq!(peer_reclaims_ranges(dir, "hostC:3").await, 0);
+        record_count_eviction_pass(dir, "hostA:1", 2);
+        assert_eq!(
+            read()["ranges_reclaimed"].as_u64(),
+            Some(2),
+            "the count restarts after an install"
+        );
+    }
 
-        // A stopped instance's document: past the age bound it is no longer debited.
-        let aged = ReclaimDocument {
-            schema: RECLAIM_DOCUMENT_SCHEMA,
-            instance_id: "hostD:4".to_string(),
-            generation: 3,
-            ranges_reclaimed: 500,
-            recorded_at_unix_nanos: now_nanos()
-                .saturating_sub((RECLAIM_DOCUMENT_MAX_AGE_SECS + 1) * 1_000_000_000),
-        };
-        aged.install(dir).unwrap();
-        let live = ReclaimDocument {
-            instance_id: "hostE:5".to_string(),
-            recorded_at_unix_nanos: now_nanos(),
-            ranges_reclaimed: 40,
-            ..aged.clone()
-        };
-        live.install(dir).unwrap();
-        // A foreign schema and a temp name both read as nothing.
+    /// A read that overlaps a flush sees each removal once.
+    ///
+    /// The flush has taken the removal out of the unflushed map and has not written it to the
+    /// instance's document; a read in that window finds it in neither, and the figure it sizes
+    /// from keeps bytes that were already removed.
+    ///
+    /// A failure implicates the flush counters in [`flush_removal_debits`] or the retry in
+    /// [`read_removal_debits`].
+    #[tokio::test]
+    async fn a_read_during_a_flush_sees_each_removal_once() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let shard = Shard::new("bucket", "0d");
+        accumulate_removal(
+            &dir,
+            "host:1",
+            shard,
+            StagedRemoval {
+                bytes: 4_096,
+                ranges: 3,
+            },
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        FLUSH_HOOKS.lock().unwrap().insert(
+            dir_tag(&dir),
+            std::sync::Arc::new(move || {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }),
+        );
+        let flush_dir = dir.clone();
+        let flusher = std::thread::spawn(move || flush_removal_debits(&flush_dir, "host:1"));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the flush reached its hook");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+        });
+        let read = read_removal_debits(&dir).await;
+        releaser.join().unwrap();
+        flusher.join().unwrap();
+        FLUSH_HOOKS.lock().unwrap().remove(&dir_tag(&dir));
+        let ranges: u64 = read
+            .iter()
+            .filter(|e| e.bucket == "bucket" && e.l1 == "0d")
+            .map(|e| e.ranges)
+            .sum();
+        println!("T4j read during a flush: entries={read:?}");
+        assert_eq!(
+            ranges, 3,
+            "a read that overlapped a flush counted the removal {ranges} time(s) instead of once: {read:?}"
+        );
+    }
+
+    /// A flush that starts and finishes between the document read and the map read: the read saw
+    /// no document entry and finds the map empty, so only the completed-flush count tells it to
+    /// read again.
+    ///
+    /// A failure implicates the `FLUSHES_COMPLETED` clause in [`read_removal_debits`].
+    #[tokio::test]
+    async fn a_flush_between_the_two_reads_is_seen_once() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        accumulate_removal(
+            &dir,
+            "host:1",
+            Shard::new("bucket", "0e"),
+            StagedRemoval {
+                bytes: 4_096,
+                ranges: 5,
+            },
+        );
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_fired = std::sync::Arc::clone(&fired);
+        let flush_dir = dir.clone();
+        READ_BETWEEN_HOOKS.lock().unwrap().insert(
+            dir_tag(&dir),
+            std::sync::Arc::new(move || {
+                if !hook_fired.swap(true, Ordering::SeqCst) {
+                    flush_removal_debits(&flush_dir, "host:1");
+                }
+            }),
+        );
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read_removal_debits(&dir),
+        )
+        .await
+        .expect("the read must return");
+        READ_BETWEEN_HOOKS.lock().unwrap().remove(&dir_tag(&dir));
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "fixture precondition: the flush ran between the reads"
+        );
+        let ranges: u64 = read
+            .iter()
+            .filter(|e| e.bucket == "bucket" && e.l1 == "0e")
+            .map(|e| e.ranges)
+            .sum();
+        assert_eq!(
+            ranges, 5,
+            "a flush between the two reads left the removal counted {ranges} time(s): {read:?}"
+        );
+    }
+
+    /// The latency a stalled flush adds to every removal-debit read in the process: the read waits
+    /// for the cap and then returns, and does not wait for the flush.
+    #[tokio::test]
+    async fn a_read_during_a_stalled_flush_returns_at_its_time_cap() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        accumulate_removal(
+            &dir,
+            "host:1",
+            Shard::new("bucket", "0f"),
+            StagedRemoval {
+                bytes: 1_024,
+                ranges: 1,
+            },
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        FLUSH_HOOKS.lock().unwrap().insert(
+            dir_tag(&dir),
+            std::sync::Arc::new(move || {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30));
+            }),
+        );
+        let flush_dir = dir.clone();
+        let flusher = std::thread::spawn(move || flush_removal_debits(&flush_dir, "host:1"));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the flush reached its hook");
+        let started = std::time::Instant::now();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read_removal_debits(&dir),
+        )
+        .await
+        .expect("the read must return while the flush is stalled");
+        let waited = started.elapsed();
+        release_tx.send(()).unwrap();
+        flusher.join().unwrap();
+        FLUSH_HOOKS.lock().unwrap().remove(&dir_tag(&dir));
+        println!(
+            "stalled flush: the read waited {waited:?} against a cap of {READ_CONSISTENT_WAIT:?} \
+             and returned {} entries",
+            read.len()
+        );
+        assert!(
+            waited >= READ_CONSISTENT_WAIT,
+            "the read returned after {waited:?}, before the cap, while a flush was in flight"
+        );
+        assert!(
+            waited < READ_CONSISTENT_WAIT + std::time::Duration::from_secs(2),
+            "the read waited {waited:?}, well past its cap of {READ_CONSISTENT_WAIT:?}"
+        );
+    }
+
+    /// An install's retirement of the compat reclaim document cannot land between the count the
+    /// document carries and its write, which would leave a document the install superseded.
+    ///
+    /// A failure implicates the lock [`publish_compat_reclaim`] holds across its write.
+    #[test]
+    fn a_fold_install_cannot_retire_between_the_compat_count_and_its_write() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("metadata/_shard_state/eviction_reclaims/hostA:1.json");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        COMPAT_PUBLISH_HOOKS.lock().unwrap().insert(
+            dir_tag(&dir),
+            std::sync::Arc::new(move || {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }),
+        );
+        let publish_dir = dir.clone();
+        let publisher =
+            std::thread::spawn(move || publish_compat_reclaim(&publish_dir, "hostA:1", 5));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the publish reached its hook");
+        let retire_dir = dir.clone();
+        let retirer = std::thread::spawn(move || retire_compat_reclaim(&retire_dir, "hostA:1"));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+        retirer.join().unwrap();
+        COMPAT_PUBLISH_HOOKS.lock().unwrap().remove(&dir_tag(&dir));
+        println!("T4k compat survivor: exists={}", path.exists());
+        assert!(
+            !path.exists(),
+            "a reclaim document survived the install that superseded it: {path:?}"
+        );
+    }
+
+    /// A fold install removes the compat reclaim document even when this process did not write it
+    /// (a predecessor on the same name left it), as 3.0.3's install did.
+    ///
+    /// A failure implicates [`retire_compat_reclaim`].
+    #[test]
+    fn a_fold_install_removes_a_reclaim_document_this_process_did_not_write() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let path = dir.join("metadata/_shard_state/eviction_reclaims/hostA:1.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
-            ReclaimDocument::path(dir, "hostF:6"),
+            &path,
             format!(
-                "{{\"schema\":2,\"instance_id\":\"hostF:6\",\"generation\":0,\
+                "{{\"schema\":1,\"instance_id\":\"hostA:1\",\"generation\":2,\
                  \"ranges_reclaimed\":9,\"recorded_at_unix_nanos\":{}}}",
                 now_nanos()
             ),
         )
         .unwrap();
-        // Fresh timestamp and valid schema, so only the name keeps it out.
-        std::fs::write(
-            ReclaimDocument::dir(dir).join("hostG:7.json.tmp.host.7"),
+        retire_compat_reclaim(dir, "hostA:1");
+        assert!(
+            !path.exists(),
+            "an install left a reclaim document this process had no count for: {path:?}"
+        );
+    }
+
+    /// A 3.0.3 peer publishes no removal debits; its count reclaims reach this release only as its
+    /// reclaim document, so the count verdict subtracts the live ones. A document this release
+    /// wrote is skipped (its ranges are in the removal debits), and one past the age bound is
+    /// ignored.
+    ///
+    /// A failure implicates [`peer_303_reclaimed_ranges`] or its use in
+    /// [`count_eviction_verdict`].
+    #[tokio::test]
+    async fn a_303_peers_reclaim_document_is_debited_by_this_releases_count_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let shard = Shard::new("bucket", "0d");
+        let (trigger, _target) = count_eviction_thresholds(95, 80);
+        let from_303: u64 = 20_000;
+        let from_this_release: u64 = 5_000;
+        assert!(
+            STAGED_RANGE_BUDGET - from_303 > trigger,
+            "fixture: over the trigger"
+        );
+        seed_shard_figure(dir, &shard, 4_096, STAGED_RANGE_BUDGET, 5);
+        let reclaims = dir.join("metadata/_shard_state/eviction_reclaims");
+        std::fs::create_dir_all(&reclaims).unwrap();
+        let document = |instance: &str, ranges: u64, recorded_at: u64| {
             format!(
-                "{{\"schema\":1,\"instance_id\":\"hostG:7\",\"generation\":0,\
-                 \"ranges_reclaimed\":11,\"recorded_at_unix_nanos\":{}}}",
-                now_nanos()
-            ),
+                "{{\"schema\":1,\"instance_id\":\"{instance}\",\"generation\":4,\
+                 \"ranges_reclaimed\":{ranges},\"recorded_at_unix_nanos\":{recorded_at}}}"
+            )
+        };
+        std::fs::write(
+            reclaims.join("hostA:1.json"),
+            document("hostA:1", from_303, now_nanos()),
         )
         .unwrap();
+        let too_old = now_nanos()
+            .saturating_sub(RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(1_000_000_000))
+            .saturating_sub(60_000_000_000);
+        std::fs::write(
+            reclaims.join("hostC:3.json"),
+            document("hostC:3", 7_000, too_old),
+        )
+        .unwrap();
+        // The document this release writes, through its own writer.
+        record_count_eviction_pass(dir, "hostB:2", from_this_release);
+        assert!(
+            reclaims.join("hostB:2.json").exists(),
+            "fixture: this release's document"
+        );
+        let verdict = count_eviction_verdict(dir, 95, 80).await;
+        println!("T4l 3.0.3 peer reclaim: verdict={verdict:?}");
+        assert!(
+            matches!(verdict, CountEvictionVerdict::Needed { count, observed_count, .. }
+                if observed_count == STAGED_RANGE_BUDGET && count == STAGED_RANGE_BUDGET - from_303),
+            "the verdict did not debit exactly the live 3.0.3 document's {from_303} ranges: \
+             expected count {}, got {verdict:?}",
+            STAGED_RANGE_BUDGET - from_303
+        );
+    }
+
+    /// The removal debit document's lifecycle: published by its owner, applied by every reader
+    /// while its shard's checkpoint predates the removal and clamped to the shard's figure, made
+    /// inert by an install of the shard, dropped by the owner's next write after its own install,
+    /// and removed by a reader once it and every entry are past twice the age bound.
+    ///
+    /// A failure implicates [`write_removal_debits`], [`read_removal_debits`] or
+    /// [`PendingReadOutcome::applied_debit`], all in `staged_fold.rs`.
+    #[tokio::test]
+    async fn a_removal_debit_document_is_published_pruned_and_aged_out() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let applied = |debits: Vec<RemovalDebitEntry>| {
+            PendingReadOutcome {
+                removal_debits: debits,
+                ..Default::default()
+            }
+            .applied_debit(&read_shard_checkpoints(dir))
+        };
+        assert!(
+            read_removal_debits(dir).await.is_empty(),
+            "a volume with no staged_debits/ directory reads as nothing to debit"
+        );
+        let shard = Shard::new("bucket", "3c");
+        seed_shard_figure(dir, &shard, 10_000, 10, 5);
+
+        record_shard_debit_for_tests(dir, "hostB:2", "bucket", "3c", 4_000, 4, None);
+        let path = RemovalDebitDocument::path(dir, "hostB:2");
+        let doc = RemovalDebitDocument::parse(&std::fs::read_to_string(&path).unwrap())
+            .expect("the owner's document parses");
         assert_eq!(
-            peer_reclaims_ranges(dir, "hostC:3").await,
-            40,
-            "only the live document counts: the aged one, the foreign schema and the temp do not"
+            (doc.instance_id.as_str(), doc.entries.len()),
+            ("hostB:2", 1)
+        );
+        assert_eq!(
+            applied(read_removal_debits(dir).await),
+            AppliedDebit {
+                bytes: 4_000,
+                ranges: 4
+            },
+            "an entry newer than the shard's checkpoint applies"
+        );
+
+        // A second instance's debit larger than what is left: the shard is clamped at zero.
+        record_shard_debit_for_tests(dir, "hostC:3", "bucket", "3c", 50_000, 50, None);
+        assert_eq!(
+            applied(read_removal_debits(dir).await),
+            AppliedDebit {
+                bytes: 10_000,
+                ranges: 10
+            },
+            "debits are clamped to the shard's own figure"
+        );
+
+        // The owner's install of the shard, from a visit that began after both removals.
+        fold_installed_for_tests(dir, "hostB:2", "bucket", "3c", 6_000, 6);
+        assert_eq!(
+            applied(read_removal_debits(dir).await),
+            AppliedDebit::default(),
+            "every entry is inert once the shard's checkpoint began its visit after the removal"
+        );
+        flush_removal_debits(dir, "hostB:2");
+        assert!(
+            !path.exists(),
+            "the owner's next write drops the entries its own install made inert, and an empty \
+             document is removed"
+        );
+
+        // A stopped instance's document: kept while its mtime is recent, even with old entries;
+        // removed once both are past twice the age bound. Temps and foreign schemas read as nothing.
+        let old = now_nanos()
+            .saturating_sub(RECLAIM_DOCUMENT_MAX_AGE_SECS.saturating_mul(3) * 1_000_000_000);
+        let stale = RemovalDebitDocument {
+            schema: REMOVAL_DEBIT_SCHEMA,
+            instance_id: "hostD:4".to_string(),
+            entries: vec![RemovalDebitEntry {
+                bucket: "bucket".to_string(),
+                l1: "4d".to_string(),
+                removed_at_unix_nanos: old,
+                bytes: 1,
+                ranges: 1,
+            }],
+        };
+        stale.install(dir).unwrap();
+        let stale_path = RemovalDebitDocument::path(dir, "hostD:4");
+        std::fs::write(
+            RemovalDebitDocument::dir(dir).join("hostF:6.json"),
+            r#"{"schema":2,"instance_id":"hostF:6","entries":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            RemovalDebitDocument::dir(dir).join("hostG:7.json.tmp.host.7"),
+            serde_json::to_string(&stale).unwrap(),
+        )
+        .unwrap();
+        let read = read_removal_debits(dir).await;
+        assert!(
+            stale_path.exists() && read.iter().filter(|e| e.l1 == "4d").count() == 1,
+            "a recently written document is kept; a temp and a foreign schema are not read: {read:?}"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_path)
+            .unwrap()
+            .set_modified(
+                SystemTime::now()
+                    - std::time::Duration::from_secs(RECLAIM_DOCUMENT_MAX_AGE_SECS * 3),
+            )
+            .unwrap();
+        assert!(read_removal_debits(dir).await.iter().all(|e| e.l1 != "4d"));
+        assert!(
+            !stale_path.exists(),
+            "a reader removes a document whose mtime and every entry are past twice the age bound"
         );
     }
 
@@ -12324,16 +14947,14 @@ mod tests {
         seed_shard_figure(dir, &shard, 4_096, STAGED_RANGE_BUDGET, 5);
         invalidate_budget_snapshot(dir);
         assert!(
-            count_eviction_verdict(dir, "host:1", 95, 80)
-                .await
-                .is_needed(),
+            count_eviction_verdict(dir, 95, 80).await.is_needed(),
             "fixture: the trigger must fire first, or the latch has nothing to suppress"
         );
 
         // A pass that found nothing reclaimable.
-        record_count_eviction_pass(dir, "host:1", 0);
+        record_count_eviction_pass(dir, "hostA:1", 0);
         assert_eq!(
-            count_eviction_verdict(dir, "host:1", 95, 80).await,
+            count_eviction_verdict(dir, 95, 80).await,
             CountEvictionVerdict::NotNeeded,
             "a pass that reclaimed nothing has established the population is empty; re-firing \
              would take the FLEET eviction lock every consolidation cycle for no yield"
@@ -12342,9 +14963,7 @@ mod tests {
         // A fold install lifts it, because the inputs have changed.
         invalidate_budget_snapshot(dir);
         assert!(
-            count_eviction_verdict(dir, "host:1", 95, 80)
-                .await
-                .is_needed(),
+            count_eviction_verdict(dir, 95, 80).await.is_needed(),
             "and the latch must LIFT on a fold install — a latch that never lifts silently \
              disables the count trigger for the process's lifetime, which is the wedge again"
         );
@@ -12353,11 +14972,9 @@ mod tests {
         // full request so the count is still over the trigger, isolating the latch from the
         // debit — otherwise a passing assertion here could be the debit, not the absent latch.
         let partial = 1u64;
-        record_count_eviction_pass(dir, "host:1", partial);
+        record_count_eviction_pass(dir, "hostA:1", partial);
         assert!(
-            count_eviction_verdict(dir, "host:1", 95, 80)
-                .await
-                .is_needed(),
+            count_eviction_verdict(dir, 95, 80).await.is_needed(),
             "partial progress means the population was NOT empty, so the next cycle has real \
              work to do and must not be suppressed"
         );
@@ -12820,7 +15437,7 @@ mod tests {
         let meta =
             crate::disk_cache::get_sharded_path(&dir.join("metadata"), target, ".meta").unwrap();
         std::fs::remove_file(&meta).unwrap();
-        mark_shard_dirty(dir, "host-b:2", target);
+        mark_shard_dirty(dir, "host-b:2", target, StagedRemoval::default());
 
         let b_pass = run_staged_fold_sampled(dir, &ledger_b, "host-b:2", None).await;
         let summary = b_pass.summary();
@@ -12985,7 +15602,7 @@ mod tests {
         let meta =
             crate::disk_cache::get_sharded_path(&dir.join("metadata"), target, ".meta").unwrap();
         std::fs::remove_file(&meta).unwrap();
-        mark_shard_dirty(dir, "host:1", target);
+        mark_shard_dirty(dir, "host:1", target, StagedRemoval::default());
         assert_eq!(dirty_shard_count(dir), 1);
         let before = staged_authority_figure_uncached(dir)
             .await
@@ -13765,10 +16382,182 @@ mod authority_unknown_tests {
             later >= 60,
             "a derivation in flight for 61 s must read as unknown (read {later})"
         );
+        assert!(
+            authority_unknown_seconds(&dir, now + 61) >= 60,
+            "a derivation whose caller stopped waiting runs on its own task, so it stays in \
+             flight and keeps reading as unknown"
+        );
+    }
+}
+
+/// One authority derivation per process: deciders share it, its memo survives a long derivation,
+/// its checkpoint read runs in parallel off the calling thread, and the post-lock sizing read never
+/// joins a derivation begun before it.
+#[cfg(test)]
+mod one_derivation_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Concurrent deciders on an expired memo cause one derivation, not one each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_deciders_on_an_expired_memo_share_one_derivation() {
+        const DECIDERS: usize = 8;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        seed_shard_figure_for_tests(&dir, "bucket", "ab", 4096, 1);
+        // Every load takes 300 ms, so every decider checks the memo before any derivation can
+        // install one.
+        let _probe = register_checkpoint_load_probe_for_tests(&dir, Duration::from_millis(300));
+        let before = shard_checkpoint_reads_for_tests(&dir);
+        let barrier = Arc::new(tokio::sync::Barrier::new(DECIDERS));
+        let tasks: Vec<_> = (0..DECIDERS)
+            .map(|_| {
+                let d = dir.clone();
+                let b = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    b.wait().await;
+                    staged_authority_figure(&d).await
+                })
+            })
+            .collect();
+        let results = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut out = Vec::new();
+            for t in tasks {
+                out.push(t.await.unwrap());
+            }
+            out
+        })
+        .await
+        .expect("the deciders did not finish within 60 s");
+        let reads = shard_checkpoint_reads_for_tests(&dir) - before;
+        println!("ONE-DERIVATION concurrent: deciders={DECIDERS} checkpoint_reads={reads}");
+        for r in &results {
+            assert_eq!(
+                r.map(|f| f.resident_staged_bytes),
+                Some(4096),
+                "every decider must receive the derived figure"
+            );
+        }
         assert_eq!(
-            authority_unknown_seconds(&dir, now + 61),
-            0,
-            "a dropped derivation leaves nothing in flight and recorded no attempt"
+            reads, 1,
+            "{DECIDERS} concurrent deciders on an expired memo read the checkpoint set {reads} \
+             times: each derived for itself instead of joining the one in flight"
+        );
+    }
+
+    /// A derivation that outlasts the TTL leaves a memo the next decider uses, and the memo's
+    /// published age is the age of its inputs.
+    #[tokio::test]
+    async fn a_derivation_longer_than_the_ttl_leaves_a_memo_a_decider_can_use() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        seed_shard_figure_for_tests(&dir, "bucket", "ab", 4096, 1);
+        backdate_next_derivation_for_tests(&dir, AUTHORITY_SNAPSHOT_TTL_SECS + 1);
+        let first = staged_authority_figure(&dir).await.expect("readable");
+        assert_eq!(first.resident_staged_bytes, 4096);
+        let before = shard_checkpoint_reads_for_tests(&dir);
+        let second = staged_authority_figure(&dir).await.expect("readable");
+        let reads = shard_checkpoint_reads_for_tests(&dir) - before;
+        let age = authority_snapshot_age_secs(&dir);
+        println!(
+            "ONE-DERIVATION long derivation: second_read_checkpoint_reads={reads} age={age:?}"
+        );
+        assert_eq!(second.resident_staged_bytes, 4096);
+        assert_eq!(
+            reads, 0,
+            "a derivation that took longer than the {AUTHORITY_SNAPSHOT_TTL_SECS} s TTL installed \
+             a memo that was already expired, so the next decider derived again"
+        );
+        assert!(
+            age.is_some_and(|a| a > AUTHORITY_SNAPSHOT_TTL_SECS),
+            "the published memo age must be the age of the inputs, older than the TTL here \
+             (read {age:?})"
+        );
+    }
+
+    /// The checkpoint read runs with more than one and at most 64 loads in flight, none of them on
+    /// the calling thread.
+    #[tokio::test]
+    async fn the_checkpoint_read_runs_in_parallel_off_the_calling_thread() {
+        const SHARDS: u64 = 96;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for i in 0..SHARDS {
+            seed_shard_figure_for_tests(&dir, "bucket", &format!("{i:02x}"), 1000, 1);
+        }
+        let probe = register_checkpoint_load_probe_for_tests(&dir, Duration::from_millis(25));
+        let caller = std::thread::current().id();
+        let figure =
+            tokio::time::timeout(Duration::from_secs(60), staged_authority_figure_fresh(&dir))
+                .await
+                .expect("the derivation did not finish within 60 s")
+                .expect("readable");
+        let (peak, loads, on_caller) = (probe.peak(), probe.loads(), probe.ran_on(caller));
+        println!(
+            "ONE-DERIVATION parallel read: loads={loads} peak_in_flight={peak} \
+             any_on_calling_thread={on_caller}"
+        );
+        assert_eq!(figure.resident_staged_bytes, SHARDS * 1000);
+        assert_eq!(
+            loads as u64, SHARDS,
+            "fixture: every shard document was loaded once"
+        );
+        assert!(
+            !on_caller,
+            "a checkpoint load ran on the calling (runtime) thread: the read blocks a tokio worker"
+        );
+        assert!(
+            peak > 1 && peak <= 64,
+            "the checkpoint read had {peak} loads in flight at most; it must run more than one \
+             and at most the bound of 64 at once"
+        );
+    }
+
+    /// The post-lock sizing read derives for itself while a joinable derivation, begun before it,
+    /// is still in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_post_lock_read_derives_fresh_while_a_joinable_derivation_is_in_flight() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        seed_shard_figure_for_tests(&dir, "bucket", "ab", 4096, 1);
+        staged_authority_figure(&dir)
+            .await
+            .expect("fixture: primed");
+        assert!(age_authority_snapshot_for_tests(&dir, 3600));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        set_authority_between_reads_hook_for_tests(
+            &dir,
+            Box::new(move || {
+                Box::pin(async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                })
+            }),
+        );
+        let earlier = {
+            let d = dir.clone();
+            tokio::spawn(async move { staged_authority_figure(&d).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("fixture: the earlier derivation never reached its hook")
+            .unwrap();
+        seed_shard_figure_for_tests(&dir, "bucket", "ab", 8192, 1);
+        let fresh =
+            tokio::time::timeout(Duration::from_secs(5), staged_authority_figure_fresh(&dir)).await;
+        let _ = release_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(10), earlier).await;
+        let fresh = fresh.expect(
+            "the post-lock sizing read waited on a derivation that began before it instead of \
+             deriving for itself",
+        );
+        assert_eq!(
+            fresh.map(|f| f.resident_staged_bytes),
+            Some(8192),
+            "the post-lock read must see the checkpoint as it is after the earlier derivation began"
         );
     }
 }

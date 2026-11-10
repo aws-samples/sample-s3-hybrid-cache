@@ -68,6 +68,7 @@ mod sanitization_consistency_test;
 mod signed_range_integrity_test;
 mod slice_read_cost_test;
 mod staged_range_predicate_test;
+mod staged_removal_debit_test;
 mod staging_eviction_inflight_bytes_test;
 mod staging_pass_pending_lock_timeout_test;
 mod streamed_damage_never_completes_test;

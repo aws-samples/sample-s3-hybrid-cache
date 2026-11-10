@@ -250,9 +250,10 @@ async fn delete_before_the_first_fold_drops_the_pending_credit_within_one_rotati
         .unwrap();
     assert_eq!(
         staged_fold_bytes(dir).await,
-        before,
-        "before any fold, the post-cut pending credit is still counted — this is the \
-         bounded over-statement, recorded so the next line is a real transition"
+        before - staged,
+        "before any fold, the deleting process's own removal is already debited from its figure: \
+         the post-cut pending credit is still counted, and the removal debit it reads takes the \
+         object's bytes off"
     );
     fold_rotation(&m).await;
     let after = staged_fold_bytes(dir).await;

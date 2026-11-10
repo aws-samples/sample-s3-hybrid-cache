@@ -454,7 +454,7 @@ cache:
 ### How write caching works
 
 - **PUT**: the body is stored as one range covering the whole object, valid for `put_ttl`. The client receives S3's response unchanged.
-- **Multipart upload**: CreateMultipartUpload records the upload, each UploadPart is stored as a range file, CompleteMultipartUpload gives the parts their final byte offsets and writes the object's metadata, and AbortMultipartUpload deletes the cached parts.
+- **Multipart upload**: CreateMultipartUpload records the upload, and each UploadPart is stored as a range file. CompleteMultipartUpload gives the parts their final byte offsets and writes the object's metadata, valid for `put_ttl` as for a PUT. AbortMultipartUpload deletes the cached parts.
 
 The `CompleteMultipartUpload` body is bounded by `max_complete_body_bytes`; see
 [CompleteMultipartUpload body limit](#completemultipartupload-body-limit).

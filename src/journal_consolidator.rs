@@ -1501,8 +1501,10 @@ impl SizeAccumulator {
 
     /// Reset both accumulators to zero. Called after validation scan corrects drift.
     pub(crate) fn reset(&self) {
-        // The census re-grounded the figure from the volume, so every credited byte is in it
-        // and the unflushed delta this clears will never reach a delta file.
+        // A validation install re-grounded the figure, and the unflushed delta this clears will
+        // never reach a delta file. A full scan counted every credited byte; a rolling install
+        // extrapolated the slots it did not visit, so bytes credited since the cycle's snapshot
+        // are in the figure only as far as that extrapolation is right.
         if let Some(cache_dir) = self.size_tracking_dir.parent() {
             crate::cache::note_accounting_reground(cache_dir);
         }
@@ -5951,6 +5953,23 @@ impl JournalConsolidator {
                 }
                 state.last_updated_by = get_instance_id();
 
+                // At staged-authority epoch 1 the staged figure is the fold's, and this scan's census
+                // is compared with the event-maintained counter, which graduation does not debit.
+                // That difference is the graduated bytes, so it is not published as drift.
+                let at_fold_epoch = sample_kind
+                    == crate::cache_size_tracker::ValidationSampleKind::FullScan
+                    && write_cache_size.is_some()
+                    && crate::staged_authority::fold_authority_active(&file.cache_dir);
+                let write_cache_drift_text = if at_fold_epoch {
+                    "not_evaluable (staged authority epoch 1: the census was compared with the \
+                     event-maintained write_cache_size, not with the fold figure)"
+                        .to_string()
+                } else {
+                    format!(
+                        "{} (census compared with the event-maintained write_cache_size)",
+                        state.write_cache_size as i64 - old_write_cache_size as i64
+                    )
+                };
                 // Requirement 6.5: log the write-cache drift corrected alongside the total, so
                 // recurring drift in either figure is visible without diffing state files.
                 info!(
@@ -5962,7 +5981,7 @@ impl JournalConsolidator {
                     scanned_size as i64 - old_size as i64,
                     old_write_cache_size,
                     state.write_cache_size,
-                    state.write_cache_size as i64 - old_write_cache_size as i64,
+                    write_cache_drift_text,
                     state.cached_objects
                 );
 
@@ -5987,13 +6006,18 @@ impl JournalConsolidator {
                 // re-grounding over a bookkeeping write would be worse.
                 // Spec: cache-eviction-at-scale. Requirements: 12.6, 12.7, 12.8.
                 // =====================================================================
-                let drift_sample = crate::cache_size_tracker::AccountingDriftSample::new(
+                let mut drift_sample = crate::cache_size_tracker::AccountingDriftSample::new(
                     get_instance_id(),
                     sample_kind,
                     state_readable,
                     (old_size, old_write_cache_size, old_cached_objects),
                     (scanned_size, write_cache_size, cached_objects),
                 );
+                if at_fold_epoch {
+                    drift_sample.mark_write_cache_not_evaluable(
+                        crate::cache_size_tracker::DRIFT_REASON_WRITE_CACHE_AT_FOLD_EPOCH,
+                    );
+                }
                 if let Err(e) = drift_sample.install(&file.cache_dir) {
                     debug!("Could not publish the accounting drift sample: {}", e);
                 }
@@ -6235,6 +6259,22 @@ impl JournalConsolidator {
                     }
                     state.last_updated_by = get_instance_id();
 
+                    // At staged-authority epoch 1 the staged figure is the fold's, and this scan's census
+                    // is compared with the event-maintained counter, which graduation does not debit.
+                    // That difference is the graduated bytes, so it is not published as drift.
+                    let at_fold_epoch = sample_kind
+                        == crate::cache_size_tracker::ValidationSampleKind::FullScan
+                        && crate::staged_authority::fold_authority_active(&file.cache_dir);
+                    let write_cache_drift_text = if at_fold_epoch {
+                        "not_evaluable (staged authority epoch 1: the census was compared with \
+                         the event-maintained write_cache_size, not with the fold figure)"
+                            .to_string()
+                    } else {
+                        format!(
+                            "{} (census compared with the event-maintained write_cache_size)",
+                            census_write_cache_size as i64 - baseline.write_cache_size as i64
+                        )
+                    };
                     info!(
                         "Updated size state from validation: baseline_size={}, census_size={}, \
                          drift={}, old_size={}, new_size={}, baseline_write_cache_size={}, \
@@ -6246,13 +6286,13 @@ impl JournalConsolidator {
                         state.total_size,
                         baseline.write_cache_size,
                         census_write_cache_size,
-                        census_write_cache_size as i64 - baseline.write_cache_size as i64,
+                        write_cache_drift_text,
                         state.cached_objects
                     );
 
                     // R12.6-R12.8: the same sample the absolute install publishes, with the
                     // baseline as the persisted term. See `update_size_from_validation_with_kind`.
-                    let drift_sample = crate::cache_size_tracker::AccountingDriftSample::new(
+                    let mut drift_sample = crate::cache_size_tracker::AccountingDriftSample::new(
                         get_instance_id(),
                         sample_kind,
                         true,
@@ -6267,6 +6307,11 @@ impl JournalConsolidator {
                             Some(census_objects),
                         ),
                     );
+                    if at_fold_epoch {
+                        drift_sample.mark_write_cache_not_evaluable(
+                            crate::cache_size_tracker::DRIFT_REASON_WRITE_CACHE_AT_FOLD_EPOCH,
+                        );
+                    }
                     if let Err(e) = drift_sample.install(&file.cache_dir) {
                         debug!("Could not publish the accounting drift sample: {}", e);
                     }
@@ -8536,6 +8581,13 @@ impl JournalConsolidator {
     /// 10. Return ConsolidationCycleResult
     pub async fn run_consolidation_cycle(&self) -> Result<ConsolidationCycleResult> {
         let cycle_start = std::time::Instant::now();
+        // This instance's removals since the last cycle (graduations, DELETEs, overwrites, heals,
+        // expiries) become its removal debits on the shared volume, before the idle check, so an
+        // idle cycle still publishes them. One small rewrite, and none when nothing was removed.
+        crate::staged_fold::flush_removal_debits(
+            &self.cache_dir,
+            self.write_ledger().instance_id(),
+        );
 
         // Idle detection: skip the entire cycle if there's no pending work.
         // This avoids acquiring the global consolidation lock, scanning the journal
@@ -13815,6 +13867,93 @@ mod tests {
             );
         }
 
+        /// GitHub issue 29. At staged-authority epoch 1 a full scan's census is compared with the
+        /// event-maintained `write_cache_size`, which graduation does not debit, so the difference
+        /// is the graduated bytes. The sample publishes the write-cache figure as not evaluable and
+        /// names the epoch; the total's drift is unchanged.
+        #[tokio::test]
+        async fn at_staged_authority_epoch_1_the_write_cache_drift_is_not_evaluable() {
+            let temp = TempDir::new().unwrap();
+            let dir = temp.path();
+            let consolidator = consolidator(dir);
+            crate::staged_fold::seed_shard_figure_for_tests(dir, "test-bucket", "3f", 4_444_444, 9);
+            assert!(
+                crate::staged_authority::activate(dir, "host:test").unwrap(),
+                "fixture: activation flips the epoch"
+            );
+            consolidator
+                .seed_size_state_for_tests(&SizeState {
+                    total_size: 20_000_000,
+                    write_cache_size: 8_000_000,
+                    cached_objects: 10,
+                    last_updated_by: "test".to_string(),
+                    last_consolidation: SystemTime::now(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            consolidator
+                .update_size_from_validation_with_kind(
+                    20_000_000,
+                    Some(5_000_000),
+                    Some(10),
+                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
+                .await;
+            let sample = crate::cache_size_tracker::AccountingDriftSample::load(dir)
+                .expect("the scan published a drift sample");
+            println!(
+                "ISSUE-29 epoch 1: write_cache drift={:?} reason={:?} total drift={:?}",
+                sample.write_cache_size.drift,
+                sample.write_cache_size.unevaluable_reason,
+                sample.total_size.drift
+            );
+            assert_eq!(
+                sample.write_cache_size.drift, None,
+                "an epoch-1 scan published the graduated bytes as write-cache drift"
+            );
+            assert_eq!(
+                sample.write_cache_size.unevaluable_reason.as_deref(),
+                Some("staged_authority_epoch_1")
+            );
+            assert_eq!(
+                sample.total_size.drift,
+                Some(0),
+                "the total's drift is unchanged"
+            );
+        }
+
+        /// The same scan before activation: the write-cache drift is the number it always was.
+        #[tokio::test]
+        async fn at_epoch_0_the_write_cache_drift_is_published_as_before() {
+            let temp = TempDir::new().unwrap();
+            let dir = temp.path();
+            let consolidator = consolidator(dir);
+            consolidator
+                .seed_size_state_for_tests(&SizeState {
+                    total_size: 20_000_000,
+                    write_cache_size: 8_000_000,
+                    cached_objects: 10,
+                    last_updated_by: "test".to_string(),
+                    last_consolidation: SystemTime::now(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            consolidator
+                .update_size_from_validation_with_kind(
+                    20_000_000,
+                    Some(5_000_000),
+                    Some(10),
+                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
+                )
+                .await;
+            let sample = crate::cache_size_tracker::AccountingDriftSample::load(dir)
+                .expect("the scan published a drift sample");
+            assert_eq!(sample.write_cache_size.drift, Some(-3_000_000));
+            assert_eq!(sample.write_cache_size.unevaluable_reason, None);
+        }
+
         /// `None` must leave the existing figure alone rather than zeroing it, so a
         /// caller that cannot compute a whole-cache staged figure does not install a
         /// partial sum as one. This is the behaviour the rolling scan relies on, and it
@@ -17248,9 +17387,10 @@ mod tests {
         );
     }
 
-    /// A retain CAN persist: an unparseable shard checkpoint is rewritten by neither the staged
-    /// fold (which retains before visiting) nor the `st_size` fold (whose install returns the
-    /// load error). With the attempt gate it costs one pass per interval, not one per cycle.
+    /// A retain CAN persist: a shard checkpoint a newer release wrote is rewritten by neither the
+    /// staged fold (which retains before visiting, and quarantines only a damaged document) nor
+    /// the `st_size` fold (whose install returns the load error). With the attempt gate it costs
+    /// one pass per interval, not one per cycle.
     ///
     /// # RED SIDE
     ///
@@ -17270,7 +17410,8 @@ mod tests {
             .join("bucket")
             .join("aa.json");
         std::fs::create_dir_all(doc.parent().unwrap()).unwrap();
-        std::fs::write(&doc, b"{ not json").unwrap();
+        const NEWER: &[u8] = b"{\"schema\":99,\"bucket\":\"bucket\",\"l1\":\"aa\"}";
+        std::fs::write(&doc, NEWER).unwrap();
         // A range in the shard, so the st_size fold has something to install into it.
         let ranges = dir.join("ranges").join("bucket").join("aa").join("111");
         std::fs::create_dir_all(&ranges).unwrap();
@@ -17280,18 +17421,18 @@ mod tests {
         assert_eq!(
             first.as_ref().and_then(|o| o.retain_reason()),
             Some(crate::staged_fold::FoldRetainReason::PreviousCheckpointUnreadable),
-            "FIXTURE: an unparseable checkpoint must retain: {first:?}"
+            "FIXTURE: a newer release's checkpoint must retain: {first:?}"
         );
 
         // Persistence: an st_size pass over the shard does not repair the document either.
         let st = crate::st_size_fold::run_st_size_fold(dir, "host:st", Duration::ZERO).await;
         assert!(
             st.installed.is_empty(),
-            "FIXTURE: the st_size fold must not install over an unparseable document: {st:?}"
+            "FIXTURE: the st_size fold must not install over a newer release's document: {st:?}"
         );
         assert_eq!(
             std::fs::read(&doc).unwrap(),
-            b"{ not json",
+            NEWER,
             "PERSISTENCE: nothing may have rewritten the document"
         );
 

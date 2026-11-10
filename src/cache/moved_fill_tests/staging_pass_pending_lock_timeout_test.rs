@@ -135,7 +135,7 @@ pub(super) fn staged_on_disk(cache_dir: &Path, keys: &[String]) -> Vec<String> {
 }
 
 /// `objects` unread uploads through `m`, folded, with the counter at [`COUNTER_BYTES`].
-async fn stage(m: &CacheManager, objects: usize) -> Vec<String> {
+pub(super) async fn stage(m: &CacheManager, objects: usize) -> Vec<String> {
     let dir = m.get_cache_dir().to_path_buf();
     activate_epoch_1(&dir);
     let mut keys = Vec::new();
@@ -264,6 +264,11 @@ async fn a_pending_lock_timeout_over_the_trigger_does_not_size_from_the_counter(
         survivors.len(),
         keys.len()
     );
+    assert_eq!(
+        freed, 0,
+        "a pass during a pending-lock timeout has no figure it may size from, so it frees nothing \
+         by size (staged={staged}, freed={freed}, trigger={trigger})"
+    );
     assert!(
         left + OBJECT_SIZE as u64 > target,
         "a staging pass during a pending-lock timeout freed past its target by more than one \
@@ -355,6 +360,14 @@ async fn a_peer_eviction_is_not_repeated(held: bool) {
          freed_by_a={freed_by_a}, trigger={trigger}, target={target})"
     );
 
+    if !held {
+        // The case this arm exists for: B's memo, taken before A evicted, is one a deciding
+        // reader would still accept. Without this the arm could pass on an expired memo.
+        assert!(
+            s3_proxy::staged_fold::authority_snapshot_age_secs(&link).is_some(),
+            "fixture: B's memo must be inside its TTL before B's pass"
+        );
+    }
     let lock = held.then(|| PeerPendingLock::hold(&dir));
     let freed_by_b = b.evict_staging_tier().await;
     drop(lock);
@@ -614,5 +627,111 @@ async fn past_sixty_seconds_the_pre_lock_read_never_takes_the_lock_on_the_counte
          survivors={}/{})",
         survivors.len(),
         keys.len()
+    );
+}
+
+/// A pass whose locked sizing derivation outlasts half of `eviction_lock_timeout` still evicts: a
+/// live holder's lock cannot be taken over, so nothing in the pass may stop on lock age.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_derivation_past_half_the_lock_timeout_still_evicts() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let shared = SharedStorageConfig {
+        eviction_lock_timeout: Duration::from_secs(2),
+        ..SharedStorageConfig::default()
+    };
+    let m = manager_with_shared(dir, shared).await;
+    let keys = stage(&m, 7).await;
+    let (trigger, target) = m.get_staging_eviction_thresholds();
+    // Both memos fresh, so the pre-lock reads are memo hits and the first derivation of the pass
+    // is the locked sizing read, which the hook stalls.
+    s3_proxy::staged_fold::invalidate_authority_snapshot_for_tests(dir);
+    s3_proxy::staged_fold::invalidate_budget_snapshot_for_tests(dir);
+    let staged = m
+        .get_staging_resident_bytes()
+        .await
+        .expect("fixture: a staged figure");
+    let _ = s3_proxy::staged_fold::count_eviction_verdict(dir, 95, 80).await;
+    assert!(
+        staged > trigger,
+        "fixture: over the trigger (staged={staged}, trigger={trigger})"
+    );
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&stalled);
+    s3_proxy::staged_fold::set_authority_between_reads_hook_for_tests(
+        dir,
+        Box::new(move || {
+            Box::pin(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            })
+        }),
+    );
+    let freed = tokio::time::timeout(Duration::from_secs(60), m.evict_staging_tier())
+        .await
+        .expect("the pass did not finish within 60 s");
+    let survivors = staged_on_disk(dir, &keys);
+    println!(
+        "SLOW-LOCKED-DERIVATION: staged={staged} trigger={trigger} target={target} \
+         freed={freed} stalled={} survivors={}/{}",
+        stalled.load(std::sync::atomic::Ordering::SeqCst),
+        survivors.len(),
+        keys.len()
+    );
+    assert!(
+        stalled.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture: the pass's derivation must have run the 1.5 s stall"
+    );
+    assert!(
+        freed > 0,
+        "a pass whose locked derivation took 1.5 s against a 2 s eviction_lock_timeout freed \
+         nothing (staged={staged}, trigger={trigger}): a lock-age stop ended it"
+    );
+}
+
+/// A stale under-trigger figure decides only while derivations fail: the first successful
+/// derivation after the memo expires replaces it, and that pass evicts to the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_under_trigger_figure_does_not_outlive_the_first_successful_derivation() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let (m, mut keys) = fixture(dir, 3).await;
+    let (trigger, target) = m.get_staging_eviction_thresholds();
+    assert_eq!(
+        m.evict_staging_tier().await,
+        0,
+        "fixture: under the trigger the first pass evicts nothing"
+    );
+
+    let lock = PeerPendingLock::hold(dir);
+    for i in 3..7 {
+        let key = format!("test-bucket/lock-timeout/object-{i}.bin");
+        put(&m, &key, &body(OBJECT_SIZE, 70 + i as u64)).await;
+        keys.push(key);
+    }
+    age_authority_snapshot_for_tests(dir, AUTHORITY_SNAPSHOT_TTL_SECS);
+    let freed_held = m.evict_staging_tier().await;
+    drop(lock);
+
+    age_authority_snapshot_for_tests(dir, AUTHORITY_SNAPSHOT_TTL_SECS);
+    let freed_after = m.evict_staging_tier().await;
+    let staged_now = (keys.len() * OBJECT_SIZE) as u64;
+    let left = staged_now.saturating_sub(freed_after);
+    let survivors = staged_on_disk(dir, &keys);
+    println!(
+        "STALE-UNDER-TRIGGER: trigger={trigger} target={target} freed_held={freed_held} \
+         freed_after={freed_after} left={left} survivors={}/{}",
+        survivors.len(),
+        keys.len()
+    );
+    assert_eq!(
+        freed_held, 0,
+        "with the pending lock held the stale under-trigger figure decides and frees nothing"
+    );
+    assert!(
+        freed_after > 0 && left <= trigger && left + OBJECT_SIZE as u64 > target,
+        "once the lock is free the first successful derivation must replace the stale figure and \
+         the pass evict to the target (freed_after={freed_after}, left={left}, \
+         trigger={trigger}, target={target})"
     );
 }

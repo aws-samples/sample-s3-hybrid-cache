@@ -2683,10 +2683,18 @@ async fn heal_damaged_range_once(
             }
         }
         if deletion.staged_stripped {
+            let removed = deletion.unlinked_ranges.iter().filter(|u| u.staged).fold(
+                crate::staged_fold::StagedRemoval::default(),
+                |acc, u| crate::staged_fold::StagedRemoval {
+                    bytes: acc.bytes.saturating_add(u.compressed_size),
+                    ranges: acc.ranges + 1,
+                },
+            );
             crate::staged_fold::mark_shard_dirty(
                 cache_dir,
                 consolidator.write_ledger().instance_id(),
                 &cache_key,
+                removed,
             );
         }
         consolidator

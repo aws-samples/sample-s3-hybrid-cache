@@ -144,6 +144,7 @@ struct Instruments {
     staged_fold_incomplete_total: Gauge<u64>,
     staged_fold_shard_budget_capped_total: Gauge<u64>,
     staged_fold_dirty_shards: Gauge<u64>,
+    staged_removal_debit_bytes: Gauge<u64>,
     staged_fold_shard_duration_count: Gauge<u64>,
     staged_fold_shard_duration_sum_ms: Gauge<u64>,
     staged_fold_shard_duration_bucket: Gauge<u64>,
@@ -153,6 +154,7 @@ struct Instruments {
     pending_lock_waits_total: Gauge<u64>,
     pending_lock_wait_ms_total: Gauge<u64>,
     pending_lock_timeouts_total: Gauge<u64>,
+    pending_lines_quarantined_total: Gauge<u64>,
     staging_figure_unknown_seconds: Gauge<u64>,
     staging_figure_unknown_passes_total: Gauge<u64>,
     staged_authority_snapshot_hits_total: Gauge<u64>,
@@ -806,6 +808,7 @@ impl OtlpExporter {
                 "write_cache.staged_fold_shard_budget_capped_total"
             ),
             staged_fold_dirty_shards: g_u64!("write_cache.staged_fold_dirty_shards"),
+            staged_removal_debit_bytes: g_u64!("write_cache.staged_removal_debit_bytes"),
             staged_fold_shard_duration_count: g_u64!(
                 "write_cache.staged_fold_shard_duration_count"
             ),
@@ -823,6 +826,7 @@ impl OtlpExporter {
             pending_lock_waits_total: g_u64!("write_cache.pending_lock_waits_total"),
             pending_lock_wait_ms_total: g_u64!("write_cache.pending_lock_wait_ms_total"),
             pending_lock_timeouts_total: g_u64!("write_cache.pending_lock_timeouts_total"),
+            pending_lines_quarantined_total: g_u64!("write_cache.pending_lines_quarantined_total"),
             staging_figure_unknown_seconds: g_u64!("write_cache.staging_figure_unknown_seconds"),
             staging_figure_unknown_passes_total: g_u64!(
                 "write_cache.staging_figure_unknown_passes_total"
@@ -1455,6 +1459,10 @@ impl OtlpExporter {
             // not yet re-folded. Never unreadable, so always recorded. § 16.6.9.
             i.staged_fold_dirty_shards
                 .record(wc.staged_fold.staged_fold_dirty_shards, a);
+            // Unreadable reads as absent, never as zero, like the byte figure it is taken off.
+            if let Some(v) = wc.staged_fold.staged_removal_debit_bytes {
+                i.staged_removal_debit_bytes.record(v, a);
+            }
             // The histogram, as `_count`, `_sum` and one series per class carrying its upper edge
             // in an `le` attribute. Fixed classes rather than a quantile, so the export is
             // comparable across instances and releases; `+Inf` is the class with no edge.
@@ -1481,6 +1489,8 @@ impl OtlpExporter {
                 .record(wc.pending_lock_wait_ms_total, a);
             i.pending_lock_timeouts_total
                 .record(wc.pending_lock_timeouts_total, a);
+            i.pending_lines_quarantined_total
+                .record(wc.pending_lines_quarantined_total, a);
             i.staging_figure_unknown_seconds
                 .record(wc.staging_figure_unknown_seconds, a);
             i.staging_figure_unknown_passes_total
@@ -3276,6 +3286,7 @@ mod tests {
         write_cache.staged_fold.staged_range_budget = 100;
         write_cache.staged_fold.staged_shard_authority_age_secs = Some(4);
         write_cache.staged_fold.staged_fold_dirty_shards = 2;
+        write_cache.staged_fold.staged_removal_debit_bytes = Some(5);
         write_cache.staged_fold.staged_fold_shard_duration_secs = ShardDurationHistogram {
             classes: vec![
                 ShardDurationClass {
