@@ -3519,6 +3519,15 @@ impl SignedPutHandler {
             return Ok(());
         }
 
+        // The key's resolved `put_ttl` (the matching `cache_rules.json` rule, else the global
+        // value), as the single-part PUT paths use. Resolved before any lock is taken, since
+        // it may read bucket settings. Without a cache manager there are no settings to
+        // resolve, so the previous one-day default stands.
+        let write_ttl = match &self.cache_manager {
+            Some(cache_mgr) => cache_mgr.get_effective_put_ttl(cache_key).await,
+            None => std::time::Duration::from_secs(86400),
+        };
+
         // Wait for the parts this Complete names to appear in the tracker before
         // evaluating it (the lifecycle race).
         //
@@ -4216,7 +4225,6 @@ impl SignedPutHandler {
         // This ensures the object size matches what S3 returns (only requested parts)
         let total_size: u64 = sorted_parts.iter().map(|p| p.size).sum();
         let now = std::time::SystemTime::now();
-        let write_ttl = std::time::Duration::from_secs(86400); // 1 day default
 
         // Build part_ranges from byte_offsets (Requirements 7.1, 7.2)
         // Maps part number to (start_offset, end_offset) byte range
@@ -11881,6 +11889,100 @@ mod tests {
             "the superseded snapshot re-seeded during the publish survived it: etag={:?}",
             resident.map(|m| m.object_metadata.etag)
         );
+    }
+
+    /// A completed multipart upload is write-cached for the key's resolved `put_ttl`, as a
+    /// single-part PUT is, in both `write_cache_expires_at` and the entry's `expires_at`: the
+    /// global value (one hour here), and a `cache_rules.json` rule's where one matches.
+    /// Mutation that must break this: restore the fixed one-day `write_ttl`.
+    #[tokio::test]
+    async fn a_completed_multipart_upload_expires_after_the_resolved_put_ttl() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("mpu-put-ttl");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        std::fs::write(
+            cache_root.join("cache_rules.json"),
+            r#"{"rules":[{"pattern":"test-bucket/ruled/**","put_ttl":"30d"}]}"#,
+        )
+        .unwrap();
+        let cache_manager =
+            initialized_accounting_cache_manager(cache_root.clone(), 1024 * 1024 * 1024).await;
+        let mut handler = SignedPutHandler::new(
+            cache_root.clone(),
+            (*cache_manager.get_compression_handler()).clone(),
+            0,
+            u64::MAX,
+            None,
+            10 * 1024 * 1024,
+            4,
+        );
+        handler.set_cache_manager(cache_manager.clone());
+
+        let hour = std::time::Duration::from_secs(3_600);
+        let thirty_days = std::time::Duration::from_secs(30 * 86_400);
+        for (cache_key, upload_id, expected) in [
+            ("test-bucket/global/object.bin", "mpu-ttl-global", hour),
+            ("test-bucket/ruled/object.bin", "mpu-ttl-ruled", thirty_days),
+        ] {
+            for n in 1..=2u32 {
+                stage_part(
+                    &handler,
+                    cache_key,
+                    upload_id,
+                    n,
+                    &vec![n as u8; 1024],
+                    &format!("etag{n}"),
+                )
+                .await
+                .unwrap();
+            }
+            handler
+                .finalize_multipart_upload(
+                    cache_key,
+                    upload_id,
+                    "\"mpu-ttl-final\"",
+                    &HashMap::new(),
+                    &[
+                        RequestedPart {
+                            part_number: 1,
+                            etag: "etag1".to_string(),
+                        },
+                        RequestedPart {
+                            part_number: 2,
+                            etag: "etag2".to_string(),
+                        },
+                    ],
+                )
+                .await
+                .expect("the completion publishes");
+
+            let metadata_file = crate::disk_cache::get_sharded_path(
+                &cache_root.join("metadata"),
+                cache_key,
+                ".meta",
+            )
+            .unwrap();
+            let published: crate::cache_types::NewCacheMetadata =
+                serde_json::from_str(&std::fs::read_to_string(&metadata_file).unwrap()).unwrap();
+            let object = &published.object_metadata;
+            assert!(
+                object.is_write_cached,
+                "fixture: {cache_key} is write-cached"
+            );
+            let created = object
+                .write_cache_created_at
+                .expect("write-cache creation time");
+            assert_eq!(
+                object.write_cache_expires_at,
+                Some(created + expected),
+                "{cache_key}: write_cache_expires_at must be the resolved put_ttl after creation"
+            );
+            assert_eq!(
+                published.expires_at,
+                created + expected,
+                "{cache_key}: expires_at must be the resolved put_ttl after creation"
+            );
+        }
     }
 
     /// — a part file that vanishes after the existence check and before the renames
