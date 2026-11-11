@@ -1818,6 +1818,772 @@ async fn a_waiter_whose_budget_runs_out_fetches_for_itself() {
     );
 }
 
+/// Which request shape a fallback test drives.
+#[derive(Clone, Copy)]
+enum WaiterShape {
+    Part,
+    Range,
+}
+
+const CHANGED_BODY: &[u8] = b"CHANGED-OBJECT-BODY-DATA";
+const CHANGED_ETAG: &str = "\"changed-etag-prop2\"";
+
+/// A part or range waiter whose leader outlives the wait budget fetches for itself and
+/// serves S3's answer. The fill's flight is pre-registered and never completes. With
+/// `version_changed`, the cache holds the old version and the origin now holds another, so
+/// the answer must be the origin's current version in full, never a mix of the two.
+async fn run_waiter_fallback(shape: WaiterShape, version_changed: bool) {
+    let mut config_inner = Config::default();
+    config_inner.cache.get_ttl = Duration::from_secs(3600);
+    config_inner.cache.head_ttl = Duration::from_secs(3600);
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 1;
+    config_inner
+        .cache
+        .download_coordination
+        .max_waiter_resubscriptions = 1;
+    config_inner.cache.ram_cache_enabled = false;
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let inflight_tracker = Arc::new(InFlightTracker::new());
+    let waiter_auth = make_auth(7, true);
+    let cache_key = format!(
+        "bucket-fallback/{}-{version_changed}.bin",
+        match shape {
+            WaiterShape::Part => "part",
+            WaiterShape::Range => "range",
+        }
+    );
+    let uri_path = format!("/{cache_key}");
+
+    let (origin_body, origin_etag) = if version_changed {
+        prime_cache(&cache_manager, &cache_key).await;
+        (CHANGED_BODY, CHANGED_ETAG)
+    } else {
+        (FETCHER_BODY, CACHED_ETAG)
+    };
+    let stub = StubS3Client::new().with_response_for_authorization(
+        &waiter_auth,
+        StubResponse::ok(Bytes::from_static(origin_body))
+            .with_header("etag", origin_etag)
+            .with_header("last-modified", CACHED_LAST_MODIFIED)
+            .with_header("content-type", "application/octet-stream"),
+    );
+    let s3_client = stub.clone().into_trait_object();
+
+    let last = FETCHER_BODY.len() as u64 - 1;
+    let flight_key = match shape {
+        WaiterShape::Part => InFlightTracker::make_part_key(&cache_key, 1),
+        WaiterShape::Range => InFlightTracker::make_range_key(&cache_key, 0, last),
+    };
+    let guard = match inflight_tracker.try_register(&flight_key) {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+
+    let call = async {
+        let response = match shape {
+            WaiterShape::Part => {
+                let uri: hyper::Uri = format!("{uri_path}?partNumber=1").parse().unwrap();
+                HttpProxy::forward_part_with_coordination(
+                    Method::GET,
+                    uri,
+                    "s3.amazonaws.com".to_string(),
+                    signed_headers(&waiter_auth),
+                    cache_key.clone(),
+                    1,
+                    Arc::clone(&cache_manager),
+                    Arc::clone(&s3_client),
+                    Arc::clone(&inflight_tracker),
+                    Arc::clone(&range_handler),
+                    Arc::clone(&config),
+                    true,
+                    Duration::from_millis(200),
+                    1,
+                    None,
+                    &ResolvedSettings::default(),
+                    &None,
+                    None,
+                )
+                .await
+                .expect("part coordination")
+            }
+            WaiterShape::Range => {
+                let uri: hyper::Uri = uri_path.parse().unwrap();
+                let spec = RangeSpec {
+                    start: 0,
+                    end: last,
+                };
+                let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&spec);
+                HttpProxy::forward_range_with_coordination(
+                    Method::GET,
+                    uri,
+                    "s3.amazonaws.com".to_string(),
+                    signed_range_headers(&waiter_auth, 0, last),
+                    cache_key.clone(),
+                    spec,
+                    overlap,
+                    Arc::clone(&cache_manager),
+                    Arc::clone(&range_handler),
+                    Arc::clone(&s3_client),
+                    Arc::clone(&config),
+                    true,
+                    None,
+                    Arc::clone(&inflight_tracker),
+                    None,
+                    &ResolvedSettings::default(),
+                    &None,
+                    None,
+                )
+                .await
+                .expect("range coordination")
+            }
+        };
+        let status = response.status();
+        let etag = response
+            .headers()
+            .get("etag")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, etag, body)
+    };
+    let (status, etag, body) = tokio::time::timeout(Duration::from_secs(30), call)
+        .await
+        .expect("the waiter must answer once its budget is spent");
+    let fill_still_registered = inflight_tracker.try_resubscribe(&flight_key).is_some();
+    let requests = stub.captured();
+    let fetches = requests.len();
+    drop(guard);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a waiter whose budget ran out must serve its own fetch, got {status:?}"
+    );
+    assert_eq!(
+        &body[..],
+        origin_body,
+        "the origin's current bytes, in full"
+    );
+    assert_eq!(
+        etag.as_deref(),
+        Some(origin_etag),
+        "the version the origin answered with"
+    );
+    assert!(
+        fill_still_registered,
+        "the fill's flight must stay registered"
+    );
+    assert_eq!(fetches, 1, "exactly one fetch of the waiter's own");
+    // The request the origin saw is the waiter's own, in the shape of the arm under test: a
+    // part waiter asks for its part, a range waiter for its range.
+    let request = &requests[0];
+    assert_eq!(request.authorization(), Some(waiter_auth.as_str()));
+    match shape {
+        WaiterShape::Part => assert!(
+            request.uri.contains("partNumber=1"),
+            "the part arm's fetch names its part, got {}",
+            request.uri
+        ),
+        WaiterShape::Range => {
+            assert!(
+                !request.uri.contains("partNumber"),
+                "the range arm's fetch is not a part request, got {}",
+                request.uri
+            );
+            assert_eq!(
+                request.headers.get("range").map(String::as_str),
+                Some(format!("bytes=0-{last}").as_str()),
+                "the range arm's fetch names its range"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_part_waiter_whose_budget_runs_out_fetches_for_itself() {
+    run_waiter_fallback(WaiterShape::Part, false).await;
+}
+
+#[tokio::test]
+async fn a_range_waiter_whose_budget_runs_out_fetches_for_itself() {
+    run_waiter_fallback(WaiterShape::Range, false).await;
+}
+
+#[tokio::test]
+async fn a_part_waiter_falling_back_after_a_version_change_serves_the_new_version() {
+    run_waiter_fallback(WaiterShape::Part, true).await;
+}
+
+#[tokio::test]
+async fn a_range_waiter_falling_back_after_a_version_change_serves_the_new_version() {
+    run_waiter_fallback(WaiterShape::Range, true).await;
+}
+
+/// One version of the object as the origin answers it.
+#[derive(Clone, Copy)]
+struct OriginVersion {
+    body: &'static [u8],
+    etag: &'static str,
+}
+
+const OLD_VERSION: OriginVersion = OriginVersion {
+    body: FETCHER_BODY,
+    etag: CACHED_ETAG,
+};
+const NEW_VERSION: OriginVersion = OriginVersion {
+    body: CHANGED_BODY,
+    etag: CHANGED_ETAG,
+};
+
+type Reply = (StatusCode, Option<String>, Bytes);
+
+/// A cached object's ETag and each recorded range's start, end and bytes.
+type CacheContents = (String, Vec<(u64, u64, Vec<u8>)>);
+
+/// The fixtures below run one at a time: two of them in one process leave each other's fills
+/// uncached, so a fixture that reads the cache would otherwise read an apparatus failure.
+static RACE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A real leader and a real waiter on one key, against a stub origin that answers the two
+/// by their authorization: the leader's request is held for `leader_delay`, so its flight
+/// outlives the waiter's wait budget, and the waiter's own fetch is held for `waiter_delay`.
+struct RaceFixture {
+    _temp_dir: TempDir,
+    shape: WaiterShape,
+    config: Arc<Config>,
+    cache_manager: Arc<CacheManager>,
+    disk_cache_manager: Arc<tokio::sync::RwLock<DiskCacheManager>>,
+    range_handler: Arc<RangeHandler>,
+    tracker: Arc<InFlightTracker>,
+    s3: Arc<dyn S3ClientApi + Send + Sync>,
+    stub: StubS3Client,
+    cache_key: String,
+    flight_key: String,
+    leader_auth: String,
+    waiter_auth: String,
+    preloaded: Option<s3_proxy::cache_types::NewCacheMetadata>,
+}
+
+/// How long a waiter waits before it fetches for itself, for each shape's fixture.
+fn waiter_budget(shape: WaiterShape) -> Duration {
+    match shape {
+        // 200 ms, once re-subscribed.
+        WaiterShape::Part => Duration::from_millis(400),
+        // `wait_timeout_secs = 1`, once re-subscribed.
+        WaiterShape::Range => Duration::from_secs(2),
+    }
+}
+
+fn origin_response(version: OriginVersion, partial: bool) -> StubResponse {
+    let response = if partial {
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from_static(version.body))
+            .with_header(
+                "content-range",
+                format!("bytes 0-{}/{}", version.body.len() - 1, version.body.len()),
+            )
+    } else {
+        StubResponse::ok(Bytes::from_static(version.body))
+    };
+    response
+        .with_header("etag", version.etag)
+        .with_header("last-modified", CACHED_LAST_MODIFIED)
+        .with_header("content-type", "application/octet-stream")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn race_fixture(
+    shape: WaiterShape,
+    name: &str,
+    primed: bool,
+    leader: OriginVersion,
+    leader_delay: Duration,
+    waiter: OriginVersion,
+    waiter_delay: Duration,
+    partial: bool,
+) -> Arc<RaceFixture> {
+    let mut config_inner = Config::default();
+    config_inner.cache.get_ttl = Duration::from_secs(3600);
+    config_inner.cache.head_ttl = Duration::from_secs(3600);
+    config_inner.cache.download_coordination.enabled = true;
+    config_inner.cache.download_coordination.wait_timeout_secs = 1;
+    config_inner
+        .cache
+        .download_coordination
+        .max_waiter_resubscriptions = 1;
+    config_inner.cache.ram_cache_enabled = false;
+    let config = Arc::new(config_inner);
+    let (temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+    let range_handler = Arc::new(RangeHandler::new(
+        Arc::clone(&cache_manager),
+        Arc::clone(&disk_cache_manager),
+    ));
+    let cache_key = format!("bucket-race/{name}.bin");
+    let mut preloaded = None;
+    if primed {
+        prime_cache(&cache_manager, &cache_key).await;
+        preloaded = cache_manager
+            .read_metadata_file(&cache_key)
+            .await
+            .expect("primed metadata read");
+        assert!(preloaded.is_some(), "the primed entry must have a .meta");
+    }
+    let leader_auth = make_auth(11, true);
+    let waiter_auth = make_auth(12, true);
+    // A `partNumber` answer is cached only when it names the object's part layout.
+    let answer = |version: OriginVersion, delay: Duration| {
+        let response = origin_response(version, partial).with_delay(delay);
+        if partial && matches!(shape, WaiterShape::Part) {
+            response.with_header("x-amz-mp-parts-count", "1")
+        } else {
+            response
+        }
+    };
+    let stub = StubS3Client::new()
+        .with_response_for_authorization(&leader_auth, answer(leader, leader_delay))
+        .with_response_for_authorization(&waiter_auth, answer(waiter, waiter_delay));
+    let s3 = stub.clone().into_trait_object();
+    let last = OLD_VERSION.body.len() as u64 - 1;
+    let flight_key = match shape {
+        WaiterShape::Part => InFlightTracker::make_part_key(&cache_key, 1),
+        WaiterShape::Range => InFlightTracker::make_range_key(&cache_key, 0, last),
+    };
+    Arc::new(RaceFixture {
+        _temp_dir: temp_dir,
+        shape,
+        config,
+        cache_manager,
+        disk_cache_manager,
+        range_handler,
+        tracker: Arc::new(InFlightTracker::new()),
+        s3,
+        stub,
+        cache_key,
+        flight_key,
+        leader_auth,
+        waiter_auth,
+        preloaded,
+    })
+}
+
+impl RaceFixture {
+    /// Issue one request through the coordination entry point for this fixture's shape.
+    fn spawn_request(
+        self: &Arc<Self>,
+        auth: &str,
+        is_signed: bool,
+    ) -> tokio::task::JoinHandle<Reply> {
+        let fx = Arc::clone(self);
+        let auth = auth.to_string();
+        tokio::spawn(async move {
+            let last = OLD_VERSION.body.len() as u64 - 1;
+            let response = match fx.shape {
+                WaiterShape::Part => {
+                    let uri: hyper::Uri =
+                        format!("/{}?partNumber=1", fx.cache_key).parse().unwrap();
+                    HttpProxy::forward_part_with_coordination(
+                        Method::GET,
+                        uri,
+                        "s3.amazonaws.com".to_string(),
+                        signed_headers(&auth),
+                        fx.cache_key.clone(),
+                        1,
+                        Arc::clone(&fx.cache_manager),
+                        Arc::clone(&fx.s3),
+                        Arc::clone(&fx.tracker),
+                        Arc::clone(&fx.range_handler),
+                        Arc::clone(&fx.config),
+                        true,
+                        Duration::from_millis(200),
+                        1,
+                        None,
+                        &ResolvedSettings::default(),
+                        &None,
+                        None,
+                    )
+                    .await
+                    .expect("part coordination")
+                }
+                WaiterShape::Range => {
+                    let uri: hyper::Uri = format!("/{}", fx.cache_key).parse().unwrap();
+                    let spec = RangeSpec {
+                        start: 0,
+                        end: last,
+                    };
+                    let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&spec);
+                    HttpProxy::forward_range_with_coordination(
+                        Method::GET,
+                        uri,
+                        "s3.amazonaws.com".to_string(),
+                        signed_range_headers(&auth, 0, last),
+                        fx.cache_key.clone(),
+                        spec,
+                        overlap,
+                        Arc::clone(&fx.cache_manager),
+                        Arc::clone(&fx.range_handler),
+                        Arc::clone(&fx.s3),
+                        Arc::clone(&fx.config),
+                        is_signed,
+                        fx.preloaded.as_ref(),
+                        Arc::clone(&fx.tracker),
+                        None,
+                        &ResolvedSettings::default(),
+                        &None,
+                        None,
+                    )
+                    .await
+                    .expect("range coordination")
+                }
+            };
+            let status = response.status();
+            let etag = response
+                .headers()
+                .get("etag")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, etag, body)
+        })
+    }
+
+    /// Start the leader and wait until its flight is registered, so the next request waits on it.
+    async fn start_leader(self: &Arc<Self>) -> tokio::task::JoinHandle<Reply> {
+        let leader = self.spawn_request(&self.leader_auth, true);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.tracker.try_resubscribe(&self.flight_key).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader never registered its flight"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        leader
+    }
+
+    /// The `.meta` ETag and each recorded range's bytes, as the cache holds them now.
+    async fn cache_contents(&self) -> Option<CacheContents> {
+        // Includes this proxy's own committed-but-unconsolidated fill, which is all a fill
+        // leaves until the consolidator folds its journal into the shared `.meta`.
+        let meta = self
+            .cache_manager
+            .get_metadata_from_disk(&self.cache_key)
+            .await
+            .ok()
+            .flatten()?;
+        let disk = self.disk_cache_manager.read().await;
+        let mut ranges = Vec::new();
+        for range in &meta.ranges {
+            let bytes = disk
+                .load_range_data(range)
+                .await
+                .unwrap_or_else(|e| panic!("a recorded range must load: {e}"));
+            ranges.push((range.start, range.end, bytes));
+        }
+        Some((meta.object_metadata.etag.clone(), ranges))
+    }
+}
+
+fn is_served(status: StatusCode) -> bool {
+    status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT
+}
+
+fn same_etag(a: &str, b: &str) -> bool {
+    a.trim_matches('"') == b.trim_matches('"')
+}
+
+/// The cache must hold one version: every recorded range's bytes are the slice of the
+/// version the `.meta` names. Returns the version held, if any.
+fn one_version_held(
+    contents: &Option<CacheContents>,
+    versions: &[OriginVersion],
+    when: &str,
+) -> Option<OriginVersion> {
+    let (etag, ranges) = contents.as_ref()?;
+    let held = versions
+        .iter()
+        .find(|v| same_etag(v.etag, etag))
+        .unwrap_or_else(|| panic!("{when}: the .meta names ETag {etag}, which no version has"));
+    for (start, end, bytes) in ranges {
+        assert_eq!(
+            &bytes[..],
+            &held.body[*start as usize..=*end as usize],
+            "{when}: the range {start}-{end} bytes are not the bytes of the version the .meta \
+             names ({etag})"
+        );
+    }
+    Some(*held)
+}
+
+/// A real leader's fill is still running when the waiter's budget runs out and the origin
+/// has changed version. The waiter gets the origin's new version in full with its ETag, the
+/// leader gets the version it fetched, and the cache is left holding one version.
+async fn run_leader_waiter_version_change(shape: WaiterShape, primed: bool, name: &str) {
+    let _serial = RACE_SERIAL.lock().await;
+    let budget = waiter_budget(shape);
+    let fx = race_fixture(
+        shape,
+        name,
+        primed,
+        OLD_VERSION,
+        budget + Duration::from_millis(600),
+        NEW_VERSION,
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    let leader = fx.start_leader().await;
+    let waiter = fx.spawn_request(&fx.waiter_auth, true);
+    let (w_status, w_etag, w_body) = tokio::time::timeout(Duration::from_secs(30), waiter)
+        .await
+        .expect("the waiter must answer once its budget is spent")
+        .expect("waiter join");
+    assert!(
+        is_served(w_status),
+        "the waiter's own fetch is served, got {w_status:?}"
+    );
+    assert_eq!(
+        &w_body[..],
+        NEW_VERSION.body,
+        "the waiter must receive the origin's current bytes, in full"
+    );
+    assert_eq!(
+        w_etag.as_deref(),
+        Some(NEW_VERSION.etag),
+        "the waiter must receive the ETag of the bytes it was sent"
+    );
+    let (l_status, l_etag, l_body) = tokio::time::timeout(Duration::from_secs(30), leader)
+        .await
+        .expect("the leader must answer")
+        .expect("leader join");
+    assert!(
+        is_served(l_status),
+        "the leader's own fetch is served, got {l_status:?}"
+    );
+    assert_eq!(&l_body[..], OLD_VERSION.body, "the leader's own fetch");
+    assert_eq!(l_etag.as_deref(), Some(OLD_VERSION.etag));
+    assert_eq!(fx.stub.captured().len(), 2, "one fetch each");
+
+    // Both fills publish asynchronously and the consolidator folds them into the `.meta`.
+    // Two fills of different ETags may leave one version or, as the fold resolves the
+    // conflict, nothing; what the cache must never hold is the `.meta` of one version over
+    // the bytes of the other. Reads fold, so read after each publish has had time to land.
+    let versions = [OLD_VERSION, NEW_VERSION];
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let first = fx.cache_contents().await;
+    one_version_held(&first, &versions, "first read");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let consolidator = fx
+        .cache_manager
+        .get_journal_consolidator()
+        .await
+        .expect("shared-storage consolidator present");
+    consolidator
+        .run_consolidation_cycle()
+        .await
+        .expect("consolidation cycle");
+    let settled = fx.cache_contents().await;
+    let held = one_version_held(&settled, &versions, "settled read");
+    // After the fold the cache holds the one version the two fills leave: the waiter's, when
+    // nothing was cached before; the cached one, which a fill of another version does not
+    // replace. An empty cache is neither.
+    let expected = if primed { OLD_VERSION } else { NEW_VERSION };
+    assert_eq!(
+        held.map(|version| version.etag),
+        Some(expected.etag),
+        "after the fold the cache must hold {}, but it holds {}",
+        expected.etag,
+        held.map_or("nothing", |version| version.etag)
+    );
+}
+
+#[tokio::test]
+async fn a_part_waiter_falling_back_while_a_leader_fills_serves_one_version() {
+    run_leader_waiter_version_change(WaiterShape::Part, false, "part-cold").await;
+}
+
+#[tokio::test]
+async fn a_range_waiter_falling_back_while_a_leader_fills_serves_one_version() {
+    run_leader_waiter_version_change(WaiterShape::Range, false, "range-cold").await;
+}
+
+#[tokio::test]
+async fn a_part_waiter_falling_back_over_a_cached_old_version_serves_the_new_one() {
+    run_leader_waiter_version_change(WaiterShape::Part, true, "part-primed").await;
+}
+
+#[tokio::test]
+async fn a_range_waiter_falling_back_over_a_cached_old_version_serves_the_new_one() {
+    run_leader_waiter_version_change(WaiterShape::Range, true, "range-primed").await;
+}
+
+/// An unsigned range waiter whose budget runs out falls back through the unsigned forward
+/// with the preloaded metadata its caller read, and serves the origin's current bytes.
+#[tokio::test]
+async fn an_unsigned_range_waiter_whose_budget_runs_out_fetches_for_itself() {
+    let _serial = RACE_SERIAL.lock().await;
+    let fx = race_fixture(
+        WaiterShape::Range,
+        "range-unsigned",
+        true,
+        OLD_VERSION,
+        Duration::ZERO,
+        NEW_VERSION,
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    assert!(
+        fx.preloaded.is_some(),
+        "the waiter carries preloaded metadata"
+    );
+    // A leader whose flight never completes within the waiter's budget.
+    let guard = match fx.tracker.try_register(&fx.flight_key) {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let waiter = fx.spawn_request(&fx.waiter_auth, false);
+    let (status, _etag, body) = tokio::time::timeout(Duration::from_secs(30), waiter)
+        .await
+        .expect("the unsigned waiter must answer once its budget is spent")
+        .expect("waiter join");
+    let fill_still_registered = fx.tracker.try_resubscribe(&fx.flight_key).is_some();
+    let fetches = fx.stub.captured().len();
+    drop(guard);
+    assert!(
+        status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT,
+        "an unsigned waiter whose budget ran out must serve its own fetch, got {status:?}"
+    );
+    assert_eq!(
+        &body[..],
+        NEW_VERSION.body,
+        "the origin's current bytes, in full"
+    );
+    assert!(
+        fill_still_registered,
+        "the fill's flight must stay registered"
+    );
+    assert_eq!(fetches, 1, "exactly one fetch of the waiter's own");
+}
+
+/// A waiter that fell back is mid-fetch when the object is deleted or overwritten through
+/// the proxy. Its answer is served to its client, and its fill must not outlive the write:
+/// after the consolidator folds the journal, the cache holds nothing the write superseded.
+/// With `write` as `None` the same run is the control: the fold must keep the waiter's fill.
+async fn run_waiter_fill_racing_a_write(shape: WaiterShape, write: Option<&str>, name: &str) {
+    let _serial = RACE_SERIAL.lock().await;
+    let fx = race_fixture(
+        shape,
+        name,
+        false,
+        OLD_VERSION,
+        Duration::ZERO,
+        OLD_VERSION,
+        Duration::from_millis(1500),
+        true,
+    )
+    .await;
+    // A leader whose flight never completes, so the request becomes a waiter that falls back.
+    let guard = match fx.tracker.try_register(&fx.flight_key) {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let waiter = fx.spawn_request(&fx.waiter_auth, true);
+    // The stub records a request on arrival, before its delay: once it holds one, the
+    // waiter's fallback has captured its fill witness and is waiting for the origin.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while fx.stub.captured().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the waiter never fetched for itself"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if let Some(operation) = write {
+        fx.cache_manager
+            .invalidate_cache_unified_for_operation(&fx.cache_key, operation)
+            .await
+            .expect("the write's invalidation");
+    }
+    let (status, _etag, body) = tokio::time::timeout(Duration::from_secs(30), waiter)
+        .await
+        .expect("the waiter must answer once its fetch returns")
+        .expect("waiter join");
+    drop(guard);
+    assert!(is_served(status), "the waiter is served, got {status:?}");
+    assert_eq!(&body[..], OLD_VERSION.body, "the waiter's own fetch");
+    assert_eq!(fx.stub.captured().len(), 1, "one fetch of the waiter's own");
+
+    // The publish lands asynchronously; then fold the journal, which is the read a later
+    // request makes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let consolidator = fx
+        .cache_manager
+        .get_journal_consolidator()
+        .await
+        .expect("shared-storage consolidator present");
+    consolidator
+        .run_consolidation_cycle()
+        .await
+        .expect("consolidation cycle");
+    let contents = fx.cache_contents().await;
+    match write {
+        Some(operation) => assert!(
+            contents.is_none(),
+            "a fill fetched before an acknowledged {operation} must not be in the cache after \
+             the fold, but it holds {:?}",
+            contents.as_ref().map(|(etag, ranges)| (
+                etag.clone(),
+                ranges
+                    .iter()
+                    .map(|(start, end, bytes)| (*start, *end, bytes.len()))
+                    .collect::<Vec<_>>()
+            ))
+        ),
+        None => {
+            let held = one_version_held(&contents, &[OLD_VERSION], "after the fold");
+            assert!(
+                held.is_some(),
+                "with no write, the fold must keep the waiter's fill, but the cache is empty"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_part_waiter_fill_is_kept_when_no_write_races_it() {
+    run_waiter_fill_racing_a_write(WaiterShape::Part, None, "part-nowrite").await;
+}
+
+#[tokio::test]
+async fn a_range_waiter_fill_is_kept_when_no_write_races_it() {
+    run_waiter_fill_racing_a_write(WaiterShape::Range, None, "range-nowrite").await;
+}
+
+#[tokio::test]
+async fn a_part_waiter_fill_does_not_outlive_a_delete_it_raced() {
+    run_waiter_fill_racing_a_write(WaiterShape::Part, Some("DELETE"), "part-delete").await;
+}
+
+#[tokio::test]
+async fn a_range_waiter_fill_does_not_outlive_a_delete_it_raced() {
+    run_waiter_fill_racing_a_write(WaiterShape::Range, Some("DELETE"), "range-delete").await;
+}
+
+#[tokio::test]
+async fn a_part_waiter_fill_does_not_outlive_an_overwrite_it_raced() {
+    run_waiter_fill_racing_a_write(WaiterShape::Part, Some("PUT"), "part-put").await;
+}
+
+#[tokio::test]
+async fn a_range_waiter_fill_does_not_outlive_an_overwrite_it_raced() {
+    run_waiter_fill_racing_a_write(WaiterShape::Range, Some("PUT"), "range-put").await;
+}
+
 /// Distinct flight keys preservation (Requirement 3.11).
 ///
 /// Concurrent requests against different cache keys produce independent

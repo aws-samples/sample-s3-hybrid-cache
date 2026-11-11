@@ -101,7 +101,7 @@ enabled, sends to `http://localhost:4318` by default.
 
 `server.request_timeout` (`Duration`, default `30s`) is accepted and validated but has no
 effect on request handling. Each upstream read request has a fixed 30-second timeout from
-connect to response. The upstream timeouts you can set are
+connect to its response headers. The upstream timeouts you can set are
 [Upstream timeout](#upstream-timeout-stalled-response-fast-fail) for GET and HEAD, and
 [Upstream write timeout](#upstream-write-timeout) for uploads and other writes.
 
@@ -270,6 +270,7 @@ server:
 | `cert_path` | (empty) | Path to PEM certificate file (required when enabled) |
 | `key_path` | (empty) | Path to PEM private key file (required when enabled) |
 | `connect_allowlist` | unset | Hostname patterns the proxy may connect to. Setting it also turns on the destination policy for the HTTP forwarding paths, which then connect only to addresses the policy accepts. See [Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection) |
+| `tunnel_refused_addresses` | `[]` | IPv4 or IPv6 addresses that `CONNECT` tunnels and the HTTPS passthrough (port 443) refuse: ones that reach a proxy without being on its interfaces, such as an EC2 public IPv4 or Elastic IP address. The passthrough reads it even when `enabled` is `false`. An entry that is not an IP address fails the configuration load. See [Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection) |
 
 **Validation rules**:
 - With `enabled: true`, `cert_path` and `key_path` must be set.
@@ -642,7 +643,7 @@ Field syntax, for a key pattern whose reads fall mostly within the same pages:
 { "pattern": "**/*.parquet", "page_widening": true, "page_size": 16777216 }
 ```
 
-**`hedging_enabled` / `hedge_trigger_after` / `hedge_max_per_request` (hedged upstream requests).** `hedging_enabled` (bool, default `false`) turns on hedged upstream requests for matching keys. When the original fetch has not returned its first byte within `hedge_trigger_after`, the proxy sends a second identical fetch, serves whichever responds first and cancels the other. `hedge_trigger_after` (duration, default `250ms`) sets that first-byte threshold, and every rules load checks that it is above zero and below `connection_pool.upstream_first_byte_timeout` (default `5s`). `hedge_max_per_request` (integer, default `1`) caps the hedges per client request, shared across all the parallel fetches of a range GET. Only a rule can turn hedging on, because each hedge is an extra S3 request and the right threshold depends on the workload's first-byte times. See [Hedged upstream requests](HEDGING.md) for the mechanism:
+**`hedging_enabled` / `hedge_trigger_after` / `hedge_max_per_request` (hedged upstream requests).** `hedging_enabled` (bool, default `false`) turns on hedged upstream requests for matching keys. When the original fetch has not answered within `hedge_trigger_after`, the proxy sends a second identical fetch, serves whichever answers first and cancels the other. `hedge_trigger_after` (duration, default `250ms`) sets that threshold, and every rules load checks that an explicit value on a rule that sets `hedging_enabled: true` is above zero and below `connection_pool.upstream_first_byte_timeout` (default `5s`). `hedge_max_per_request` (integer, default `1`) caps the hedges per client request, shared across all the parallel fetches of a range GET. Only a rule can turn hedging on, because each hedge is an extra S3 request and the right threshold depends on the workload's first-byte times. See [Hedged upstream requests](HEDGING.md) for the mechanism:
 
 ```json
 { "pattern": "analytics-bucket/hot-prefix/**", "hedging_enabled": true, "hedge_trigger_after": "250ms", "hedge_max_per_request": 1 }
@@ -981,7 +982,7 @@ cache:
 ```
 `wait_timeout_secs` outside 5 to 120 is clamped to that range, with a startup warning.
 
-When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter that times out rejoins the fetch still in flight, up to `download_coordination.max_waiter_resubscriptions` times (default `3`). After that, a full-object GET or HEAD waiter fetches from S3 itself, as an uncoalesced request does, and a part or range waiter receives HTTP 504. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
+When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter that times out rejoins the fetch still in flight, up to `download_coordination.max_waiter_resubscriptions` times (default `3`). After that, the waiter fetches from S3 itself, as an uncoalesced request does. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
 
 ## Cache size tracking
 
@@ -1095,11 +1096,11 @@ connection_pool:
 
 **`upstream_first_byte_timeout`** (`Duration`, default `"5s"`)
 
-How long the proxy waits for the first byte of a full-object GET or HEAD response, timed from the start of each attempt, so the connect counts against it. Range GETs do not use it; they are bounded by the fixed 30-second read timeout (see [`request_timeout` is not enforced](#request_timeout-is-not-enforced)). On timeout, before anything has been sent to the client, the proxy retries up to `upstream_idle_retries` times, failing over between the origin's addresses, and then answers `504 Gateway Timeout`. Set it above the slowest first-byte times you see from the origin and well below the client's 60-second read timeout, so the proxy retries before the client gives up.
+How long the proxy waits for the first byte of a full-object GET, a part-number GET or a HEAD response, timed from the start of each attempt, so the connect counts against it. Range GETs do not use it; the fixed 30-second read timeout bounds their wait for the response headers (see [`request_timeout` is not enforced](#request_timeout-is-not-enforced)). On timeout, before anything has been sent to the client, the proxy retries up to `upstream_idle_retries` times, failing over between the origin's addresses, and then answers `504 Gateway Timeout`. Set it above the slowest first-byte times you see from the origin and well below the client's 60-second read timeout, so the proxy retries before the client gives up.
 
 **`upstream_idle_timeout`** (`Duration`, default `"5s"`)
 
-Mid-stream idle watchdog: if no bytes are received from upstream for this duration after data has started flowing, the proxy terminates the client connection so the client's own retry logic engages. A slow-but-steady transfer (bytes arriving within the timeout window) is never aborted: the criterion is "no bytes for T", not "transfer took longer than T". The timer is paused under client backpressure (when the proxy is not reading from upstream because the client write half is slow).
+Mid-stream idle watchdog for the cache-miss fetches the proxy streams: full-object GETs, part-number GET misses, complete range misses and signed ranges. If no bytes are received from upstream for this duration after data has started flowing, the proxy terminates the client connection so the client's own retry logic engages. A slow-but-steady transfer (bytes arriving within the timeout window) is never aborted: the criterion is "no bytes for T", not "transfer took longer than T". The timer is paused under client backpressure (when the proxy is not reading from upstream because the client write half is slow).
 
 **`upstream_idle_retries`** (`usize`, default `2`)
 
@@ -1124,7 +1125,7 @@ Any byte written or read restarts the idle timer, so a transfer that keeps movin
 
 ### Hedged requests governor
 
-A per-proxy cap on hedged upstream requests. Cache rules turn hedging on per key pattern with `hedging_enabled`, `hedge_trigger_after` and `hedge_max_per_request`; this field only limits the share of a proxy's in-flight fetches that may be hedges, which bounds the extra S3 requests across every key with hedging on.
+A per-proxy cap on hedged upstream requests. Cache rules turn hedging on per key pattern with `hedging_enabled`, `hedge_trigger_after` and `hedge_max_per_request`. This field only limits the share of a proxy's in-flight fetches for those keys that may be hedges, which bounds their extra S3 requests.
 
 ```yaml
 connection_pool:
@@ -1134,7 +1135,7 @@ connection_pool:
 
 **`max_inflight_fraction`** (`f64`, default `0.1`)
 
-Maximum fraction of in-flight upstream fetches that may be hedges. Valid range `[0.0, 1.0]`. When `(in_flight_hedges + 1) / max(in_flight_fetches, 1)` exceeds this value, new hedges are suppressed and the original fetch is served alone.
+Maximum fraction of in-flight upstream fetches for keys with hedging on that may be hedges. Valid range `[0.0, 1.0]`. When `(in_flight_hedges + 1) / max(in_flight_fetches, 1)` exceeds this value, new hedges are suppressed and the original fetch runs alone.
 
 The first hedge is always admitted when no other hedge is in flight, so a lightly loaded proxy still hedges and `0.0` does not turn hedging off. To turn it off, remove `hedging_enabled` from the rules. Each proxy enforces the cap on its own.
 
@@ -1170,7 +1171,7 @@ connection issues).
 
 ## DNS server configuration
 
-By default the proxy resolves origin hostnames through the Google and Cloudflare public resolvers (`8.8.8.8`, `8.8.4.4`, `1.1.1.1` and `1.0.0.1`) and never reads `/etc/hosts`; `connection_pool.dns_servers` replaces them for upstream requests through the connection pool. The HTTPS passthrough on port 443, CONNECT tunnels through the TLS proxy listener, and destination-policy lookups on the HTTP forwarding path always use the public resolvers.
+By default the proxy resolves origin hostnames through the Google and Cloudflare public resolvers and never reads `/etc/hosts`. Their addresses are `8.8.8.8`, `8.8.4.4`, `2001:4860:4860::8888` and `2001:4860:4860::8844` for Google, and `1.1.1.1`, `1.0.0.1`, `2606:4700:4700::1111` and `2606:4700:4700::1001` for Cloudflare. `connection_pool.dns_servers` replaces them for upstream requests through the connection pool. The HTTPS passthrough on port 443, CONNECT tunnels through the TLS proxy listener, and destination-policy lookups on the HTTP forwarding path always use the public resolvers.
 
 The proxy ignores `/etc/hosts` because a hosts file or DNS zone may point S3's hostnames at the proxy itself. For the same reason, `dns_servers` must not name a resolver that answers S3's hostnames with the proxy's address, which would create a loop.
 
@@ -1180,6 +1181,34 @@ connection_pool:
 ```
 
 Set `dns_servers` to use internal resolvers, or for S3 PrivateLink from on premises (below).
+
+On a host that reaches the internet only through an egress-only internet gateway, which carries IPv6 alone, set `dns_servers` to the four IPv6 addresses:
+
+```yaml
+connection_pool:
+  dns_ip_strategy: ipv6_only
+  dns_servers: ["2001:4860:4860::8888", "2001:4860:4860::8844", "2606:4700:4700::1111", "2606:4700:4700::1001"]
+```
+
+The HTTPS passthrough, `CONNECT` tunnels and destination-policy lookups still use all eight addresses, so on such a host only the IPv6 servers can answer them.
+
+### Address families
+
+`connection_pool.dns_ip_strategy` chooses which address families every lookup above asks for, and which family the proxy tries first.
+
+```yaml
+connection_pool:
+  dns_ip_strategy: ipv6_and_ipv4  # default
+```
+
+| Value | Looks up | Use on |
+|---|---|---|
+| `ipv6_and_ipv4` (default) | AAAA and A records, IPv6 addresses first | A host that reaches the origin over both families |
+| `ipv4_and_ipv6` | A and AAAA records, IPv4 addresses first | A host that reaches both families and should prefer IPv4 |
+| `ipv4_only` | A records only | A host with no IPv6 route |
+| `ipv6_only` | AAAA records only | A host that reaches the origin only over IPv6, such as one behind an egress-only internet gateway |
+
+With [IP distribution](#ip-distribution) on, requests rotate through every address a lookup returns, and an address that keeps failing to connect leaves rotation ([IP health tracking](CONNECTION_POOLING.md#3-ip-health-tracking)). With it off, an unhedged GET or HEAD dials only the first address. A PUT, a POST, a signed DELETE or a [hedged read](HEDGING.md#connection-diversity) can still use any of them, so a host with no IPv6 route needs `ipv4_only` either way. The HTTPS passthrough (port 443) and `CONNECT` tunnels try each address in turn.
 
 ## S3 PrivateLink (interface VPC endpoints)
 
@@ -1387,7 +1416,7 @@ One HTTP/1.1 connection to S3 carries one request at a time, so throughput comes
 
 ### How IP distribution works
 
-1. The connection pool resolves the endpoint's addresses through DNS, or takes them from `endpoint_overrides`.
+1. The connection pool resolves the endpoint's addresses through DNS, for the address families `dns_ip_strategy` selects ([Address families](#address-families)), or takes them from `endpoint_overrides`.
 2. Each outgoing request takes the next address in round-robin order.
 3. The proxy rewrites the request's URI authority from the hostname to that address, for example from `s3.eu-west-1.amazonaws.com` to `52.92.17.224`.
 4. The HTTP client keeps a separate connection pool for each address.
@@ -1745,7 +1774,7 @@ The [annotated example configuration](../config/config.example.yaml) shows every
 
 ### Connection issues
 
-- Raise `connection_timeout` for uploads and other writes, whose connects it bounds. For a full-object GET or HEAD the connect counts against `upstream_first_byte_timeout`. A range GET's connect is bounded only by the fixed 30-second read timeout; see [`request_timeout` is not enforced](#request_timeout-is-not-enforced).
+- Raise `connection_timeout` for uploads and other writes, whose connects it bounds. For a full-object GET, a part-number GET or a HEAD the connect counts against `upstream_first_byte_timeout`. A range GET's connect is bounded only by the fixed 30-second read timeout; see [`request_timeout` is not enforced](#request_timeout-is-not-enforced).
 - Raise `max_idle_per_ip`, or `max_idle_per_host` with IP distribution off.
 - Check `dns_refresh_interval` and the connection pool figures on `/metrics`.
 

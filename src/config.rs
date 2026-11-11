@@ -523,6 +523,13 @@ pub struct TlsConfig {
     /// No hardcoded default patterns are shipped; operators add their own patterns.
     #[serde(default)]
     pub connect_allowlist: Option<Vec<String>>,
+    /// IP addresses a CONNECT or SNI passthrough tunnel is refused, because they lead
+    /// back to a proxy without being on one of this host's interfaces: an EC2 public
+    /// IPv4 or Elastic IP address, a load balancer in front of the fleet, every peer
+    /// proxy's public addresses. This host's interface addresses are refused whether
+    /// or not they are listed. Default empty.
+    #[serde(default)]
+    pub tunnel_refused_addresses: Vec<std::net::IpAddr>,
 }
 
 impl Default for TlsConfig {
@@ -533,6 +540,7 @@ impl Default for TlsConfig {
             cert_path: String::new(),
             key_path: String::new(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         }
     }
 }
@@ -2512,6 +2520,12 @@ pub struct ConnectionPoolConfig {
     /// causing hyper to create separate connection pools per IP for better load distribution.
     #[serde(default = "default_ip_distribution_enabled")]
     pub ip_distribution_enabled: bool,
+    /// Which address families the proxy asks DNS for when it resolves an upstream name, and in
+    /// what order it tries them (default: `ipv6_and_ipv4`, AAAA answers first).
+    /// Applies to the cached read path, signed writes, the port 443 passthrough and the CONNECT
+    /// tunnel. Set `ipv4_only` on a host with no IPv6 route and `ipv6_only` on an IPv6-only host.
+    #[serde(default = "default_dns_ip_strategy")]
+    pub dns_ip_strategy: DnsIpStrategy,
     /// Maximum idle connections per IP when IP distribution is enabled (default: 10)
     /// With 8 S3 IPs, this results in ~80 total idle connections.
     /// Valid range: 1-100
@@ -2627,6 +2641,9 @@ fn default_max_idle_per_ip() -> usize {
 fn default_ip_distribution_enabled() -> bool {
     true
 }
+fn default_dns_ip_strategy() -> DnsIpStrategy {
+    DnsIpStrategy::default()
+}
 
 fn default_keepalive_idle_secs() -> u64 {
     15
@@ -2679,6 +2696,34 @@ fn default_upstream_write_idle_timeout() -> Duration {
     Duration::from_secs(120)
 }
 
+/// Address families and order for upstream DNS lookups (`connection_pool.dns_ip_strategy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsIpStrategy {
+    /// Ask for AAAA and A in parallel and try AAAA answers first.
+    #[default]
+    Ipv6AndIpv4,
+    /// Ask for A and AAAA in parallel and try A answers first.
+    Ipv4AndIpv6,
+    /// Ask for A records only.
+    Ipv4Only,
+    /// Ask for AAAA records only.
+    Ipv6Only,
+}
+
+impl DnsIpStrategy {
+    /// The resolver library's value for this setting.
+    pub fn to_lookup_strategy(self) -> hickory_resolver::config::LookupIpStrategy {
+        use hickory_resolver::config::LookupIpStrategy;
+        match self {
+            DnsIpStrategy::Ipv6AndIpv4 => LookupIpStrategy::Ipv6AndIpv4,
+            DnsIpStrategy::Ipv4AndIpv6 => LookupIpStrategy::Ipv4AndIpv6,
+            DnsIpStrategy::Ipv4Only => LookupIpStrategy::Ipv4Only,
+            DnsIpStrategy::Ipv6Only => LookupIpStrategy::Ipv6Only,
+        }
+    }
+}
+
 impl Default for ConnectionPoolConfig {
     fn default() -> Self {
         Self {
@@ -2694,6 +2739,7 @@ impl Default for ConnectionPoolConfig {
             endpoint_overrides: std::collections::HashMap::new(),
             upstream_overrides: std::collections::HashMap::new(),
             ip_distribution_enabled: true,
+            dns_ip_strategy: default_dns_ip_strategy(),
             max_idle_per_ip: default_max_idle_per_ip(),
             keepalive_idle_secs: default_keepalive_idle_secs(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
@@ -3305,6 +3351,7 @@ impl Default for Config {
                 endpoint_overrides: std::collections::HashMap::new(),
                 upstream_overrides: std::collections::HashMap::new(),
                 ip_distribution_enabled: true,
+                dns_ip_strategy: default_dns_ip_strategy(),
                 max_idle_per_ip: default_max_idle_per_ip(),
                 keepalive_idle_secs: default_keepalive_idle_secs(),
                 keepalive_interval_secs: default_keepalive_interval_secs(),
@@ -7835,6 +7882,7 @@ metrics:
             cert_path: String::new(),
             key_path: "/path/to/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -7849,6 +7897,7 @@ metrics:
             cert_path: "/path/to/cert.pem".to_string(),
             key_path: String::new(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -7863,6 +7912,7 @@ metrics:
             cert_path: "/path/to/cert.pem".to_string(),
             key_path: "/path/to/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         };
         assert!(tls.validate().is_ok());
     }
@@ -7875,6 +7925,7 @@ metrics:
             cert_path: String::new(),
             key_path: String::new(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         };
         assert!(tls.validate().is_ok());
     }
@@ -7887,6 +7938,7 @@ metrics:
             cert_path: String::new(),
             key_path: String::new(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -7902,6 +7954,7 @@ metrics:
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -7918,6 +7971,7 @@ metrics:
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -7934,6 +7988,7 @@ metrics:
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -7952,6 +8007,7 @@ metrics:
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -7968,6 +8024,7 @@ metrics:
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -7984,6 +8041,7 @@ metrics:
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         assert!(config.validate_tls_config().is_ok());
     }
@@ -8003,6 +8061,7 @@ metrics:
             cert_path: String::new(),
             key_path: String::new(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         // Port 0 check still applies
         // But http_port (80) is not 0, so this should pass since enabled=false skips conflict check
@@ -8111,6 +8170,7 @@ metrics:
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
         let result = config.validate_proxy_only_mode();
         assert!(result.is_err());
@@ -9934,6 +9994,7 @@ mod tls_config_property_tests {
                 cert_path,
                 key_path,
                 connect_allowlist: None,
+                tunnel_refused_addresses: Vec::new(),
             }
         }
     }
@@ -9993,6 +10054,7 @@ mod tls_config_property_tests {
             cert_path,
             key_path,
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         };
 
         let result = config.validate();
@@ -10069,6 +10131,7 @@ mod tls_config_property_tests {
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
             connect_allowlist: None,
+            tunnel_refused_addresses: Vec::new(),
         });
 
         let result = config.validate_tls_config();
@@ -10812,5 +10875,40 @@ metrics:
     fn metadata_cache_max_entries_default_matches_documented_value() {
         // The doc comment on MetadataCacheConfig::max_entries states 100000; pin it.
         assert_eq!(MetadataCacheConfig::default().max_entries, 100_000);
+    }
+}
+
+#[cfg(test)]
+mod tunnel_refused_addresses_tests {
+    use super::*;
+
+    /// A TLS section written before the field existed loads, with nothing listed.
+    #[test]
+    fn a_tls_section_without_the_field_gets_an_empty_list() {
+        let tls: TlsConfig =
+            serde_yaml_ng::from_str("enabled: false\nconnect_allowlist: [\"*.amazonaws.com\"]\n")
+                .expect("a pre-existing TLS section must still parse");
+        assert!(tls.tunnel_refused_addresses.is_empty());
+        assert!(TlsConfig::default().tunnel_refused_addresses.is_empty());
+    }
+
+    /// Both families parse; an entry that is not an IP address is a load error.
+    #[test]
+    fn listed_addresses_parse_and_a_name_is_rejected() {
+        let tls: TlsConfig = serde_yaml_ng::from_str(
+            "tunnel_refused_addresses: [\"203.0.113.7\", \"2001:db8::1\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tls.tunnel_refused_addresses,
+            vec![
+                "203.0.113.7".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+        assert!(serde_yaml_ng::from_str::<TlsConfig>(
+            "tunnel_refused_addresses: [\"proxy.example\"]\n"
+        )
+        .is_err());
     }
 }

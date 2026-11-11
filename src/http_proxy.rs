@@ -307,12 +307,6 @@ mod range_fit_predicate_tests {
         assert!(!fits(0, u64::MAX, Some("0")), "no overflow at u64::MAX");
     }
 }
-/// Construct an empty `BoxBody` suitable for error responses (e.g., 504 Gateway Timeout).
-pub(crate) fn empty_boxed_body() -> BoxBody<Bytes, hyper::Error> {
-    Full::new(Bytes::new())
-        .map_err(|never| match never {})
-        .boxed()
-}
 
 /// Result of evaluating client conditional headers against cached metadata
 /// in Mode B (`evaluate_conditions_from_cache = true`).
@@ -1623,10 +1617,7 @@ impl HttpProxy {
                 ));
 
                 // Create a dedicated resolver for policy checks
-                use hickory_resolver::config::{
-                    ResolveHosts, ResolverConfig, ResolverOpts, CLOUDFLARE, GOOGLE,
-                };
-                use hickory_resolver::net::runtime::TokioRuntimeProvider;
+                use hickory_resolver::config::{ResolverConfig, CLOUDFLARE, GOOGLE};
                 let mut resolver_config = ResolverConfig::default();
                 for ns in GOOGLE.udp_and_tcp() {
                     resolver_config.add_name_server(ns);
@@ -1634,15 +1625,11 @@ impl HttpProxy {
                 for ns in CLOUDFLARE.udp_and_tcp() {
                     resolver_config.add_name_server(ns);
                 }
-                let mut resolver_opts = ResolverOpts::default();
-                resolver_opts.use_hosts_file = ResolveHosts::Never;
                 let resolver = Arc::new(
-                    TokioResolver::builder_with_config(
+                    crate::connection_pool::build_resolver(
                         resolver_config,
-                        TokioRuntimeProvider::default(),
+                        config.connection_pool.dns_ip_strategy,
                     )
-                    .with_options(resolver_opts)
-                    .build()
                     .expect("Failed to build HTTP-path policy DNS resolver"),
                 );
 
@@ -15952,14 +15939,28 @@ impl HttpProxy {
                                     part_number = part_number,
                                     re_subscribe_count = re_subscribe_count,
                                     max_resubscriptions = max_resubscriptions,
-                                    "Download coordination: part waiter exceeded max re-subscriptions, returning 504"
+                                    "Download coordination: part waiter exceeded max re-subscriptions, fetching from S3 itself"
                                 );
 
-                                let response = Response::builder()
-                                    .status(hyper::StatusCode::GATEWAY_TIMEOUT)
-                                    .body(crate::http_proxy::empty_boxed_body())
-                                    .unwrap();
-                                return Ok(response);
+                                // Fetch for this request alone, as the full-object waiter
+                                // does: no flight registered and no guard held, so the
+                                // fill it gave up on is neither waited on nor raced.
+                                return Self::forward_get_head_to_s3_and_cache(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    cache_manager,
+                                    s3_client,
+                                    range_handler,
+                                    config.clone(),
+                                    resolved,
+                                    proxy_referer,
+                                    None,
+                                    permit,
+                                )
+                                .await;
                             }
 
                             // Check if FetchGuard still exists
@@ -16337,14 +16338,52 @@ impl HttpProxy {
                                     range_end = range_spec.end,
                                     re_subscribe_count = re_subscribe_count,
                                     max_resubscriptions = max_resubscriptions,
-                                    "Download coordination: range waiter exceeded max re-subscriptions, returning 504"
+                                    "Download coordination: range waiter exceeded max re-subscriptions, fetching from S3 itself"
                                 );
 
-                                let response = Response::builder()
-                                    .status(hyper::StatusCode::GATEWAY_TIMEOUT)
-                                    .body(crate::http_proxy::empty_boxed_body())
-                                    .unwrap();
-                                return Ok(response);
+                                // Fetch for this request alone, as the full-object waiter
+                                // does: no flight registered and no guard held, so the
+                                // fill it gave up on is neither waited on nor raced.
+                                return if is_signed {
+                                    Self::forward_signed_range_request(
+                                        method,
+                                        uri,
+                                        host,
+                                        headers,
+                                        cache_key,
+                                        range_spec,
+                                        overlap,
+                                        cache_manager,
+                                        range_handler,
+                                        s3_client,
+                                        config,
+                                        resolved,
+                                        proxy_referer,
+                                        None,
+                                        permit.clone(),
+                                    )
+                                    .await
+                                } else {
+                                    Self::forward_range_request_to_s3(
+                                        method,
+                                        uri,
+                                        host,
+                                        headers,
+                                        cache_key,
+                                        range_spec,
+                                        overlap,
+                                        cache_manager,
+                                        range_handler,
+                                        s3_client,
+                                        config,
+                                        preloaded_metadata,
+                                        resolved,
+                                        proxy_referer,
+                                        None,
+                                        permit.clone(),
+                                    )
+                                    .await
+                                };
                             }
 
                             // Check if FetchGuard still exists
@@ -21799,7 +21838,9 @@ impl HttpProxy {
                 // Resolve the connect IP: IP literals dial directly; hostnames go
                 // through the pool's configured DNS resolver (bypasses /etc/hosts,
                 // which would loop hosts-file routing back to the proxy).
-                let ip = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                let ip = if let Ok(ip) =
+                    crate::https_connector::unbracketed(host).parse::<std::net::IpAddr>()
+                {
                     ip
                 } else {
                     let pool = s3_client.get_connection_pool();
@@ -21839,6 +21880,7 @@ impl HttpProxy {
                     validated_endpoint,
                     timeouts: s3_client.upstream_timeouts(),
                     response_ledger: Some(s3_client.get_inflight_ledger()),
+                    health: None,
                 }))
             }
             None => {
@@ -21884,6 +21926,13 @@ impl HttpProxy {
                 Some(Arc::new(UpstreamTransport {
                     timeouts: s3_client.upstream_timeouts(),
                     response_ledger: Some(s3_client.get_inflight_ledger()),
+                    health: s3_client.ip_health_tracker().map(|tracker| {
+                        crate::signed_request_proxy::UpstreamHealth {
+                            tracker,
+                            pool: Arc::clone(&pool),
+                            host: host.to_string(),
+                        }
+                    }),
                     ..UpstreamTransport::verified_tls_443(ip, tls)
                 }))
             }
@@ -21959,6 +22008,20 @@ mod tests {
         );
         assert_eq!(
             HttpProxy::signed_forward_error_response(&uri, &Method::PUT, other).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+    /// A GET whose every connect failed reaches the client as 502 BadGateway.
+    #[test]
+    fn a_connect_failure_on_a_get_is_a_502() {
+        let uri: Uri = "/bucket/key".parse().unwrap();
+        let err = crate::ProxyError::UpstreamSendFailed {
+            message: "Failed to send request: client error (Connect)".into(),
+            detail: "client error (Connect): tcp connect error".into(),
+            kind: crate::error::UpstreamSendFailureKind::Connect,
+        };
+        assert_eq!(
+            HttpProxy::s3_forward_error_response(&uri, &"GET", &err, "fallback").status(),
             StatusCode::BAD_GATEWAY
         );
     }
@@ -22365,6 +22428,17 @@ mod tests {
         config: crate::config::ConnectionPoolConfig,
         allowlisted: bool,
     ) -> std::net::IpAddr {
+        signed_write_transport(host, authority_port, config, allowlisted)
+            .await
+            .0
+    }
+    /// [`signed_write_transport_ip`], with whether the transport carries IP health.
+    async fn signed_write_transport(
+        host: &str,
+        authority_port: u16,
+        config: crate::config::ConnectionPoolConfig,
+        allowlisted: bool,
+    ) -> (std::net::IpAddr, bool) {
         let policy = allowlisted.then(|| {
             Arc::new(DestinationPolicy::new(
                 80,
@@ -22387,8 +22461,8 @@ mod tests {
         let s3_client: Arc<dyn S3ClientApi + Send + Sync> = client;
         HttpProxy::resolve_signed_upstream_transport(host, authority_port, &s3_client)
             .await
+            .map(|transport| (transport.ip, transport.health.is_some()))
             .expect("the name resolves")
-            .ip
     }
 
     /// The default signed-write arm dials only an address the policy accepts.
@@ -22418,6 +22492,28 @@ mod tests {
         // Control: without a policy the same arm takes the first address, loopback.
         let ip = signed_write_transport_ip(host, 8080, config, false).await;
         assert_eq!(ip, "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+    }
+    /// Only the default signed-write arm carries the GET path's IP health, so a failed
+    /// signed write counts against its address there. An `upstream_overrides` arm dials
+    /// a destination the operator named and records nothing.
+    #[tokio::test]
+    async fn only_the_default_signed_write_arm_records_ip_health() {
+        let host = "allowlisted.example.test";
+        let (_, default_health) = signed_write_transport(host, 443, Default::default(), true).await;
+        assert!(
+            default_health,
+            "the default signed-write arm must carry IP health"
+        );
+        let mut config = crate::config::ConnectionPoolConfig::default();
+        config.upstream_overrides.insert(
+            format!("{host}:8080"),
+            crate::config::UpstreamOverrideConfig {
+                scheme: crate::config::UpstreamScheme::Http,
+                validate_tls: false,
+            },
+        );
+        let (_, override_health) = signed_write_transport(host, 8080, config, true).await;
+        assert!(!override_health, "the override arm must carry no IP health");
     }
 
     #[test]

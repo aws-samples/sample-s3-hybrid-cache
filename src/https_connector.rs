@@ -648,8 +648,16 @@ pub(crate) fn recover_tls_name(uri: &Uri, pool_manager: &ConnectionPoolManager) 
         return Some(carried);
     }
     uri.host()
-        .and_then(|host| host.parse::<IpAddr>().ok())
+        .and_then(|host| unbracketed(host).parse::<IpAddr>().ok())
         .and_then(|ip| pool_manager.get_hostname_for_ip(&ip))
+}
+
+/// A URI host without the square brackets an IPv6 literal carries in an authority
+/// (`[2001:db8::1]` becomes `2001:db8::1`). Any other host is returned unchanged.
+pub(crate) fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// Read the host carried in a rewritten authority's userinfo, if it is usable as a
@@ -714,7 +722,7 @@ impl Service<Uri> for CustomHttpsConnector {
             // "file it under the dotted quad" — see
             // `ConnectionPoolManager::get_metrics_endpoint_key`.
             let (connect_ip, tls_hostname, metrics_endpoint_key) = if let Ok(ip) =
-                uri_host.parse::<IpAddr>()
+                unbracketed(uri_host).parse::<IpAddr>()
             {
                 // URI host is an IP — IpDistributor already selected it. The TLS
                 // name is the host this request targeted, carried in the authority's
@@ -743,7 +751,7 @@ impl Service<Uri> for CustomHttpsConnector {
                             "[HTTPS_CONNECTOR] No hostname mapping found for IP {}, TLS SNI may fail",
                             ip
                         );
-                        (ip, uri_host.to_string(), metrics_key)
+                        (ip, ip.to_string(), metrics_key)
                     }
                 }
             } else {
@@ -1728,6 +1736,79 @@ mod tests {
             seen_sni.lock().unwrap().as_slice(),
             &[Some(REGIONAL.to_string())],
             "the SNI sent must be the endpoint name with the bucket removed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bracketed_authority_tests {
+    use super::*;
+    use crate::config::{ConnectionPoolConfig, UpstreamOverrideConfig, UpstreamScheme};
+
+    /// A bracketed IPv6 authority, the form the IP-distribution rewrite and an
+    /// IPv6-literal origin both produce, is dialled as that address. The bracketed
+    /// string never reaches the name lookup.
+    #[tokio::test]
+    async fn a_bracketed_ipv6_authority_is_dialled_without_a_name_lookup() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // `::1` where the host has IPv6 loopback. Otherwise the IPv4-mapped form of a
+        // 127.0.0.1 listener, which is still a bracketed IPv6 literal in the URI.
+        let (listener, literal) = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => (l, "::1"),
+            Err(_) => (
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                "::ffff:127.0.0.1",
+            ),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let bracketed = format!("[{literal}]");
+        let config = ConnectionPoolConfig::default();
+        let pool_manager = Arc::new(tokio::sync::RwLock::new(
+            ConnectionPoolManager::new_with_config(config.clone()).unwrap(),
+        ));
+        pool_manager
+            .read()
+            .await
+            .seed_dns_failure_for_test(&bracketed);
+        let overrides: std::collections::HashMap<String, UpstreamOverrideConfig> = [(
+            format!("{bracketed}:{port}"),
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: true,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let mut connector = CustomHttpsConnector::new(
+            Arc::clone(&pool_manager),
+            Arc::new(rustls::RootCertStore::empty()),
+            config,
+            Arc::new(IpHealthTracker::new(3)),
+            Arc::new(UpstreamOverrides::from_config(&overrides)),
+        );
+        let uri: Uri = format!("http://{bracketed}:{port}/bucket/key")
+            .parse()
+            .unwrap();
+        let connected = tokio::time::timeout(Duration::from_secs(10), connector.call(uri))
+            .await
+            .expect("the connect must not hang");
+        assert!(
+            connected.is_ok(),
+            "a bracketed IPv6 authority must be dialled: {:?}",
+            connected.err()
+        );
+        let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+        assert!(
+            matches!(accepted, Ok(Ok(_))),
+            "the listener on {literal} must see the connection"
+        );
+        assert_eq!(
+            pool_manager
+                .read()
+                .await
+                .dns_lookups_started_for_test(&bracketed),
+            0,
+            "the bracketed string must never reach the name lookup"
         );
     }
 }

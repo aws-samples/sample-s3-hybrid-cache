@@ -10033,6 +10033,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: crate::signed_request_proxy::UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         });
 
         // Bounded so a regression in the body-feeding path fails this test instead of
@@ -17155,6 +17156,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: crate::signed_request_proxy::UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         });
 
         let response = tokio::time::timeout(
@@ -17484,6 +17486,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: crate::signed_request_proxy::UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         })
     }
 

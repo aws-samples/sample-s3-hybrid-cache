@@ -1604,3 +1604,177 @@ async fn widened_page_with_an_etagless_extent_is_not_merged_with_another_version
         seen
     );
 }
+
+// ---------------------------------------------------------------------------
+// A range waiter's fallback over a version change during its wait
+// ---------------------------------------------------------------------------
+
+/// How a waiter's wait ends: its leader goes away without an answer, or its budget runs out
+/// while the leader is still working.
+#[derive(Clone, Copy)]
+enum WaitEnd {
+    LeaderGone,
+    BudgetSpent,
+}
+
+/// A SigV4 `Authorization` whose `SignedHeaders` name `range`, so the proxy must send the
+/// client's request on unchanged.
+const SIGNED_RANGE_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20250101/us-west-2/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=0123456789abcdef";
+
+impl Harness {
+    /// A harness whose waiters give up after `wait_secs` and do not re-subscribe.
+    async fn with_spent_budget(wait_secs: u64) -> Self {
+        let mut config = Config::default();
+        config.cache.download_coordination.enabled = true;
+        config.cache.download_coordination.wait_timeout_secs = wait_secs;
+        config
+            .cache
+            .download_coordination
+            .max_waiter_resubscriptions = 0;
+        config.cache.ram_cache_enabled = false;
+        config.cache.full_object_check_threshold = 512;
+        let config = Arc::new(config);
+        let (t, cache_manager, range_handler) = make_infra(&config).await;
+        Self {
+            _t: t,
+            cache_manager,
+            range_handler,
+            config,
+            tracker: Arc::new(InFlightTracker::new()),
+        }
+    }
+}
+
+/// The cache holds version 1 of the first page. A range waiter that listed it is waiting
+/// on a leader that never answers. While it waits the origin changes to version 2, and
+/// when its wait ends it fetches for itself. Its client must receive version 2's bytes
+/// with version 2's headers, never version 1 bytes joined to version 2 bytes. With
+/// `through_proxy` the overwrite is also acknowledged by the proxy, which removes the
+/// cached entry; without it the overwrite went straight to the origin and the cache still
+/// says version 1.
+async fn run_range_waiter_across_a_version_change(
+    signed: bool,
+    end: WaitEnd,
+    through_proxy: bool,
+    name: &str,
+) {
+    let h = Arc::new(match end {
+        WaitEnd::LeaderGone => Harness::new(true).await,
+        WaitEnd::BudgetSpent => Harness::with_spent_budget(1).await,
+    });
+    let key = format!("bucket/{name}.bin");
+    seed_v1_extent(&key, &h.cache_manager, 0, PAGE_SIZE - 1, OBJECT_SIZE).await;
+    // Every request the origin sees is a request made after the wait began: it is version 2.
+    let s3 = VersionedS3::new(0, OBJECT_SIZE, Duration::ZERO).await;
+    // The flight key of the whole requested range: the cache key, then `:start-end`.
+    let guard = match h
+        .tracker
+        .try_register(&format!("{key}:0-{}", OBJECT_SIZE - 1))
+    {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let client = if signed {
+        with(&[("authorization", SIGNED_RANGE_AUTHORIZATION)])
+    } else {
+        HashMap::new()
+    };
+    let waiter = {
+        let (h, s3, key) = (h.clone(), s3.clone(), key.clone());
+        let range = format!("bytes=0-{}", OBJECT_SIZE - 1);
+        tokio::spawn(async move {
+            h.range_get(&key, &range, client, ResolvedSettings::default(), false, s3)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !waiter.is_finished() && s3.seen().is_empty(),
+        "PRECONDITION MISSING: the request must be waiting on the leader, with no origin \
+         request yet: {:?}",
+        s3.seen()
+    );
+    if through_proxy {
+        h.cache_manager
+            .invalidate_cache_unified_for_operation(&key, "PUT")
+            .await
+            .expect("the overwrite's invalidation");
+    }
+    if matches!(end, WaitEnd::LeaderGone) {
+        drop(guard);
+    } else {
+        // Held until the waiter's budget runs out.
+        let served = tokio::time::timeout(Duration::from_secs(30), waiter)
+            .await
+            .expect("the waiter must answer once its budget is spent")
+            .expect("waiter join");
+        drop(guard);
+        return assert_one_version(&served, &s3);
+    }
+    let served = tokio::time::timeout(Duration::from_secs(30), waiter)
+        .await
+        .expect("the waiter must answer once its leader is gone")
+        .expect("waiter join");
+    assert_one_version(&served, &s3);
+}
+
+fn assert_one_version(served: &Served, s3: &VersionedS3) {
+    assert!(
+        served.status == StatusCode::OK || served.status == StatusCode::PARTIAL_CONTENT,
+        "the waiter must be served by its own fetch, got {}: {:?}",
+        served.status,
+        s3.seen()
+    );
+    assert_eq!(
+        served.body.len() as u64,
+        OBJECT_SIZE,
+        "the whole requested range"
+    );
+    assert_eq!(
+        body_version(&served.body),
+        Some(V2_ETAG),
+        "the body must be version 2 throughout, not version 1 bytes joined to version 2 \
+         (first {} bytes are {:?}, headers {:?}): {:?}",
+        PAGE_SIZE,
+        &served.body[..4],
+        served.etag,
+        s3.seen()
+    );
+    assert_eq!(
+        served.etag.as_deref().map(unquote),
+        Some(unquote(V2_ETAG)),
+        "the headers must name the version of the bytes sent"
+    );
+}
+
+#[tokio::test]
+async fn an_unsigned_range_waiter_whose_leader_is_gone_serves_one_version_after_an_overwrite() {
+    run_range_waiter_across_a_version_change(false, WaitEnd::LeaderGone, false, "vc-un-gone").await;
+}
+
+#[tokio::test]
+async fn an_unsigned_range_waiter_whose_budget_ran_out_serves_one_version_after_an_overwrite() {
+    run_range_waiter_across_a_version_change(false, WaitEnd::BudgetSpent, false, "vc-un-spent")
+        .await;
+}
+
+#[tokio::test]
+async fn a_signed_range_waiter_whose_leader_is_gone_serves_one_version_after_an_overwrite() {
+    run_range_waiter_across_a_version_change(true, WaitEnd::LeaderGone, false, "vc-sg-gone").await;
+}
+
+#[tokio::test]
+async fn a_signed_range_waiter_whose_budget_ran_out_serves_one_version_after_an_overwrite() {
+    run_range_waiter_across_a_version_change(true, WaitEnd::BudgetSpent, false, "vc-sg-spent")
+        .await;
+}
+
+#[tokio::test]
+async fn an_unsigned_range_waiter_serves_one_version_after_an_overwrite_through_the_proxy() {
+    run_range_waiter_across_a_version_change(false, WaitEnd::LeaderGone, true, "vc-un-proxy").await;
+}
+
+#[tokio::test]
+async fn a_signed_range_waiter_serves_one_version_after_an_overwrite_through_the_proxy() {
+    run_range_waiter_across_a_version_change(true, WaitEnd::LeaderGone, true, "vc-sg-proxy").await;
+}

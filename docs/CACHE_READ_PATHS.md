@@ -634,7 +634,7 @@ A waiter waits up to `wait_timeout_secs` for the fetcher to finish:
 
 - **The fetcher succeeds**: the waiter tries the cache first, since the fetcher should have cached the data. On a hit, it serves the response from disk or RAM with no S3 request. If the lookup misses, for example because the metadata is not yet consolidated, it makes its own S3 fetch.
 - **The fetcher fails**: the waiter makes its own S3 fetch.
-- **The wait times out**: the waiter waits on the same fetch again, up to `max_waiter_resubscriptions` times (default `3`). After that, a full-object GET or HEAD waiter makes its own S3 fetch, and the proxy answers a part or range waiter `504 Gateway Timeout`.
+- **The wait times out**: the waiter waits on the same fetch again, up to `max_waiter_resubscriptions` times (default `3`). After that, the waiter makes its own S3 fetch, whether it asked for a full object, a range or a part.
 
 ```yaml
 cache:

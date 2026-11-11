@@ -148,10 +148,12 @@ async fn test_tcp_passthrough_mode() {
     let tcp_addr = SocketAddr::from(([127, 0, 0, 1], 8443));
 
     // Create TCP proxy for passthrough mode
-    let _tcp_proxy = TcpProxy::new(
+    let _tcp_proxy = TcpProxy::new_with_dns_ip_strategy(
         tcp_addr,
         s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
         Arc::new(DestinationPolicy::new(443, None, HashSet::new())),
+        s3_proxy::config::ConnectionPoolConfig::default().dns_ip_strategy,
+        Arc::new(s3_proxy::destination_policy::OwnAddresses::new(&[])),
     );
 
     // Verify TCP proxy can be created and configured
@@ -275,14 +277,18 @@ async fn test_end_to_end_proxy_setup() {
 
     // TCP proxy setup (for HTTPS passthrough)
     let tcp_addr = SocketAddr::from(([127, 0, 0, 1], 8443));
-    let _tcp_proxy = TcpProxy::new(
+    let _tcp_proxy = TcpProxy::new_with_dns_ip_strategy(
         tcp_addr,
         s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
         Arc::new(DestinationPolicy::new(443, None, HashSet::new())),
+        s3_proxy::config::ConnectionPoolConfig::default().dns_ip_strategy,
+        Arc::new(s3_proxy::destination_policy::OwnAddresses::new(&[])),
     );
 
     // Connection pool manager setup
-    let manager = ConnectionPoolManager::new().expect("Failed to create connection pool manager");
+    let manager =
+        ConnectionPoolManager::new_with_config(s3_proxy::config::ConnectionPoolConfig::default())
+            .expect("Failed to create connection pool manager");
 
     // Verify manager starts with no distributors
     let stats = manager.get_ip_distribution_stats();
@@ -297,7 +303,8 @@ async fn test_end_to_end_proxy_setup() {
 async fn test_s3_compatible_services() {
     // Test that hostname lookup works for IPs in distributors
     let mut manager =
-        ConnectionPoolManager::new().expect("Failed to create connection pool manager");
+        ConnectionPoolManager::new_with_config(s3_proxy::config::ConnectionPoolConfig::default())
+            .expect("Failed to create connection pool manager");
 
     let ips = vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
     manager.ip_distributors.insert(

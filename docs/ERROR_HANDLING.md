@@ -115,11 +115,11 @@ To monitor it:
 
 ### 7. Stalled upstream responses (mid-stream idle watchdog)
 
-**Detection**: no bytes arrive from the upstream within `upstream_idle_timeout` (default `5s`) while the proxy is trying to read. Backpressure from a slow client does not count as an idle upstream.
+**Detection**: no bytes arrive from the upstream within `upstream_idle_timeout` (default `5s`) while the proxy is trying to read. The watchdog covers the cache-miss fetches the proxy streams: full-object GETs, part-number GET misses, complete range misses and signed ranges; see [Upstream idle watchdog](CONNECTION_POOLING.md#upstream-idle-watchdog). Backpressure from a slow client does not count as an idle upstream.
 
 **What the proxy does**:
 
-- **Before the first byte**: it retries up to `upstream_idle_retries` times (default 2), failing over through the connection pool. When the retries run out, it answers `504 Gateway Timeout`.
+- **Before the first byte** of a full-object GET, a part-number GET or a HEAD: it retries up to `upstream_idle_retries` times (default 2), failing over through the connection pool. When the retries run out, it answers `504 Gateway Timeout`.
 - **Mid-stream**: it closes the client connection, ending the body early, and the client's own retry logic takes over. The requested range is never cached as if it had arrived whole.
 
 The idle timer measures a gap with no bytes, not the total transfer time, so a slow transfer that keeps making progress is never aborted. While the cache writer cannot keep up, the proxy stops asking the upstream for data and the timer pauses. An aborted fetch never publishes a truncated `.bin` under the requested bounds. If at least `cache.partial_range_commit_ratio` (default `0.5`) of the requested bytes arrived in order, the proxy caches them as a smaller valid range; otherwise it deletes the temporary file. See [Cache safety](CONNECTION_POOLING.md#cache-safety). The watchdog does not apply while a request waits for another request's fetch of the same object, which has its own coordination timeout.
@@ -215,7 +215,7 @@ Every request the proxy forwards over the HTTP listener or the TLS proxy listene
 - A `Via` entry from another proxy, as in [chaining to another proxy](CONFIGURATION.md), is kept, and this proxy's entry is appended after it.
 - A request that signs `via`, in its `Authorization` header's `SignedHeaders` or in a presigned URL's `X-Amz-SignedHeaders`, is forwarded with its `Via` unchanged. It carries no entry from this proxy, so a loop through it is not detected. This is the only exception: every other forwarded request carries the entry, including cache revalidation and refetch requests.
 - The entry is added whatever `add_referer_header` is set to; no setting turns it off.
-- The HTTPS passthrough (port 443) never reads request headers, so it neither adds the entry nor detects loops.
+- The HTTPS passthrough (port 443) never reads request headers, so it does not add the entry. Both it and `CONNECT` tunnels refuse a destination that leads back to a proxy instead ([Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection)).
 
 ### 10. Writes the origin stops answering
 
@@ -240,15 +240,14 @@ The proxy passes S3's own error responses through. It answers the statuses below
 | `400` | `BadRequest` | The proxy could not read the client's request body |
 | `400` | None: a plain-text body | A presigned URL whose signing parameters cannot be parsed, or, on the TLS listener, a CONNECT request that names no target |
 | `403` | `AccessDenied` | On the HTTP paths, the destination policy refuses the request's destination; see [Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection) |
-| `403` | None: a plain-text body | A presigned URL that has expired, refused before the cache lookup, or a CONNECT tunnel whose destination the policy refuses (the body is `Forbidden`) |
+| `403` | None: a plain-text body | A presigned URL that has expired, refused before the cache lookup, or a CONNECT tunnel whose destination the policy refuses (the body is `Forbidden`). A CONNECT tunnel to a destination that leads back to a proxy gets the body `Forbidden: the destination leads back to a proxy` |
 | `405` | `MethodNotAllowed` | A method other than GET, HEAD, PUT, POST and DELETE |
 | `413` | `EntityTooLarge` | A body over S3's 5 GiB single-part PUT and UploadPart maximum, or a CompleteMultipartUpload body over `max_complete_body_bytes` (default 10 MiB). A request that declares its size in `Content-Length` is refused before any upstream connection opens. A streamed body with no `Content-Length` that passes 5 GiB is refused mid-stream, after the upstream request has started |
 | `500` | `InternalError` | An internal failure that is not the client's or the origin's |
 | `501` | `NotImplemented` | A SelectObjectContent request; see [Operations that bypass cache](CACHING.md#operations-that-bypass-cache) |
 | `502` | `BadGateway` | The origin cannot be reached, or S3's answer to a write is over 8 MiB or cut short. A request that waited on another request's fetch at `get_ttl: "0s"` also gets `502` when its own revalidation request to S3 does not complete, whatever the cause |
 | `503` | `SlowDown` | `server.max_concurrent_requests` or `server.max_inflight_buffer_bytes` is reached. The response carries `Retry-After` |
-| `504` | `GatewayTimeout` | An upstream timeout: a full-object GET or HEAD whose first byte does not arrive in time, a write's connect or idle bound, or the fixed 30-second timeout on each upstream read request |
-| `504` | None: an empty body | A part or range request that waited on another request's fetch and ran out of `max_waiter_resubscriptions`; see [Download coordination](CACHE_READ_PATHS.md#download-coordination) |
+| `504` | `GatewayTimeout` | An upstream timeout: a full-object GET, a part-number GET or a HEAD whose first byte does not arrive in time, a write's connect or idle bound, or the fixed 30-second timeout on each upstream read request |
 | `508` | `LoopDetected` | The request has already passed through this proxy; see [Request loops](#9-request-loops-via-and-508-loop-detected) |
 
 ## Error metrics

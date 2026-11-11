@@ -140,6 +140,9 @@ endpoints:
 The server accepts at most 50 concurrent connections. It rejects further connections and logs
 each rejection at WARN with the peer address.
 
+A log request reads at most the eight newest application log files, and at most the last 1 MiB
+of each, so older entries do not appear in the viewer or in `/api/logs`.
+
 ## Performance impact
 
 An open page polls the proxy at the two refresh intervals, and each poll reads cache statistics

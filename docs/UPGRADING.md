@@ -10,11 +10,11 @@ see different memory use, connection counts, network exposure, or on-disk layout
 binary swap. The tables below list the releases that do one of those things, so you can
 read only the ones between your current version and your target.
 
-For 3.0.0 to 3.0.3, [Upgrading to 3.0.0](#upgrading-to-300), [Upgrading to 3.0.1](#upgrading-to-301), [Upgrading to 3.0.2](#upgrading-to-302), [Upgrading to 3.0.3](#upgrading-to-303) and the guides they link carry the detail, and
+For 3.0.0 to 3.0.5, each release's section below, from [Upgrading to 3.0.5](#upgrading-to-305) to [Upgrading to 3.0.0](#upgrading-to-300), and the guides it links carry the detail, and
 the [changelog](../CHANGELOG.md) summarizes each release. For every release up to 2.8.4,
 the detail is in the [pre-3.0.0 changelog](../changelog-pre-v3.md).
 
-3.0.0 upgrades in place from any 2.8 release, and 3.0.1, 3.0.2 and 3.0.3 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
+3.0.0 upgrades in place from any 2.8 release, and 3.0.1 to 3.0.5 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
 After 3.0.0, restart a fleet one proxy at a time. Clients that fail over, such as CRT-based ones, retry on another proxy while one restarts, and the cache volume survives restarts.
 Releases from before 1.0.0 are not covered. Upgrading from a pre-1.0.0 build is not a
 supported path; start from a fresh cache directory and a config derived from the
@@ -27,6 +27,7 @@ cannot be read.
 
 | Version | Action |
 |---|---|
+| 3.0.5 | Deployments whose DNS64 resolver uses the local-use NAT64 range `64:ff9b:1::/48`, clients that reach a proxy's own addresses through the HTTPS passthrough or `CONNECT`, and fleets that set `connection_pool.ip_failure_threshold` against the old count have a step to take; see [Upgrading to 3.0.5](#upgrading-to-305). |
 | 3.0.2 | Operators with an allowlist and S3 on private addresses, S3 Select clients, or alarms on removed `/metrics` fields, and code built on the `s3_proxy` library, have a step to take; see [Upgrading to 3.0.2](#upgrading-to-302). |
 | 3.0.1 | Fleets where objects are overwritten in place, and proxies whose clocks may differ from the cache volume's file server by 10 minutes or more, have a step to take; see [Upgrading to 3.0.1](#upgrading-to-301). |
 | 3.0.0 | Operators with their own hardened systemd unit, Docker, health or metrics checks from another host, `cache_rules.json` patterns with special characters, several proxies on one cache volume, or an S3-compatible origin that omits the `Range` total have a step to take; see [Upgrading to 3.0.0](#upgrading-to-300). |
@@ -86,6 +87,35 @@ corrupted.
 Releases not listed above require no action and change no defaults: internal fixes,
 performance work, additive opt-in features that stay disabled until configured, and
 dependency bumps.
+
+## Upgrading to 3.0.5
+
+3.0.5 upgrades in place from 3.0.4 and needs no configuration change: its two new fields, `connection_pool.dns_ip_strategy` and `server.tls.tunnel_refused_addresses`, have defaults. When upgrading from 3.0.3 or earlier, take those releases' steps as well. It lets the proxy connect to an origin's IPv6 addresses on every path, and tightens which destinations the HTTPS passthrough (port 443) and `CONNECT` tunnels accept.
+
+### Before upgrading to 3.0.5
+
+- If your DNS64 resolver synthesizes addresses in the local-use NAT64 range `64:ff9b:1::/48`, list the addresses the proxy needs in `connection_pool.endpoint_overrides` before upgrading. 3.0.5 refuses that range on the HTTPS passthrough and `CONNECT` tunnels, and on the HTTP forwarding paths once `server.tls.connect_allowlist` is set ([Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection)).
+- The well-known prefix `64:ff9b::/96`, which DNS64 in an Amazon VPC uses, needs no change. An address in it is judged by the IPv4 address it embeds.
+
+### What you will see after upgrading to 3.0.5
+
+- A GET or HEAD that IP distribution sends to an origin's IPv6 address connects to it. On a host with no IPv6 route, set `connection_pool.dns_ip_strategy: ipv4_only`, because the default tries IPv6 addresses first ([Address families](CONFIGURATION.md#address-families)).
+- The HTTPS passthrough and `CONNECT` tunnels refuse a destination with an address on the proxy host's interfaces, a loopback or unspecified address, or one in `server.tls.tunnel_refused_addresses`, even when `endpoint_overrides` lists it. The passthrough closes the connection, and `CONNECT` answers `403` with the body `Forbidden: the destination leads back to a proxy`.
+- To refuse the addresses that reach a proxy without being on its interfaces, such as each proxy's EC2 public IPv4 or Elastic IP address, list them in `server.tls.tunnel_refused_addresses` ([Credentials and network access](AWS_DEPLOYMENT.md#credentials-and-network-access)).
+- The HTTPS passthrough and `CONNECT` tunnels try each allowed address in turn, each attempt for up to 10 seconds and the whole connect for up to 30. A `CONNECT` connect attempt now gives up after 10 seconds and moves to the next address.
+- A GET or HEAD whose upstream connect fails is retried up to three times before the proxy answers `502`, which adds up to 700 ms of waiting. A signed range GET can make up to 12 attempts and wait up to 2.4 s. With IP distribution on, each retry goes to the next address.
+- A key whose cache rule turns hedging on follows different connect-retry rules ([Hedging](HEDGING.md#connection-diversity)).
+- A failed connect counts once against its address, so an address that refuses connections leaves rotation after `ip_failure_threshold` failed connects (3 by default) instead of 2. Review the threshold if you set it against the old count.
+- Uploads and other writes count failed connects against the address too, so an address that keeps failing leaves rotation for reads and writes alike.
+- A part or range request that waited on another request's fetch through all its rejoins fetches from S3 itself instead of getting `504`.
+- A dashboard log request reads at most the eight newest application log files.
+
+### During a rolling upgrade to 3.0.5
+
+3.0.5 uses the cache volume as 3.0.4 does, so 3.0.4 and 3.0.5 proxies can share it while the fleet is upgraded one proxy at a time.
+
+- A 3.0.4 proxy ignores `dns_ip_strategy` and `tunnel_refused_addresses` in a shared `config.yaml`, so it keeps trying IPv6 addresses first and does not refuse the listed addresses.
+- Until it is upgraded, a 3.0.4 proxy still fails to connect to an origin's IPv6 addresses and still relays a passthrough or `CONNECT` connection back to itself. It also still answers a part or range waiter `504`.
 
 ## Upgrading to 3.0.4
 

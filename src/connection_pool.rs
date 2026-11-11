@@ -6,7 +6,7 @@
 use crate::destination_policy::DestinationPolicy;
 use crate::{ProxyError, Result};
 use dashmap::DashMap;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// Builds the DNS resolver for every resolver site in the proxy. The lookup strategy is set
+/// here explicitly, so a change to the resolver library's default cannot change which address
+/// family the proxy dials first. The hosts file is never read.
+pub fn build_resolver(
+    resolver_config: ResolverConfig,
+    strategy: crate::config::DnsIpStrategy,
+) -> std::result::Result<TokioResolver, hickory_resolver::net::NetError> {
+    TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+        .with_options(resolver_options(strategy))
+        .build()
+}
+
+/// The resolver options `build_resolver` uses.
+pub fn resolver_options(strategy: crate::config::DnsIpStrategy) -> ResolverOpts {
+    let mut opts = ResolverOpts::default();
+    opts.use_hosts_file = ResolveHosts::Never; // bypass /etc/hosts
+    opts.ip_strategy = strategy.to_lookup_strategy();
+    opts
+}
 
 // ---------------------------------------------------------------------------
 // EndpointOverrides — shared exact + suffix hostname-to-IP resolution
@@ -746,48 +766,9 @@ pub struct ConnectionPoolManager {
 }
 
 impl ConnectionPoolManager {
-    /// Create a new connection pool manager with external DNS servers
-    pub fn new() -> Result<Self> {
-        use hickory_resolver::config::{ResolveHosts, CLOUDFLARE, GOOGLE};
-        let mut config = ResolverConfig::default();
-        for ns in GOOGLE.udp_and_tcp() {
-            config.add_name_server(ns);
-        }
-        for ns in CLOUDFLARE.udp_and_tcp() {
-            config.add_name_server(ns);
-        }
-
-        let mut opts = ResolverOpts::default();
-        opts.use_hosts_file = ResolveHosts::Never;
-
-        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
-            .with_options(opts)
-            .build()
-            .map_err(|e| {
-                ProxyError::ConnectionError(format!("Failed to build DNS resolver: {}", e))
-            })?;
-        info!("DNS resolver initialized with external servers (bypassing /etc/hosts)");
-
-        Ok(Self {
-            lookup: Arc::new(NameLookup::new(
-                resolver,
-                EndpointOverrides::from_config(&HashMap::new()),
-                Duration::from_secs(60),
-                10_000,
-            )),
-            default_dns_refresh_interval: Duration::from_secs(60),
-            dns_refresh_count: 0,
-            overrides: EndpointOverrides::from_config(&HashMap::new()),
-            ip_distributors: HashMap::new(),
-            resolved_ips: HashMap::new(),
-            last_dns_refresh: HashMap::new(),
-            max_registered_endpoints: 10_000,
-        })
-    }
-
     /// Create a new connection pool manager with configuration
     pub fn new_with_config(config: crate::config::ConnectionPoolConfig) -> Result<Self> {
-        use hickory_resolver::config::{NameServerConfig, ResolveHosts, CLOUDFLARE, GOOGLE};
+        use hickory_resolver::config::{NameServerConfig, CLOUDFLARE, GOOGLE};
         let mut resolver_config = ResolverConfig::default();
 
         if config.dns_servers.is_empty() {
@@ -816,16 +797,9 @@ impl ConnectionPoolManager {
             );
         }
 
-        let mut opts = ResolverOpts::default();
-        opts.use_hosts_file = ResolveHosts::Never;
-
-        let resolver =
-            TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
-                .with_options(opts)
-                .build()
-                .map_err(|e| {
-                    ProxyError::ConnectionError(format!("Failed to build DNS resolver: {}", e))
-                })?;
+        let resolver = build_resolver(resolver_config, config.dns_ip_strategy).map_err(|e| {
+            ProxyError::ConnectionError(format!("Failed to build DNS resolver: {}", e))
+        })?;
 
         // Parse endpoint overrides (exact + suffix patterns)
         let overrides = EndpointOverrides::from_config(&config.endpoint_overrides);

@@ -5,16 +5,19 @@
 //! preserving end-to-end TLS encryption and certificate validation.
 
 use crate::connection_pool::EndpointOverrides;
-use crate::destination_policy::DestinationPolicy;
+use crate::destination_policy::{DestinationPolicy, OwnAddresses};
 use crate::{ProxyError, Result};
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::TokioResolver;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
+
+/// The longest a tunnel spends connecting upstream, over all its addresses and rounds.
+/// Thirty seconds is the passthrough's worst case before it tried every address.
+pub(crate) const TUNNEL_CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// TCP Proxy handler for transparent HTTPS passthrough
 pub struct TcpProxy {
@@ -24,16 +27,21 @@ pub struct TcpProxy {
     overrides: EndpointOverrides,
     /// Destination policy for CONNECT/SNI restriction
     destination_policy: Arc<DestinationPolicy>,
+    /// Addresses a tunnel is never relayed to, because they lead back to a proxy.
+    own_addresses: Arc<OwnAddresses>,
 }
 
 impl TcpProxy {
-    /// Create a new TCP proxy instance with external DNS resolver
-    pub fn new(
+    /// Create a new TCP proxy instance with an external DNS resolver that uses the
+    /// configured address-family strategy for upstream lookups.
+    pub fn new_with_dns_ip_strategy(
         listen_addr: SocketAddr,
         overrides: EndpointOverrides,
         destination_policy: Arc<DestinationPolicy>,
+        dns_ip_strategy: crate::config::DnsIpStrategy,
+        own_addresses: Arc<OwnAddresses>,
     ) -> Self {
-        use hickory_resolver::config::{ResolveHosts, CLOUDFLARE, GOOGLE};
+        use hickory_resolver::config::{CLOUDFLARE, GOOGLE};
         // Use external DNS servers to bypass /etc/hosts (same as connection pool)
         let mut config = ResolverConfig::default();
         for ns in GOOGLE.udp_and_tcp() {
@@ -43,12 +51,7 @@ impl TcpProxy {
             config.add_name_server(ns);
         }
 
-        let mut opts = ResolverOpts::default();
-        opts.use_hosts_file = ResolveHosts::Never; // Critical: bypass /etc/hosts
-
-        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
-            .with_options(opts)
-            .build()
+        let resolver = crate::connection_pool::build_resolver(config, dns_ip_strategy)
             .expect("Failed to build DNS resolver");
 
         if !overrides.is_empty() {
@@ -64,6 +67,7 @@ impl TcpProxy {
             resolver,
             overrides,
             destination_policy,
+            own_addresses,
         }
     }
 
@@ -90,9 +94,10 @@ impl TcpProxy {
                             let resolver = self.resolver.clone();
                             let overrides = self.overrides.clone();
                             let policy = self.destination_policy.clone();
+                            let own_addresses = Arc::clone(&self.own_addresses);
                             tokio::spawn(async move {
                                 if let Err(e) =
-                                    Self::handle_connection(client_stream, client_addr, resolver, overrides, policy).await
+                                    Self::handle_connection(client_stream, client_addr, resolver, overrides, policy, own_addresses).await
                                 {
                                     // Check if this is a client-initiated cancellation or connection error
                                     let err_str = e.to_string();
@@ -130,6 +135,7 @@ impl TcpProxy {
         resolver: TokioResolver,
         overrides: EndpointOverrides,
         policy: Arc<DestinationPolicy>,
+        own_addresses: Arc<OwnAddresses>,
     ) -> Result<()> {
         // Set up connection cleanup on error
         let cleanup_connection = || {
@@ -198,6 +204,8 @@ impl TcpProxy {
             resolver,
             overrides,
             policy,
+            &own_addresses,
+            443,
         )
         .await
         {
@@ -350,6 +358,9 @@ impl TcpProxy {
     }
 
     /// Establish TCP tunnel to target endpoint
+    // Every argument is per-connection state handed over by the accept loop, which is the
+    // only caller outside tests; a struct to carry them would be a type with one user.
+    #[allow(clippy::too_many_arguments)]
     async fn establish_tcp_tunnel(
         mut client_stream: TcpStream,
         client_addr: SocketAddr,
@@ -357,14 +368,13 @@ impl TcpProxy {
         resolver: TokioResolver,
         overrides: EndpointOverrides,
         policy: Arc<DestinationPolicy>,
+        own_addresses: &OwnAddresses,
+        target_port: u16,
     ) -> Result<()> {
         debug!(
             "Resolving {} using external DNS (bypassing /etc/hosts)",
             target_host
         );
-
-        let target_port = 443u16;
-
         // Determine connect IPs: endpoint overrides take priority, otherwise
         // policy.check() resolves + validates in one step (no second DNS lookup).
         let ip_addresses: Vec<IpAddr> = if let Some(ips) = overrides.resolve(target_host) {
@@ -405,6 +415,17 @@ impl TcpProxy {
             }
         };
 
+        // Never relay to an address that leads back to a proxy, carved-out override
+        // addresses included: the tunnel would arrive at a passthrough again.
+        let ip_addresses = match own_addresses.filter_tunnel_targets(ip_addresses) {
+            Ok(rest) => rest,
+            Err(refused) => {
+                own_addresses.warn_refused("SNI passthrough", target_host, target_port, &refused);
+                let _ = client_stream.shutdown().await;
+                return Ok(());
+            }
+        };
+
         if ip_addresses.is_empty() {
             error!("No IP addresses found for {}", target_host);
             drop(client_stream);
@@ -421,28 +442,31 @@ impl TcpProxy {
             ip_addresses
         );
 
-        // Try to connect to the first IP address (could be enhanced with load balancing)
-        let target_ip = ip_addresses[0];
-        let target_addr = SocketAddr::new(target_ip, 443);
-
         debug!(
-            "Establishing tunnel from {} to {} ({}:443)",
-            client_addr, target_host, target_ip
+            "Establishing tunnel from {} to {} ({:?} port {})",
+            client_addr, target_host, ip_addresses, target_port
         );
-
-        // Attempt to connect to target with timeout and retry logic
-        let server_stream = match Self::connect_with_retry_to_ip(target_addr, 3).await {
-            Ok(stream) => stream,
+        // Every address the policy allowed, in resolver order, until one connects.
+        let server_stream = match Self::connect_first_reachable(
+            &ip_addresses,
+            target_port,
+            3,
+            std::time::Duration::from_secs(10),
+            TUNNEL_CONNECT_DEADLINE,
+        )
+        .await
+        {
+            Ok((stream, _ip)) => stream,
             Err(e) => {
                 error!(
-                    "Failed to connect to target {}:{} for client {} after retries: {}",
-                    target_host, target_ip, client_addr, e
+                    "Failed to connect to target {} ({:?}) for client {} after retries: {}",
+                    target_host, ip_addresses, client_addr, e
                 );
                 // Close client connection gracefully as per requirement 14.6
                 drop(client_stream);
                 return Err(ProxyError::ConnectionError(format!(
-                    "Failed to connect to target {}:{}: {}",
-                    target_host, target_ip, e
+                    "Failed to connect to target {}: {}",
+                    target_host, e
                 )));
             }
         };
@@ -453,7 +477,7 @@ impl TcpProxy {
         );
 
         // Start bidirectional forwarding with error handling
-        let target_addr_str = format!("{}:443", target_host);
+        let target_addr_str = format!("{}:{}", target_host, target_port);
         let start_time = std::time::Instant::now();
         match Self::forward_tcp_traffic(client_stream, server_stream, client_addr, &target_addr_str)
             .await
@@ -484,62 +508,67 @@ impl TcpProxy {
         }
     }
 
-    /// Connect to target IP with retry logic for better reliability
-    async fn connect_with_retry_to_ip(
-        target_addr: SocketAddr,
-        max_retries: u32,
-    ) -> Result<TcpStream> {
-        let mut last_error = None;
-
-        for attempt in 1..=max_retries {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                TcpStream::connect(target_addr),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => {
-                    if attempt > 1 {
-                        debug!("Connected to {} on attempt {}", target_addr, attempt);
-                    }
-                    return Ok(stream);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "Connection attempt {} to {} failed: {}",
-                        attempt, target_addr, e
-                    );
-                    last_error = Some(e);
-                }
-                Err(_) => {
-                    warn!(
-                        "Connection attempt {} to {} timed out",
-                        attempt, target_addr
-                    );
-                    last_error = Some(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Connection timeout",
+    /// Connect to the first of `addresses` that accepts, trying them in order.
+    ///
+    /// Each round tries every address once, each attempt bounded by `attempt_timeout`.
+    /// Up to `rounds` rounds run, with a backoff of 100 ms after the first and 200 ms
+    /// after the second, doubling for each later round. The whole call stops at
+    /// `deadline`, so the time spent no longer grows with the number of addresses.
+    /// Callers pass only the addresses the destination policy allowed, so no other
+    /// address is dialled. Returns the stream and the address it reached.
+    pub(crate) async fn connect_first_reachable(
+        addresses: &[IpAddr],
+        port: u16,
+        rounds: u32,
+        attempt_timeout: std::time::Duration,
+        deadline: std::time::Duration,
+    ) -> Result<(TcpStream, IpAddr)> {
+        let started = tokio::time::Instant::now();
+        let mut last_error: Option<String> = None;
+        'rounds: for round in 1..=rounds {
+            for &ip in addresses {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    last_error = Some(format!(
+                        "connect deadline of {:?} reached (last: {})",
+                        deadline,
+                        last_error.as_deref().unwrap_or("none")
                     ));
+                    break 'rounds;
+                }
+                let addr = SocketAddr::new(ip, port);
+                match tokio::time::timeout(attempt_timeout.min(remaining), TcpStream::connect(addr))
+                    .await
+                {
+                    Ok(Ok(stream)) => {
+                        if last_error.is_some() {
+                            debug!("Connected to {} after earlier failures", addr);
+                        }
+                        return Ok((stream, ip));
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Connection attempt {} to {} failed: {}", round, addr, e);
+                        last_error = Some(format!("{}: {}", addr, e));
+                    }
+                    Err(_) => {
+                        warn!("Connection attempt {} to {} timed out", round, addr);
+                        last_error = Some(format!("{}: connection timeout", addr));
+                    }
                 }
             }
-
-            if attempt < max_retries {
-                // Exponential backoff: 100ms, 200ms, 400ms
-                let delay = std::time::Duration::from_millis(100 * (1 << (attempt - 1)));
-                tokio::time::sleep(delay).await;
+            if round < rounds {
+                let delay = std::time::Duration::from_millis(100u64 << (round - 1).min(10));
+                tokio::time::sleep(delay.min(deadline.saturating_sub(started.elapsed()))).await;
             }
         }
-
         Err(ProxyError::ConnectionError(format!(
-            "Failed to connect to {} after {} attempts: {}",
-            target_addr,
-            max_retries,
-            last_error
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "Unknown error".to_string())
+            "Failed to connect to any of {} address(es) on port {} after {} round(s): {}",
+            addresses.len(),
+            port,
+            rounds,
+            last_error.unwrap_or_else(|| "no addresses".to_string())
         )))
     }
-
     /// Forward TCP traffic bidirectionally between client and server
     /// Returns (tx_bytes, rx_bytes) where tx is client->server and rx is server->client
     async fn forward_tcp_traffic(
@@ -1037,5 +1066,338 @@ mod tests {
         let result = policy.classify_ips("vpce-endpoint.amazonaws.com", &override_ips);
         let allowed = result.expect("Carved-out override IP should be allowed");
         assert_eq!(allowed, override_ips);
+    }
+}
+
+#[cfg(test)]
+mod address_order_tests {
+    use super::*;
+    use crate::destination_policy::DestinationPolicy;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    const HOST: &str = "passthrough-order.test";
+
+    /// Start one passthrough tunnel for `HOST`, whose endpoint override lists
+    /// `addresses`, under a policy whose carve-out holds `carved_out`, with the
+    /// upstream on `port`. Returns the client end and the tunnel task.
+    async fn start_passthrough(
+        addresses: &[&str],
+        carved_out: &[&str],
+        port: u16,
+        own: OwnAddresses,
+    ) -> (TcpStream, tokio::task::JoinHandle<Result<()>>) {
+        let overrides = EndpointOverrides::from_config(&HashMap::from([(
+            HOST.to_string(),
+            addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        )]));
+        let carve_out: HashSet<IpAddr> = carved_out.iter().map(|a| a.parse().unwrap()).collect();
+        let policy = Arc::new(DestinationPolicy::new(port, None, carve_out));
+        let resolver = crate::connection_pool::build_resolver(
+            ResolverConfig::default(),
+            crate::config::DnsIpStrategy::Ipv6AndIpv4,
+        )
+        .unwrap();
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(front.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, peer) = front.accept().await.unwrap();
+        let tunnel = tokio::spawn(async move {
+            TcpProxy::establish_tcp_tunnel(
+                accepted, peer, HOST, resolver, overrides, policy, &own, port,
+            )
+            .await
+        });
+        (client, tunnel)
+    }
+
+    /// The passthrough moves on to the next allowed address when the first refuses.
+    /// The first is `::1`, where nothing listens on this port; on a host with no IPv6
+    /// loopback that connect fails at once as well. The second is 127.0.0.1, where
+    /// the upstream listens, and the client's bytes must arrive through it.
+    #[tokio::test]
+    async fn the_passthrough_connects_through_the_second_address_when_the_first_refuses() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (mut client, tunnel) = start_passthrough(
+            &["::1", "127.0.0.1"],
+            &["::1", "127.0.0.1"],
+            port,
+            OwnAddresses::listed_only(&[]),
+        )
+        .await;
+        let (mut server, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+            .await
+            .expect("the tunnel never reached the second address")
+            .unwrap();
+        server.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buf))
+            .await
+            .expect("no byte came back through the tunnel")
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+        drop(client);
+        drop(server);
+        let _ = tokio::time::timeout(Duration::from_secs(5), tunnel).await;
+    }
+
+    /// An address the destination policy refused is never dialled, even when every
+    /// allowed address fails. 127.0.0.1 is loopback and outside the carve-out here,
+    /// so the tunnel must fail without its listener seeing a connection.
+    #[tokio::test]
+    async fn the_passthrough_never_dials_an_address_the_policy_refused() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (_client, tunnel) = start_passthrough(
+            &["::1", "127.0.0.1"],
+            &["::1"],
+            port,
+            OwnAddresses::listed_only(&[]),
+        )
+        .await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), tunnel)
+            .await
+            .expect("the tunnel must give up")
+            .unwrap();
+        assert!(
+            outcome.is_err(),
+            "the only allowed address refuses, so the tunnel must fail"
+        );
+        let reached = tokio::time::timeout(Duration::from_millis(500), upstream.accept()).await;
+        assert!(
+            reached.is_err(),
+            "127.0.0.1, which the policy refused, must never be dialled"
+        );
+    }
+
+    /// The passthrough refuses a destination that is one of this host's interface
+    /// addresses. 127.0.0.1 is on the loopback interface of every host, so the
+    /// production interface read makes it this proxy's own without root. The endpoint
+    /// override carves it out of the destination policy, so only the loop check can
+    /// stop the tunnel; the listener on it stands in for the proxy's own port.
+    #[tokio::test]
+    async fn the_passthrough_refuses_an_interface_address_of_this_host() {
+        let own = OwnAddresses::new(&[]);
+        assert!(
+            own.contains("127.0.0.1".parse().unwrap()),
+            "precondition: the interface read lists 127.0.0.1"
+        );
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (_client, tunnel) = start_passthrough(&["127.0.0.1"], &["127.0.0.1"], port, own).await;
+        let reached = tokio::time::timeout(Duration::from_millis(500), upstream.accept()).await;
+        assert!(
+            reached.is_err(),
+            "127.0.0.1 is this host's own address and must never be dialled"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), tunnel)
+            .await
+            .expect("a refused tunnel must end")
+            .unwrap();
+        assert!(
+            outcome.is_ok(),
+            "a refused tunnel closes quietly: {outcome:?}"
+        );
+    }
+
+    /// The passthrough refuses an address listed in `tunnel_refused_addresses`.
+    /// 127.0.0.2 answers on Linux's loopback without being an interface address, so
+    /// only the list makes it the proxy's own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_passthrough_refuses_a_listed_address() {
+        let listed: IpAddr = "127.0.0.2".parse().unwrap();
+        let upstream = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (_client, tunnel) = start_passthrough(
+            &["127.0.0.2"],
+            &["127.0.0.2"],
+            port,
+            OwnAddresses::new(&[listed]),
+        )
+        .await;
+        let reached = tokio::time::timeout(Duration::from_millis(500), upstream.accept()).await;
+        assert!(
+            reached.is_err(),
+            "127.0.0.2 is listed and must never be dialled"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), tunnel)
+            .await
+            .expect("a refused tunnel must end")
+            .unwrap();
+        assert!(
+            outcome.is_ok(),
+            "a refused tunnel closes quietly: {outcome:?}"
+        );
+    }
+
+    /// A name that resolves to a listed address and to another one is refused as a
+    /// whole: the other address's listener sees no connection.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_passthrough_refuses_a_name_with_one_own_address_among_others() {
+        let listed: IpAddr = "127.0.0.2".parse().unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = other.local_addr().unwrap().port();
+        let (_client, tunnel) = start_passthrough(
+            &["127.0.0.2", "127.0.0.1"],
+            &["127.0.0.2", "127.0.0.1"],
+            port,
+            OwnAddresses::listed_only(&[listed]),
+        )
+        .await;
+        let reached = tokio::time::timeout(Duration::from_millis(500), other.accept()).await;
+        assert!(
+            reached.is_err(),
+            "one own address refuses the tunnel, so the other must never be dialled"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), tunnel)
+            .await
+            .expect("a refused tunnel must end")
+            .unwrap();
+        assert!(
+            outcome.is_ok(),
+            "a refused tunnel closes quietly: {outcome:?}"
+        );
+    }
+
+    /// Under the production read every 127/8 address is own, since the passthrough's
+    /// dual-stack listener answers on all of them.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_passthrough_refuses_any_loopback_address() {
+        let own = OwnAddresses::new(&[]);
+        let upstream = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (_client, tunnel) = start_passthrough(&["127.0.0.2"], &["127.0.0.2"], port, own).await;
+        let reached = tokio::time::timeout(Duration::from_millis(500), upstream.accept()).await;
+        assert!(
+            reached.is_err(),
+            "127.0.0.2 is loopback and must never be dialled"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), tunnel)
+            .await
+            .expect("a refused tunnel must end")
+            .unwrap();
+        assert!(
+            outcome.is_ok(),
+            "a refused tunnel closes quietly: {outcome:?}"
+        );
+    }
+
+    /// The control for the refusals: an address that is not own is still relayed. No
+    /// foreign address answers on a test host, so the interface read is switched off
+    /// and 127.0.0.2 stands in for it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_passthrough_relays_an_address_that_is_not_its_own() {
+        let own = OwnAddresses::listed_only(&[]);
+        assert!(
+            !own.contains("127.0.0.2".parse().unwrap()),
+            "precondition: 127.0.0.2 is neither listed nor on an interface"
+        );
+        let upstream = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (mut client, tunnel) =
+            start_passthrough(&["127.0.0.2"], &["127.0.0.2"], port, own).await;
+        let (mut server, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+            .await
+            .expect("an unrelated address must be relayed")
+            .unwrap();
+        server.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buf))
+            .await
+            .expect("no byte came back through the tunnel")
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+        drop(client);
+        drop(server);
+        let _ = tokio::time::timeout(Duration::from_secs(5), tunnel).await;
+    }
+
+    /// The production interface read does not refuse an address that is not this host's.
+    /// No foreign address answers on a test host without a network, so the dial itself
+    /// cannot be completed. A refusal ends the tunnel at once and quietly (`Ok`), where a
+    /// relay dials the documentation-range address: the tunnel is still connecting after
+    /// half a second, or its dial has failed with an error. A `new()` that refused every
+    /// address ends the tunnel with `Ok` and fails the dial assertion first; the checks on
+    /// the interface read itself run after it, so they never hide the dial's verdict.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_production_interface_read_dials_an_address_that_is_not_this_hosts() {
+        let own = OwnAddresses::new(&[]);
+        let foreign: IpAddr = "192.0.2.44".parse().unwrap();
+        let own_by_read = own.contains(foreign);
+        let filtered = own.filter_tunnel_targets(vec![foreign]);
+        let (client, mut tunnel) =
+            start_passthrough(&["192.0.2.44"], &["192.0.2.44"], 4431, own).await;
+        match tokio::time::timeout(Duration::from_millis(500), &mut tunnel).await {
+            Err(_elapsed) => tunnel.abort(),
+            Ok(joined) => {
+                let outcome = joined.unwrap();
+                assert!(
+                    outcome.is_err(),
+                    "a tunnel to an address that is not this host's must dial it; ending with \
+                     Ok is the quiet close a refusal gives: {outcome:?} (the interface read \
+                     calls the address own: {own_by_read}, the target filter returned \
+                     {filtered:?})"
+                );
+            }
+        }
+        drop(client);
+        assert!(
+            !own_by_read,
+            "precondition: 192.0.2.44 is not on an interface of this host"
+        );
+        assert_eq!(
+            filtered,
+            Ok(vec![foreign]),
+            "the list is passed through unchanged"
+        );
+    }
+    /// A tunnel's connect stops at its deadline however many addresses it has. Every
+    /// address is a listener whose accept queue is full, so the kernel drops each SYN
+    /// and every attempt runs to its 10 s bound. On a paused clock, eight such
+    /// addresses over the passthrough's three rounds take 240.3 s without the deadline.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_tunnel_connect_stops_at_its_deadline_whatever_the_address_count() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let full = socket.listen(0).unwrap();
+        let addr = full.local_addr().unwrap();
+        let mut held = Vec::new();
+        let mut filled = false;
+        for _ in 0..16 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                Ok(stream) => held.push(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    filled = true;
+                    break;
+                }
+                Err(e) => panic!("precondition: the probe was refused, not left hanging: {e}"),
+            }
+        }
+        assert!(filled, "precondition: the accept queue never filled");
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = TcpProxy::connect_first_reachable(
+            &[addr.ip(); 8],
+            addr.port(),
+            3,
+            Duration::from_secs(10),
+            TUNNEL_CONNECT_DEADLINE,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "nothing can accept");
+        assert!(
+            elapsed <= TUNNEL_CONNECT_DEADLINE + Duration::from_millis(100),
+            "the connect took {elapsed:?}, past its {TUNNEL_CONNECT_DEADLINE:?} deadline"
+        );
+        drop(held);
     }
 }

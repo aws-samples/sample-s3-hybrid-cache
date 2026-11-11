@@ -4,7 +4,7 @@
 //! - TCP passthrough: Direct TCP tunneling without TLS termination
 
 use crate::connection_pool::EndpointOverrides;
-use crate::destination_policy::DestinationPolicy;
+use crate::destination_policy::{DestinationPolicy, OwnAddresses};
 use crate::{config::Config, tcp_proxy::TcpProxy, Result};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -16,8 +16,9 @@ pub struct HttpsProxy {
     listen_addr: SocketAddr,
     overrides: EndpointOverrides,
     destination_policy: Arc<DestinationPolicy>,
+    dns_ip_strategy: crate::config::DnsIpStrategy,
+    own_addresses: Arc<OwnAddresses>,
 }
-
 impl HttpsProxy {
     /// Create a new HTTPS proxy instance
     pub fn new(listen_addr: SocketAddr, config: Arc<Config>) -> Self {
@@ -50,19 +51,29 @@ impl HttpsProxy {
             listen_addr,
             overrides,
             destination_policy,
+            dns_ip_strategy: config.connection_pool.dns_ip_strategy,
+            own_addresses: Arc::new(OwnAddresses::new(
+                config
+                    .server
+                    .tls
+                    .as_ref()
+                    .map(|tls| tls.tunnel_refused_addresses.as_slice())
+                    .unwrap_or_default(),
+            )),
         }
     }
-
     /// Start the HTTPS proxy server in TCP passthrough mode
     pub async fn start(&self, shutdown_signal: crate::shutdown::ShutdownSignal) -> Result<()> {
         info!(
             "Starting HTTPS proxy in TCP passthrough mode on {}",
             self.listen_addr
         );
-        let tcp_proxy = TcpProxy::new(
+        let tcp_proxy = TcpProxy::new_with_dns_ip_strategy(
             self.listen_addr,
             self.overrides.clone(),
             self.destination_policy.clone(),
+            self.dns_ip_strategy,
+            Arc::clone(&self.own_addresses),
         );
         tcp_proxy.start(shutdown_signal).await
     }

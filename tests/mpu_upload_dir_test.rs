@@ -198,6 +198,7 @@ async fn traversal_upload_ids_create_nothing_outside_their_digest_directory() {
             validated_endpoint: None,
             timeouts: s3_proxy::signed_request_proxy::UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         });
         let resp = tokio::time::timeout(
             Duration::from_secs(60),

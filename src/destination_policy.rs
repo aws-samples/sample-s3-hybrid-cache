@@ -7,11 +7,16 @@
 //! The `DestinationPolicy` struct encapsulates the allow/deny decision for outbound
 //! connections. Both the TLS proxy listener (CONNECT) and the TCP proxy (SNI passthrough)
 //! call `policy.check()` before establishing a connection.
+//!
+//! `OwnAddresses` is the second gate on both tunnels: after the policy has chosen the
+//! addresses, a tunnel is never relayed to one that leads back to a proxy.
 
 use hickory_resolver::TokioResolver;
 use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Reason a destination was rejected by the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +72,8 @@ impl fmt::Display for RejectionReason {
 /// - 192.168.0.0/16 (private)
 /// - 169.254.0.0/16 (link-local)
 /// - ::ffff:0:0/96 (IPv4-mapped — delegates to IPv4 check)
+/// - 64:ff9b::/96 (NAT64 well-known prefix — classified by the embedded IPv4 address)
+/// - 64:ff9b:1::/48 (NAT64 local-use prefix — refused whole)
 /// - ::/128 (IPv6 unspecified)
 /// - ::1/128 (IPv6 loopback)
 /// - fe80::/10 (IPv6 link-local)
@@ -125,6 +132,21 @@ fn is_prohibited_v6(ip: Ipv6Addr) -> bool {
         return true;
     }
     let segments = ip.segments();
+    // 64:ff9b::/96 — NAT64 well-known prefix (RFC 6052). The low 32 bits are an IPv4
+    // address a NAT64 gateway will connect to, so classify that address exactly as its
+    // IPv4 form: 64:ff9b::a9fe:a9fe is 169.254.169.254 and must be refused.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6].iter().all(|s| *s == 0) {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        return is_prohibited_v4(Ipv4Addr::new(a, b, c, d));
+    }
+    // 64:ff9b:1::/48 — NAT64 local-use prefix (RFC 8215). The embedded IPv4 address sits at
+    // a position that depends on the prefix length the operator chose, which the proxy
+    // cannot know, so the whole range is refused. An address an operator needs in it can be
+    // listed in `endpoint_overrides`.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        return true;
+    }
     // fe80::/10 — link-local (first 10 bits: 1111 1110 10xx xxxx)
     if (segments[0] & 0xFFC0) == 0xFE80 {
         return true;
@@ -302,6 +324,222 @@ impl DestinationPolicy {
 
         false
     }
+}
+
+/// How long a snapshot of this host's interface addresses is used before it is read again.
+const OWN_ADDRESS_REFRESH: Duration = Duration::from_secs(30);
+/// At most one tunnel-refusal warning per interval; the ones in between are counted into
+/// the next.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The addresses a CONNECT or SNI passthrough tunnel is never relayed to, because they
+/// lead back to a proxy: this host's interface addresses, plus
+/// `server.tls.tunnel_refused_addresses` for the ones that reach a proxy without being on
+/// an interface (an EC2 public IPv4 or Elastic IP address, a load balancer in front of the
+/// fleet, peer proxies).
+///
+/// Without this a tunnel whose destination is the proxy itself is relayed back into its
+/// own listener, which relays it again, until descriptors run out. The destination
+/// policy does not stop that for an address it allows (an EC2 instance's global IPv6
+/// address, a public IPv4 address on the interface), nor for one an `endpoint_overrides`
+/// entry carves out, so this check runs after the policy and applies to both.
+///
+/// Interface addresses come from `getifaddrs`, read again on the first check after the
+/// snapshot is 30 seconds old: an address added since is not refused for up to that long.
+/// A failed read keeps the previous snapshot. Addresses are compared in canonical form,
+/// so `::ffff:a.b.c.d` and the NAT64 `64:ff9b::a.b.c.d` match `a.b.c.d`.
+pub struct OwnAddresses {
+    configured: HashSet<IpAddr>,
+    read_interfaces: bool,
+    snapshot: Mutex<Option<(Instant, Arc<HashSet<IpAddr>>)>>,
+    refusal_log: Mutex<RefusalLog>,
+}
+
+struct RefusalLog {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl OwnAddresses {
+    /// This host's interface addresses plus `configured`.
+    pub fn new(configured: &[IpAddr]) -> Self {
+        Self::build(configured, true)
+    }
+
+    /// `configured` alone, never reading the interfaces: lets a unit test relay to a
+    /// loopback upstream, which the interface read would refuse.
+    #[cfg(test)]
+    pub(crate) fn listed_only(configured: &[IpAddr]) -> Self {
+        Self::build(configured, false)
+    }
+
+    fn build(configured: &[IpAddr], read_interfaces: bool) -> Self {
+        Self {
+            configured: configured.iter().map(|ip| canonical(*ip)).collect(),
+            read_interfaces,
+            snapshot: Mutex::new(None),
+            refusal_log: Mutex::new(RefusalLog {
+                last: None,
+                suppressed: 0,
+            }),
+        }
+    }
+
+    /// Whether a tunnel to `ip` would lead back to a proxy.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let interfaces = self.interfaces();
+        self.is_own(&interfaces, ip)
+    }
+
+    /// Refuse a tunnel when any of its candidate addresses leads back to a proxy.
+    /// `Err` carries the refused addresses; `Ok` returns the list unchanged. One own
+    /// address refuses the whole list, because the name resolves to a host that answers
+    /// on it and a dial to the others could still loop through the first on a retry
+    /// or a different resolution.
+    pub fn filter_tunnel_targets(
+        &self,
+        ips: Vec<IpAddr>,
+    ) -> std::result::Result<Vec<IpAddr>, Vec<IpAddr>> {
+        let interfaces = self.interfaces();
+        let own: Vec<IpAddr> = ips
+            .iter()
+            .copied()
+            .filter(|ip| self.is_own(&interfaces, *ip))
+            .collect();
+        if own.is_empty() {
+            Ok(ips)
+        } else {
+            Err(own)
+        }
+    }
+
+    /// Log a refused tunnel at `warn!`, at most once per ten seconds; the line carries the
+    /// number of refusals left unlogged since the last one.
+    pub fn warn_refused(&self, tunnel: &str, host: &str, port: u16, refused: &[IpAddr]) {
+        let now = Instant::now();
+        let suppressed = {
+            let mut log = self
+                .refusal_log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if log
+                .last
+                .is_some_and(|last| now.duration_since(last) < REFUSAL_LOG_INTERVAL)
+            {
+                log.suppressed += 1;
+                return;
+            }
+            log.last = Some(now);
+            std::mem::take(&mut log.suppressed)
+        };
+        tracing::warn!(
+            hostname = %host,
+            port = port,
+            addresses = ?refused,
+            suppressed_since_last = suppressed,
+            "{} destination refused: it leads back to a proxy (an interface address of this host or a server.tls.tunnel_refused_addresses entry)",
+            tunnel
+        );
+    }
+
+    fn is_own(&self, interfaces: &HashSet<IpAddr>, ip: IpAddr) -> bool {
+        let ip = canonical(ip);
+        // The passthrough's dual-stack listener answers on every 127/8 address, on
+        // 0.0.0.0 and on :: as well as on the ones an interface lists.
+        let loopback_or_unspecified =
+            self.read_interfaces && (ip.is_loopback() || ip.is_unspecified());
+        loopback_or_unspecified || self.configured.contains(&ip) || interfaces.contains(&ip)
+    }
+
+    fn interfaces(&self) -> Arc<HashSet<IpAddr>> {
+        if !self.read_interfaces {
+            return Arc::default();
+        }
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        if let Some((taken, set)) = snapshot.as_ref() {
+            if now.duration_since(*taken) < OWN_ADDRESS_REFRESH {
+                return Arc::clone(set);
+            }
+        }
+        let set = match interface_addresses() {
+            Ok(set) => Arc::new(set.into_iter().map(canonical).collect()),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not read this host's interface addresses, keeping the previous set for tunnel loop refusal: {}",
+                    e
+                );
+                snapshot
+                    .as_ref()
+                    .map(|(_, set)| Arc::clone(set))
+                    .unwrap_or_default()
+            }
+        };
+        *snapshot = Some((now, Arc::clone(&set)));
+        set
+    }
+}
+
+/// `ip` with an IPv4-mapped or NAT64 well-known-prefix IPv6 form reduced to its IPv4
+/// address, so either form matches an IPv4 entry.
+fn canonical(ip: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
+    }
+    let segments = v6.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6].iter().all(|s| *s == 0) {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        return IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+    }
+    ip
+}
+
+/// Every IPv4 and IPv6 address on this host's interfaces, loopback included.
+#[cfg(unix)]
+fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` writes the head of a list it allocates, freed below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut addresses = HashSet::new();
+    let mut node = head;
+    while !node.is_null() {
+        // SAFETY: `node` is an element of the list `getifaddrs` returned, not yet freed.
+        let ifa = unsafe { &*node };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: `ifa_addr` is non-null and its family says which sockaddr it is.
+            let family = libc::c_int::from(unsafe { (*ifa.ifa_addr).sa_family });
+            if family == libc::AF_INET {
+                // SAFETY: an AF_INET address is a `sockaddr_in`.
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                addresses.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    sin.sin_addr.s_addr,
+                ))));
+            } else if family == libc::AF_INET6 {
+                // SAFETY: an AF_INET6 address is a `sockaddr_in6`.
+                let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                addresses.insert(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+            }
+        }
+        node = ifa.ifa_next;
+    }
+    // SAFETY: `head` came from a successful `getifaddrs` and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(addresses)
+}
+
+/// No interface read off Unix: only the configured addresses are refused.
+#[cfg(not(unix))]
+fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    Ok(HashSet::new())
 }
 
 #[cfg(test)]
@@ -805,5 +1043,72 @@ mod tests {
         let allowed_with_override = result_with_override.is_ok();
 
         rejected_without_override && allowed_with_override
+    }
+}
+
+#[cfg(test)]
+mod own_address_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The interface read lists loopback, which every host carries, and no address
+    /// outside this host.
+    #[test]
+    fn the_interface_read_lists_loopback_and_nothing_foreign() {
+        let own = OwnAddresses::new(&[]);
+        assert!(own.contains(ip("127.0.0.1")));
+        assert!(own.contains(ip("::ffff:127.0.0.1")), "the IPv4-mapped form");
+        assert!(!own.contains(ip("192.0.2.44")));
+        assert!(!own.contains(ip("2001:db8::44")));
+    }
+
+    /// A listed address matches in its IPv4-mapped and NAT64 forms too.
+    #[test]
+    fn a_listed_address_matches_in_every_form() {
+        let own = OwnAddresses::listed_only(&[ip("198.51.100.7")]);
+        assert!(own.contains(ip("198.51.100.7")));
+        assert!(own.contains(ip("::ffff:198.51.100.7")));
+        assert!(own.contains(ip("64:ff9b::c633:6407")));
+        assert!(!own.contains(ip("198.51.100.8")));
+    }
+
+    /// A list with no own address passes unchanged; one own address anywhere in it
+    /// refuses the whole list and names only the own addresses.
+    #[test]
+    fn one_own_address_refuses_the_whole_list() {
+        let own = OwnAddresses::listed_only(&[ip("203.0.113.5")]);
+        assert_eq!(
+            own.filter_tunnel_targets(vec![ip("192.0.2.1"), ip("192.0.2.2")]),
+            Ok(vec![ip("192.0.2.1"), ip("192.0.2.2")])
+        );
+        assert_eq!(
+            own.filter_tunnel_targets(vec![ip("192.0.2.1"), ip("203.0.113.5"), ip("192.0.2.2")]),
+            Err(vec![ip("203.0.113.5")])
+        );
+        assert_eq!(
+            own.filter_tunnel_targets(vec![ip("203.0.113.5")]),
+            Err(vec![ip("203.0.113.5")])
+        );
+    }
+
+    /// Every 127/8 address, 0.0.0.0, :: and ::1 count as own under the production
+    /// interface read, listed or not on an interface.
+    #[test]
+    fn loopback_and_unspecified_addresses_are_own() {
+        let own = OwnAddresses::new(&[]);
+        for a in [
+            "127.0.0.2",
+            "127.255.255.254",
+            "0.0.0.0",
+            "::",
+            "::1",
+            "::ffff:127.0.0.9",
+        ] {
+            assert!(own.contains(ip(a)), "{a} must count as own");
+        }
+        assert!(!own.contains(ip("192.0.2.44")));
     }
 }

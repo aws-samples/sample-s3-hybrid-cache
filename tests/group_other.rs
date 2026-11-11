@@ -28,6 +28,10 @@ mod connection_pool_validation_property_test;
 mod dns_resolution_preservation_test;
 #[path = "ip_distribution_property_test.rs"]
 mod ip_distribution_property_test;
+#[path = "nat64_destination_policy_test.rs"]
+mod nat64_destination_policy_test;
+#[path = "resolver_strategy_test.rs"]
+mod resolver_strategy_test;
 #[path = "retry_exponential_backoff_property_test.rs"]
 mod retry_exponential_backoff_property_test;
 #[path = "s3_client_test.rs"]

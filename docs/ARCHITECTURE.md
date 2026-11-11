@@ -665,14 +665,17 @@ The proxy includes a destination policy engine that prevents SSRF attacks by val
 
 **Gating**: The HTTP forwarding path's policy (on the port-80 listener and on the TLS proxy listener alike) is active only when `connect_allowlist` is configured in the `server.tls` section. Without an allowlist those paths skip the check entirely, which lets operators who rely on the proxy as a general forward proxy opt out. The CONNECT and SNI paths always apply the port gate and IP classification; an allowlist, when configured, adds hostname filtering to them.
 
-**What the check does**: it is a pre-flight rejection of destinations, evaluated before any request is sent. The proxy then resolves the name again through the connection pool when it dials, and with an allowlist set the pool keeps only the addresses the policy accepts. So the connection goes only to an address the policy accepts, and a name whose every address is refused is not dialed. Addresses listed in `endpoint_overrides` are dialed as listed.
+**What the check does**: it is a pre-flight rejection of destinations, evaluated before any request is sent. The proxy then resolves the name again through the connection pool when it dials, and with an allowlist set the pool keeps only the addresses the policy accepts. So the connection goes only to an address the policy accepts, and a name whose every address is refused is not dialed. Addresses listed in `endpoint_overrides` are dialed as listed. The `CONNECT` and port-443 SNI passthrough paths skip that second lookup: they connect to the addresses the check accepted, in resolver order, until one answers. Each attempt gets 10 seconds and the whole connect 30.
 
 **IP ranges blocked** (on every path the policy gates):
 - `0.0.0.0/8`, `127.0.0.0/8` (loopback), `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (private)
 - `169.254.0.0/16` (link-local / IMDS)
 - IPv6 equivalents: `::`, `::1`, `fe80::/10`, `fc00::/7`, `::ffff:` IPv4-mapped
+- NAT64: an address in `64:ff9b::/96` is judged by the IPv4 address it embeds, so `64:ff9b::a9fe:a9fe` is refused as `169.254.169.254`. All of the local-use range `64:ff9b:1::/48` is refused, because the proxy cannot locate the IPv4 address inside it
 
-**Endpoint override carve-out**: IPs listed in `connection_pool.endpoint_overrides` are exempted from the prohibited-range check, allowing PrivateLink ENIs in private address space.
+**Endpoint override carve-out**: IPs listed in `connection_pool.endpoint_overrides` are exempted from the prohibited-range check, allowing PrivateLink ENIs in private address space. List an address you need from `64:ff9b:1::/48` there too.
+
+**Destinations that lead back to a proxy**: after the policy, the `CONNECT` and port-443 SNI passthrough paths refuse a destination when any address they would connect to leads back to a proxy, carved-out addresses included. Such an address is on the proxy host's interfaces, is loopback or unspecified, or is listed in `server.tls.tunnel_refused_addresses`, in IPv4, IPv4-mapped or NAT64 form. List there the addresses that reach a proxy without being on its interfaces, such as an EC2 public IPv4 or Elastic IP address. The passthrough closes the connection, `CONNECT` answers `403`, and the proxy logs a warning at most once every 10 seconds. The check does not look at ports, so it refuses an own address even when `https_port` is not 443. The proxy reads its interface addresses again once its last read is 30 seconds old. If the proxy cannot read its interface addresses when it starts, it logs a warning and, until a read succeeds, refuses only loopback, unspecified and `tunnel_refused_addresses` destinations.
 
 **S3 endpoints**: All public S3 IPs pass the policy. The check has no impact on normal S3 traffic.
 

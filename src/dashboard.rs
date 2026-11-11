@@ -2515,6 +2515,11 @@ impl ApiHandler {
     }
 }
 
+/// The most log files one request reads, newest first. The application log rotates daily,
+/// so eight files cover a week of history; with the 1 MiB read from the end of each, one
+/// request reads at most 8 MiB however many files the directory holds.
+const MAX_LOG_FILES_PER_REQUEST: usize = 8;
+
 /// Log reader for application logs
 pub struct LogReader {
     app_log_dir: PathBuf,
@@ -2569,7 +2574,7 @@ impl LogReader {
             return Ok(entries);
         }
 
-        for log_file in log_files {
+        for log_file in log_files.into_iter().take(MAX_LOG_FILES_PER_REQUEST) {
             if entries.len() >= limit {
                 break;
             }
@@ -3948,6 +3953,53 @@ mod tests {
             json["write_cache"]["max_size_bytes"].as_u64(),
             Some(300_000),
             "write_cache_percent 30 of max_cache_size 1000000"
+        );
+    }
+
+    /// A request reads only the newest log files, however many the directory holds, so a
+    /// filter that matches nothing cannot make it read every file there.
+    #[tokio::test]
+    async fn a_log_request_reads_at_most_the_newest_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("test-host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let now = std::time::SystemTime::now();
+        let total = MAX_LOG_FILES_PER_REQUEST + 4;
+        // File i is i hours old; the line the filter looks for is in the file at `index`.
+        let write_files = |needle_at: usize| {
+            for i in 0..total {
+                let path = host_dir.join(format!("s3-proxy.log.{i:02}"));
+                let message = if i == needle_at { "needle" } else { "hay" };
+                std::fs::write(
+                    &path,
+                    format!(
+                        "2026-01-23T15:24:13.161401787+00:00  INFO ThreadId(05) s3_proxy::x: src/x.rs:1: {message}\n"
+                    ),
+                )
+                .unwrap();
+                let file = std::fs::File::options().write(true).open(&path).unwrap();
+                file.set_modified(now - std::time::Duration::from_secs(3600 * (i as u64 + 1)))
+                    .unwrap();
+            }
+        };
+        let reader = LogReader::new(dir.path().to_path_buf(), "test-host".to_string());
+        let params = || LogQueryParams {
+            limit: Some(100),
+            level_filter: None,
+            text_filter: Some("needle".to_string()),
+            since: None,
+        };
+
+        write_files(MAX_LOG_FILES_PER_REQUEST - 1);
+        let found = reader.read_recent_logs(params()).await.unwrap();
+        assert_eq!(found.len(), 1, "the oldest file inside the cap is read");
+
+        write_files(MAX_LOG_FILES_PER_REQUEST);
+        let found = reader.read_recent_logs(params()).await.unwrap();
+        assert!(
+            found.is_empty(),
+            "a file past the cap must not be read, found {} entries",
+            found.len()
         );
     }
 }

@@ -96,8 +96,44 @@ pub struct UpstreamTransport {
     /// The in-flight ledger the buffered response is reserved against. `None`
     /// reserves nothing; the response bound applies either way.
     pub response_ledger: Option<Arc<crate::inflight_ledger::InflightLedger>>,
+    /// Where the outcome of connecting to `ip` is recorded, so an address that keeps
+    /// failing is excluded from the host's distributor as it is for GETs. `None`
+    /// records nothing: an override target, which no distributor serves, or a test.
+    pub health: Option<UpstreamHealth>,
 }
 
+/// The per-address health record a signed write's connect outcome goes into: the
+/// tracker the GET path uses, and the distributor an address is excluded from.
+#[derive(Clone)]
+pub struct UpstreamHealth {
+    pub tracker: Arc<crate::connection_pool::IpHealthTracker>,
+    pub pool: Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>>,
+    /// The request host, whose distributor holds `ip`.
+    pub host: String,
+}
+
+impl UpstreamHealth {
+    /// Record one connect outcome for `ip`. A failure that reaches the tracker's
+    /// threshold removes `ip` from the host's distributor, as the GET path does; the
+    /// recovery probe re-admits it.
+    fn record(&self, ip: IpAddr, connected: bool) {
+        if connected {
+            self.tracker.record_success(&ip);
+            return;
+        }
+        if self.tracker.record_failure(&ip) {
+            warn!(ip = %ip, host = %self.host, "IP failure threshold reached on a signed-write connect, excluding from distributor");
+            let pool = Arc::clone(&self.pool);
+            let host = self.host.clone();
+            tokio::spawn(async move {
+                let mut pm = pool.write().await;
+                if let Some(dist) = pm.get_distributor_mut(&host) {
+                    dist.remove_ip(ip, "signed-write connect failure");
+                }
+            });
+        }
+    }
+}
 /// Bounds on one signed-write attempt's waits on the upstream.
 ///
 /// Every deadline is per attempt and inside the forward: nothing here times the
@@ -255,6 +291,7 @@ impl UpstreamTransport {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         }
     }
 }
@@ -1345,10 +1382,11 @@ where
 /// `timeouts.connect` is one deadline around the whole of
 /// [`connect_upstream_with_retry`]: every TCP attempt, every TLS handshake and the
 /// backoff between them, so the retries cannot multiply it. No request byte has
-/// been written when it expires.
+/// been written when it expires. The outcome, connected or not, is recorded against
+/// `transport.ip` when the transport carries a health record.
 async fn open_upstream(transport: &UpstreamTransport, target_host: &str) -> Result<UpstreamStream> {
     let connect = transport.timeouts.connect;
-    match tokio::time::timeout(
+    let opened = match tokio::time::timeout(
         connect,
         connect_upstream_with_retry(transport, target_host, 5),
     )
@@ -1365,9 +1403,12 @@ async fn open_upstream(transport: &UpstreamTransport, target_host: &str) -> Resu
                 connect
             )))
         }
+    };
+    if let Some(health) = &transport.health {
+        health.record(transport.ip, opened.is_ok());
     }
+    opened
 }
-
 /// Write the request head, then the body frame by frame, then the chunked
 /// terminator or trailers, and flush.
 ///
@@ -2983,6 +3024,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         }
     }
     async fn forward_empty_put(transport: &UpstreamTransport) -> Result<StatusCode> {
@@ -3040,6 +3082,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
         let error = forward_empty_put(&transport)
             .await
@@ -3183,6 +3226,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3241,6 +3285,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         // 200-byte body, cap 100, no Content-Length header → first frame trips.
@@ -3378,6 +3423,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -3431,6 +3477,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
         let response = forward_signed_request_streaming_verbatim(
             request,
@@ -3530,6 +3577,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
         let uri = "/bucket/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=signature";
         let response = forward_signed_request_streaming(
@@ -3591,6 +3639,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
         let mut headers = hyper::HeaderMap::new();
         for (k, v) in client_headers {
@@ -3800,6 +3849,7 @@ mod tests {
                 validated_endpoint: None,
                 timeouts: UpstreamTimeouts::default(),
                 response_ledger: None,
+                health: None,
             };
             let response = forward_signed_request_streaming(
                 &method.parse().unwrap(),
@@ -3861,6 +3911,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -3952,6 +4003,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4054,6 +4106,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4145,6 +4198,7 @@ mod tests {
                 validated_endpoint: None,
                 timeouts: UpstreamTimeouts::default(),
                 response_ledger: None,
+                health: None,
             };
 
             let result = forward_signed_request_streaming(
@@ -4284,6 +4338,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4514,6 +4569,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4583,6 +4639,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4629,6 +4686,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4683,6 +4741,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4745,6 +4804,7 @@ mod tests {
             validated_endpoint: None,
             timeouts: UpstreamTimeouts::default(),
             response_ledger: None,
+            health: None,
         };
 
         let result = forward_signed_request_streaming(
@@ -4959,6 +5019,7 @@ mod upstream_timeout_tests {
                 ..UpstreamTimeouts::default()
             },
             response_ledger: None,
+            health: None,
         }
     }
 
@@ -5424,5 +5485,87 @@ mod upstream_timeout_tests {
             .expect("a pausing client completes");
         assert!(started.elapsed() >= IDLE * 2, "{:?}", started.elapsed());
         assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod signed_write_health_tests {
+    use super::*;
+    use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
+    use std::net::SocketAddr;
+
+    fn transport_to(addr: SocketAddr, health: &UpstreamHealth) -> UpstreamTransport {
+        UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+            timeouts: UpstreamTimeouts::default(),
+            response_ledger: None,
+            health: Some(health.clone()),
+        }
+    }
+
+    /// A signed write whose connect to its address fails records the failure there,
+    /// so three failed writes exclude the address from the host's distributor as
+    /// three failed GETs do. A later connect that succeeds clears the record.
+    #[tokio::test]
+    async fn a_failed_signed_write_connect_counts_against_its_address() {
+        let host = "signed-write-health.test";
+        let refused: SocketAddr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let pool = Arc::new(tokio::sync::RwLock::new(
+            ConnectionPoolManager::new_with_config(crate::config::ConnectionPoolConfig::default())
+                .unwrap(),
+        ));
+        pool.write()
+            .await
+            .apply_resolution(host, vec![refused.ip()], None);
+        assert_eq!(
+            pool.read().await.get_distributed_ip(host),
+            Some(refused.ip())
+        );
+        let health = UpstreamHealth {
+            tracker: Arc::new(IpHealthTracker::new(3)),
+            pool: Arc::clone(&pool),
+            host: host.to_string(),
+        };
+        let failing = transport_to(refused, &health);
+        for _ in 0..3 {
+            let opened =
+                tokio::time::timeout(Duration::from_secs(30), open_upstream(&failing, host))
+                    .await
+                    .expect("the connect must give up");
+            assert!(opened.is_err(), "nothing listens on {refused}");
+        }
+        assert!(
+            health.tracker.is_unhealthy(&refused.ip()),
+            "three failed signed-write connects must mark the address unhealthy"
+        );
+        let excluded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pool.read().await.get_distributed_ip(host).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            excluded.is_ok(),
+            "the address must leave the host's distributor"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let working = transport_to(listener.local_addr().unwrap(), &health);
+        let opened = tokio::time::timeout(Duration::from_secs(10), open_upstream(&working, host))
+            .await
+            .expect("the connect must not hang");
+        assert!(opened.is_ok(), "the listener accepts");
+        assert!(
+            !health.tracker.is_unhealthy(&refused.ip()),
+            "a connect that succeeds clears the address's record"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Download bandwidth QoS
 
-Download bandwidth QoS (quality of service) caps the bandwidth Hybrid Cache for Amazon S3 uses to fetch cache misses from S3 and shares that ceiling fairly between callers or buckets. Use it to keep cache-miss traffic inside an origin egress budget, or to stop one workload taking all of it from the others. Cache hits are never counted against the ceiling or slowed by it.
+Download bandwidth QoS (quality of service) caps the bandwidth Hybrid Cache for Amazon S3 uses to stream cache misses from S3 and shares that ceiling fairly between callers or buckets. Use it to keep cache-miss traffic inside an origin egress budget, or to stop one workload taking all of it from the others. Cache hits are never counted against the ceiling or slowed by it.
 
 ## Turn it on
 
@@ -17,7 +17,7 @@ Every field has a default, and a configuration file without a `download_bandwidt
 
 ## How it works
 
-The proxy throttles a cache-miss download by holding back reads from the S3 response until the byte budget allows them, so TCP flow control slows the S3 connection. The bytes counted are the bytes fetched from S3 on cache misses.
+The proxy throttles the cache-miss downloads it streams: full-object GETs, part-number GET misses, complete range misses and signed ranges. It holds back reads from the S3 response until the byte budget allows them, so TCP flow control slows the S3 connection. The bytes counted are the bytes those downloads fetch from S3.
 
 ### Fairness classes: caller or bucket
 
@@ -71,7 +71,7 @@ Where each proxy has its own `cache_dir`, as on a [local NVMe fleet](LOCAL_NVME_
 
 ## Limits
 
-- The ceiling applies to cache-miss downloads only. Uploads, cache hits and the HTTPS passthrough (port 443) are not throttled.
+- The ceiling applies only to the streamed cache-miss downloads listed under [How it works](#how-it-works). Other traffic passes unthrottled, including the buffered fetches of a partial range hit or a page fill, requests forwarded without caching, uploads, cache hits and the HTTPS passthrough (port 443).
 - Each proxy's share is a fixed `max_bytes_per_sec / N` that does not follow demand. When traffic is uneven across the fleet, the fleet can run below the ceiling while its busiest proxies are throttled; see [Detecting uneven load](#detecting-uneven-load).
 - The fleet-wide ceiling is approximate: each proxy can exceed its share by up to 100 ms of traffic.
 

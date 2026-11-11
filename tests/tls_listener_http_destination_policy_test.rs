@@ -162,6 +162,7 @@ fn listener_config(
         cert_path: cert_path.to_string(),
         key_path: key_path.to_string(),
         connect_allowlist: allowlist,
+        tunnel_refused_addresses: Vec::new(),
     });
     Arc::new(config)
 }
@@ -191,11 +192,20 @@ async fn spawn_listener(allowlist: Option<Vec<String>>) -> Harness {
 
 /// [`spawn_listener`] with the HTTP-path policy's port set to `http_port`.
 async fn spawn_listener_on(allowlist: Option<Vec<String>>, http_port: u16) -> Harness {
+    spawn_listener_edited(allowlist, http_port, |_| {}).await
+}
+/// [`spawn_listener_on`] with `edit` applied to the config before the listener is built.
+async fn spawn_listener_edited(
+    allowlist: Option<Vec<String>>,
+    http_port: u16,
+    edit: impl FnOnce(&mut Config),
+) -> Harness {
     let _ = rustls::crypto::ring::default_provider().install_default();
-
     let cert_dir = TempDir::new().expect("cert tempdir");
     let (cert_path, key_path) = write_cert_pem(cert_dir.path());
-    let config = listener_config(&cert_path, &key_path, allowlist, http_port);
+    let mut config = (*listener_config(&cert_path, &key_path, allowlist, http_port)).clone();
+    edit(&mut config);
+    let config = Arc::new(config);
 
     let fixture = Fixture::new(Arc::clone(&config)).await;
 
@@ -547,4 +557,60 @@ async fn non_standard_port_store_still_passes() {
             );
         }
     }
+}
+
+/// **A bracketed IPv6 CONNECT, end to end, and the loop refusal on CONNECT.**
+/// `CONNECT [::1]:443` with `::1` carved out by an endpoint override passes the policy
+/// only if the authority is parsed to the bare address: unparsed, `[::1]` is a name that
+/// fails DNS and gets the policy's plain `Forbidden`. `::1` is on this host's loopback
+/// interface, so the tunnel is then refused as leading back to the proxy, and the body
+/// says so. An address listed in `tunnel_refused_addresses` is refused the same way, and
+/// a documentation address that is neither listed nor on an interface is admitted.
+#[tokio::test]
+async fn a_bracketed_ipv6_connect_is_parsed_and_refused_when_it_leads_back_to_the_proxy() {
+    let harness = spawn_listener_edited(None, 80, |config| {
+        config
+            .connection_pool
+            .endpoint_overrides
+            .insert("loopback-v6.test".to_string(), vec!["::1".to_string()]);
+        if let Some(tls) = config.server.tls.as_mut() {
+            tls.tunnel_refused_addresses = vec!["2001:db8::9".parse().unwrap()];
+        }
+    })
+    .await;
+    let loop_body = "the destination leads back to a proxy";
+    let (status_line, response) =
+        send_request(harness.addr, "CONNECT [::1]:443 HTTP/1.1", "[::1]:443").await;
+    assert!(
+        status_line.contains("403") && response.contains(loop_body),
+        "CONNECT [::1]:443 must pass the policy (::1 is carved out) and then be refused as \
+         this proxy's own address. status_line={status_line:?} response={response:?}"
+    );
+    let (status_line, response) = send_request(
+        harness.addr,
+        "CONNECT [2001:db8::9]:443 HTTP/1.1",
+        "[2001:db8::9]:443",
+    )
+    .await;
+    assert!(
+        status_line.contains("403") && response.contains(loop_body),
+        "a listed address must be refused as leading back to a proxy. \
+         status_line={status_line:?} response={response:?}"
+    );
+    let (status_line, response) = send_request(
+        harness.addr,
+        "CONNECT [2001:db8::7]:443 HTTP/1.1",
+        "[2001:db8::7]:443",
+    )
+    .await;
+    assert!(
+        status_line.contains("200"),
+        "an address neither listed nor on an interface must be admitted. \
+         status_line={status_line:?} response={response:?}"
+    );
+    assert!(
+        harness.stub.captured().is_empty(),
+        "a CONNECT must never reach the caching egress: {:#?}",
+        harness.stub.captured()
+    );
 }

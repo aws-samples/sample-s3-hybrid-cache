@@ -6,7 +6,7 @@ Hybrid Cache for Amazon S3 keeps its connections to S3 open and reuses them, spr
 
 - The HTTP client keeps a pool of open connections per endpoint, reuses them and closes idle ones.
 - The connector opens each new TCP and TLS connection, sets the socket options, and records connection failures against the IP address it dialed.
-- The pool manager resolves endpoint hostnames, applies `endpoint_overrides`, and keeps a round-robin list of addresses (the distributor) for each endpoint.
+- The pool manager resolves endpoint hostnames for the address families `dns_ip_strategy` selects ([Address families](CONFIGURATION.md#address-families)), applies `endpoint_overrides`, and keeps a round-robin list of addresses (the distributor) for each endpoint.
 - The health tracker counts consecutive failures per IP address, takes an address out of rotation at a threshold, and returns it after a successful recovery probe.
 
 ## Configuration
@@ -23,6 +23,7 @@ connection_pool:
   dns_refresh_interval: "60s"    # DNS re-resolution interval (default: 60s)
   connection_timeout: "10s"      # Connect deadline for writes and recovery probes (default: 10s)
   ip_distribution_enabled: true  # One pool per IP address, by rewriting the URI authority (default: true)
+  dns_ip_strategy: ipv6_and_ipv4  # Address families to look up, and which to try first (default: ipv6_and_ipv4)
   keepalive_idle_secs: 15        # TCP_KEEPIDLE: seconds idle before the first probe (default: 15)
   keepalive_interval_secs: 5     # TCP_KEEPINTVL: seconds between probes (default: 5)
   keepalive_retries: 3           # TCP_KEEPCNT: failed probes before the connection is dead (default: 3)
@@ -51,7 +52,7 @@ The connector sets these on every new connection, after the TCP connect and befo
 
 ### 3. IP health tracking
 
-- TCP connect failures, TLS handshake failures and HTTP connection errors increment the address's failure count. A successful response resets it to zero.
+- TCP connect failures, TLS handshake failures and HTTP connection errors add one to the address's failure count for each failed attempt. A failed connect for an upload or other write counts too. A successful response, or a successful connect for a write, resets the count to zero.
 - When the count reaches `ip_failure_threshold` (default 3), the address is removed from the distributor of the hostname whose request failed.
 - Health state belongs to the address. Once an address is excluded, each hostname's next DNS refresh leaves it out of that hostname's distributor until a recovery probe confirms it. A client whose `Host` the upstream certificate does not cover can therefore briefly take a shared address out of rotation for other hostnames. Their requests keep succeeding, on the remaining addresses or through hostname-based routing.
 - A DNS refresh rebuilds the distributor from the resolved addresses minus any address still excluded, so a refresh never undoes an exclusion.
@@ -59,7 +60,7 @@ The connector sets these on every new connection, after the TCP connect and befo
 
 ### 3a. Recovery probing
 
-An excluded address returns to rotation only when a probe confirms it is reachable.
+An excluded address returns to rotation only when a probe confirms it is reachable. The proxy probes only with IP distribution on; with it off, an excluded address stays out of rotation until the proxy restarts.
 
 - After `health_probe_initial_cooldown` (default `5s`), an excluded address becomes a probe candidate.
 - The proxy probes candidates once per `pool_check_interval` (default `10s`), right after the DNS refresh, so this interval only bounds how soon an elapsed cooldown is noticed.
@@ -95,7 +96,9 @@ An excluded address returns to rotation only when a probe confirms it is reachab
 ### 6. Error recovery
 
 - A connection error removes the failed connection from the pool.
-- Connection errors, timeouts and S3 5xx and 429 responses are retried on a new connection, up to 3 retries for GET and HEAD. Every retry counts against that limit.
+- Connection errors (a failed connect among them) and timeouts are retried on a new connection, up to 3 retries for GET and HEAD. The waits before them are 100, 200 and 400 ms, and every retry counts against that limit. With IP distribution on, each retry takes the next address. A signed range GET that still fails is sent up to twice more, after waits of 100 ms and 200 ms, with the same retries each time.
+- An error response from S3, `5xx` and `429` included, is not retried; the proxy returns it to the client. The AWS SDKs and the AWS CLI retry transient server errors and throttling errors, such as `503 SlowDown`, with backoff. On a partial range hit or a page fill, a sub-fetch that gets an error response makes the proxy fetch the client's range once instead.
+- A key whose cache rule turns hedging on follows different rules; see [Hedging](HEDGING.md#connection-diversity).
 - A GET or HEAD without a body whose established connection is lost after the request went out is first retried once, immediately, on a new connection that bypasses the pool. The usual cause is a pooled connection that S3 had already closed while it was idle. That first loss does not count toward `ip_failure_threshold`, since S3 closes idle connections on every address alike; a loss on the retry does. Requests with a body are never retried this way.
 - The health tracker excludes persistently failing addresses from the round-robin, as described in [IP health tracking](#3-ip-health-tracking).
 
@@ -110,11 +113,11 @@ This sets the client's pool idle timeout and its idle connections per host to 0,
 
 ## Upstream idle watchdog
 
-The proxy detects a stalled upstream connection and ends it, rather than leaving the client to wait for its own read timeout (60 seconds by default in the AWS CLI and botocore). One slow or dead upstream connection therefore cannot hold a client indefinitely.
+The proxy detects a stalled upstream connection and ends it, rather than leaving the client to wait for its own read timeout (60 seconds by default in the AWS CLI and botocore). It does so on the cache-miss fetches it streams: full-object GETs, part-number GET misses, complete range misses and signed ranges. Some fetches have no timer once their response headers arrive, among them the buffered fetches of a partial range hit or a page fill and requests forwarded without caching. Such a fetch lasts until the origin finishes or the client disconnects.
 
 ### Two-phase detection
 
-1. **Before the first byte** (`upstream_first_byte_timeout`, default `5s`): if no response byte arrives within the timeout after the proxy sends a request upstream, the attempt is aborted and retried, up to `upstream_idle_retries` times. When the retries run out, the proxy answers `504 Gateway Timeout`.
+1. **Before the first byte** of a full-object GET, a part-number GET or a HEAD (`upstream_first_byte_timeout`, default `5s`): if no response byte arrives within the timeout, the attempt is aborted and retried, up to `upstream_idle_retries` times. When the retries run out, the proxy answers `504 Gateway Timeout`.
 2. **Mid-stream** (`upstream_idle_timeout`, default `5s`): once the upstream has started sending, if no new chunk arrives within the timeout, the proxy closes the client connection and the body ends early. The client's own retry logic takes over. [Cache safety](#cache-safety) describes what is cached.
 
 ```yaml
@@ -138,9 +141,9 @@ An aborted mid-stream fetch never caches a truncated range under the bounds that
 
 ## Hedged upstream requests
 
-When a cache rule enables hedging for a key, the proxy can send a second, identical request when the first is slow to return its first byte, and serve whichever answers first. The hedge prefers a different IP address from the original, chosen through the same distributor, which is what makes it effective against one slow connection or one degraded address. If only one healthy address is available, both attempts use it on separate connections; if the destination matches an `upstream_overrides` entry, neither attempt is pinned to an address.
+When a cache rule enables hedging for a key, the proxy can send a second, identical request when the first is slow to answer, and serve whichever answers first. Where it can, the hedge uses a different IP address from the original, chosen through the same distributor, which makes it effective against one slow connection or one degraded address. [Connection diversity](HEDGING.md#connection-diversity) says when the two attempts are tied to addresses and what a failed connect does.
 
-[Hedged upstream requests](HEDGING.md) is the guide: when hedging helps, its rule fields and cost governor, and [how it relates to the upstream timeouts](HEDGING.md#relationship-to-the-upstream-timeouts). Each upstream read request also has a fixed 30-second timeout from connect to response, and uploads and other writes are bounded by [Upstream write timeout](CONFIGURATION.md#upstream-write-timeout). No timer covers a whole client request: `server.request_timeout` has no effect, as described in [`request_timeout` is not enforced](CONFIGURATION.md#request_timeout-is-not-enforced).
+[Hedged upstream requests](HEDGING.md) is the guide: when hedging helps, its rule fields and cost governor, and [how it relates to the upstream timeouts](HEDGING.md#relationship-to-the-upstream-timeouts). Each upstream read request also has a fixed 30-second timeout from connect to its response headers, and uploads and other writes are bounded by [Upstream write timeout](CONFIGURATION.md#upstream-write-timeout). No timer covers a whole client request: `server.request_timeout` has no effect, as described in [`request_timeout` is not enforced](CONFIGURATION.md#request_timeout-is-not-enforced).
 
 ## Metrics
 
@@ -223,5 +226,5 @@ If `error_closures` keeps increasing:
 
 - [Connection pooling configuration](CONFIGURATION.md#connection-pooling): every field, default and valid range
 - [Upstream timeout](CONFIGURATION.md#upstream-timeout-stalled-response-fast-fail): the first-byte and idle timeout fields
-- [Hedged upstream requests](HEDGING.md): second attempts against slow first bytes
+- [Hedged upstream requests](HEDGING.md): a second attempt when an upstream request is slow to answer
 - [Error handling](ERROR_HANDLING.md#7-stalled-upstream-responses-mid-stream-idle-watchdog): what a stalled upstream looks like in metrics and logs

@@ -111,11 +111,11 @@
         },
         "hedging_enabled": {
           "type": "boolean",
-          "description": "Turns on hedged upstream requests for matching keys. When the first S3 fetch has not returned its first byte within hedge_trigger_after, the proxy sends a second identical fetch and serves whichever responds first. It is off by default, and only a rule can turn it on, because each hedge is a duplicate S3 request and the right trigger depends on the workload. See docs/HEDGING.md for the cost governor and when hedging helps. Default: false."
+          "description": "Turns on hedged upstream requests for matching keys. When the first S3 fetch has not answered within hedge_trigger_after, the proxy sends a second identical fetch and serves whichever answers first. It is off by default, and only a rule can turn it on, because each hedge is a duplicate S3 request and the right trigger depends on the workload. See docs/HEDGING.md for the cost governor and when hedging helps. Default: false."
         },
         "hedge_trigger_after": {
           "type": "string",
-          "description": "Time to first byte after which a hedge is sent; applies only where hedging_enabled is true. Must be greater than 0 and less than connection_pool.upstream_first_byte_timeout (default: 5s); checked each time the rules load. Same format as get_ttl. Default: \"250ms\".",
+          "description": "How long the first S3 fetch may go unanswered before a hedge is sent; applies only where hedging_enabled is true. Must be greater than 0 and less than connection_pool.upstream_first_byte_timeout (default: 5s); an explicit value on a rule that sets hedging_enabled to true is checked each time the rules load. Same format as get_ttl. Default: \"250ms\".",
           "pattern": "^\\s*[0-9]+(\\.[0-9]+)?\\s*(ms|millis|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)?\\s*$",
           "examples": [
             "250ms",
@@ -126,7 +126,7 @@
         "hedge_max_per_request": {
           "type": "integer",
           "minimum": 0,
-          "description": "Most hedges per client request. A range GET that fans out into several missing-range fetches shares one budget across all of them. Default: 1.",
+          "description": "Most hedges per client request. A range GET that fans out into several missing-range fetches shares one budget across all of them. 0 sends no hedge yet still ties the original request to an address, which skips an unhedged request's connect and timeout retries; to turn hedging off, set hedging_enabled to false. Default: 1.",
           "examples": [
             1,
             2,

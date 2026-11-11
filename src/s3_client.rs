@@ -257,7 +257,12 @@ pub trait S3ClientApi: Send + Sync {
     fn upstream_timeouts(&self) -> crate::signed_request_proxy::UpstreamTimeouts {
         crate::signed_request_proxy::UpstreamTimeouts::default()
     }
-
+    /// The per-address health tracker the GET path records into, so the signed-write
+    /// path records its connect outcomes in the same place. `None`, the default,
+    /// records nothing, which is what test stubs want.
+    fn ip_health_tracker(&self) -> Option<Arc<crate::connection_pool::IpHealthTracker>> {
+        None
+    }
     /// True when the client was built with endpoint overrides (PrivateLink
     /// destinations). Consumers use this to decide whether to lock outbound
     /// TLS to 1.2.
@@ -329,7 +334,9 @@ impl S3ClientApi for S3Client {
     fn upstream_timeouts(&self) -> crate::signed_request_proxy::UpstreamTimeouts {
         self.upstream_timeouts.clone()
     }
-
+    fn ip_health_tracker(&self) -> Option<Arc<crate::connection_pool::IpHealthTracker>> {
+        Some(Arc::clone(&self.health_tracker))
+    }
     fn has_endpoint_overrides(&self) -> bool {
         S3Client::has_endpoint_overrides(self)
     }
@@ -1259,7 +1266,10 @@ impl S3Client {
 
     /// Whether a send failure should count against the IP it was sent to.
     ///
-    /// Everything counts except a lost connection on a first attempt that
+    /// A failed connect never counts here: the connector has already recorded it
+    /// against the address it dialled, TCP and TLS failures alike, and a second record
+    /// would let one request's retries exclude a two- or three-address distributor.
+    /// Otherwise everything counts except a lost connection on a first attempt that
     /// `forward_request` is about to retry on a new connection: S3 closes idle
     /// connections on every address alike, so that one says nothing about this
     /// address, and three would take a healthy IP out of rotation at the default
@@ -1268,7 +1278,20 @@ impl S3Client {
     /// excluded by these first losses, and each request sent to it costs one extra
     /// connection (the retry picks an address again).
     fn counts_against_ip(error: &ProxyError, context: &S3RequestContext, attempt: Attempt) -> bool {
+        if Self::is_connect_failure(error) {
+            return false;
+        }
         attempt == Attempt::Retry || !Self::is_retryable_lost_connection(error, context)
+    }
+    /// Whether `error` is a failed connect, which the connector records itself.
+    fn is_connect_failure(error: &ProxyError) -> bool {
+        matches!(
+            error,
+            ProxyError::UpstreamSendFailed {
+                kind: UpstreamSendFailureKind::Connect,
+                ..
+            }
+        )
     }
 
     /// Track a request for the connection reuse calculation
@@ -1300,6 +1323,10 @@ impl S3Client {
         match error {
             ProxyError::ConnectionError(_) => true,
             ProxyError::TimeoutError(_) => true,
+            ProxyError::UpstreamSendFailed {
+                kind: UpstreamSendFailureKind::Connect,
+                ..
+            } => true,
             ProxyError::HttpError(msg) | ProxyError::UpstreamSendFailed { message: msg, .. } => {
                 // Retry on specific HTTP errors that indicate temporary issues
                 msg.contains("connection") || msg.contains("timeout") || msg.contains("reset")
@@ -3225,7 +3252,69 @@ mod lost_connection_tests {
             &request(1, Method::PUT, Some(Bytes::from_static(b"x"))),
             Attempt::First
         ));
-        assert!(S3Client::counts_against_ip(&refused, &get, Attempt::First));
+        assert!(
+            !S3Client::counts_against_ip(&refused, &get, Attempt::First),
+            "the connector has already recorded a failed connect"
+        );
+    }
+    /// One failed connect is one failure against its address. The connector records
+    /// it, so the client must not record it again. At threshold 2, one failed connect
+    /// leaves the address in rotation and a second takes it out.
+    #[tokio::test]
+    async fn one_failed_connect_counts_once_against_its_address() {
+        use crate::connection_pool::IpDistributor;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut config = ConnectionPoolConfig {
+            ip_distribution_enabled: true,
+            ip_failure_threshold: 2,
+            ..Default::default()
+        };
+        config.upstream_overrides.insert(
+            format!("{ip}:{port}"),
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: false,
+            },
+        );
+        let client = S3Client::new(&config, None).expect("client builds");
+        client
+            .pool_manager
+            .write()
+            .await
+            .ip_distributors
+            .insert("fake-s3.test".into(), IpDistributor::new(vec![ip]));
+        let get = S3RequestContext {
+            method: Method::GET,
+            uri: format!("http://fake-s3.test:{port}/bucket/key")
+                .parse()
+                .unwrap(),
+            headers: HashMap::new(),
+            body: None,
+            host: "fake-s3.test".into(),
+            request_size: None,
+            operation_type: None,
+            allow_streaming: false,
+        };
+        let first = tokio::time::timeout(Duration::from_secs(10), client.try_forward_request(&get))
+            .await
+            .expect("one connect is bounded");
+        assert!(first.is_err(), "nothing listens on port {port}");
+        assert!(
+            !client.health_tracker.is_unhealthy(&ip),
+            "one failed connect was counted twice: the threshold of 2 was reached after one"
+        );
+        let second =
+            tokio::time::timeout(Duration::from_secs(10), client.try_forward_request(&get))
+                .await
+                .expect("one connect is bounded");
+        assert!(second.is_err(), "nothing listens on port {port}");
+        assert!(
+            client.health_tracker.is_unhealthy(&ip),
+            "a second failed connect must reach the threshold of 2"
+        );
     }
 
     /// With IP distribution on, a lost connection the retry recovers on another
@@ -3688,6 +3777,20 @@ mod lost_connection_tests {
         )));
     }
 
+    /// A failure to connect sent no request byte, so the ladder retries it, and with
+    /// IP distribution the retry takes the next address. hyper-util's message for it,
+    /// "client error (Connect)", matches none of the ladder's text tests.
+    #[test]
+    fn the_retry_ladder_retries_a_connect_failure() {
+        let connect_failed = ProxyError::UpstreamSendFailed {
+            message: "Failed to send request: client error (Connect)".into(),
+            detail: "client error (Connect): tcp connect error: Connection refused (os error 111)"
+                .into(),
+            kind: UpstreamSendFailureKind::Connect,
+        };
+        let client = client_for(1, Duration::from_secs(55));
+        assert!(client.should_retry_error(&connect_failed));
+    }
     #[test]
     fn io_kinds_that_mean_a_lost_connection() {
         use std::io::ErrorKind::*;

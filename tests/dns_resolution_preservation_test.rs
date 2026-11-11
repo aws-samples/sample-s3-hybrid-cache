@@ -29,8 +29,8 @@ use std::net::IpAddr;
 #[tokio::test]
 #[ignore]
 async fn test_live_dns_resolves_s3_endpoints() {
-    let manager = ConnectionPoolManager::new()
-        .expect("ConnectionPoolManager::new() should succeed with default resolvers");
+    let manager = ConnectionPoolManager::new_with_config(ConnectionPoolConfig::default())
+        .expect("the pool manager builds with the default resolvers");
 
     for endpoint in &["s3.amazonaws.com", "s3.us-east-1.amazonaws.com"] {
         let ips = manager

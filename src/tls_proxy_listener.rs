@@ -6,14 +6,19 @@
 //! traffic while maintaining full caching capability.
 
 use crate::{
-    cache::CacheManager, config::Config, destination_policy::DestinationPolicy,
-    http_proxy::HttpProxy, inflight_tracker::InFlightTracker, logging::LoggerManager,
-    range_handler::RangeHandler, s3_client::S3ClientApi, shutdown::ShutdownSignal, ProxyError,
-    Result,
+    cache::CacheManager,
+    config::Config,
+    destination_policy::{DestinationPolicy, OwnAddresses},
+    http_proxy::HttpProxy,
+    inflight_tracker::InFlightTracker,
+    logging::LoggerManager,
+    range_handler::RangeHandler,
+    s3_client::S3ClientApi,
+    shutdown::ShutdownSignal,
+    ProxyError, Result,
 };
 use bytes::Bytes;
-use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts, CLOUDFLARE, GOOGLE};
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::config::{ResolverConfig, CLOUDFLARE, GOOGLE};
 use hickory_resolver::TokioResolver;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -62,6 +67,8 @@ pub struct TlsProxyListener {
     /// default deployment free of any policy evaluation on either listener.
     http_destination_policy: Option<Arc<DestinationPolicy>>,
     resolver: Arc<TokioResolver>,
+    /// Addresses a CONNECT tunnel is never relayed to, because they lead back to a proxy.
+    own_addresses: Arc<OwnAddresses>,
 }
 
 impl TlsProxyListener {
@@ -96,13 +103,12 @@ impl TlsProxyListener {
         for ns in CLOUDFLARE.udp_and_tcp() {
             resolver_config.add_name_server(ns);
         }
-        let mut opts = ResolverOpts::default();
-        opts.use_hosts_file = ResolveHosts::Never;
         let resolver = Arc::new(
-            TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
-                .with_options(opts)
-                .build()
-                .expect("Failed to build DNS resolver for TLS proxy listener"),
+            crate::connection_pool::build_resolver(
+                resolver_config,
+                config.connection_pool.dns_ip_strategy,
+            )
+            .expect("Failed to build DNS resolver for TLS proxy listener"),
         );
 
         // Build DestinationPolicy from config
@@ -140,6 +146,15 @@ impl TlsProxyListener {
             ))
         });
 
+        let own_addresses = Arc::new(OwnAddresses::new(
+            config
+                .server
+                .tls
+                .as_ref()
+                .map(|tls| tls.tunnel_refused_addresses.as_slice())
+                .unwrap_or_default(),
+        ));
+
         Ok(Self {
             listen_addr,
             tls_acceptor,
@@ -156,6 +171,7 @@ impl TlsProxyListener {
             destination_policy,
             http_destination_policy,
             resolver,
+            own_addresses,
         })
     }
 
@@ -213,6 +229,7 @@ impl TlsProxyListener {
                             let destination_policy = Arc::clone(&self.destination_policy);
                             let http_destination_policy = self.http_destination_policy.clone();
                             let resolver = Arc::clone(&self.resolver);
+                            let own_addresses = Arc::clone(&self.own_addresses);
 
                             tokio::spawn(async move {
                                 // Perform TLS handshake
@@ -242,6 +259,7 @@ impl TlsProxyListener {
                                     let destination_policy = Arc::clone(&destination_policy);
                                     let http_destination_policy = http_destination_policy.clone();
                                     let resolver = Arc::clone(&resolver);
+                                    let own_addresses = Arc::clone(&own_addresses);
 
                                     async move {
                                         // Intercept CONNECT requests for TCP passthrough
@@ -252,6 +270,7 @@ impl TlsProxyListener {
                                                 addr,
                                                 &destination_policy,
                                                 &resolver,
+                                                &own_addresses,
                                             )
                                             .await;
                                         }
@@ -391,12 +410,14 @@ impl TlsProxyListener {
 /// destinations (wrong port, private/loopback/link-local IPs, allowlist miss).
 ///
 /// Returns a `200 Connection Established` response on success, or `403 Forbidden`
-/// if the destination policy rejects the target.
+/// if the destination policy rejects the target or every address it allows leads back
+/// to a proxy.
 async fn handle_connect(
     req: Request<Incoming>,
     client_addr: SocketAddr,
     policy: &DestinationPolicy,
     resolver: &TokioResolver,
+    own_addresses: &OwnAddresses,
 ) -> std::result::Result<
     Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>>,
     std::convert::Infallible,
@@ -423,15 +444,7 @@ async fn handle_connect(
         return Ok(resp);
     }
 
-    // Parse host and port from target
-    let (host, port) = if let Some(colon) = target.rfind(':') {
-        let h = &target[..colon];
-        let p = target[colon + 1..].parse::<u16>().unwrap_or(443);
-        (h.to_string(), p)
-    } else {
-        (target.clone(), 443u16)
-    };
-
+    let (host, port) = parse_connect_target(&target);
     // Check destination policy before connecting
     let allowed_ips = match policy.check(&host, port, resolver).await {
         Ok(ips) => ips,
@@ -464,6 +477,26 @@ async fn handle_connect(
         }
     };
 
+    // Never relay to an address that leads back to a proxy, carved-out override
+    // addresses included: on 443 the tunnel would arrive at a passthrough again.
+    let allowed_ips = match own_addresses.filter_tunnel_targets(allowed_ips) {
+        Ok(rest) => rest,
+        Err(refused) => {
+            own_addresses.warn_refused("CONNECT", &host, port, &refused);
+            let resp = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(
+                    Full::new(Bytes::from(
+                        "Forbidden: the destination leads back to a proxy\n",
+                    ))
+                    .map_err(|never| match never {})
+                    .boxed(),
+                )
+                .unwrap();
+            return Ok(resp);
+        }
+    };
+
     info!(
         "CONNECT tunnel request from {} to {}:{} (HTTPS_PROXY passthrough, no caching)",
         client_addr, host, port
@@ -477,9 +510,8 @@ async fn handle_connect(
             Ok(upgraded) => {
                 let mut client_io = TokioIo::new(upgraded);
 
-                // Connect to one of the policy-approved IPs
-                let connect_addr = SocketAddr::new(allowed_ips[0], port);
-                match TcpStream::connect(connect_addr).await {
+                // Every policy-approved address, in resolver order, until one connects.
+                match connect_tunnel_upstream(&allowed_ips, port).await {
                     Ok(mut server_stream) => {
                         debug!(
                             "CONNECT tunnel established: {} <-> {}",
@@ -527,6 +559,43 @@ async fn handle_connect(
         )
         .unwrap();
     Ok(resp)
+}
+
+/// Split a CONNECT target into host and port. A bracketed IPv6 literal
+/// (`[2001:db8::1]:443`) yields the bare address, which the destination policy then
+/// classifies by range. A missing or unparsable port is 443.
+fn parse_connect_target(target: &str) -> (String, u16) {
+    if let Some((h, after)) = target
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        let p = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(443);
+        return (h.to_string(), p);
+    }
+    if let Some(colon) = target.rfind(':') {
+        let h = &target[..colon];
+        let p = target[colon + 1..].parse::<u16>().unwrap_or(443);
+        (h.to_string(), p)
+    } else {
+        (target.to_string(), 443u16)
+    }
+}
+
+/// Dial a CONNECT tunnel's upstream: each address the policy allowed, in order,
+/// once, each attempt bounded at 10 seconds and all of them together at 30.
+async fn connect_tunnel_upstream(allowed_ips: &[IpAddr], port: u16) -> Result<TcpStream> {
+    crate::tcp_proxy::TcpProxy::connect_first_reachable(
+        allowed_ips,
+        port,
+        1,
+        std::time::Duration::from_secs(10),
+        crate::tcp_proxy::TUNNEL_CONNECT_DEADLINE,
+    )
+    .await
+    .map(|(stream, _ip)| stream)
 }
 
 /// Load TLS certificate chain and private key from PEM files and build a
@@ -615,5 +684,73 @@ mod tests {
                 TestResult::from_bool(error_msg.contains(&cert_path))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_target_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A bracketed IPv6 CONNECT authority splits into the bare address and its port,
+    /// and the destination policy then classifies that address.
+    #[tokio::test]
+    async fn a_bracketed_ipv6_connect_target_is_parsed_to_the_address() {
+        assert_eq!(
+            parse_connect_target("[::1]:8443"),
+            ("::1".to_string(), 8443)
+        );
+        assert_eq!(
+            parse_connect_target("[2001:db8::1]:443"),
+            ("2001:db8::1".to_string(), 443)
+        );
+        assert_eq!(
+            parse_connect_target("s3.amazonaws.com:443"),
+            ("s3.amazonaws.com".to_string(), 443)
+        );
+        assert_eq!(
+            parse_connect_target("s3.amazonaws.com"),
+            ("s3.amazonaws.com".to_string(), 443)
+        );
+        let (host, port) = parse_connect_target("[::1]:443");
+        let loopback: IpAddr = "::1".parse().unwrap();
+        let policy = DestinationPolicy::new(443, None, HashSet::from([loopback]));
+        let resolver = crate::connection_pool::build_resolver(
+            ResolverConfig::default(),
+            crate::config::DnsIpStrategy::Ipv6AndIpv4,
+        )
+        .unwrap();
+        let checked = tokio::time::timeout(
+            Duration::from_secs(10),
+            policy.check(&host, port, &resolver),
+        )
+        .await
+        .expect("the check must not hang");
+        assert_eq!(
+            checked.ok(),
+            Some(vec![loopback]),
+            "the bare address must pass the policy's carve-out"
+        );
+    }
+
+    /// The CONNECT tunnel's dial moves on to the next allowed address when the first
+    /// refuses. The first is `::1`, where nothing listens on this port; on a host
+    /// with no IPv6 loopback that connect fails at once as well. The second is
+    /// 127.0.0.1, where the upstream listens.
+    #[tokio::test]
+    async fn the_connect_tunnel_dials_the_second_address_when_the_first_refuses() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let allowed: Vec<IpAddr> = vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()];
+        let dialled = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_tunnel_upstream(&allowed, port),
+        )
+        .await
+        .expect("the dial must connect or give up");
+        let stream = dialled.expect("the second address accepts");
+        assert_eq!(stream.peer_addr().unwrap().ip(), allowed[1]);
+        let reached = tokio::time::timeout(Duration::from_secs(5), upstream.accept()).await;
+        assert!(matches!(reached, Ok(Ok(_))));
     }
 }

@@ -74,6 +74,13 @@ server:
     tls_proxy_port: 3129  # Default: 3129
     cert_path: "/etc/proxy/tls/cert.pem"  # PEM certificate chain
     key_path: "/etc/proxy/tls/key.pem"  # PEM private key
+    # IPv4 or IPv6 addresses that CONNECT tunnels and the HTTPS passthrough (port 443)
+    # refuse (default: empty). Both already refuse this host's interface, loopback and
+    # unspecified addresses. List the ones that reach a proxy without being on an
+    # interface: each proxy's EC2 public IPv4 or Elastic IP address, and a load
+    # balancer's public addresses. The passthrough reads this list even when the TLS
+    # proxy listener is disabled.
+    # tunnel_refused_addresses: ["203.0.113.10", "2001:db8::10"]
 
 cache:
   cache_dir: "./tmp/cache"  # Local development; use an absolute path in production, e.g. "/mnt/cache"
@@ -288,9 +295,8 @@ cache:
     # How long a waiting request waits for the fetch (default: 30s; range 5-120s, and a
     # value outside it is clamped with a warning). If the fetch is still running, the
     # waiter waits on the same fetch again, up to max_waiter_resubscriptions times
-    # (default: 3). After that, a full-object GET or HEAD waiter fetches from S3 itself
-    # and a part or range waiter returns 504 Gateway Timeout. A waiter also fetches from
-    # S3 itself when the fetch it waits on fails or goes away.
+    # (default: 3). After that, the waiter fetches from S3 itself, as it does when the
+    # fetch it waits on fails or goes away.
     wait_timeout_secs: 30
 
   # Range merge gap threshold (default: 1 MiB).
@@ -543,6 +549,14 @@ connection_pool:
   # connections spread across all of S3's front-end IPs instead of a few, which avoids
   # per-IP throttling. TLS SNI and the Host header keep the hostname, as SigV4 requires.
   ip_distribution_enabled: true  # Default: true
+  # Address families the proxy looks up for upstream names, and which it tries first
+  # (default: ipv6_and_ipv4, IPv6 first). The others are ipv4_and_ipv6, ipv4_only for
+  # a host with no IPv6 route, and ipv6_only for a host that reaches the origin only
+  # over IPv6. With ip_distribution_enabled false an unhedged GET or HEAD dials only
+  # the first address. A PUT, a POST, a signed DELETE or a hedged read can still use
+  # any of them, so a host with no IPv6 route needs ipv4_only either way. See
+  # docs/CONFIGURATION.md, "Address families".
+  # dns_ip_strategy: ipv6_and_ipv4
   # Maximum idle connections per IP when IP distribution is on (default: 10; range
   # 1-100). With N S3 IPs, typically about 8, that is about N x 10 = 80 idle
   # connections. With IP distribution off, max_idle_per_host applies instead.
@@ -579,15 +593,17 @@ connection_pool:
   # request has its place in download coordination; time spent waiting there is not
   # counted.
 
-  # Time from connecting to the first response byte (default: 5s). It sits above
-  # typical cross-Region time-to-first-byte tails and well below the AWS CLI's 60s read
-  # timeout. When it expires before any byte has gone to the client, the fetch is
-  # retried up to upstream_idle_retries times.
+  # Time from connecting to the first response byte of a full-object GET, a part-number GET or a HEAD
+  # (default: 5s); range GETs do not use it. It sits above typical cross-Region
+  # time-to-first-byte tails and well below the AWS CLI's 60s read timeout. When it
+  # expires before any byte has gone to the client, the fetch is retried up to
+  # upstream_idle_retries times.
   # upstream_first_byte_timeout: "5s"
 
-  # Mid-stream idle timeout (default: 5s). If no byte arrives from S3 for this long after
-  # data has started, the client connection is closed and the client retries. A slow but
-  # steady transfer is never cut off.
+  # Mid-stream idle timeout (default: 5s) for the cache-miss fetches the proxy streams:
+  # full-object GETs, part-number GET misses, complete range misses and signed ranges. If no byte arrives from S3
+  # for this long after data has started, the client connection is closed and the client
+  # retries. A slow but steady transfer is never cut off.
   # upstream_idle_timeout: "5s"
 
   # Retries when the first-byte timeout expires before any byte has gone to the client
@@ -604,9 +620,10 @@ connection_pool:
   # Hedged upstream requests: the per-proxy governor. A cache_rules.json rule turns
   # hedging on for a key pattern (hedging_enabled, hedge_trigger_after,
   # hedge_max_per_request); there is no global switch. This section only caps the share
-  # of in-flight fetches that may be hedges, which bounds the extra S3 requests.
+  # of in-flight fetches for those keys that may be hedges, which bounds their extra
+  # S3 requests.
   # hedged_requests:
-  #   # Maximum share of in-flight fetches that may be hedges (default: 0.1; range
+  #   # Maximum share of those in-flight fetches that may be hedges (default: 0.1; range
   #   # 0.0-1.0). Above it, new hedges are suppressed. The first hedge is always admitted
   #   # when none is in flight, so 0.0 does not turn hedging off; remove hedging_enabled
   #   # from the rules for that. See docs/HEDGING.md.
@@ -733,9 +750,11 @@ dashboard:
 # ==============================================================================
 # Download bandwidth QoS (default: off)
 #
-# Caps the total bytes per second the proxy pulls from S3 on cache misses, and
-# shares that budget fairly across callers (the User-Agent app ID) or buckets. Cache
-# hits are never throttled. Leaving this section out leaves the feature off.
+# Caps the bytes per second the proxy streams from S3 on cache misses (full-object
+# GETs, part-number GET misses, complete range misses and signed ranges), and shares that budget fairly across
+# callers (the User-Agent app ID) or buckets. The buffered fetches of a partial range
+# hit or a page fill, requests forwarded without caching and cache hits are not
+# throttled. Leaving this section out leaves the feature off.
 # See docs/BANDWIDTH_QOS.md.
 # ==============================================================================
 download_bandwidth:

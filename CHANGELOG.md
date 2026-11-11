@@ -11,6 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [3.0.5] - 2026-11-11
+
+3.0.5 lets the proxy connect to an origin's IPv6 addresses on every path, adds `connection_pool.dns_ip_strategy` to choose which address families it looks up, and refuses passthrough and `CONNECT` destinations that lead back to a proxy. It also retries a GET or HEAD whose upstream connect fails, and part and range requests that waited on another request's fetch no longer get `504`.
+
+**Upgrade impact:** Operators whose DNS64 resolver uses the local-use NAT64 range `64:ff9b:1::/48`, whose clients connect through the proxy to one of its own addresses, or who tuned `connection_pool.ip_failure_threshold` should read [Upgrading to 3.0.5](docs/UPGRADING.md#upgrading-to-305) before upgrading.
+
+### Fixed
+
+- Previously, a GET or HEAD that IP distribution (on by default) sent to an origin's IPv6 address failed before connecting, and now connects. This affected an origin with only IPv6 addresses in public 1.7.7 to 3.0.4, and a dualstack origin in public 1.15.2 to 3.0.4, where the proxy tried IPv6 addresses first. Thanks to [@samantha-earthmover](https://github.com/samantha-earthmover) for [GitHub issue #18](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/18).
+- Previously, in public 1.10.0 to 3.0.4, a `CONNECT` request naming a bracketed IPv6 address, such as `CONNECT [2001:db8::1]:443`, failed, because the proxy looked the bracketed text up as a host name. The destination policy now checks the address itself.
+- Previously, in public 1.16.0 to 3.0.4, the destination policy allowed a NAT64 address that embeds a prohibited IPv4 address, such as `64:ff9b::a9fe:a9fe` for the instance metadata address. It now judges an address in `64:ff9b::/96` by the IPv4 address it embeds, and refuses all of the local-use range `64:ff9b:1::/48`. See [Destination policy](docs/ARCHITECTURE.md#destination-policy-ssrf-protection).
+- Previously, in every public release up to 3.0.4, a GET or HEAD whose connection to the origin could not be opened got `502` at once, except a signed range GET, which retried twice. It is now retried like other connection errors, up to three times, each time on the next address when IP distribution is on. A signed range GET runs that retry up to three times, so it can make up to 12 attempts; see [Connection pooling](docs/CONNECTION_POOLING.md#6-error-recovery).
+- A key whose cache rule turns hedging on follows different connect-retry rules; see [Hedging](docs/HEDGING.md#connection-diversity).
+- Previously, in public 1.9.0 to 3.0.4, a failed connect counted twice against its address when IP distribution was on. At the default `ip_failure_threshold` of 3, the address left rotation after 2 failed connects. It now counts once, so the address leaves after 3.
+
+### Changed
+
+- The HTTPS passthrough (port 443) and `CONNECT` tunnels on the TLS proxy listener (port 3129) now try each address the destination policy allows, in the order DNS returns them, until one connects. Previously they tried only the first, so a dualstack destination failed on a host with no IPv6 route. Each attempt has 10 seconds and the whole connect 30, where a `CONNECT` attempt had only the operating system's limit.
+- The HTTPS passthrough and `CONNECT` tunnels now refuse a destination when any address they would connect to leads back to a proxy. Such an address is on the proxy host's interfaces, is loopback or unspecified, or is listed in the new `server.tls.tunnel_refused_addresses`, even when `endpoint_overrides` lists it. The passthrough closes the connection and `CONNECT` answers `403`.
+- Uploads and other writes now count a failed connect against the address, as reads do, so an address that keeps failing leaves rotation for both. A successful connect for a write resets the address's count.
+- A part or range request that waited on another request's fetch through all `download_coordination.max_waiter_resubscriptions` rejoins now fetches from S3 itself, as a full-object GET does, instead of getting `504`.
+- A dashboard log request (`/api/logs`) now reads at most the eight newest application log files, where it could read every file in the directory, newest first, until it had enough entries.
+
+### Added
+
+- `connection_pool.dns_ip_strategy` chooses which address families the proxy looks up and which it tries first. The default, `ipv6_and_ipv4`, keeps the previous order; set `ipv4_only` on a host with no IPv6 route or `ipv6_only` on a host that reaches the origin only over IPv6. See [Address families](docs/CONFIGURATION.md#address-families).
+- `server.tls.tunnel_refused_addresses` (default empty) lists addresses that lead back to a proxy without being on its interfaces, such as each proxy's EC2 public IPv4 or Elastic IP address. The HTTPS passthrough and `CONNECT` tunnels refuse them. See [TLS proxy listener configuration](docs/CONFIGURATION.md#tls-proxy-listener-configuration).
+
 ## [3.0.4] - 2026-11-10
 
 3.0.4 stops write cache reclamation from removing unread uploads it does not need to, recovers on its own from a torn `.pending` line or damaged shard checkpoint, and keeps completed multipart uploads for `put_ttl`.
