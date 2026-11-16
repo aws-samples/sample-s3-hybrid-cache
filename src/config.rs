@@ -585,7 +585,10 @@ pub struct DownloadCoordinationConfig {
     /// If the fetcher takes longer than this, the waiter re-subscribes to the in-flight fetch
     /// (or becomes the fetcher if that fetch has gone). Once `max_waiter_resubscriptions`
     /// is exceeded, a full-object GET or HEAD waiter fetches from S3 itself, as an
-    /// uncoalesced request does, and a part or range waiter returns 504.
+    /// uncoalesced request does, and a part or range waiter returns 504. A full-object
+    /// GET or HEAD waiter also stops waiting 30 s after it began, whatever this and
+    /// `max_waiter_resubscriptions` allow, so its response head comes before the AWS
+    /// SDKs' 60 s read timeout.
     /// Valid range: 5-120 seconds (values outside this range are clamped with a warning)
     /// Requirement: 18.2, 18.3, 18.5
     #[serde(default = "default_download_coordination_wait_timeout_secs")]
@@ -840,20 +843,14 @@ pub struct SharedStorageConfig {
         deserialize_with = "duration_serde::deserialize"
     )]
     pub shard_fold_max_duration: Duration,
-    /// A range is a Tail_Partition member only if its **compressed** size is at least this
-    /// (default: 1 MiB).
+    /// DEPRECATED, no effect. Accepted and range-validated (4 KiB - 1 GiB) so existing configs
+    /// still load, and a config carrying it logs one warning
+    /// ([`TAIL_FLOOR_BYTES_DEPRECATION`]).
     ///
-    /// The floor exists to keep tiny entries out of a file eviction reads a bounded prefix of;
-    /// it is not the membership boundary. Membership is a per-shard **rank** cap
-    /// ([`Self::tail_max_entries`]), which is what makes partitions from different shards
-    /// mergeable even when their smallest member differs by orders of magnitude.
-    ///
-    /// **Compressed size, not the range's logical extent.** They differ for compressible data,
-    /// and the extent is not the number of bytes an eviction frees — testing the floor against
-    /// it admits ranges whose on-disk size is below the floor.
-    ///
-    /// Valid range: 4 KiB - 1 GiB. Rejected rather than clamped, per
-    /// [`Self::shard_fold_interval`]'s precedent.
+    /// It used to keep ranges below it out of the Tail_Partition and the tail-delta. A cache of
+    /// small ranges then had no index at all and every read-tier eviction pass parsed every
+    /// `.meta` on the volume. Every range is now indexed, and the per-shard rank cap
+    /// ([`Self::tail_max_entries`]) is the only membership bound.
     #[serde(default = "default_tail_floor_bytes")]
     pub tail_floor_bytes: u64,
     /// Per shard, how many of the **largest** above-floor ranges the Tail_Partition keeps
@@ -1784,15 +1781,25 @@ fn warn_on_removed_server_keys(document: &serde_yaml_ng::Value) {
 /// config ships these keys at their defaults, so a `!= default` check would stay quiet for the
 /// operators who copied it.
 fn warn_on_inert_cache_keys(document: &serde_yaml_ng::Value) {
-    let present = document
-        .get("cache")
-        .and_then(|c| c.get("shared_storage"))
-        .and_then(|s| s.get("consolidation_size_threshold"))
-        .is_some();
-    if present {
-        warn!("{}", CONSOLIDATION_SIZE_THRESHOLD_DEPRECATION);
+    let shared = document.get("cache").and_then(|c| c.get("shared_storage"));
+    for (key, notice) in [
+        (
+            "consolidation_size_threshold",
+            CONSOLIDATION_SIZE_THRESHOLD_DEPRECATION,
+        ),
+        ("tail_floor_bytes", TAIL_FLOOR_BYTES_DEPRECATION),
+    ] {
+        if shared.and_then(|s| s.get(key)).is_some() {
+            warn!("{}", notice);
+        }
     }
 }
+/// The deprecation notice for `cache.shared_storage.tail_floor_bytes`.
+const TAIL_FLOOR_BYTES_DEPRECATION: &str =
+    "Configuration field 'cache.shared_storage.tail_floor_bytes' is deprecated and has no \
+     effect: every cached range is indexed for read-tier eviction, bounded per shard by \
+     'cache.shared_storage.tail_max_entries'. The value is ignored. Delete the field to silence \
+     this warning.";
 
 /// The deprecation notice for `cache.shared_storage.consolidation_size_threshold`.
 const CONSOLIDATION_SIZE_THRESHOLD_DEPRECATION: &str =
@@ -1917,7 +1924,7 @@ pub struct CacheConfig {
     #[serde(default)]
     pub metadata_cache: MetadataCacheConfig,
     /// Percentage of max_cache_size at which eviction triggers (default: 95)
-    /// Valid range: 50-100
+    /// Valid range: 50-99. A value outside it is clamped with a warning, so 100 runs as 99.
     /// Requirement: 3.1
     #[serde(default = "default_eviction_trigger_percent")]
     pub eviction_trigger_percent: u8,
@@ -2684,7 +2691,7 @@ fn default_upstream_first_byte_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-fn default_upstream_idle_timeout() -> Duration {
+pub(crate) fn default_upstream_idle_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
@@ -4562,16 +4569,18 @@ impl Config {
     /// Validate and correct eviction threshold configuration
     ///
     /// Requirements:
-    /// - 3.5: eviction_trigger_percent must be in range 50-100
+    /// - 3.5: eviction_trigger_percent must be in range 50-99
     /// - 3.6: eviction_target_percent must be in range 50-99
-    /// - 3.7: If trigger is outside 50-100, log warning and clamp
+    /// - 3.7: If trigger is outside 50-99, log warning and clamp. 100 was accepted before
+    ///   3.0.6 and clamps to 99: at 100 the trigger waits for the cache to pass
+    ///   `max_cache_size`, the figure every admission stops at.
     /// - 3.8: If target is outside 50-99, log warning and clamp
     /// - 3.9: If target >= trigger, log warning and set target = trigger - 10
     fn validate_eviction_thresholds(&mut self) {
         let original_trigger = self.cache.eviction_trigger_percent;
         let original_target = self.cache.eviction_target_percent;
 
-        // Validate eviction_trigger_percent (50-100)
+        // Validate eviction_trigger_percent (50-99)
         // Requirement: 3.5, 3.7
         if self.cache.eviction_trigger_percent < 50 {
             warn!(
@@ -4579,12 +4588,14 @@ impl Config {
                 original_trigger
             );
             self.cache.eviction_trigger_percent = 50;
-        } else if self.cache.eviction_trigger_percent > 100 {
+        } else if self.cache.eviction_trigger_percent > 99 {
             warn!(
-                "eviction_trigger_percent {} is above maximum 100, clamping to 100",
+                "eviction_trigger_percent {} is above maximum 99, clamping to 99: at 100 eviction \
+                 starts only once the cache is over max_cache_size, and caching stops at \
+                 max_cache_size",
                 original_trigger
             );
-            self.cache.eviction_trigger_percent = 100;
+            self.cache.eviction_trigger_percent = 99;
         }
 
         // Validate eviction_target_percent (50-99)
@@ -7443,15 +7454,86 @@ max_log_entries: 200
 
     #[test]
     fn test_eviction_threshold_validation_trigger_above_max() {
-        // Requirement 3.7: If trigger is above 100, clamp to 100
+        // Requirement 3.7: If trigger is above 99, clamp to 99
         let mut config = Config::default();
         config.cache.eviction_trigger_percent = 150;
         config.cache.eviction_target_percent = 80;
 
         config.validate_eviction_thresholds();
 
-        assert_eq!(config.cache.eviction_trigger_percent, 100);
+        assert_eq!(config.cache.eviction_trigger_percent, 99);
         assert_eq!(config.cache.eviction_target_percent, 80);
+    }
+
+    /// `eviction_trigger_percent: 100` in a configuration file loads as 99 with a WARN naming
+    /// why, and the target keeps its value below it. A file without the field keeps the default
+    /// 95 and warns about nothing. `Config::load` cannot run under the harness, so its call to
+    /// the validator is pinned by source, as `out_of_range_collection_interval_still_boots_clamped`
+    /// pins its clamp.
+    #[test]
+    fn a_trigger_of_100_loads_as_99_and_warns() {
+        let with_100 = r#"
+cache:
+  cache_dir: "./cache"
+  eviction_trigger_percent: 100
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let without = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let mut clamped: Config = serde_yaml_ng::from_str(with_100).expect("config must parse");
+        assert_eq!(
+            clamped.cache.eviction_trigger_percent, 100,
+            "fixture: the file sets 100"
+        );
+        let clamped_log = capture_warnings(|| clamped.validate_eviction_thresholds());
+        let mut default: Config = serde_yaml_ng::from_str(without).expect("config must parse");
+        let default_log = capture_warnings(|| default.validate_eviction_thresholds());
+        let warned = clamped_log.contains("eviction_trigger_percent 100")
+            && clamped_log.contains("clamping to 99")
+            && clamped_log.contains("max_cache_size");
+        println!(
+            "Trigger 100: loaded as trigger {} target {}, warned {warned}; no field: trigger {} \
+             target {}, warnings {:?}",
+            clamped.cache.eviction_trigger_percent,
+            clamped.cache.eviction_target_percent,
+            default.cache.eviction_trigger_percent,
+            default.cache.eviction_target_percent,
+            default_log
+        );
+        assert_eq!(
+            (
+                clamped.cache.eviction_trigger_percent,
+                clamped.cache.eviction_target_percent,
+                warned,
+                default.cache.eviction_trigger_percent,
+                default.cache.eviction_target_percent,
+                default_log.is_empty(),
+            ),
+            (99, 80, true, 95, 80, true),
+            "a trigger of 100 must run as 99 and say why; no field must keep 95 silently"
+        );
+        // Searched only inside `load_from_matches`, which `Config::load` returns, so the calls in
+        // this module's tests cannot satisfy it.
+        let needle = concat!("config.", "validate_eviction_thresholds();");
+        let source = include_str!("config.rs");
+        let start = source
+            .find(concat!("fn load_from", "_matches("))
+            .expect("Config::load_from_matches");
+        let end = start
+            + source[start..]
+                .find(concat!("fn unread_fields", "_warning("))
+                .expect("the function after load_from_matches");
+        assert!(
+            source[start..end].contains(needle),
+            "Config::load must run the eviction threshold clamp"
+        );
     }
 
     #[test]
@@ -7476,10 +7558,10 @@ max_log_entries: 200
 
         config.validate_eviction_thresholds();
 
-        assert_eq!(config.cache.eviction_trigger_percent, 100);
-        // Target clamped to 99, but 99 >= 100 is false, so no further adjustment
-        // Wait, 99 < 100, so it should stay at 99
-        assert_eq!(config.cache.eviction_target_percent, 99);
+        // The trigger clamps to 99 and the target to 99, which is not below the trigger, so
+        // the target becomes 99 - 10.
+        assert_eq!(config.cache.eviction_trigger_percent, 99);
+        assert_eq!(config.cache.eviction_target_percent, 89);
     }
 
     #[test]
@@ -7538,15 +7620,25 @@ max_log_entries: 200
 
     #[test]
     fn test_eviction_threshold_validation_max_boundary() {
-        // Test boundary values: trigger=100, target=99 (both at maximum)
+        // Boundary values: trigger=99, target=98 (both at their highest accepted pair), and
+        // trigger=100, target=99, where the trigger clamps to 99 and the target moves below it.
+        let mut config = Config::default();
+        config.cache.eviction_trigger_percent = 99;
+        config.cache.eviction_target_percent = 98;
+
+        config.validate_eviction_thresholds();
+
+        assert_eq!(config.cache.eviction_trigger_percent, 99);
+        assert_eq!(config.cache.eviction_target_percent, 98);
+
         let mut config = Config::default();
         config.cache.eviction_trigger_percent = 100;
         config.cache.eviction_target_percent = 99;
 
         config.validate_eviction_thresholds();
 
-        assert_eq!(config.cache.eviction_trigger_percent, 100);
-        assert_eq!(config.cache.eviction_target_percent, 99);
+        assert_eq!(config.cache.eviction_trigger_percent, 99);
+        assert_eq!(config.cache.eviction_target_percent, 89);
     }
 
     // =========================================================================
@@ -9007,6 +9099,58 @@ logging:
         );
     }
 
+    /// `cache.shared_storage.tail_floor_bytes` is deprecated and inert: a config carrying it
+    /// loads, validates and warns once naming it; a config without it loads at the default and
+    /// does not warn; and the value reaches no Tail_Partition consumer (the tracker's and the
+    /// consolidator's configurations no longer carry a floor, so there is nothing to copy it to).
+    #[test]
+    fn tail_floor_bytes_is_accepted_ignored_and_warned() {
+        let field = "tail_floor_bytes";
+        for (yaml, expected) in [
+            (
+                "cache:\n  shared_storage:\n    tail_floor_bytes: 4096\n",
+                4096u64,
+            ),
+            (
+                "cache:\n  shared_storage:\n    tail_floor_bytes: 1073741824\n",
+                1_073_741_824u64,
+            ),
+        ] {
+            let config: Config =
+                serde_yaml_ng::from_str(yaml).expect("config with the field loads");
+            assert_eq!(config.cache.shared_storage.tail_floor_bytes, expected);
+            assert!(config.cache.shared_storage.validate().is_ok());
+            let tracker = crate::cache_size_tracker::CacheSizeConfig::from_shared_storage(
+                &config.cache.shared_storage,
+                Duration::from_secs(1),
+            );
+            assert_eq!(
+                tracker.tail_max_entries,
+                config.cache.shared_storage.tail_max_entries
+            );
+            let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+            let captured = capture_warnings(|| warn_on_inert_cache_keys(&document));
+            assert_eq!(
+                captured.matches(field).count(),
+                1,
+                "a config carrying the field must WARN exactly once naming it; captured: {captured:?}"
+            );
+            assert!(captured.contains("deprecated and has no effect"));
+        }
+        let yaml = "cache:\n  shared_storage:\n    tail_max_entries: 64\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("config without the field loads");
+        assert_eq!(
+            config.cache.shared_storage.tail_floor_bytes,
+            default_tail_floor_bytes()
+        );
+        assert!(config.cache.shared_storage.validate().is_ok());
+        let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let quiet = capture_warnings(|| warn_on_inert_cache_keys(&document));
+        assert!(
+            !quiet.contains(field),
+            "a config without the field must not warn about it; got: {quiet:?}"
+        );
+    }
     /// `cache.ram_cache_flush_threshold` is REMOVED, and a config carrying it must still load.
     ///
     /// The upgrade contract in the config compatibility rule is that an existing

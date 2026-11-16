@@ -65,7 +65,7 @@
         },
         "put_ttl": {
           "type": "string",
-          "description": "How long an object in the write cache stays cached before its first GET, which moves it to get_ttl. Same format as get_ttl.",
+          "description": "How long an object in the write cache stays valid before its first GET, which moves it to get_ttl. Same format as get_ttl.",
           "pattern": "^\\s*[0-9]+(\\.[0-9]+)?\\s*(ms|millis|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)?\\s*$",
           "examples": [
             "30s",
@@ -126,7 +126,7 @@
         "hedge_max_per_request": {
           "type": "integer",
           "minimum": 0,
-          "description": "Most hedges per client request. A range GET that fans out into several missing-range fetches shares one budget across all of them. 0 sends no hedge yet still ties the original request to an address, which skips an unhedged request's connect and timeout retries; to turn hedging off, set hedging_enabled to false. Default: 1.",
+          "description": "Most hedges per client request. A range GET that fans out into several missing-range fetches shares one budget across all of them. 0 turns hedging off for the keys it applies to, as hedging_enabled false does. Default: 1.",
           "examples": [
             1,
             2,

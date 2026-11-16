@@ -694,8 +694,8 @@ The proxy invalidates a key's cached entry when:
 
 1. A HEAD, or a revalidation after `get_ttl`, gets a different ETag or Last-Modified from S3, or S3
    returns another version while the proxy fills a gap in a partly cached range. A cache-miss GET
-   that receives another version serves it to the client but does not cache it, and leaves the
-   cached entry in place until one of these checks runs.
+   that receives another version serves it to the client and removes the cached entry, or replaces
+   it when the GET caches the whole object.
 2. A PUT to the key arrives: the new upload replaces the old entry (see
    [Conflict handling](#conflict-handling)).
 3. A CompleteMultipartUpload to the key completes: the completed object replaces the old entry.
@@ -1088,7 +1088,9 @@ covers the mechanism, the full set of counters, and the one cached read the limi
   only the copy is skipped.
 - This is the same soft stop as the write cache's, against the same figure. The proxy decides once,
   at the start of each fill, so a fill already streaming completes and is cached.
-- Caching resumes on its own once eviction brings the total back below the limit.
+- Caching resumes on its own once eviction brings the total back below the limit. A declined
+  object up to half the gap between `max_cache_size` and `eviction_target_percent` starts that
+  eviction itself ([Room for a declined object](EVICTION.md#room-for-a-declined-object)).
   [`cache.read_fills_declined_max_cache_size_total`](METRICS_REFERENCE.md#the-max_cache_size-soft-stop-on-fills)
   counts the declined fills, and one log line per minute names the figures while it is happening.
 - The [free-space floor](CONFIGURATION.md#free-space-floor-and-the-danger-band) governs free space

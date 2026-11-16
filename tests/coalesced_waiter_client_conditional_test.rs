@@ -1606,6 +1606,66 @@ async fn widened_page_with_an_etagless_extent_is_not_merged_with_another_version
 }
 
 // ---------------------------------------------------------------------------
+// A full-object waiter's head wait
+// ---------------------------------------------------------------------------
+/// With the default coordination settings, a whole-object GET waiting on a fill that has not
+/// committed gets its response head before the AWS SDKs' 60 s read timeout: it stops waiting
+/// and fetches for itself. Paused time: the wait elapses at once, and the figure asserted is
+/// the virtual time from the request to its head.
+#[tokio::test(start_paused = true)]
+async fn a_full_object_waiter_on_a_slow_fill_gets_its_head_before_the_sdk_read_timeout() {
+    let h = Harness::with_default_coordination().await;
+    let coordination = &h.config.cache.download_coordination;
+    assert_eq!(
+        (
+            coordination.wait_timeout_secs,
+            coordination.max_waiter_resubscriptions
+        ),
+        (30, 3),
+        "PRECONDITION: the defaults"
+    );
+    let key = "bucket/slow-fill-waiter.bin";
+    let s3 = VersionedS3::new(0, OBJECT_SIZE, Duration::ZERO).await;
+    // The fetcher of a fill that does not commit during the test.
+    let _fill = match h.tracker.try_register(&InFlightTracker::make_full_key(key)) {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let s3_client: Arc<dyn s3_proxy::S3ClientApi + Send + Sync> = s3.clone();
+    let start = tokio::time::Instant::now();
+    let response = HttpProxy::forward_get_head_with_coordination(
+        Method::GET,
+        format!("/{}", key).parse().unwrap(),
+        "s3.us-west-2.amazonaws.com".to_string(),
+        HashMap::new(),
+        key.to_string(),
+        Arc::clone(&h.cache_manager),
+        s3_client,
+        Arc::clone(&h.tracker),
+        Arc::clone(&h.range_handler),
+        Arc::clone(&h.config),
+        true,
+        h.config.cache.download_coordination.wait_timeout(),
+        None,
+        &ResolvedSettings::default(),
+        &None,
+        None,
+    )
+    .await
+    .expect("Infallible");
+    let head_after = start.elapsed();
+    assert!(
+        head_after < Duration::from_secs(60),
+        "A FULL-OBJECT WAITER ON A SLOW FILL GOT ITS HEAD AFTER {head_after:?}, past the SDKs' 60 s read timeout (status {})",
+        response.status()
+    );
+    assert!(
+        !s3.seen().is_empty(),
+        "the waiter must have fetched for itself, status {}",
+        response.status()
+    );
+}
+// ---------------------------------------------------------------------------
 // A range waiter's fallback over a version change during its wait
 // ---------------------------------------------------------------------------
 
@@ -1622,6 +1682,22 @@ enum WaitEnd {
 const SIGNED_RANGE_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20250101/us-west-2/s3/aws4_request, SignedHeaders=host;range;x-amz-date, Signature=0123456789abcdef";
 
 impl Harness {
+    /// A harness with the default download-coordination settings.
+    async fn with_default_coordination() -> Self {
+        let mut config = Config::default();
+        config.cache.download_coordination.enabled = true;
+        config.cache.ram_cache_enabled = false;
+        config.cache.full_object_check_threshold = 512;
+        let config = Arc::new(config);
+        let (t, cache_manager, range_handler) = make_infra(&config).await;
+        Self {
+            _t: t,
+            cache_manager,
+            range_handler,
+            config,
+            tracker: Arc::new(InFlightTracker::new()),
+        }
+    }
     /// A harness whose waiters give up after `wait_secs` and do not re-subscribe.
     async fn with_spent_budget(wait_secs: u64) -> Self {
         let mut config = Config::default();

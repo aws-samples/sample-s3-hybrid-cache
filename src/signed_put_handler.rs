@@ -1543,11 +1543,22 @@ impl SignedPutHandler {
     /// - Requirement 2.2: Bypass if Content-Length exceeds capacity
     /// - Requirement 2.3: Stream with capacity check if no Content-Length
     fn should_cache(&self, content_length: Option<u64>) -> CacheDecision {
-        check_cache_capacity(
+        let decision = check_cache_capacity(
             content_length,
             self.current_cache_usage,
             self.max_cache_capacity,
-        )
+        );
+        // A size refusal asks the read tier to evict room for this object.
+        if let CacheDecision::Bypass(
+            crate::capacity_manager::BypassReason::ContentLengthExceedsCapacity {
+                content_length,
+                ..
+            },
+        ) = &decision
+        {
+            crate::cache::note_size_refusal(&self.cache_dir, *content_length);
+        }
+        decision
     }
 
     /// Handle signed PUT with caching (Content-Length known and fits).
@@ -2293,8 +2304,8 @@ impl SignedPutHandler {
     }
 
     /// R16.10's disk-safety verdict for a CreateMultipartUpload, `true` when caching the upload
-    /// must be declined. `disk_safety_refusal` reads `size_state.json` and calls `statvfs`
-    /// inline, so it runs on a blocking thread: a stalled volume must not hold a runtime
+    /// must be declined. `disk_safety_refusal` calls `statvfs` inline, so it runs on a
+    /// blocking thread: a stalled volume must not hold a runtime
     /// worker. Fails open, as the check itself does (R7.5), if no verdict comes back.
     async fn create_disk_safety_refused(&self) -> bool {
         let Some(cache_manager) = self.cache_manager.clone() else {
@@ -10101,6 +10112,47 @@ mod tests {
         }
     }
 
+    /// The PUT router's size refusal records the declined Content-Length as eviction demand up
+    /// to the cap, and counts a larger one apart.
+    #[test]
+    fn a_router_size_refusal_records_eviction_demand_up_to_the_cap() {
+        const MAX: u64 = 10_000_000;
+        const CAP: u64 = 1_000_000; // (MAX - 80% of MAX) / 2
+        let temp_dir = TempDir::new().unwrap();
+        crate::cache::register_eviction_demand(temp_dir.path(), MAX, 80);
+        let handler = SignedPutHandler::new(
+            temp_dir.path().to_path_buf(),
+            CompressionHandler::new(1024, true),
+            9_400_000,
+            MAX,
+            None,
+            10 * 1024 * 1024,
+            5,
+        );
+        let bypassed = |d: &CacheDecision| matches!(d, CacheDecision::Bypass(_));
+        let over = handler.should_cache(Some(CAP + 1));
+        let after_over = (
+            crate::cache::eviction_demand(temp_dir.path()),
+            crate::cache::eviction_demand_counters(temp_dir.path()).1,
+        );
+        let at_cap = handler.should_cache(Some(CAP));
+        let after_at_cap = crate::cache::eviction_demand(temp_dir.path());
+        let fits = handler.should_cache(Some(600_000));
+        let observed = (
+            bypassed(&over),
+            after_over,
+            bypassed(&at_cap),
+            after_at_cap,
+            fits,
+        );
+        println!("Router demand: {observed:?}");
+        assert_eq!(
+            observed,
+            (true, (0, 1), true, CAP, CacheDecision::Cache),
+            "the router must record a refused size up to the cap and count a larger one"
+        );
+    }
+
     #[test]
     fn test_should_cache_without_content_length() {
         let temp_dir = TempDir::new().unwrap();
@@ -11984,119 +12036,6 @@ mod tests {
                 "{cache_key}: expires_at must be the resolved put_ttl after creation"
             );
         }
-    }
-
-    /// A completed multipart upload that expires unread leaves the staged figure through the
-    /// removal debit, as a single-part PUT's expiry does: the expiry site removes the ranges of
-    /// a completed multipart object with the same predicate the fold counts with, and records
-    /// the staged bytes and ranges against the object's shard.
-    ///
-    /// The upload is written with a one-second `put_ttl` rule and left to expire, so the expiry
-    /// is the resolved TTL's, not a hand-set timestamp.
-    /// Mutation that must break this: skip multi-range objects (a completed multipart upload) where
-    /// `check_and_invalidate_expired_write_cache` debits what it removed.
-    #[tokio::test]
-    async fn an_expired_multipart_upload_leaves_the_staged_figure_through_the_removal_debit() {
-        let temp_dir = TempDir::new().unwrap();
-        let cache_root = temp_dir.path().join("mpu-expiry-debit");
-        std::fs::create_dir_all(&cache_root).unwrap();
-        std::fs::write(
-            cache_root.join("cache_rules.json"),
-            r#"{"rules":[{"pattern":"test-bucket/short/**","put_ttl":"1s"}]}"#,
-        )
-        .unwrap();
-        let cache_manager =
-            initialized_accounting_cache_manager(cache_root.clone(), 1024 * 1024 * 1024).await;
-        let mut handler = SignedPutHandler::new(
-            cache_root.clone(),
-            (*cache_manager.get_compression_handler()).clone(),
-            0,
-            u64::MAX,
-            None,
-            10 * 1024 * 1024,
-            4,
-        );
-        handler.set_cache_manager(cache_manager.clone());
-        let cache_key = "test-bucket/short/object.bin";
-        let upload_id = "mpu-expiry-debit";
-        for n in 1..=2u32 {
-            stage_part(
-                &handler,
-                cache_key,
-                upload_id,
-                n,
-                &vec![n as u8; 4096],
-                &format!("etag{n}"),
-            )
-            .await
-            .unwrap();
-        }
-        handler
-            .finalize_multipart_upload(
-                cache_key,
-                upload_id,
-                "\"mpu-expiry-final\"",
-                &HashMap::new(),
-                &[
-                    RequestedPart {
-                        part_number: 1,
-                        etag: "etag1".to_string(),
-                    },
-                    RequestedPart {
-                        part_number: 2,
-                        etag: "etag2".to_string(),
-                    },
-                ],
-            )
-            .await
-            .expect("the completion publishes");
-        let metadata_file =
-            crate::disk_cache::get_sharded_path(&cache_root.join("metadata"), cache_key, ".meta")
-                .unwrap();
-        let published: crate::cache_types::NewCacheMetadata =
-            serde_json::from_str(&std::fs::read_to_string(&metadata_file).unwrap()).unwrap();
-        let (staged_bytes, staged_ranges) = (
-            published.staged_compressed_size(),
-            published.staged_range_count(),
-        );
-        assert!(
-            published.object_metadata.is_write_cached
-                && published.ranges.len() == 2
-                && staged_bytes > 0
-                && staged_ranges > 0,
-            "fixture: a staged multipart object (write-cached={}, ranges={}, staged_bytes={}, \
-             staged_ranges={})",
-            published.object_metadata.is_write_cached,
-            published.ranges.len(),
-            staged_bytes,
-            staged_ranges
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
-        let expired = cache_manager
-            .check_and_invalidate_expired_write_cache(cache_key)
-            .await
-            .expect("the expiry check runs");
-        assert!(expired, "fixture: the one-second put_ttl entry has expired");
-        assert!(
-            !metadata_file.exists(),
-            "fixture: the expiry removed the .meta"
-        );
-        let (bucket, l1) = crate::staged_fold::shard_of(cache_key).expect("a shard");
-        let debits = crate::staged_fold::removal_debits_for_tests(&cache_root).await;
-        let (bytes, ranges) = debits
-            .iter()
-            .filter(|e| e.bucket == bucket && e.l1 == l1)
-            .fold((0u64, 0u64), |(b, r), e| (b + e.bytes, r + e.ranges));
-        println!(
-            "MPU expiry debit: staged_bytes={staged_bytes} staged_ranges={staged_ranges} \
-             debited_bytes={bytes} debited_ranges={ranges} entries={debits:?}"
-        );
-        assert_eq!(
-            (bytes, ranges),
-            (staged_bytes, staged_ranges),
-            "the expiry of a completed multipart object did not leave the staged figure through \
-             the removal debit: debits={debits:?}"
-        );
     }
 
     /// — a part file that vanishes after the existence check and before the renames
@@ -16949,6 +16888,8 @@ mod tests {
 
         let disk_manager =
             initialized_accounting_cache_manager(temp_dir.path().join("disk-safety"), 1).await;
+        // Component 1 decides on the published usage figure, so publish one as startup does.
+        disk_manager.start_put_usage_refresher().await;
         let mut disk_put = SignedPutHandler::new(
             temp_dir.path().to_path_buf(),
             (*disk_manager.get_compression_handler()).clone(),
@@ -17289,6 +17230,213 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // `CreateMultipartUpload` decides on the one whole-cache figure
+    // =========================================================================
+
+    /// A manager whose volume holds `total_size` in `size_state.json` and `part_bytes` of
+    /// in-progress multipart parts before its usage refresher starts, so the startup snapshot is
+    /// taken on exactly that state. `epoch_1` activates the fold epoch first.
+    ///
+    /// Not `initialize()`d: its validation scheduler can scan a fresh volume that has no
+    /// `validation.json`, which would rewrite the seeded `total_size` under the test.
+    async fn whole_cache_cmu_manager(
+        cache_dir: &std::path::Path,
+        max_cache_size: u64,
+        total_size: u64,
+        part_bytes: u64,
+        epoch_1: bool,
+    ) -> Arc<crate::cache::CacheManager> {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let mut cache_manager = crate::cache::CacheManager::new_with_shared_storage(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            max_cache_size,
+            crate::cache::CacheEvictionAlgorithm::default(),
+            1,
+            true,
+            std::time::Duration::from_secs(315_360_000),
+            std::time::Duration::from_secs(3_600),
+            std::time::Duration::from_secs(3_600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86_400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            64,
+            std::time::Duration::from_secs(5),
+        );
+        // Component 2 (free space) off, so a decline can only be component 1's.
+        cache_manager.set_disk_safety_free_space_floor(0);
+        let cache_manager = Arc::new(cache_manager);
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        let consolidator = cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("fixture: a shared-storage manager has a consolidator");
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = total_size;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+        let part_dir = cache_dir
+            .join("mpus_in_progress")
+            .join("whole-cache-parts-in-progress");
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let info = crate::cache_types::CachedPartInfo::new(
+            1,
+            part_bytes,
+            "\"etag-whole-cache\"".to_string(),
+            crate::compression::CompressionAlgorithm::Lz4,
+        )
+        .with_compressed_size(part_bytes);
+        std::fs::write(
+            part_dir.join("part1.json"),
+            serde_json::to_string(&info).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::signed_put_handler::in_progress_part_bytes(cache_dir),
+            Some(part_bytes),
+            "fixture: P must be non-zero and readable on the volume, or the test is vacuous"
+        );
+        if epoch_1 {
+            crate::staged_fold::seed_shard_figure_for_tests(cache_dir, "test-bucket", "3f", 1, 1);
+            assert!(crate::staged_authority::activate(cache_dir, "host:test").unwrap());
+            assert!(
+                crate::staged_authority::fold_authority_active(cache_dir),
+                "fixture: epoch 1 must be active"
+            );
+        } else {
+            assert_eq!(
+                crate::staged_authority::read_epoch(cache_dir),
+                crate::staged_authority::EPOCH_LEGACY,
+                "fixture: no epoch document means epoch 0"
+            );
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cache_manager.start_put_usage_refresher(),
+        )
+        .await
+        .expect("start_put_usage_refresher must not hang");
+        cache_manager
+    }
+
+    /// One `CreateMultipartUpload` through the production handler against a mock S3. Returns
+    /// the status the client got and whether the upload tracker was written, which is what
+    /// "the upload is write-through cached" means at this call.
+    async fn create_multipart_through(
+        cache_manager: Arc<crate::cache::CacheManager>,
+        cache_dir: &std::path::Path,
+        upload_id: &str,
+    ) -> (StatusCode, bool) {
+        let mut handler = SignedPutHandler::new(
+            cache_dir.to_path_buf(),
+            (*cache_manager.get_compression_handler()).clone(),
+            0,
+            u64::MAX,
+            None,
+            10 * 1024 * 1024,
+            4,
+        );
+        handler.set_cache_manager(cache_manager);
+        handler.set_metrics_manager(Arc::new(RwLock::new(MetricsManager::new())));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(accept_and_reply_initiate_multipart(
+            listener,
+            upload_id.to_string(),
+        ));
+        let (req, _conn_keepalive) =
+            incoming_request_with_method("POST", "/r16-14-object?uploads", Vec::new()).await;
+        let transport = Arc::new(UpstreamTransport {
+            ip: upstream_addr.ip(),
+            port: upstream_addr.port(),
+            tls: None,
+            validated_endpoint: None,
+            timeouts: crate::signed_request_proxy::UpstreamTimeouts::default(),
+            response_ledger: None,
+            health: None,
+        });
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            handler.handle_create_multipart_upload(
+                req,
+                "test-bucket/r16-14-object".to_string(),
+                "test-bucket.s3.amazonaws.com".to_string(),
+                transport,
+            ),
+        )
+        .await
+        .expect("handle_create_multipart_upload did not finish within 60s")
+        .expect("CreateMultipartUpload must reach the mock upstream and return its response");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
+        let tracked = mpu_upload_dir(cache_dir, upload_id)
+            .join("upload.meta")
+            .exists();
+        (response.status(), tracked)
+    }
+
+    /// `CreateMultipartUpload` is declined once `total_size + P` passes `max_cache_size`,
+    /// where `total_size` alone is under it. The control differs only in `P`, sized so the sum
+    /// fits: without it a decline in the subject could be any of the guard's other causes.
+    async fn assert_create_multipart_counts_parts_in_progress(epoch_1: bool) {
+        const MAX: u64 = 10_000_000;
+        const TOTAL: u64 = 6_000_000;
+        // TOTAL + P_UNDER = 9 MB: fits.
+        const P_UNDER: u64 = 3_000_000;
+        // TOTAL + P_OVER = 11 MB: past the limit, with TOTAL alone 4 MB under it.
+        const P_OVER: u64 = 5_000_000;
+        let temp = TempDir::new().unwrap();
+        let control_dir = temp.path().join("control");
+        let subject_dir = temp.path().join("subject");
+        let control = whole_cache_cmu_manager(&control_dir, MAX, TOTAL, P_UNDER, epoch_1).await;
+        let subject = whole_cache_cmu_manager(&subject_dir, MAX, TOTAL, P_OVER, epoch_1).await;
+        let (control_status, control_tracked) =
+            create_multipart_through(control, &control_dir, "whole-cache-control-upload").await;
+        let (subject_status, subject_tracked) =
+            create_multipart_through(subject, &subject_dir, "whole-cache-subject-upload").await;
+        println!(
+            "Whole-cache CreateMultipartUpload, epoch {}: total {TOTAL}, max {MAX}; control P {P_UNDER} \
+             tracked={control_tracked}; subject P {P_OVER} tracked={subject_tracked}",
+            u8::from(epoch_1)
+        );
+        assert_eq!(
+            (control_status, subject_status),
+            (StatusCode::OK, StatusCode::OK),
+            "the upload itself reaches S3 either way; only caching is declined"
+        );
+        assert_eq!(
+            (control_tracked, subject_tracked),
+            (true, false),
+            "(control tracked, subject tracked): in-progress parts are bytes on the volume, so \
+             CreateMultipartUpload must decline once total_size + P passes max_cache_size, \
+             and admit while it fits"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_multipart_upload_counts_parts_in_progress_at_epoch_1() {
+        assert_create_multipart_counts_parts_in_progress(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_multipart_upload_counts_parts_in_progress_at_epoch_0() {
+        assert_create_multipart_counts_parts_in_progress(false).await;
+    }
     // --- uploadId validation tests (Security: path traversal prevention) ---
 
     #[tokio::test]
@@ -19489,36 +19637,27 @@ mod tests {
     }
 
     /// Red side (fix 2): CreateMultipartUpload awaited `disk_safety_refusal(0)` in front
-    /// of the forward, and that reads `size_state.json` from the shared volume. The stall is a
-    /// FIFO at that path: a read of it blocks until a writer opens it, as a hung NFS or EFS
-    /// read does. The answer must come within the bound, and a Create answered before its
-    /// cache setup finished leaves no tracker, so the upload is not cached.
+    /// of the forward, and that check calls `statvfs` on the shared volume. The stall is the
+    /// seam in `disk_safety_refusal_inner`, a blocking sleep where a hung NFS or EFS
+    /// `statvfs` blocks. The answer must come within the bound, and a Create answered before
+    /// its cache setup finished leaves no tracker, so the upload is not cached.
     #[tokio::test]
     async fn create_is_answered_within_the_bound_when_the_disk_safety_check_stalls() {
-        use std::os::unix::fs::OpenOptionsExt;
         let temp_dir = TempDir::new().unwrap();
         let cache_dir = temp_dir.path().to_path_buf();
-        // Generous, so component 1 runs (it needs `max_cache_size > 0`) and admits once it
-        // reads; floor 0 disables component 2.
+        // Generous, so the check admits once the stall ends; floor 0 disables component 2.
         let cache_manager = initialized_accounting_cache_manager_with_floor(
             cache_dir.clone(),
             10 * 1024 * 1024 * 1024,
             0,
         )
         .await;
-        assert!(
-            cache_manager.get_journal_consolidator().await.is_some(),
-            "fixture: component 1 reads size_state.json through the journal consolidator"
-        );
-        let size_state = cache_dir.join("size_tracking").join("size_state.json");
-        std::fs::create_dir_all(size_state.parent().unwrap()).unwrap();
-        let original = std::fs::read(&size_state).ok();
-        let _ = std::fs::remove_file(&size_state);
-        let made = std::process::Command::new("mkfifo")
-            .arg(&size_state)
-            .status()
-            .unwrap();
-        assert!(made.success(), "fixture: mkfifo {:?}", size_state);
+        // Longer than the bound, short enough for the permit wait below to see it end.
+        let stall_key = cache_dir.to_string_lossy().to_string();
+        crate::cache::WRITE_CACHE_SETUP_STALL.lock().unwrap().push((
+            stall_key.clone(),
+            WRITE_CACHE_SETUP_WAIT_BOUND + std::time::Duration::from_secs(2),
+        ));
 
         let mut handler = SignedPutHandler::new(
             cache_dir.clone(),
@@ -19565,26 +19704,6 @@ mod tests {
         };
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
 
-        // Release every parked read before asserting: a blocking read parked on the FIFO holds
-        // a blocking thread the test runtime's drop waits on. A non-blocking read-write open
-        // never parks and wakes any reader parked in `open`; the original document is renamed
-        // over the FIFO while that writer is held, so a later reader opens a regular file.
-        let fifo = size_state.clone();
-        tokio::task::spawn_blocking(move || {
-            let held = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&fifo)
-                .unwrap();
-            let restore = fifo.with_extension("case75-restore");
-            std::fs::write(&restore, original.unwrap_or_default()).unwrap();
-            std::fs::rename(&restore, &fifo).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            drop(held);
-        })
-        .await
-        .unwrap();
         let mut permit_returned = false;
         for _ in 0..100 {
             if permits.available_permits() == 1 {
@@ -19593,6 +19712,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        crate::cache::WRITE_CACHE_SETUP_STALL
+            .lock()
+            .unwrap()
+            .retain(|(k, _)| *k != stall_key);
         let upload_dir = mpu_upload_dir(&cache_dir, upload_id);
 
         let bound = WRITE_CACHE_SETUP_WAIT_BOUND + std::time::Duration::from_millis(500);

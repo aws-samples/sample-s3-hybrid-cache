@@ -30,7 +30,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
-/// The 60-second admission window in `collect_candidates_from_metadata_file`
+/// The 60-second admission window in read-tier eviction
 /// is evaluated against each range's `last_accessed`. The window is unconditional — there
 /// is no bypass — so backdating is the only way a fixture gets a candidate collected. 120s
 /// is the margin
@@ -207,8 +207,7 @@ mod fail_open {
     /// The fail-open assertion: with the total unreadable, the disk-safety bound admits.
     ///
     /// `max_cache_size` is 1 byte against a 4 KiB object, so a working headroom check
-    /// *would* decline. It admits because the total it would compare against cannot be
-    /// read.
+    /// *would* decline. It admits because no figure to compare against has been read.
     #[tokio::test]
     async fn unreadable_size_state_admits_rather_than_refusing() {
         let temp = TempDir::new().unwrap();
@@ -225,10 +224,11 @@ mod fail_open {
     /// The control, and the test above is vacuous without it: a function that never
     /// refuses anything satisfies it trivially.
     ///
-    /// Identical manager, identical 1-byte limit, identical 4 KiB object. The single
-    /// difference is that the journal components are wired, so the total is readable — and
-    /// it declines. That pair is what proves the fail-open *branch* did the admitting,
-    /// rather than the bound simply being unreachable in this fixture.
+    /// Identical 1-byte limit, identical 4 KiB object. The difference is that the journal
+    /// components are wired and the usage refresher has published the figure the check reads,
+    /// as `HttpProxy::start` does — and it declines. That pair is what proves the fail-open
+    /// *branch* did the admitting, rather than the bound simply being unreachable in this
+    /// fixture.
     ///
     /// This is `pre-push-checklist.md` § "Assert the predicate the code evaluates":
     /// asserting a refusal proves none of its possible causes, so the two arms must differ
@@ -236,7 +236,8 @@ mod fail_open {
     #[tokio::test]
     async fn a_readable_size_state_over_the_limit_does_refuse() {
         let temp = TempDir::new().unwrap();
-        let m = manager_with_journal(temp.path(), 1);
+        let m = std::sync::Arc::new(manager_with_journal(temp.path(), 1));
+        m.start_put_usage_refresher().await;
 
         assert_eq!(
             m.disk_safety_refusal(4096).await,
@@ -347,10 +348,10 @@ mod read_tier_covers_staged_entries {
     ///
     /// Shown failing first two ways, each reproducing a different plausible mistake:
     ///
-    /// 1. Add `if new_metadata.object_metadata.is_write_cached { continue; }` to
-    ///    `collect_candidates_from_metadata_file` — the "staged entries are
-    ///    the write tier's business" assumption. The first assertion then fails: the
-    ///    `.meta` survives, because nothing collected it.
+    /// 1. Make read-tier selection skip every staged range, expired or not (the
+    ///    `TailCandidateVerdict::Staged` check without its expiry test) — the "staged entries
+    ///    are the write tier's business" assumption. The first assertion then fails: the
+    ///    `.meta` survives, because nothing selected it.
     /// 2. Delete the `is_staged_range_parts` arm from Step 5's accounting. The `.meta` is still
     ///    deleted, so assertions 1 and 2 pass, and the write-cache delta comes back 0 —
     ///    which is the R1/R5 leak signature, bytes leaving the disk while the figure that
@@ -368,6 +369,11 @@ mod read_tier_covers_staged_entries {
 
         let (meta, bin, compressed) =
             seed_object(temp.path(), "test-bucket/staged.bin", SIZE, true);
+        // Expired, as R5.5 says: an unread write-cached object past its expiry.
+        let mut doc: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+        doc.expires_at = SystemTime::now() - Duration::from_secs(60);
+        std::fs::write(&meta, serde_json::to_string(&doc).unwrap()).unwrap();
         // Size_State must report the cache as over its limit; the eviction entry point
         // reads it, not the filesystem.
         seed_size_state(&m, SIZE as u64, compressed).await;
@@ -410,6 +416,22 @@ mod read_tier_covers_staged_entries {
         );
     }
 
+    /// The unexpired control: a staged entry before its expiry stays with the write tier, and
+    /// the read path does not delete it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unexpired_staged_entry_is_not_reclaimed_by_the_read_path() {
+        let temp = TempDir::new().unwrap();
+        let m = manager_with_journal(temp.path(), 40 * 1024);
+        const SIZE: usize = 64 * 1024;
+        let (meta, bin, compressed) =
+            seed_object(temp.path(), "test-bucket/staged-fresh.bin", SIZE, true);
+        seed_size_state(&m, SIZE as u64, compressed).await;
+        let _ = m.enforce_disk_cache_limits().await.unwrap();
+        assert!(
+            meta.exists() && bin.exists(),
+            "an unexpired staged entry is the write tier's to reclaim"
+        );
+    }
     /// The unstaged control. Identical in every respect except `is_write_cached`, so the
     /// difference in the write-cache delta is attributable to the flag and nothing else.
     ///

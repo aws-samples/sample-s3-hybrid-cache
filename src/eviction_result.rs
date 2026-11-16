@@ -130,6 +130,42 @@ pub struct EvictionPassResult {
     pub mode: EvictionMode,
 }
 
+/// The document on disk: the pass's [`EvictionPassResult`] plus what only the passes themselves
+/// read. It is a separate type so that the `/metrics` payload, which serializes
+/// [`EvictionPassResult`] alone, does not grow a field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EvictionResultFile {
+    #[serde(flatten)]
+    result: EvictionPassResult,
+    /// The shortfall the pass would still have had after evicting every byte of the read tier it
+    /// could evict. `Some` only when the pass's bounded selection proved that whole tier read
+    /// (every shard partitioned, read to its end, not cap-bound and freshly rebuilt, nothing
+    /// excluded, every journal read) and it held less than the pass asked for:
+    /// the one outcome that is evidence a repeat pass cannot make room. Absent for every other
+    /// pass, and in a document from a build without the field, which reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exhausted_shortfall_bytes: Option<u64>,
+    /// How many passes in a row, this one included, started on a size refusal's demand alone and
+    /// made no room for it. The next pass on demand alone, on any proxy, waits a delay that
+    /// doubles with this count. Absent for every other pass, which resets the count, and in a
+    /// document from a build without the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    demand_backoff_streak: Option<u32>,
+}
+
+/// What only the read tier's passes read from the document on disk, beside the
+/// [`EvictionPassResult`] that `/metrics` serves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassEvidence {
+    /// The shortfall the pass would still have had after evicting every byte of the read tier it
+    /// could evict. `Some` only when the pass read that whole tier and it held less than the pass
+    /// asked for.
+    pub exhausted_shortfall_bytes: Option<u64>,
+    /// Passes in a row, this one included, started on a size refusal's demand alone that made no
+    /// room for it. `None` for every other pass.
+    pub demand_backoff_streak: Option<u32>,
+}
+
 /// The pass that wrote an [`EvictionPassResult`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,13 +257,29 @@ impl EvictionPassResult {
     /// test is worth more than a cross-reference. It is a real guard against the behaviour
     /// flip happening by accident, so it must not be relaxed to accommodate a comment.)
     pub fn install(&self, cache_dir: &Path) -> std::io::Result<()> {
+        self.install_with_evidence(cache_dir, PassEvidence::default())
+    }
+
+    /// [`Self::install`], recording what only the passes read ([`PassEvidence`]): the exhausted
+    /// shortfall, `Some` only when the pass read the whole evictable read tier, which a pass
+    /// reading this document needs before it treats the shortfall as one no repeat pass can
+    /// close; and the demand backoff streak.
+    pub fn install_with_evidence(
+        &self,
+        cache_dir: &Path,
+        evidence: PassEvidence,
+    ) -> std::io::Result<()> {
         use std::io::Write;
         let path = Self::path(cache_dir);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let body = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::other(format!("serialize eviction result: {e}")))?;
+        let body = serde_json::to_string_pretty(&EvictionResultFile {
+            result: self.clone(),
+            exhausted_shortfall_bytes: evidence.exhausted_shortfall_bytes,
+            demand_backoff_streak: evidence.demand_backoff_streak,
+        })
+        .map_err(|e| std::io::Error::other(format!("serialize eviction result: {e}")))?;
         let tmp = path.with_extension(format!(
             "json.tmp.{}.{}",
             gethostname::gethostname()
@@ -248,6 +300,12 @@ impl EvictionPassResult {
     /// A read or parse failure is `None` with a WARN rather than an error: this is an
     /// observability document, and a `/metrics` scrape must not fail because of it.
     pub fn load(cache_dir: &Path) -> Option<Self> {
+        Self::load_with_evidence(cache_dir).map(|(result, _)| result)
+    }
+
+    /// [`Self::load`] with the [`PassEvidence`] [`Self::install_with_evidence`] wrote; each field
+    /// is `None` when the document has none.
+    pub fn load_with_evidence(cache_dir: &Path) -> Option<(Self, PassEvidence)> {
         let path = Self::path(cache_dir);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -261,12 +319,18 @@ impl EvictionPassResult {
                 return None;
             }
         };
-        match serde_json::from_str::<Self>(&content) {
-            Ok(parsed) if parsed.schema == SCHEMA => Some(parsed),
+        match serde_json::from_str::<EvictionResultFile>(&content) {
+            Ok(parsed) if parsed.result.schema == SCHEMA => Some((
+                parsed.result,
+                PassEvidence {
+                    exhausted_shortfall_bytes: parsed.exhausted_shortfall_bytes,
+                    demand_backoff_streak: parsed.demand_backoff_streak,
+                },
+            )),
             Ok(parsed) => {
                 warn!(
                     "Unknown eviction result schema {} in {}; ignoring",
-                    parsed.schema,
+                    parsed.result.schema,
                     path.display()
                 );
                 None

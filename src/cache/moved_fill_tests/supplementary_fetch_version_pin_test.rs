@@ -593,7 +593,18 @@ async fn widened_read_in_uncached_page_never_serves_bytes_under_another_versions
 
     assert_eq!(served.status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(served.body.len(), 10);
-    assert_one_version(&served, "widened read inside page 1");
+    // The fill read version 2 and removed the cached version 1, so the serve finds no `.meta`
+    // and sends the minimal header set: an absent ETag is allowed, a wrong one is not.
+    let version = body_version(&served.body)
+        .unwrap_or_else(|mix| panic!("MIXED VERSIONS (widened read inside page 1): {}", mix));
+    if let Some(etag) = served.etag.as_deref() {
+        assert_eq!(
+            unquote(etag),
+            unquote(version),
+            "HEADERS FROM ANOTHER VERSION (widened read inside page 1): content-range={:?}",
+            served.content_range
+        );
+    }
     // And a second read is no different (the fill must not leave a state that
     // serves version-2 bytes under version-1 headers on every read).
     let again = range_get(
@@ -842,8 +853,9 @@ async fn store_journal_pending(
     );
 }
 /// The `.meta`-names-v1, page-1-pending-as-v2 state cannot be built by the range-fill
-/// writer: publishing a fill reads the key's `.meta` under the slot lock and drops a fill
-/// whose ETag differs from it, so nothing is journalled. This pins that guard.
+/// writer: publishing a fill reads the key's `.meta` under the slot lock and, when the fill's
+/// ETag differs from it, removes the cached version and journals nothing. This pins that
+/// guard.
 #[tokio::test]
 async fn range_fill_of_another_version_under_a_meta_is_never_journal_pending() {
     let config = test_config();
@@ -882,8 +894,16 @@ async fn range_fill_of_another_version_under_a_meta_is_never_journal_pending() {
         "a fill of another version than the .meta must journal nothing: {:?}",
         pending
     );
-    assert_eq!(stored_ranges(&cache_manager, key), vec![(0, PAGE_SIZE - 1)]);
-    assert_eq!(stored_etag(&cache_manager, key).as_deref(), Some(V1_ETAG));
+    assert_eq!(
+        stored_ranges(&cache_manager, key),
+        Vec::<(u64, u64)>::new(),
+        "the cached version must be removed"
+    );
+    assert_eq!(
+        stored_etag(&cache_manager, key),
+        None,
+        "no .meta may remain"
+    );
 }
 /// The reachable journal-pending state: no `.meta` yet; page 0 was filled as version
 /// 1, the object was overwritten directly in S3, and page 1 was filled as version 2

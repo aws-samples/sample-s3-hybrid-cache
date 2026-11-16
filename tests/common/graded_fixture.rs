@@ -23,9 +23,9 @@
 //! file:
 //!
 //! 1. **Validation is by read-back through product code**, not by this module's own
-//!    assertions. See `tests/graded_fixture_generator_test.rs`, which drives
-//!    `CacheManager::collect_range_candidates_for_eviction` over a generated tree
-//!    and compares what eviction *discovered* against what was written. A generator
+//!    assertions. See `tests/graded_fixture_generator_test.rs`, which reads every
+//!    emitted `.meta` back with the product's own `NewCacheMetadata` at its sharded
+//!    path and checks each range's `.bin` against what was written. A generator
 //!    whose output only its own parser accepts proves nothing.
 //! 2. **The tree is self-describing.** [`generate`] writes a
 //!    `FIXTURE_MANIFEST.json` recording counts, the size histogram, per-L1-shard
@@ -35,10 +35,9 @@
 //!
 //! # Ages are backdated deliberately
 //!
-//! `CacheManager::collect_candidates_from_metadata_file` applies an unconditional
-//! 60-second admission window (`src/cache.rs`, in the `for range_spec in
-//! &new_metadata.ranges` loop) and skips any range whose `last_accessed` is inside
-//! it. A fixture written with `SystemTime::now()` ages is therefore **invisible to
+//! Eviction's selection applies an unconditional 60-second admission window
+//! (`ADMISSION_WINDOW` in `src/cache.rs`, read by `CacheManager::verify_tail_candidate`)
+//! and skips any range whose `last_accessed` is inside it. A fixture written with `SystemTime::now()` ages is therefore **invisible to
 //! eviction**, and the resulting empty candidate list looks exactly like a
 //! selection defect. Every range here is aged into
 //! `[FixtureSpec::min_age, FixtureSpec::max_age]`, and [`FixtureSpec::validate`]
@@ -253,14 +252,11 @@ pub enum PayloadMode {
     ///
     /// # Consequence for any byte-valued measurement
     ///
-    /// `collect_candidates_from_metadata_file` stats the `.bin` and puts the
-    /// **actual file length** in `RangeEvictionCandidate::size`, falling back to
-    /// `compressed_size` only when the stat fails. So on a `RecordedSizeOnly` tree
-    /// the candidate's `size` carries the stub and its `compressed_size` carries
-    /// the realistic figure, and anything that sums `size` to reach a byte target
-    /// will measure the stubs. Use `compressed_size`, or use a `Genuine` tree.
-    /// `tests/graded_fixture_generator_test.rs` pins this asymmetry so it cannot be
-    /// "tidied" away unnoticed.
+    /// Eviction's selection sizes a candidate from the recorded `compressed_size`,
+    /// which the Tail_Partition record carries, while the bytes a pass removes from
+    /// disk are the stubs. So on a `RecordedSizeOnly` tree a byte target is reached on
+    /// the realistic figure and frees far fewer bytes. Byte-valued measurements read
+    /// `compressed_size`; use a `Genuine` tree when the freed bytes must match.
     RecordedSizeOnly { stub_bytes: usize },
 }
 
@@ -311,7 +307,8 @@ pub struct FixtureSpec {
     pub tail_cap: usize,
 }
 
-/// The admission window in `collect_candidates_from_metadata_file`. Mirrored here
+/// The admission window eviction's selection applies (`ADMISSION_WINDOW` in
+/// `src/cache.rs`). Mirrored here
 /// only so [`FixtureSpec::validate`] can refuse an age that would make the fixture
 /// invisible to eviction; the product value is the authority.
 pub const EVICTION_ADMISSION_WINDOW: Duration = Duration::from_secs(60);
@@ -352,7 +349,7 @@ impl FixtureSpec {
         if self.min_age <= EVICTION_ADMISSION_WINDOW {
             return Err(format!(
                 "min_age {:?} does not clear the {:?} eviction admission window in \
-                 CacheManager::collect_candidates_from_metadata_file; every range would be \
+                 CacheManager::verify_tail_candidate; every range would be \
                  skipped as ineligible and the fixture would look like a selection defect",
                 self.min_age, EVICTION_ADMISSION_WINDOW
             ));
@@ -1341,8 +1338,8 @@ pub fn generate_with(
              while `.meta` records realistic compressed_size/uncompressed_size. Count-scale and \
              byte-scale are separate questions and coupling them makes a ~10M-range fixture \
              unbuildable. DO NOT reconcile the two figures. Byte-valued measurements over this \
-             tree must read RangeSpec.compressed_size, NOT the on-disk length that \
-             collect_candidates_from_metadata_file puts in RangeEvictionCandidate::size."
+             tree must read RangeSpec.compressed_size, NOT the on-disk length of the .bin \
+             stubs."
                 .to_string()
         } else {
             "Not applicable: payloads are genuine, so on-disk length equals recorded \

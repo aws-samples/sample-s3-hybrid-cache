@@ -101,7 +101,19 @@ const EVICTION_RECLAIMS_DIR: &str = "eviction_reclaims";
 const RECLAIM_DOCUMENT_SCHEMA: u32 = 1;
 
 /// Entries one [`RemovalDebitDocument`] holds before its owner merges each shard's entries.
+/// After a merge the document holds one entry per shard with a live debit, so its size is
+/// bounded by the shard population (about 121 bytes an entry) and no entry is dropped.
 const REMOVAL_DEBIT_MAX_ENTRIES: usize = 4_096;
+
+/// Merges of this process's removal-debit documents since it started: `/metrics`
+/// `write_cache.removal_debit_merges_total`.
+static REMOVAL_DEBIT_MERGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Times this process merged its removal-debit document to one entry per shard because it held
+/// more than [`REMOVAL_DEBIT_MAX_ENTRIES`] entries. **Per-instance.**
+pub(crate) fn removal_debit_merges_total() -> u64 {
+    REMOVAL_DEBIT_MERGES_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Age past which a removal debit leaves its owner's document, seconds; twice it, past which a
 /// reader removes a document whose every entry is that old.
@@ -555,7 +567,8 @@ impl RemovalDebitEntry {
 ///   began at or after the removal, entries older than [`RECLAIM_DOCUMENT_MAX_AGE_SECS`] (every
 ///   shard re-folds within it), and removes the file when nothing is left. At more than
 ///   [`REMOVAL_DEBIT_MAX_ENTRIES`] entries it merges each shard's entries into one with the
-///   latest time, which only widens the set a reader applies (the under-count direction).
+///   latest time, which only widens the set a reader applies (the under-count direction), and
+///   counts the merge. Nothing is dropped: the merged document holds one entry per shard.
 /// - A reader removes a document only when its mtime and every entry are older than twice
 ///   [`RECLAIM_DOCUMENT_MAX_AGE_SECS`]: an instance that stopped never rewrites its own.
 /// - No `staged_debits/` directory, an unparseable document or another schema contributes
@@ -765,7 +778,8 @@ fn note_own_install(cache_dir: &Path, instance_id: &str, shard: &Shard, visit_st
 }
 
 /// Merge `new` into `instance_id`'s document, drop what is inert to this instance's own installs
-/// or past the age bound, cap it, and write it (or remove it when empty).
+/// or past the age bound, merge it per shard past [`REMOVAL_DEBIT_MAX_ENTRIES`], and write it
+/// (or remove it when empty).
 fn write_removal_debits(
     cache_dir: &Path,
     instance_id: &str,
@@ -803,17 +817,7 @@ fn write_removal_debits(
     });
     if entries.len() > REMOVAL_DEBIT_MAX_ENTRIES {
         entries = merged_per_shard(entries);
-    }
-    if entries.len() > REMOVAL_DEBIT_MAX_ENTRIES {
-        // More shards than the cap carry debits. Drop the oldest: an over-count of their bytes
-        // until their shards re-install, the behaviour before debits existed.
-        entries.sort_by_key(|e| std::cmp::Reverse(e.removed_at_unix_nanos));
-        let dropped = entries.len() - REMOVAL_DEBIT_MAX_ENTRIES;
-        entries.truncate(REMOVAL_DEBIT_MAX_ENTRIES);
-        warn!(
-            "Removal debits for {} cover more than {} shards; dropped the {} oldest",
-            instance_id, REMOVAL_DEBIT_MAX_ENTRIES, dropped
-        );
+        REMOVAL_DEBIT_MERGES_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
     let result = if entries.is_empty() {
         match std::fs::remove_file(&path) {
@@ -1095,13 +1099,6 @@ impl PendingReadOutcome {
         }
         total
     }
-}
-
-/// Every removal debit this process can read for `cache_dir`: the published documents and this
-/// process's own unflushed removals.
-#[cfg(test)]
-pub(crate) async fn removal_debits_for_tests(cache_dir: &Path) -> Vec<RemovalDebitEntry> {
-    read_removal_debits(cache_dir).await
 }
 
 /// The published staged figure (`F + post-cut pending + P`), for a test in a file that may not
@@ -1386,7 +1383,8 @@ struct CountEvictionState {
     /// same event that makes a removal debit inert, for the same reason.
     ///
     /// **Not** set by a pass that reclaimed something, however little: partial progress means
-    /// the population was non-empty, so the next cycle has real work to do.
+    /// the population was non-empty, so the next cycle has real work to do. Nor by a pass the
+    /// deadline stopped, which did not assess every candidate.
     found_nothing: bool,
     /// Count-driven passes completed against this directory, and the ranges they reclaimed.
     ///
@@ -1513,7 +1511,13 @@ pub(crate) const AUTHORITY_SNAPSHOT_TTL_SECS: u64 = 5;
 static AUTHORITY_SNAPSHOT: Mutex<BTreeMap<u64, AuthoritySnapshot>> = Mutex::new(BTreeMap::new());
 
 /// Entries [`AUTHORITY_SNAPSHOT`] may hold before it is cleared. Production needs one.
+#[cfg(not(test))]
 const AUTHORITY_SNAPSHOT_MAX_KEYS: usize = 64;
+/// In the lib test binary every fixture directory is a key, and a clear at the 64th distinct one
+/// removes the memo of whichever test is running then, mid-test. The cap bounds growth against a
+/// pathological caller, which a test binary is not, so it sits far above the number of fixtures.
+#[cfg(test)]
+const AUTHORITY_SNAPSHOT_MAX_KEYS: usize = 1 << 20;
 
 /// One memoised derivation: when it was taken, and what it found.
 #[derive(Debug, Clone, Copy)]
@@ -2678,6 +2682,10 @@ async fn peer_303_reclaimed_ranges(cache_dir: &Path) -> u64 {
 
 /// Record a count-driven pass: its totals, and the latch when it reclaimed nothing.
 ///
+/// `stopped_by_deadline` is true when the pass ended at its time budget. Such a pass did not
+/// assess every candidate, so reclaiming nothing does not show the population is empty and the
+/// latch stays clear.
+///
 /// The ranges it reclaimed are not debited here. The staging pass publishes them per shard as
 /// removal debits ([`publish_removal_debits`]) before its re-fold, and [`count_eviction_verdict`]
 /// applies them, on this instance and on every peer. Returns the process totals
@@ -2686,6 +2694,7 @@ pub(crate) fn record_count_eviction_pass(
     cache_dir: &Path,
     instance_id: &str,
     ranges_reclaimed: u64,
+    stopped_by_deadline: bool,
 ) -> (u64, u64) {
     let tag = dir_tag(cache_dir);
     if ranges_reclaimed > 0 {
@@ -2695,9 +2704,10 @@ pub(crate) fn record_count_eviction_pass(
         return (0, 0);
     };
     let state = states.entry(tag).or_default();
-    // Latch only on a pass that reclaimed NOTHING. Partial progress means the population was
-    // non-empty, so the next cycle has real work to do. See `found_nothing`.
-    if ranges_reclaimed == 0 {
+    // Latch only on a pass that reclaimed NOTHING and ran to the end of its candidates. Partial
+    // progress means the population was non-empty, so the next cycle has real work to do; a pass
+    // the deadline stopped has not looked at every candidate. See `found_nothing`.
+    if ranges_reclaimed == 0 && !stopped_by_deadline {
         state.found_nothing = true;
     }
     state.passes_total = state.passes_total.saturating_add(1);
@@ -4474,7 +4484,9 @@ pub(crate) fn lock_checkpoint_document(cache_dir: &Path, shard: &Shard) -> Optio
 /// ([`checkpoint_bytes_are_torn`]). If the document under the lock is still damaged, its bytes are
 /// appended to `{XX}.json.torn` and synced, and the new document is renamed over it, so the
 /// shard's document is never absent. If a peer has replaced it since, the install proceeds as for
-/// any other shard.
+/// any other shard. A damaged document is replaced only under the lock: when the lock cannot be
+/// taken the install returns an error, the shard retains, and the document stays for a later
+/// visit, so readers keep reporting the figure as unknown.
 fn install_preserving_foreign_fields(
     cache_dir: &Path,
     mut checkpoint: StagedShardCheckpoint,
@@ -4482,7 +4494,13 @@ fn install_preserving_foreign_fields(
 ) -> std::io::Result<()> {
     let fallback_other = checkpoint.other.clone();
     // Held until the end of the function, which is after the install.
-    let _lock = lock_checkpoint_document(cache_dir, &checkpoint.shard());
+    let lock = lock_checkpoint_document(cache_dir, &checkpoint.shard());
+    if replace_damaged && lock.is_none() {
+        return Err(std::io::Error::other(
+            "the checkpoint document lock could not be taken, so the damaged document stays in \
+             place for a later visit",
+        ));
+    }
     if replace_damaged && keep_damaged_checkpoint_bytes(cache_dir, &checkpoint.shard())? {
         checkpoint.other = fallback_other;
         return checkpoint.install(cache_dir);
@@ -7223,10 +7241,11 @@ async fn run_derivation(
             publish_early_budget_count(tag, id, generation, &pending, &checkpoints);
             #[cfg(test)]
             collector_walk_stall_hook(&dir).await;
+            let nothing_staged = nothing_staged_on(&dir, &checkpoints).await;
             let observation =
                 crate::signed_put_handler::observe_in_progress(&dir, std::time::Duration::ZERO)
                     .await;
-            let p = if figure_inputs_complete(&pending, &checkpoints) {
+            let p = if figure_inputs_complete(&pending, &checkpoints, nothing_staged) {
                 crate::signed_put_handler::compose_in_progress_part_bytes(
                     &dir,
                     crate::signed_put_handler::PUBLISHED_WALK_BASE_MAX_AGE,
@@ -7237,7 +7256,7 @@ async fn run_derivation(
                 None
             };
             let figures = DerivedFigures {
-                figure: figure_of(&pending, &checkpoints, p),
+                figure: figure_of(&pending, &checkpoints, nothing_staged, p),
                 count: staged_range_count_of(&pending, &checkpoints),
                 count_debit: pending.applied_debit(&checkpoints).ranges,
             };
@@ -7479,9 +7498,33 @@ async fn run_gauge_between_reads_hook(cache_dir: &Path) {
 }
 
 /// Whether `pending` and `checkpoints` can carry a byte figure: both read completely, and at
-/// least one fold has installed a shard.
-fn figure_inputs_complete(pending: &PendingReadOutcome, checkpoints: &ShardCheckpointSet) -> bool {
-    pending.is_complete() && checkpoints.is_complete() && !checkpoints.shards().is_empty()
+/// least one fold has installed a shard, or `nothing_staged` (see [`nothing_staged_on`]).
+fn figure_inputs_complete(
+    pending: &PendingReadOutcome,
+    checkpoints: &ShardCheckpointSet,
+    nothing_staged: bool,
+) -> bool {
+    pending.is_complete()
+        && checkpoints.is_complete()
+        && (!checkpoints.shards().is_empty() || nothing_staged)
+}
+
+/// Whether an empty, complete checkpoint set means nothing is staged on this volume: the write
+/// ledger has no shard directory and no legacy flat file. A credited staged range always has its
+/// ledger entry first, so with no ledger there is no credited range, and the figure is `0` plus
+/// the pending and in-progress terms. Read after the checkpoint set, so a first upload whose
+/// ledger entry lands between the two reads leaves the figure unknown, never short. `false` when
+/// the set is not empty or the listing fails.
+///
+/// Activation reads its own evidence ([`rotation_evidence`]), which this does not change: a volume
+/// with no checkpoint never shows a rotation.
+async fn nothing_staged_on(cache_dir: &Path, checkpoints: &ShardCheckpointSet) -> bool {
+    if !checkpoints.is_complete() || !checkpoints.shards().is_empty() {
+        return false;
+    }
+    let ledger = WriteLedger::new(cache_dir.to_path_buf(), String::new());
+    matches!(ledger.legacy_ledger_file_count().await, Ok(0))
+        && matches!(ledger.ledger_shards().await, Ok(shards) if shards.is_empty())
 }
 
 /// The byte figure from one read of the pending files and the checkpoint set, with `P`; `None`
@@ -7489,9 +7532,10 @@ fn figure_inputs_complete(pending: &PendingReadOutcome, checkpoints: &ShardCheck
 fn figure_of(
     pending: &PendingReadOutcome,
     checkpoints: &ShardCheckpointSet,
+    nothing_staged: bool,
     in_progress_part_bytes: Option<u64>,
 ) -> Option<StagedAuthorityFigure> {
-    if !figure_inputs_complete(pending, checkpoints) {
+    if !figure_inputs_complete(pending, checkpoints, nothing_staged) {
         return None;
     }
     let debit = pending.applied_debit(checkpoints).bytes;
@@ -7532,7 +7576,8 @@ async fn derive_figures(
     let checkpoints = read_shard_checkpoints_bounded(cache_dir).await;
     let count = staged_range_count_of(&pending, &checkpoints);
     let count_debit = pending.applied_debit(&checkpoints).ranges;
-    if !figure_inputs_complete(&pending, &checkpoints) {
+    let nothing_staged = nothing_staged_on(cache_dir, &checkpoints).await;
+    if !figure_inputs_complete(&pending, &checkpoints, nothing_staged) {
         return DerivedFigures {
             figure: None,
             count,
@@ -7568,7 +7613,7 @@ async fn derive_figures(
         }
     };
     DerivedFigures {
-        figure: figure_of(&pending, &checkpoints, p),
+        figure: figure_of(&pending, &checkpoints, nothing_staged, p),
         count,
         count_debit,
     }
@@ -7627,6 +7672,54 @@ fn age_secs(scanned_at_nanos: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past [`REMOVAL_DEBIT_MAX_ENTRIES`] distinct shards (17 buckets), the merge keeps every
+    /// shard's debit: nothing is dropped, and the merge is counted.
+    ///
+    /// RED SIDE: with the drop step back (newest first, truncated to the cap), the document holds
+    /// 4,096 of the 4,352 shards and their bytes fall 256 entries short.
+    #[test]
+    fn past_the_cap_no_live_debit_is_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let instance = "fixture-debits:1";
+        let shards: Vec<Shard> = (0..17)
+            .flat_map(|b| {
+                (0..256).map(move |l| Shard::new(format!("bucket-{b}"), format!("{l:02x}")))
+            })
+            .collect();
+        assert!(
+            shards.len() > REMOVAL_DEBIT_MAX_ENTRIES,
+            "fixture: more shards carry debits than the cap"
+        );
+        let now = now_nanos();
+        let new: Vec<RemovalDebitEntry> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, s)| RemovalDebitEntry {
+                bucket: s.bucket.clone(),
+                l1: s.l1.clone(),
+                removed_at_unix_nanos: now + i as u64,
+                bytes: 100,
+                ranges: 1,
+            })
+            .collect();
+        let merges_before = removal_debit_merges_total();
+        write_removal_debits(dir, instance, new).unwrap();
+        let body = std::fs::read_to_string(RemovalDebitDocument::path(dir, instance)).unwrap();
+        let doc = RemovalDebitDocument::parse(&body).expect("the document parses");
+        let bytes: u64 = doc.entries.iter().map(|e| e.bytes).sum();
+        assert_eq!(
+            (doc.entries.len(), bytes),
+            (shards.len(), 100 * shards.len() as u64),
+            "A LIVE REMOVAL DEBIT WAS DROPPED past the cap: every shard's entry must survive the \
+             merge"
+        );
+        assert!(
+            removal_debit_merges_total() > merges_before,
+            "the merge must be counted"
+        );
+    }
 
     /// Test oracles: one read of the production derivation, without the memo or the
     /// single-flight, so a test can compare what a reader got with what the volume says now.
@@ -9827,6 +9920,12 @@ mod tests {
         )
         .await
         .expect("the fold pass must not hang");
+        assert!(
+            outcome.summary().busy.contains(&damaged),
+            "fixture: the pass reached the damaged shard and found its claim busy, rather than \
+             stopping before it: busy={:?}",
+            outcome.summary().busy
+        );
         println!(
             "busy damaged shard: retain={:?} published={:?}",
             outcome.retain_reason(),
@@ -9843,6 +9942,153 @@ mod tests {
             "the damaged document stays in place until a fresh one replaces it"
         );
         assert!(!with_suffix(&doc, ".torn").exists());
+    }
+    /// A damaged checkpoint whose shard this pass claims, and whose visit then retains on an
+    /// unreadable ledger file, stays in place: only an install replaces it, so readers keep
+    /// reporting unknown.
+    ///
+    /// # RED SIDE
+    ///
+    /// The damaged document moved aside when the claimed visit starts, before the visit knows it
+    /// will install.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_damaged_shard_whose_claimed_visit_retains_keeps_its_document() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        let (damaged, _, doc) = two_shards_one_damaged(dir, &ledger).await;
+        let ledger_file = ledger
+            .shard_path_for_key("bucket/t7-damaged.bin")
+            .expect("fixture precondition: the damaged shard's ledger file");
+        let restore = std::fs::metadata(&ledger_file).unwrap().permissions();
+        std::fs::set_permissions(&ledger_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&ledger_file).is_ok() {
+            std::fs::set_permissions(&ledger_file, restore).unwrap();
+            println!("SKIPPED: this user can read a mode-000 file");
+            return;
+        }
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        std::fs::set_permissions(&ledger_file, restore).unwrap();
+        assert!(
+            outcome
+                .summary()
+                .retained
+                .contains(&(damaged.clone(), FoldRetainReason::LedgerFileUnreadable)),
+            "fixture: the damaged shard's claimed visit retained on its unreadable ledger file: \
+             {:?}",
+            outcome.summary().retained
+        );
+        assert_eq!(
+            std::fs::read_to_string(&doc).unwrap_or_default(),
+            DAMAGED_CHECKPOINT,
+            "A DAMAGED CHECKPOINT WAS MOVED ASIDE BY A VISIT THAT RETAINED"
+        );
+        assert!(!with_suffix(&doc, ".torn").exists());
+        assert_eq!(
+            published_figure_for_tests(dir).await,
+            None,
+            "and readers still report unknown"
+        );
+    }
+    /// A damaged checkpoint whose document lock cannot be taken is not replaced: the install is
+    /// refused, the shard retains, and readers keep reporting unknown.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the replace path run unlocked, the damaged bytes go to `.torn` and a fresh document is
+    /// renamed over it without the lock.
+    #[tokio::test]
+    async fn a_damaged_checkpoint_is_not_replaced_without_its_document_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        let (damaged, _, doc) = two_shards_one_damaged(dir, &ledger).await;
+        // A directory where the lock file goes: the open fails, so no lock can be taken.
+        let lock_path = doc.with_extension("json.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        std::fs::create_dir_all(&lock_path).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_staged_fold_sampled(dir, &ledger, "host:1", None),
+        )
+        .await
+        .expect("the fold pass must not hang");
+        std::fs::remove_dir(&lock_path).unwrap();
+        println!(
+            "unlocked damaged shard: retained={:?} torn={}",
+            outcome.summary().retained,
+            with_suffix(&doc, ".torn").exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&doc).unwrap_or_default(),
+            DAMAGED_CHECKPOINT,
+            "A DAMAGED CHECKPOINT WAS REPLACED WITHOUT ITS DOCUMENT LOCK"
+        );
+        assert!(!with_suffix(&doc, ".torn").exists());
+        assert!(
+            outcome
+                .summary()
+                .retained
+                .contains(&(damaged.clone(), FoldRetainReason::CheckpointWriteFailed)),
+            "the shard retains: {:?}",
+            outcome.summary().retained
+        );
+        assert_eq!(published_figure_for_tests(dir).await, None);
+    }
+    /// A volume that has taken no upload has nothing staged, and its staged figure is `0`, not
+    /// unknown: no `could not be derived` error comes due and the unknown gauge reads `0`. The
+    /// volume still shows no rotation, so it cannot activate epoch 1.
+    ///
+    /// # RED SIDE
+    ///
+    /// With an empty checkpoint set refused whatever the ledger holds, the figure is `None`.
+    #[tokio::test]
+    async fn a_volume_that_has_taken_no_upload_derives_a_zero_figure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let figure = staged_authority_figure_fresh(dir).await;
+        let now = unix_secs();
+        let unknown = authority_unknown_seconds(dir, now + 61);
+        println!("no-upload volume: figure={figure:?} unknown_seconds_after_61s={unknown}");
+        assert_eq!(
+            figure.map(|f| (f.resident_staged_bytes, f.in_progress_part_bytes)),
+            Some((0, 0)),
+            "A VOLUME THAT HAS TAKEN NO UPLOAD READ ITS STAGED FIGURE AS UNKNOWN"
+        );
+        assert_eq!(
+            unknown, 0,
+            "the unknown gauge reads 0, so no error comes due"
+        );
+        assert_eq!(
+            rotation_evidence(dir),
+            None,
+            "the empty volume shows no rotation and cannot activate"
+        );
+    }
+    /// A volume with a write-ledger shard and no checkpoint yet (an upload the fold has not
+    /// visited) still reads unknown: the empty set is accepted only when nothing is staged.
+    #[tokio::test]
+    async fn a_ledger_shard_with_no_checkpoint_still_reads_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ledger = WriteLedger::new(dir.to_path_buf(), "host:1".to_string());
+        publish_staged_range(dir, &ledger, "bucket/unfolded.bin", 4096).await;
+        assert!(
+            read_shard_checkpoints(dir).shards().is_empty(),
+            "fixture precondition: no checkpoint"
+        );
+        assert_eq!(
+            staged_authority_figure_fresh(dir).await,
+            None,
+            "A STAGED UPLOAD THE FOLD HAS NOT VISITED WAS READ AS NOTHING STAGED"
+        );
     }
     /// An eviction-scoped pass folds only the shards it was named, so a damaged checkpoint in a
     /// shard it was not named stays in place and readers keep reporting unknown.
@@ -10539,14 +10785,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
 
-        // Before any fold: unknown, NOT zero. Zero is the healthiest possible reading and
-        // would silently stop staging eviction on a volume that had never folded.
+        // Before any fold, with nothing staged (no write ledger): zero. A volume with a staged
+        // upload and no installed shard figure reads unknown, not zero
+        // (`a_ledger_shard_with_no_checkpoint_still_reads_unknown`).
         assert_eq!(
-            staged_authority_figure(dir).await,
-            None,
-            "a volume with no installed shard figure has an UNKNOWN staged figure, not an \
-             empty one"
+            staged_authority_figure(dir)
+                .await
+                .map(|f| f.resident_staged_bytes),
+            Some(0),
+            "a volume with nothing staged has a staged figure of zero"
         );
+        invalidate_authority_snapshot_for_tests(dir);
 
         // Three distinct, non-coinciding values.
         const F_BYTES: u64 = 700_000_000;
@@ -14297,7 +14546,7 @@ mod tests {
             ranges_to_free,
             None,
         );
-        let (passes, freed) = record_count_eviction_pass(dir, "hostA:1", ranges_to_free);
+        let (passes, freed) = record_count_eviction_pass(dir, "hostA:1", ranges_to_free, false);
         // Per-directory, so these are this fixture's own figures rather than the process's —
         // which is what makes an exact assertion safe here at all. An unkeyed cumulative
         // counter would be the process-global-counter trap, and it fired on the first run of
@@ -14437,7 +14686,7 @@ mod tests {
             own_reclaimed,
             None,
         );
-        record_count_eviction_pass(dir, "hostA:1", own_reclaimed);
+        record_count_eviction_pass(dir, "hostA:1", own_reclaimed, false);
         let verdict = count_eviction_verdict(dir, 95, 80).await;
         assert!(
             matches!(
@@ -14470,7 +14719,7 @@ mod tests {
             .unwrap()
         };
 
-        record_count_eviction_pass(dir, "hostA:1", 5);
+        record_count_eviction_pass(dir, "hostA:1", 5, false);
         let first = read();
         assert_eq!(
             (
@@ -14482,14 +14731,14 @@ mod tests {
         );
         assert!(first["generation"].is_u64() && first["recorded_at_unix_nanos"].is_u64());
 
-        record_count_eviction_pass(dir, "hostA:1", 3);
+        record_count_eviction_pass(dir, "hostA:1", 3, false);
         assert_eq!(
             read()["ranges_reclaimed"].as_u64(),
             Some(8),
             "the document is cumulative since the last install, as 3.0.3 wrote it"
         );
 
-        record_count_eviction_pass(dir, "hostA:1", 0);
+        record_count_eviction_pass(dir, "hostA:1", 0, false);
         assert_eq!(
             read()["ranges_reclaimed"].as_u64(),
             Some(8),
@@ -14501,7 +14750,7 @@ mod tests {
             !path.exists(),
             "a fold install supersedes the document, so it is removed"
         );
-        record_count_eviction_pass(dir, "hostA:1", 2);
+        record_count_eviction_pass(dir, "hostA:1", 2, false);
         assert_eq!(
             read()["ranges_reclaimed"].as_u64(),
             Some(2),
@@ -14786,7 +15035,7 @@ mod tests {
         )
         .unwrap();
         // The document this release writes, through its own writer.
-        record_count_eviction_pass(dir, "hostB:2", from_this_release);
+        record_count_eviction_pass(dir, "hostB:2", from_this_release, false);
         assert!(
             reclaims.join("hostB:2.json").exists(),
             "fixture: this release's document"
@@ -14952,7 +15201,7 @@ mod tests {
         );
 
         // A pass that found nothing reclaimable.
-        record_count_eviction_pass(dir, "hostA:1", 0);
+        record_count_eviction_pass(dir, "hostA:1", 0, false);
         assert_eq!(
             count_eviction_verdict(dir, 95, 80).await,
             CountEvictionVerdict::NotNeeded,
@@ -14972,7 +15221,7 @@ mod tests {
         // full request so the count is still over the trigger, isolating the latch from the
         // debit — otherwise a passing assertion here could be the debit, not the absent latch.
         let partial = 1u64;
-        record_count_eviction_pass(dir, "hostA:1", partial);
+        record_count_eviction_pass(dir, "hostA:1", partial, false);
         assert!(
             count_eviction_verdict(dir, 95, 80).await.is_needed(),
             "partial progress means the population was NOT empty, so the next cycle has real \

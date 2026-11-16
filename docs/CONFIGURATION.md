@@ -50,10 +50,10 @@ Some fields are accepted and have no effect. A config that sets one still loads,
 - `cache.eviction_buffer_percent`, `connection_pool.max_connections_per_ip`, `dashboard.max_log_entries` and `server.max_buffered_request_body_bytes`, when set to a value other than the default.
 - `metrics.include_cache_stats`, `metrics.include_compression_stats` and `metrics.include_connection_stats`, when set to `false`.
 - `health.check_interval` and `cache.initialization.parallel_scan`, `scan_timeout` and `progress_logging` (environment variables `PARALLEL_SCAN`, `SCAN_TIMEOUT` and `PROGRESS_LOGGING`; flags `--parallel-scan`, `--no-parallel-scan`, `--scan-timeout`, `--progress-logging` and `--no-progress-logging`), which share one warning logged when any is set to a value other than the default.
-- `cache.ram_cache_flush_threshold`, `cache.ram_cache_flush_on_eviction`, `cache.metadata_cache.stale_handle_max_retries`, `cache.shared_storage.consolidation_size_threshold`, `cache.shared_storage.max_cached_objects`, `cache.shared_storage.lock_refresh_interval`, `cache.shared_storage.metadata_lock_timeout_ms`, `server.https_mode` and `compression.content_aware`, when present.
+- `cache.ram_cache_flush_threshold`, `cache.ram_cache_flush_on_eviction`, `cache.metadata_cache.stale_handle_max_retries`, `cache.shared_storage.consolidation_size_threshold`, `cache.shared_storage.tail_floor_bytes`, `cache.shared_storage.max_cached_objects`, `cache.shared_storage.lock_refresh_interval`, `cache.shared_storage.metadata_lock_timeout_ms`, `server.https_mode` and `compression.content_aware`, when present.
 - `cache.shared_storage.recovery_max_concurrent`, when present, and `cache.shared_storage.orphan_recovery_enabled`, `orphan_recovery_interval`, `orphan_scan_timeout` and `orphan_max_per_cycle`, which share one warning logged when any is set to a non-default value. Public 2.8.4 honoured these five ([Configuration fields that are now ignored](UPGRADING.md#configuration-fields-that-are-now-ignored)).
 
-`cache.shared_storage.validation_frequency` is validated and has no effect, without a warning ([Validation scan](#validation-scan)). `cache.shared_storage.consolidation_size_threshold` (100 KiB to 10 MiB) and `dashboard.max_log_entries` (10 to 10,000) have no effect but are still range-checked, and a value outside the range fails startup.
+`cache.shared_storage.validation_frequency` is validated and has no effect, without a warning ([Validation scan](#validation-scan)). `cache.shared_storage.consolidation_size_threshold` (100 KiB to 10 MiB), `cache.shared_storage.tail_floor_bytes` (4 KiB to 1 GiB) and `dashboard.max_log_entries` (10 to 10,000) have no effect but are still range-checked, and a value outside the range fails startup.
 
 ### Loading configuration
 
@@ -394,7 +394,7 @@ cache:
 
 ### GET TTL
 
-`get_ttl` (default `1d`, range `0s` to `315360000s`, which is 10 years) bounds how long the proxy keeps serving an object that was overwritten or deleted without passing through it. An overwrite or delete through the proxy invalidates the cached copy at once. When `get_ttl` expires, the entry stays on disk and the next GET sends S3 a conditional request, serving the cached bytes on `304`. With `actively_remove_cached_data: true`, the validation scan also deletes expired entries; see [Active vs lazy expiration](#active-vs-lazy-expiration).
+`get_ttl` (default `1d`, range `0s` to `315360000s`, which is 10 years) bounds how long the proxy keeps serving an object that was overwritten or deleted without passing through it. An overwrite or delete through the proxy invalidates the cached copy at once. When `get_ttl` expires, the entry stays on disk and the next GET sends S3 a conditional request, serving the cached bytes on `304`. No background pass removes an expired read-cache entry, and eviction frees the space. A revalidation that finds the object changed invalidates the entry. See [Active vs lazy expiration](#active-vs-lazy-expiration).
 
 ```yaml
 cache:
@@ -405,7 +405,7 @@ A client that sends a HeadObject before each download, as the AWS CRT transfer c
 
 ### PUT TTL
 
-`put_ttl` (default `1h`) is how long an object in the write cache stays valid before its first GET. It is shorter than `get_ttl` by default because an uploaded object may never be read. The first GET within `put_ttl` makes one conditional request to S3 to learn the object's `Last-Modified`, serves the cached bytes and moves the entry onto `get_ttl`; see [TTL transition on first read](#how-write-caching-works). Later reads do not extend it, and an object not read within `put_ttl` expires. The write cache stores objects on disk only, not in the RAM cache.
+`put_ttl` (default `1h`) is how long an object in the write cache stays valid before its first GET. It is shorter than `get_ttl` by default because an uploaded object may never be read. The first GET within `put_ttl` makes one conditional request to S3 to learn the object's `Last-Modified`, serves the cached bytes and moves the entry onto `get_ttl`; see [TTL transition on first read](#how-write-caching-works). Later reads do not extend it. An object not read within `put_ttl` stays cached, and its next GET revalidates it with S3 before serving it. The write cache stores objects on disk only, not in the RAM cache.
 
 ### Incomplete upload TTL
 
@@ -423,17 +423,15 @@ cache:
 ```
 
 With `false`, the default and the recommended setting, an expired entry stays on disk until
-a request revalidates it or eviction removes it. With `true`, the
-[validation scan](#validation-scan) also deletes expired entries as it passes them, which
-frees their space before eviction would, at the cost of more I/O in each scan.
+a request revalidates it or eviction removes it. `true` behaves the same way: the
+[validation scan](#validation-scan) leaves an expired read-cache entry in place, and eviction
+frees the space. For storage that bills by usage, set `max_cache_size` to the amount you want to keep.
 
-Keep `actively_remove_cached_data: false` with `get_ttl: "0s"`. A zero TTL expires an entry
-as soon as it is cached, so active expiration would delete it before any request could
-revalidate it, and the cache would never serve a hit. See
-[Minimum TTL values](CACHE_FRESHNESS.md#minimum-ttl-values).
+Either value leaves an expired entry on disk for revalidation, including with `get_ttl: "0s"`;
+keep the default `false`. See [Minimum TTL values](CACHE_FRESHNESS.md#minimum-ttl-values).
 
-In a fleet, active expiration skips an entry that another proxy is using. HEAD metadata is
-removed when `head_ttl` expires, whatever this setting.
+The validation scan removes a HEAD-only entry, one with no cached ranges, once its HEAD expiry
+has passed by more than a day, whatever this setting.
 
 ## Write cache configuration
 
@@ -464,7 +462,8 @@ The `CompleteMultipartUpload` body is bounded by `max_complete_body_bytes`; see
 `is_write_cached` flag and sets its expiry to `get_ttl` from that moment. This happens once:
 later reads do not extend it, and the object then follows the read cache's expiry rules
 ([Rules are re-evaluated on each read](#rules-are-re-evaluated-on-each-read)). An object
-never read expires after `put_ttl`.
+never read expires after `put_ttl`: its next read revalidates it with S3, and eviction reclaims
+it before unexpired data.
 
 The same transition moves the object's bytes out of the write cache's allocation. Before its
 first read the object counts against `write_cache_percent`; afterwards it counts only against
@@ -573,7 +572,7 @@ cache:
   write_cache_enabled: true
   write_cache_percent: 20.0               # 20% of max_cache_size for objects not yet read
   write_cache_max_object_size: 536870912  # cache uploads up to 512 MiB
-  put_ttl: "1d"                           # keep unread uploads for a day
+  put_ttl: "1d"                           # unread uploads stay valid for a day
   incomplete_upload_ttl: "6h"             # drop the parts of abandoned uploads after 6 hours
 ```
 
@@ -879,7 +878,7 @@ cache:
   eviction_target_percent: 80   # default
 ```
 
-Eviction starts when the cache exceeds `eviction_trigger_percent` of `max_cache_size` and removes entries until it is down to `eviction_target_percent`. With a 10 GiB cache and the defaults, eviction starts at 9.5 GiB and stops at 8 GiB. A target closer to the trigger keeps more of the cache in use and evicts more often. The write cache applies the same two percentages to its own allocation. [Eviction](EVICTION.md) describes how entries are chosen and how a fleet shares the work.
+Eviction starts when the cache, counting multipart uploads in progress, exceeds `eviction_trigger_percent` of `max_cache_size`, or when an object it declined for space would not fit. It removes entries until the cache is down to `eviction_target_percent`. With a 10 GiB cache and the defaults, eviction starts at 9.5 GiB and stops at 8 GiB. A target closer to the trigger keeps more of the cache in use and evicts more often. The write cache applies the same two percentages to its own allocation. `eviction_trigger_percent` takes 50 to 99: a higher value, 100 included, runs as 99, and a lower one as 50, with a warning at startup. `eviction_target_percent` takes 50 to 99, and a target at or above the trigger runs as the trigger minus 10, with a warning. [Eviction](EVICTION.md) describes how entries are chosen and how a fleet shares the work.
 
 `eviction_buffer_percent` is accepted and has no effect.
 
@@ -898,7 +897,6 @@ cache:
     validation_threshold_error: 20.0  # default
     shard_fold_interval: "1h"         # default 1h, range 5m-7d
     shard_fold_max_duration: "30m"    # default 30m, range 1m-24h
-    tail_floor_bytes: 1048576         # default 1 MiB, range 4 KiB-1 GiB
     tail_max_entries: 4096            # default 4096, range 1-1048576
     tail_delta_max_entries: 4096      # default 4096, range 1-1048576
     eviction_lock_timeout: "60s"      # default 60s, range 30-3600s
@@ -912,10 +910,9 @@ cache:
 | `consolidation_interval` | How often each proxy applies the journals to the `.meta` files. Each cycle applies whatever the journals hold |
 | `validation_max_duration`, `validation_threshold_warn`, `validation_threshold_error` | The validation scan's time budget and logging thresholds; see [Validation scan](#validation-scan) |
 | `shard_fold_interval`, `shard_fold_max_duration` | The shortest interval between size folds, and the time budget of one pass; see [Size fold cadence](#size-fold-cadence) |
-| `tail_floor_bytes` | The smallest compressed range that eviction's per-shard index of large ranges holds. Lower it when most objects are under 1 MiB, where the default leaves the index empty |
 | `tail_max_entries` | How many of the largest ranges the index keeps per cache shard. Raise it if eviction reports freeing less than it was asked to while the cache is full |
-| `tail_delta_max_entries` | How many recently cached large ranges each proxy remembers between index rebuilds. Keep it at or above `tail_max_entries` |
-| `eviction_lock_timeout` | Whether a proxy that finds the fleet's eviction lock held tries once more before skipping the pass; see [Distributed eviction](SHARED_STORAGE.md#distributed-eviction) |
+| `tail_delta_max_entries` | How many recently cached ranges each proxy remembers between index rebuilds. Keep it at or above `tail_max_entries` |
+| `eviction_lock_timeout` | How long a write cache eviction pass may hold the fleet's eviction lock before it releases it, and the lock age after which a proxy that finds it held tries once more before skipping the pass; see [Distributed eviction](SHARED_STORAGE.md#distributed-eviction) |
 | `eviction_worklist_lease` | How long a proxy holds a chunk of the eviction work list before another proxy may take it over; see [Which proxy deletes](EVICTION.md#which-proxy-deletes) |
 
 A proxy starts each batch of up to 64 deletions only while at least half its work-list lease remains, and the lease is not extended, so a long chunk takes several claims. The 760-second minimum lets one batch fit in half the lease when each deletion waits up to `lock_acquire_wait_budget` for its lock. With `lock_acquire_wait_budget` above `5s`, proxies hold each lease for at least 2 × (64 × the budget + 60 s) and log a startup warning.
@@ -982,7 +979,7 @@ cache:
 ```
 `wait_timeout_secs` outside 5 to 120 is clamped to that range, with a startup warning.
 
-When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter that times out rejoins the fetch still in flight, up to `download_coordination.max_waiter_resubscriptions` times (default `3`). After that, the waiter fetches from S3 itself, as an uncoalesced request does. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
+When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter that times out rejoins the fetch still in flight, up to `download_coordination.max_waiter_resubscriptions` times (default `3`). After that, the waiter fetches from S3 itself, as an uncoalesced request does. A whole-object GET or HEAD waits at most 30 seconds in total, then fetches from S3 itself, so a `wait_timeout_secs` above 30 applies only to range and part waiters. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
 
 ## Cache size tracking
 
@@ -1100,7 +1097,7 @@ How long the proxy waits for the first byte of a full-object GET, a part-number 
 
 **`upstream_idle_timeout`** (`Duration`, default `"5s"`)
 
-Mid-stream idle watchdog for the cache-miss fetches the proxy streams: full-object GETs, part-number GET misses, complete range misses and signed ranges. If no bytes are received from upstream for this duration after data has started flowing, the proxy terminates the client connection so the client's own retry logic engages. A slow-but-steady transfer (bytes arriving within the timeout window) is never aborted: the criterion is "no bytes for T", not "transfer took longer than T". The timer is paused under client backpressure (when the proxy is not reading from upstream because the client write half is slow).
+Mid-stream idle watchdog for the cache-miss fetches the proxy streams: full-object GETs, part-number GET misses, complete range misses and signed ranges. If no bytes are received from upstream for this duration after data has started flowing, the proxy closes the client connection, so the body ends short of its `Content-Length`. A slow-but-steady transfer (bytes arriving within the timeout window) is never aborted: the criterion is "no bytes for T", not "transfer took longer than T". The timer counts only time the proxy spends waiting on the upstream: a slow client or a bandwidth limit that pauses reading does not count.
 
 **`upstream_idle_retries`** (`usize`, default `2`)
 
@@ -1208,7 +1205,7 @@ connection_pool:
 | `ipv4_only` | A records only | A host with no IPv6 route |
 | `ipv6_only` | AAAA records only | A host that reaches the origin only over IPv6, such as one behind an egress-only internet gateway |
 
-With [IP distribution](#ip-distribution) on, requests rotate through every address a lookup returns, and an address that keeps failing to connect leaves rotation ([IP health tracking](CONNECTION_POOLING.md#3-ip-health-tracking)). With it off, an unhedged GET or HEAD dials only the first address. A PUT, a POST, a signed DELETE or a [hedged read](HEDGING.md#connection-diversity) can still use any of them, so a host with no IPv6 route needs `ipv4_only` either way. The HTTPS passthrough (port 443) and `CONNECT` tunnels try each address in turn.
+With [IP distribution](#ip-distribution) on, requests rotate through every address a lookup returns, and an address that keeps failing to connect leaves rotation ([IP health tracking](CONNECTION_POOLING.md#3-ip-health-tracking)). With it off, a request dials the first address a lookup returns, so a host with no IPv6 route needs `ipv4_only` either way. A host named by an exact `endpoint_overrides` entry is the exception: its writes and [hedged reads](HEDGING.md#connection-diversity) take its addresses in turn. The HTTPS passthrough (port 443) and `CONNECT` tunnels try each address in turn.
 
 ## S3 PrivateLink (interface VPC endpoints)
 
@@ -1757,7 +1754,6 @@ The [annotated example configuration](../config/config.example.yaml) shows every
 ### High disk usage
 
 - Lower `cache.max_cache_size`.
-- Set `actively_remove_cached_data: true`, so the validation scan deletes expired entries.
 - Lower `get_ttl` for data that changes often.
 
 ### Poor cache hit rate

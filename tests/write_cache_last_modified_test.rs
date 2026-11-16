@@ -147,6 +147,88 @@ async fn write_cached_entry_revalidates_despite_fresh_ttl() {
     );
 }
 
+/// A write-cached entry past `put_ttl` and past `get_ttl`, with no `Last-Modified` (what real
+/// S3's PUT leaves), is revalidated on its next read and its cached bytes are served on a `304`.
+/// An expired staged object is judged like an expired read entry: never read as absent and
+/// refetched, never served without asking the origin.
+///
+/// This guards the revalidate-and-serve outcome on the mainline range route. That route reads the
+/// `.meta` through `CacheManager::get_metadata_cached` and hands it to `find_cached_ranges` as a
+/// preloaded document, so it never calls `DiskCacheManager::get_metadata`: a filter in that
+/// function cannot change this test's verdict. The request-path readers that do call it are
+/// `try_widened_range_request` and `find_page_overlap`.
+#[tokio::test]
+async fn an_expired_write_cached_entry_revalidates_and_serves_on_a_304() {
+    let config = test_config(OBJECT_SIZE);
+    let fixture = Fixture::new(config).await;
+    let cache_key = "bucket/write-cached-expired.bin";
+    let (start, end) = (0u64, OBJECT_SIZE - 1);
+    let len = OBJECT_SIZE as usize;
+    let spec = SeedSpec {
+        stored_expiry: common::expired_fixture::StoredExpiry::Expired,
+        // `write_cache_expires_at` is the write plus one day, so two days ago is past it.
+        created_age: std::time::Duration::from_secs(2 * 86_400),
+        ..SeedSpec::write_cached_no_last_modified(vec![(start, end)], OBJECT_SIZE, "\"wc-x1\"")
+    };
+    let etag = fixture.seed(cache_key, &spec);
+    fixture.invalidate_metadata_cache(cache_key).await;
+    let meta = fixture.read_meta(cache_key).expect(".meta must exist");
+    let now = std::time::SystemTime::now();
+    assert!(
+        meta.object_metadata.is_write_cached
+            && meta.object_metadata.last_modified.is_empty()
+            && meta.expires_at < now
+            && meta
+                .object_metadata
+                .write_cache_expires_at
+                .is_some_and(|at| at < now),
+        "fixture: a write-cached entry with no Last-Modified, past its stored expiry and its \
+         write-cache expiry"
+    );
+    let ttl = s3_proxy::bucket_settings::ResolvedSettings {
+        get_ttl: std::time::Duration::from_secs(86400),
+        ..s3_proxy::bucket_settings::ResolvedSettings::default()
+    };
+    let stub = StubS3Client::new()
+        .with_response_for_etag(
+            etag.clone(),
+            not_modified_with_last_modified(&etag, "Wed, 09 Sep 2026 16:51:54 GMT"),
+        )
+        .with_default(
+            StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+                .with_body(Bytes::from(vec![b'B'; len]))
+                .with_header(
+                    "content-range",
+                    format!("bytes {}-{}/{}", start, end, OBJECT_SIZE),
+                )
+                .with_header("etag", "\"wc-x2\""),
+        );
+    let response = fixture
+        .range_get(
+            cache_key,
+            &format!("bytes={}-{}", start, end),
+            HashMap::new(),
+            &ttl,
+            fixture.production_current_etag(cache_key),
+            stub.clone().into_trait_object(),
+        )
+        .await;
+    let body = body_of(response).await;
+    let captured = stub.captured();
+    let conditionals = conditional_requests(&captured);
+    assert!(
+        !conditionals.is_empty() && conditionals[0].if_none_match() == Some(etag.as_str()),
+        "AN EXPIRED WRITE-CACHED ENTRY WAS NOT REVALIDATED: its next read must send a conditional \
+         carrying the cached ETag. Captured requests: {:#?}",
+        captured
+    );
+    assert_eq!(
+        body,
+        old_bytes(len),
+        "after the 304 the cached bytes must be served"
+    );
+}
+
 /// R1.4 (negative control): a READ-cache entry with no effective Last-Modified —
 /// legitimately possible from an older release — must retain its EXISTING TTL
 /// behaviour and must NOT be forced to revalidate by this new trigger. Uses

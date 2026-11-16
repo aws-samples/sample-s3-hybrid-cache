@@ -310,8 +310,9 @@ confined to the consolidator, which runs every `consolidation_interval` (default
 Consequences:
 
 - **Peers see a metadata update after a delay.** The update becomes visible after the writing
-  proxy's next journal flush and the next consolidation cycle, single-digit seconds at the
-  defaults. Cached data is visible as soon as its range file lands; only the metadata index lags.
+  proxy's next journal flush and the consolidation cycle that applies it, which runs every
+  `consolidation_interval` (default `5s`). Until then, a peer with no entry for the object
+  fetches it from S3.
 - **A stalled consolidator accumulates journals.** Watch
   `consolidation.last_consolidation_timestamp` on `/metrics`. If it stops advancing, metadata
   updates are piling up unapplied.
@@ -382,10 +383,10 @@ once, each unaware of what the others freed, and overshoot the target.
 The lock is a `flock`, so like the metadata locks it is held only while its holder is alive: the
 kernel releases it when the holding process exits, and the NFS server releases it when a
 client's lease expires. A held eviction lock is never broken. `eviction_lock_timeout` (default
-`60s`, valid from 30 to 3,600 seconds) decides only whether a proxy that finds the lock held
-tries once more before skipping the pass. It tries again when the acquisition time the holder
-recorded in the lock file is older than the timeout. No value lets two proxies run a pass at
-once.
+`60s`, valid from 30 to 3,600 seconds) is the time a write cache eviction pass may hold the lock
+before it releases it. It is also the age at which a proxy that finds the lock held tries once
+more before skipping the pass, judged from the acquisition time the holder recorded in the lock
+file. No value lets two proxies run a pass at once.
 
 Two counters under `eviction_coordination` on `/metrics` report the lock.
 `evictions_skipped_lock_held` rises in normal operation, each time another proxy held the lock.
@@ -621,8 +622,9 @@ range file younger than 10 minutes and every part of a multipart upload that is 
 completed. Nothing is lost while a pass waits; orphaned files stay until a later pass.
 `orphan_reclaim.passes_gated` on `/metrics` counts the passes skipped.
 
-Each proxy runs one pass every 300 seconds, capped at 30 seconds or 4,096 directories, and
-resumes where its previous pass stopped. Proxies claim one `(bucket, first shard level)`
+Each proxy runs one pass every 300 seconds. A pass visits at least one directory, starts no new
+one after 30 seconds of visiting or 4,096 directories, and resumes where its previous pass
+stopped. Proxies claim one `(bucket, first shard level)`
 directory at a time under a lease, so two proxies never scan the same directory at once, and
 each proxy added to the fleet adds its own pass per interval. Files at the `ranges/` root,
 outside any shard directory, are covered once per rotation.
@@ -655,7 +657,7 @@ journalctl -u s3-proxy | grep 'Orphan reclaim:'
 | WARN `Discarded unapplied journal of a stopped process on this host` at startup | A proxy on this host stopped without its final consolidation and was restarted more than 5 minutes later, and no peer applied its journal in between. On a fleet the file usually holds only lines no proxy could apply. On a single proxy its last few seconds of cache fills were not recorded, so those objects are fetched from S3 again and their range files are left for [orphan recovery](#orphan-recovery) |
 | `cache.metadata_lock_retry_exhausted_total` climbing | Metadata slot-lock contention: callers are using up `lock_max_retries` and giving up. Raise `lock_max_retries`, or lengthen `consolidation_interval` so the consolidator competes for the same slots less often. `atomic_metadata.metadata_lock_hold_time_ms_total` divided by `metadata_lock_acquisitions_successful` shows whether the holds themselves are slow, which points at volume latency instead |
 | `atomic_metadata.metadata_lock_wait_budget_expired_total` climbing | Metadata slot-lock contention on the budgeted path: requests give up after `lock_acquire_wait_budget` instead of waiting. The client sees a retryable error and nothing was written. Raise the budget to favor waiting over failing, or reduce how long holds last; the same hold-time division as the row above separates contention from a slow volume |
-| `eviction_coordination.stale_locks_recovered` climbing | Eviction passes holding the lock longer than `eviction_lock_timeout`, with a peer retrying as one ends. No two proxies ran a pass at once |
+| `eviction_coordination.stale_locks_recovered` climbing | Read cache eviction passes holding the lock longer than `eviction_lock_timeout`, with a peer retrying as one ends. A write cache pass stops at that time and counts here only when its last stage runs past it. No two proxies ran a pass at once |
 | Tracked size above actual disk usage | [Concurrent-write over-counting](#concurrent-write-over-counting) during a cold-cache stampede. Bounded by the number of proxies and corrected by the re-grounding passes |
 | Disk-cache reads capped near 625 MB/s per proxy on FSx | `nconnect` missing; one TCP flow hitting the EC2 5 Gbps single-flow limit |
 | Slow downloads on cache misses while hits are unaffected, `tee_backpressure_wait_ms_total_get` rising | Cache volume write throughput is too low for the miss rate; see [write-side sizing](AWS_DEPLOYMENT.md#writes-bind-before-reads-do-and-a-slow-volume-degrades-differently-than-a-failed-one). Nothing is written on a hit, so the slowdown follows the miss rate instead of affecting every request |

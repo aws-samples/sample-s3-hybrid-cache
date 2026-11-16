@@ -12,17 +12,19 @@
 //!
 //! ## Mid-stream idle watchdog (Requirement 5, Task 11)
 //!
-//! When `idle_timeout` is configured, the stream tracks time since the last
-//! upstream chunk was received. If the upstream produces no bytes within the
-//! timeout, the stream terminates with an error, which aborts the client
-//! connection (the client's own retry logic engages). The cache channel is
-//! dropped without finalization, so a truncated body is never persisted.
+//! When `idle_timeout` is configured, the stream ends when the upstream has had
+//! nothing for it for `idle_timeout`, which aborts the client connection. Most
+//! single-stream clients tested then report an error and do not retry; some, such as
+//! the C++ SDK's `S3Client` and the .NET SDK's `TransferUtility`, retry the GET. The
+//! cache channel is dropped without finalization, so a truncated body is never
+//! persisted.
 //!
-//! **Backpressure exclusion:** The idle timer only ticks while the stream is
-//! actively polling the upstream (inner stream). During backpressure (pending
-//! cache-channel send), the timer is paused because `poll_next` resolves the
-//! pending send before polling the inner stream. This means a slow client cannot
-//! trigger a false idle abort — only genuine upstream stalls are detected.
+//! **Only upstream silence counts.** The timer starts at the first poll that finds
+//! the inner stream pending since its last frame, and is checked only while the
+//! inner stream stays pending. A poll that finds a frame ready returns it whatever
+//! the time, so a consumer that stops polling the body (a client that is not
+//! reading, hyper's write buffer above its watermark, `ThrottleStream` waiting on a
+//! grant, a busy runtime) or a full cache channel never causes an idle abort.
 
 use bytes::Bytes;
 use futures::Stream;
@@ -129,8 +131,11 @@ pub(crate) struct TeeStream<S> {
     channel_closed: bool,
     /// Mid-stream idle timeout configuration (None = disabled)
     idle_timeout: Option<Duration>,
-    /// Sleep future for the idle watchdog. Reset on every upstream chunk.
+    /// Sleep future for the idle watchdog, armed when the inner stream is found pending.
     idle_sleep: Option<Pin<Box<Sleep>>>,
+    /// Whether `idle_sleep` holds the deadline of the current wait on the upstream. Cleared
+    /// whenever a frame is returned, so the next wait starts a fresh deadline.
+    idle_armed: bool,
 }
 
 impl<S> TeeStream<S>
@@ -160,6 +165,7 @@ where
             channel_closed: false,
             idle_timeout: Some(idle_timeout),
             idle_sleep,
+            idle_armed: false,
         }
     }
 
@@ -220,12 +226,9 @@ where
                     // Send completed — record backpressure duration
                     self.resolve_backpressure_wait();
                     self.pending_send = None;
-                    // Reset idle timer: backpressure time doesn't count as upstream idle.
-                    // The upstream was ready (it delivered this chunk), it was the cache
-                    // writer that was slow. Don't penalize the upstream for that.
-                    if let Some(timeout) = self.idle_timeout {
-                        self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
-                    }
+                    // Backpressure time is not upstream silence: the next wait on the
+                    // upstream starts a fresh deadline.
+                    self.idle_armed = false;
                     // Return the frame we were holding
                     let frame = self.pending_frame.take().unwrap();
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
@@ -235,10 +238,7 @@ where
                     self.resolve_backpressure_wait();
                     self.pending_send = None;
                     self.channel_closed = true;
-                    // Reset idle timer after backpressure resolution
-                    if let Some(timeout) = self.idle_timeout {
-                        self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
-                    }
+                    self.idle_armed = false;
                     let frame = self.pending_frame.take().unwrap();
                     debug!("Cache channel closed during backpressure, continuing without caching");
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
@@ -250,37 +250,12 @@ where
             }
         }
 
-        // Step 2: Check the idle watchdog BEFORE polling the inner stream.
-        // If the idle sleep has fired, the upstream has stalled — abort.
-        if let Some(ref mut sleep) = self.idle_sleep {
-            if sleep.as_mut().poll(cx).is_ready() {
-                // Idle timeout fired — upstream stalled
-                let timeout = self.idle_timeout.unwrap_or(Duration::from_secs(5));
-                // Once per stream: the body ends here, and hyper does not poll a body again
-                // after it returns `None`.
-                UPSTREAM_IDLE_ABORT_MID_STREAM.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    "[UPSTREAM_IDLE_ABORT] Mid-stream idle timeout ({:?}) exceeded, aborting stream. \
-                     bytes_sent={}, backpressure_events={}",
-                    timeout, self.bytes_sent, self.backpressure_events
-                );
-                // Return None to signal stream end. The hyper body will be incomplete,
-                // which causes the client connection to be aborted (RST or incomplete
-                // chunked encoding). The cache channel is dropped without all bytes,
-                // so commit_incremental_range_shared will fail with "size mismatch" and the
-                // partial .bin/.tmp will be cleaned up.
-                return Poll::Ready(None);
-            }
-        }
-
-        // Step 3: Poll the inner stream for the next frame
+        // Step 2: Poll the inner stream for the next frame
         let inner = Pin::new(&mut self.inner);
         match inner.poll_next(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                // Reset the idle timer — we received a chunk from upstream
-                if let Some(timeout) = self.idle_timeout {
-                    self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
-                }
+                // The upstream delivered: the next wait on it starts a fresh deadline.
+                self.idle_armed = false;
 
                 match frame.into_data() {
                     Ok(data) => {
@@ -344,7 +319,6 @@ where
                     }
                     Err(frame) => {
                         // Non-data frame (trailers, etc), pass through
-                        // Don't reset idle timer for non-data frames
                         Poll::Ready(Some(Ok(frame)))
                     }
                 }
@@ -362,10 +336,34 @@ where
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                // The inner stream is not ready — we ARE waiting on upstream here.
-                // The idle timer is registered with the waker via the poll in Step 2,
-                // so if the timeout fires before inner becomes ready, we'll wake up
-                // and detect it in Step 2 on the next poll.
+                // The inner stream has nothing: only this wait on the upstream counts
+                // towards the watchdog. Arm the deadline at the first such poll since the
+                // last frame, and poll it so its expiry wakes this task.
+                let this = &mut *self;
+                if let (Some(timeout), Some(sleep)) = (this.idle_timeout, this.idle_sleep.as_mut())
+                {
+                    if !this.idle_armed {
+                        sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
+                        this.idle_armed = true;
+                    }
+                    if sleep.as_mut().poll(cx).is_ready() {
+                        // Once per stream: the body ends here, and hyper does not poll a
+                        // body again after it returns `None`.
+                        UPSTREAM_IDLE_ABORT_MID_STREAM.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "[UPSTREAM_IDLE_ABORT] Mid-stream idle timeout ({:?}) exceeded, aborting stream. \
+                             bytes_sent={}, backpressure_events={}",
+                            timeout, this.bytes_sent, this.backpressure_events
+                        );
+                        // Return None to signal stream end. The hyper body will be
+                        // incomplete, which causes the client connection to be aborted
+                        // (RST or incomplete chunked encoding). The cache channel is
+                        // dropped without all bytes, so commit_incremental_range_shared
+                        // will fail with "size mismatch" and the partial .bin/.tmp will
+                        // be cleaned up.
+                        return Poll::Ready(None);
+                    }
+                }
                 Poll::Pending
             }
         }
@@ -566,6 +564,35 @@ mod tests {
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0], Bytes::from("hello"));
         assert_eq!(collected[1], Bytes::from("world"));
+    }
+
+    /// A consumer that does not poll for longer than the idle timeout while the upstream
+    /// has data ready does not end the stream: only time spent waiting on the upstream
+    /// counts as upstream silence.
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_pause_longer_than_the_idle_timeout_does_not_abort_a_ready_upstream() {
+        let (tx, _rx) = mpsc::channel(10);
+        let data = vec![
+            Ok(Frame::data(Bytes::from("one"))),
+            Ok(Frame::data(Bytes::from("two"))),
+            Ok(Frame::data(Bytes::from("three"))),
+        ];
+        let mut tee = TeeStream::with_idle_timeout(stream::iter(data), tx, Duration::from_secs(5));
+        let mut received = Vec::new();
+        if let Some(Ok(frame)) = tee.next().await {
+            received.push(frame.into_data().unwrap());
+        }
+        // The consumer stops polling for longer than the timeout; the upstream has data.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        while let Some(Ok(frame)) = tee.next().await {
+            received.push(frame.into_data().unwrap());
+        }
+        assert_eq!(
+            received.len(),
+            3,
+            "A CONSUMER PAUSE WITH UPSTREAM DATA READY WAS COUNTED AS UPSTREAM SILENCE: the stream ended after {} of 3 frames",
+            received.len()
+        );
     }
 
     /// Test: mid-stream stall → stream terminated at idle timeout, no hanging.

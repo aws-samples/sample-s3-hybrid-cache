@@ -614,6 +614,9 @@ static OVERLAPS: AtomicU64 = AtomicU64::new(0);
 /// Test seam: a pause per leaf, so concurrent passes interleave.
 #[cfg(test)]
 static LEAF_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+/// Test seam: a pause in a pass's enumeration, standing in for a large or slow `ranges/`.
+#[cfg(test)]
+static ENUMERATION_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 fn visit_begin(cache_dir: &Path, unit: &Shard) {
@@ -1525,7 +1528,10 @@ async fn visit_unit(
     let mut cursor = previous.cursor.clone();
     let mut completed = true;
     for leaf in leaves {
-        if *budget_leaves == 0 || Instant::now() >= deadline {
+        // The pass's first leaf is visited whatever the clock says, so a pass always makes
+        // progress (see `run_pass_inner`).
+        if *budget_leaves == 0 || (!outcome.visited_leaves.is_empty() && Instant::now() >= deadline)
+        {
             completed = false;
             break;
         }
@@ -1647,25 +1653,43 @@ async fn run_pass_inner(
 ) -> PassOutcome {
     PASSES.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    let deadline = started + budget.time;
     let mut outcome = PassOutcome::default();
     let ranges_dir = cache_dir.join("ranges");
-    let (units, flat_names) = {
-        let r = ranges_dir.clone();
-        match tokio::task::spawn_blocking(move || enumerate_units(&r)).await {
+    // The enumeration and every unit's checkpoint read, in one blocking task: one small-file
+    // read per unit is synchronous I/O that grows with the volume, and on a runtime worker it
+    // stalls every other task scheduled there.
+    let (units, flat_names, checkpoints) = {
+        let (r, c) = (ranges_dir.clone(), cache_dir.to_path_buf());
+        let read = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            {
+                let pause = ENUMERATION_PAUSE_MS.load(Ordering::Relaxed);
+                if pause > 0 {
+                    std::thread::sleep(Duration::from_millis(pause));
+                }
+            }
+            let (units, flat_names) = enumerate_units(&r);
+            let checkpoints: BTreeMap<Shard, OrphanCheckpoint> = units
+                .iter()
+                .filter_map(|u| read_checkpoint(&c, u).map(|cp| (u.clone(), cp)))
+                .collect();
+            (units, flat_names, checkpoints)
+        });
+        match read.await {
             Ok(found) => found,
             Err(_) => return outcome,
         }
     };
-    let checkpoints: BTreeMap<Shard, OrphanCheckpoint> = units
-        .iter()
-        .filter_map(|u| read_checkpoint(cache_dir, u).map(|c| (u.clone(), c)))
-        .collect();
+    // The time budget covers visiting, and starts once the reads above have returned: they
+    // grow with the number of units, and a budget spent on them visits nothing. The first
+    // unit is visited even when the budget is already spent, so every pass makes progress.
+    let deadline = Instant::now() + budget.time;
+    let mut units_visited = 0u64;
     let now = now_secs();
     let mut budget_leaves = budget.leaves;
     let mut uploads = None;
     for unit in visit_order(&units, &checkpoints, now) {
-        if budget_leaves == 0 || Instant::now() >= deadline {
+        if budget_leaves == 0 || (units_visited > 0 && Instant::now() >= deadline) {
             break;
         }
         if gated && !fleet_ready(cache_dir) {
@@ -1677,6 +1701,7 @@ async fn run_pass_inner(
             continue;
         }
         UNITS_VISITED.fetch_add(1, Ordering::Relaxed);
+        units_visited += 1;
         #[cfg(test)]
         visit_begin(cache_dir, &unit);
         let completed = visit_unit(
@@ -1700,7 +1725,10 @@ async fn run_pass_inner(
             break;
         }
     }
-    record_rotation_progress(cache_dir, &units);
+    {
+        let c = cache_dir.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || record_rotation_progress(&c, &units)).await;
+    }
     if outcome.reclaimed > 0 || outcome.found > 0 {
         info!(
             "Orphan reclaim pass: found={} reclaimed={} bytes_reclaimed={} kept_listed={} \
@@ -1732,6 +1760,74 @@ mod tests {
     /// `r15_15_bytes_reclaimed_on_the_metrics_surface_moves_by_exactly_the_reclaimed_file`
     /// would read a concurrent test's reclamation.
     static PASS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// A pass whose enumeration outlasts its whole time budget still visits: the budget starts
+    /// once the enumeration and the checkpoint reads have returned. Two orphans in two bucket
+    /// units, a 300 ms budget and a 700 ms enumeration. Started before the enumeration, the
+    /// budget is spent before the first unit and the pass visits nothing.
+    #[tokio::test]
+    async fn pass_budget_an_enumeration_longer_than_the_budget_still_visits() {
+        let _serial = PASS_SERIAL.lock().await;
+        let temp = TempDir::new().unwrap();
+        let cache = temp.path();
+        journals_dir(cache);
+        let one = write_bin(cache, "bkta/budget/one", 0, 99);
+        let two = write_bin(cache, "bktb/budget/two", 0, 99);
+        ENUMERATION_PAUSE_MS.store(700, Ordering::Relaxed);
+        let out = run_pass(
+            cache,
+            "instance-b",
+            PassBudget {
+                leaves: usize::MAX,
+                time: Duration::from_millis(300),
+            },
+        )
+        .await;
+        ENUMERATION_PAUSE_MS.store(0, Ordering::Relaxed);
+        assert!(
+            !out.visited_leaves.is_empty(),
+            "a pass whose enumeration took longer than its budget visited nothing: \
+             reclaimed={} found={}",
+            out.reclaimed,
+            out.found
+        );
+        assert!(
+            !one.exists() && !two.exists() && out.reclaimed == 2,
+            "with the budget started after the enumeration both orphans are reclaimed: \
+             reclaimed={} visited_leaves={:?}",
+            out.reclaimed,
+            out.visited_leaves
+        );
+    }
+
+    /// A pass with no time left still visits exactly one unit, so a rotation always moves.
+    #[tokio::test]
+    async fn pass_budget_a_spent_budget_visits_one_unit_and_stops() {
+        let _serial = PASS_SERIAL.lock().await;
+        let temp = TempDir::new().unwrap();
+        let cache = temp.path();
+        journals_dir(cache);
+        let orphan = write_bin(cache, "bkta/budget/spent", 0, 99);
+        let out = run_pass(
+            cache,
+            "instance-b",
+            PassBudget {
+                leaves: usize::MAX,
+                time: Duration::ZERO,
+            },
+        )
+        .await;
+        assert_eq!(
+            out.visited_leaves.len(),
+            1,
+            "a zero budget must visit one unit (the first leaf of the first unit claimed) and \
+             stop: visited {:?}",
+            out.visited_leaves
+        );
+        assert!(
+            orphan.exists(),
+            "the root unit ranks first, so the bucket unit's orphan waits for the next pass"
+        );
+    }
 
     fn big_budget() -> PassBudget {
         PassBudget {

@@ -33,7 +33,7 @@ Three per-rule fields in `cache_rules.json` turn hedging on for the keys a rule 
 
 - **`hedging_enabled`** (`bool`, default `false`): the switch. Nothing on this page applies to a key unless a matching rule sets it to `true`.
 - **`hedge_trigger_after`** (duration, default `250ms` when hedging is enabled): how long the original request may go unanswered before the proxy sends the hedge. It must be greater than zero and less than `connection_pool.upstream_first_byte_timeout` (default `5s`), or the first-byte timeout would fire before a hedge could be sent. The proxy checks an explicit value on a rule that sets `hedging_enabled: true` each time it loads the rules file, and rejects a file that breaks it; see [Hot reload and error resilience](CONFIGURATION.md#hot-reload-and-error-resilience).
-- **`hedge_max_per_request`** (integer, default `1` when hedging is enabled): the hedge budget for one client request. A range GET that fans out into several parallel sub-fetches shares one budget across all of them, so a budget of 1 on a request with four sub-fetches allows one hedge in total. A budget of `0` sends no hedge, yet the original request is still tied to an address as described in [Connection diversity](#connection-diversity). It therefore skips the connect and timeout retries an unhedged request gets, and every fetch still unanswered at `hedge_trigger_after` increments `suppressed`. To turn hedging off for a prefix, set `hedging_enabled: false` instead.
+- **`hedge_max_per_request`** (integer, default `1` when hedging is enabled): the hedge budget for one client request. A range GET that fans out into several parallel sub-fetches shares one budget across all of them, so a budget of 1 on a request with four sub-fetches allows one hedge in total. A budget of `0` turns hedging off for the keys it applies to, as `hedging_enabled: false` does.
 
 Rule matching and first-match-per-field precedence work as for every other rule field; see [Cache rules](CONFIGURATION.md#cache-rules). The rule fields are also described in the [cache rules schema](cache-rules-schema.json).
 
@@ -88,7 +88,7 @@ The hedge prefers a different upstream IP address from the original, so it is a 
 
 Both attempts are tied to addresses whenever the proxy holds a healthy address for the host. With two or more, they get different ones. With one, both use it on separate connections, and the hedge is not suppressed for lack of a second address. Neither attempt is tied to an address while the proxy holds none for the host, or when the destination matches an `upstream_overrides` entry, in which case both take the override's path.
 
-With IP distribution on, the proxy resolves a host when it first sees it and keeps its addresses current. With it off, the proxy holds addresses only for a host named by an exact `endpoint_overrides` entry, and for a host it has forwarded a PUT, a POST or a signed DELETE to. It does not refresh those addresses or probe excluded ones. A host it has written to keeps the addresses its first successful lookup returned, and an address excluded after repeated failures stays out of rotation until the proxy restarts.
+With IP distribution on, the proxy resolves a host when it first sees it and keeps its addresses current. With it off, the proxy holds addresses only for a host named by an exact `endpoint_overrides` entry. It does not refresh those addresses or probe excluded ones, so an address excluded after repeated failures stays out of rotation until the proxy restarts.
 
 A failed connect on a tied attempt is not retried; the other attempt is the recovery. An untied attempt takes the connect retries described in [Error recovery](CONNECTION_POOLING.md#6-error-recovery). When both attempts fail, or the original fails and no hedge is sent, what happens next depends on the fetch path:
 
@@ -96,7 +96,7 @@ A failed connect on a tied attempt is not retried; the other attempt is the reco
 |---|---|
 | Full-object GET, HEAD and part-number GET | The request fails. If every attempt sent reaches `upstream_first_byte_timeout` without answering, the race first runs again on the same addresses, up to `upstream_idle_retries` times |
 | Complete range miss | The request fails |
-| Signed range | The proxy tries up to twice more, after waits of 100 ms and 200 ms, choosing the addresses again each time. A failed upstream TLS certificate check fails the request at once |
+| Signed range | The request fails |
 | Partial range hit or page fill | The proxy fetches the client's range once more without hedging, which takes the connect retries, and the request fails only if that fetch fails too |
 
 A request that fails gets the status an unhedged request gets on the same path: `502` for most failures and `504` for a timeout. Retries share the request's hedge budget, so at the default budget of 1 a retry runs without a hedge once a hedge has been sent.
@@ -115,7 +115,7 @@ Range GETs take one of three paths, and all three hedge. An unsigned range takes
 
 On every path the loser is dropped as soon as the winner answers, and none of its data is kept. Three details apply to ranges:
 
-- **No first-byte timeout.** No range path sets a first-byte timeout, and hedging does not add one. The fixed 30-second upstream request timeout still bounds each upstream request an attempt sends, from connect to its response headers. Nothing times the body of a buffered sub-fetch after that.
+- **No first-byte timeout.** No range path sets a first-byte timeout, and hedging does not add one. The fixed 30-second upstream request timeout still bounds each upstream request an attempt sends, from connect to its response headers. After that, `upstream_idle_timeout` bounds each gap in a buffered sub-fetch's body.
 - **One shared budget.** One client range GET gets one `hedge_max_per_request` budget across all its sub-fetches. Only sub-fetches that have not answered at `hedge_trigger_after` try to claim it, so the budget goes to a slow one. Raise it on the prefix's rule for workloads that routinely fetch several ranges per request.
 - **Independent address pairs.** Each sub-fetch picks its own two addresses.
 

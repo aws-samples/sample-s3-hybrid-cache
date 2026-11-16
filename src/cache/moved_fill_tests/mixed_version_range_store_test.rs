@@ -101,13 +101,16 @@ fn read_meta(cache_dir: &Path) -> Option<NewCacheMetadata> {
 /// Serve the whole object from cache the way a mainline cache hit does: lookup with the
 /// cached ETag as the only known version, then load each listed extent. Returns the
 /// `.meta` ETag and, per extent, `Some(byte)` for a loaded uniform extent or `None` for a
-/// miss (a missing `.bin` is a miss, which is allowed; a wrong version is not).
+/// miss (a missing `.bin` is a miss, which is allowed; a wrong version is not). No `.meta`
+/// is a whole-object miss: an empty ETag and no extents.
 async fn serve_whole_object(
     cache_dir: &Path,
     manager: &CacheManager,
     rh: &RangeHandler,
 ) -> (String, Vec<(u64, Option<u8>)>) {
-    let meta = read_meta(cache_dir).expect("a .meta must be published");
+    let Some(meta) = read_meta(cache_dir) else {
+        return (String::new(), Vec::new());
+    };
     let overlap = rh
         .find_cached_ranges(
             KEY,
@@ -143,6 +146,9 @@ async fn serve_whole_object(
 }
 
 fn assert_one_version(etag: &str, extents: &[(u64, Option<u8>)]) {
+    if etag.is_empty() && extents.is_empty() {
+        return;
+    }
     let expected = if etag == ETAG_V1 {
         BYTE_V1
     } else if etag == ETAG_V2 {
@@ -361,11 +367,11 @@ async fn prepare_order_inverting_rename_order_never_lists_an_extent_over_the_oth
         "page 0 must read as a miss after a disagreeing pass: {:?}",
         extents
     );
+    // The pass met a fill of another version than the `.meta` names, so neither version
+    // stays cached: page 1 is a miss too.
     assert!(
-        extents
-            .iter()
-            .any(|(s, b)| *s == EXTENT && *b == Some(BYTE_V2)),
-        "control: page 1 (one fill, v2) must stay a hit: {:?}",
+        extents.iter().all(|(_, b)| b.is_none()),
+        "after a pass that met two versions no extent may stay a hit: {:?}",
         extents
     );
     assert!(

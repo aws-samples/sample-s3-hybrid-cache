@@ -134,6 +134,7 @@ by roughly the proxy count. See [What to alarm on](LOCAL_NVME_CACHE.md#what-to-a
 | `cache.cache_hits` | Gauge | Total disk cache hits (GET) |
 | `cache.cache_misses` | Gauge | Total disk cache misses (GET, forwarded to S3) |
 | `cache.evictions` | Gauge | Disk cache evictions |
+| `eviction_coordination.eviction_lock_held_secs` | Gauge (seconds) | How long this proxy has held the global eviction lock, `0` when it does not hold it. Per-proxy |
 | `cache.s3_requests_saved` | Gauge | S3 requests avoided (disk hits + metadata hits) |
 | `cache.bytes_served_from_cache` | Gauge (bytes) | S3 transfer bytes saved |
 
@@ -164,7 +165,7 @@ by roughly the proxy count. See [What to alarm on](LOCAL_NVME_CACHE.md#what-to-a
 |--------|------|-------------|
 | `cache.corruption_metadata_total` | Gauge | Corrupted metadata files detected |
 | `cache.corruption_missing_range_total` | Gauge | Missing range files detected |
-| `cache.disk_full_events_total` | Gauge | Cache writes refused with `ENOSPC`: range data files (whole or streamed), request-path `.meta` writes, and journal appends. Consolidator and orphan-sweep `.meta` writes, cache-hit journal flushes and accounting state files are not counted; see [ERROR_HANDLING.md: Disk Space Exhaustion](ERROR_HANDLING.md#3-disk-space-exhaustion) |
+| `cache.disk_full_events_total` | Gauge | Cache writes refused with `ENOSPC`: range data files (whole or streamed), request-path `.meta` writes, journal appends, the eviction index, eviction work lists and orphan reclamation checkpoints. Consolidator and orphan-sweep `.meta` writes, cache-hit journal flushes and other accounting state files are not counted; see [ERROR_HANDLING.md: Disk Space Exhaustion](ERROR_HANDLING.md#3-disk-space-exhaustion) |
 | `cache.metadata_lock_retry_exhausted_total` | Gauge | Callers that exhausted `lock_max_retries` waiting for a metadata slot lock and gave up. The retry count bounds the wait; the metadata lock protocol has no timeout |
 | `cache.incomplete_uploads_evicted` | Gauge | Incomplete multipart uploads evicted from the write cache |
 | `cache.consumed_bytes` | Gauge (bytes) | Real `statvfs`-derived bytes consumed on the cache volume's file system. Observability only, not a capacity authority. Per-proxy file system, `0` on a read failure. Compare against `cache.total_cache_size` yourself only with the scope mismatch in mind; see [Metrics reference](METRICS_REFERENCE.md) |
@@ -281,8 +282,9 @@ shared across a fleet.
 | `write_cache.pending_lock_wait_ms_total` | Gauge (milliseconds) | Summed wait for those locks, timeouts included. Per-proxy |
 | `write_cache.pending_lock_timeouts_total` | Gauge (count) | Waits abandoned at their bound. On a read, each makes the staged range count and the staged byte figure unknown for that read; the budget admits rather than declines, and at epoch 1 a reclamation pass removes nothing by size. On a credit append, each loses up to 1,024 credit records whose ledger entries are durable, so the staged figure under-states those bytes until a staged-fold pass visits the shards the stage marked dirty. Per-proxy |
 | `write_cache.pending_lines_quarantined_total` | Gauge (count) | Pending-credit lines moved to a `{instance}.pending.torn` file because they were blank or not JSON, which is what an interrupted write leaves. Per-proxy |
+| `write_cache.removal_debit_merges_total` | Gauge (count) | Times this proxy combined its removal-debit document into one entry per cache shard, which it does when the document holds more than 4,096 entries. Per-proxy |
 | `write_cache.staging_figure_unknown_seconds` | Gauge (seconds) | Seconds this proxy has been unable to recompute the staged figure; `0` while its most recent recomputation produced one. Lags a change by at most `metrics.collection_interval` plus one recomputation. Recorded when a collection finishes, and once more when a collection has not returned after twice `metrics.collection_interval` (at least 60 s). `/metrics` reads it on each request and shows a recomputation stuck for 60 s or more. Per-proxy |
-| `write_cache.staging_figure_unknown_passes_total` | Gauge (count) | Passes that removed nothing by size because the staged figure could not be derived. Per-proxy, since the process started |
+| `write_cache.staging_figure_unknown_passes_total` | Gauge (count) | Passes that removed nothing by size because the staged figure could not be derived or read within `eviction_lock_timeout`. Per-proxy, since the process started |
 | `write_cache.staged_authority_epoch` | Gauge (0 or 1) | Which derivation the staged figure uses. Read it before comparing figures across proxies or across time |
 | `write_cache.staged_authority_snapshot_hits_total` | Gauge (count) | Staged-figure reads served from the short-lived cache. Per-proxy |
 | `write_cache.staged_authority_snapshot_recomputes_total` | Gauge (count) | Recomputations of the staged figure from the cache volume. A reader that waits for one already running counts in neither this nor the row above. Per-proxy |

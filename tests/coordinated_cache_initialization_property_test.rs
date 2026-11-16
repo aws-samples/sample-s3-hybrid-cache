@@ -17,6 +17,29 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
+/// Write `size_state.json` as a fixture and read it back, so the consolidator's memo holds it.
+/// These tests seeded through the absolute validation install, which no longer exists.
+async fn seed_size_state(
+    consolidator: &JournalConsolidator,
+    cache_dir: &std::path::Path,
+    total_size: u64,
+    write_cache_size: u64,
+    cached_objects: u64,
+) {
+    let state = s3_proxy::journal_consolidator::SizeState {
+        total_size,
+        write_cache_size,
+        cached_objects,
+        ..Default::default()
+    };
+    std::fs::write(
+        cache_dir.join("size_tracking").join("size_state.json"),
+        serde_json::to_string(&state).unwrap(),
+    )
+    .unwrap();
+    consolidator.load_size_state().await.unwrap();
+}
+
 /// Helper function to create a test CacheSizeTracker with JournalConsolidator
 async fn create_test_size_tracker(
     cache_dir: &std::path::Path,
@@ -179,17 +202,16 @@ fn prop_inflight_and_resident_are_never_cross_validated(
         let (size_tracker, consolidator) = create_test_size_tracker(temp_dir.path()).await;
 
         // `total_size` must be at least the write-cache figure: the staged figure is a
-        // SUBSET of the total and `update_size_from_validation_with_kind` clamps it with a WARN
-        // otherwise (R6.4).
+        // SUBSET of the total (R6.4).
         if tracker_size > 0 {
-            consolidator
-                .update_size_from_validation_with_kind(
-                    tracker_size,
-                    Some(tracker_size),
-                    None,
-                    s3_proxy::cache_size_tracker::ValidationSampleKind::FullScan,
-                )
-                .await;
+            seed_size_state(
+                &consolidator,
+                temp_dir.path(),
+                tracker_size,
+                tracker_size,
+                0,
+            )
+            .await;
         }
 
         let validation_results = coordinator

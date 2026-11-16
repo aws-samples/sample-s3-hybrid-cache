@@ -94,7 +94,7 @@ fn activate_epoch_1(cache_dir: &Path) {
 }
 
 /// Incompressible, so each object's staged compressed size is close to its length.
-fn body(len: usize, seed: u64) -> Vec<u8> {
+pub(super) fn body(len: usize, seed: u64) -> Vec<u8> {
     let mut x = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
     (0..len)
         .map(|_| {
@@ -106,7 +106,7 @@ fn body(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-async fn put(m: &CacheManager, cache_key: &str, data: &[u8]) {
+pub(super) async fn put(m: &CacheManager, cache_key: &str, data: &[u8]) {
     m.invalidate_cache_unified_for_operation(cache_key, "PUT")
         .await
         .unwrap();

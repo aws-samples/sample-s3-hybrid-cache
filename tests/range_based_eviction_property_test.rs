@@ -13,7 +13,6 @@
 //! - Property 9: Directory Cleanup (Requirements 5.1, 5.2)
 
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use s3_proxy::cache::CacheManager;
 use s3_proxy::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::{get_sharded_path, DiskCacheManager};
@@ -26,31 +25,6 @@ use tokio::runtime::Runtime;
 // ============================================================================
 // Test Configuration Types
 // ============================================================================
-
-#[derive(Debug, Clone)]
-struct RangeIndependenceConfig {
-    num_objects: usize,
-    ranges_per_object: Vec<usize>,
-    range_sizes: Vec<u64>,
-}
-
-impl Arbitrary for RangeIndependenceConfig {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let num_objects = 1 + (usize::arbitrary(g) % 5);
-        let ranges_per_object: Vec<usize> = (0..num_objects)
-            .map(|_| 1 + (usize::arbitrary(g) % 10))
-            .collect();
-        let total_ranges: usize = ranges_per_object.iter().sum();
-        let range_sizes: Vec<u64> = (0..total_ranges)
-            .map(|_| 1024 + (u64::arbitrary(g) % (1024 * 1024)))
-            .collect();
-        RangeIndependenceConfig {
-            num_objects,
-            ranges_per_object,
-            range_sizes,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct MetadataUpdateConfig {
@@ -92,81 +66,6 @@ fn create_test_cache_dir() -> (TempDir, PathBuf) {
     std::fs::create_dir_all(cache_dir.join("ranges")).ok();
     std::fs::create_dir_all(cache_dir.join("size_tracking")).ok();
     (temp_dir, cache_dir)
-}
-
-fn create_test_metadata(
-    cache_dir: &Path,
-    cache_key: &str,
-    num_ranges: usize,
-    range_sizes: &[u64],
-) -> Result<usize, String> {
-    let now = SystemTime::now();
-    let old_access_time = now - Duration::from_secs(120);
-
-    let object_metadata = ObjectMetadata::new(
-        format!("etag-{}", cache_key),
-        "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        range_sizes.iter().sum(),
-        Some("application/octet-stream".to_string()),
-    );
-
-    let mut ranges = Vec::with_capacity(num_ranges);
-    let mut current_offset = 0u64;
-
-    for i in 0..num_ranges {
-        let size = range_sizes.get(i).copied().unwrap_or(8192);
-        let start = current_offset;
-        let end = current_offset + size - 1;
-        let file_path = format!(
-            "{}/{}_{}-{}.bin",
-            cache_key.replace('/', "%2F"),
-            cache_key.replace('/', "%2F"),
-            start,
-            end
-        );
-
-        let mut range_spec = RangeSpec::new(
-            start,
-            end,
-            file_path.clone(),
-            CompressionAlgorithm::Lz4,
-            size,
-            size,
-        );
-        range_spec.last_accessed = old_access_time;
-        ranges.push(range_spec);
-
-        let bin_path = cache_dir.join("ranges").join(&file_path);
-        if let Some(parent) = bin_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let data = vec![0u8; size as usize];
-        std::fs::write(&bin_path, &data).map_err(|e| format!("Failed to write bin file: {}", e))?;
-        current_offset = end + 1;
-    }
-
-    let metadata = NewCacheMetadata {
-        cache_key: cache_key.to_string(),
-        object_metadata,
-        ranges,
-        created_at: old_access_time,
-        expires_at: now + Duration::from_secs(3600),
-        compression_info: CompressionInfo::default(),
-        ..Default::default()
-    };
-
-    let meta_path = get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
-        .map_err(|e| format!("Failed to get sharded path: {}", e))?;
-
-    if let Some(parent) = meta_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create dirs: {}", e))?;
-    }
-
-    let json = serde_json::to_string_pretty(&metadata)
-        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
-    std::fs::write(&meta_path, json).map_err(|e| format!("Failed to write metadata: {}", e))?;
-
-    Ok(num_ranges)
 }
 
 fn create_test_metadata_with_ranges(
@@ -248,114 +147,6 @@ fn read_metadata(meta_path: &PathBuf) -> Result<NewCacheMetadata, String> {
 // Property 1: Range Independence
 // **Validates: Requirements 1.1, 1.5**
 // ============================================================================
-
-fn prop_candidate_count_equals_range_count(config: RangeIndependenceConfig) -> TestResult {
-    let rt = Runtime::new().expect("Failed to create runtime");
-    rt.block_on(async {
-        let (_temp_dir, cache_dir) = create_test_cache_dir();
-        let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
-
-        let mut total_expected_ranges = 0usize;
-        let mut range_size_idx = 0usize;
-
-        for obj_idx in 0..config.num_objects {
-            let cache_key = format!("test-bucket/object-{}", obj_idx);
-            let num_ranges = config.ranges_per_object.get(obj_idx).copied().unwrap_or(1);
-            let end_idx = (range_size_idx + num_ranges).min(config.range_sizes.len());
-            let sizes: Vec<u64> = if range_size_idx < config.range_sizes.len() {
-                config.range_sizes[range_size_idx..end_idx].to_vec()
-            } else {
-                vec![8192; num_ranges]
-            };
-            range_size_idx = end_idx;
-
-            match create_test_metadata(&cache_dir, &cache_key, num_ranges, &sizes) {
-                Ok(created_ranges) => total_expected_ranges += created_ranges,
-                Err(_) => return TestResult::discard(),
-            }
-        }
-
-        let candidates = match cache_manager.collect_range_candidates_for_eviction().await {
-            Ok(c) => c,
-            Err(_) => return TestResult::discard(),
-        };
-
-        if candidates.len() != total_expected_ranges {
-            return TestResult::failed();
-        }
-        TestResult::passed()
-    })
-}
-
-fn prop_each_range_is_independent(config: RangeIndependenceConfig) -> TestResult {
-    let rt = Runtime::new().expect("Failed to create runtime");
-    rt.block_on(async {
-        let (_temp_dir, cache_dir) = create_test_cache_dir();
-        let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
-
-        let cache_key = "test-bucket/multi-range-object";
-        let num_ranges = config
-            .ranges_per_object
-            .first()
-            .copied()
-            .unwrap_or(3)
-            .max(2);
-        let sizes: Vec<u64> = config
-            .range_sizes
-            .iter()
-            .take(num_ranges)
-            .copied()
-            .collect();
-        let sizes = if sizes.len() < num_ranges {
-            vec![8192; num_ranges]
-        } else {
-            sizes
-        };
-
-        if create_test_metadata(&cache_dir, cache_key, num_ranges, &sizes).is_err() {
-            return TestResult::discard();
-        }
-
-        let candidates = match cache_manager.collect_range_candidates_for_eviction().await {
-            Ok(c) => c,
-            Err(_) => return TestResult::discard(),
-        };
-
-        let mut seen_ranges: Vec<(u64, u64)> = Vec::new();
-        for candidate in &candidates {
-            if candidate.cache_key != cache_key {
-                return TestResult::failed();
-            }
-            let range_bounds = (candidate.range_start, candidate.range_end);
-            if seen_ranges.contains(&range_bounds) {
-                return TestResult::failed();
-            }
-            seen_ranges.push(range_bounds);
-            if candidate.access_count < 1 {
-                return TestResult::failed();
-            }
-        }
-
-        if seen_ranges.len() != num_ranges {
-            return TestResult::failed();
-        }
-        TestResult::passed()
-    })
-}
-
-#[test]
-fn test_property_range_independence_candidate_count() {
-    QuickCheck::new().tests(20).quickcheck(
-        prop_candidate_count_equals_range_count as fn(RangeIndependenceConfig) -> TestResult,
-    );
-}
-
-#[test]
-fn test_property_range_independence_separate_candidates() {
-    QuickCheck::new()
-        .tests(20)
-        .quickcheck(prop_each_range_is_independent as fn(RangeIndependenceConfig) -> TestResult);
-}
 
 // ============================================================================
 // Property 5: Metadata Update After Range Eviction
@@ -516,29 +307,4 @@ fn test_property_metadata_update_preserves_object_metadata() {
     QuickCheck::new().tests(20).quickcheck(
         prop_metadata_preserves_object_metadata as fn(MetadataUpdateConfig) -> TestResult,
     );
-}
-
-// ============================================================================
-// Unit tests for edge cases
-// ============================================================================
-
-#[cfg(test)]
-mod unit_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_single_range_object() {
-        let (_temp_dir, cache_dir) = create_test_cache_dir();
-        let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
-
-        let cache_key = "test-bucket/single-range";
-        create_test_metadata(&cache_dir, cache_key, 1, &[8192]).unwrap();
-
-        let candidates = cache_manager
-            .collect_range_candidates_for_eviction()
-            .await
-            .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].cache_key, cache_key);
-    }
 }

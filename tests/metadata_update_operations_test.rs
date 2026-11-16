@@ -279,6 +279,87 @@ async fn test_remove_invalidated_range_with_remaining_ranges() {
     assert_eq!(updated_metadata.ranges[0].end, 16777215);
 }
 
+/// The rewrite of a `.meta` that keeps ranges is a rename of a complete document, never a write
+/// into the file readers have open. An in-place `std::fs::write` truncates the same inode first,
+/// so a reader between the truncate and the write sees an empty document. A reader that opened
+/// the file before the call must still read the whole old document afterwards, the path must be
+/// a different inode, and no temporary file may be left beside it.
+#[tokio::test]
+async fn test_remove_invalidated_range_publishes_by_rename() {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let (manager, _temp_dir) = create_test_cache_manager().await;
+    let cache_key = "test-bucket/test-object";
+    let now = SystemTime::now();
+    let ranges = vec![
+        RangeSpec::new(
+            0,
+            8388607,
+            format!("{}_0-8388607.bin", cache_key),
+            CompressionAlgorithm::Lz4,
+            8388608,
+            8388608,
+        ),
+        RangeSpec::new(
+            8388608,
+            16777215,
+            format!("{}_8388608-16777215.bin", cache_key),
+            CompressionAlgorithm::Lz4,
+            8388608,
+            8388608,
+        ),
+    ];
+    let metadata = NewCacheMetadata {
+        cache_key: cache_key.to_string(),
+        object_metadata: ObjectMetadata::new(
+            "test-etag".to_string(),
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            16777216,
+            Some("application/octet-stream".to_string()),
+        ),
+        ranges,
+        created_at: now,
+        expires_at: now + Duration::from_secs(3600),
+        compression_info: CompressionInfo::default(),
+        ..Default::default()
+    };
+    manager.seed_metadata(&metadata);
+    let meta_path = manager.get_new_metadata_file_path(cache_key);
+    let mut reader = std::fs::File::open(&meta_path).unwrap();
+    let inode_before = std::fs::metadata(&meta_path).unwrap().ino();
+    manager
+        .remove_invalidated_range(cache_key, 0, 8388607)
+        .await
+        .unwrap();
+    let inode_after = std::fs::metadata(&meta_path).unwrap().ino();
+    let mut seen_by_old_reader = String::new();
+    reader.read_to_string(&mut seen_by_old_reader).unwrap();
+    let old_ranges = serde_json::from_str::<NewCacheMetadata>(&seen_by_old_reader)
+        .map(|m| m.ranges.len())
+        .ok();
+    let leftovers: Vec<String> = std::fs::read_dir(meta_path.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".tmp"))
+        .collect();
+    println!(
+        "inode before {inode_before}, after {inode_after}; the old reader's document parsed with \
+         {old_ranges:?} range(s); temporary files left {leftovers:?}"
+    );
+    assert_ne!(
+        inode_before, inode_after,
+        "the rewrite went into the file readers have open instead of replacing it by rename"
+    );
+    assert_eq!(
+        old_ranges,
+        Some(2),
+        "a reader that opened the .meta before the rewrite must still read the whole old document"
+    );
+    assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    let updated = manager.get_metadata(cache_key).await.unwrap().unwrap();
+    assert_eq!(updated.ranges.len(), 1);
+}
 #[tokio::test]
 async fn test_remove_invalidated_range_nonexpired() {
     let (manager, _temp_dir) = create_test_cache_manager().await;

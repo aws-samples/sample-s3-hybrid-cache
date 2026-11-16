@@ -123,6 +123,10 @@ struct Instruments {
     cache_capacity_guard_last_free_bytes: Gauge<u64>,
     cache_capacity_guard_floor_bytes: Gauge<u64>,
     cache_read_fills_declined_max_cache_size_total: Gauge<u64>,
+    cache_eviction_demand_passes_total: Gauge<u64>,
+    cache_eviction_demand_refusals_over_cap_total: Gauge<u64>,
+    cache_eviction_demand_dedup_skips_total: Gauge<u64>,
+    cache_eviction_demand_backoff_skips_total: Gauge<u64>,
     cache_hostname_collisions_total: Gauge<u64>,
     // -- staged (write) tier: § 16.6.7's operator signals --
     //
@@ -155,6 +159,7 @@ struct Instruments {
     pending_lock_wait_ms_total: Gauge<u64>,
     pending_lock_timeouts_total: Gauge<u64>,
     pending_lines_quarantined_total: Gauge<u64>,
+    removal_debit_merges_total: Gauge<u64>,
     staging_figure_unknown_seconds: Gauge<u64>,
     staging_figure_unknown_passes_total: Gauge<u64>,
     staged_authority_snapshot_hits_total: Gauge<u64>,
@@ -220,6 +225,7 @@ struct Instruments {
     cache_eviction_passes_total: Gauge<u64>,
     cache_eviction_last_result_duration_ms: Gauge<u64>,
     eviction_coordination_staging_evictions_skipped_lock_held: Gauge<u64>,
+    eviction_coordination_eviction_lock_held_secs: Gauge<u64>,
     // -- eviction: R12.3's rates, the admission rates they race, the verdict, the backlog --
     //
     // Same reasoning as the block above: a field with no instrument here is invisible to an
@@ -250,9 +256,8 @@ struct Instruments {
     cache_st_size_fold_oldest_shard_scan_age_secs: Gauge<u64>,
     // -- eviction: the Tail_Partition mechanism, build side --
     //
-    // `tail_floor_bytes` is the one to read first when partitions look empty: a floor above the
-    // cache's whole size distribution produces empty partitions, and an empty partition is
-    // indistinguishable from an idle cache on every other series here.
+    // `tail_floor_bytes` is always 0: the floor is deprecated and has no effect. Kept so a
+    // dashboard reading the series does not break.
     cache_tail_floor_bytes: Gauge<u64>,
     cache_tail_max_entries: Gauge<u64>,
     cache_tail_rebuilds_total: Gauge<u64>,
@@ -260,16 +265,8 @@ struct Instruments {
     cache_tail_effective_min_bytes: Gauge<u64>,
     cache_tail_delta_records: Gauge<u64>,
     // -- eviction: the Tail_Partition mechanism, selection side --
-    //
-    // The three fallback counters are what say whether the bounded path is being used at all. A
-    // deployment whose partitions have never been built falls back on every pass and looks
-    // identical to one using the bounded path on every other series;
-    // `eviction_fallback_unvisited_total` is the one that distinguishes them.
     cache_tail_coverage_ratio: Gauge<f64>,
     cache_tail_coverage_short_total: Gauge<u64>,
-    cache_eviction_fallback_tail_empty_total: Gauge<u64>,
-    cache_eviction_fallback_cap_exhausted_total: Gauge<u64>,
-    cache_eviction_fallback_unvisited_total: Gauge<u64>,
     cache_eviction_oversized_single_candidate_total: Gauge<u64>,
     cache_tail_delta_cap_rewrites_total: Gauge<u64>,
     // One series per verdict reason, carried as a `reason` attribute — the `class_bytes` pattern.
@@ -437,7 +434,7 @@ struct Instruments {
     //
     // Monotone since process start: `rejected_total`, `aborted_accumulations_total`, and
     // `peak_reserved_bytes` (a high-water mark). Levels: `reserved_bytes`. Configuration in force:
-    // `ceiling_bytes` and `ram_cache_max_bytes`, exported for the reason `cache.tail_floor_bytes`
+    // `ceiling_bytes` and `ram_cache_max_bytes`, exported for the reason `cache.tail_max_entries`
     // is — a numerator without its denominator cannot be read as saturation. All six are gauges,
     // like every `_total` on this exporter: the export records a cumulative snapshot, and an OTLP
     // counter takes increments.
@@ -786,6 +783,16 @@ impl OtlpExporter {
             cache_read_fills_declined_max_cache_size_total: g_u64!(
                 "cache.read_fills_declined_max_cache_size_total"
             ),
+            cache_eviction_demand_passes_total: g_u64!("cache.eviction_demand_passes_total"),
+            cache_eviction_demand_refusals_over_cap_total: g_u64!(
+                "cache.eviction_demand_refusals_over_cap_total"
+            ),
+            cache_eviction_demand_dedup_skips_total: g_u64!(
+                "cache.eviction_demand_dedup_skips_total"
+            ),
+            cache_eviction_demand_backoff_skips_total: g_u64!(
+                "cache.eviction_demand_backoff_skips_total"
+            ),
             cache_hostname_collisions_total: g_u64!("cache.hostname_collisions_total"),
             // staged (write) tier
             staged_range_count: g_u64!("write_cache.staged_range_count"),
@@ -827,6 +834,7 @@ impl OtlpExporter {
             pending_lock_wait_ms_total: g_u64!("write_cache.pending_lock_wait_ms_total"),
             pending_lock_timeouts_total: g_u64!("write_cache.pending_lock_timeouts_total"),
             pending_lines_quarantined_total: g_u64!("write_cache.pending_lines_quarantined_total"),
+            removal_debit_merges_total: g_u64!("write_cache.removal_debit_merges_total"),
             staging_figure_unknown_seconds: g_u64!("write_cache.staging_figure_unknown_seconds"),
             staging_figure_unknown_passes_total: g_u64!(
                 "write_cache.staging_figure_unknown_passes_total"
@@ -937,6 +945,9 @@ impl OtlpExporter {
             eviction_coordination_staging_evictions_skipped_lock_held: g_u64!(
                 "eviction_coordination.staging_evictions_skipped_lock_held"
             ),
+            eviction_coordination_eviction_lock_held_secs: g_u64!(
+                "eviction_coordination.eviction_lock_held_secs"
+            ),
             // eviction: R12.3's rates
             cache_eviction_shed_bytes_total: g_u64!("cache.eviction_shed_bytes_total"),
             cache_eviction_shed_ranges_total: g_u64!("cache.eviction_shed_ranges_total"),
@@ -969,15 +980,6 @@ impl OtlpExporter {
             // eviction: Tail_Partition, selection side
             cache_tail_coverage_ratio: g_f64!("cache.tail_coverage_ratio"),
             cache_tail_coverage_short_total: g_u64!("cache.tail_coverage_short_total"),
-            cache_eviction_fallback_tail_empty_total: g_u64!(
-                "cache.eviction_fallback_tail_empty_total"
-            ),
-            cache_eviction_fallback_cap_exhausted_total: g_u64!(
-                "cache.eviction_fallback_cap_exhausted_total"
-            ),
-            cache_eviction_fallback_unvisited_total: g_u64!(
-                "cache.eviction_fallback_unvisited_total"
-            ),
             cache_eviction_oversized_single_candidate_total: g_u64!(
                 "cache.eviction_oversized_single_candidate_total"
             ),
@@ -1400,6 +1402,15 @@ impl OtlpExporter {
             // real reading here, unlike the guard's free-space one.
             i.cache_read_fills_declined_max_cache_size_total
                 .record(c.read_fills_declined_max_cache_size_total, a);
+            // The size refusals' eviction demand. Always recorded: zero is a real reading.
+            i.cache_eviction_demand_passes_total
+                .record(c.eviction_demand_passes_total, a);
+            i.cache_eviction_demand_refusals_over_cap_total
+                .record(c.eviction_demand_refusals_over_cap_total, a);
+            i.cache_eviction_demand_dedup_skips_total
+                .record(c.eviction_demand_dedup_skips_total, a);
+            i.cache_eviction_demand_backoff_skips_total
+                .record(c.eviction_demand_backoff_skips_total, a);
             // The unique-hostname prerequisite's detector. Always recorded: zero is the reading
             // an operator needs to see, because it is the one that says the prerequisite holds.
             i.cache_hostname_collisions_total
@@ -1491,6 +1502,8 @@ impl OtlpExporter {
                 .record(wc.pending_lock_timeouts_total, a);
             i.pending_lines_quarantined_total
                 .record(wc.pending_lines_quarantined_total, a);
+            i.removal_debit_merges_total
+                .record(wc.removal_debit_merges_total, a);
             i.staging_figure_unknown_seconds
                 .record(wc.staging_figure_unknown_seconds, a);
             i.staging_figure_unknown_passes_total
@@ -2028,19 +2041,13 @@ impl OtlpExporter {
             // eviction: Tail_Partition, selection side.
             let ts = &c.tail_selection;
             // Skipped when unknown rather than zeroed, and here the distinction is sharper than
-            // elsewhere: zero is a REAL reading of this gauge — a genuinely sub-floor cache has
+            // elsewhere: zero is a REAL reading of this gauge — a cache of small ranges has
             // coverage zero — so a zeroed unknown is indistinguishable from a measured emptiness.
             if let Some(v) = ts.tail_coverage_ratio {
                 i.cache_tail_coverage_ratio.record(v, a);
             }
             i.cache_tail_coverage_short_total
                 .record(ts.tail_coverage_short_total, a);
-            i.cache_eviction_fallback_tail_empty_total
-                .record(ts.eviction_fallback_tail_empty_total, a);
-            i.cache_eviction_fallback_cap_exhausted_total
-                .record(ts.eviction_fallback_cap_exhausted_total, a);
-            i.cache_eviction_fallback_unvisited_total
-                .record(ts.eviction_fallback_unvisited_total, a);
             i.cache_eviction_oversized_single_candidate_total
                 .record(ts.eviction_oversized_single_candidate_total, a);
             i.cache_tail_delta_cap_rewrites_total
@@ -2113,6 +2120,8 @@ impl OtlpExporter {
         if let Some(ec) = &metrics.eviction_coordination {
             i.eviction_coordination_staging_evictions_skipped_lock_held
                 .record(ec.staging_evictions_skipped_lock_held, a);
+            i.eviction_coordination_eviction_lock_held_secs
+                .record(ec.eviction_lock_held_secs, a);
         }
 
         // cache_size: R12.6-R12.8's accounting drift, one series per accounted population.
@@ -3360,6 +3369,10 @@ mod tests {
                 max_cache_size_limit: 8192,
                 consumed_bytes: 4096,
                 read_fills_declined_max_cache_size_total: 0,
+                eviction_demand_passes_total: 0,
+                eviction_demand_refusals_over_cap_total: 0,
+                eviction_demand_dedup_skips_total: 0,
+                eviction_demand_backoff_skips_total: 0,
                 hostname_collisions_total: 0,
                 capacity_guard: crate::capacity_guard::CapacityGuardGauges {
                     declines_total: 2,
@@ -3508,6 +3521,7 @@ mod tests {
                 evictions_coordinated: 2,
                 evictions_skipped_lock_held: 1,
                 staging_evictions_skipped_lock_held: 6,
+                eviction_lock_held_secs: 0,
             }),
             signed_put: None,
             cache_size: Some(CacheSizeMetrics {
@@ -3527,6 +3541,7 @@ mod tests {
                 )),
                 checkpoint_count: 0,
                 delta_log_size: 0,
+                rolling_snapshot_lock_aborts_total: 0,
             }),
             atomic_metadata: Some(Default::default()),
             consolidation: Some(ConsolidationMetrics {

@@ -837,6 +837,16 @@ const UNRECOGNISED_QUERY_BYPASS_REASON: &str = "unrecognised_query";
 const INVALID_PART_NUMBER_BYPASS_REASON: &str = "invalid_part_number";
 /// Highest part number S3 accepts.
 const MAX_PART_NUMBER: u32 = 10_000;
+
+/// The longest a full-object GET or HEAD waiter waits on an in-flight fill, in all, before it
+/// fetches from S3 itself. A waiter's response head waits for the fill to commit, which is
+/// after the fetcher's own client has read the whole object, so one slow client could hold
+/// every concurrent same-key GET for `wait_timeout_secs` x (1 + `max_waiter_resubscriptions`),
+/// 120 s with the defaults, past the AWS SDKs' 60 s read timeout. 30 s is one wait with the
+/// defaults, and leaves the waiter's own fetch the rest: with the default
+/// `upstream_first_byte_timeout` (5 s) and `upstream_idle_retries` (2), its head comes within
+/// 45 s of the request.
+const FULL_OBJECT_WAITER_HEAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The most cache work may delay a DeleteObjects response after S3's answer: one flat
 /// budget for the origin-marker read and the whole batch of invalidations, so a large batch
 /// finishes more keys before the response goes out. Keys not finished by then go to the
@@ -8591,7 +8601,7 @@ impl HttpProxy {
         };
 
         let body_bytes = match s3_response.body {
-            Some(body) => match body.into_bytes().await {
+            Some(body) => match body.into_bytes(s3_client.upstream_idle_timeout()).await {
                 Ok(b) => b,
                 Err(e) => {
                     error!(
@@ -12797,11 +12807,8 @@ impl HttpProxy {
             let disk_cache = range_handler.get_disk_cache_manager().read().await;
 
             // The range spec with file path info, from the document the head came from.
-            let disk_range_spec = reread_extent_spec(
-                Self::listing_of(document.as_ref(), preloaded_metadata.is_some()),
-                cached_range.start,
-                cached_range.end,
-            );
+            let disk_range_spec =
+                reread_extent_spec(document.as_ref(), cached_range.start, cached_range.end);
 
             // Also check journals for pending ranges (shared storage mode)
             let disk_range_spec = match disk_range_spec {
@@ -13491,7 +13498,7 @@ impl HttpProxy {
         head_listing_seam::run(cache_key);
         let disk_cache_manager = range_handler.get_disk_cache_manager().clone();
         let disk_cache = disk_cache_manager.read().await;
-        let metadata = Self::listing_of(document.as_ref(), preloaded_metadata.is_some());
+        let metadata = document.as_ref();
         let mut specs = Vec::with_capacity(plan.len());
         for &(idx, skip, take) in plan {
             let extent = &overlap.cached_ranges[idx];
@@ -13695,11 +13702,7 @@ impl HttpProxy {
         #[cfg(test)]
         head_listing_seam::run(cache_key);
         let disk_cache = range_handler.get_disk_cache_manager().read().await;
-        let from_metadata = reread_extent_spec(
-            Self::listing_of(document.as_ref(), preloaded_metadata.is_some()),
-            extent.start,
-            extent.end,
-        );
+        let from_metadata = reread_extent_spec(document.as_ref(), extent.start, extent.end);
         let disk_range_spec = match from_metadata {
             ExtentSpecReread::Listed(spec) => Some(spec),
             // Marked since the lookup. Refetched through the healing miss path whatever its
@@ -13947,20 +13950,6 @@ impl HttpProxy {
         document
             .map(|d| d.object_metadata.clone())
             .unwrap_or_default()
-    }
-
-    /// A document from [`Self::resolve_cached_document`] as the listing extents are resolved
-    /// against. A write-cached entry past its expiry lists nothing, as
-    /// `DiskCacheManager::get_metadata` reports it; a preloaded document is used as given.
-    fn listing_of(
-        document: Option<&crate::cache_types::NewCacheMetadata>,
-        preloaded: bool,
-    ) -> Option<&crate::cache_types::NewCacheMetadata> {
-        document.filter(|d| {
-            preloaded
-                || !(d.object_metadata.is_write_cached
-                    && d.object_metadata.is_write_cache_expired())
-        })
     }
 
     /// Add cached S3 headers to a response builder.
@@ -14886,18 +14875,20 @@ impl HttpProxy {
                         // at peak; both are now refcount operations.
                         // Requirement: IMA 5.3
                         let fetched_data = match s3_response.body {
-                            Some(body) => match body.into_bytes().await {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    error!("Failed to collect fetched range body: {}", e);
-                                    return Err(Self::build_error_response(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "InternalError",
-                                        "Failed to collect response body",
-                                        None,
-                                    ));
+                            Some(body) => {
+                                match body.into_bytes(s3_client.upstream_idle_timeout()).await {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        error!("Failed to collect fetched range body: {}", e);
+                                        return Err(Self::build_error_response(
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            "InternalError",
+                                            "Failed to collect response body",
+                                            None,
+                                        ));
+                                    }
                                 }
-                            },
+                            }
                             None => Bytes::new(),
                         };
 
@@ -15516,12 +15507,16 @@ impl HttpProxy {
                     .download_coordination
                     .max_waiter_resubscriptions;
                 let mut re_subscribe_count: u32 = 0;
+                let wait_deadline = tokio::time::Instant::now() + FULL_OBJECT_WAITER_HEAD_WAIT;
 
                 // Re-subscription loop: on timeout, check if FetchGuard is still present
-                // and re-subscribe rather than launching a duplicate S3 fetch.
+                // and re-subscribe rather than launching a duplicate S3 fetch, until the
+                // re-subscriptions or FULL_OBJECT_WAITER_HEAD_WAIT run out.
                 // Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
                 loop {
-                    match tokio::time::timeout(wait_timeout, rx.recv()).await {
+                    let this_wait = wait_timeout
+                        .min(wait_deadline.saturating_duration_since(tokio::time::Instant::now()));
+                    match tokio::time::timeout(this_wait, rx.recv()).await {
                         Ok(Ok(Ok(()))) => {
                             // Record wait duration.
                             // Requirement 19.5 (cache-hit metric is recorded
@@ -15630,7 +15625,9 @@ impl HttpProxy {
                             // Requirements: 7.1, 7.2, 7.5
                             re_subscribe_count += 1;
 
-                            if re_subscribe_count > max_resubscriptions {
+                            if re_subscribe_count > max_resubscriptions
+                                || tokio::time::Instant::now() >= wait_deadline
+                            {
                                 // The wait budget is spent and the fill is still running:
                                 // fetch from S3 as an uncoalesced request does. The fetch
                                 // registers no flight and holds no guard, so it neither
@@ -15648,7 +15645,7 @@ impl HttpProxy {
                                     cache_key = %cache_key,
                                     re_subscribe_count = re_subscribe_count,
                                     max_resubscriptions = max_resubscriptions,
-                                    "Download coordination: waiter exceeded max re-subscriptions, fetching from S3 itself"
+                                    "Download coordination: waiter spent its wait on the fill (max re-subscriptions or the 30 s head wait), fetching from S3 itself"
                                 );
 
                                 return Self::forward_get_head_to_s3_and_cache(
@@ -19233,11 +19230,18 @@ impl HttpProxy {
         );
         context.allow_streaming = true; // Stream S3 response directly to client
 
-        // Forward request to S3 with retry on transient failures (Requirement 2.1, 2.3)
-        const MAX_RETRIES: u32 = 2;
-        let mut last_error = None;
-        let mut coordination_guard = coordination_guard;
-
+        // Forward request to S3 (Requirement 2.1, 2.3) in one pass through
+        // `fetch_maybe_hedged`. Unhedged, `S3Client::forward_request`'s ladder retries a
+        // timeout, a failed connect or a lost connection: at most 5 sends and about 150.7 s
+        // (`a_black_holed_origin_ends_a_get_within_the_ladders_bound`). It makes up to 4
+        // sends, each bounded by the 30 s request timeout, with 100, 200 and 400 ms waits
+        // between them, and a lost connection ends the ladder with one replay on a fresh
+        // connection, so after three timeouts a lost connection on the fourth send makes a
+        // fifth. With every address black-holed that is 4 sends and at most 4 x 30 s + 0.7 s;
+        // a connection lost just before the fourth send's deadline adds the replay's 30 s.
+        // Hedged, the race's attempts are the recovery. A retry loop here ran that ladder up
+        // to three times (12 sends).
+        //
         // Hedging: signed range requests forward the client's exact Range header
         // and cannot be split or re-fetched piecemeal like the unsigned
         // complete-cache-miss path (`stream_range_from_s3_with_caching`), but the
@@ -19246,8 +19250,7 @@ impl HttpProxy {
         // any client that signs its Range header (e.g. the AWS CLI/SDK's
         // `GetObject` with `--range`) got zero hedging coverage even when a rule
         // enabled it, silently narrowing Requirement 2.3 to unsigned ranges only.
-        // One client request = one budget, shared across retries below (a retry
-        // is the same logical request, not a fresh hedging opportunity).
+        // One client request = one budget.
         // Spec: hedged-upstream-requests Requirements 1.2, 1.3, 2.1, 2.3, 6.1, 6.5.
         let hedge_budget: Option<AtomicUsize> = if resolved.hedging_enabled && method == Method::GET
         {
@@ -19257,153 +19260,63 @@ impl HttpProxy {
         };
         let max_inflight_fraction = config.connection_pool.hedged_requests.max_inflight_fraction;
 
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                // Brief delay before retry (100ms * attempt)
-                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt as u64)).await;
-                debug!(
-                    "Retrying S3 request: cache_key={}, attempt={}/{}",
+        match hedged_fetch::fetch_maybe_hedged(
+            s3_client.as_ref(),
+            context,
+            &host,
+            hedge_budget.as_ref(),
+            resolved.hedge_trigger_after,
+            max_inflight_fraction,
+            &cache_key,
+        )
+        .await
+        {
+            Ok(s3_response) => {
+                if method != Method::HEAD {
+                    let s3_fetch_ms = perf_s3_start.elapsed().as_millis();
+                    let range_size = range_spec.end - range_spec.start + 1;
+                    debug!(
+                        "PERF cache_miss path={} range={}-{} size={} s3_fetch_ms={} total_ms={} source=s3_signed_range",
+                        uri.path(), range_spec.start, range_spec.end, range_size, s3_fetch_ms, s3_fetch_ms
+                    );
+                }
+                Self::handle_signed_range_s3_response(
+                    s3_response,
                     cache_key,
-                    attempt + 1,
-                    MAX_RETRIES + 1
+                    range_spec,
+                    overlap,
+                    range_handler,
+                    s3_client,
+                    config,
+                    resolved,
+                    coordination_guard,
+                    permit,
+                    fill_witness,
+                )
+                .await
+            }
+            Err(e) => {
+                // Non-retryable: a TlsValidated cert failure surfaces as the 400
+                // (Requirements 4.1-4.3).
+                if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+                    return Ok(Self::proxy_error_to_response(&e));
+                }
+                Self::log_s3_forward_error(
+                    &uri,
+                    &method,
+                    &format_args!("the fetch failed, cache_key={}, error={:?}", cache_key, e),
                 );
-
-                // Rebuild context for retry (connection may have been reset)
-                let mut retry_context = crate::s3_client::build_s3_request_context(
-                    method.clone(),
-                    uri.clone(),
-                    client_headers.clone(),
+                if matches!(e, crate::ProxyError::TimeoutError(_)) {
+                    return Ok(Self::proxy_error_to_response(&e));
+                }
+                Ok(Self::build_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "BadGateway",
+                    "Failed to fetch from S3",
                     None,
-                    host.clone(),
-                );
-                retry_context.allow_streaming = true;
-
-                match hedged_fetch::fetch_maybe_hedged(
-                    s3_client.as_ref(),
-                    retry_context,
-                    &host,
-                    hedge_budget.as_ref(),
-                    resolved.hedge_trigger_after,
-                    max_inflight_fraction,
-                    &cache_key,
-                )
-                .await
-                {
-                    Ok(s3_response) => {
-                        if method != Method::HEAD {
-                            let s3_fetch_ms = perf_s3_start.elapsed().as_millis();
-                            let range_size = range_spec.end - range_spec.start + 1;
-                            debug!(
-                                "PERF cache_miss path={} range={}-{} size={} s3_fetch_ms={} total_ms={} source=s3_signed_range",
-                                uri.path(), range_spec.start, range_spec.end, range_size, s3_fetch_ms, s3_fetch_ms
-                            );
-                        }
-                        return Self::handle_signed_range_s3_response(
-                            s3_response,
-                            cache_key,
-                            range_spec,
-                            overlap,
-                            range_handler,
-                            s3_client,
-                            config,
-                            resolved,
-                            coordination_guard.take(),
-                            permit.clone(),
-                            fill_witness.clone(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        // Non-retryable: a TlsValidated cert failure cannot succeed
-                        // on retry, so surface the 400 immediately without further
-                        // attempts (Requirements 4.1-4.3).
-                        if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
-                            return Ok(Self::proxy_error_to_response(&e));
-                        }
-                        warn!(
-                            "S3 request retry {} failed: cache_key={}, error={}",
-                            attempt + 1,
-                            cache_key,
-                            e
-                        );
-                        last_error = Some(e);
-                    }
-                }
-            } else {
-                // First attempt
-                match hedged_fetch::fetch_maybe_hedged(
-                    s3_client.as_ref(),
-                    context.clone(),
-                    &host,
-                    hedge_budget.as_ref(),
-                    resolved.hedge_trigger_after,
-                    max_inflight_fraction,
-                    &cache_key,
-                )
-                .await
-                {
-                    Ok(s3_response) => {
-                        if method != Method::HEAD {
-                            let s3_fetch_ms = perf_s3_start.elapsed().as_millis();
-                            let range_size = range_spec.end - range_spec.start + 1;
-                            debug!(
-                                "PERF cache_miss path={} range={}-{} size={} s3_fetch_ms={} total_ms={} source=s3_signed_range",
-                                uri.path(), range_spec.start, range_spec.end, range_size, s3_fetch_ms, s3_fetch_ms
-                            );
-                        }
-                        return Self::handle_signed_range_s3_response(
-                            s3_response,
-                            cache_key,
-                            range_spec,
-                            overlap,
-                            range_handler,
-                            s3_client,
-                            config,
-                            resolved,
-                            coordination_guard.take(),
-                            permit.clone(),
-                            fill_witness.clone(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        // Non-retryable: a TlsValidated cert failure cannot succeed
-                        // on retry, so surface the 400 immediately without retrying
-                        // (Requirements 4.1-4.3).
-                        if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
-                            return Ok(Self::proxy_error_to_response(&e));
-                        }
-                        debug!(
-                            "S3 request failed (will retry): cache_key={}, error={}",
-                            cache_key, e
-                        );
-                        last_error = Some(e);
-                    }
-                }
+                ))
             }
         }
-
-        // All retries exhausted. (A TlsValidated cert failure is handled inside the
-        // loop as non-retryable — Requirements 4.1-4.3 — so it never reaches here.)
-        Self::log_s3_forward_error(
-            &uri,
-            &method,
-            &format_args!(
-                "all {} attempts failed, cache_key={}, last_error={:?}",
-                MAX_RETRIES + 1,
-                cache_key,
-                last_error
-            ),
-        );
-        if let Some(e @ crate::ProxyError::TimeoutError(_)) = &last_error {
-            return Ok(Self::proxy_error_to_response(e));
-        }
-        Ok(Self::build_error_response(
-            StatusCode::BAD_GATEWAY,
-            "BadGateway",
-            "Failed to fetch from S3",
-            None,
-        ))
     }
 
     /// Handle S3 response for signed range request (extracted for retry logic)
@@ -21819,7 +21732,13 @@ impl HttpProxy {
     ///   system-roots TLS connector (`build_tls_config_for_host`). When the host has
     ///   no distributor yet (fresh process, first signed write before any GET), the
     ///   endpoint is registered on demand and, failing that, resolved directly —
-    ///   rather than failing the request.
+    ///   rather than failing the request. With `ip_distribution_enabled: false` no
+    ///   distributor is seeded, because nothing would refresh it or re-admit an
+    ///   address excluded from it. A write then uses a distributor only when one
+    ///   exists already (an exact `endpoint_overrides` host, seeded at startup), and
+    ///   records its per-address health into that one; otherwise it resolves the
+    ///   host, dials the first address and records no health, as the GET connector
+    ///   does.
     ///
     /// Returns `None` only when the host cannot be resolved at all (the caller maps
     /// this to a 502 "Failed to resolve S3 endpoint").
@@ -21886,11 +21805,18 @@ impl HttpProxy {
             None => {
                 // Secure_Default_Behaviour: distributed IP + verified TLS on 443.
                 let pool = s3_client.get_connection_pool();
+                // With IP distribution off, DNS refresh and the recovery probe never
+                // run, so a distributor seeded here would keep its first lookup for the
+                // life of the process and never re-admit an address it excluded. So
+                // with the flag off: seed none. A distributor that exists anyway (an
+                // exact `endpoint_overrides` host, seeded at startup) still gets the
+                // write's health, or a dead address in it would keep taking writes.
+                let distributed = s3_client.ip_distribution_enabled();
                 let mut connect_ip = {
                     let pm = pool.read().await;
                     pm.get_distributed_ip(host)
                 };
-                if connect_ip.is_none() {
+                if connect_ip.is_none() && distributed {
                     // Cold start: no distributor for this host yet. Nothing on the
                     // signed-write path seeds one — the GET path only does so as a
                     // side effect of its own `None` fallback in
@@ -21904,12 +21830,14 @@ impl HttpProxy {
                     connect_ip = pm.get_distributed_ip(host);
                 }
 
+                let from_distributor = connect_ip.is_some();
                 let ip = match connect_ip {
                     Some(ip) => ip,
                     None => {
-                        // No IP to distribute: the `max_registered_endpoints` cap was
-                        // reached, DNS failed, or every IP of the host's distributor
-                        // is under a health exclusion. Resolve directly — override-
+                        // No IP to distribute: IP distribution is off, the
+                        // `max_registered_endpoints` cap was reached, DNS failed, or
+                        // every IP of the host's distributor is under a health
+                        // exclusion. Resolve directly — override-
                         // first, then DNS — as both the override arm above and
                         // `CustomHttpsConnector` do. For an overridden host that is
                         // the entry's first listed IP, not a public S3 address.
@@ -21926,13 +21854,14 @@ impl HttpProxy {
                 Some(Arc::new(UpstreamTransport {
                     timeouts: s3_client.upstream_timeouts(),
                     response_ledger: Some(s3_client.get_inflight_ledger()),
-                    health: s3_client.ip_health_tracker().map(|tracker| {
-                        crate::signed_request_proxy::UpstreamHealth {
+                    health: (distributed || from_distributor)
+                        .then(|| s3_client.ip_health_tracker())
+                        .flatten()
+                        .map(|tracker| crate::signed_request_proxy::UpstreamHealth {
                             tracker,
                             pool: Arc::clone(&pool),
                             host: host.to_string(),
-                        }
-                    }),
+                        }),
                     ..UpstreamTransport::verified_tls_443(ip, tls)
                 }))
             }
@@ -22420,6 +22349,135 @@ mod tests {
         );
     }
 
+    /// With IP distribution off a signed write seeds no distributor, so an address
+    /// that failed is dialled again once it recovers. Three failed connects remove an
+    /// address from a seeded distributor (`UpstreamHealth::record`), and with the flag
+    /// off nothing re-admitted it, so every later write went to the other addresses.
+    /// The removal below acts only on a distributor the first write seeded.
+    #[tokio::test]
+    async fn with_ip_distribution_off_an_excluded_address_is_dialled_again() {
+        let host = "flag-off.example.test";
+        let (first, second): (std::net::IpAddr, std::net::IpAddr) =
+            ("192.0.2.10".parse().unwrap(), "192.0.2.11".parse().unwrap());
+        let config = crate::config::ConnectionPoolConfig {
+            ip_distribution_enabled: false,
+            ..Default::default()
+        };
+        let client =
+            Arc::new(crate::s3_client::S3Client::new(&config, None).expect("client builds"));
+        let pool = client.get_connection_pool();
+        pool.read()
+            .await
+            .seed_dns_answer_for_test(host, vec![first, second]);
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> = client;
+        HttpProxy::resolve_signed_upstream_transport(host, 443, &s3_client)
+            .await
+            .expect("the name resolves");
+        // What the threshold's third failed connect to `first` does.
+        if let Some(dist) = pool.write().await.get_distributor_mut(host) {
+            dist.remove_ip(first, "fixture: consecutive failures");
+        }
+        // `first` has recovered; the next write must be able to reach it.
+        let transport = HttpProxy::resolve_signed_upstream_transport(host, 443, &s3_client)
+            .await
+            .expect("the name resolves");
+        assert_eq!(
+            transport.ip, first,
+            "AN ADDRESS EXCLUDED WITH IP DISTRIBUTION OFF WAS NOT DIALLED AGAIN: the write went to {} (distributor seeded: {})",
+            transport.ip,
+            pool.read().await.get_distributed_ip(host).is_some()
+        );
+        assert!(
+            pool.read().await.get_distributed_ip(host).is_none(),
+            "with IP distribution off a signed write must seed no distributor"
+        );
+        assert!(
+            transport.health.is_none(),
+            "with nothing to exclude an address from, a write records no per-address health"
+        );
+    }
+    /// With IP distribution off a signed write to an exact `endpoint_overrides` host
+    /// still takes turns across the override's addresses from the distributor seeded at
+    /// startup, and records its health into it.
+    #[tokio::test]
+    async fn with_ip_distribution_off_an_override_host_keeps_its_rotation() {
+        let host = "bucket.vpce.example.test";
+        let ips = ["198.51.100.1", "198.51.100.2"];
+        let mut config = crate::config::ConnectionPoolConfig {
+            ip_distribution_enabled: false,
+            ..Default::default()
+        };
+        config.endpoint_overrides.insert(
+            host.to_string(),
+            ips.iter().map(|s| s.to_string()).collect(),
+        );
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> =
+            Arc::new(crate::s3_client::S3Client::new(&config, None).expect("client builds"));
+        let mut dialled = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let transport = HttpProxy::resolve_signed_upstream_transport(host, 443, &s3_client)
+                .await
+                .expect("the override resolves");
+            assert!(
+                transport.health.is_some(),
+                "an override host's distributor must get the write's health"
+            );
+            dialled.insert(transport.ip);
+        }
+        assert_eq!(
+            dialled.len(),
+            2,
+            "AN OVERRIDE HOST'S SIGNED WRITES STOPPED TAKING TURNS WITH IP DISTRIBUTION OFF: dialled {dialled:?}"
+        );
+    }
+    /// With IP distribution off, an exact `endpoint_overrides` address whose connects fail
+    /// is excluded from the startup distributor, so later writes stop dialling it.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `health` left `None` for a flag-off write (the 3.0.6 build before this fix) no
+    /// failure is recorded, and the dead address keeps taking its turn.
+    #[tokio::test]
+    async fn with_ip_distribution_off_a_dead_override_address_stops_taking_writes() {
+        let host = "bucket.dead-address.example.test";
+        let (dead, live): (std::net::IpAddr, std::net::IpAddr) = (
+            "198.51.100.1".parse().unwrap(),
+            "198.51.100.2".parse().unwrap(),
+        );
+        let mut config = crate::config::ConnectionPoolConfig {
+            ip_distribution_enabled: false,
+            ..Default::default()
+        };
+        config
+            .endpoint_overrides
+            .insert(host.to_string(), vec![dead.to_string(), live.to_string()]);
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> =
+            Arc::new(crate::s3_client::S3Client::new(&config, None).expect("client builds"));
+        // Each write that dials the dead address records a failed connect, as the signed
+        // forward does, up to the failure threshold.
+        for _ in 0..16 {
+            let transport = HttpProxy::resolve_signed_upstream_transport(host, 443, &s3_client)
+                .await
+                .expect("the override resolves");
+            if transport.ip == dead {
+                if let Some(health) = &transport.health {
+                    health.record(dead, false);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut later = Vec::new();
+        for _ in 0..6 {
+            let transport = HttpProxy::resolve_signed_upstream_transport(host, 443, &s3_client)
+                .await
+                .expect("the override resolves");
+            later.push(transport.ip);
+        }
+        assert!(
+            !later.contains(&dead),
+            "A DEAD OVERRIDE ADDRESS KEPT TAKING WRITES WITH IP DISTRIBUTION OFF: later writes dialled {later:?}"
+        );
+    }
     /// The transport the signed-write path would dial for `host`, with the seam
     /// answering `[127.0.0.1, 192.0.2.10]`.
     async fn signed_write_transport_ip(

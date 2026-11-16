@@ -20,7 +20,7 @@ What always holds:
 
 | Situation | What a client can receive | For how long | Mitigation | Details |
 |---|---|---|---|---|
-| The object is overwritten or deleted without passing through a proxy that shares this cache volume: a client writing to S3 directly, S3 Lifecycle, replication, or a proxy with its own cache volume | The older object, or one S3 has deleted. Reading an uncached range of that object does not refresh the cache: the client gets S3's current bytes, and the cached ranges keep serving the older object. A ranged download without `If-Match` can therefore combine both versions. A lone `If-Match` naming the old ETag gets the old object where S3 would answer `412`. A download sized from a cached HEAD can be planned against the older `Content-Length` | GET: until `get_ttl` has passed since the entry was cached or last confirmed by S3 (default `1d`). HEAD: until `head_ttl` has passed (default `60s`). The next read after that revalidates by ETag. A client that sends a HEAD before its GET, as `aws s3 cp` does, is covered by `head_ttl`. The first HEAD after it passes revalidates with S3, and a changed ETag or length removes the cached ranges, so the following GET fetches the new object ([Scenario 3d](#scenario-3d-head-detects-object-change-range-invalidation)). A client that sends no HEAD gets no such check | Send writes through the proxy. Lower `get_ttl` and `head_ttl` for the prefix in `cache_rules.json`; `"0s"` revalidates every read. A lowered TTL reaches entries already cached, as [Settings are re-evaluated on each read](CACHING.md#settings-are-re-evaluated-on-each-read) describes | [GET TTL](#get-ttl-get_ttl), [HEAD TTL](#head-ttl-head_ttl) |
+| The object is overwritten or deleted without passing through a proxy that shares this cache volume: a client writing to S3 directly, S3 Lifecycle, replication, or a proxy with its own cache volume | The older object, or one S3 has deleted. Reading an uncached range of that object removes the cached copy once S3 returns a different ETag, so later reads get S3's current object. A ranged download without `If-Match` can still combine both versions, from ranges it read before that. A lone `If-Match` naming the old ETag gets the old object where S3 would answer `412`. A download sized from a cached HEAD can be planned against the older `Content-Length` | GET: until `get_ttl` has passed since the entry was cached or last confirmed by S3 (default `1d`). HEAD: until `head_ttl` has passed (default `60s`). The next read after that revalidates by ETag. A client that sends a HEAD before its GET, as `aws s3 cp` does, is covered by `head_ttl`. The first HEAD after it passes revalidates with S3, and a changed ETag or length removes the cached ranges, so the following GET fetches the new object ([Scenario 3d](#scenario-3d-head-detects-object-change-range-invalidation)). A client that sends no HEAD gets no such check | Send writes through the proxy. Lower `get_ttl` and `head_ttl` for the prefix in `cache_rules.json`; `"0s"` revalidates every read. A lowered TTL reaches entries already cached, as [Settings are re-evaluated on each read](CACHING.md#settings-are-re-evaluated-on-each-read) describes | [GET TTL](#get-ttl-get_ttl), [HEAD TTL](#head-ttl-head_ttl) |
 | A caller loses access after the object was cached: an IAM or bucket policy change, revoked credentials, or a request carrying a non-matching `x-amz-expected-bucket-owner` | The cached object, where S3 would answer `403` | As the row above: `get_ttl` for GET, `head_ttl` for HEAD | For the prefix, set `get_ttl: "0s"` and `head_ttl: "0s"`, so every read reaches S3, including a `?partNumber=` GET, a HEAD that carries a `Range` header, and a request whose only conditional header is `If-Match` or `If-Range`. Restrict network access to the proxy. The proxy refuses an expired presigned URL whatever the cache holds | [Shared cache access model](ARCHITECTURE.md#shared-cache-access-model), [Zero TTL revalidation](CACHING.md#zero-ttl-revalidation), [Request validation limitations](ARCHITECTURE.md#request-validation-limitations) |
 | An object is written through one hostname and read through another: an access point or Multi-Region Access Point and the bucket's own hostname, or two access points | The older object, or a deleted one | As the first row: `get_ttl` for GET, `head_ttl` for HEAD, including the HEAD-before-GET check | Write and read each object through the same hostname, or give the access point's key prefix a short or `"0s"` TTL | [Access points and Multi-Region Access Points](CACHING.md#access-points-and-multi-region-access-points) |
 | Another proxy sharing the cache volume acknowledges an overwrite or delete while this proxy holds the object in RAM | The older object, or a deleted one, from this proxy | A RAM range hit: up to `cache.ram_cache_verification_interval` (default `1s`). An answer from the RAM metadata cache, such as a HEAD: up to `cache.metadata_cache.refresh_interval` (default `5s`). A key with `page_widening: true`: a widened read re-checks a page held in this proxy's RAM against the shared metadata after `cache.ram_cache_verification_interval`, like a RAM range hit | Read after write through the proxy that took the write. Lower both intervals on every proxy, since each bounds only its own RAM. For keys where even one second of RAM staleness matters, set `ram_cache_eligible: false` | [RAM cache coherency](#ram-tier-coherency-contract), [Write-through ordering](CACHING.md#write-through-ordering) |
@@ -57,15 +57,10 @@ cache:
   (10 years), globally or for a prefix in `cache_rules.json`.
 - Freshness is judged at each access against the currently resolved `get_ttl`.
 
-When `get_ttl` passes, what happens depends on the expiration mode:
-
-- **Lazy expiration** (`actively_remove_cached_data: false`, the default): expired entries stay on
-  disk until they are read or evicted, and the next request revalidates with S3 as described
-  below. This suits fixed-capacity deployments, where eviction manages space.
-- **Active expiration** (`actively_remove_cached_data: true`): the daily validation scan removes
-  expired entries. This suits storage that bills by usage. It does not work with a zero TTL: a
-  zero-TTL entry is expired as soon as it is cached, so active expiration removes the data that
-  revalidation works from.
+When `get_ttl` passes, the entry stays on disk until it is read or evicted, and the next request
+revalidates with S3 as described below. The daily validation scan deletes no expired read-cache
+entry, with either value of `actively_remove_cached_data`, so eviction manages space. Keep the
+default `false`.
 
 **Revalidation.** When a request reads an expired entry under lazy expiration, the proxy sends S3
 a conditional request:
@@ -114,10 +109,9 @@ entries still marked write-cached with the field unknown, not to entries cached 
 fetching it again. An unchanged object then costs one conditional round trip and no body transfer,
 however large it is. Two limits apply:
 
-- **The entry is available only while its files exist.** Active expiration and capacity eviction
-  both delete expired entries on their own schedules. Once either has, the next request is an
-  ordinary miss that transfers the body, so the saving depends on lazy expiration and spare
-  capacity.
+- **The entry is available only while its files exist.** Capacity eviction deletes expired entries
+  when the cache nears `max_cache_size`. Once it has, the next request is an ordinary miss that
+  transfers the body, so the saving depends on spare capacity.
 - **Incomplete coverage is still a miss.** If the metadata lists a range the proxy cannot read
   (the `.bin` file is gone, or the cached extents do not cover the whole request), the proxy
   fetches instead of serving bytes it cannot prove it has. A `304` proves the version is current;
@@ -310,7 +304,7 @@ No minimum is enforced. `get_ttl` and `head_ttl` accept any valid duration, incl
 cache:
   get_ttl: "0s"
   head_ttl: "0s"
-  actively_remove_cached_data: false  # Required with a zero TTL
+  actively_remove_cached_data: false  # Lazy expiration (default)
 ```
 
 - The cache still stores the data, so range merging and bandwidth savings still work.
@@ -334,9 +328,8 @@ ETag is revalidated, so an unchanged object is served from cache after a bodyles
 If S3 must evaluate IAM on every read, and not only check freshness, both settings are needed: a
 request answered from cache is a request S3 never authorizes.
 
-**Lazy expiration is required.** A zero TTL needs `actively_remove_cached_data: false`. Active
-expiration deletes expired entries, and a zero-TTL entry is expired as soon as it is cached, so
-active expiration removes the data that revalidation works from.
+**Keep lazy expiration.** With a zero TTL, an expired entry stays on disk for revalidation under
+either value of `actively_remove_cached_data`; leave it at the default `false`.
 
 [Shared cache access model](ARCHITECTURE.md#shared-cache-access-model) covers the security side of
 a zero TTL and when to use one.
@@ -351,8 +344,8 @@ cache:
 ```
 
 - An object cached by a PUT starts with `put_ttl`.
-- `put_ttl` is shorter than `get_ttl` because an uploaded object may never be read, and an unread
-  object only takes space.
+- After `put_ttl`, an object still unread stays cached, and its next GET revalidates it with S3
+  before serving it, as for a read-cached object past `get_ttl`.
 - A GET within `put_ttl` moves the entry to `get_ttl`, with a metadata-only update and no data
   copy.
 - A write-cached object is stored in the range format, so it serves range requests at once.
@@ -363,8 +356,8 @@ For example:
 2. The client GETs it 30 minutes later. The GET is served from cache, and the entry moves to
    `get_ttl` (1 day by default).
 3. A later range request is served from cache with no S3 fetch.
-4. An object not read within the hour expires, and the daily validation scan removes it in either
-   expiration mode (see [Lazy vs periodic cleanup](#lazy-vs-periodic-cleanup)).
+4. An object not read within the hour stays cached, and its next GET revalidates it with S3 (see
+   [Lazy vs periodic cleanup](#lazy-vs-periodic-cleanup)).
 
 ### Cache expiration modes (`actively_remove_cached_data`)
 
@@ -382,9 +375,9 @@ For fixed-capacity deployments, where eviction manages the cache size:
 - Expired read-cache entries stay on disk until they are read or evicted.
 - A GET of an entry past `get_ttl` revalidates with S3 (see
   [Scenario 3c](#scenario-3c-ttl-expired-cache-entry-revalidation)).
-- Background passes still remove three kinds of entry that no TTL decision can revive: write-cached
-  entries whose `put_ttl` passed unread, HEAD-only entries (no cached ranges) whose HEAD expiry
-  passed more than a day ago, and abandoned multipart uploads (see
+- Background passes still remove two kinds of entry that no TTL decision can revive. They are
+  HEAD-only entries (no cached ranges) whose HEAD expiry passed more than a day ago, and abandoned
+  multipart uploads (see
   [Lazy vs periodic cleanup](#lazy-vs-periodic-cleanup)).
 - No background pass spends I/O removing expired read-cache entries, and an expired entry stays
   available for a bodyless `304` revalidation.
@@ -394,10 +387,9 @@ claim, or a single proxy with dedicated cache storage.
 
 #### Active expiration (`true`)
 
-For storage that bills by usage, such as an elastic NFS file system. The daily validation scan
-removes expired entries, so their space is freed at the first scan after `get_ttl` passes instead
-of when eviction needs it, which lowers the bill on usage-billed storage. The scan's deletions add
-I/O, and they remove data that a read soon afterwards could have revalidated with a bodyless `304`.
+The daily validation scan deletes no expired read-cache entry with this value either, so eviction
+frees the space. For storage that bills by usage, such as an elastic NFS file system, set
+`max_cache_size` to the amount you want to keep.
 
 #### HEAD metadata expiration
 
@@ -507,8 +499,7 @@ Client GET → proxy checks the cache → get_ttl expired
 
 All parts and ranges of the object expire together.
 [Scenario 3c](#scenario-3c-ttl-expired-cache-entry-revalidation) gives the full flow, including the
-`403` case and byte-range requests. Under active expiration the entry may already have been
-removed, and the GET is then an ordinary miss.
+`403` case and byte-range requests. If eviction has removed the entry, the GET is an ordinary miss.
 
 #### Scenario 3: Client conditional headers forwarded to S3
 
@@ -1004,10 +995,9 @@ Nothing is deleted.
 
 **Periodic** removal happens in two background passes, in either expiration mode:
 
-- **The daily validation scan** (once a day, around midnight local time) deletes write-cached
-  entries whose `put_ttl` passed unread. With `actively_remove_cached_data: true`, it also deletes
-  read-cache entries whose `get_ttl` has passed. It also deletes `.meta` files that hold no cached
-  ranges and whose HEAD expiry passed more than a day ago.
+- **The daily validation scan** (once a day, around midnight local time) deletes `.meta` files
+  that hold no cached ranges and whose HEAD expiry passed more than a day ago. It deletes no
+  read-cache entry for `get_ttl`, with either value of `actively_remove_cached_data`.
 - **The incomplete-upload sweep** (at startup, then every `min(incomplete_upload_ttl / 4, 1h)`)
   removes multipart uploads idle for longer than `incomplete_upload_ttl`. See
   [What reaps abandoned staging](MULTIPART_UPLOAD.md#what-reaps-abandoned-staging).

@@ -258,8 +258,8 @@ async fn an_etag_mismatch_invalidation_leaves_only_the_new_versions_ranges() {
     assert_eq!(metadata.ranges.len(), 1, "Should have 1 range");
     assert_eq!(metadata.object_metadata.etag, "test-etag");
 
-    // The origin's object changed. A fill of the new version over the published `.meta` is
-    // dropped, so it never replaces the cached version in place.
+    // The origin's object changed. A fill of the new version over the published `.meta`
+    // removes the cached version and is not published itself.
     let different_metadata = ObjectMetadata::new(
         "different-etag".to_string(),
         "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
@@ -280,30 +280,15 @@ async fn an_etag_mismatch_invalidation_leaves_only_the_new_versions_ranges() {
         )
         .await
         .unwrap();
-    let metadata = cache_manager
-        .get_metadata(cache_key)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        metadata.object_metadata.etag, "test-etag",
-        "a fill of another version must not change the cached version's ETag"
-    );
-    assert_eq!(
-        metadata.ranges.len(),
-        1,
-        "a fill of another version must not be listed beside the cached one"
-    );
-    // What the revalidation that sees the new version does: it removes the old version's
-    // ranges and its `.meta`, after which the new version's fill publishes.
-    let removal = cache_manager
-        .batch_delete_ranges_expecting(cache_key, &[(0, 1023)], None)
-        .await
-        .unwrap();
     assert!(
-        removal.meta_unlinked,
-        "the invalidation must take the old version's .meta"
+        cache_manager
+            .get_metadata(cache_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "a fill of another version must remove the cached version's .meta"
     );
+    // The next fill of the new version publishes.
     cache_manager
         .store_range(cache_key, 1024, 2047, &data2, different_metadata, ttl, true)
         .await

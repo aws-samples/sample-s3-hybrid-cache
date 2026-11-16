@@ -2388,17 +2388,25 @@ async fn run_leader_waiter_version_change(shape: WaiterShape, primed: bool, name
         .expect("consolidation cycle");
     let settled = fx.cache_contents().await;
     let held = one_version_held(&settled, &versions, "settled read");
-    // After the fold the cache holds the one version the two fills leave: the waiter's, when
-    // nothing was cached before; the cached one, which a fill of another version does not
-    // replace. An empty cache is neither.
-    let expected = if primed { OLD_VERSION } else { NEW_VERSION };
-    assert_eq!(
-        held.map(|version| version.etag),
-        Some(expected.etag),
-        "after the fold the cache must hold {}, but it holds {}",
-        expected.etag,
-        held.map_or("nothing", |version| version.etag)
-    );
+    // After the fold, with nothing cached before: the waiter's version. With the old version
+    // cached, the waiter's fill reads the new version and removes it, so the cache holds the
+    // new version or nothing, never the old one.
+    if primed {
+        assert!(
+            held.is_none_or(|version| version.etag == NEW_VERSION.etag),
+            "after the fold the cache must hold {} or nothing, but it holds {}",
+            NEW_VERSION.etag,
+            held.map_or("nothing", |version| version.etag)
+        );
+    } else {
+        assert_eq!(
+            held.map(|version| version.etag),
+            Some(NEW_VERSION.etag),
+            "after the fold the cache must hold {}, but it holds {}",
+            NEW_VERSION.etag,
+            held.map_or("nothing", |version| version.etag)
+        );
+    }
 }
 
 #[tokio::test]

@@ -2377,7 +2377,9 @@ impl RangeHandler {
                                     // previously did `body_bytes.to_vec()`, holding the
                                     // fetched range twice for the rest of the scope.
                                     // Requirement: IMA 5.2
-                                    let body_bytes = body.into_bytes().await?;
+                                    let body_bytes = body
+                                        .into_bytes(s3_client.upstream_idle_timeout())
+                                        .await?;
                                     let response_headers = s3_response.headers.clone();
                                     debug!(
                                         "Successfully fetched range from S3: cache_key={}, range={}-{}, size={} bytes, duration={:.2}ms",
@@ -2851,7 +2853,7 @@ impl RangeHandler {
                         // previously did `.to_vec()` and then `body_vec.clone()` into
                         // `data`, so a fallback fetch held the range three times at
                         // peak. Requirement: IMA 5.2
-                        let body_bytes = body.into_bytes().await?;
+                        let body_bytes = body.into_bytes(s3_client.upstream_idle_timeout()).await?;
                         let body_len = body_bytes.len() as u64;
                         let expected_size = requested_range.end - requested_range.start + 1;
 

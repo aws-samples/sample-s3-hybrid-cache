@@ -1082,6 +1082,8 @@ pub(crate) struct RepairPassSummary {
     pub metas_examined: u64,
     /// L2 directories enumerated across the pass.
     pub dirs_read: u64,
+    /// The pass listed the shard population and found it empty, so there was nothing to sweep.
+    pub population_empty: bool,
 }
 
 /// The outcome of one pass.
@@ -1101,6 +1103,13 @@ impl RepairOutcome {
             Self::Swept(s) => !s.completed.is_empty() || !s.advanced.is_empty(),
             Self::Refused(..) => false,
         }
+    }
+    /// Whether this pass listed the whole shard population and found it empty. That is as
+    /// complete an observation as a sweep, so the cadence gate takes it as it takes progress, and
+    /// an empty metadata tree is looked at once per interval instead of every cycle. A refusal
+    /// because peers hold every shard is not this.
+    pub(crate) fn observed_empty_population(&self) -> bool {
+        matches!(self, Self::Refused(RepairRefusal::NoShardAvailable, s) if s.population_empty)
     }
 }
 
@@ -1293,7 +1302,13 @@ pub(crate) async fn run_ledger_repair_sampled(
         None => return refuse(RepairRefusal::ShardPopulationUnreadable, summary),
     };
     if population.is_empty() {
-        return refuse(RepairRefusal::NoShardAvailable, summary);
+        return refuse(
+            RepairRefusal::NoShardAvailable,
+            RepairPassSummary {
+                population_empty: true,
+                ..summary
+            },
+        );
     }
 
     let previous = read_repair_checkpoints(cache_dir);

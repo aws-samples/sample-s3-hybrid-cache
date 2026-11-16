@@ -158,15 +158,15 @@ async fn the_quoting_difference_is_symmetric() {
 }
 
 /// The pair that stops the fix being a widening: a different opaque value still invalidates.
+/// The fill of the other version removes the cached one and is not published itself.
 #[tokio::test]
 async fn a_different_opaque_etag_still_invalidates() {
     let surviving = ranges_after_second_store(STORED_BARE, DIFFERENT_OPAQUE).await;
     assert_eq!(
-        surviving, 1,
+        surviving, 0,
         "`{DIFFERENT_OPAQUE}` is a DIFFERENT object from `{STORED_BARE}`, so the existing range \
-         must be invalidated and only the newly stored one remain. {surviving} ranges means the \
-         comparison stopped detecting real changes, which is a worse defect than the one being \
-         fixed"
+         must be removed and the other version's fill not published. {surviving} range(s) \
+         means the comparison stopped detecting real changes"
     );
 }
 
@@ -176,8 +176,8 @@ async fn a_different_opaque_etag_still_invalidates() {
 async fn a_different_part_count_still_invalidates() {
     let surviving = ranges_after_second_store(STORED_BARE, DIFFERENT_PARTS).await;
     assert_eq!(
-        surviving, 1,
+        surviving, 0,
         "`{DIFFERENT_PARTS}` differs from `{STORED_BARE}` only in the part count, and that is a \
-         different object: {surviving} ranges means the suffix is being ignored"
+         different object: {surviving} range(s) means the suffix is being ignored"
     );
 }

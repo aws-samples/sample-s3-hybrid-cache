@@ -87,7 +87,9 @@ async fn test_calculate_disk_cache_size_with_new_architecture() {
     // With accumulator-based size tracking, we need to add the size via the accumulator
     // and run a consolidation cycle to update size_state.json
     if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
-        consolidator.size_accumulator().add(8388608);
+        consolidator
+            .size_accumulator()
+            .add_range("fixture-credit-1", 0, 8388607, 8388608);
         let _ = consolidator.run_consolidation_cycle().await;
     }
 

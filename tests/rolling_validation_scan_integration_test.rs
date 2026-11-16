@@ -20,6 +20,29 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
+/// Write `size_state.json` as a fixture and read it back, so the consolidator's memo holds it.
+/// These tests seeded through the absolute validation install, which no longer exists.
+async fn seed_size_state(
+    consolidator: &JournalConsolidator,
+    cache_dir: &std::path::Path,
+    total_size: u64,
+    write_cache_size: u64,
+    cached_objects: u64,
+) {
+    let state = s3_proxy::journal_consolidator::SizeState {
+        total_size,
+        write_cache_size,
+        cached_objects,
+        ..Default::default()
+    };
+    std::fs::write(
+        cache_dir.join("size_tracking").join("size_state.json"),
+        serde_json::to_string(&state).unwrap(),
+    )
+    .unwrap();
+    consolidator.load_size_state().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -243,14 +266,7 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
 
     let consolidator = create_test_consolidator(cache_dir.clone()).await;
     // Set initial tracked size so proportional correction has something to work with
-    consolidator
-        .update_size_from_validation_with_kind(
-            4000,
-            None,
-            Some(4),
-            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
-        )
-        .await;
+    seed_size_state(&consolidator, &cache_dir, 4000, 0, 4).await;
 
     let max_duration = Duration::from_secs(60); // 1 minute budget
     let tracker = create_test_tracker(cache_dir.clone(), consolidator.clone(), max_duration).await;
@@ -313,14 +329,14 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
     );
 
     // Update size state
-    consolidator
-        .update_size_from_validation_with_kind(
-            corrected_size,
-            None,
-            Some(corrected_objects),
-            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
-        )
-        .await;
+    seed_size_state(
+        &consolidator,
+        &cache_dir,
+        corrected_size,
+        0,
+        corrected_objects,
+    )
+    .await;
 
     // Advance cursor and persist
     let new_cursor = ((rolling_state.cursor as usize + dirs_scanned) % 256) as u8;
@@ -390,14 +406,7 @@ async fn test_rolling_scan_cursor_continuity() {
     );
 
     let consolidator = create_test_consolidator(cache_dir.clone()).await;
-    consolidator
-        .update_size_from_validation_with_kind(
-            4000,
-            None,
-            Some(8),
-            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
-        )
-        .await;
+    seed_size_state(&consolidator, &cache_dir, 4000, 0, 8).await;
 
     let max_duration = Duration::from_secs(60);
     let tracker = create_test_tracker(cache_dir.clone(), consolidator.clone(), max_duration).await;
@@ -609,14 +618,7 @@ async fn test_mode_transition_full_to_rolling_and_back() {
     populate_l1_dirs(&cache_dir, "test-bucket", &[0, 1, 2, 3], 500);
 
     let consolidator = create_test_consolidator(cache_dir.clone()).await;
-    consolidator
-        .update_size_from_validation_with_kind(
-            2000,
-            None,
-            Some(4),
-            s3_proxy::cache_size_tracker::ValidationSampleKind::RollingExtrapolation,
-        )
-        .await;
+    seed_size_state(&consolidator, &cache_dir, 2000, 0, 4).await;
 
     let max_duration = Duration::from_secs(3600); // 1 hour budget
     let tracker = create_test_tracker(cache_dir.clone(), consolidator.clone(), max_duration).await;

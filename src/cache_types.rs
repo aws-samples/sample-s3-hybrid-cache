@@ -670,16 +670,6 @@ impl ObjectMetadata {
             graduation_accounted: false,
         }
     }
-    /// Check if write cache entry is expired
-    pub(crate) fn is_write_cache_expired(&self) -> bool {
-        if !self.is_write_cached {
-            return false;
-        }
-        match self.write_cache_expires_at {
-            Some(expires_at) => SystemTime::now() > expires_at,
-            None => false, // No expiration set means not expired
-        }
-    }
 }
 
 /// Decide whether a **newly written** range counts toward the write (staging) tier.

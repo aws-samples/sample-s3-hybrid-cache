@@ -75,9 +75,6 @@ const FLATTENED_CACHE_FIELDS: &[&str] = &[
     // TailSelectionGauges
     "tail_coverage_ratio",
     "tail_coverage_short_total",
-    "eviction_fallback_tail_empty_total",
-    "eviction_fallback_cap_exhausted_total",
-    "eviction_fallback_unvisited_total",
     "eviction_oversized_single_candidate_total",
     "eviction_tail_verdict_total",
     "tail_delta_cap_rewrites_total",
@@ -150,6 +147,10 @@ fn populated_metrics() -> SystemMetrics {
             consumed_bytes: 4096,
             capacity_guard: s3_proxy::capacity_guard::CapacityGuardGauges::default(),
             read_fills_declined_max_cache_size_total: 7,
+            eviction_demand_passes_total: 9,
+            eviction_demand_refusals_over_cap_total: 10,
+            eviction_demand_dedup_skips_total: 11,
+            eviction_demand_backoff_skips_total: 13,
             hostname_collisions_total: 8,
             read_cache_size: 3072,
             read_cache_size_inverted_secs: 1800,
@@ -277,6 +278,7 @@ fn populated_metrics() -> SystemMetrics {
             evictions_skipped_lock_held: 1,
             // The field that was incremented and documented but never serialised.
             staging_evictions_skipped_lock_held: 6,
+            eviction_lock_held_secs: 0,
         }),
         signed_put: None,
         cache_size: Some(CacheSizeMetrics {
@@ -294,6 +296,7 @@ fn populated_metrics() -> SystemMetrics {
             )),
             checkpoint_count: 0,
             delta_log_size: 0,
+            rolling_snapshot_lock_aborts_total: 0,
         }),
         atomic_metadata: None,
         consolidation: None,

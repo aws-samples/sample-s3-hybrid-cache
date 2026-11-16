@@ -156,6 +156,74 @@ impl S3ClientApi for DelayedHedgeStub {
     }
 }
 
+/// An origin every address of which is black-holed: each fetch fails as a timeout, as
+/// `S3Client::forward_request` does once its own ladder is spent. Counts the fetches.
+#[derive(Clone)]
+struct BlackHoledStub {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl S3ClientApi for BlackHoledStub {
+    async fn forward_request(&self, _context: S3RequestContext) -> Result<S3Response> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(s3_proxy::ProxyError::TimeoutError(
+            "fixture: every address black-holed".to_string(),
+        ))
+    }
+
+    async fn forward_request_pinned(
+        &self,
+        context: S3RequestContext,
+        _pinned_ip: Option<IpAddr>,
+    ) -> Result<S3Response> {
+        self.forward_request(context).await
+    }
+
+    fn extract_metadata_from_response(&self, _headers: &HashMap<String, String>) -> CacheMetadata {
+        CacheMetadata {
+            content_length: 0,
+            etag: String::new(),
+            last_modified: String::new(),
+            part_number: None,
+            cache_control: None,
+            access_count: 0,
+            last_accessed: SystemTime::now(),
+        }
+    }
+
+    fn extract_object_metadata_from_response(
+        &self,
+        _headers: &HashMap<String, String>,
+    ) -> ObjectMetadata {
+        ObjectMetadata::default()
+    }
+
+    fn get_connection_pool(&self) -> Arc<tokio::sync::RwLock<ConnectionPoolManager>> {
+        Arc::new(tokio::sync::RwLock::new(
+            ConnectionPoolManager::new_with_config(
+                s3_proxy::config::ConnectionPoolConfig::default(),
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn has_endpoint_overrides(&self) -> bool {
+        false
+    }
+
+    async fn set_metrics_manager(
+        &self,
+        _: Arc<tokio::sync::RwLock<s3_proxy::metrics::MetricsManager>>,
+    ) {
+    }
+
+    async fn register_endpoint(&self, _: &str) {}
+    async fn refresh_dns(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -916,6 +984,58 @@ async fn test_signed_range_hedging_enabled_slow_original_hedge_wins() {
     );
 }
 
+/// A signed range GET to an origin whose every address is black-holed makes one pass
+/// through the client's retry ladder and answers 504: at most 4 sends of up to 30 s each.
+/// A retry loop around the ladder used to run it three times (12 sends).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_signed_range_to_a_black_holed_origin_makes_one_pass_through_the_ladder() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(BlackHoledStub {
+        calls: Arc::clone(&calls),
+    });
+    let mut config_inner = Config::default();
+    config_inner.cache.download_coordination.enabled = false;
+    let config = Arc::new(config_inner);
+    let (_temp_dir, cache_manager_for_call, range_handler) = make_test_cache(&config).await;
+    let resolved = resolved_with_hedging(false, Duration::from_millis(50), 1);
+    let range_spec = s3_proxy::range_handler::RangeSpec { start: 0, end: 3 };
+    let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec);
+    let mut signed_headers = HashMap::new();
+    signed_headers.insert(
+        "authorization".to_string(),
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-west-2/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=deadbeef".to_string(), // #gitleaks:allow
+    );
+    signed_headers.insert("range".to_string(), "bytes=0-3".to_string());
+    let response = HttpProxy::forward_range_with_coordination(
+        Method::GET,
+        "/test-bucket/signed-range-black-holed.bin".parse().unwrap(),
+        "s3.amazonaws.com".to_string(),
+        signed_headers,
+        "test-bucket/signed-range-black-holed.bin".to_string(),
+        range_spec,
+        overlap,
+        cache_manager_for_call,
+        range_handler,
+        s3_client,
+        config,
+        true, // is_signed
+        None,
+        Arc::new(s3_proxy::inflight_tracker::InFlightTracker::new()),
+        None,
+        &resolved,
+        &None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "A SIGNED RANGE GET MULTIPLIED THE RETRY LADDER: it ran the client's ladder {} times",
+        calls.load(Ordering::SeqCst)
+    );
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+}
 /// Req 1.3: hedging disabled for a signed range request → byte-identical to
 /// pre-fix behaviour, exactly one upstream call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

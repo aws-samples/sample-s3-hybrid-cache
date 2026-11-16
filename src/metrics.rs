@@ -143,15 +143,8 @@ pub struct CacheMetrics {
     #[serde(flatten)]
     pub tail_partition: crate::cache_size_tracker::TailPartitionGauges,
     /// The **selection** side of the Tail_Partition mechanism: R3.4's coverage ratio and its
-    /// `TAIL_COVERAGE_SHORT` emissions, § 4.5's three fallback outcomes, § 5.3's
-    /// oversized-single-candidate guard, and § 5.4's verification verdicts by reason.
-    ///
-    /// **Read the three fallback counters before concluding the mechanism works.** A deployment
-    /// whose partitions have never been built falls back on every pass and is indistinguishable
-    /// from one using the bounded path on every other signal —
-    /// `eviction_fallback_unvisited_total` is the one that says so, and it is deliberately
-    /// separate from `..._tail_empty_total`, which is a claim about what the cache holds rather
-    /// than about whether anything has looked.
+    /// `TAIL_COVERAGE_SHORT` emissions, § 5.3's oversized-single-candidate guard, and § 5.4's
+    /// verification verdicts by reason.
     ///
     /// **`tail_coverage_ratio` is as current as the last selection pass, not as current as now.**
     /// An unpressured cache runs no pass. See `crate::cache::TailSelectionGauges`.
@@ -472,6 +465,24 @@ pub struct CacheMetrics {
     /// `cache.capacity_guard.declines_total`. A rising figure here means eviction is not
     /// keeping pace with miss ingest, not that anything failed.
     pub read_fills_declined_max_cache_size_total: u64,
+    /// Read-cache eviction passes this process spawned because an admission declined an object
+    /// for `max_cache_size` while the cache was at or under `eviction_trigger_percent`. Each pass
+    /// frees down to `eviction_target_percent`, making room for the declined object.
+    /// Per-instance, monotonic since process start.
+    pub eviction_demand_passes_total: u64,
+    /// `max_cache_size` declines of an object larger than half of `max_cache_size` minus the
+    /// eviction target (10% of `max_cache_size` at the default target), which start no eviction.
+    /// Per-instance, monotonic since process start.
+    pub eviction_demand_refusals_over_cap_total: u64,
+    /// Read-cache eviction passes this process started for a declined object and skipped under
+    /// the eviction lock, because a read-cache pass on any proxy completed after the object was
+    /// declined. Per-instance, monotonic since process start.
+    pub eviction_demand_dedup_skips_total: u64,
+    /// Read-cache eviction passes this process started for a declined object and skipped under
+    /// the eviction lock on the demand backoff: the passes on demand alone before it, on any
+    /// proxy, made no room, and the delay since the last of them had not run out.
+    /// Per-instance, monotonic since process start.
+    pub eviction_demand_backoff_skips_total: u64,
     /// Times this proxy has detected another proxy sharing its hostname on this cache volume.
     ///
     /// Proxies sharing one cache volume must have distinct hostnames: every instance identity on
@@ -781,6 +792,10 @@ pub struct EvictionCoordinationMetrics {
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 7.4
     pub staging_evictions_skipped_lock_held: u64,
+    /// How long this proxy has held the global eviction lock, in whole seconds, or 0 while
+    /// it does not hold it. Per-proxy, read from `CacheManager::eviction_lock_held_secs`.
+    #[serde(default)]
+    pub eviction_lock_held_secs: u64,
 }
 
 /// Signed PUT caching metrics
@@ -1528,7 +1543,7 @@ pub struct MetricsCollectionGauges {
     ///
     /// Published so an operator can confirm from outside the process which threshold is in force,
     /// rather than inferring it — the same reason `inflight_memory.ceiling_bytes` and
-    /// `tail_floor_bytes` are published. Derived from the configured `metrics.collection_interval`,
+    /// `tail_max_entries` are published. Derived from the configured `metrics.collection_interval`,
     /// so it changes when that does and is not a separate knob.
     pub slow_threshold_ms: u64,
 }
@@ -1888,6 +1903,10 @@ pub struct WriteCacheMetrics {
     /// left the pending term; its bytes return when the fold next reads that object's `.meta`.
     #[serde(default)]
     pub pending_lines_quarantined_total: u64,
+    /// Times this process merged its removal-debit document to one entry per cache shard,
+    /// which it does when the document holds more than 4,096 entries. **Per-instance.**
+    #[serde(default)]
+    pub removal_debit_merges_total: u64,
     /// Seconds this process has been unable to derive the staged byte figure: `0` while its most
     /// recent derivation produced one, otherwise the time since its newest complete figure was
     /// taken, or since its first attempt when it has none. A derivation still running after 60 s
@@ -3315,6 +3334,7 @@ impl MetricsManager {
             pending_lock_wait_ms_total: crate::staged_fold::pending_lock_wait_stats().1,
             pending_lock_timeouts_total: crate::staged_fold::pending_lock_wait_stats().2,
             pending_lines_quarantined_total: crate::staged_fold::pending_lines_quarantined_total(),
+            removal_debit_merges_total: crate::staged_fold::removal_debit_merges_total(),
             staging_figure_unknown_seconds: staging_figure_unknown.0,
             staging_figure_unknown_passes_total: staging_figure_unknown.1,
             // In-memory, like the epoch latch above: the consolidator records the verdict it
@@ -3986,10 +4006,10 @@ impl MetricsManager {
                     )
                 },
             },
-            // Two process-local atomics carrying the configured floor and cap, two more counting
-            // this process's rebuilds, and one read of the per-instance tail-delta files. The
-            // floor and cap are published so an operator can confirm from outside the process
-            // that the values configured are the values the rebuild reads.
+            // A process-local atomic carrying the configured cap (the floor is always 0), two more
+            // counting this process's rebuilds, and one read of the per-instance tail-delta files.
+            // The cap is published so an operator can confirm from outside the process that the
+            // value configured is the value the rebuild reads.
             // Spec: cache-eviction-at-scale § 4.2, § 4.4.
             tail_partition: crate::cache_size_tracker::collect_tail_partition_gauges(
                 cache_manager.get_cache_dir(),
@@ -4130,6 +4150,21 @@ impl MetricsManager {
             ),
             // One atomic load. The read-fill soft stop's counter.
             read_fills_declined_max_cache_size_total: crate::cache::read_fill_declines_total(),
+            // One mutex each. The size refusals' eviction demand.
+            eviction_demand_passes_total: crate::cache::eviction_demand_counters(
+                cache_manager.get_cache_dir(),
+            )
+            .0,
+            eviction_demand_refusals_over_cap_total: crate::cache::eviction_demand_counters(
+                cache_manager.get_cache_dir(),
+            )
+            .1,
+            eviction_demand_dedup_skips_total: crate::cache::eviction_demand_dedup_skips(
+                cache_manager.get_cache_dir(),
+            ),
+            eviction_demand_backoff_skips_total: crate::cache::eviction_demand_backoff_skips(
+                cache_manager.get_cache_dir(),
+            ),
             // One atomic load. The unique-hostname prerequisite's detector.
             hostname_collisions_total: crate::cache::hostname_collisions_total(),
         })
@@ -4510,6 +4545,10 @@ impl MetricsManager {
             // struct and was documented as a published counter, so a consumer reading it got
             // `null`.
             staging_evictions_skipped_lock_held: stats.staging_evictions_skipped_lock_held,
+            eviction_lock_held_secs: self
+                .cache_manager
+                .as_ref()
+                .map_or(0, |c| c.eviction_lock_held_secs()),
         })
     }
 
@@ -5836,8 +5875,8 @@ mod tests {
     /// `CacheManager::initialize()` coordinated path: the latter also starts
     /// `CacheSizeTracker`'s background validation task, which — because no
     /// `validation.json` exists yet in a fresh temp dir — runs an immediate
-    /// filesystem-scan validation that calls `update_size_from_validation_with_kind`
-    /// and overwrites `write_cache_size` back to the scanned (zero) figure,
+    /// filesystem-scan validation that installs its census over `write_cache_size`,
+    /// moving it back towards the scanned (zero) figure,
     /// racing with this test's own `atomic_update_size_delta` calls. Skipping
     /// it keeps the test deterministic without weakening what's under test:
     /// `collect_write_cache_metrics` reads through
@@ -6253,6 +6292,15 @@ mod tests {
             crate::staged_authority::fold_authority_active(dir),
             "fixture: epoch 1 is active"
         );
+        // A staged upload's ledger shard with no fold yet, so the figure is unknown rather than
+        // the zero of a volume with nothing staged.
+        std::fs::create_dir_all(
+            crate::write_ledger::WriteLedger::new(dir.to_path_buf(), "host:test".to_string())
+                .ledger_dir()
+                .join("test-bucket")
+                .join("3f"),
+        )
+        .unwrap();
         crate::staged_fold::invalidate_authority_snapshot_for_tests(dir);
         let mut metrics_manager = MetricsManager::new();
         metrics_manager.set_cache_manager(cache_manager.clone());

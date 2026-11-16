@@ -1185,7 +1185,7 @@ Fields:
   objects written through the cache that have not yet been read. An object leaves this figure
   when it is read for the first time (it becomes read-cached, and the bytes stay on disk) or
   when it is removed. Only the consolidator maintains it: adjusted incrementally as objects are
-  cached, read and removed, and re-grounded absolutely by a full validation scan. On a volume
+  cached, read and removed, and corrected by the difference each validation scan finds. On a volume
   whose staged-authority epoch has been activated, the staged fold produces the published
   write-cache figure instead, and the credits and debits below do not govern it; see
   [Size accounting](#size-accounting) for which mechanism is live and how to tell.

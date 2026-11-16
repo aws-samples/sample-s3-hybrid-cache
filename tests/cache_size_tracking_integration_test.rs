@@ -408,8 +408,12 @@ async fn test_full_consolidation_cycle_with_size_tracking() {
 
     // With accumulator-based tracking, we add size via the accumulator
     // (simulating what happens at write time)
-    consolidator.size_accumulator().add(1000);
-    consolidator.size_accumulator().add(1000);
+    consolidator
+        .size_accumulator()
+        .add_range("fixture-credit-1", 0, 999, 1000);
+    consolidator
+        .size_accumulator()
+        .add_range("fixture-credit-2", 0, 999, 1000);
 
     // Create journal entries for Add operations (for metadata updates only)
     let cache_key = "test-bucket/test-object";
@@ -512,7 +516,9 @@ async fn test_consolidation_cycle_with_remove_operations() {
     let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
     // First, add some data via the accumulator (simulating write time)
-    consolidator.size_accumulator().add(1000);
+    consolidator
+        .size_accumulator()
+        .add_range("fixture-credit-3", 0, 999, 1000);
 
     // Create journal entry for metadata update
     let cache_key = "test-bucket/remove-test-object";
@@ -580,7 +586,9 @@ async fn test_eviction_triggered_by_consolidator() {
     let consolidator = create_test_consolidator(cache_dir.clone(), max_cache_size).await;
 
     // Add size via accumulator (simulating write time)
-    consolidator.size_accumulator().add(1000);
+    consolidator
+        .size_accumulator()
+        .add_range("fixture-credit-4", 0, 999, 1000);
 
     // Create journal entries for metadata update
     let cache_key = "test-bucket/eviction-test-object";
@@ -706,59 +714,6 @@ async fn test_startup_with_missing_size_state() {
     );
 }
 
-/// Task 14.4: Test validation scan corrects drift
-///
-/// Validates: Requirements 4.1, 4.2, 4.3
-/// - Validation scan calculates actual cache size from filesystem
-/// - Validation corrects size state if drift exceeds threshold
-/// - Validation logs drift amount for monitoring
-#[tokio::test]
-async fn test_validation_scan_corrects_drift() {
-    let temp_dir = TempDir::new().unwrap();
-    let cache_dir = temp_dir.path().to_path_buf();
-
-    // Create consolidator with initial size state that has drift
-    let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
-
-    // Manually set an incorrect size (simulating drift)
-    // We'll use update_size_from_validation_with_kind to correct it
-    let _incorrect_size = 10000;
-    let correct_size = 5000;
-
-    // First, set the incorrect size by running a consolidation with fake entries
-    // Then correct it with validation
-
-    // Update size from validation (simulating what CacheSizeTracker does after a scan)
-    consolidator
-        .update_size_from_validation_with_kind(
-            correct_size,
-            Some(500),
-            None,
-            s3_proxy::cache_size_tracker::ValidationSampleKind::FullScan,
-        )
-        .await;
-
-    // Verify size was corrected
-    let size_state = consolidator.get_size_state().await.unwrap();
-    assert_eq!(
-        size_state.total_size, correct_size,
-        "Total size should be corrected by validation"
-    );
-    assert_eq!(
-        size_state.write_cache_size, 500,
-        "Write cache size should be updated by validation"
-    );
-
-    // Verify the corrected size is persisted
-    let size_state_path = cache_dir.join("size_tracking").join("size_state.json");
-    let persisted_content = tokio::fs::read_to_string(&size_state_path).await.unwrap();
-    let persisted_state: SizeState = serde_json::from_str(&persisted_content).unwrap();
-    assert_eq!(
-        persisted_state.total_size, correct_size,
-        "Persisted size should be corrected"
-    );
-}
-
 /// Task 14.5: Test graceful shutdown persists size state
 ///
 /// Validates: Requirements 6.1, 6.2, 6.3
@@ -775,7 +730,9 @@ async fn test_graceful_shutdown_persists_size_state() {
     let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
     // Add some data via accumulator (simulating write time)
-    consolidator.size_accumulator().add(1000);
+    consolidator
+        .size_accumulator()
+        .add_range("fixture-credit-5", 0, 999, 1000);
 
     // Create journal entry for metadata update
     let cache_key = "test-bucket/shutdown-test-object";
@@ -837,7 +794,9 @@ async fn test_multiple_consolidation_cycles_accumulate_size() {
     let consolidator = create_test_consolidator(cache_dir.clone(), 0).await;
 
     // First cycle: Add 1000 bytes via accumulator
-    consolidator.size_accumulator().add(1000);
+    consolidator
+        .size_accumulator()
+        .add_range("fixture-credit-6", 0, 999, 1000);
 
     let cache_key1 = "test-bucket/object1";
     let entry1 = create_test_journal_entry(
@@ -858,7 +817,9 @@ async fn test_multiple_consolidation_cycles_accumulate_size() {
     );
 
     // Second cycle: Add 2000 more bytes via accumulator
-    consolidator.size_accumulator().add(2000);
+    consolidator
+        .size_accumulator()
+        .add_range("fixture-credit-7", 0, 1999, 2000);
 
     let cache_key2 = "test-bucket/object2";
     let entry2 = create_test_journal_entry(

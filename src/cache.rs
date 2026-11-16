@@ -55,7 +55,7 @@ fn is_head_fresh(
 /// **What that 2.89x is a ratio OF matters, and it is not the eviction pass.** This constant
 /// bounds one phase of [`CacheManager::perform_eviction_with_lock`] — the mutation region
 /// dispatched through [`run_leaf_groups`] below. Candidate selection (including the
-/// O(all resident objects) fallback collector and its `.meta` parse per object), the sort,
+/// bounded Tail_Partition read and its `.meta` verification), the sort,
 /// the grouping, result aggregation, the accumulator debit and the per-range `Remove`
 /// journal append are all **serial** phases outside it. Dividing two rates published on the
 /// same host and volume, the mutation region is only **1.9-3.6%** of a real executor pass on
@@ -160,240 +160,6 @@ const EXECUTOR_CHUNK_CONCURRENCY: usize = 4;
 /// figure too — 64 of tokio's 512 threads is 12.5%, still a minority of the pool.
 static EVICTION_OBJECT_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(LEAF_CONCURRENCY_LIMIT);
-/// `.meta` documents the full-population eviction collector reads at once.
-///
-/// [`CacheManager::collect_range_candidates_for_eviction`] reads one document and stats its
-/// ranges per candidate, and on shared storage each of those is a round trip: a selection over
-/// 2,162 to 4,334 candidate ranges took 12.8 to 29.4 s on FSx for NetApp ONTAP, about 10 ms a
-/// range, which alternated the author pass with the drain instead of overlapping them.
-///
-/// `64` is taken from the same measured knee as
-/// [`crate::staged_fold::STAGED_FOLD_CANDIDATE_CONCURRENCY`] and `ledger_repair`'s
-/// `SWEEP_READ_CONCURRENCY`, and deliberately equals both: that table swept `.meta` reads on a
-/// shared volume and found 64→128 returning 3% of linear while per-file latency rose linearly,
-/// the signature of a fixed-capacity service queue. This is a third consumer of that knee rather
-/// than a second, so a proxy folding, sweeping and selecting at once holds 192 reads outstanding;
-/// each is bounded and short-lived, and selection is the one of the three that holds the global
-/// eviction lock while it runs, so finishing it sooner shortens the window the other two contend
-/// with.
-///
-/// Not [`LEAF_CONCURRENCY_LIMIT`]: that bounds leaf groups whose workers take a metadata slot
-/// lock and mutate, and its arithmetic is about collision probability between mutators. These
-/// are reads under no lock, so the collision term does not apply. Against tokio's default
-/// `max_blocking_threads` of 512, 64 is 12.5% of the pool, the share
-/// [`EVICTION_OBJECT_PERMITS`]'s comment already accepts for eviction.
-///
-/// Still a `const` rather than a config field, for § 16.6.4's reason: it is derived from a
-/// measurement, and an operator who raised it would push the volume past its knee for every
-/// other consumer too.
-const SELECTION_META_READ_CONCURRENCY: usize = 64;
-
-/// The fan-out in force for `cache_dir`'s full-population collector:
-/// [`SELECTION_META_READ_CONCURRENCY`], or a test's armed override.
-fn selection_meta_read_concurrency(cache_dir: &Path) -> usize {
-    let _ = cache_dir;
-    #[cfg(test)]
-    if let Some(fanout) = selection_read_seam::armed_fanout(cache_dir) {
-        return fanout.max(1);
-    }
-    SELECTION_META_READ_CONCURRENCY
-}
-
-/// Test seam for the full-population collector's `.meta` reads: the armed fan-out, a per-file
-/// delay, and the peak number of reads in flight.
-///
-/// Keyed by cache directory, as [`crate::eviction_worklist`]'s counters are, so a test observes
-/// only what its own fixture drove. Without that, two tests sharing the binary would read each
-/// other's peak and a negative assertion could pass on a neighbour's work.
-#[cfg(test)]
-pub(crate) mod selection_read_seam {
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-    use std::time::Duration;
-
-    #[derive(Debug, Default)]
-    struct SeamState {
-        fanout: Option<usize>,
-        slow_marker: Option<String>,
-        delay: Duration,
-        in_flight: usize,
-        peak_in_flight: usize,
-        paths_live: usize,
-        peak_paths_live: usize,
-    }
-
-    static STATE: Mutex<BTreeMap<PathBuf, SeamState>> = Mutex::new(BTreeMap::new());
-
-    fn with<R>(f: impl FnOnce(&mut BTreeMap<PathBuf, SeamState>) -> R) -> R {
-        f(&mut STATE.lock().unwrap_or_else(|p| p.into_inner()))
-    }
-
-    /// Arm `cache_dir`'s collector: `fanout` documents at once, and a `.meta` whose file name
-    /// contains `slow_marker` sleeps `delay` inside its blocking read.
-    pub(crate) fn arm(cache_dir: &Path, fanout: usize, slow_marker: Option<&str>, delay: Duration) {
-        with(|map| {
-            let state = map.entry(cache_dir.to_path_buf()).or_default();
-            state.fanout = Some(fanout);
-            state.slow_marker = slow_marker.map(str::to_string);
-            state.delay = delay;
-            state.in_flight = 0;
-            state.peak_in_flight = 0;
-            state.paths_live = 0;
-            state.peak_paths_live = 0;
-        });
-    }
-
-    pub(crate) fn disarm(cache_dir: &Path) {
-        with(|map| map.remove(cache_dir));
-    }
-
-    pub(crate) fn armed_fanout(cache_dir: &Path) -> Option<usize> {
-        with(|map| map.get(cache_dir).and_then(|state| state.fanout))
-    }
-
-    /// The most reads this fixture ever had in flight at once. `0` when nothing was armed, which
-    /// is not a reading of the collector: an assertion about the fan-out must fail on it rather
-    /// than treat it as serial.
-    pub(crate) fn peak_in_flight(cache_dir: &Path) -> usize {
-        with(|map| map.get(cache_dir).map_or(0, |state| state.peak_in_flight))
-    }
-
-    /// Called by [`super::MetaFileWalk::next`] as a path leaves the walk, and again by the
-    /// collector once that path's read has come back: the live count is the paths the collector
-    /// is holding in memory, which `buffered` bounds by the fan-out however large the tree is.
-    pub(crate) fn observe_path_taken(cache_dir: &Path) {
-        with(|map| {
-            if let Some(state) = map.get_mut(cache_dir) {
-                state.paths_live += 1;
-                state.peak_paths_live = state.peak_paths_live.max(state.paths_live);
-            }
-        });
-    }
-
-    /// See [`observe_path_taken`].
-    pub(crate) fn observe_path_released(cache_dir: &Path) {
-        with(|map| {
-            if let Some(state) = map.get_mut(cache_dir) {
-                state.paths_live = state.paths_live.saturating_sub(1);
-            }
-        });
-    }
-
-    /// The most `.meta` paths this fixture ever had in memory at once. `0` when nothing was
-    /// armed, which is not a reading of the collector: an assertion about the bound must fail on
-    /// it rather than read it as bounded.
-    pub(crate) fn peak_paths_live(cache_dir: &Path) -> usize {
-        with(|map| map.get(cache_dir).map_or(0, |state| state.peak_paths_live))
-    }
-
-    /// Called at the top of each blocking `.meta` read: counts it in flight, records the peak,
-    /// sleeps if this file is one of the armed slow ones, and counts it out again.
-    pub(crate) fn observe(cache_dir: &Path, meta_path: &Path) {
-        let delay = with(|map| {
-            let Some(state) = map.get_mut(cache_dir) else {
-                return Duration::ZERO;
-            };
-            state.in_flight += 1;
-            state.peak_in_flight = state.peak_in_flight.max(state.in_flight);
-            let slow = state.slow_marker.as_deref().is_some_and(|marker| {
-                meta_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(marker))
-            });
-            if slow {
-                state.delay
-            } else {
-                Duration::ZERO
-            }
-        });
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-        with(|map| {
-            if let Some(state) = map.get_mut(cache_dir) {
-                state.in_flight = state.in_flight.saturating_sub(1);
-            }
-        });
-    }
-}
-
-/// A lazy depth-first walk of the `.meta` paths under a directory: the producer the
-/// full-population eviction collector's bounded fan-out pulls from.
-///
-/// One open directory stream per level of the tree (`metadata/{bucket}/{XX}/{YYY}`, so four) and
-/// nothing else is held, so the collector's memory is bounded by its fan-out rather than by the
-/// cache's object count. Reading every path into a `Vec` first, as the first concurrent
-/// collector did, also made the walk a barrier: no document could be read until the last
-/// directory had been listed.
-///
-/// The order is the contract: each directory's entries in `read_dir` order, descending into a
-/// subdirectory as soon as it is seen, which is the order the single-threaded collector read the
-/// documents in. `buffered` yields the reads in it, so the candidate vector is the serial walk's
-/// element for element. That is load-bearing rather than tidy -- the comparator downstream is a
-/// STABLE sort, so candidates tying on expiry, size and coldness are evicted in collection
-/// order.
-///
-/// An unreadable directory or entry is skipped with a `debug!` and the walk continues, as it did
-/// when one function walked and read, so a selection over a partly unreadable tree still returns
-/// what it could read.
-struct MetaFileWalk {
-    /// One open directory stream per level, deepest last.
-    stack: Vec<std::fs::ReadDir>,
-    /// The cache directory this walk's test seam counts against. The collector walks
-    /// `<cache_dir>/metadata`, so it is the walk root's parent; there is no other caller.
-    #[cfg(test)]
-    seam_dir: PathBuf,
-}
-
-impl MetaFileWalk {
-    fn new(dir: &Path) -> Self {
-        let mut stack = Vec::new();
-        match std::fs::read_dir(dir) {
-            Ok(entries) => stack.push(entries),
-            Err(e) => debug!("Failed to read directory {:?}: {}", dir, e),
-        }
-        Self {
-            stack,
-            #[cfg(test)]
-            seam_dir: dir.parent().unwrap_or(dir).to_path_buf(),
-        }
-    }
-}
-
-impl Iterator for MetaFileWalk {
-    type Item = PathBuf;
-
-    fn next(&mut self) -> Option<PathBuf> {
-        while let Some(level) = self.stack.last_mut() {
-            let Some(entry) = level.next() else {
-                self.stack.pop();
-                continue;
-            };
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    debug!("Failed to read directory entry: {}", e);
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if path.is_dir() {
-                match std::fs::read_dir(&path) {
-                    Ok(entries) => self.stack.push(entries),
-                    Err(e) => debug!("Failed to read directory {:?}: {}", path, e),
-                }
-            } else if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                #[cfg(test)]
-                selection_read_seam::observe_path_taken(&self.seam_dir);
-                return Some(path);
-            }
-        }
-        None
-    }
-}
-
 /// The ETag S3 returns for a zero-byte object: the MD5 of the empty byte string,
 /// quoted exactly as S3 sends it and as `ObjectMetadata::etag` stores it.
 ///
@@ -478,24 +244,183 @@ fn nanos_to_systime(nanos: u64) -> SystemTime {
 static TAIL_OVERSIZED_SINGLE_CANDIDATE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// § 4.5's `TAIL_EMPTY` fallback: every shard's partition was read and none holds a member above
-/// `tail_floor_bytes`.
-static TAIL_FALLBACK_TAIL_EMPTY: std::sync::atomic::AtomicU64 =
+/// Most shards one selection rebuilds lazily before it selects again. The wall-time budget
+/// below is the bound that binds on shared storage; this one caps the bookkeeping on a volume
+/// of many tiny shards.
+const LAZY_TAIL_REBUILD_MAX_SHARDS: usize = 1024;
+
+/// Wall time one selection may spend on lazy rebuilds. Checked between shards, never inside one,
+/// so one shard larger than the budget still completes, and a pass's rebuild time is this budget
+/// plus one shard's rebuild. A shard holds about the volume's `.meta` count over 256 × buckets:
+/// about 390,000 for a one-bucket cache of 100 million ranges, about 100 s on EFS at its
+/// measured 3,801 `.meta`/s, and about 4,000 at 100 buckets.
+const LAZY_TAIL_REBUILD_BUDGET: Duration = Duration::from_secs(5);
+
+/// A shard whose partition was rebuilt this recently, by any proxy or by the rolling pass, is
+/// not rebuilt lazily again. One consolidation interval apart would rebuild a shard the pass
+/// keeps finding short on every cycle; this bounds a shard to one lazy rebuild per 5 minutes.
+const LAZY_TAIL_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How often one process may rebuild exhausted or cap-bound shards lazily, each tier on its
+/// own clock (`CacheManager::rebuild_short_tail_shards`'s second and third tiers). A read tier
+/// that cannot meet the target leaves every pass short, and every such shard older than
+/// [`LAZY_TAIL_REBUILD_MIN_INTERVAL`] is a candidate, so without this each pass would spend the
+/// whole [`LAZY_TAIL_REBUILD_BUDGET`] re-reading `.meta` files: on EFS about 3,800 a second, the
+/// backend's whole scan rate. With it, at most one budget per tier per 300 s per proxy, about
+/// 63 `.meta` reads a second averaged for each.
+const LAZY_TAIL_CAP_BOUND_REBUILD_INTERVAL: Duration = Duration::from_secs(300);
+
+/// When this process last ran the cap-bound rebuild tier, per cache directory.
+static LAZY_TAIL_CAP_BOUND_REBUILT_AT: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// When this process last rebuilt a stale exhausted shard lazily, per cache directory.
+static LAZY_TAIL_EXHAUSTED_REBUILT_AT: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Claim this interval's cap-bound rebuild tier for `cache_dir`: `true` (and stamped) when this
+/// process has not run it in the last [`LAZY_TAIL_CAP_BOUND_REBUILD_INTERVAL`].
+fn claim_cap_bound_rebuild(cache_dir: &Path) -> bool {
+    claim_rebuild_tier(&LAZY_TAIL_CAP_BOUND_REBUILT_AT, cache_dir)
+}
+
+/// Claim this interval's exhausted-shard rebuild tier for `cache_dir`, on the same terms as
+/// [`claim_cap_bound_rebuild`].
+fn claim_exhausted_rebuild(cache_dir: &Path) -> bool {
+    claim_rebuild_tier(&LAZY_TAIL_EXHAUSTED_REBUILT_AT, cache_dir)
+}
+
+fn claim_rebuild_tier(
+    tier: &std::sync::LazyLock<Mutex<HashMap<PathBuf, std::time::Instant>>>,
+    cache_dir: &Path,
+) -> bool {
+    let mut map = match tier.lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = std::time::Instant::now();
+    match map.get(cache_dir) {
+        Some(at) if now.duration_since(*at) < LAZY_TAIL_CAP_BOUND_REBUILD_INTERVAL => false,
+        _ => {
+            map.insert(cache_dir.to_path_buf(), now);
+            true
+        }
+    }
+}
+
+/// Most `.meta` opens one bounded selection spends on records that do not verify as evictable
+/// (hot, staged, superseded, gone or unreadable by the document). Each open that yields a
+/// candidate counts towards the target instead, and the accumulation stops at the target, so
+/// this is what bounds a selection's `.meta` reads when nothing verifies: at most this many,
+/// however many `.meta` files the volume holds. 16,384 is about 4.3 s on EFS at its measured
+/// 3,801 `.meta`/s and about 0.4 s on FSx for NetApp ONTAP, the same order as
+/// [`LAZY_TAIL_REBUILD_BUDGET`].
+const TAIL_VERIFY_MAX_REJECTED_OPENS: usize = 16_384;
+
+/// The `CAP_EXHAUSTED` WARN fires at most once per this interval per process.
+const TAIL_CAP_BOUND_WARN_INTERVAL_SECS: u64 = 300;
+
+/// Seconds since the epoch of the last `CAP_EXHAUSTED` WARN, `0` before the first.
+static TAIL_CAP_BOUND_LAST_WARN_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// § 4.5's `CAP_EXHAUSTED` fallback: members exist, the prefix reached `tail_max_entries`, and the
-/// target is still not met. **Deliberately a different counter from `TAIL_EMPTY`**, because R3.5
-/// justifies the entry-dimension fallback only for the empty case — this cache has skew by
-/// construction, so the entry dimension is not exact for it.
-static TAIL_FALLBACK_CAP_EXHAUSTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// The rate-limited operator WARN for a selection that came up short with cap-bound partitions:
+/// the rank cap is what stopped it, and raising `tail_max_entries` is the action.
+fn warn_cap_bound(cap_bound: usize, cap: usize, available: u64, target: u64) {
+    let now = unix_now_secs();
+    let last = TAIL_CAP_BOUND_LAST_WARN_SECS.load(AtomicOrdering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < TAIL_CAP_BOUND_WARN_INTERVAL_SECS {
+        return;
+    }
+    if TAIL_CAP_BOUND_LAST_WARN_SECS
+        .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    warn!(
+        "Tail selection: CAP_EXHAUSTED. {} shard partition(s) hold the rank cap of \
+         tail_max_entries={} records, and the index named {} bytes against a target of {}. \
+         Raise cache.shared_storage.tail_max_entries so each partition lists more of its \
+         shard. Logged at most once every {} s.",
+        cap_bound, cap, available, target, TAIL_CAP_BOUND_WARN_INTERVAL_SECS
+    );
+}
 
-/// § 4.5's third fallback, and NOT one of its two named outcomes: no shard has a partition file at
-/// all, so no pass has visited this volume since the scheme was introduced.
-///
-/// Separated from `TAIL_EMPTY` because collapsing them would let a cold volume report that the
-/// cache holds nothing large — a claim about contents — when what it holds is an unvisited shard.
-static TAIL_FALLBACK_UNVISITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// What one round of `CacheManager::select_from_tail_index` read from the index.
+#[derive(Debug, Default)]
+struct TailIndexRound {
+    /// The merged, excluded candidates, unsorted.
+    ordered: Vec<RangeEvictionCandidate>,
+    present: usize,
+    absent: usize,
+    unreadable: usize,
+    /// Some partition could yield more at a deeper read.
+    more_available: bool,
+    /// Shards read to the end and holding fewer than the cap's records, plus unreadable ones.
+    exhausted_shards: Vec<(String, String)>,
+    /// Shards not read to the end, or read to the end holding the cap's records.
+    cap_bound_shards: Vec<(String, String)>,
+    records_merged: usize,
+}
+
+/// What `CacheManager::rebuild_short_tail_shards` did.
+#[derive(Debug, Default)]
+struct LazyRebuildRound {
+    /// Shards rebuilt.
+    rebuilt: usize,
+    /// `.meta` files those rebuilds parsed.
+    parsed: u64,
+    /// Shards with a metadata directory still without a partition.
+    unindexed_after: usize,
+    /// Shards rebuilt by this round, or found rebuilt within [`LAZY_TAIL_REBUILD_MIN_INTERVAL`].
+    fresh: std::collections::HashSet<(String, String)>,
+}
+
+/// Test seam: per-cache-directory overrides of the rejected-open budget and the per-selection
+/// rebuild shard cap, so a fixture of tens of objects can exercise the bounds.
+#[cfg(test)]
+static TAIL_TEST_LIMITS: std::sync::LazyLock<Mutex<HashMap<PathBuf, TailTestLimits>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `(rejected-open budget, rebuild shard cap)` overrides for one cache directory.
+#[cfg(test)]
+type TailTestLimits = (Option<usize>, Option<usize>);
+
+/// Override the rejected-open budget and the rebuild shard cap for one cache directory. Tests only.
+#[cfg(test)]
+pub(crate) fn set_tail_test_limits(
+    cache_dir: &std::path::Path,
+    reject_budget: Option<usize>,
+    rebuild_max_shards: Option<usize>,
+) {
+    TAIL_TEST_LIMITS
+        .lock()
+        .unwrap()
+        .insert(cache_dir.to_path_buf(), (reject_budget, rebuild_max_shards));
+}
+
+/// [`TAIL_VERIFY_MAX_REJECTED_OPENS`], or a test's override for `cache_dir`.
+fn tail_verify_reject_budget(cache_dir: &Path) -> usize {
+    let _ = cache_dir;
+    #[cfg(test)]
+    if let Some((Some(budget), _)) = TAIL_TEST_LIMITS.lock().unwrap().get(cache_dir) {
+        return *budget;
+    }
+    TAIL_VERIFY_MAX_REJECTED_OPENS
+}
+
+/// [`LAZY_TAIL_REBUILD_MAX_SHARDS`], or a test's override for `cache_dir`.
+fn lazy_tail_rebuild_max_shards(cache_dir: &Path) -> usize {
+    let _ = cache_dir;
+    #[cfg(test)]
+    if let Some((_, Some(max))) = TAIL_TEST_LIMITS.lock().unwrap().get(cache_dir) {
+        return *max;
+    }
+    LAZY_TAIL_REBUILD_MAX_SHARDS
+}
 
 /// Test seam: the one `.meta` path whose existence check fails with a non-not-found error.
 #[cfg(test)]
@@ -543,7 +468,9 @@ enum TailCandidateVerdict {
     /// `last_accessed` moved, or the range is inside the admission window. **R3.6a: an expired
     /// range is not `NowHot` merely for being inside the window.**
     NowHot,
-    /// The object is write-cached and this range is still staged (§ 9.2).
+    /// The object is write-cached, this range is still staged (§ 9.2), and the object has not
+    /// expired. An expired staged range is unread past `put_ttl` and is evictable by the read
+    /// tier (write-cache R5.5); the delete re-checks the expiry under the slot lock.
     Staged,
     /// The `.meta` could not be read or parsed. Skip: do not act on no information.
     Unreadable,
@@ -598,13 +525,14 @@ impl TailCandidateVerdict {
 pub(crate) enum TailSelectionStatus {
     /// The selected set meets `target_bytes`.
     Met,
-    /// § 4.5's `TAIL_EMPTY`: every partition was read and none holds a member above the floor.
+    /// § 4.5's `TAIL_EMPTY`: every partition was read, none holds a member, and no tail-delta
+    /// record survives the exclusion.
     TailEmpty,
-    /// § 4.5's `CAP_EXHAUSTED`: members exist, the prefix reached `tail_max_entries`, still short.
+    /// § 4.5's `CAP_EXHAUSTED`: members exist, the prefix reached `tail_max_entries` or every
+    /// partition's end, and the records still hold less than the target.
     CapExhausted,
-    /// No partition file exists anywhere: the volume has not been visited since the scheme was
-    /// introduced. Selection has no information rather than the information that there is
-    /// nothing large.
+    /// No partition file exists anywhere, and the tail-deltas alone do not hold the target.
+    /// Selection verified what the deltas name and has no other information.
     Unvisited,
 }
 
@@ -623,8 +551,9 @@ pub(crate) struct TailSelectionOutcome {
     /// How it ended.
     pub status: TailSelectionStatus,
     /// **The figure R13.2's pinned test structurally cannot see**: how many `.meta` files this
-    /// pass opened. Bounded by the distinct objects named in the merged prefix, which is
-    /// `depth × shards + delta_cap × instances` — independent of the resident object count.
+    /// pass opened. Bounded by the rejected-open budget plus what the target needs, and by the
+    /// distinct objects named in the merged prefix, `depth × shards + delta_cap × instances`:
+    /// independent of the resident object count.
     pub meta_files_opened: usize,
     /// Partition records merged from the prefix reads plus the deltas.
     pub records_merged: usize,
@@ -663,18 +592,61 @@ pub(crate) struct TailSelectionOutcome {
     ///
     /// Not a degraded outcome (R3.11). The rewrite is charged per object, not per range.
     pub partial_plans: usize,
+    /// Shards whose partition the last round read to the end holding fewer than the rank cap's
+    /// records, or could not read: the shards a lazy rebuild refreshes first when the pass falls
+    /// short.
+    pub exhausted_shards: Vec<(String, String)>,
+    /// Shards whose partition the last round did not read to the end, or read to the end holding
+    /// the rank cap's records, so the build may have dropped smaller ranges. Rebuilt only on the
+    /// limited third tier, and any one leaves the exhaustion report unset.
+    pub cap_bound_shards: Vec<(String, String)>,
+    /// Every shard with a partition file when this selection enumerated them.
+    pub partitioned_shards: Vec<(String, String)>,
+    /// The last round read every partition to its end.
+    pub partitions_read_to_end: bool,
+    /// Σ `compressed_size` over the last round's merged records not marked staged, or marked
+    /// staged with an expired object, before verification: an upper bound on what the index
+    /// says the read tier could evict.
+    pub unstaged_hint_bytes: u64,
+    /// Rounds that read deeper because verification left the target unmet.
+    pub deepened_rounds: usize,
+    /// `.meta` opens that yielded no candidate, against [`TAIL_VERIFY_MAX_REJECTED_OPENS`].
+    pub rejected_opens: usize,
+    /// Verification stopped because the rejected-open budget was spent.
+    pub verify_budget_bound: bool,
+    /// Shards whose partition this pass rebuilt lazily before its final selection.
+    pub lazy_rebuilds: usize,
+    /// `.meta` files those rebuilds parsed. Kept apart from `meta_files_opened`, which is
+    /// selection's verification term.
+    pub lazy_rebuild_metas_parsed: u64,
+    /// Some shard with a metadata directory still has no partition after this pass's lazy
+    /// rebuilds (the budget ran out first). The selection then read a FRACTION of the shards,
+    /// which R3.3 rules out as a basis for an exhaustion report: the unread shards can hold an
+    /// arbitrary share of the bytes. The pass frees what it selected, and later passes rebuild
+    /// the rest. Only computed when the selection fell short.
+    pub index_incomplete: bool,
+    /// `Some(target - seen)` when this selection proved the evictable read tier holds less than
+    /// the target (`CacheManager::tail_exhaustion_shortfall`); the futility rule's only
+    /// evidence. `None` in every other case.
+    pub exhausted_shortfall: Option<u64>,
+    /// Tail-delta records the read dropped past `tail_delta_max_entries` per file
+    /// (`TailDeltaRead::dropped`).
+    pub delta_records_dropped: usize,
+    /// Their bytes (`TailDeltaRead::dropped_bytes`), counted into the exhaustion report's
+    /// `seen` so a dropped record cannot hide evictable bytes from it.
+    pub delta_dropped_bytes: u64,
 }
 
-/// The selection-side Tail_Partition figures: § 4.2's coverage ratio and its WARN, § 4.5's two
-/// fallback outcomes, § 5.3's oversized-single guard and § 5.4's verdict tally.
+/// The selection-side Tail_Partition figures: § 4.2's coverage ratio and its WARN, § 5.3's
+/// oversized-single guard and § 5.4's verdict tally.
 ///
 /// # Why the ratio is only as current as the last pass
 ///
 /// It is computed where a **global** figure already exists, which is § 4.5's bounded prefix of
 /// every partition — the design's only cross-shard read. A cache under no pressure runs no pass
 /// and so publishes a last-known rather than a current ratio, which is exactly when an operator
-/// would most like the warning in advance. Accepted: the WARN's action (raise `tail_max_entries`,
-/// lower `tail_floor_bytes`) is not time-critical, and `tail_entries` per shard gives an estimate
+/// would most like the warning in advance. Accepted: the WARN's action (raise `tail_max_entries`)
+/// is not time-critical, and `tail_entries` per shard gives an estimate
 /// between passes (R12.2).
 ///
 /// Spec: cache-eviction-at-scale § 4.2, § 4.5, § 5.3, § 5.4. Requirements: 3.4, 3.5, 3.7, 3.8
@@ -690,12 +662,6 @@ pub struct TailSelectionGauges {
     pub tail_coverage_ratio: Option<f64>,
     /// `TAIL_COVERAGE_SHORT` emissions since start.
     pub tail_coverage_short_total: u64,
-    /// Passes that fell back because no partition holds a member above the floor.
-    pub eviction_fallback_tail_empty_total: u64,
-    /// Passes that fell back because the prefix reached the cap and the target was still unmet.
-    pub eviction_fallback_cap_exhausted_total: u64,
-    /// Passes that fell back because no partition file exists anywhere yet.
-    pub eviction_fallback_unvisited_total: u64,
     /// Passes whose selected set was one candidate larger than the whole target (R1.3).
     pub eviction_oversized_single_candidate_total: u64,
     /// § 5.4's verdict tally, `reason` → count.
@@ -712,10 +678,6 @@ pub(crate) fn collect_tail_selection_gauges() -> TailSelectionGauges {
             .checked_sub(1)
             .map(|milli| milli as f64 / 1000.0),
         tail_coverage_short_total: TAIL_COVERAGE_SHORT_TOTAL.load(AtomicOrdering::Relaxed),
-        eviction_fallback_tail_empty_total: TAIL_FALLBACK_TAIL_EMPTY.load(AtomicOrdering::Relaxed),
-        eviction_fallback_cap_exhausted_total: TAIL_FALLBACK_CAP_EXHAUSTED
-            .load(AtomicOrdering::Relaxed),
-        eviction_fallback_unvisited_total: TAIL_FALLBACK_UNVISITED.load(AtomicOrdering::Relaxed),
         eviction_oversized_single_candidate_total: TAIL_OVERSIZED_SINGLE_CANDIDATE
             .load(AtomicOrdering::Relaxed),
         eviction_tail_verdict_total: TailCandidateVerdict::all()
@@ -736,9 +698,6 @@ pub(crate) fn collect_tail_selection_gauges() -> TailSelectionGauges {
 #[cfg(test)]
 pub(crate) fn reset_tail_selection_counters_for_tests() {
     TAIL_OVERSIZED_SINGLE_CANDIDATE.store(0, AtomicOrdering::SeqCst);
-    TAIL_FALLBACK_TAIL_EMPTY.store(0, AtomicOrdering::SeqCst);
-    TAIL_FALLBACK_CAP_EXHAUSTED.store(0, AtomicOrdering::SeqCst);
-    TAIL_FALLBACK_UNVISITED.store(0, AtomicOrdering::SeqCst);
     TAIL_COVERAGE_RATIO_MILLI_PLUS_ONE.store(0, AtomicOrdering::SeqCst);
     TAIL_COVERAGE_SHORT_TOTAL.store(0, AtomicOrdering::SeqCst);
     for counter in TAIL_VERDICT_TOTALS.iter() {
@@ -1060,7 +1019,7 @@ struct ReadFillBound {
     /// ([`CacheManager::put_capacity_usage`]), refreshed every [`PUT_USAGE_REFRESH_INTERVAL`]
     /// (5 s) by `CacheManager::spawn_put_usage_refresher`. `None` until the first refresh
     /// publishes one.
-    usage: tokio::sync::watch::Receiver<Option<(std::time::Instant, u64)>>,
+    usage: tokio::sync::watch::Receiver<Option<PutUsageSnapshot>>,
 }
 
 /// Red-side lever: `spawn_put_usage_refresher` does not publish the read-fill
@@ -1084,7 +1043,7 @@ static READ_FILL_BOUNDS: std::sync::LazyLock<Mutex<HashMap<PathBuf, ReadFillBoun
 fn register_read_fill_bound(
     cache_dir: &Path,
     max_cache_size: u64,
-    usage: tokio::sync::watch::Receiver<Option<(std::time::Instant, u64)>>,
+    usage: tokio::sync::watch::Receiver<Option<PutUsageSnapshot>>,
 ) {
     let mut bounds = match READ_FILL_BOUNDS.lock() {
         Ok(bounds) => bounds,
@@ -1143,16 +1102,14 @@ pub(crate) fn read_fill_refusal(cache_dir: &Path, incoming_bytes: u64) -> Option
             Some(bound) => bound.max_cache_size,
         }
     };
-    // The published figure and what this process has admitted since it was produced, read as
-    // one pair so a refresh between the two reads cannot pair an old figure with a released
-    // addend. See `figure_with_addend` and `UnconsolidatedAdmissions`.
-    let (figure, unconsolidated) =
-        figure_with_addend(cache_dir, || published_put_usage_figure(cache_dir))?;
-    let total = figure.saturating_add(unconsolidated);
+    // The one whole-cache figure every `max_cache_size` admission reads. See
+    // `whole_cache_usage`.
+    let total = whole_cache_usage(cache_dir)?.total();
     if total.saturating_add(incoming_bytes) <= max_cache_size {
         return None;
     }
     READ_FILL_DECLINES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    note_size_refusal(cache_dir, incoming_bytes);
     log_read_fill_decline_rate_limited(total, incoming_bytes, max_cache_size);
     Some(READ_FILL_MAX_CACHE_SIZE_SKIP_REASON)
 }
@@ -1170,7 +1127,532 @@ fn published_put_usage_figure(cache_dir: &Path) -> Option<u64> {
         Err(poisoned) => poisoned.into_inner(),
     };
     let snapshot = *bounds.get(cache_dir)?.usage.borrow();
-    snapshot.map(|(_, figure)| figure)
+    snapshot.map(|snapshot| snapshot.figure)
+}
+
+/// The in-progress multipart part bytes `P` inside the `put_usage` snapshot published for
+/// `cache_dir`: the `P` every `max_cache_size` admission counts through [`whole_cache_usage`].
+/// `0` when no snapshot is published, which is when those admissions admit too (R7.5).
+///
+/// The read-tier eviction trigger and its pass add this to their projected `total_size`
+/// (`JournalConsolidator::read_tier_figure`), so they count the same `P`, of the same age, as the
+/// admissions. Two in-memory reads.
+pub(crate) fn published_in_progress_part_bytes(cache_dir: &Path) -> u64 {
+    let bounds = match READ_FILL_BOUNDS.lock() {
+        Ok(bounds) => bounds,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    bounds
+        .get(cache_dir)
+        .and_then(|bound| *bound.usage.borrow())
+        .map_or(0, |snapshot| snapshot.in_progress_part_bytes)
+}
+
+/// What the `max_cache_size` size refusals have asked the read tier to evict for, per cache
+/// directory.
+///
+/// # Why a refusal asks for eviction
+///
+/// The read-tier trigger fires above `eviction_trigger_percent` of `max_cache_size`. With the
+/// figure at or under the trigger, an object larger than the space left below `max_cache_size`
+/// is declined by every admission and nothing evicts for it, for as long as nothing else moves
+/// the figure; at a trigger of 100 that state is a fixed point. A refusal therefore records the
+/// size it declined, and the read tier also fires when its figure plus that size is over
+/// `max_cache_size` ([`read_tier_eviction_due`]).
+///
+/// # The cap
+///
+/// Only a size up to `cap`, half of `max_cache_size` minus the eviction target (10% of
+/// `max_cache_size` at the default 80% target), is recorded. When demand fires, the figure is
+/// over `max_cache_size - demand`, which is at least `cap` above the target, so the pass's
+/// shortfall (figure minus target) is positive and freeing it leaves room for the object with
+/// `cap` to spare. Between two demand passes the figure must climb from the target to over
+/// `max_cache_size - cap`, at least `cap` of admitted bytes. A larger refusal records nothing
+/// and is counted in `over_cap_refusals`.
+///
+/// # On a fleet
+///
+/// The demand is this process's. The process evaluates it on every consolidation cycle,
+/// including the cycles a peer wins the consolidation lock on
+/// (`JournalConsolidator::maybe_evict_on_own_demand`), and the pass it spawns takes
+/// `global_eviction.lock` as every pass does. Under that lock a pass on demand alone skips when
+/// the read tier's last pass completed after the latest refusal ([`served_demand`]), so the
+/// refusals one pass has already answered, on any proxy, buy no second pass.
+///
+/// # Futility
+///
+/// A pass on demand alone that leaves the figure too high for the object, because the read tier
+/// holds too little it can evict, would leave the same floor if run again. So a demand pass also
+/// reads the read tier's last pass result, whichever proxy wrote it, and skips when that pass
+/// left no room for the demand ([`demand_pass_futile`]) and completed after this process last saw
+/// the usage change. The size is then marked futile, here and at the end of a demand pass that
+/// left no room, and refusals of that size or larger record no demand until
+/// [`observe_eviction_usage`] sees the usage change: the figure over the trigger, where an
+/// over-trigger pass runs and its result is the new evidence, or the figure fallen to where the
+/// futile size fits. Only the demand arm is suppressed: the over-trigger arm of
+/// [`read_tier_eviction_due`] never reads the marker.
+///
+/// Only a pass whose bounded selection proved the evictable read tier exhausted is evidence of
+/// futility (`SelectedWork::exhausted_shortfall`, recorded in the result document): nothing
+/// excluded, every shard with a metadata directory partitioned and every partition readable,
+/// read to its end, not cap-bound and rebuilt within the lazy-rebuild interval, every journal
+/// read, and every unstaged byte the index names plus every byte a journal lists in a pending
+/// `Add` came to less than the pass asked for (`CacheManager::tail_exhaustion_shortfall`). The
+/// journals count because a fill's credit can be in the usage figure before any `.meta` lists
+/// it. Every other way a pass can end short is no evidence, so it marks nothing and a peer does
+/// not read its result as futile: a selection whose index could not cover every shard, one cut
+/// short by its rejected-open budget or the rank cap, and a result document from a build
+/// without the field. A way of ending short added later is no evidence either until it sets the
+/// field, so the cost of a case the rule does not know is an extra pass, never a suppressed one.
+///
+/// # Backoff
+///
+/// A pass on demand alone that ends short for any other reason is no evidence, and it would
+/// otherwise be followed by another as soon as a refusal arrives after it completes: at the
+/// design point's O(100 million) ranges, back-to-back passes holding `global_eviction.lock`.
+/// So a pass on demand alone that made no room for its demand records how many in a row have
+/// done so (`demand_backoff_streak` in the result document), and the next pass on demand alone,
+/// on any proxy, skips under the eviction lock until one `consolidation_interval` after it
+/// completed, doubling with each pass in the row, up to [`DEMAND_BACKOFF_CAP_SECS`]
+/// ([`demand_backoff_holds`]). The row ends when a pass makes room or runs over the trigger,
+/// either of which records no streak, and the delay stops holding when this process sees the
+/// usage change by the futility rule's test ([`observe_eviction_usage`]). The pass is skipped,
+/// not queued: the demand is released and the next refusal after the delay starts one. Over the
+/// trigger nothing here is read.
+#[derive(Default)]
+struct EvictionDemand {
+    /// Half of `max_cache_size` minus the eviction target, in bytes.
+    cap: u64,
+    /// The largest size up to `cap` refused since a pass last took the demand. `0` is none.
+    pending: u64,
+    /// The demand the running pass took when it was spawned, so the pass's own comparisons
+    /// still see it. Cleared, with `pending`, when the pass ends.
+    serving: u64,
+    /// When the latest refusal `pending` holds was recorded, in whole seconds since the Unix
+    /// epoch, so a refusal after a pass completed is never read as served by that pass
+    /// ([`served_demand`]). `0` while `pending` is `0`.
+    recorded_at: u64,
+    /// `recorded_at` of the demand the running pass took.
+    serving_recorded_at: u64,
+    /// Read-tier passes spawned with the figure at or under the trigger, on demand alone.
+    demand_passes: u64,
+    /// Size refusals larger than `cap`, which record no demand.
+    over_cap_refusals: u64,
+    /// Demand passes that skipped under the eviction lock because a pass had already run for
+    /// their demand ([`served_demand`]).
+    dedup_skips: u64,
+    /// The smallest demand size a read-tier pass was found to leave no room for
+    /// ([`demand_pass_futile`]). Refusals of this size or larger record no demand while it is
+    /// set. `0` is none.
+    futile: u64,
+    /// When this process last saw the usage change enough to try a futile size again
+    /// ([`observe_eviction_usage`]), in whole seconds since the Unix epoch. `0` before the first.
+    usage_changed_at: u64,
+    /// Demand passes that skipped under the eviction lock because the demand backoff still held
+    /// ([`demand_backoff_holds`]).
+    backoff_skips: u64,
+}
+
+/// [`EvictionDemand`] per cache directory. A registry for the reason [`READ_FILL_BOUNDS`] is
+/// one: the refusals sit on `DiskCacheManager`, `CacheManager` and `SignedPutHandler`, and the
+/// trigger on `JournalConsolidator`, with no object common to all of them.
+static EVICTION_DEMAND: std::sync::LazyLock<Mutex<HashMap<PathBuf, EvictionDemand>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Run `f` against `cache_dir`'s demand, or return `None` when none is registered.
+fn with_eviction_demand<T>(
+    cache_dir: &Path,
+    f: impl FnOnce(&mut EvictionDemand) -> T,
+) -> Option<T> {
+    let mut map = match EVICTION_DEMAND.lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.get_mut(cache_dir).map(f)
+}
+
+/// Enable demand recording for `cache_dir`, with the cap derived from `max_cache_size` and
+/// `eviction_target_percent` as the pass derives its target. Called beside
+/// [`register_read_fill_bound`]; with nothing registered, refusals record nothing and every
+/// comparison reads a demand of 0.
+pub(crate) fn register_eviction_demand(
+    cache_dir: &Path,
+    max_cache_size: u64,
+    eviction_target_percent: u8,
+) {
+    let target = (max_cache_size as f64 * (eviction_target_percent as f64 / 100.0)) as u64;
+    let cap = max_cache_size.saturating_sub(target) / 2;
+    let mut map = match EVICTION_DEMAND.lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.entry(cache_dir.to_path_buf()).or_default().cap = cap;
+}
+
+/// Record a `max_cache_size` size refusal of `incoming_bytes` for `cache_dir`. Called on the
+/// decline branch of each admission that adds its incoming object to [`whole_cache_usage`]:
+/// [`read_fill_refusal`], write-through component 1 (`CacheManager::disk_safety_refusal`) and
+/// the PUT router (`SignedPutHandler::should_cache`). One mutex and no I/O.
+pub(crate) fn note_size_refusal(cache_dir: &Path, incoming_bytes: u64) {
+    with_eviction_demand(cache_dir, |demand| {
+        if incoming_bytes == 0 {
+            return;
+        }
+        if incoming_bytes <= demand.cap {
+            // No pass can make room for it until the usage changes. See [`EvictionDemand`].
+            if demand.futile > 0 && incoming_bytes >= demand.futile {
+                return;
+            }
+            demand.recorded_at = unix_now_secs();
+            demand.pending = demand.pending.max(incoming_bytes);
+        } else {
+            demand.over_cap_refusals = demand.over_cap_refusals.saturating_add(1);
+        }
+    });
+}
+
+/// The demand every read-tier comparison adds: what the refusals recorded, or what the running
+/// pass took, whichever is larger. `0` when nothing is registered.
+pub(crate) fn eviction_demand(cache_dir: &Path) -> u64 {
+    with_eviction_demand(cache_dir, |demand| demand.pending.max(demand.serving)).unwrap_or(0)
+}
+
+/// A read-tier pass is being spawned: it takes the recorded demand, so one burst of refusals
+/// buys at most one pass. `on_demand_alone` counts the pass in `demand_passes`.
+pub(crate) fn take_eviction_demand(cache_dir: &Path, on_demand_alone: bool) {
+    with_eviction_demand(cache_dir, |demand| {
+        demand.serving = demand.pending;
+        demand.pending = 0;
+        demand.serving_recorded_at = demand.recorded_at;
+        demand.recorded_at = 0;
+        if on_demand_alone {
+            demand.demand_passes = demand.demand_passes.saturating_add(1);
+        }
+    });
+}
+
+/// The pass spawned after [`take_eviction_demand`] has ended. Its demand, and anything refused
+/// while it ran, is cleared: those refusals were against the figure the pass was freeing.
+pub(crate) fn release_eviction_demand(cache_dir: &Path) {
+    with_eviction_demand(cache_dir, |demand| {
+        demand.serving = 0;
+        demand.pending = 0;
+        demand.recorded_at = 0;
+        demand.serving_recorded_at = 0;
+    });
+}
+/// When the demand a read-tier pass serves was first recorded, in whole seconds since the Unix
+/// epoch: the running pass's own demand, else the recorded one. `None` with no demand.
+fn eviction_demand_recorded_at(cache_dir: &Path) -> Option<u64> {
+    with_eviction_demand(cache_dir, |demand| {
+        if demand.serving > 0 {
+            Some(demand.serving_recorded_at)
+        } else if demand.pending > 0 {
+            Some(demand.recorded_at)
+        } else {
+            None
+        }
+    })
+    .flatten()
+}
+/// `Some((completed_at, recorded_at))` when the read tier's last pass result
+/// (`eviction_last_result.json`) completed after the current demand was recorded: a pass already
+/// ran for this demand, so a pass on demand alone has nothing to add. `None` otherwise, and with
+/// no demand or no result.
+///
+/// The lock holder reads it under `global_eviction.lock`, and both read-tier passes write the
+/// result before they release that lock, so no pass can complete between this read and the
+/// decision it feeds. `recorded_at` is the latest refusal, so a demand pass skips only when
+/// every refusal it holds came before the last pass completed, and a refusal after that pass
+/// buys a pass of its own.
+///
+/// Both times are whole seconds and compared with `>`, so a demand recorded in the same second
+/// the last pass completed buys one more pass rather than none. When a peer wrote the result the
+/// two times come from two hosts' clocks.
+fn served_demand(
+    cache_dir: &Path,
+    last: Option<&crate::eviction_result::EvictionPassResult>,
+) -> Option<(u64, u64)> {
+    let recorded_at = eviction_demand_recorded_at(cache_dir)?;
+    let completed_at = last?.completed_at;
+    (completed_at > recorded_at).then_some((completed_at, recorded_at))
+}
+
+/// Whether a read-tier pass that read the whole evictable read tier left no room for `demand`:
+/// the lowest floor any pass could reach, `target` plus `exhausted_shortfall`
+/// (`SelectedWork::exhausted_shortfall`), is over `max_cache_size - demand`. Every proxy derives
+/// `target` from the same configuration, so a peer's result reads the same here as on the proxy
+/// that wrote it.
+///
+/// Read fills since the pass add evictable bytes and so do not lower that floor. Write-through
+/// PUTs and multipart parts add staged or in-progress bytes the read tier cannot evict, which
+/// raise it. Only bytes the read tier could not evict leaving the volume lower it, and those show
+/// as the usage falling.
+fn demand_pass_futile(
+    exhausted_shortfall: u64,
+    demand: u64,
+    target: u64,
+    max_cache_size: u64,
+) -> bool {
+    demand > 0
+        && target
+            .saturating_add(exhausted_shortfall)
+            .saturating_add(demand)
+            > max_cache_size
+}
+
+/// The longest the demand backoff holds a pass on demand alone, in seconds
+/// ([`demand_backoff_delay`]). A constant, not a setting (Ed, 2026-11-11).
+pub(crate) const DEMAND_BACKOFF_CAP_SECS: u64 = 3_600;
+
+/// How long after a pass on demand alone that made no room the next one may start, in whole
+/// seconds: one `consolidation_interval` (rounded up to whole seconds, at least 1) when `streak`,
+/// the passes in the row including that one, is 1, doubling with each further pass, capped at
+/// [`DEMAND_BACKOFF_CAP_SECS`].
+fn demand_backoff_delay(streak: u32, consolidation_interval: Duration) -> u64 {
+    let base = (consolidation_interval.as_secs_f64().ceil() as u64).max(1);
+    let doublings = streak.saturating_sub(1).min(31);
+    base.saturating_mul(1u64 << doublings)
+        .min(DEMAND_BACKOFF_CAP_SECS)
+}
+
+/// `Some((completed_at, streak, delay))` when a pass on demand alone must skip on the demand
+/// backoff ([`EvictionDemand`]): `last`, the read tier's last pass result, whichever proxy wrote
+/// it, records a row of `streak` demand passes that made no room, it completed after this
+/// process last saw the usage change, and `now` is under `delay` seconds after it completed.
+/// `None` for a pass that is not on demand alone, whatever the document says.
+///
+/// Read and written under `global_eviction.lock`, so across the fleet at most one pass on demand
+/// alone starts per delay after the last one completed. When a peer wrote the result, the two
+/// times come from two hosts' clocks.
+fn demand_backoff_holds(
+    cache_dir: &Path,
+    on_demand_alone: bool,
+    last: Option<&(
+        crate::eviction_result::EvictionPassResult,
+        crate::eviction_result::PassEvidence,
+    )>,
+    consolidation_interval: Duration,
+    now: u64,
+) -> Option<(u64, u32, u64)> {
+    if !on_demand_alone {
+        return None;
+    }
+    let (result, evidence) = last?;
+    let streak = evidence.demand_backoff_streak?;
+    if result.completed_at <= eviction_usage_changed_at(cache_dir) {
+        return None;
+    }
+    let delay = demand_backoff_delay(streak, consolidation_interval);
+    (now < result.completed_at.saturating_add(delay)).then_some((
+        result.completed_at,
+        streak,
+        delay,
+    ))
+}
+
+/// The `demand_backoff_streak` a pass on demand alone that has just ended records: `None` when it
+/// made room for `demand` (`target` plus its own `shortfall_bytes` leaves room under
+/// `max_cache_size`), which ends the row; otherwise one more than the streak of `last`, the pass
+/// before it, while that one still counts (completed after this process last saw the usage
+/// change), else 1.
+fn demand_backoff_streak_after(
+    cache_dir: &Path,
+    last: Option<&(
+        crate::eviction_result::EvictionPassResult,
+        crate::eviction_result::PassEvidence,
+    )>,
+    shortfall_bytes: u64,
+    demand: u64,
+    target: u64,
+    max_cache_size: u64,
+) -> Option<u32> {
+    if !demand_pass_futile(shortfall_bytes, demand, target, max_cache_size) {
+        return None;
+    }
+    let previous = last
+        .filter(|(result, _)| result.completed_at > eviction_usage_changed_at(cache_dir))
+        .and_then(|(_, evidence)| evidence.demand_backoff_streak)
+        .unwrap_or(0);
+    Some(previous.saturating_add(1))
+}
+
+/// Mark `demand` futile for `cache_dir`: refusals of it or anything larger record no demand
+/// until [`observe_eviction_usage`] clears the mark.
+fn note_futile_eviction_demand(cache_dir: &Path, demand: u64) {
+    with_eviction_demand(cache_dir, |state| {
+        if demand > 0 && (state.futile == 0 || demand < state.futile) {
+            state.futile = demand;
+        }
+    });
+}
+
+/// A pass on demand alone has published its result: mark the demand it served futile when the
+/// pass read the whole evictable read tier (`exhausted_shortfall` is `Some`) and that left no
+/// room for it. `None` marks nothing.
+fn note_demand_pass_end(
+    cache_dir: &Path,
+    exhausted_shortfall: Option<u64>,
+    target: u64,
+    max_cache_size: u64,
+) {
+    let demand = eviction_demand(cache_dir);
+    if exhausted_shortfall.is_some_and(|s| demand_pass_futile(s, demand, target, max_cache_size)) {
+        note_futile_eviction_demand(cache_dir, demand);
+    }
+}
+
+/// When this process last saw the usage change enough to try a futile size again. `0` before
+/// the first, so any pass result counts as evidence.
+fn eviction_usage_changed_at(cache_dir: &Path) -> u64 {
+    with_eviction_demand(cache_dir, |demand| demand.usage_changed_at).unwrap_or(0)
+}
+
+/// The futile size marked for `cache_dir`, `0` for none.
+#[cfg(test)]
+pub(crate) fn eviction_demand_futile(cache_dir: &Path) -> u64 {
+    with_eviction_demand(cache_dir, |demand| demand.futile).unwrap_or(0)
+}
+
+/// The consolidation cycle's in-memory look at `usage` ([`whole_cache_usage`]) for the futility
+/// rule ([`EvictionDemand`]). The usage has changed enough to try again when it is over the
+/// trigger, where an over-trigger pass runs and publishes a newer result, or when the futile
+/// size fits beside it: the figure has fallen by at least what the futile pass fell short of
+/// making room by. Either clears the mark and stamps `usage_changed_at`, so a pass result older
+/// than the change no longer counts as evidence. One mutex, no I/O.
+///
+/// A fall to where any recordable demand fits (`usage + cap <= max_cache_size`) also stamps
+/// `usage_changed_at`, marker or not: a proxy that never held a size futile still skipped on a
+/// peer's older result, and without the stamp that result would stand until a change this proxy
+/// sees for a size it has marked.
+pub(crate) fn observe_eviction_usage(
+    cache_dir: &Path,
+    usage: u64,
+    trigger_threshold: u64,
+    max_cache_size: u64,
+) {
+    with_eviction_demand(cache_dir, |demand| {
+        let over = usage > trigger_threshold;
+        let fits = demand.futile > 0 && usage.saturating_add(demand.futile) <= max_cache_size;
+        let room_for_any = demand.cap > 0 && usage.saturating_add(demand.cap) <= max_cache_size;
+        if over || fits || room_for_any {
+            demand.usage_changed_at = unix_now_secs();
+        }
+        if over || fits {
+            demand.futile = 0;
+        }
+    });
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// A demand pass skipped under the eviction lock: [`served_demand`] found a pass that had
+/// already run for its demand.
+fn note_eviction_demand_dedup_skip(cache_dir: &Path) {
+    with_eviction_demand(cache_dir, |demand| {
+        demand.dedup_skips = demand.dedup_skips.saturating_add(1);
+    });
+}
+/// A demand pass skipped under the eviction lock on the demand backoff ([`demand_backoff_holds`]).
+fn note_eviction_demand_backoff_skip(cache_dir: &Path) {
+    with_eviction_demand(cache_dir, |demand| {
+        demand.backoff_skips = demand.backoff_skips.saturating_add(1);
+    });
+}
+/// Demand passes `cache_dir`'s process skipped on the demand backoff, since start
+/// (`cache.eviction_demand_backoff_skips_total`). The read tier's barren memo counts them as
+/// progress (`JournalConsolidator::read_tier_author_progress`).
+pub(crate) fn eviction_demand_backoff_skips(cache_dir: &Path) -> u64 {
+    with_eviction_demand(cache_dir, |demand| demand.backoff_skips).unwrap_or(0)
+}
+/// Demand passes `cache_dir`'s process skipped because a pass had already run for their demand,
+/// since start.
+pub(crate) fn eviction_demand_dedup_skips(cache_dir: &Path) -> u64 {
+    with_eviction_demand(cache_dir, |demand| demand.dedup_skips).unwrap_or(0)
+}
+/// `(passes spawned on demand alone, refusals above the cap)` for `cache_dir`, since start.
+pub(crate) fn eviction_demand_counters(cache_dir: &Path) -> (u64, u64) {
+    with_eviction_demand(cache_dir, |demand| {
+        (demand.demand_passes, demand.over_cap_refusals)
+    })
+    .unwrap_or((0, 0))
+}
+
+/// The read tier's one trigger predicate: `figure` is over `trigger_threshold`, or a size
+/// refusal's `demand` would not fit beside it under `max_cache_size`. Every read-tier comparison
+/// uses it: `JournalConsolidator::maybe_trigger_eviction` and `read_tier_over_trigger`, and the
+/// pass's pre-lock, post-lock and legacy-pass gates. See [`EvictionDemand`].
+pub(crate) fn read_tier_eviction_due(
+    figure: u64,
+    trigger_threshold: u64,
+    max_cache_size: u64,
+    demand: u64,
+) -> bool {
+    figure > trigger_threshold || (demand > 0 && figure.saturating_add(demand) > max_cache_size)
+}
+
+/// The whole-cache figure every `max_cache_size` admission decides on: write-through component 1
+/// ([`CacheManager::disk_safety_refusal`], at a PUT's cache tee and at `CreateMultipartUpload`),
+/// the PUT router ([`CacheManager::put_capacity_usage`], which also sizes `UploadPart`) and a
+/// read fill ([`read_fill_refusal`]). Each adds its incoming object to [`WholeCacheUsage::total`].
+///
+/// `published` is the `put_usage` snapshot, `CacheManager::put_usage_figure` refreshed every
+/// [`PUT_USAGE_REFRESH_INTERVAL`]: `size_state.json`'s `total_size` plus the in-progress
+/// multipart part bytes `P`, at both staged-authority epochs. `unconsolidated` is what this
+/// process has credited that the snapshot cannot contain yet. The two are read as one pair (see
+/// [`figure_with_addend`]), so a refresh landing between the reads cannot pair an old figure
+/// with an already-released addend.
+///
+/// # One figure, so one age and one composition
+///
+/// `max_cache_size` bounds the bytes on the volume under `cache_dir`, and parts in progress are
+/// on it, so every admission counts them, and a `CreateMultipartUpload` is checked against the
+/// same figure as the parts that follow it. The price of reading the snapshot is age: the figure
+/// is up to one refresh interval plus one refresh's duration older than `size_state.json`, so
+/// what peers consolidated over that interval is in the overshoot bound of every admission. This
+/// process's own admissions are not: `unconsolidated` keeps them until a published figure holds
+/// them.
+///
+/// `None` when no snapshot is published for `cache_dir`: no refresher has started, or its first
+/// read has not finished. Component 1 and read fills then admit, the R7.5 fail-open posture; the
+/// router forwards the write uncached.
+pub(crate) fn whole_cache_usage(cache_dir: &Path) -> Option<WholeCacheUsage> {
+    let (published, unconsolidated) =
+        figure_with_addend(cache_dir, || published_put_usage_figure(cache_dir))?;
+    Some(WholeCacheUsage {
+        published,
+        unconsolidated,
+    })
+}
+
+/// [`whole_cache_usage`]'s two terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WholeCacheUsage {
+    /// The `put_usage` snapshot: `total_size + P`.
+    pub(crate) published: u64,
+    /// Bytes this process credited that the snapshot cannot contain yet.
+    pub(crate) unconsolidated: u64,
+}
+
+impl WholeCacheUsage {
+    /// The figure an admission adds its incoming object to.
+    pub(crate) fn total(self) -> u64 {
+        self.published.saturating_add(self.unconsolidated)
+    }
+}
+
+/// One `put_usage` snapshot, as `CacheManager::spawn_put_usage_refresher` publishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PutUsageSnapshot {
+    /// What every `max_cache_size` admission reads: `size_state.json`'s `total_size` plus `P`.
+    pub(crate) figure: u64,
+    /// The `P` inside `figure`, kept apart for the read-tier eviction trigger. See
+    /// [`published_in_progress_part_bytes`].
+    pub(crate) in_progress_part_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1183,9 +1665,8 @@ fn published_put_usage_figure(cache_dir: &Path) -> Option<u64> {
 ///
 /// # Why the decisions need it
 ///
-/// Both `max_cache_size` decisions — [`read_fill_refusal`] for a GET-miss fill and
-/// [`CacheManager::disk_safety_refusal`]'s component 1 for a write-through upload — compare
-/// against `size_state.json`'s `total_size`. That document changes only when a consolidation
+/// Every `max_cache_size` decision reads [`whole_cache_usage`], whose figure holds
+/// `size_state.json`'s `total_size`. That document changes only when a consolidation
 /// cycle finishes its delta step: measured gaps are a median of 4-5 s on FSx for OpenZFS and 7
 /// to 16 s on FSx for NetApp ONTAP, with maxima of 25 s and 33 s. While the figure reads below
 /// the limit every arrival is admitted at the offered rate, so a proxy outran its own reading
@@ -1222,6 +1703,10 @@ struct UnconsolidatedAdmissions {
     /// Bumped by every release. A reader pairs a figure with an addend by reading this before
     /// and after it reads the figure: see [`figure_with_addend`].
     release_epoch: u64,
+    /// `(delta file renamed aside as corrupt, the bytes its record may drop to)`, noted by a
+    /// census install that has persisted a figure holding the rest, and applied by the usage
+    /// refresher after it publishes a figure read later. See [`note_census_release_targets`].
+    census_targets: HashMap<PathBuf, u64>,
 }
 
 /// Cap on retained flush records. One record per flush of this instance that no cycle has
@@ -1307,32 +1792,15 @@ pub(crate) fn note_delta_file_flushed(cache_dir: &Path, file: Option<PathBuf>, b
     });
 }
 
-/// A validation census re-grounded the figure from the volume itself, so every byte already
-/// written is in it and the accumulator's unflushed delta was discarded. Called from
-/// `SizeAccumulator::reset`. Without this, credits discarded by the reset would be added for
-/// the rest of the process's life. It is also what releases a record whose file was renamed
-/// aside as corrupt: see [`consumed_delta_files`].
-pub(crate) fn note_accounting_reground(cache_dir: &Path) {
-    with_unconsolidated(cache_dir, |state| {
-        state.unflushed = 0;
-        state.pending.clear();
-        state.release_epoch = state.release_epoch.wrapping_add(1);
-    });
-}
-
-/// The addend both `max_cache_size` decisions apply to the figure they read: bytes this process
-/// credited that no cycle has folded into it.
+/// The addend every `max_cache_size` decision applies to the figure it reads (bytes this
+/// process credited that no cycle has folded into it), and the release epoch, as one read. The
+/// pair is what makes [`figure_with_addend`] able to tell a release apart from a fresh
+/// admission.
 ///
-/// `0` when no refresher is publishing figures for this directory, so a process with no
-/// release running never accumulates a permanent decline. Evicted and debited bytes are not
-/// subtracted here; the figure carries its own debits.
-pub(crate) fn unconsolidated_admitted_bytes(cache_dir: &Path) -> u64 {
-    unconsolidated_addend_and_epoch(cache_dir).0
-}
-
-/// The addend and the release epoch as one read, which is what makes [`figure_with_addend`]
-/// able to tell a release apart from a fresh admission.
-fn unconsolidated_addend_and_epoch(cache_dir: &Path) -> (u64, u64) {
+/// The addend is `0` when no refresher is publishing figures for this directory, so a process
+/// with no release running never accumulates a permanent decline. Evicted and debited bytes are
+/// not subtracted here; the figure carries its own debits.
+pub(crate) fn unconsolidated_addend_and_epoch(cache_dir: &Path) -> (u64, u64) {
     with_unconsolidated(cache_dir, |state| {
         if !state.reset_live {
             return (0, state.release_epoch);
@@ -1354,7 +1822,7 @@ fn unconsolidated_addend_and_epoch(cache_dir: &Path) -> (u64, u64) {
 /// can therefore land between the two and pair an old figure with an already-released, lower
 /// addend, which under-declares by one cycle's bytes and admits a fill that does not fit. The
 /// addend's own lock cannot be held across the figure read — the figure comes out of a
-/// different registry, and on the write path out of `size_state.json` — so the pair is checked
+/// different registry — so the pair is checked
 /// rather than locked: the release epoch is read before and after, and an attempt whose epoch
 /// moved is discarded. A fresh admission between the reads does not move the epoch and needs no
 /// retry: those bytes belong in the total either way.
@@ -1435,16 +1903,19 @@ fn run_paired_read_seam(cache_dir: &Path) {
 /// `collect_deltas` renames an unparseable `delta_*.json` to `{name}.corrupt` and applies
 /// nothing from it, so the record's own path is gone while the figure never absorbed its bytes.
 /// Releasing on absence alone would drop them from both. The aside name is therefore checked,
-/// and those bytes stay in the count until the next validation census re-grounds the figure
-/// from the volume ([`note_accounting_reground`]) or the process restarts. The over-decline
-/// that costs is bounded by the bytes of the files renamed aside, which is at most one flush
-/// interval's credits per corrupt file, and the census that ends it runs daily.
+/// and those bytes stay in the count until a census install brings them into the figure from
+/// the volume or the process restarts: all of them at a full scan's install
+/// ([`release_corrupt_delta_records`]), and at a rolling install the part its extrapolation
+/// counted (`CacheSizeTracker::corrupt_release_targets`). The over-decline that costs is
+/// bounded by the bytes of the files renamed aside, which is at most one flush interval's
+/// credits per corrupt file.
 ///
 /// A cycle that failed before persisting keeps its files, so nothing is released on a failed
 /// cycle. A restart drops the count to zero with the previous process's files still pending:
 /// those bytes are missing from the figure until a cycle applies them, which is the pre-existing
-/// peer-shaped lag rather than a new one. A validation install deletes delta files without
-/// applying them, and [`note_accounting_reground`] covers that in the same call.
+/// peer-shaped lag rather than a new one. Neither validation install deletes a delta file, so
+/// every pending record is either consumed by a cycle or released as corrupt, as a census
+/// counts its bytes.
 pub(crate) async fn consumed_delta_files(cache_dir: &Path) -> Vec<PathBuf> {
     let pending = with_unconsolidated(cache_dir, |state| state.pending.clone());
     let mut consumed = Vec::new();
@@ -1471,6 +1942,158 @@ fn corrupt_aside_path(path: &Path) -> PathBuf {
     let mut aside = path.as_os_str().to_os_string();
     aside.push(".corrupt");
     PathBuf::from(aside)
+}
+
+/// The records whose delta file was renamed aside as corrupt, with the bytes each still counts.
+///
+/// `collect_deltas` renames an unparseable `delta_*.json` to `{name}.corrupt` and applies
+/// nothing from it, so [`consumed_delta_files`] keeps its bytes counted here: releasing on the
+/// record's absence alone would drop them from both the figure and the count. The writer renames
+/// a complete temp file into place and never rewrites one, so the file was unparseable from the
+/// start: no validation baseline's pending sum and no `size_state.json` ever held those bytes,
+/// and only a census reading the volume can bring them into the figure.
+pub(crate) async fn corrupt_delta_records(cache_dir: &Path) -> Vec<(PathBuf, u64)> {
+    let pending = with_unconsolidated(cache_dir, |state| state.pending.clone());
+    let mut corrupt = Vec::new();
+    for (path, bytes) in pending {
+        // An error reading either name counts as not aside, the direction that keeps the bytes
+        // counted.
+        if tokio::fs::try_exists(&path).await.unwrap_or(true) {
+            continue;
+        }
+        if tokio::fs::try_exists(corrupt_aside_path(&path))
+            .await
+            .unwrap_or(false)
+        {
+            corrupt.push((path, bytes));
+        }
+    }
+    corrupt
+}
+
+/// A full scan's install has brought every corrupt record's bytes into the figure, so each may
+/// drop to zero once the refresher has published a figure read after the install.
+///
+/// Its census counts the data on the volume, the ranges whose credit the corrupt file carried
+/// included, while its baseline sums only the delta files it could parse, so the correction it
+/// applies brings those bytes into `size_state.json`. Counting them here as well would then
+/// decline admissions by their size for the rest of the process's life. A record whose file is
+/// still pending is left alone: the baseline nets its credit out of the correction, and the
+/// credit reaches the figure later through the delta pipeline.
+pub(crate) async fn release_corrupt_delta_records(cache_dir: &Path) {
+    let targets: Vec<(PathBuf, u64)> = corrupt_delta_records(cache_dir)
+        .await
+        .into_iter()
+        .map(|(path, _)| (path, 0))
+        .collect();
+    note_census_release_targets(cache_dir, &targets);
+}
+
+/// Note that a census install has persisted a figure holding all but `bytes` of each named
+/// corrupt record's credit, so each record may drop to its `bytes`.
+///
+/// # Applied by the refresher, after it publishes
+///
+/// The decisions read the figure the usage refresher last published, which can predate the
+/// install by up to [`PUT_USAGE_REFRESH_INTERVAL`]. Shrinking the record here would pair that
+/// figure, which lacks the bytes, with an addend that no longer holds them, and admit past
+/// `max_cache_size` until the next refresh. So the target waits: the refresher reads it before
+/// the figure and applies it after publishing, the order [`consumed_delta_files`] uses. A target
+/// present when the refresher looked was noted after its install persisted, so the figure read
+/// after that contains the install.
+///
+/// A later target for a record replaces one not yet applied.
+pub(crate) fn note_census_release_targets(cache_dir: &Path, targets: &[(PathBuf, u64)]) {
+    if targets.is_empty() {
+        return;
+    }
+    with_unconsolidated(cache_dir, |state| {
+        for (path, bytes) in targets {
+            if state.pending.iter().any(|(pending, _)| pending == path) {
+                state.census_targets.insert(path.clone(), *bytes);
+            }
+        }
+    });
+}
+
+/// The census release targets noted so far. The refresher reads them BEFORE the figure.
+pub(crate) fn census_release_targets(cache_dir: &Path) -> Vec<(PathBuf, u64)> {
+    with_unconsolidated(cache_dir, |state| {
+        state
+            .census_targets
+            .iter()
+            .map(|(path, bytes)| (path.clone(), *bytes))
+            .collect()
+    })
+}
+
+/// Apply `targets`, read before the figure the refresher has since published: each named record
+/// is set to its target and dropped at zero. A target replaced since it was read is left for the
+/// next refresh, and a target whose record is gone (consumed, or past the cap) is dropped.
+pub(crate) fn apply_census_release_targets(cache_dir: &Path, targets: &[(PathBuf, u64)]) {
+    if targets.is_empty() {
+        return;
+    }
+    with_unconsolidated(cache_dir, |state| {
+        let mut released = false;
+        for (path, target) in targets {
+            match state.census_targets.get(path) {
+                Some(noted) if noted == target => {
+                    state.census_targets.remove(path);
+                }
+                // Replaced since it was read. The newer target can sit a byte above this one,
+                // so applying this one would hold less than the figure lacks; the newer target
+                // waits for the next refresh, whose figure is read after its install.
+                Some(_) => continue,
+                None => {}
+            }
+            let Some(index) = state
+                .pending
+                .iter()
+                .position(|(pending, _)| pending == path)
+            else {
+                continue;
+            };
+            if *target == 0 {
+                state.pending.remove(index);
+                released = true;
+            } else {
+                // Set rather than taken as a minimum: inside one cycle a target can sit a byte
+                // above the previous one (`CacheSizeTracker::corrupt_release_targets`), and the
+                // record must hold at least what the figure lacks.
+                released |= *target < state.pending[index].1;
+                state.pending[index].1 = *target;
+            }
+        }
+        let pending = &state.pending;
+        state
+            .census_targets
+            .retain(|path, _| pending.iter().any(|(kept, _)| kept == path));
+        if released {
+            state.release_epoch = state.release_epoch.wrapping_add(1);
+        }
+    });
+}
+
+/// A test's pause in the usage refresher, per cache directory: `(reached, release)`. The
+/// refresher notifies `reached` just before it publishes a figure and waits for `release`.
+#[cfg(test)]
+type RefresherPause = Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+#[cfg(test)]
+static REFRESHER_PUBLISH_PAUSES: std::sync::LazyLock<Mutex<HashMap<PathBuf, RefresherPause>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The refresher's pause point, just before it publishes: a no-op unless a test armed one.
+#[cfg(test)]
+async fn refresher_publish_pause(cache_dir: &Path) {
+    let pause = match REFRESHER_PUBLISH_PAUSES.lock() {
+        Ok(map) => map.get(cache_dir).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(cache_dir).cloned(),
+    };
+    if let Some(pause) = pause {
+        pause.0.notify_one();
+        pause.1.notified().await;
+    }
 }
 
 /// Release the records for `consumed`, whose bytes the published figure now holds. Exactly
@@ -1695,9 +2318,11 @@ pub(crate) fn register_read_fill_bound_for_test(
     cache_dir: &Path,
     max_cache_size: u64,
     figure: Option<u64>,
-) -> tokio::sync::watch::Sender<Option<(std::time::Instant, u64)>> {
-    let (tx, rx) =
-        tokio::sync::watch::channel(figure.map(|figure| (std::time::Instant::now(), figure)));
+) -> tokio::sync::watch::Sender<Option<PutUsageSnapshot>> {
+    let (tx, rx) = tokio::sync::watch::channel(figure.map(|figure| PutUsageSnapshot {
+        figure,
+        in_progress_part_bytes: 0,
+    }));
     register_read_fill_bound(cache_dir, max_cache_size, rx);
     tx
 }
@@ -2482,7 +3107,6 @@ impl Default for CacheStatistics {
 /// Write cache size tracking for PUT operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WriteCacheSizeTracker {
-    pub current_size: u64,
     pub max_object_size: u64,
     pub max_percent: f32,
 }
@@ -2490,7 +3114,6 @@ struct WriteCacheSizeTracker {
 impl Default for WriteCacheSizeTracker {
     fn default() -> Self {
         Self {
-            current_size: 0,
             max_object_size: 256 * 1024 * 1024, // 256 MiB default
             max_percent: 10.0,                  // 10% default
         }
@@ -2742,7 +3365,7 @@ impl EvictionLeaf {
 
 /// One object's eviction plan: its cache key, and the ranges of it this pass selected.
 ///
-/// The shape `group_candidates_by_object` and `order_plans_whole_object_first` already pass
+/// The shape `group_verified_by_object` and `order_plans_whole_object_first` already pass
 /// around, named here so the grouping's signatures stay readable.
 type ObjectEvictionPlan = (String, Vec<RangeEvictionCandidate>);
 
@@ -2808,6 +3431,8 @@ pub(crate) struct WorklistAuthored {
     /// Unfinished chunks of `previous` whose done-marker read failed with an I/O error twice
     /// (review issue 3). Each defers the author; each is logged at WARN with its path.
     pub markers_unreadable: u64,
+    /// `SelectedWork::exhausted_shortfall` of the selection behind this list.
+    pub exhausted_shortfall: Option<u64>,
 }
 
 /// Test seams inside the author. Empty outside tests.
@@ -3010,6 +3635,11 @@ const EXECUTOR_NO_LEASE_TAKEOVER: bool = false;
 /// Red-side lever: a failed flush still runs on to the done-marker.
 #[cfg(test)]
 const EXECUTOR_DONE_AFTER_FAILED_FLUSH: bool = false;
+/// Test seam: the size the legacy pass's drain guard returns for a cache directory, in
+/// place of the consolidator's projected figure, so a test can put the figure after the guard on
+/// the other side of the trigger from the figure the pass was decided on.
+#[cfg(test)]
+static LEGACY_GUARD_SIZE_OVERRIDE: Mutex<Option<(PathBuf, u64)>> = Mutex::new(None);
 /// Red-side lever (fix 5): the legacy pass sizes itself from the pre-guard figure without
 /// waiting for the work list's in-flight batches.
 #[cfg(test)]
@@ -3240,10 +3870,13 @@ struct SelectedWork {
     /// The plans, R3.9-ordered and grouped by leaf directory (R14.1). Empty where the pass found
     /// nothing to evict.
     leaf_groups: Vec<LeafEvictionGroup>,
-    /// Whether the full-population collector ran because the bounded selection chose nothing.
-    // Read by the bounded-versus-full equivalence test only; the pass needs only `leaf_groups`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fallback_ran: bool,
+    /// `Some(bytes_to_free - seen)` only when the bounded selection proved the evictable read
+    /// tier holds less than the pass asked for (`TailSelectionOutcome::exhausted_shortfall`,
+    /// `CacheManager::tail_exhaustion_shortfall`): the shortfall a pass that evicted every one of
+    /// those bytes would still have, so no repeat pass can do better until the usage changes.
+    /// `None` in every other case. The futility rule reads `None` as no evidence
+    /// (`EvictionDemand`).
+    exhausted_shortfall: Option<u64>,
 }
 
 /// What [`CacheManager::account_evicted`] counted, for the pass's summary line and result document.
@@ -3256,10 +3889,10 @@ struct EvictionAccounting {
 }
 
 impl SelectedWork {
-    fn empty(fallback_ran: bool) -> Self {
+    fn empty(exhausted_shortfall: Option<u64>) -> Self {
         Self {
             leaf_groups: Vec::new(),
-            fallback_ran,
+            exhausted_shortfall,
         }
     }
 }
@@ -6171,6 +6804,47 @@ pub(crate) fn reap_write_marker_if_stale(
 // A marker that is present but does not parse yet (a sibling capture between its create
 // and its write) is read again for a few milliseconds before the capture gives up.
 
+/// The capturing proxy's in-memory copies of a key that a fill must clear after it removed
+/// the key's cached version for another version it read from S3
+/// ([`CacheManager::remove_other_version_locked`]): the RAM metadata copy, the RAM range
+/// entries, the fill-visibility record, and the staged-entry gauge when the removed object was
+/// staged. Peers' RAM metadata copies expire within their `refresh_interval`, as after a
+/// HEAD-detected change.
+pub(crate) struct VersionChangeSink {
+    metadata_cache: Arc<crate::metadata_cache::MetadataCache>,
+    ram_cache: Option<Arc<ShardedRamCache>>,
+    fill_visibility_tracker: Arc<crate::fill_visibility_tracker::FillVisibilityTracker>,
+    write_cache_manager: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<tokio::sync::RwLock<crate::write_cache_manager::WriteCacheManager>>>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for VersionChangeSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VersionChangeSink").finish_non_exhaustive()
+    }
+}
+
+impl VersionChangeSink {
+    async fn clear(&self, cache_key: &str, was_staged: bool) {
+        self.fill_visibility_tracker.invalidate(cache_key);
+        self.metadata_cache.invalidate(cache_key).await;
+        if let Some(ram_cache) = &self.ram_cache {
+            // The RAM tier's keys for this object, as `remove_from_ram_cache_unified` names them.
+            let _ = ram_cache
+                .invalidate_by_prefix(&format!("{}:range:", cache_key))
+                .await;
+        }
+        if was_staged {
+            if let Some(wcm) = self.write_cache_manager.read().await.as_ref() {
+                wcm.read().await.decrement_staged_entries();
+            }
+        }
+    }
+}
+
 /// A fill's version witness: the marker token observed (or created) before its S3 request.
 /// A `None` token means no witness could be established (an unreadable marker, an I/O error),
 /// and such a fill publishes nothing.
@@ -6182,6 +6856,9 @@ pub(crate) struct FillWitness {
     /// The capturing proxy's pending-stamp check: while it holds a pending stamp for the
     /// key, the witness holds nowhere.
     probe: Option<Arc<PendingStampProbe>>,
+    /// The capturing proxy's copies to clear when the fill removes another version
+    /// ([`VersionChangeSink`]); `None` for a witness captured without a `CacheManager`.
+    version_change: Option<Arc<VersionChangeSink>>,
 }
 
 impl PartialEq for FillWitness {
@@ -6199,6 +6876,7 @@ impl FillWitness {
             token: None,
             lease: None,
             probe: None,
+            version_change: None,
         }
     }
 
@@ -6209,6 +6887,7 @@ impl FillWitness {
             token: Some(token),
             lease: lease.map(Arc::new),
             probe: None,
+            version_change: None,
         }
     }
 
@@ -6216,6 +6895,19 @@ impl FillWitness {
     fn with_probe(mut self, probe: PendingStampProbe) -> Self {
         self.probe = Some(Arc::new(probe));
         self
+    }
+    /// Attach the capturing proxy's in-memory copies of the key, for
+    /// [`Self::after_version_change`].
+    fn with_version_change_sink(mut self, sink: VersionChangeSink) -> Self {
+        self.version_change = Some(Arc::new(sink));
+        self
+    }
+    /// After the fill removed the key's cached version for another version it read from S3:
+    /// clear the capturing proxy's in-memory copies of the removed version.
+    pub(crate) async fn after_version_change(&self, cache_key: &str, was_staged: bool) {
+        if let Some(sink) = &self.version_change {
+            sink.clear(cache_key, was_staged).await;
+        }
     }
 
     /// A publisher is consulting the witness, so the fill's response is being cached: keep the
@@ -6789,6 +7481,8 @@ enum LockedEntryRead {
         metadata: Box<crate::cache_types::NewCacheMetadata>,
         evicted_part_numbers: Vec<u32>,
         total_evicted_size: u64,
+        /// Indices into `metadata.ranges` of the range files this call unlinked.
+        unlinked_ranges: Vec<usize>,
     },
 }
 
@@ -7053,6 +7747,10 @@ pub struct CacheManager {
     // UUID fence token for the current eviction pass (Requirement 5)
     // Set on lock acquisition, verified before each filesystem mutation
     eviction_uuid: Arc<Mutex<Option<String>>>,
+    /// When this proxy took `global_eviction.lock`, in Unix milliseconds, or 0 while it does
+    /// not hold it. Set beside `eviction_uuid` on both acquisition paths and zeroed by
+    /// `release_global_eviction_lock`. Published as `eviction_coordination.eviction_lock_held_secs`.
+    eviction_lock_held_since_ms: Arc<AtomicU64>,
     // Size of the in-memory compression batch used by the incremental range writer.
     // Incoming body chunks are accumulated into a batch buffer and flushed as a
     // single LZ4 frame once the buffer reaches this size. Forwarded to
@@ -7152,7 +7850,7 @@ pub struct CacheManager {
     /// read. Refreshed every `PUT_USAGE_REFRESH_INTERVAL` by a background task started at
     /// startup by [`CacheManager::start_put_usage_refresher`] (or, failing that, on the first
     /// PUT), so no PUT reads `size_state.json` before its body.
-    put_usage: tokio::sync::watch::Sender<Option<(std::time::Instant, u64)>>,
+    put_usage: tokio::sync::watch::Sender<Option<PutUsageSnapshot>>,
     /// Set once the `put_usage` refresher has been started.
     put_usage_refresher_started: std::sync::atomic::AtomicBool,
     /// The last `read_cache_size` the stats path derived from a fold figure inside
@@ -7904,6 +8602,7 @@ impl CacheManager {
             bucket_settings_manager,
             eviction_lock_file: Arc::new(Mutex::new(None)),
             eviction_uuid: Arc::new(Mutex::new(None)),
+            eviction_lock_held_since_ms: Arc::new(AtomicU64::new(0)),
             compression_batch_size,
             disk_safety_free_space_floor: DISK_SAFETY_FREE_SPACE_FLOOR_BYTES, // overridden by config in http_proxy.rs
             max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default; HttpProxy::new sets it from config
@@ -8259,11 +8958,6 @@ impl CacheManager {
             // reachable from it; without them the pass runs on `SharedStorageConfig::default()`.
             shard_fold_interval: shared_storage_config.shard_fold_interval,
             shard_fold_max_duration: shared_storage_config.shard_fold_max_duration,
-            // The Tail_Partition floor. The consolidation cycle appends above-floor admissions
-            // to the tail-delta and holds only a `ConsolidationConfig`, so without this line the
-            // delta would be built at the default whatever an operator had configured — and it
-            // must be the SAME floor the rolling pass builds partitions with.
-            tail_floor_bytes: shared_storage_config.tail_floor_bytes,
             // The tail-delta's own cap, for the same reason: the append site is the only place
             // the file can be size-capped, and it holds only a `ConsolidationConfig`.
             tail_delta_max_entries: shared_storage_config.tail_delta_max_entries,
@@ -9912,7 +10606,23 @@ impl CacheManager {
         })
         .await
         .unwrap_or_else(|_| FillWitness::unestablished());
-        witness.with_probe(self.pending_stamp_probe(cache_key))
+        witness
+            .with_probe(self.pending_stamp_probe(cache_key))
+            .with_version_change_sink(self.version_change_sink())
+    }
+
+    /// This proxy's in-memory copies of a key, for a fill that removes another version.
+    fn version_change_sink(&self) -> VersionChangeSink {
+        VersionChangeSink {
+            metadata_cache: Arc::clone(&self.metadata_cache),
+            ram_cache: if self.ram_cache_enabled {
+                self.ram_cache.clone()
+            } else {
+                None
+            },
+            fill_visibility_tracker: Arc::clone(&self.fill_visibility_tracker),
+            write_cache_manager: Arc::clone(&self.write_cache_manager),
+        }
     }
 
     async fn invalidate_cache_hierarchy_stamped(
@@ -10174,7 +10884,7 @@ impl CacheManager {
         sinks: &InvalidationSinks,
         _meta_lock: &crate::metadata_lock_manager::MetadataLock,
     ) -> LockedEntryRemoval {
-        let (new_metadata, evicted_part_numbers, total_evicted_size) =
+        let (new_metadata, evicted_part_numbers, total_evicted_size, unlinked_ranges) =
             match Self::read_and_unlink_ranges_blocking(
                 cache_dir,
                 cache_key,
@@ -10190,7 +10900,13 @@ impl CacheManager {
                     metadata,
                     evicted_part_numbers,
                     total_evicted_size,
-                } => (*metadata, evicted_part_numbers, total_evicted_size),
+                    unlinked_ranges,
+                } => (
+                    *metadata,
+                    evicted_part_numbers,
+                    total_evicted_size,
+                    unlinked_ranges,
+                ),
             };
 
         // Whether this removal drops staged bytes, through the same shared predicate the debit
@@ -10202,11 +10918,17 @@ impl CacheManager {
         };
         let drops_staged_bytes = staged_removal.ranges > 0;
 
-        // Decrement size accumulator for invalidated ranges
-        // This ensures size tracking remains accurate when cache entries are invalidated
-        // (not just evicted through the normal eviction path)
-        if let Some(accumulator) = &sinks.accumulator {
-            for range_spec in &new_metadata.ranges {
+        // Delete metadata file. Whether it went decides the dirty mark, the staged-entry gauge
+        // and the caller's `cached_objects` debit (see `ObjectEntryRemoval::ValidDocument`).
+        let metadata_deleted = Self::remove_meta_file_blocking(new_metadata_file_path);
+
+        // Decrement the size accumulator for the range files this removal unlinked, whether or
+        // not the `.meta` unlink succeeded: those bytes are off the volume either way. A later
+        // removal of this key finds the files gone and debits nothing for them, as every other
+        // removal site debits only what it unlinked. A range the `.meta` lists whose file was
+        // already absent is not debited here.
+        if let Some(accumulator) = sinks.accumulator.as_ref() {
+            for range_spec in unlinked_ranges.iter().map(|&i| &new_metadata.ranges[i]) {
                 // `subtract_range`, so the dedup entry goes with the bytes.
                 // This site matters most for that: invalidate-then-re-cache
                 // of the same range is the ordinary stale-ETag flow, and
@@ -10235,16 +10957,12 @@ impl CacheManager {
             }
         }
 
-        // Delete metadata file. Whether it went decides the caller's `cached_objects` debit
-        // (see `ObjectEntryRemoval::ValidDocument`).
-        let metadata_deleted = Self::remove_meta_file_blocking(new_metadata_file_path);
-
         // After the `.meta` is gone, so a fold visit that begins after the mark reads its
         // absence. This instance's next fold pass visits the shard ahead of stalest-first,
         // instead of the staged figure keeping these bytes until the rotation reaches it.
         // DELETE and the pre-store re-PUT invalidation both arrive here.
         // Spec: cache-eviction-at-scale § 16.6.9, "Dirty shards first".
-        if drops_staged_bytes {
+        if drops_staged_bytes && metadata_deleted {
             if let Some(instance_id) = &sinks.instance_id {
                 crate::staged_fold::mark_shard_dirty(
                     cache_dir,
@@ -10264,7 +10982,7 @@ impl CacheManager {
         // is safe here: this runs on a blocking-pool thread, and nothing in
         // `src/` takes the inner manager's write lock.
         // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
-        if new_metadata.object_metadata.is_write_cached {
+        if metadata_deleted && new_metadata.object_metadata.is_write_cached {
             if let Some(wcm) = &sinks.write_cache_manager {
                 wcm.blocking_read().decrement_staged_entries();
             }
@@ -10359,7 +11077,8 @@ impl CacheManager {
         let mut total_evicted_size = 0u64;
 
         // Delete all range binary files
-        for range_spec in &new_metadata.ranges {
+        let mut unlinked_ranges = Vec::new();
+        for (index, range_spec) in new_metadata.ranges.iter().enumerate() {
             let range_file_path = cache_dir.join("ranges").join(&range_spec.file_path);
             if range_file_path.exists() {
                 // Track size for part eviction metrics
@@ -10379,7 +11098,10 @@ impl CacheManager {
                 }
 
                 match std::fs::remove_file(&range_file_path) {
-                    Ok(_) => debug!("Removed range file: {:?}", range_file_path),
+                    Ok(_) => {
+                        debug!("Removed range file: {:?}", range_file_path);
+                        unlinked_ranges.push(index);
+                    }
                     Err(e) => warn!("Failed to remove range file {:?}: {}", range_file_path, e),
                 }
                 #[cfg(test)]
@@ -10393,6 +11115,7 @@ impl CacheManager {
             metadata: Box::new(new_metadata),
             evicted_part_numbers,
             total_evicted_size,
+            unlinked_ranges,
         }
     }
 
@@ -10964,10 +11687,11 @@ impl CacheManager {
             let wcm = wcm_arc.read().await;
             wcm.try_reserve(entry_size).await
         } else {
-            // WriteCacheManager not initialized — use legacy non-atomic check.
-            // This path only occurs during early initialization or in tests that
-            // don't call initialize(). We create a standalone WriteReservation
-            // backed by a no-op counter since there's no shared state to track.
+            // No WriteCacheManager: one is built only when the global `write_cache_enabled`
+            // is true, so production reaches this arm when it is false and a bucket or prefix
+            // rule enables write caching (`bucket_settings`), and tests reach it when they never
+            // call initialize(). The reservation is a no-op because there is no shared counter
+            // to track.
             if self.can_write_cache_accommodate(entry_size) {
                 // Return a zero-size reservation (no-op on drop) to signal "proceed"
                 Some(crate::write_cache_manager::WriteReservation::noop())
@@ -11182,6 +11906,21 @@ impl CacheManager {
         })
     }
 
+    /// The staged fold's resident staged bytes for a full validation scan to compare its staged
+    /// census with at epoch 1: the figure write cache reclamation sizes from, without the
+    /// in-progress multipart parts the census does not count. `None` when it cannot be derived.
+    ///
+    /// Read with the scan's baseline (`JournalConsolidator::read_staged_for_baseline`, whose
+    /// result `JournalConsolidator::validation_baseline_with` takes), so both terms of the
+    /// comparison date from before the walk, as the counters' do.
+    pub(crate) async fn staged_resident_bytes_for_validation(
+        cache_dir: &std::path::Path,
+    ) -> Option<u64> {
+        crate::staged_fold::staged_authority_figure(cache_dir)
+            .await
+            .map(|figure| figure.resident_staged_bytes)
+    }
+
     /// `(staging_figure_unknown_seconds, staging_figure_unknown_passes_total)`.
     ///
     /// The seconds are a function of this process's authority derivations
@@ -11211,52 +11950,73 @@ impl CacheManager {
     /// shard checkpoints from shared storage, and every pass re-folds the shards it evicted from
     /// before it releases the lock, so it sees every earlier pass's re-fold that installed.
     ///
-    /// `None` at epoch 1 when that derivation produces no figure, most often because one
-    /// `.pending` lock was not acquired within its bound. The pass then frees nothing on bytes:
-    /// the R7.5 fail-open rule [`Self::evict_staging_tier`] applies to an unreadable pre-lock
-    /// figure. The count arm reads the same pending-credit files, so it can stop in the same pass.
-    /// The pass never falls back to the incumbent, which at epoch 1
-    /// is not debited at graduation and so counts every byte staged since the last validation
-    /// scan, read or not.
+    /// `None` when that derivation produces no figure, most often because one `.pending` lock was
+    /// not acquired within its bound, and at epoch 0 also before the fold has installed any
+    /// shard's checkpoint. The pass then frees nothing on bytes: the R7.5 fail-open rule
+    /// [`Self::evict_staging_tier`] applies to an unreadable pre-lock figure. The count arm reads
+    /// the same pending-credit files, so it can stop in the same pass.
     ///
-    /// At epoch 0 it is the incumbent projected forward by the pending delta files
-    /// (`JournalConsolidator::projected_sizes`): a previous pass flushed its write-cache debit to
-    /// a delta file before releasing the eviction lock, and `size_state` alone does not carry it
-    /// until a cycle collects it. `None` then only when there is no consolidator.
+    /// # The counter never sizes a pass on its own, at either epoch
+    ///
+    /// At epoch 1 the incumbent is not debited at graduation, so it counts every byte staged since
+    /// the last validation scan, read or not, and is not read here at all.
+    ///
+    /// At epoch 0 the incumbent is debited at graduation, but only through a journal entry the
+    /// consolidator applies later, and that debit is lost when the object's `.meta` is removed
+    /// before the entry is consolidated, or when the process stops between the `.meta` transition
+    /// and the append. Nothing but a validation scan corrects it, so it over-counts by every such
+    /// loss since the last scan, and a pass sized from it removed unread uploads by that error. So
+    /// at epoch 0 the figure is the fold's, derived as at epoch 1, bounded above by the incumbent
+    /// projected forward by the pending delta files (`JournalConsolidator::projected_sizes`, which
+    /// carries a previous pass's flushed write-cache debit before a cycle collects it).
+    ///
+    /// Why the fold's figure may size a pass before the activation preconditions pass: they
+    /// establish that the fold misses nothing (every writer is fold-capable and ledgered, every
+    /// shard visited, the ledger repaired against the disk). Each failure of them is staged bytes
+    /// the fold does not count, so the figure can only be low, and a low figure frees less, the
+    /// R7.5 direction. The bound by the incumbent keeps the pass from freeing more than it did
+    /// when it sized from the incumbent alone, so where the fold over-counts (a removal not yet
+    /// debited or re-folded) the incumbent caps it.
+    ///
+    /// At epoch 0 the figure is the fold's resident staged bytes alone, without `P`: the
+    /// incumbent never counted in-progress multipart parts, and neither does the epoch-0 trigger
+    /// that started the pass, so the bound compares like with like.
     async fn staging_pass_sizing_figure(&self) -> Option<u64> {
         let consolidator = self.journal_consolidator.read().await.clone()?;
-        if crate::staged_authority::fold_authority_active(&self.cache_dir) {
-            let Some(figure) =
-                crate::staged_fold::staged_authority_figure_fresh(&self.cache_dir).await
-            else {
-                // `debug!`: each timeout is already logged at WARN where it happens, and the
-                // derivation logs an `error!` once the figure has stayed unknown for a minute.
-                debug!(
-                    "Staging eviction: the fold's staged figure could not be derived after \
-                     taking the eviction lock, so this pass removes nothing by size (fail-open). \
-                     The count arm reads the same pending-credit files and can stop removing \
-                     staged ranges in the same pass."
-                );
-                if let Some(wcm) = self.write_cache_manager.read().await.as_ref() {
-                    wcm.read().await.increment_staging_figure_unknown_passes();
-                }
-                return None;
-            };
-            return Some(
-                StagedFigure {
-                    resident_staged_bytes: figure.resident_staged_bytes,
-                    in_progress_part_bytes: figure.in_progress_part_bytes,
-                    fold_derived: true,
-                }
-                .write_cache_size(),
+        let incumbent_bound = if crate::staged_authority::fold_authority_active(&self.cache_dir) {
+            None
+        } else {
+            // `unwrap_or(0)` flattens the UNREADABLE sentinel to the permissive value, as before:
+            // the pass then frees nothing by size.
+            Some(
+                consolidator
+                    .get_projected_write_cache_size()
+                    .await
+                    .unwrap_or(0),
+            )
+        };
+        let Some(figure) = crate::staged_fold::staged_authority_figure_fresh(&self.cache_dir).await
+        else {
+            // `debug!`: each timeout is already logged at WARN where it happens, and the
+            // derivation logs an `error!` once the figure has stayed unknown for a minute.
+            debug!(
+                "Staging eviction: the fold's staged figure could not be derived after taking \
+                 the eviction lock, so this pass removes nothing by size (fail-open). The count \
+                 arm reads the same pending-credit files and can stop removing staged ranges in \
+                 the same pass."
             );
+            if let Some(wcm) = self.write_cache_manager.read().await.as_ref() {
+                wcm.read().await.increment_staging_figure_unknown_passes();
+            }
+            return None;
+        };
+        let fold = StagedFigure {
+            resident_staged_bytes: figure.resident_staged_bytes,
+            in_progress_part_bytes: figure.in_progress_part_bytes,
+            fold_derived: true,
         }
-        Some(
-            consolidator
-                .get_projected_write_cache_size()
-                .await
-                .unwrap_or(0),
-        )
+        .write_cache_size();
+        Some(incumbent_bound.map_or(fold, |bound| figure.resident_staged_bytes.min(bound)))
     }
 
     /// Resident_Bytes: the staged figure the Staging_Bound is enforced against (R7.1).
@@ -11484,38 +12244,34 @@ impl CacheManager {
     }
 
     async fn disk_safety_refusal_inner(&self, incoming_bytes: u64) -> Option<&'static str> {
+        // Test seam: the volume stalling under this check, keyed by the cache directory. The
+        // check's one volume call is component 2's `statvfs`, which a hung NFS or EFS mount
+        // blocks. See `write_cache_setup_stall_hook`.
+        #[cfg(test)]
+        write_cache_setup_stall_hook(&self.cache_dir.to_string_lossy());
         // Component 1: global max_cache_size headroom.
         let max_cache_size = {
             let inner = self.inner.lock().unwrap();
             inner.statistics.max_cache_size_limit
         };
         if max_cache_size > 0 {
-            if let Some(consolidator) = self.journal_consolidator.read().await.clone() {
-                // An unreadable size_state.json flattens to 0 here, which lets the write
-                // through. That is the deliberate fail-open posture (R7.5) and is unchanged;
-                // the condition is reported at `warn!` by `get_current_size`.
-                // The same correction the read-fill stop takes, for the same reason: this
-                // figure is `size_state.json`'s total, which changes only when a consolidation
-                // cycle finishes its delta step, so a run of uploads outran it too. See
-                // `UnconsolidatedAdmissions`.
-                //
-                // Read BEFORE the figure: the refresher releases a record only after the figure
-                // holding its bytes is published, so a release landing between these two reads
-                // counts those bytes twice for microseconds (over-declaring) instead of pairing
-                // a figure that predates them with an addend that has already dropped them.
-                // `read_fill_refusal` reads the published figure and can check the pair
-                // (`figure_with_addend`); this one reads `size_state.json` itself.
-                let unconsolidated = unconsolidated_admitted_bytes(&self.cache_dir);
-                let figure = consolidator.get_current_size().await.unwrap_or(0);
-                let total = figure.saturating_add(unconsolidated);
+            // The one whole-cache figure: the `put_usage` snapshot (`total_size + P`) paired with
+            // what this proxy has admitted since it was produced, as the PUT router and read
+            // fills read it. Two in-memory reads and no `size_state.json` read. With no snapshot
+            // published yet this admits, the deliberate fail-open posture (R7.5) a read fill
+            // takes too; an unreadable `size_state.json` is a figure of 0 in the snapshot. See
+            // `whole_cache_usage`.
+            if let Some(usage) = whole_cache_usage(&self.cache_dir) {
+                let total = usage.total();
                 if total.saturating_add(incoming_bytes) > max_cache_size {
                     warn!(
                         "Disk safety: declining to write-through cache {} bytes — total cache \
                          {} ({} of it admitted by this proxy and not yet folded into the shared \
                          figure) + incoming would exceed max_cache_size {}. The upload itself \
                          is unaffected and still streams to S3.",
-                        incoming_bytes, total, unconsolidated, max_cache_size
+                        incoming_bytes, total, usage.unconsolidated, max_cache_size
                     );
+                    note_size_refusal(&self.cache_dir, incoming_bytes);
                     return Some(DISK_SAFETY_SKIP_REASON);
                 }
             }
@@ -11656,7 +12412,12 @@ impl CacheManager {
         // the holder lives, however long its sizing derivation takes. The one exception is a
         // holder whose NFS lease expires.
         match self.try_acquire_global_eviction_lock().await {
-            Ok(true) => {}
+            Ok(true) => {
+                info!(
+                    "Acquired global eviction lock: pass=staging, time_budget_secs={}",
+                    self.shared_storage.eviction_lock_timeout.as_secs()
+                );
+            }
             Ok(false) => {
                 debug!("Staging eviction: another instance holds the eviction lock, skipping");
                 if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
@@ -11684,10 +12445,48 @@ impl CacheManager {
         // the file would look held until its timeout. Mirrors
         // `enforce_disk_cache_limits_internal`, which brackets
         // `perform_eviction_with_lock` the same way.
-        let freed = self.evict_staging_tier_locked(trigger, target).await;
+        //
+        // The pass's time budget is `eviction_lock_timeout`, the age past which a peer reads the
+        // lockfile as stale. A pass that stops inside it never looks stale to a peer, and a
+        // stalled holder stops evicting for the fleet for at most that long plus one stage.
+        let deadline = tokio::time::Instant::now() + self.shared_storage.eviction_lock_timeout;
+        let (freed, retirement) = self
+            .evict_staging_tier_locked(trigger, target, deadline)
+            .await;
 
         if let Err(e) = self.release_global_eviction_lock().await {
             warn!("Staging eviction: failed to release eviction lock: {}", e);
+        }
+
+        // R2.6: retire the consumed and terminal Write_Ledger entries, after the release.
+        //
+        // This whole-volume compaction reads and may rewrite every ledger file, so it is the
+        // step whose cost grows with the cache volume. It needs no fleet-wide exclusion:
+        //
+        // - Each file is read, filtered and renamed inside one hold of that file's own lock, the
+        //   lock every append takes, so no append is lost to it (`retire_identities`).
+        // - It only removes the identities it names. A peer's pass that starts once the lock is
+        //   released may read an entry named here before it goes. Its object's `.meta` is gone
+        //   or terminal, so the peer assesses it terminal and names it again, which is a no-op.
+        //   A new object at the key has entries of its own, which nothing here names.
+        // - The consolidation cycle's per-shard compaction already runs beside eviction passes
+        //   under a different lock, on the same two arguments.
+        // - This proxy starts no other staging pass meanwhile: `staging_eviction_in_progress`
+        //   stays set until this function returns.
+        //
+        // The removal debits and the re-fold, which the next pass sizes from, were published
+        // before the release, so moving this step changes no figure a pass reads.
+        if let Some(StagingRetirement { ledger, retired }) = retirement {
+            #[cfg(test)]
+            run_before_staging_retire_hook(&self.cache_dir);
+            if let Err(e) = ledger.retire_identities(&retired).await {
+                warn!(
+                    "Staging eviction: failed to retire {} consumed Write_Ledger entries: {}. \
+                     They will be re-verified and skipped next pass.",
+                    retired.len(),
+                    e
+                );
+            }
         }
         freed
     }
@@ -11706,7 +12505,57 @@ impl CacheManager {
             .unwrap_or_else(|p| p.into_inner())
             .push((cache_dir.to_path_buf(), hook));
     }
-    async fn evict_staging_tier_locked(&self, trigger: u64, target: u64) -> u64 {
+    /// A one-shot hook a staging pass on `cache_dir` runs just before its Write_Ledger compaction.
+    #[cfg(test)]
+    pub(crate) fn set_before_staging_retire_hook_for_tests(
+        cache_dir: &std::path::Path,
+        hook: Box<dyn FnOnce() + Send>,
+    ) {
+        BEFORE_STAGING_RETIRE_HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((cache_dir.to_path_buf(), hook));
+    }
+    /// A one-shot delay a staging pass on `cache_dir` waits before its Write_Ledger read, inside
+    /// the read's stage, standing in for a read that is slow on shared storage.
+    #[cfg(test)]
+    pub(crate) fn set_staging_ledger_read_delay_for_tests(
+        cache_dir: &std::path::Path,
+        delay: Duration,
+    ) {
+        STAGING_LEDGER_READ_DELAYS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((cache_dir.to_path_buf(), delay));
+    }
+    /// A one-shot delay a staging pass on `cache_dir` waits after its ledger read and before its
+    /// first candidate, standing in for slow candidate work that outlasts the pass's time budget.
+    #[cfg(test)]
+    pub(crate) fn set_staging_candidate_delay_for_tests(
+        cache_dir: &std::path::Path,
+        delay: Duration,
+    ) {
+        STAGING_CANDIDATE_DELAYS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((cache_dir.to_path_buf(), delay));
+    }
+    /// The locked body's time budget.
+    ///
+    /// `deadline` bounds how long the pass holds the lock. Each stage stops at a safe point once
+    /// it has passed: the sizing reads fail open (no figure, nothing to free), the ledger read is
+    /// abandoned before any candidate is assessed, and the candidate loop stops between objects,
+    /// each of whose evictions has already done its own accounting. What was removed is still
+    /// published (removal debits, the count result), and the re-fold is skipped for dirty marks
+    /// once the budget is spent. A stage that has started is not interrupted, so the hold can
+    /// exceed the budget by one stage. Returns the bytes freed and the ledger entries the caller
+    /// retires after the release.
+    async fn evict_staging_tier_locked(
+        &self,
+        trigger: u64,
+        target: u64,
+        deadline: tokio::time::Instant,
+    ) -> (u64, Option<StagingRetirement>) {
         use crate::write_ledger::StagedCandidateVerdict;
 
         // R7.3: re-read after acquiring the lock. Another instance may have evicted
@@ -11714,23 +12563,51 @@ impl CacheManager {
         // would delete data that is now within bound.
         //
         // Both arms are re-read, and neither one's re-read may abort the other's pass. The byte
-        // arm's re-read is a fresh derivation at epoch 1 and the projected incumbent in Phase L:
-        // see `staging_pass_sizing_figure`.
+        // arm's re-read is a fresh derivation, bounded by the projected incumbent in Phase L: see
+        // `staging_pass_sizing_figure`.
+        //
+        // A sizing read cut off by the deadline is the same fail-open as an underivable figure:
+        // abandoning the wait cancels nothing, because the derivation runs on its own task and
+        // installs its result for later readers.
+        let mut deadline_hit: Option<&'static str> = None;
         let resident = if trigger == 0 {
             None
         } else {
-            self.staging_pass_sizing_figure().await
+            match tokio::time::timeout_at(deadline, self.staging_pass_sizing_figure()).await {
+                Ok(figure) => figure,
+                Err(_) => {
+                    deadline_hit = Some("sizing");
+                    if let Some(wcm) = self.write_cache_manager.read().await.as_ref() {
+                        wcm.read().await.increment_staging_figure_unknown_passes();
+                    }
+                    None
+                }
+            }
         };
         let bytes_to_free = match resident {
             Some(r) if r > trigger => r.saturating_sub(target),
             _ => 0,
         };
-        let count_verdict = crate::staged_fold::count_eviction_verdict(
-            &self.cache_dir,
-            self.eviction_trigger_percent,
-            self.eviction_target_percent,
+        let count_verdict = match tokio::time::timeout_at(
+            deadline,
+            crate::staged_fold::count_eviction_verdict(
+                &self.cache_dir,
+                self.eviction_trigger_percent,
+                self.eviction_target_percent,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(verdict) => verdict,
+            Err(_) => {
+                deadline_hit.get_or_insert("sizing");
+                crate::staged_fold::CountEvictionVerdict::NotNeeded
+            }
+        };
+        if let Some(stage) = deadline_hit {
+            self.log_staging_pass_deadline(stage, 0, 0, 0, 0);
+            return (0, None);
+        }
         let ranges_to_free = match count_verdict {
             crate::staged_fold::CountEvictionVerdict::Needed { ranges_to_free, .. } => {
                 ranges_to_free
@@ -11743,11 +12620,11 @@ impl CacheManager {
                  (resident={:?}, byte_trigger={}, count_verdict={:?}), skipping",
                 resident, trigger, count_verdict
             );
-            return 0;
+            return (0, None);
         }
         let Some(consolidator) = self.journal_consolidator.read().await.clone() else {
             warn!("Staging eviction: journal consolidator not wired, skipping");
-            return 0;
+            return (0, None);
         };
         let ledger = consolidator.write_ledger().clone();
 
@@ -11764,8 +12641,8 @@ impl CacheManager {
         // anything while logging a reassuring message about upgrades.
         //
         // The figure driving eviction is NOT decided here: `resident` above is
-        // `staging_pass_sizing_figure`, which is the projected incumbent Size_State figure in
-        // Phase L and a fresh derivation of the fold's figure once the staged-authority epoch is 1.
+        // `staging_pass_sizing_figure`, a fresh derivation of the fold's figure, bounded by the
+        // projected incumbent Size_State figure in Phase L.
         // What this read changed is the failure path only.
         //
         // New failure behaviour: an unreadable file, a discarded line, or a
@@ -11784,14 +12661,27 @@ impl CacheManager {
         // names removals rather than retentions, so acting on a capped prefix cannot
         // delete an entry this pass never read. `is_complete()` is therefore NOT the
         // predicate used here — the fields are checked individually.
-        let read = match ledger
-            .read_for_authority(STAGING_EVICTION_CANDIDATE_CAP)
-            .await
-        {
-            Ok(read) => read,
-            Err(e) => {
+        //
+        // Abandoned at the deadline before any candidate is assessed. The read only reads, each
+        // file under its own lock inside a blocking task that finishes and unlocks on its own.
+        let read_ledger = async {
+            #[cfg(test)]
+            if let Some(delay) = take_staging_ledger_read_delay(&self.cache_dir) {
+                tokio::time::sleep(delay).await;
+            }
+            ledger
+                .read_for_authority(STAGING_EVICTION_CANDIDATE_CAP)
+                .await
+        };
+        let read = match tokio::time::timeout_at(deadline, read_ledger).await {
+            Ok(Ok(read)) => read,
+            Ok(Err(e)) => {
                 warn!("Staging eviction: failed to read Write_Ledger: {}", e);
-                return 0;
+                return (0, None);
+            }
+            Err(_) => {
+                self.log_staging_pass_deadline("ledger read", 0, 0, 0, 0);
+                return (0, None);
             }
         };
         if read.files_unreadable > 0 || read.malformed_lines > 0 {
@@ -11801,7 +12691,7 @@ impl CacheManager {
                  staged objects. Refusing to evict on a partial view; retrying next pass.",
                 read.files_unreadable, read.malformed_lines
             );
-            return 0;
+            return (0, None);
         }
         if read.files_read != read.files_expected {
             warn!(
@@ -11809,7 +12699,7 @@ impl CacheManager {
                  read. Refusing to evict on a partial view; retrying next pass.",
                 read.files_expected, read.files_read
             );
-            return 0;
+            return (0, None);
         }
         let entries = read.entries;
         if entries.is_empty() {
@@ -11868,12 +12758,22 @@ impl CacheManager {
             crate::staged_fold::StagedRemoval,
         > = std::collections::BTreeMap::new();
 
+        #[cfg(test)]
+        if let Some(delay) = take_staging_candidate_delay(&self.cache_dir) {
+            tokio::time::sleep(delay).await;
+        }
         for candidate in &ordered {
             // BOTH arms have to be satisfied before the walk stops. A count-driven pass has
             // `bytes_to_free == 0`, so testing bytes alone would break on the first candidate
             // and reclaim nothing — the count trigger would fire, log, publish a zero-freed
             // result, and change nothing. § 16.6.12 point 5.
             if total_freed >= bytes_to_free && total_ranges_freed >= ranges_to_free {
+                break;
+            }
+            // Between objects: every eviction above finished its own accounting, and what this
+            // pass removed is published below as for a pass that ran out of candidates.
+            if tokio::time::Instant::now() >= deadline {
+                deadline_hit = Some("candidate loop");
                 break;
             }
             candidates_considered += 1;
@@ -11908,8 +12808,16 @@ impl CacheManager {
                             // new object to its own assessment on a later pass.
                             *skips.entry("replaced_since_assessment").or_insert(0) += 1;
                         }
-                        Ok(Some(freed)) => {
-                            total_freed = total_freed.saturating_add(freed);
+                        Ok(Some(eviction)) if !eviction.meta_removed => {
+                            // The range files went and the `.meta` did not, so the fold still
+                            // counts the object and its ledger entries are its only hint. Debit
+                            // nothing and retire nothing: the next pass assesses the surviving
+                            // `.meta` and debits it once, when its unlink succeeds.
+                            total_freed = total_freed.saturating_add(eviction.freed);
+                            *skips.entry("meta_unlink_failed").or_insert(0) += 1;
+                        }
+                        Ok(Some(eviction)) => {
+                            total_freed = total_freed.saturating_add(eviction.freed);
                             // The RANGE count reclaimed, from the same `.meta` read that
                             // produced the verdict the eviction acted on — not a re-derivation
                             // and not the ledger's hint, so the figure the count trigger is
@@ -11989,7 +12897,18 @@ impl CacheManager {
             }
         }
 
-        // R2.6: retire consumed and terminal entries, naming exactly what to remove.
+        if let Some(stage) = deadline_hit {
+            self.log_staging_pass_deadline(
+                stage,
+                evicted_objects,
+                total_freed,
+                total_ranges_freed,
+                candidates_considered,
+            );
+        }
+
+        // R2.6: retire consumed and terminal entries, naming exactly what to remove. The caller
+        // does it after releasing the lock; see `evict_staging_tier`.
         //
         // This used to compute `all_identities - retired` and hand it to a retain-set
         // rewrite that deleted everything absent from it. That is only correct if
@@ -12001,16 +12920,6 @@ impl CacheManager {
         // Naming the removals removes the dependency on the read being complete. An
         // entry beyond the cap, and an entry appended by another instance after the read,
         // are both simply not named.
-        if !retired.is_empty() {
-            if let Err(e) = ledger.retire_identities(&retired).await {
-                warn!(
-                    "Staging eviction: failed to retire {} consumed Write_Ledger entries: {}. \
-                     They will be re-verified and skipped next pass.",
-                    retired.len(),
-                    e
-                );
-            }
-        }
 
         info!(
             "Staging eviction complete: resident_before={:?}, trigger={}, target={}, \
@@ -12074,6 +12983,7 @@ impl CacheManager {
                 &self.cache_dir,
                 ledger.instance_id(),
                 total_ranges_freed,
+                deadline_hit.is_some(),
             );
             let pass_result = crate::eviction_result::WriteCacheCountPassResult::new(
                 format!(
@@ -12134,7 +13044,27 @@ impl CacheManager {
         // Best-effort. A shard a peer holds, or a pass the fold refuses, keeps its pre-eviction
         // checkpoint until a later visit, and its removal debit stands in for the eviction until
         // then.
-        if !evicted_shards.is_empty() {
+        //
+        // Skipped once the budget is spent: the removal debits above already stand in for these
+        // evictions, and a dirty mark sends each shard to the front of the periodic fold.
+        if !evicted_shards.is_empty() && tokio::time::Instant::now() >= deadline {
+            for shard in &evicted_shards {
+                crate::staged_fold::mark_dirty_shard(
+                    &self.cache_dir,
+                    ledger.instance_id(),
+                    shard.clone(),
+                );
+            }
+            if deadline_hit.is_none() {
+                self.log_staging_pass_deadline(
+                    "re-fold",
+                    evicted_objects,
+                    total_freed,
+                    total_ranges_freed,
+                    candidates_considered,
+                );
+            }
+        } else if !evicted_shards.is_empty() {
             let outcome = crate::staged_fold::run_staged_fold_over_shards(
                 &self.cache_dir,
                 &ledger,
@@ -12175,7 +13105,30 @@ impl CacheManager {
             }
         }
 
-        total_freed
+        let retirement = (!retired.is_empty()).then_some(StagingRetirement { ledger, retired });
+        (total_freed, retirement)
+    }
+
+    /// The one line a staging pass stopped by its time budget logs, with what it did.
+    fn log_staging_pass_deadline(
+        &self,
+        stage: &str,
+        evicted_objects: u64,
+        freed: u64,
+        ranges_freed: u64,
+        candidates_considered: u64,
+    ) {
+        warn!(
+            "Staging eviction stopped at its time budget ({} s, eviction_lock_timeout) during \
+             the {}: evicted_objects={}, freed={}, ranges_freed={}, candidates_considered={}. \
+             Releasing the eviction lock; the next pass continues.",
+            self.shared_storage.eviction_lock_timeout.as_secs(),
+            stage,
+            evicted_objects,
+            freed,
+            ranges_freed,
+            candidates_considered
+        );
     }
 
     /// Evict one staged object, delegating to the accounting-correct implementation on
@@ -12193,7 +13146,7 @@ impl CacheManager {
         &self,
         cache_key: &str,
         expected: Option<&crate::write_cache_manager::StagedObjectIdentity>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<crate::write_cache_manager::StagingEviction>> {
         let wcm_guard = self.write_cache_manager.read().await;
         let Some(wcm_arc) = wcm_guard.as_ref() else {
             return Err(ProxyError::CacheError(
@@ -12249,26 +13202,21 @@ impl CacheManager {
         });
     }
 
-    /// Check if write cache can accommodate new entry (non-atomic, legacy).
+    /// Whether one object may be write-through cached when no `WriteCacheManager` exists, which
+    /// is the case when `cache.write_cache_enabled` is false and a bucket rule enables write
+    /// caching. Called only from [`Self::try_reserve_write_cache`]'s arm for that case.
     ///
-    /// **Deprecated**: Use `try_reserve_write_cache()` instead for atomic reservation.
-    /// This method only checks capacity without reserving it, which is racy under
-    /// concurrent uploads.
+    /// A per-object check, not a whole-cache one: the object must be at most the tracker's
+    /// `max_object_size` and at most the Staging_Bound. Whether it fits under `max_cache_size`
+    /// is component 1 of [`Self::disk_safety_refusal`], which both production callers of
+    /// `try_reserve_write_cache` evaluate first.
     pub(crate) fn can_write_cache_accommodate(&self, entry_size: u64) -> bool {
         let inner = self.inner.lock().unwrap();
-
-        // Check object size limit
         if entry_size > inner.write_cache_tracker.max_object_size {
             return false;
         }
-
-        // Check total size limit
-        let new_total = inner.write_cache_tracker.current_size + entry_size;
         drop(inner); // Release lock before calling get_write_cache_capacity
-
-        let max_allowed = self.get_write_cache_capacity();
-
-        new_total <= max_allowed
+        entry_size <= self.get_write_cache_capacity()
     }
 
     /// Get compression handler (for testing, configuration, and health/metrics monitoring)
@@ -12339,10 +13287,12 @@ impl CacheManager {
             // consolidation cycle's `collect_deltas`, so a cache over its trigger on the
             // projected figure returned here under it and the pass did nothing.
             //
+            // Plus `P`, as the trigger counts it: `JournalConsolidator::read_tier_figure`.
+            //
             // Fail open on an unreadable size_state.json, as before. Deliberately NOT
             // routed to the filesystem-walk fallback below: that arm is for an absent
             // consolidator, and re-routing would be a behaviour change, not a sentinel fix.
-            consolidator.get_projected_size().await.unwrap_or(0)
+            consolidator.read_tier_eviction_size().await.unwrap_or(0)
         } else {
             warn!("Consolidator not available, falling back to filesystem walk for enforce_disk_cache_limits");
             self.calculate_disk_cache_size().await?
@@ -12362,7 +13312,17 @@ impl CacheManager {
         // Spec: cache-eviction-at-scale. Requirements: 2.4.
         let trigger_threshold =
             (max_size as f64 * (self.eviction_trigger_percent as f64 / 100.0)) as u64;
-        if max_size == 0 || current_size <= trigger_threshold {
+        // Over the trigger, or a size refusal's demand does not fit: `read_tier_eviction_due`.
+        let demand = eviction_demand(&self.cache_dir);
+        if max_size == 0
+            || !read_tier_eviction_due(current_size, trigger_threshold, max_size, demand)
+        {
+            // A demand the projected figure says now fits is spent: cleared, so it does not lower
+            // the trigger to `max_cache_size - demand` until some later pass ends. A spawned
+            // pass's end clears it too; this covers the callers that spawn nothing.
+            if max_size != 0 && demand > 0 {
+                release_eviction_demand(&self.cache_dir);
+            }
             return Ok(0);
         }
 
@@ -12374,7 +13334,10 @@ impl CacheManager {
         // Always use distributed locking for eviction (journal-based coordination)
         debug!("Attempting to acquire distributed eviction lock");
         let _lock_acquired = match self.try_acquire_global_eviction_lock().await {
-            Ok(true) => true,
+            Ok(true) => {
+                info!("Acquired global eviction lock: pass=read_tier");
+                true
+            }
             Ok(false) => {
                 debug!("Another instance is handling eviction, skipping");
                 // Record eviction skipped due to lock being held
@@ -12405,16 +13368,85 @@ impl CacheManager {
         // figure and freed the same amount a second time. See `projected_sizes` for the order.
         let current_size =
             if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
-                consolidator.get_projected_size().await.unwrap_or(0)
+                consolidator.read_tier_eviction_size().await.unwrap_or(0)
             } else {
                 current_size // fall back to pre-lock value
             };
 
-        if current_size <= trigger_threshold {
-            info!(
-                "Cache no longer over trigger threshold after acquiring eviction lock (size={}, trigger_threshold={}, max={}), skipping eviction",
-                current_size, trigger_threshold, max_size
-            );
+        let demand = eviction_demand(&self.cache_dir);
+        let due = read_tier_eviction_due(current_size, trigger_threshold, max_size, demand);
+        // On demand alone, the read tier's last pass result, this proxy's or a peer's, decides.
+        // A pass that left no room for the demand makes it futile until the usage changes
+        // (`demand_pass_futile`); one that completed after the latest refusal already ran for it
+        // (`served_demand`). Over the trigger the pass runs whatever the last one did, so neither
+        // can hold off an over-trigger pass.
+        let on_demand_alone = due && current_size <= trigger_threshold;
+        let target_size = (max_size as f64 * (self.eviction_target_percent as f64 / 100.0)) as u64;
+        let last = if on_demand_alone {
+            crate::eviction_result::EvictionPassResult::load_with_evidence(&self.cache_dir)
+        } else {
+            None
+        };
+        // Only a pass that read the whole evictable read tier is evidence of futility; a result
+        // without the field, from any build, is not.
+        let futile = last
+            .as_ref()
+            .and_then(|(r, evidence)| {
+                evidence
+                    .exhausted_shortfall_bytes
+                    .map(|shortfall| (r, shortfall))
+            })
+            .filter(|(r, shortfall)| {
+                r.completed_at > eviction_usage_changed_at(&self.cache_dir)
+                    && demand_pass_futile(*shortfall, demand, target_size, max_size)
+            })
+            .map(|(r, shortfall)| (r.completed_at, shortfall));
+        // A row of passes on demand alone that made no room backs the next one off, fleet-wide,
+        // through the same document (`demand_backoff_holds`). Never over the trigger.
+        let backoff = if futile.is_none() {
+            demand_backoff_holds(
+                &self.cache_dir,
+                on_demand_alone,
+                last.as_ref(),
+                self.shared_storage.consolidation_interval,
+                unix_now_secs(),
+            )
+        } else {
+            None
+        };
+        let served = if futile.is_none() && backoff.is_none() {
+            served_demand(&self.cache_dir, last.as_ref().map(|(r, _)| r))
+        } else {
+            None
+        };
+        if !due || served.is_some() || futile.is_some() || backoff.is_some() {
+            if let Some((completed_at, shortfall)) = futile {
+                note_futile_eviction_demand(&self.cache_dir, demand);
+                release_eviction_demand(&self.cache_dir);
+                info!(
+                    "Eviction demand of {} bytes is futile: the last read-cache pass, completed at {}, read the whole evictable read tier and would still fall {} bytes short of its target, so no pass can make room for it under max={} until usage changes (size={}), skipping eviction",
+                    demand, completed_at, shortfall, max_size, current_size
+                );
+            } else if let Some((completed_at, streak, delay)) = backoff {
+                release_eviction_demand(&self.cache_dir);
+                note_eviction_demand_backoff_skip(&self.cache_dir);
+                info!(
+                    "Eviction demand of {} bytes backed off: {} read-cache pass(es) in a row on demand alone made no room for it, the last completed at {}, and the next may start {} s after that (size={}, max={}), skipping eviction",
+                    demand, streak, completed_at, delay, current_size, max_size
+                );
+            } else if let Some((completed_at, recorded_at)) = served {
+                release_eviction_demand(&self.cache_dir);
+                note_eviction_demand_dedup_skip(&self.cache_dir);
+                info!(
+                    "Eviction demand already served: the last read-cache pass completed at {} and the demand was recorded at {} (size={}, max={}), skipping eviction",
+                    completed_at, recorded_at, current_size, max_size
+                );
+            } else {
+                info!(
+                    "Cache no longer over trigger threshold after acquiring eviction lock (size={}, trigger_threshold={}, max={}), skipping eviction",
+                    current_size, trigger_threshold, max_size
+                );
+            }
             // Calculate lock hold time before releasing
             if let Ok(lock_hold_duration) = SystemTime::now().duration_since(lock_acquired_at) {
                 if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
@@ -12494,8 +13526,33 @@ impl CacheManager {
                             listed_items,
                             result.summary()
                         );
-                        if let Err(e) = result.install(&self.cache_dir) {
+                        let evidence = crate::eviction_result::PassEvidence {
+                            exhausted_shortfall_bytes: a.exhausted_shortfall,
+                            demand_backoff_streak: if on_demand_alone {
+                                demand_backoff_streak_after(
+                                    &self.cache_dir,
+                                    last.as_ref(),
+                                    result.shortfall_bytes,
+                                    demand,
+                                    target_size,
+                                    max_size,
+                                )
+                            } else {
+                                None
+                            },
+                        };
+                        if let Err(e) = result.install_with_evidence(&self.cache_dir, evidence) {
                             debug!("Could not publish the authored eviction result: {}", e);
+                        }
+                        // On demand alone, a listing that cannot make room makes the demand
+                        // futile. See `EvictionDemand`.
+                        if on_demand_alone {
+                            note_demand_pass_end(
+                                &self.cache_dir,
+                                a.exhausted_shortfall,
+                                target_size,
+                                max_size,
+                            );
                         }
                     }
                     Err(e) => warn!(
@@ -12542,7 +13599,16 @@ impl CacheManager {
         // deleting as resident and frees them twice. So the pass runs only once no chunk of the
         // current generation is in flight, sized from the projected figure read after that check.
         let current_size = match self.legacy_pass_size_after_drain_guard(current_size).await {
-            Some(size) if size > trigger_threshold => size,
+            Some(size)
+                if read_tier_eviction_due(
+                    size,
+                    trigger_threshold,
+                    max_size,
+                    eviction_demand(&self.cache_dir),
+                ) =>
+            {
+                size
+            }
             guarded => {
                 debug!(
                     "Legacy eviction pass not run this trigger: {}",
@@ -12572,9 +13638,26 @@ impl CacheManager {
         };
 
         // Ensure lock is released even if eviction fails
+        let pass_started_secs = unix_now_secs();
+        let pass_started = std::time::Instant::now();
         let eviction_result = self
             .perform_eviction_with_lock(current_size, max_size, skip_pre_eviction_consolidation)
             .await;
+        // On demand alone, a pass that left no room makes the demand futile and backs the next
+        // one off. See `note_legacy_demand_pass_end`. "On demand alone" is the decision under the
+        // lock (`on_demand_alone`), not `current_size`, which is the figure after the drain guard
+        // and can have fallen to the trigger since: a pass decided over it records no streak.
+        if on_demand_alone && eviction_result.is_ok() {
+            self.note_legacy_demand_pass_end(
+                last.as_ref(),
+                pass_started_secs,
+                pass_started,
+                current_size,
+                target_size,
+                max_size,
+            )
+            .await;
+        }
 
         // NOTE: Do NOT subtract bytes_freed directly here!
         // Eviction already debited the size accumulator for what it unlinked
@@ -12731,7 +13814,11 @@ impl CacheManager {
         // Steps 1-3 and the start of step 4: SELECTION through the leaf grouping, now one function
         // the pass-authoring half of DR-EVICT can call. The legacy pass passes an empty exclusion
         // set, which makes the selection identical to what was inline here.
-        let SelectedWork { leaf_groups, .. } = self
+        let SelectedWork {
+            leaf_groups,
+            exhausted_shortfall,
+            ..
+        } = self
             .select_pass_work(bytes_to_free, &ExclusionSet::new())
             .await?;
         if leaf_groups.is_empty() {
@@ -13017,7 +14104,11 @@ impl CacheManager {
                 pass_result.summary()
             );
         }
-        if let Err(e) = pass_result.install(&self.cache_dir) {
+        let evidence = crate::eviction_result::PassEvidence {
+            exhausted_shortfall_bytes: exhausted_shortfall,
+            ..Default::default()
+        };
+        if let Err(e) = pass_result.install_with_evidence(&self.cache_dir, evidence) {
             debug!("Could not publish the eviction pass result: {}", e);
         }
 
@@ -13026,19 +14117,95 @@ impl CacheManager {
         Ok(total_bytes_freed)
     }
 
+    /// A legacy pass on demand alone has ended, still under `global_eviction.lock`: mark its
+    /// demand futile when its own result says so, and record its `demand_backoff_streak`
+    /// ([`demand_backoff_streak_after`]), against `last`, the result before it.
+    ///
+    /// Its own result only: one older than `pass_started_secs` means the pass published none,
+    /// which happens when it selected nothing. One is published for it here, requesting what the
+    /// pass was sized to free (`current_size` minus `target_size`) and freeing nothing, with no
+    /// exhaustion recorded; without it a pass that keeps finding nothing it can evict would never
+    /// be backed off.
+    async fn note_legacy_demand_pass_end(
+        &self,
+        last: Option<&(
+            crate::eviction_result::EvictionPassResult,
+            crate::eviction_result::PassEvidence,
+        )>,
+        pass_started_secs: u64,
+        pass_started: std::time::Instant,
+        current_size: u64,
+        target_size: u64,
+        max_size: u64,
+    ) {
+        let demand = eviction_demand(&self.cache_dir);
+        let own = crate::eviction_result::EvictionPassResult::load_with_evidence(&self.cache_dir)
+            .filter(|(r, _)| r.completed_at >= pass_started_secs);
+        let (result, mut evidence) = match own {
+            Some((result, evidence)) => {
+                note_demand_pass_end(
+                    &self.cache_dir,
+                    evidence.exhausted_shortfall_bytes,
+                    target_size,
+                    max_size,
+                );
+                (result, evidence)
+            }
+            None => (
+                crate::eviction_result::EvictionPassResult::new(
+                    format!(
+                        "{}:{}",
+                        gethostname::gethostname().to_string_lossy(),
+                        std::process::id()
+                    ),
+                    current_size.saturating_sub(target_size),
+                    0,
+                    0,
+                    crate::signed_put_handler::compose_in_progress_part_bytes(
+                        &self.cache_dir,
+                        crate::signed_put_handler::PUBLISHED_WALK_BASE_MAX_AGE,
+                    )
+                    .await
+                    .bytes,
+                    Some(pass_started.elapsed()),
+                ),
+                crate::eviction_result::PassEvidence::default(),
+            ),
+        };
+        evidence.demand_backoff_streak = demand_backoff_streak_after(
+            &self.cache_dir,
+            last,
+            result.shortfall_bytes,
+            demand,
+            target_size,
+            max_size,
+        );
+        if evidence.demand_backoff_streak.is_none() {
+            return;
+        }
+        if let Err(e) = result.install_with_evidence(&self.cache_dir, evidence) {
+            debug!(
+                "Could not record the demand backoff in the eviction pass result: {}",
+                e
+            );
+        }
+    }
+
     /// The selection half of [`Self::perform_eviction_with_lock`]: everything from the tail-partition
     /// read to the leaf grouping, with no filesystem mutation.
     ///
     /// Extracted so the pass's author (DR-EVICT task 45) can select work without deleting it. The
-    /// legacy pass calls this with an empty `exclude` and proceeds exactly as it did when the code
-    /// was inline: same reads, same log lines in the same order, same result.
+    /// legacy pass calls this with an empty `exclude`.
     ///
     /// `exclude` names extents `(cache_key, range_start, range_end)` that must not be selected.
-    /// Every caller passes it empty today (see [`ExclusionSet`]). It is applied
-    /// to the candidate population BEFORE the byte accounting, on both the bounded path and the
-    /// full-population fallback, so a selection that excludes extents still reaches
+    /// Every caller passes it empty today (see [`ExclusionSet`]). It is applied to the candidate
+    /// population BEFORE the byte accounting, so a selection that excludes extents still reaches
     /// `bytes_to_free` from the next-oldest candidates rather than coming up short by whatever
     /// the exclusion removed.
+    ///
+    /// The bounded selection is the only selection: there is no full-population walk behind it.
+    /// A short selection frees what it found and reports short, and its exhaustion report is the
+    /// futility rule's evidence.
     ///
     /// Returns an empty [`SelectedWork::leaf_groups`] where the pass returned `Ok(0)` for want of
     /// candidates.
@@ -13049,85 +14216,50 @@ impl CacheManager {
         bytes_to_free: u64,
         exclude: &ExclusionSet,
     ) -> Result<SelectedWork> {
-        let mut fallback_ran = false;
-        // Steps 1-3: SELECTION. § 4.5's bounded prefix read of every shard's Tail_Partition
-        // first, and only the full-population collector if the partitions cannot answer.
+        // Steps 1-3: SELECTION. § 4.5's bounded prefix read of every shard's Tail_Partition.
         //
-        // The bounded path's cost is `shards` partial reads plus `instances` delta reads plus one
-        // `.meta` open per object it has decided it wants — no term proportional to the resident
-        // object count (R1.5, R3.3). The fallback below is O(all resident objects) and is what
-        // R13.2 red-sides; it survives for the three cases the partitions genuinely cannot serve.
+        // The cost is `shards` partial reads per round plus `instances` delta reads plus one
+        // `.meta` open per object it has decided it wants, plus at most the rejected-open budget
+        // — no term proportional to the resident object count (R1.5, R3.3).
         let mut selection = self
             .select_eviction_candidates_bounded_excluding(bytes_to_free, exclude)
             .await;
         info!(
             "[DISK_CACHE_EVICTION] Tail selection: status={:?}, rounds={}, depth={}, \
-             partitions present/absent/unreadable={}/{}/{}, delta_records={}, \
-             records_merged={}, meta_files_opened={}, selected={} range(s) / {} bytes, \
-             verdicts={:?}",
+             deepened={}, partitions present/absent/unreadable={}/{}/{}, delta_records={}, \
+             records_merged={}, meta_files_opened={} ({} rejected, budget bound: {}), \
+             lazy_rebuilds={} ({} .meta parsed), selected={} range(s) / {} bytes, \
+             exhausted_shortfall={:?}, verdicts={:?}",
             selection.status,
             selection.rounds,
             selection.final_depth,
+            selection.deepened_rounds,
             selection.partitions_present,
             selection.partitions_absent,
             selection.partitions_unreadable,
             selection.delta_records,
             selection.records_merged,
             selection.meta_files_opened,
+            selection.rejected_opens,
+            selection.verify_budget_bound,
+            selection.lazy_rebuilds,
+            selection.lazy_rebuild_metas_parsed,
             selection
                 .selected
                 .iter()
                 .map(|(_, r)| r.len())
                 .sum::<usize>(),
             selection.selected_bytes,
+            selection.exhausted_shortfall,
             selection.verdicts,
         );
+        let exhausted_shortfall = selection.exhausted_shortfall;
+        // The figures stay on `selection`; the plans move into the work list.
+        let mut grouped_candidates = std::mem::take(&mut selection.selected);
 
-        let mut grouped_candidates = if !selection.selected.is_empty() {
-            // The figures stay on `selection`; the plans move into the work list.
-            std::mem::take(&mut selection.selected)
-        } else {
-            fallback_ran = true;
-            // R3.5's fallback, and § 4.5's two named outcomes plus the unvisited case. Each is
-            // counted separately because they have different justifications: the entry dimension
-            // is exact only when sizes are uniform, and `CAP_EXHAUSTED` means the cache has skew
-            // by construction, so the fallback there is best-effort and says so.
-            debug!(
-                "Tail selection produced nothing ({:?}); falling back to the full-population \
-                 collector, which is O(all resident objects).",
-                selection.status
-            );
-            let mut range_candidates = self.collect_range_candidates_for_eviction().await?;
-            if !exclude.is_empty() {
-                range_candidates.retain(|c| {
-                    !exclude.contains(&(c.cache_key.clone(), c.range_start, c.range_end))
-                });
-            }
-
-            if range_candidates.is_empty() {
-                debug!("No range candidates found for eviction");
-                return Ok(SelectedWork::empty(fallback_ran));
-            }
-
-            debug!(
-                "Collected {} range candidates for eviction",
-                range_candidates.len()
-            );
-
-            // § 5.2's byte-dimension ordering: TTL-expired first, then size, then coldness, and
-            // R3.9's whole-object preference LAST. The fallback is still the BYTE dimension, so
-            // R3.6 governs it too — and unlike the bounded path this collector read every
-            // document, so `object_range_count` is populated and R3.9's term is live here.
-            self.sort_byte_dimension_candidates(&mut range_candidates);
-
-            // Group candidates by object, with § 5.3's best-fit repair.
-            self.group_candidates_by_object(range_candidates, bytes_to_free)
-        };
-
-        // R3.9 over the work list, on BOTH selection paths. The bounded path has already applied
-        // it to its own `selected`; re-running it here is idempotent (the key is the same and the
-        // sort is stable) and is what covers the fallback branch above, whose `group_*` does not
-        // order plans. Cheap: one stable sort of the object count, no I/O.
+        // R3.9 over the work list. The bounded path has already applied it to its own
+        // `selected`; re-running it here is idempotent (the key is the same and the sort is
+        // stable). Cheap: one stable sort of the object count, no I/O.
         let (whole_object_plans, partial_plans) =
             self.order_plans_whole_object_first(&mut grouped_candidates);
         debug!(
@@ -13139,7 +14271,7 @@ impl CacheManager {
 
         if grouped_candidates.is_empty() {
             debug!("No candidates grouped for eviction");
-            return Ok(SelectedWork::empty(fallback_ran));
+            return Ok(SelectedWork::empty(exhausted_shortfall));
         }
 
         debug!(
@@ -13180,7 +14312,7 @@ impl CacheManager {
 
         Ok(SelectedWork {
             leaf_groups,
-            fallback_ran,
+            exhausted_shortfall,
         })
     }
 
@@ -13312,7 +14444,7 @@ impl CacheManager {
         let reread = true;
         let consolidator = self.journal_consolidator.read().await.clone();
         let projected_size = match consolidator {
-            Some(c) if reread => c.get_projected_size().await.ok_or_else(|| {
+            Some(c) if reread => c.read_tier_eviction_size().await.ok_or_else(|| {
                 ProxyError::CacheError(
                     "eviction work list: the projected size is unreadable after the drain \
                      guard; authoring nothing"
@@ -13333,6 +14465,7 @@ impl CacheManager {
         let work = self
             .select_pass_work(shortfall, &ExclusionSet::new())
             .await?;
+        out.exhausted_shortfall = work.exhausted_shortfall;
         let mut by_shard: std::collections::BTreeMap<crate::staged_fold::Shard, Vec<wl::WorkItem>> =
             std::collections::BTreeMap::new();
         for (_, plans) in work.leaf_groups {
@@ -13976,6 +15109,16 @@ impl CacheManager {
         if LEGACY_PASS_IGNORES_IN_FLIGHT {
             return Some(fallback);
         }
+        #[cfg(test)]
+        if let Some((dir, size)) = LEGACY_GUARD_SIZE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            if dir == self.cache_dir {
+                return Some(size);
+            }
+        }
         let dir = self.cache_dir.as_path();
         let generation = match wl::settled_current_generation(dir).await {
             Ok(g) => g,
@@ -13997,7 +15140,9 @@ impl CacheManager {
                 None
             }
             Ok(_) => match self.journal_consolidator.read().await.as_ref() {
-                Some(consolidator) => Some(consolidator.get_projected_size().await.unwrap_or(0)),
+                Some(consolidator) => {
+                    Some(consolidator.read_tier_eviction_size().await.unwrap_or(0))
+                }
                 None => Some(fallback),
             },
             Err(e) => {
@@ -14760,118 +15905,14 @@ impl CacheManager {
         Ok(total_size)
     }
 
-    /// Collect all ranges as independent eviction candidates
+    /// Override the two Tail_Partition caps on a manager built by a test constructor.
     ///
-    /// This method implements range-based disk cache eviction where each cached range
-    /// is treated as an independent eviction candidate with equal weight. This enables
-    /// fine-grained eviction decisions based on individual range access patterns.
-    ///
-    /// # Process
-    /// - Traverses all .meta files in the metadata/ directory
-    /// - For each range in metadata, creates a separate RangeEvictionCandidate
-    /// - Uses per-range last_accessed and access_count from RangeSpec
-    ///
-    /// # Returns
-    /// A vector of RangeEvictionCandidate structs, one for each cached range
-    ///
-    /// # Requirements
-    /// Implements Requirements 1.1, 1.2, 1.3 from range-based-disk-eviction spec
-    pub async fn collect_range_candidates_for_eviction(
-        &self,
-    ) -> Result<Vec<RangeEvictionCandidate>> {
-        // Only traverse the metadata/ directory which contains .meta files
-        let metadata_dir = self.cache_dir.join("metadata");
-        if !metadata_dir.exists() {
-            debug!("Metadata directory does not exist, no range candidates to collect");
-            return Ok(Vec::new());
-        }
-
-        // The documents are read and parsed and their ranges stat'd on the blocking pool,
-        // `selection_meta_read_concurrency` of them at a time, FED FROM THE WALK AS A STREAM:
-        // [`MetaFileWalk`] is a lazy iterator, so `buffered` pulls a path only when it has room
-        // for another read, and the walk, the reads and the stats run together rather than in
-        // two phases. What is in memory is therefore bounded by the fan-out -- at most that many
-        // paths and that many documents, 64 of each at the shipped constant, plus one open
-        // directory stream per level of the tree -- and not by the cache's object count, which at
-        // the design point's O(100 million) ranges would be gigabytes of paths before the first
-        // read. (The candidate vector this returns is still proportional to the candidates found;
-        // that is the fallback path's contract and unchanged here.)
-        //
-        // On shared storage each document is a round trip and each range a second one, which is
-        // the ~10 ms per candidate that made an ONTAP author pass take 12.8 to 29.4 s.
-        //
-        // `buffered`, never `buffer_unordered`: it yields each document's candidates in
-        // enumeration order however the reads interleave, so the vector this returns is the one
-        // the serial walk built, element for element. That matters beyond tidiness -- the
-        // comparator downstream is a STABLE sort, so candidates that tie on expiry, size and
-        // coldness are evicted in collection order, and reordering here would silently change
-        // which of a tied pair goes.
-        //
-        // A document whose read or parse fails contributes nothing, as it did serially (every
-        // failure path inside `collect_candidates_from_metadata_file` returns `Ok(())` after a
-        // `debug!`, so the `?` it replaces never carried an error). A blocking task that panics
-        // now costs that one document's candidates rather than the whole pass.
-        let cache_dir = self.cache_dir.clone();
-        let mut reads = stream::iter(MetaFileWalk::new(&metadata_dir).map(|meta_path| {
-            let cache_dir = cache_dir.clone();
-            async move {
-                #[cfg(test)]
-                let seam_dir = cache_dir.clone();
-                let file_candidates = tokio::task::spawn_blocking(move || {
-                    #[cfg(test)]
-                    selection_read_seam::observe(&cache_dir, &meta_path);
-                    let mut file_candidates = Vec::new();
-                    if let Err(e) = Self::collect_candidates_from_metadata_file(
-                        &cache_dir,
-                        &meta_path,
-                        &mut file_candidates,
-                    ) {
-                        debug!(
-                            "Failed to collect eviction candidates from {:?}: {}",
-                            meta_path, e
-                        );
-                    }
-                    file_candidates
-                })
-                .await
-                .unwrap_or_default();
-                // This path is no longer in memory: the walk counted it in as it came out.
-                #[cfg(test)]
-                selection_read_seam::observe_path_released(&seam_dir);
-                file_candidates
-            }
-        }))
-        .buffered(selection_meta_read_concurrency(&self.cache_dir));
-        let mut candidates = Vec::new();
-        while let Some(file_candidates) = reads.next().await {
-            candidates.extend(file_candidates);
-        }
-
-        debug!(
-            "Collected {} range candidates for eviction using {:?} algorithm",
-            candidates.len(),
-            self.eviction_algorithm
-        );
-
-        Ok(candidates)
-    }
-
-    /// The Tail_Partition floor in force for this manager, from
-    /// `cache.shared_storage.tail_floor_bytes`.
-    fn tail_floor_bytes_in_force(&self) -> u64 {
-        self.shared_storage.tail_floor_bytes
-    }
-
-    /// Override the three Tail_Partition tuning values on a manager built by a test constructor.
-    ///
-    /// Tests only. Needed because the default floor is 1 MiB and the default cap is 4096, and a
-    /// fixture that had to clear both would have to write megabytes of `.bin` payload per range
-    /// and 4097 ranges per shard — at which point the arms that only the cap and the floor reach
-    /// would be unreachable in any reasonable fixture. This is the same reason `TAIL-BUILD`'s
-    /// cap-exceeded arm sets the cap to 3.
+    /// Tests only. Needed because the default cap is 4096, and a fixture that had to exceed it
+    /// would have to write 4097 ranges per shard — at which point the arms that only the cap
+    /// reaches would be unreachable in any reasonable fixture. This is the same reason
+    /// `TAIL-BUILD`'s cap-exceeded arm sets the cap to 3.
     #[cfg(test)]
-    fn set_tail_config_for_tests(&mut self, floor: u64, cap: usize, delta_cap: usize) {
-        self.shared_storage.tail_floor_bytes = floor;
+    fn set_tail_config_for_tests(&mut self, cap: usize, delta_cap: usize) {
         self.shared_storage.tail_max_entries = cap;
         self.shared_storage.tail_delta_max_entries = delta_cap;
     }
@@ -14901,29 +15942,346 @@ impl CacheManager {
             .await
     }
 
+    /// Read-tier selection from the per-shard index, with a lazy rebuild of the shards that
+    /// could not answer, and the read tier's exhaustion report.
+    ///
+    /// [`Self::select_from_tail_index`] reads every shard's Tail_Partition prefix and the
+    /// tail-deltas, deepening the prefix while verification leaves the target unmet. When what
+    /// it verified still falls short of `target_bytes`, the shards that could say more are
+    /// rebuilt from their `.meta` files ([`Self::rebuild_short_tail_shards`]) and the index is
+    /// read once more. Without this, a shard's index is only as fresh as its last rolling visit,
+    /// which at the design point is days.
+    ///
+    /// A selection still short then asks whether the read tier is exhausted
+    /// ([`Self::tail_exhaustion_shortfall`]): the one outcome the futility rule accepts as
+    /// evidence that a repeat pass cannot make room.
+    ///
+    /// # Cost
+    ///
+    /// The index reads stay bounded as [`Self::select_from_tail_index`] states, twice when a
+    /// rebuild ran. A rebuild is O(objects in that shard), never O(N): at most
+    /// [`LAZY_TAIL_REBUILD_MAX_SHARDS`] shards and [`LAZY_TAIL_REBUILD_BUDGET`] of wall time per
+    /// pass, and a shard rebuilt in the last [`LAZY_TAIL_REBUILD_MIN_INTERVAL`] (by any proxy,
+    /// read from its checkpoint's `tail_built_at`) is not rebuilt again. The exhaustion report
+    /// reads every journal once, and only when every other condition already holds.
+    ///
+    /// Spec: cache-eviction-at-scale § 4.4, § 4.5.
+    pub(crate) async fn select_eviction_candidates_bounded_excluding(
+        &self,
+        target_bytes: u64,
+        exclude: &ExclusionSet,
+    ) -> TailSelectionOutcome {
+        let first = self.select_from_tail_index(target_bytes, exclude).await;
+        if first.selected_bytes >= target_bytes {
+            return first;
+        }
+        let rebuild = self.rebuild_short_tail_shards(&first).await;
+        let mut outcome = if rebuild.rebuilt == 0 {
+            first
+        } else {
+            let mut second = self.select_from_tail_index(target_bytes, exclude).await;
+            second.lazy_rebuilds = rebuild.rebuilt;
+            second.lazy_rebuild_metas_parsed = rebuild.parsed;
+            second.meta_files_opened += first.meta_files_opened;
+            second
+        };
+        outcome.index_incomplete = rebuild.unindexed_after > 0;
+        if outcome.selected_bytes < target_bytes {
+            outcome.exhausted_shortfall = self
+                .tail_exhaustion_shortfall(&outcome, &rebuild, target_bytes, exclude)
+                .await;
+        }
+        outcome
+    }
+
+    /// `Some(target_bytes - seen)` when `outcome` proves the evictable read tier holds less than
+    /// `target_bytes`, so no repeat pass can make room until the usage changes. `None` in every
+    /// other case, which the futility rule reads as no evidence.
+    ///
+    /// # The conditions, every one required
+    ///
+    /// - Nothing excluded: an exclusion hides bytes the next pass may take.
+    /// - Every shard with a metadata directory has a partition (`index_incomplete` is false), and
+    ///   none was unreadable.
+    /// - Every partition was read to its end, and none is cap-bound
+    ///   (`TailSelectionOutcome::cap_bound_shards` is empty): a partition holding the rank cap's
+    ///   worth of records may have dropped smaller ranges at build time.
+    /// - Every partition was rebuilt within [`LAZY_TAIL_REBUILD_MIN_INTERVAL`], by this pass or
+    ///   by any proxy (`LazyRebuildRound::fresh`), so it lists what its shard held at most that
+    ///   long ago. A lazy rebuild that could not read a leaf or a `.meta` (an I/O error, possibly
+    ///   transient) is stamped as never built, so its shard does not count.
+    /// - Every journal was read: `seen` counts their pending `Add` bytes, because a fill is
+    ///   credited to the usage figure before its `.meta` lists it.
+    ///
+    /// `seen` is then every byte the index names that the read tier may evict (unstaged, or
+    /// staged and expired; partitions plus tail-deltas, hot and in-window ranges included,
+    /// before verification), plus every byte of the tail-delta records the read dropped past
+    /// its per-instance cap (staged or not, so an upper bound on theirs), plus those pending
+    /// bytes. Verification
+    /// can only remove bytes from that sum, so `seen` is an upper bound on what any pass could
+    /// evict from the read tier, and a pass short of `seen` is short however it verifies.
+    ///
+    /// # Why it is never set while evictable bytes remain unread
+    ///
+    /// Each evictable byte is in a `.meta`, in a shard. A shard with no partition, an unreadable
+    /// partition, a partition not read to its end or a cap-bound one each leave the report
+    /// unset, so every listed range of every shard was read. A range a fresh partition does not
+    /// list was admitted after its rebuild, and its admission appended a tail-delta record,
+    /// which the selection read. What remains is a record that never reached the delta (a lost
+    /// append, or one compacted out of a full delta file) for a range admitted since the
+    /// rebuild: the report can then read the tier as exhausted while it holds those bytes. The
+    /// cost is a futile mark that suppresses demand passes for that size until the usage
+    /// changes, never a wrong delete; the over-trigger pass never reads the mark.
+    ///
+    /// Spec: cache-eviction-at-scale § 4.5.
+    async fn tail_exhaustion_shortfall(
+        &self,
+        outcome: &TailSelectionOutcome,
+        rebuild: &LazyRebuildRound,
+        target_bytes: u64,
+        exclude: &ExclusionSet,
+    ) -> Option<u64> {
+        if !exclude.is_empty()
+            || outcome.index_incomplete
+            || outcome.partitions_unreadable > 0
+            || !outcome.partitions_read_to_end
+            || !outcome.cap_bound_shards.is_empty()
+            || !outcome
+                .partitioned_shards
+                .iter()
+                .all(|s| rebuild.fresh.contains(s))
+        {
+            return None;
+        }
+        let journals_dir = self.cache_dir.join("metadata").join("_journals");
+        let pending =
+            tokio::task::spawn_blocking(move || Self::pending_journal_add_bytes_in(&journals_dir))
+                .await
+                .ok()
+                .flatten()?;
+        let seen = outcome
+            .unstaged_hint_bytes
+            .saturating_add(outcome.delta_dropped_bytes)
+            .saturating_add(pending);
+        (seen < target_bytes).then(|| target_bytes - seen)
+    }
+
+    /// Rebuild, within the per-pass budget, the shards `outcome` could not get more from.
+    ///
+    /// Order: shards with a metadata directory and no partition file first (selection had no
+    /// information about them at all), then `outcome.exhausted_shards` (read to the end, not
+    /// cap-bound; limited, see below). Then, only when neither tier rebuilt anything this pass and
+    /// this process has
+    /// not done so in the last [`LAZY_TAIL_CAP_BOUND_REBUILD_INTERVAL`], the cap-bound shards
+    /// (`outcome.cap_bound_shards`), whose rebuild helps only if the partition is stale.
+    ///
+    /// # Rate in the futile state
+    ///
+    /// A read tier that cannot meet the target leaves every pass short. The unindexed tier ends
+    /// once every shard has a partition. The exhausted and cap-bound tiers would otherwise spend
+    /// the whole [`LAZY_TAIL_REBUILD_BUDGET`] on every pass: at the design point most shards
+    /// hold fewer ranges than the rank cap, so most partitions read to their end, and a volume of
+    /// 25,600 shards always has one older than [`LAZY_TAIL_REBUILD_MIN_INTERVAL`]. That reads
+    /// `.meta` files at about the backend's whole scan rate under `global_eviction.lock`.
+    /// Limited, each tier rebuilds for at most one budget per
+    /// [`LAZY_TAIL_CAP_BOUND_REBUILD_INTERVAL`] per proxy. A shard rebuilt within
+    /// [`LAZY_TAIL_REBUILD_MIN_INTERVAL`] still counts as fresh when its tier's claim is taken.
+    async fn rebuild_short_tail_shards(&self, outcome: &TailSelectionOutcome) -> LazyRebuildRound {
+        use crate::cache_size_tracker as cst;
+
+        let mut round = LazyRebuildRound::default();
+        let cache_dir = self.cache_dir.clone();
+        let listed = tokio::task::spawn_blocking(move || {
+            (
+                cst::enumerate_metadata_shards(&cache_dir),
+                cst::enumerate_tail_shards(&cache_dir),
+            )
+        })
+        .await;
+        let Ok((metadata_shards, partitioned)) = listed else {
+            round.unindexed_after = usize::MAX;
+            return round;
+        };
+        let partitioned_set: std::collections::HashSet<&(String, String)> =
+            partitioned.iter().collect();
+        let unindexed: Vec<(String, String)> = metadata_shards
+            .iter()
+            .filter(|s| !partitioned_set.contains(s))
+            .cloned()
+            .collect();
+        let unindexed_before = unindexed.len();
+        round.unindexed_after = unindexed_before;
+        let order = unindexed;
+
+        let started = std::time::Instant::now();
+        let mut unindexed_rebuilt = 0usize;
+        let mut cuts: Vec<(String, String, u64)> = Vec::new();
+        self.rebuild_tail_shards_in_order(
+            order,
+            unindexed_before,
+            started,
+            &mut round,
+            &mut unindexed_rebuilt,
+            &mut cuts,
+            None,
+        )
+        .await;
+        if !outcome.exhausted_shards.is_empty() {
+            self.rebuild_tail_shards_in_order(
+                outcome.exhausted_shards.clone(),
+                0,
+                started,
+                &mut round,
+                &mut unindexed_rebuilt,
+                &mut cuts,
+                Some(claim_exhausted_rebuild),
+            )
+            .await;
+        }
+        if round.rebuilt == 0
+            && !outcome.cap_bound_shards.is_empty()
+            && claim_cap_bound_rebuild(&self.cache_dir)
+        {
+            self.rebuild_tail_shards_in_order(
+                outcome.cap_bound_shards.clone(),
+                0,
+                started,
+                &mut round,
+                &mut unindexed_rebuilt,
+                &mut cuts,
+                None,
+            )
+            .await;
+        }
+        if !cuts.is_empty() {
+            let cache_dir = self.cache_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                cst::retire_delta_records_for_lazy_rebuilds(&cache_dir, &cuts)
+            })
+            .await;
+        }
+        if round.rebuilt > 0 {
+            info!(
+                "Tail selection: the index fell short, so {} shard partition(s) were rebuilt \
+                 lazily ({} .meta parsed in {:?}) before selecting again",
+                round.rebuilt,
+                round.parsed,
+                started.elapsed()
+            );
+        }
+        round.unindexed_after = unindexed_before.saturating_sub(unindexed_rebuilt);
+        round
+    }
+
+    /// One tier of [`Self::rebuild_short_tail_shards`]: rebuild each shard of `order` in turn,
+    /// skipping one rebuilt within [`LAZY_TAIL_REBUILD_MIN_INTERVAL`] (recorded as fresh), until
+    /// the shard cap or the wall-time budget runs out. The first `unindexed` entries of `order`
+    /// are shards with no partition. With `claim`, the first shard that needs a rebuild takes
+    /// the tier's claim, and a refused claim rebuilds nothing while fresh shards are still
+    /// recorded as fresh.
+    #[allow(clippy::too_many_arguments)] // One call per tier; a struct would only rename them.
+    async fn rebuild_tail_shards_in_order(
+        &self,
+        order: Vec<(String, String)>,
+        unindexed: usize,
+        started: std::time::Instant,
+        round: &mut LazyRebuildRound,
+        unindexed_rebuilt: &mut usize,
+        cuts: &mut Vec<(String, String, u64)>,
+        claim: Option<fn(&Path) -> bool>,
+    ) {
+        let mut claimed: Option<bool> = None;
+        use crate::cache_size_tracker as cst;
+        let cap = self.tail_max_entries_in_force();
+        let max_shards = lazy_tail_rebuild_max_shards(&self.cache_dir);
+        let min_interval_nanos = LAZY_TAIL_REBUILD_MIN_INTERVAL.as_nanos() as u64;
+        for (position, (bucket, l1)) in order.into_iter().enumerate() {
+            if round.rebuilt >= max_shards || started.elapsed() >= LAZY_TAIL_REBUILD_BUDGET {
+                break;
+            }
+            if round.fresh.contains(&(bucket.clone(), l1.clone())) {
+                continue;
+            }
+            let now_nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let built_at = cst::tail_built_at_for(&self.cache_dir, &bucket, &l1);
+            if built_at.is_some_and(|at| now_nanos.saturating_sub(at) < min_interval_nanos) {
+                round.fresh.insert((bucket, l1));
+                continue;
+            }
+            if let Some(claim) = claim {
+                if !*claimed.get_or_insert_with(|| claim(&self.cache_dir)) {
+                    continue;
+                }
+            }
+            if let Some(done) =
+                cst::rebuild_tail_partition_lazily(&self.cache_dir, &bucket, &l1, cap).await
+            {
+                round.rebuilt += 1;
+                round.parsed += done.metas_parsed;
+                if position < unindexed {
+                    *unindexed_rebuilt += 1;
+                }
+                debug!(
+                    "Tail selection: lazily rebuilt shard {}/{} ({} .meta parsed, {} member(s))",
+                    bucket, l1, done.metas_parsed, done.entries
+                );
+                if done.read_gaps == 0 {
+                    cuts.push((bucket.clone(), l1.clone(), done.started_at));
+                    round.fresh.insert((bucket, l1));
+                } else {
+                    debug!(
+                        "Tail selection: the lazy rebuild of {}/{} could not read {} entr(ies), \
+                         so its partition is not evidence of what the shard holds",
+                        bucket, l1, done.read_gaps
+                    );
+                }
+            }
+        }
+    }
+
     /// § 4.5's selection read, § 5.3's best-fit accumulation and § 5.4's verification, as one
     /// pass whose cost is bounded independently of the resident object count.
     ///
-    /// # What replaces what
+    /// # What it reads
     ///
-    /// [`Self::collect_range_candidates_for_eviction`] `read_dir`s the whole of `metadata/`,
-    /// parses **every** `.meta`, takes one `stat` **per range**, and pushes one candidate per
-    /// range — all before the first decision that consults `bytes_to_free`. That is
-    /// O(all resident objects) and it is the R13.2 failure. This reads a bounded prefix of every
-    /// shard's Tail_Partition instead, merges the bounded tail-deltas, and opens a `.meta` only
-    /// for a record it has already decided it wants.
+    /// A bounded prefix of every shard's Tail_Partition, merged with the bounded tail-deltas. A
+    /// `.meta` is opened only for a record the accumulation has already reached, and not for a
+    /// record that already says its range is staged and unexpired ([`Self::verdict_from_record`]).
+    ///
+    /// # Deepening
+    ///
+    /// The prefix starts at [`crate::cache_size_tracker::initial_prefix_depth`] and grows by
+    /// `depth × 4`, capped at `tail_max_entries`, in two cases: the records read hold fewer bytes
+    /// than the target (no `.meta` is read for that), or they held enough and verification
+    /// left the target unmet because the largest records are hot, staged, in the window or
+    /// gone. Each deeper round reads further into every partition, so the colder, smaller
+    /// ranges below those records are reached. It stops when the target is met, the prefix is
+    /// at the cap or every partition was read to its end, or the rejected-open budget is spent.
     ///
     /// # The bound, stated as arithmetic (R1.5, R3.3)
     ///
-    /// - partition reads: `shards × 1` opens, each reading `min(depth × 512 B, whole file)`, with
-    ///   `depth <= tail_max_entries`. `shards` is `256 × buckets`.
+    /// With `shards = 256 × buckets`, `d` the final depth (`d <= tail_max_entries`) and `S`
+    /// the target in bytes:
+    ///
+    /// - rounds: at most `1 + ceil(log4(tail_max_entries / d0))`, where `d0` is at least 64:
+    ///   4 at the default cap of 4,096 (64, 256, 1,024, 4,096). Escalation and deepening share
+    ///   the one depth schedule, so together they take no more rounds than that.
+    /// - partition reads: `shards` opens per round, each reading `min(depth × 512 B, file)`, so
+    ///   at most about `1.33 × file` per shard over the rounds.
     /// - delta reads: `instances × 1` opens, each file capped at `2 × tail_delta_max_entries`
     ///   records by [`crate::cache_size_tracker::append_tail_delta_records`].
-    /// - `.meta` opens: at most one per **distinct object** named in the merged prefix, so at most
-    ///   `depth × shards + cap × instances`.
+    /// - `.meta` opens: every open either yields a candidate the accumulation counts towards
+    ///   `S`, which stops at `S`, or counts against [`TAIL_VERIFY_MAX_REJECTED_OPENS`]. So at
+    ///   most `rounds × objects(S) + TAIL_VERIFY_MAX_REJECTED_OPENS + 3` (the best-fit swap's
+    ///   verifications), where `objects(S)` is the number of objects whose largest ranges sum to
+    ///   `S`, and never more than `d × shards + tail_delta_max_entries × instances`.
     /// - `stat`s per range: **zero**. `compressed_size` comes from the record.
     ///
-    /// Not one term is proportional to N.
+    /// No term is the resident object count: a pass that verifies nothing opens at most the
+    /// rejected-open budget, however many `.meta` files the volume holds.
     ///
     /// # R3.3: every shard, never a fraction
     ///
@@ -14939,9 +16297,15 @@ impl CacheManager {
     /// (`available`, the accumulation, the status), so the target is reached from the next-oldest
     /// candidates. An empty set skips the filter and leaves the selection unchanged.
     ///
+    /// # No partition anywhere
+    ///
+    /// The tail-deltas are still read and selected from: a fresh volume's deltas hold its
+    /// recent admissions, up to `tail_delta_max_entries` per instance. The status is then
+    /// `Unvisited` unless the deltas alone hold the target.
+    ///
     /// Spec: cache-eviction-at-scale § 4.5, § 5.2, § 5.3, § 5.4.
     /// Requirements: 3.3, 3.5, 3.6, 3.6a, 3.7, 3.8, 1.5, 13.2
-    pub(crate) async fn select_eviction_candidates_bounded_excluding(
+    async fn select_from_tail_index(
         &self,
         target_bytes: u64,
         exclude: &ExclusionSet,
@@ -14950,6 +16314,7 @@ impl CacheManager {
 
         let cap = self.tail_max_entries_in_force();
         let delta_cap = self.tail_delta_max_entries_in_force();
+        let reject_budget = tail_verify_reject_budget(&self.cache_dir);
         let shards = cst::enumerate_tail_shards(&self.cache_dir);
 
         let mut outcome = TailSelectionOutcome {
@@ -14968,25 +16333,37 @@ impl CacheManager {
             verdicts: Vec::new(),
             whole_object_plans: 0,
             partial_plans: 0,
+            exhausted_shards: Vec::new(),
+            cap_bound_shards: Vec::new(),
+            partitioned_shards: shards.clone(),
+            partitions_read_to_end: false,
+            unstaged_hint_bytes: 0,
+            deepened_rounds: 0,
+            rejected_opens: 0,
+            verify_budget_bound: false,
+            lazy_rebuilds: 0,
+            lazy_rebuild_metas_parsed: 0,
+            index_incomplete: false,
+            exhausted_shortfall: None,
+            delta_records_dropped: 0,
+            delta_dropped_bytes: 0,
         };
 
         if shards.is_empty() {
-            // No partition file anywhere. NOT `TAIL_EMPTY` — that would be a claim about what the
-            // cache holds, and what this observes is that nothing has looked yet.
-            TAIL_FALLBACK_UNVISITED.fetch_add(1, AtomicOrdering::Relaxed);
+            // No partition file anywhere. The deltas below are still read: on a fresh volume they
+            // are the whole index. NOT `TAIL_EMPTY` if they fall short — that would be a claim
+            // about what the cache holds, and what this observes is that nothing has rebuilt yet.
             debug!(
-                "Tail selection: no Tail_Partition exists under {:?}; no rolling visit has \
-                 happened since the partition scheme was introduced. Falling back to the \
-                 full-population collector.",
+                "Tail selection: no Tail_Partition exists under {:?}; selecting from the \
+                 tail-deltas alone",
                 cst::tails_dir(&self.cache_dir)
             );
-            return outcome;
+        } else {
+            // The coverage check is computed here because this is the one place a GLOBAL figure
+            // already exists — § 4.5's bounded prefix of every partition is the design's only
+            // cross-shard read, and `target_bytes` is in hand.
+            self.publish_tail_coverage_ratio(shards.len(), cap);
         }
-
-        // The coverage check is computed here because this is the one place a GLOBAL figure
-        // already exists — § 4.5's bounded prefix of every partition is the design's only
-        // cross-shard read, and `target_bytes` is in hand.
-        self.publish_tail_coverage_ratio(shards.len(), cap);
 
         let histogram = cst::global_size_histogram(&self.cache_dir);
         let mut depth =
@@ -15002,119 +16379,14 @@ impl CacheManager {
             );
         }
 
-        let delta = cst::read_tail_delta_candidates(&self.cache_dir, delta_cap);
+        let delta_read = cst::read_tail_delta_candidates(&self.cache_dir, delta_cap);
+        outcome.delta_records_dropped = delta_read.dropped;
+        outcome.delta_dropped_bytes = delta_read.dropped_bytes;
+        let delta = delta_read.records;
         outcome.delta_records = delta.len();
 
-        let mut ordered: Vec<RangeEvictionCandidate>;
-        loop {
-            outcome.rounds += 1;
-            outcome.final_depth = depth;
-
-            let mut present = 0usize;
-            let mut absent = 0usize;
-            let mut unreadable = 0usize;
-            let mut more_available = false;
-            let mut hints: Vec<crate::cache_size_tracker::TailRecord> = Vec::new();
-
-            // EVERY shard, never a fraction. R3.3.
-            for (bucket, l1) in &shards {
-                let read = cst::read_tail_partition_prefix(&self.cache_dir, bucket, l1, depth);
-                match &read {
-                    cst::TailPartitionRead::Absent => absent += 1,
-                    cst::TailPartitionRead::Unreadable => unreadable += 1,
-                    cst::TailPartitionRead::Present { .. } => present += 1,
-                }
-                if read.could_yield_more() {
-                    more_available = true;
-                }
-                hints.extend(read.records().iter().cloned());
-            }
-            outcome.partitions_present = present;
-            outcome.partitions_absent = absent;
-            outcome.partitions_unreadable = unreadable;
-
-            // Merge the deltas. Deduplicated on the range's identity, because a range admitted
-            // since a rebuild can be in both files and evicting it twice is not a thing the
-            // executor can do — it would count the bytes twice against the target.
-            let mut seen: std::collections::HashSet<(String, u64, u64)> = hints
-                .iter()
-                .map(|r| (r.cache_key.clone(), r.range_start, r.range_end))
-                .collect();
-            for record in &delta {
-                let id = (
-                    record.record.cache_key.clone(),
-                    record.record.range_start,
-                    record.record.range_end,
-                );
-                if seen.insert(id) {
-                    hints.push(record.record.clone());
-                }
-            }
-            outcome.records_merged = hints.len();
-
-            ordered = hints
-                .into_iter()
-                .map(|r| self.candidate_from_tail_record(&r))
-                .collect();
-            if !exclude.is_empty() {
-                ordered.retain(|c| {
-                    !exclude.contains(&(c.cache_key.clone(), c.range_start, c.range_end))
-                });
-            }
-            self.sort_byte_dimension_candidates(&mut ordered);
-
-            // The heap can meet the target iff the hints' own bytes sum to it. Verification can
-            // only remove candidates, so this is the necessary condition — it is checked before
-            // paying for any `.meta` read, which is the whole point of carrying `compressed_size`
-            // in the record.
-            let available: u64 = ordered.iter().map(|c| c.size).sum();
-            if available >= target_bytes {
-                outcome.status = TailSelectionStatus::Met;
-                break;
-            }
-            if present > 0 && ordered.is_empty() && !more_available {
-                // Every partition read to EOF and none holds a member above the floor. § 4.5's
-                // `TAIL_EMPTY`, and the one fallback R3.5 justifies — but only when sizes are
-                // uniform, not under § 4.3's sub-floor skew.
-                outcome.status = TailSelectionStatus::TailEmpty;
-                TAIL_FALLBACK_TAIL_EMPTY.fetch_add(1, AtomicOrdering::Relaxed);
-                break;
-            }
-            if depth >= cap || !more_available {
-                outcome.status = TailSelectionStatus::CapExhausted;
-                TAIL_FALLBACK_CAP_EXHAUSTED.fetch_add(1, AtomicOrdering::Relaxed);
-                warn!(
-                    "Tail selection: CAP_EXHAUSTED. {} record(s) across {} shard partition(s) \
-                     hold {} bytes against a target of {}, and the prefix has reached \
-                     tail_max_entries={} at tail_floor_bytes={}. This cache has size skew by \
-                     construction, so the entry dimension is NOT exact for a byte target here \
-                     (R3.5): the pass frees what it selected and reports short. Raise \
-                     cache.shared_storage.tail_max_entries or lower \
-                     cache.shared_storage.tail_floor_bytes.",
-                    ordered.len(),
-                    present,
-                    available,
-                    target_bytes,
-                    cap,
-                    self.tail_floor_bytes_in_force(),
-                );
-                break;
-            }
-            depth = depth.saturating_mul(4).min(cap);
-        }
-
-        if matches!(outcome.status, TailSelectionStatus::TailEmpty) {
-            return outcome;
-        }
-
-        // §§ 5.3 + 5.4, fused: verify as we accumulate, so a `.meta` is opened only for a record
-        // the accumulation has already reached. Verifying the whole ordered list first would open
-        // one `.meta` per record and reintroduce a cost proportional to what was read.
-        let mut chosen: Vec<RangeEvictionCandidate> = Vec::new();
-        let mut accumulated: u64 = 0;
-        let mut verdict_counts = [0usize; TailCandidateVerdict::COUNT];
-        let mut meta_cache: HashMap<String, Option<crate::cache_types::NewCacheMetadata>> =
-            HashMap::new();
+        // Verification state, kept across the deepening rounds: a `.meta` read in one round is
+        // memoised for the next, and a hint's verdict is tallied once however many rounds see it.
         let now = SystemTime::now();
         // The lower bound on every `.meta` read this pass is about to make, in the same
         // nanosecond clock a tail-delta record's `at` is stamped in. A record is retired below
@@ -15125,31 +16397,127 @@ impl CacheManager {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        let mut verdict_counts = [0usize; TailCandidateVerdict::COUNT];
+        let mut meta_cache: HashMap<String, Option<crate::cache_types::NewCacheMetadata>> =
+            HashMap::new();
+        let mut tallied: std::collections::HashSet<(String, u64, u64)> =
+            std::collections::HashSet::new();
         // Extents this pass read the `.meta` for and found gone. Only `MetadataAbsent` and
         // `RangeAbsent` reach it: see the retire block at the end of this function for why
         // `Unreadable` must not.
         let mut proved_gone: std::collections::HashSet<(String, u64, u64)> =
             std::collections::HashSet::new();
 
+        let mut ordered: Vec<RangeEvictionCandidate>;
+        let mut chosen: Vec<RangeEvictionCandidate> = Vec::new();
         let mut chosen_idx: Vec<usize> = Vec::new();
-        for (idx, hint) in ordered.iter().enumerate() {
-            if accumulated >= target_bytes {
+        loop {
+            outcome.rounds += 1;
+            outcome.final_depth = depth;
+            let round = self.read_tail_index_round(&shards, &delta, depth, cap, exclude);
+            outcome.partitions_present = round.present;
+            outcome.partitions_absent = round.absent;
+            outcome.partitions_unreadable = round.unreadable;
+            outcome.records_merged = round.records_merged;
+            outcome.exhausted_shards = round.exhausted_shards;
+            outcome.cap_bound_shards = round.cap_bound_shards;
+            outcome.partitions_read_to_end = !round.more_available;
+            ordered = round.ordered;
+            self.sort_byte_dimension_candidates(&mut ordered);
+            outcome.unstaged_hint_bytes = ordered
+                .iter()
+                .filter(|c| c.staged != Some(true) || c.is_expired_at(now))
+                .map(|c| c.size)
+                .sum();
+            let can_deepen = depth < cap && round.more_available;
+
+            // The heap can meet the target iff the hints' own bytes sum to it. Verification can
+            // only remove candidates, so this is the necessary condition — it is checked before
+            // paying for any `.meta` read, which is the whole point of carrying `compressed_size`
+            // in the record.
+            let available: u64 = ordered.iter().map(|c| c.size).sum();
+            if available >= target_bytes {
+                outcome.status = TailSelectionStatus::Met;
+            } else if shards.is_empty() {
+                // The deltas are the whole index and hold less than the target.
+                outcome.status = TailSelectionStatus::Unvisited;
+            } else if round.present > 0 && ordered.is_empty() && !round.more_available {
+                // Every partition read to EOF and none holds a member. § 4.5's `TAIL_EMPTY`.
+                outcome.status = TailSelectionStatus::TailEmpty;
+                return outcome;
+            } else if can_deepen {
+                depth = depth.saturating_mul(4).min(cap);
+                continue;
+            } else {
+                outcome.status = TailSelectionStatus::CapExhausted;
+                debug!(
+                    "Tail selection: CAP_EXHAUSTED. {} record(s) across {} shard partition(s) \
+                     hold {} bytes against a target of {}, at prefix depth {} of \
+                     tail_max_entries={}. The shards that cannot say more are rebuilt lazily \
+                     within the pass's budget; a pass still short frees what it selected and \
+                     reports short.",
+                    ordered.len(),
+                    round.present,
+                    available,
+                    target_bytes,
+                    depth,
+                    cap,
+                );
+                if !outcome.cap_bound_shards.is_empty() {
+                    warn_cap_bound(outcome.cap_bound_shards.len(), cap, available, target_bytes);
+                }
+            }
+
+            // §§ 5.3 + 5.4, fused: verify as we accumulate, so a `.meta` is opened only for a
+            // record the accumulation has already reached. Verifying the whole ordered list
+            // first would open one `.meta` per record and reintroduce a cost proportional to
+            // what was read.
+            chosen.clear();
+            chosen_idx.clear();
+            let mut accumulated: u64 = 0;
+            for (idx, hint) in ordered.iter().enumerate() {
+                if accumulated >= target_bytes {
+                    break;
+                }
+                if outcome.rejected_opens >= reject_budget {
+                    outcome.verify_budget_bound = true;
+                    break;
+                }
+                let (verdict, verified) = match Self::verdict_from_record(hint, now) {
+                    Some(verdict) => (verdict, None),
+                    None => {
+                        let opened_before = outcome.meta_files_opened;
+                        let checked = self.verify_tail_candidate(
+                            hint,
+                            now,
+                            &mut meta_cache,
+                            &mut outcome.meta_files_opened,
+                        );
+                        if outcome.meta_files_opened > opened_before && checked.1.is_none() {
+                            outcome.rejected_opens += 1;
+                        }
+                        checked
+                    }
+                };
+                if tallied.insert((hint.cache_key.clone(), hint.range_start, hint.range_end)) {
+                    verdict_counts[verdict.metric_index()] += 1;
+                    TAIL_VERDICT_TOTALS[verdict.metric_index()]
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    Self::note_proved_gone(verdict, hint, &mut proved_gone);
+                }
+                if let Some(candidate) = verified {
+                    accumulated += candidate.size;
+                    chosen.push(candidate);
+                    chosen_idx.push(idx);
+                }
+            }
+            if accumulated >= target_bytes || outcome.verify_budget_bound || !can_deepen {
                 break;
             }
-            let (verdict, verified) = self.verify_tail_candidate(
-                hint,
-                now,
-                &mut meta_cache,
-                &mut outcome.meta_files_opened,
-            );
-            verdict_counts[verdict.metric_index()] += 1;
-            TAIL_VERDICT_TOTALS[verdict.metric_index()].fetch_add(1, AtomicOrdering::Relaxed);
-            Self::note_proved_gone(verdict, hint, &mut proved_gone);
-            if let Some(candidate) = verified {
-                accumulated += candidate.size;
-                chosen.push(candidate);
-                chosen_idx.push(idx);
-            }
+            // Verification left the target unmet and the partitions can say more: read deeper,
+            // so the colder ranges below the records that did not verify are reached.
+            outcome.deepened_rounds += 1;
+            depth = depth.saturating_mul(4).min(cap);
         }
 
         // § 5.3's BEST FIT. See `best_fit_final_swap` for why the single-removal repair alone
@@ -15165,23 +16533,25 @@ impl CacheManager {
             &mut verdict_counts,
             &mut proved_gone,
         );
-        accumulated = chosen.iter().map(|c| c.size).sum();
+        let accumulated: u64 = chosen.iter().map(|c| c.size).sum();
 
         outcome.verdicts = TailCandidateVerdict::all()
             .iter()
             .map(|v| (v.reason(), verdict_counts[v.metric_index()]))
             .collect();
 
-        if accumulated < target_bytes && matches!(outcome.status, TailSelectionStatus::Met) {
-            // The hints held enough bytes and verification took the total below the target. Not
-            // `CAP_EXHAUSTED`, which is about prefix depth: this is a stale partition, and the
-            // verdict tally names which kind of staleness.
+        if accumulated < target_bytes {
             debug!(
-                "Tail selection: verification left {} of {} target bytes after {} hint(s); \
-                 verdicts {:?}. A partition that is mostly skips is a compaction problem.",
+                "Tail selection: verification left {} of {} target bytes after {} hint(s) at \
+                 depth {} ({} deeper round(s), {} rejected .meta open(s), budget bound: {}); \
+                 verdicts {:?}",
                 accumulated,
                 target_bytes,
                 ordered.len(),
+                outcome.final_depth,
+                outcome.deepened_rounds,
+                outcome.rejected_opens,
+                outcome.verify_budget_bound,
                 outcome.verdicts
             );
         }
@@ -15213,6 +16583,100 @@ impl CacheManager {
         outcome.whole_object_plans = whole;
         outcome.partial_plans = partial;
         outcome
+    }
+
+    /// One round of [`Self::select_from_tail_index`]: the prefix of every partition at `depth`,
+    /// merged with the tail-deltas and filtered by `exclude`. No `.meta` is read.
+    ///
+    /// The merge is deduplicated on the range's identity, because a range admitted since a
+    /// rebuild can be in both files and evicting it twice is not a thing the executor can do —
+    /// it would count the bytes twice against the target. Where a partition record says staged
+    /// and a delta record for the same extent says unstaged, the delta record wins: graduation
+    /// is the only transition that clears it, and it appends that record after publishing the
+    /// graduated `.meta`.
+    fn read_tail_index_round(
+        &self,
+        shards: &[(String, String)],
+        delta: &[crate::cache_size_tracker::TailDeltaRecord],
+        depth: usize,
+        cap: usize,
+        exclude: &ExclusionSet,
+    ) -> TailIndexRound {
+        use crate::cache_size_tracker as cst;
+        let mut round = TailIndexRound::default();
+        let mut hints: Vec<cst::TailRecord> = Vec::new();
+        // EVERY shard, never a fraction. R3.3.
+        for (bucket, l1) in shards {
+            let read = cst::read_tail_partition_prefix(&self.cache_dir, bucket, l1, depth);
+            match &read {
+                cst::TailPartitionRead::Absent => round.absent += 1,
+                cst::TailPartitionRead::Unreadable => round.unreadable += 1,
+                cst::TailPartitionRead::Present { .. } => round.present += 1,
+            }
+            let shard = (bucket.clone(), l1.clone());
+            if read.could_yield_more() {
+                round.more_available = true;
+                round.cap_bound_shards.push(shard);
+            } else if read.records().len() >= cap {
+                // Read to its end, and holding the rank cap's worth: the build may have dropped
+                // smaller ranges, so only a rebuild could say more.
+                round.cap_bound_shards.push(shard);
+            } else if !matches!(read, cst::TailPartitionRead::Absent) {
+                round.exhausted_shards.push(shard);
+            }
+            hints.extend(read.records().iter().cloned());
+        }
+        let mut position: HashMap<(String, u64, u64), usize> = hints
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((r.cache_key.clone(), r.range_start, r.range_end), i))
+            .collect();
+        for record in delta {
+            let id = (
+                record.record.cache_key.clone(),
+                record.record.range_start,
+                record.record.range_end,
+            );
+            match position.get(&id) {
+                Some(&i) => {
+                    if hints[i].is_staged && !record.record.is_staged {
+                        hints[i] = record.record.clone();
+                    }
+                }
+                None => {
+                    position.insert(id, hints.len());
+                    hints.push(record.record.clone());
+                }
+            }
+        }
+        round.records_merged = hints.len();
+        round.ordered = hints
+            .into_iter()
+            .map(|r| self.candidate_from_tail_record(&r))
+            .collect();
+        if !exclude.is_empty() {
+            round
+                .ordered
+                .retain(|c| !exclude.contains(&(c.cache_key.clone(), c.range_start, c.range_end)));
+        }
+        round
+    }
+
+    /// § 5.4's verdict where the record alone decides it, so no `.meta` is opened: a record that
+    /// says its range is staged and its object unexpired.
+    ///
+    /// It can only skip a range. A staged record whose range has graduated is replaced in the
+    /// merge by the graduation's delta record ([`Self::read_tail_index_round`]); where that
+    /// append was lost, or the record's expiry is older than the document's, the range is
+    /// skipped until its shard is next rebuilt. The cost is a range evicted later, never a range
+    /// evicted wrongly. The admission window is not judged from the record: it is the document's
+    /// `last_accessed` that decides it (R3.8).
+    fn verdict_from_record(
+        hint: &RangeEvictionCandidate,
+        now: SystemTime,
+    ) -> Option<TailCandidateVerdict> {
+        (hint.staged == Some(true) && !hint.is_expired_at(now))
+            .then_some(TailCandidateVerdict::Staged)
     }
 
     /// Record that a hint's `.meta` says the extent is gone, for the tail-delta retire.
@@ -15277,9 +16741,8 @@ impl CacheManager {
     /// (`append_tail_delta_for_admissions`, which runs **after** the `.meta` write, so a record
     /// never describes a range the document does not), and that record has a different `at` and
     /// survives. So the hint comes back on the next consolidation cycle. It does **not** come
-    /// back where the refill is below `tail_floor_bytes`, or where its append fails — and there
-    /// the cost is one skipped candidate until the shard's next rebuild, which is exactly the
-    /// cost § 4.4 already accepts for a lost append.
+    /// back where its append fails — and there the cost is one skipped candidate until the
+    /// shard's next rebuild, which is exactly the cost § 4.4 already accepts for a lost append.
     ///
     /// A journal-pending `Add` is **not** this hazard: the record is appended after the fold that
     /// lists the range, so a range whose `.meta` does not list it yet has no record to retire.
@@ -15432,14 +16895,20 @@ impl CacheManager {
         if range.compressed_size != hint.compressed_size {
             return (TailCandidateVerdict::Superseded, None);
         }
-        if crate::cache_types::is_staged_range_spec(range, metadata.object_metadata.is_write_cached)
+        let expired = Self::stored_expiry_of(metadata)
+            .map(|at| at <= now)
+            .unwrap_or(false);
+        // Write-cache R5.5: an expired staged range is evictable here. The executor re-checks
+        // the expiry under the key's slot lock (`DeleteExpectation::staged_expired_at`).
+        if !expired
+            && crate::cache_types::is_staged_range_spec(
+                range,
+                metadata.object_metadata.is_write_cached,
+            )
         {
             return (TailCandidateVerdict::Staged, None);
         }
 
-        let expired = Self::stored_expiry_of(metadata)
-            .map(|at| at <= now)
-            .unwrap_or(false);
         // R3.6a — the 60-second admission window does not protect an expired range. The window
         // exists to stop thrashing on freshly-cached data, and an expired range is by definition
         // not that.
@@ -15478,7 +16947,7 @@ impl CacheManager {
     ///
     /// # Why this exists, when § 5.3 already specifies a repair
     ///
-    /// § 5.3's stated premise is that `group_candidates_by_object` "tests the cutoff *before*
+    /// § 5.3's stated premise is that the byte-target grouping "tests the cutoff *before*
     /// adding, so it always overshoots by one candidate". **That is not what the loop does.** It
     /// adds a candidate only while the accumulated sum is *below* the target, so the last one
     /// added is exactly the one that carried the sum to or past it — and removing it puts the sum
@@ -15600,7 +17069,7 @@ impl CacheManager {
 
     /// Group verified candidates by `cache_key`, first-occurrence order preserved.
     ///
-    /// The same shape [`Self::group_candidates_by_object`] ends with, without the accumulation —
+    /// The object-grouped shape the executor takes, built without an accumulation —
     /// the bounded path has already accumulated and repaired, so re-running the cutoff here would
     /// apply it twice.
     fn group_verified_by_object(
@@ -15685,11 +17154,10 @@ impl CacheManager {
             TAIL_COVERAGE_SHORT_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             warn!(
                 "TAIL_COVERAGE_SHORT: the largest {} ranges ({} shards × tail_max_entries={}) \
-                 hold {} bytes, which is {:.3} of the 2 × T_max = {} that R3.4 asks for at \
-                 tail_floor_bytes={}. Byte-denominated eviction can see less than twice its \
-                 largest single-pass target, so a large pass may report short. Raise \
-                 cache.shared_storage.tail_max_entries or lower \
-                 cache.shared_storage.tail_floor_bytes. This ratio is as current as the last \
+                 hold {} bytes, which is {:.3} of the 2 × T_max = {} that R3.4 asks for. \
+                 Byte-denominated eviction can see less than twice its largest single-pass \
+                 target, so a large pass may report short. Raise \
+                 cache.shared_storage.tail_max_entries. This ratio is as current as the last \
                  selection pass, not as current as now.",
                 budget,
                 shards,
@@ -15697,7 +17165,6 @@ impl CacheManager {
                 covered_bytes,
                 ratio,
                 2 * t_max,
-                self.tail_floor_bytes_in_force(),
             );
         }
     }
@@ -15892,133 +17359,6 @@ impl CacheManager {
         distinct.len() as u64 == total
     }
 
-    /// Create RangeEvictionCandidate entries from a metadata file
-    ///
-    /// For each range in the metadata, creates a separate candidate with:
-    /// - Per-range last_accessed timestamp
-    /// - Per-range access_count
-    /// - Actual .bin file size
-    /// - Paths to both .bin and .meta files
-    ///
-    /// # Arguments
-    /// * `cache_dir` - The manager's cache directory, which `ranges/` paths are built from
-    /// * `meta_path` - Path to the .meta file
-    /// * `candidates` - Vector to collect candidates into
-    ///
-    /// Takes `cache_dir` rather than `&self` so one document's read can be owned by a blocking
-    /// task: [`Self::collect_range_candidates_for_eviction`] runs
-    /// [`SELECTION_META_READ_CONCURRENCY`] of these at once. Nothing else of the manager was
-    /// ever read here.
-    ///
-    /// # Requirements
-    /// Implements Requirements 1.1, 1.2, 1.3 from range-based-disk-eviction spec
-    fn collect_candidates_from_metadata_file(
-        cache_dir: &std::path::Path,
-        meta_path: &std::path::Path,
-        candidates: &mut Vec<RangeEvictionCandidate>,
-    ) -> Result<()> {
-        // Read and parse metadata file
-        let metadata_content = match std::fs::read_to_string(meta_path) {
-            Ok(content) => content,
-            Err(e) => {
-                debug!("Failed to read metadata file {:?}: {}", meta_path, e);
-                return Ok(());
-            }
-        };
-
-        let new_metadata =
-            match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    debug!("Failed to parse metadata file {:?}: {}", meta_path, e);
-                    return Ok(());
-                }
-            };
-
-        // Skip if no ranges (shouldn't happen normally, but handle gracefully)
-        if new_metadata.ranges.is_empty() {
-            debug!("Metadata file {:?} has no ranges, skipping", meta_path);
-            return Ok(());
-        }
-
-        // The version these candidates come from, re-checked under the slot lock at delete time.
-        let identity = Arc::new(crate::disk_cache::ExpectedObjectIdentity::of(&new_metadata));
-
-        // Create a candidate for each range
-        for range_spec in &new_metadata.ranges {
-            // Construct the full path to the .bin file
-            let bin_file_path = cache_dir.join("ranges").join(&range_spec.file_path);
-
-            // Admission window: skip ranges cached within the last 60 seconds
-            // This prevents evicting ranges that were just downloaded, avoiding cache thrashing
-            // during large file downloads where new ranges would otherwise be evicted immediately
-            // due to having zero access history in TinyLFU.
-            // The window is unconditional: there is no bypass.
-            //
-            // R3.6a — EXCEPT for an expired range, which the window does not protect. The window
-            // exists to stop thrashing on freshly-cached data and an expired range is by
-            // definition not that, so without this exemption the two rules contradict each other
-            // for a range cached, expired and read inside the same minute — reachable with a
-            // short `get_ttl`, and it leaves dead data resident in preference to live data.
-            let now = SystemTime::now();
-            let admission_window = std::time::Duration::from_secs(60);
-            let object_expired = Self::stored_expiry_of(&new_metadata)
-                .map(|at| at <= now)
-                .unwrap_or(false);
-            if !object_expired {
-                if let Ok(age) = now.duration_since(range_spec.last_accessed) {
-                    if age < admission_window {
-                        debug!(
-                            "Skipping range {}-{} for eviction: within admission window ({:.1}s old)",
-                            range_spec.start,
-                            range_spec.end,
-                            age.as_secs_f64()
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            // Get actual file size from filesystem
-            let size = match std::fs::metadata(&bin_file_path) {
-                Ok(file_meta) => file_meta.len(),
-                Err(e) => {
-                    debug!(
-                        "Failed to get size for range file {:?}: {}, using compressed_size from metadata",
-                        bin_file_path, e
-                    );
-                    // Fall back to compressed_size from metadata if file doesn't exist
-                    // This can happen if the file was deleted but metadata wasn't updated
-                    range_spec.compressed_size
-                }
-            };
-
-            let candidate = RangeEvictionCandidate {
-                cache_key: new_metadata.cache_key.clone(),
-                range_start: range_spec.start,
-                range_end: range_spec.end,
-                last_accessed: range_spec.last_accessed,
-                size,
-                compressed_size: range_spec.compressed_size,
-                access_count: range_spec.access_count,
-                bin_file_path,
-                is_write_cached: new_metadata.object_metadata.is_write_cached,
-                staged: range_spec.staged,
-                expires_at: Self::stored_expiry_of(&new_metadata),
-                // R3.9's input. This collector has the whole document in hand, so unlike the
-                // bounded path's hints it can say how many ranges the object has — which is what
-                // makes the comparator's R3.9 tiebreak live on THIS path, the one every
-                // deployment takes until the rolling visit has built partitions.
-                object_range_count: Some(new_metadata.ranges.len() as u64),
-                identity: Some(identity.clone()),
-            };
-
-            candidates.push(candidate);
-        }
-
-        Ok(())
-    }
-
     /// One object's stored expiry, or `None` when it has none.
     ///
     /// `NewCacheMetadata::expires_at` is a `SystemTime` with no sentinel for "never", and the
@@ -16034,95 +17374,6 @@ impl CacheManager {
         } else {
             Some(metadata.expires_at)
         }
-    }
-
-    /// Group sorted range candidates by cache_key for batch processing
-    ///
-    /// This method groups range eviction candidates by their cache_key (object) while
-    /// preserving the eviction priority order within each group. It stops collecting
-    /// candidates once the target bytes threshold is reached.
-    ///
-    /// # Arguments
-    /// * `candidates` - Pre-sorted vector of range candidates (sorted by eviction priority)
-    /// * `target_bytes` - Target number of bytes to free through eviction
-    ///
-    /// # Returns
-    /// A vector of (cache_key, Vec<RangeEvictionCandidate>) tuples, where each tuple
-    /// contains all ranges to evict for a single object. The order of objects reflects
-    /// the priority of their highest-priority range.
-    ///
-    /// # Requirements
-    /// Implements Requirements 1.1, 6.4 from range-based-disk-eviction spec:
-    /// - 1.1: Each range is treated as an independent candidate
-    /// - 6.4: Account for individual range sizes when calculating eviction target
-    fn group_candidates_by_object(
-        &self,
-        candidates: Vec<RangeEvictionCandidate>,
-        target_bytes: u64,
-    ) -> Vec<(String, Vec<RangeEvictionCandidate>)> {
-        use std::collections::HashMap;
-
-        let mut grouped: HashMap<String, Vec<RangeEvictionCandidate>> = HashMap::new();
-        let mut object_order: Vec<String> = Vec::new();
-        let mut accumulated_bytes: u64 = 0;
-
-        // Process candidates in priority order (already sorted)
-        for candidate in candidates {
-            // Stop if we've accumulated enough bytes to meet target
-            if accumulated_bytes >= target_bytes {
-                break;
-            }
-
-            let cache_key = candidate.cache_key.clone();
-            accumulated_bytes += candidate.size;
-
-            // Track object order (first occurrence determines priority)
-            if !grouped.contains_key(&cache_key) {
-                object_order.push(cache_key.clone());
-            }
-
-            // Add candidate to its object's group
-            grouped.entry(cache_key).or_default().push(candidate);
-        }
-
-        // § 5.3's repair pass. The accumulation above stops at the FIRST candidate that carries
-        // the sum to or past the target, so the crossing candidate can be arbitrarily larger than
-        // the shortfall it covered — with a multi-terabyte candidate that overshoot is a large
-        // fraction of the cache. Largest first, drop any selected candidate the target no longer
-        // needs. See `retain_minimal_by_single_removal` for what "minimal" means here.
-        let mut flat: Vec<RangeEvictionCandidate> = object_order
-            .iter()
-            .filter_map(|key| grouped.remove(key))
-            .flatten()
-            .collect();
-        let dropped = Self::retain_minimal_by_single_removal(&mut flat, target_bytes);
-
-        // Regroup the survivors, preserving the original object priority order.
-        let mut regrouped: HashMap<String, Vec<RangeEvictionCandidate>> = HashMap::new();
-        let mut kept_order: Vec<String> = Vec::new();
-        for candidate in flat {
-            let key = candidate.cache_key.clone();
-            if !regrouped.contains_key(&key) {
-                kept_order.push(key.clone());
-            }
-            regrouped.entry(key).or_default().push(candidate);
-        }
-        let result: Vec<(String, Vec<RangeEvictionCandidate>)> = kept_order
-            .into_iter()
-            .filter_map(|key| regrouped.remove(&key).map(|ranges| (key, ranges)))
-            .collect();
-
-        debug!(
-            "Grouped {} ranges into {} objects for batch eviction, target_bytes={}, \
-             accumulated_bytes={}, dropped_by_repair={}",
-            result.iter().map(|(_, ranges)| ranges.len()).sum::<usize>(),
-            result.len(),
-            target_bytes,
-            accumulated_bytes,
-            dropped
-        );
-
-        result
     }
 
     /// § 5.3 step 2: drop, largest first, every selected candidate the target does not need.
@@ -16262,12 +17513,17 @@ impl CacheManager {
                 r.is_write_cached,
             )
         });
+        // The read tier selects a staged range only when its object has expired (write-cache
+        // R5.5), so the locked read must find it still expired at the delete: a refresh or a
+        // re-PUT between the selection and here skips the key.
+        let staged_expired_at = staged_selected.then(SystemTime::now);
         let expectation =
             identity
                 .as_deref()
                 .map(|identity| crate::disk_cache::DeleteExpectation {
                     identity,
                     staged_selected,
+                    staged_expired_at,
                 });
 
         let operation_start = std::time::Instant::now();
@@ -16444,9 +17700,8 @@ impl CacheManager {
         }
         let seeded =
             match tokio::time::timeout(PUT_USAGE_FIRST_READ_BOUND, self.put_usage_figure()).await {
-                Ok(Ok(figure)) => {
-                    self.put_usage
-                        .send_replace(Some((std::time::Instant::now(), figure)));
+                Ok(Ok(snapshot)) => {
+                    self.put_usage.send_replace(Some(snapshot));
                     true
                 }
                 Ok(Err(e)) => {
@@ -16497,6 +17752,11 @@ impl CacheManager {
                 inner.statistics.max_cache_size_limit
             };
             register_read_fill_bound(&self.cache_dir, max_cache_size, self.put_usage.subscribe());
+            register_eviction_demand(
+                &self.cache_dir,
+                max_cache_size,
+                self.eviction_target_percent,
+            );
         }
         let weak = Arc::downgrade(self);
         let tx = self.put_usage.clone();
@@ -16508,11 +17768,12 @@ impl CacheManager {
                 let Some(manager) = weak.upgrade() else { break };
                 // Read BEFORE the figure and released AFTER it is published, so the
                 // published figure always contains every byte a release drops. See
-                // `consumed_delta_files`.
+                // `consumed_delta_files` and `note_census_release_targets`.
                 let consumed = consumed_delta_files(&manager.cache_dir).await;
+                let census_targets = census_release_targets(&manager.cache_dir);
                 let cache_dir = manager.cache_dir.clone();
-                let figure = match manager.put_usage_figure().await {
-                    Ok(figure) => figure,
+                let snapshot = match manager.put_usage_figure().await {
+                    Ok(snapshot) => snapshot,
                     Err(e) => {
                         warn!(
                             "Failed to read cache size for PUT capacity checks, treating \
@@ -16520,19 +17781,25 @@ impl CacheManager {
                              admit past the configured maximum until this recovers): {}",
                             e
                         );
-                        0
+                        PutUsageSnapshot {
+                            figure: 0,
+                            in_progress_part_bytes: 0,
+                        }
                     }
                 };
                 drop(manager);
-                tx.send_replace(Some((std::time::Instant::now(), figure)));
+                #[cfg(test)]
+                refresher_publish_pause(&cache_dir).await;
+                tx.send_replace(Some(snapshot));
                 release_consumed_delta_files(&cache_dir, &consumed);
+                apply_census_release_targets(&cache_dir, &census_targets);
                 tokio::time::sleep(PUT_USAGE_REFRESH_INTERVAL).await;
             }
         });
     }
 
-    /// The figure a PUT's capacity check reads: `total_cache_size` as
-    /// [`Self::get_cache_size_stats`] defines it, `total_size + P`, computed directly.
+    /// The snapshot every `max_cache_size` admission reads ([`whole_cache_usage`]):
+    /// `total_size + P`, computed directly.
     ///
     /// # Why not `get_cache_size_stats`
     ///
@@ -16541,21 +17808,22 @@ impl CacheManager {
     /// staged-fold derivation, which reads every `.pending` file and every shard checkpoint,
     /// the checkpoints synchronously on the async worker. After a restart on a loaded shared
     /// volume that took longer than the first PUT's 5 s wait. This reads `size_state.json`
-    /// and, in the fold epoch only, takes a walk of `mpus_in_progress/` on the blocking pool
+    /// and composes `P`, which at most takes a walk of `mpus_in_progress/` on the blocking pool
     /// that is at most `IN_PROGRESS_OBSERVATION_REUSE` old.
     ///
-    /// # When `P` counts
+    /// # `P` counts at both epochs
     ///
-    /// Only when the staged-authority epoch is the fold's, as in the stats path's fold arm. In
-    /// Phase L the stats path reports `P = 0`, and so does this. One deliberate difference: when
-    /// the epoch is active but the fold's figure is unreadable (a `.pending` or checkpoint read
-    /// failed), the stats path falls back to the incumbent with `P = 0`, while this still adds
-    /// `P` when `P` itself is readable. That is the over-count direction, the safe one for an
-    /// admission check. An unreadable `P` counts as 0, the stats path's value in that case.
+    /// `max_cache_size` bounds the bytes on the volume, and in-progress parts are on it, so this
+    /// adds `P` in Phase L as well as in the fold epoch. The stats path reports `P = 0` in Phase
+    /// L, and also when the epoch is active but the fold's figure is unreadable (a `.pending` or
+    /// checkpoint read failed); in those two states this figure is `cache.total_cache_size` plus
+    /// `P`. Both differences are the over-count direction, the safe one for an admission check.
+    /// An unreadable `P` counts as 0, the stats path's value in that case.
     ///
     /// With no consolidator there is no `size_state.json` to read, and this defers to the stats
-    /// path's filesystem-walk fallback unchanged.
-    async fn put_usage_figure(&self) -> Result<u64> {
+    /// path's filesystem-walk fallback unchanged, with `P` reported as 0: no read-tier trigger
+    /// runs without a consolidator.
+    async fn put_usage_figure(&self) -> Result<PutUsageSnapshot> {
         #[cfg(test)]
         {
             let delay = self
@@ -16567,20 +17835,17 @@ impl CacheManager {
         }
         let consolidator = self.journal_consolidator.read().await.clone();
         let Some(consolidator) = consolidator else {
-            return Ok(self
-                .get_cache_size_stats()
-                .await?
-                .sizes
-                .map(|s| s.total_cache_size)
-                .unwrap_or(0));
+            return Ok(PutUsageSnapshot {
+                figure: self
+                    .get_cache_size_stats()
+                    .await?
+                    .sizes
+                    .map(|s| s.total_cache_size)
+                    .unwrap_or(0),
+                in_progress_part_bytes: 0,
+            });
         };
         let total_size = consolidator.get_current_size().await.unwrap_or(0);
-        let cache_dir = self.cache_dir.clone();
-        let fold_epoch = tokio::task::spawn_blocking(move || {
-            crate::staged_authority::fold_authority_active(&cache_dir)
-        })
-        .await
-        .unwrap_or(false);
         // The composed figure: the last full walk plus every proxy's published growth since it
         // began, which starts no walk in the steady state. This figure is itself a snapshot
         // refreshed every `PUT_USAGE_REFRESH_INTERVAL` (5 s), so the `P` an admission reads lags
@@ -16588,22 +17853,28 @@ impl CacheManager {
         // `consolidation_interval`) of a peer's new parts. An older, lower `P`
         // admits a little past the configured maximum; the staging trigger, which is what keeps
         // the volume from filling, reads the same composition.
-        let in_progress_part_bytes = if fold_epoch {
-            crate::signed_put_handler::compose_in_progress_part_bytes(
-                &self.cache_dir,
-                crate::signed_put_handler::PUBLISHED_WALK_BASE_MAX_AGE,
-            )
-            .await
-            .bytes
-            .unwrap_or(0)
-        } else {
-            0
-        };
-        Ok(total_size.saturating_add(in_progress_part_bytes))
+        //
+        // At both epochs. Nothing the composition reads is epoch-dependent: the walk of
+        // `mpus_in_progress/`, the `_journals/` roster, and each proxy's in-progress document,
+        // which the consolidation cycle publishes and the metrics collection's walk dates at
+        // either epoch.
+        let in_progress_part_bytes = crate::signed_put_handler::compose_in_progress_part_bytes(
+            &self.cache_dir,
+            crate::signed_put_handler::PUBLISHED_WALK_BASE_MAX_AGE,
+        )
+        .await
+        .bytes
+        .unwrap_or(0);
+        Ok(PutUsageSnapshot {
+            figure: total_size.saturating_add(in_progress_part_bytes),
+            in_progress_part_bytes,
+        })
     }
 
     /// The whole-cache figure a PUT, `UploadPart` or unsigned PUT hands to
-    /// `SignedPutHandler::check_cache_capacity`, read before the request body.
+    /// `SignedPutHandler::check_cache_capacity`, read before the request body. It is
+    /// [`whole_cache_usage`]'s total, the figure write-through component 1 and read fills decide
+    /// on too.
     ///
     /// Fails open to 0 on an unreadable size, as the two inline reads it replaced did. `None`
     /// when no snapshot exists and the first refresh did not publish one within
@@ -16638,15 +17909,22 @@ impl CacheManager {
     pub async fn put_capacity_usage(self: &Arc<Self>) -> Option<u64> {
         self.spawn_put_usage_refresher(false);
 
-        if let Some((_, figure)) = *self.put_usage.borrow() {
-            return Some(figure);
+        // Each `watch` borrow ends with its statement, before `whole_cache_usage` borrows the
+        // same channel through the read-fill registry.
+        let published = self.put_usage.borrow().is_some();
+        if published {
+            return whole_cache_usage(&self.cache_dir).map(WholeCacheUsage::total);
         }
         let mut rx = self.put_usage.subscribe();
-        let waited: Option<u64> =
-            match tokio::time::timeout(PUT_ROUTER_READ_BOUND, rx.wait_for(|v| v.is_some())).await {
-                Ok(Ok(snapshot)) => (*snapshot).map(|(_, figure)| figure),
-                _ => None,
-            };
+        let first_published = matches!(
+            tokio::time::timeout(PUT_ROUTER_READ_BOUND, rx.wait_for(|v| v.is_some())).await,
+            Ok(Ok(_))
+        );
+        let waited: Option<u64> = if first_published {
+            whole_cache_usage(&self.cache_dir).map(WholeCacheUsage::total)
+        } else {
+            None
+        };
         if waited.is_none() {
             // At most one WARN per minute; `signed_put.skipped_puts_total` under
             // `capacity_unknown` carries the total.
@@ -16748,17 +18026,16 @@ impl CacheManager {
         //
         // This is the relationship `SizeState::write_cache_size`'s own field doc states
         // ("a subset of `total_size`, not an addition to it, so `read_cache_size` is
-        // `total_size - write_cache_size`") and that Requirement 6.4's clamp in
-        // `update_size_from_validation_with_kind` exists to protect — that clamp's doc comment
-        // says an out-of-range staged figure is rejected precisely "because accepting it
-        // would make `read_cache_size = total_size - write_cache_size` underflow at every
-        // reporting site downstream". Until 2026-08-26 no reporting site performed the
+        // `total_size - write_cache_size`") and that Requirement 6.4's check in
+        // `install_validation_correction` exists to protect: an out-of-range staged figure would
+        // make `read_cache_size = total_size - write_cache_size` underflow at every reporting
+        // site downstream. Until 2026-08-26 no reporting site performed the
         // subtraction, so `read_cache_size` carried the whole-cache total under a name
         // that said otherwise, and anything adding it to `write_cache_size` counted the
         // staged bytes twice.
         //
         // Checked rather than `saturating_sub`, and WARN rather than silence: R6.4's
-        // clamp covers `update_size_from_validation_with_kind`, but `atomic_update_size_delta`
+        // check covers the validation install, but `atomic_update_size_delta`
         // applies the two deltas independently and enforces no relationship between
         // them, so `write_cache_size > total_size` is reachable on the delta path. It has
         // been reached — the state this spec was opened for had `write_cache_size` at
@@ -16905,9 +18182,8 @@ impl CacheManager {
         // - `atomic_update_size_delta`, called from `run_consolidation_cycle` under the global
         //   consolidation lock to apply the fleet's collected accumulator deltas — the
         //   incremental writer;
-        // - `update_size_from_validation_with_kind`, the re-grounding write, reached from the
-        //   cache size tracker's validation scans (`perform_full_validation`,
-        //   `write_phase_locked`).
+        // - `install_validation_correction`, the validation scans' relative correction, reached
+        //   from the cache size tracker (`install_full_scan_figures`, `write_phase_locked`).
         //
         // The `st_size` fold (`crate::st_size_fold::run_st_size_fold`) is NOT a writer of it:
         // `install_fold_fields` writes only the `other` fold fields (`byte_sum`, `entry_count`
@@ -17342,6 +18618,88 @@ impl CacheManager {
         }
     }
 
+    /// Bytes (`compressed_size`) the `Add` lines of every `*.journal` in `journals_dir` list.
+    ///
+    /// A fill's credit can reach the usage figure while its `.meta` does not exist yet: a streamed
+    /// GET-miss fill's metadata is written to the journal only, and multipart and full-object
+    /// stores credit on the journal append. Consolidation writes the `.meta` before it drops the
+    /// line, so read before the walk, each such byte is in a journal here or in a `.meta` the walk
+    /// can reach. A line already consolidated but not yet dropped, or an `Add` the consolidator
+    /// will reject, is counted too, which errs towards room and so towards another pass.
+    ///
+    /// `None` when the directory, a journal or a line cannot be read, which leaves exhaustion
+    /// unproven. A missing directory, a journal gone since the listing and a line that does not
+    /// parse are not errors. Synchronous `std::fs`; the caller runs it on the blocking pool.
+    fn pending_journal_add_bytes_in(journals_dir: &Path) -> Option<u64> {
+        #[derive(serde::Deserialize)]
+        struct AddLineRange {
+            compressed_size: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct AddLine {
+            operation: crate::journal_manager::JournalOperation,
+            range_spec: AddLineRange,
+        }
+        let dir_entries = match std::fs::read_dir(journals_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(0),
+            Err(e) => {
+                debug!(
+                    "Failed to read journals directory {:?}: {}",
+                    journals_dir, e
+                );
+                return None;
+            }
+        };
+        let mut total: u64 = 0;
+        for dir_entry in dir_entries {
+            let path = match dir_entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    debug!("Failed to read journals directory entry: {}", e);
+                    return None;
+                }
+            };
+            if !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".journal"))
+            {
+                continue;
+            }
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    debug!("Failed to open journal {:?}: {}", path, e);
+                    return None;
+                }
+            };
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!("Failed to read journal {:?}: {}", path, e);
+                        return None;
+                    }
+                }
+                let Ok(line) = std::str::from_utf8(&buf) else {
+                    continue;
+                };
+                let Ok(parsed) = serde_json::from_str::<AddLine>(line.trim()) else {
+                    continue;
+                };
+                if parsed.operation == crate::journal_manager::JournalOperation::Add {
+                    total = total.saturating_add(parsed.range_spec.compressed_size);
+                }
+            }
+        }
+        Some(total)
+    }
     /// The cross-instance activity window: `2 × ram_cache_flush_interval` (Req 19.2).
     ///
     /// See [`EvictionActivityOracle`] for the derivation of the `2×` and what may be spent of it.
@@ -17512,6 +18870,8 @@ impl CacheManager {
 
         // Drop the lock file handle, which automatically releases the flock
         *self.eviction_lock_file.lock().unwrap() = None;
+        self.eviction_lock_held_since_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         debug!("Released global eviction lock (flock)");
         Ok(())
     }
@@ -21310,6 +22670,24 @@ impl CacheManager {
         (removed, failed)
     }
 
+    /// Append a graduated object's ranges to this instance's tail-delta, so read-tier selection
+    /// sees them before their shard is next rebuilt
+    /// (`JournalConsolidator::append_tail_delta_for_graduation`). One `O_APPEND` write on the
+    /// blocking pool, once per object lifetime; best-effort, and a no-op with no consolidator.
+    async fn append_graduated_ranges_to_tail_delta(
+        &self,
+        metadata: &crate::cache_types::NewCacheMetadata,
+    ) {
+        let consolidator = self.journal_consolidator.read().await.as_ref().cloned();
+        if let Some(consolidator) = consolidator {
+            let metadata = metadata.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                consolidator.append_tail_delta_for_graduation(&metadata)
+            })
+            .await;
+        }
+    }
+
     /// Debit both size channels for range files removed because the ranges they held
     /// are no longer referenced by the object's metadata.
     ///
@@ -21388,6 +22766,84 @@ impl CacheManager {
         }
     }
 
+    /// Remove the version a `.meta` names after a fill, inside the same slot-lock hold, read
+    /// another version from S3 (`disk_cache::publish_range_fill_under_slot_lock_at`).
+    /// `published` is the caller's locked read
+    /// of the `.meta` at `meta_path`, and `_slot` is the hold.
+    ///
+    /// ETags carry no order, so the fill may hold the older version: the caller publishes
+    /// neither. The removal set is the one a HEAD-detected change removes, every listed range
+    /// plus every unfolded journal `Add` for the key, each debited from both size channels with
+    /// a `Remove` journal entry and, when staged, the staged removal debit. The `.meta` is
+    /// unlinked and `cached_objects` debited. A fresh write-order marker is stamped in the same
+    /// hold, so a fill of either version whose S3 request began before this removal cannot
+    /// publish afterwards, and the fold retires its pending `Add` as superseded.
+    ///
+    /// Returns whether a write-cached `.meta` was removed, for the staged-entry gauge.
+    pub(crate) async fn remove_other_version_locked(
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        meta_path: &std::path::Path,
+        published: &crate::cache_types::NewCacheMetadata,
+        journal_consolidator: Option<&Arc<crate::journal_consolidator::JournalConsolidator>>,
+        slot: &crate::metadata_lock_manager::MetadataLock,
+    ) -> bool {
+        let was_staged = published.object_metadata.is_write_cached;
+        let mut dereferenced = published.ranges.clone();
+        for pending in crate::disk_cache::unfolded_journal_add_ranges(cache_dir, cache_key).await {
+            if !dereferenced
+                .iter()
+                .any(|r| r.file_path == pending.file_path)
+            {
+                dereferenced.push(pending);
+            }
+        }
+        let (removed, failed) =
+            Self::remove_range_files_in(cache_dir, cache_key, &dereferenced, was_staged);
+        if failed > 0 {
+            warn!(
+                "Version-change range cleanup incomplete: cache_key={}, removed={}, failed={}; \
+                 the undeleted files are orphaned and are deliberately not debited",
+                cache_key,
+                removed.len(),
+                failed
+            );
+        }
+        let meta_removed = match std::fs::remove_file(meta_path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                warn!(
+                    "Failed to remove the .meta of a version a fill found superseded: \
+                     cache_key={}, path={:?}, error={}",
+                    cache_key, meta_path, e
+                );
+                false
+            }
+        };
+        Self::debit_removed_ranges_with(
+            journal_consolidator.cloned(),
+            cache_dir,
+            cache_key,
+            &removed,
+        )
+        .await;
+        if meta_removed {
+            if let Some(consolidator) = journal_consolidator {
+                consolidator.size_accumulator().add_cached_objects(-1);
+            }
+        }
+        if let Err(e) = stamp_write_marker_locked(meta_path, cache_key, &WriteToken::fresh(), slot)
+        {
+            warn!(
+                "Version change: the write-order marker could not be stamped, so a fill that \
+                 began before the removal may still publish: cache_key={}, error={}",
+                cache_key, e
+            );
+        }
+        was_staged && meta_removed
+    }
+
     pub(crate) async fn debit_removed_ranges(&self, cache_key: &str, removed: &[RemovedRange]) {
         Self::debit_removed_ranges_in(
             &self.journal_consolidator,
@@ -21430,8 +22886,23 @@ impl CacheManager {
         if removed.is_empty() {
             return;
         }
+        let consolidator = journal_consolidator.read().await.clone();
+        Self::debit_removed_ranges_with(consolidator, cache_dir, cache_key, removed).await
+    }
 
-        let Some(consolidator) = journal_consolidator.read().await.clone() else {
+    /// [`Self::debit_removed_ranges_in`] against the consolidator itself, for a caller that
+    /// holds the `Arc` rather than the `CacheManager`'s slot for it.
+    async fn debit_removed_ranges_with(
+        consolidator: Option<Arc<crate::journal_consolidator::JournalConsolidator>>,
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        removed: &[RemovedRange],
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+
+        let Some(consolidator) = consolidator else {
             warn!(
                 "Journal consolidator not wired: {} dereferenced range(s) of {} were deleted but \
                  will not be debited from total_size or write_cache_size until the next full \
@@ -21684,12 +23155,18 @@ impl CacheManager {
                 }
 
                 let now = SystemTime::now();
+                // The expiry the request handler stamped as `write_cache_expires_at`, so the two
+                // cannot differ by the commit and slot-lock wait between its clock read and this
+                // one.
+                let expires_at = object_metadata
+                    .write_cache_expires_at
+                    .unwrap_or(now + effective_put_ttl);
                 let metadata = NewCacheMetadata {
                     cache_key: cache_key.to_string(),
                     object_metadata,
                     ranges: vec![range_spec],
                     created_at: now,
-                    expires_at: now + effective_put_ttl,
+                    expires_at,
                     compression_info: crate::cache_types::CompressionInfo::default(),
                     ..Default::default()
                 };
@@ -22762,6 +24239,8 @@ impl CacheManager {
                 )
                 .await;
             }
+            // The graduated ranges are read-tier now; see `append_graduated_ranges_to_tail_delta`.
+            self.append_graduated_ranges_to_tail_delta(&metadata).await;
             // Then the epoch gate: once the fold is authoritative the `.meta` transition above IS
             // the accounting (§ 16.6.1, "Debits: none"), so no journal entry is written and a
             // journal-append failure can no longer turn this graduation into an `Err`.
@@ -23191,6 +24670,9 @@ impl CacheManager {
             .await;
         }
 
+        // The graduated ranges are read-tier now, and no index lists them: the PUT published
+        // its own `.meta`, so the fold skipped its `Add`s and appended nothing.
+        self.append_graduated_ranges_to_tail_delta(&metadata).await;
         // R1.1/1.2/1.3: record the decrement for the consolidator to apply under the
         // global lock. Written AFTER the `.meta` transition, so a crash between the two
         // leaves an entry that has graduated but not yet been debited — recoverable by
@@ -23340,119 +24822,6 @@ impl CacheManager {
         }
     }
 
-    /// Check if a write-cached object is expired and invalidate it if so (lazy expiration)
-    ///
-    /// This implements lazy expiration for write-cached objects:
-    /// - If the object is write-cached and expired, invalidate it
-    /// - Returns true if the object was expired and invalidated
-    /// - Returns false if the object is not expired or not write-cached
-    ///
-    /// # Requirements (write-through-cache-finalization)
-    /// - Requirement 5.3: When a write-cached object expires AND actively_remove_cached_data is false,
-    ///   the Proxy SHALL remove it lazily on access
-    /// - Requirement 5.4: When a write-cached object expires AND actively_remove_cached_data is true,
-    ///   the Proxy SHALL actively remove it in background scans
-    pub(crate) async fn check_and_invalidate_expired_write_cache(
-        &self,
-        cache_key: &str,
-    ) -> Result<bool> {
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        if !metadata_file_path.exists() {
-            return Ok(false);
-        }
-
-        // Hold the key's metadata slot lock from the read below through the `.meta`
-        // removal. The expiry verdict is taken from that read; without the lock a
-        // concurrent writer (a re-PUT, a graduation) can republish between the read and
-        // the delete and lose its update. Released by `Drop` on every return.
-        let _meta_lock = self.metadata_lock_manager().acquire_lock(cache_key).await?;
-
-        // Read current metadata (UNDER the lock)
-        let metadata_content = match std::fs::read_to_string(&metadata_file_path) {
-            Ok(content) => content,
-            Err(e) => {
-                debug!(
-                    "Failed to read metadata for write cache expiration check: {}",
-                    e
-                );
-                return Ok(false);
-            }
-        };
-
-        let metadata =
-            match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!(
-                        "Failed to parse metadata for write cache expiration check: {}",
-                        e
-                    );
-                    return Ok(false);
-                }
-            };
-
-        // Check if this is a write-cached object and if it's expired
-        if !metadata.object_metadata.is_write_cached {
-            return Ok(false);
-        }
-
-        if !metadata.object_metadata.is_write_cache_expired() {
-            return Ok(false);
-        }
-
-        // Object is expired - invalidate it
-        info!(
-            "Write cache entry expired (lazy expiration): cache_key={}, expires_at={:?}",
-            cache_key, metadata.object_metadata.write_cache_expires_at
-        );
-
-        // Delete all range files and debit both size channels for what was actually
-        // removed. Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
-        let (removed, _failed) = self.remove_range_files(
-            cache_key,
-            &metadata.ranges,
-            metadata.object_metadata.is_write_cached,
-        );
-        self.debit_removed_ranges(cache_key, &removed).await;
-
-        // Delete metadata file
-        let metadata_deleted = match std::fs::remove_file(&metadata_file_path) {
-            Ok(()) => {
-                debug!(
-                    "Removed expired write cache metadata file: {:?}",
-                    metadata_file_path
-                );
-                true
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to remove expired write cache metadata file {:?}: {}",
-                    metadata_file_path, e
-                );
-                false
-            }
-        };
-
-        // The `.meta` is gone, so the object no longer exists — decrement
-        // `cached_objects` so it converges with reality, mirroring
-        // `WriteCacheManager::evict_write_cached_object`'s `metadata_deleted` gate. Every
-        // parseable `.meta` is counted, rangeless included (`ObjectEntryRemoval`).
-        if metadata_deleted {
-            if let Some(consolidator) = self.journal_consolidator.read().await.clone() {
-                consolidator.decrement_cached_objects(1).await;
-            }
-        }
-
-        // The early return above guarantees `metadata.object_metadata.is_write_cached`
-        // was true to reach here, so this entry is unconditionally leaving the
-        // staging tier by lazy expiration rather than by graduation.
-        // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
-        self.decrement_write_cache_staged_entries().await;
-
-        Ok(true)
-    }
-
     /// Get new range file path for new range storage architecture
     /// Returns the sharded path `ranges/{bucket}/{XX}/{YYY}/{sanitized_key}_{start}-{end}.bin`,
     /// matching [`crate::disk_cache::DiskCacheManager::get_new_range_file_path`].
@@ -23548,6 +24917,22 @@ impl CacheManager {
     /// Get path to global eviction lock file
     /// Returns: {cache_dir}/locks/global_eviction.lock
     /// Requirement: 4.1
+    /// How long this proxy has held `global_eviction.lock`, in whole seconds, or 0 while it does
+    /// not hold it. Per-proxy; published as `eviction_coordination.eviction_lock_held_secs`.
+    pub(crate) fn eviction_lock_held_secs(&self) -> u64 {
+        let since = self
+            .eviction_lock_held_since_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if since == 0 {
+            return 0;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms.saturating_sub(since) / 1000
+    }
+
     pub fn get_global_eviction_lock_path(&self) -> PathBuf {
         self.cache_dir.join("locks").join("global_eviction.lock")
     }
@@ -23728,6 +25113,8 @@ impl CacheManager {
 
                     // Store the UUID and the verified lock file handle
                     *self.eviction_uuid.lock().unwrap() = Some(my_uuid.clone());
+                    self.eviction_lock_held_since_ms
+                        .store(now_ms.max(1), std::sync::atomic::Ordering::SeqCst);
                     *guard = Some(lock_file);
 
                     debug!(
@@ -23832,6 +25219,10 @@ impl CacheManager {
                                                         crate::metrics::record_stale_eviction_lock_recovered();
                                                         *self.eviction_uuid.lock().unwrap() =
                                                             Some(my_uuid);
+                                                        self.eviction_lock_held_since_ms.store(
+                                                            now_ms.max(1),
+                                                            std::sync::atomic::Ordering::SeqCst,
+                                                        );
                                                         *guard = Some(lock_file_for_takeover);
                                                         return Ok(true);
                                                     }
@@ -31023,129 +32414,6 @@ mod store_full_object_st_size_audit_tests {
     }
 }
 
-/// Unit tests for [`CacheManager::check_and_invalidate_expired_write_cache`] and
-/// the explicit write-cache invalidation path (since removed) — the last two undebited delete
-/// sites from the cache eviction at scale feature R7.1. Both delete `.bin` range
-/// files and the `.meta` with no debit and no journal entry before this fix, so a
-/// lazy expiration or an explicit/eviction invalidation freed disk space without ever
-/// relieving `total_size` or `write_cache_size` — the same shape as the R1/R5 leaks
-/// this spec exists to close, just reached from different callers.
-///
-/// Both now route through [`CacheManager::remove_range_files`] and
-/// [`CacheManager::debit_removed_ranges`], exactly as task 47's two sites do, and —
-/// unlike those two — both delete the `.meta`, so both also call
-/// `JournalConsolidator::decrement_cached_objects(1)`, mirroring
-/// `WriteCacheManager::evict_write_cached_object`'s `metadata_deleted` gate.
-///
-/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
-#[cfg(test)]
-mod undebited_write_cache_invalidation_tests {
-    use super::*;
-    use crate::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
-
-    const RANGE_BYTES: u64 = 4096;
-    const KEY: &str = "test-bucket/expiring-object.bin";
-
-    fn setup(cache_dir: &std::path::Path) -> CacheManager {
-        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
-            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
-        }
-        let manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
-        let _ = manager.create_configured_disk_cache_manager();
-        manager
-    }
-
-    async fn deltas(manager: &CacheManager) -> (i64, i64) {
-        let consolidator = manager.get_journal_consolidator().await.unwrap();
-        let acc = consolidator.size_accumulator();
-        (acc.current_delta(), acc.current_write_cache_delta())
-    }
-
-    /// The persisted count plus this instance's pending delta, i.e. what the next cycle
-    /// publishes. Read without a cycle so `deltas` stays observable.
-    async fn cached_objects(manager: &CacheManager) -> u64 {
-        let consolidator = manager.get_journal_consolidator().await.unwrap();
-        let persisted = consolidator.load_size_state().await.unwrap().cached_objects;
-        let pending = consolidator
-            .size_accumulator()
-            .current_cached_objects_delta();
-        (persisted as i64 + pending).max(0) as u64
-    }
-
-    /// Plant a staged (`is_write_cached: true`) `.meta` + `.bin`, already expired, and
-    /// seed `cached_objects` to 1 so the decrement is observable.
-    async fn plant_expired_staged_entry(manager: &CacheManager, cache_dir: &std::path::Path) {
-        let rel_path = format!("{}_0-{}.bin", KEY.replace('/', "_"), RANGE_BYTES - 1);
-        let bin_path = cache_dir.join("ranges").join(&rel_path);
-        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
-        std::fs::write(&bin_path, vec![0u8; RANGE_BYTES as usize]).unwrap();
-
-        let now = SystemTime::now();
-        let range_spec = RangeSpec::new(
-            0,
-            RANGE_BYTES - 1,
-            rel_path,
-            crate::compression::CompressionAlgorithm::Lz4,
-            RANGE_BYTES,
-            RANGE_BYTES,
-        );
-        let metadata = NewCacheMetadata {
-            cache_key: KEY.to_string(),
-            object_metadata: ObjectMetadata {
-                is_write_cached: true,
-                content_length: RANGE_BYTES,
-                write_cache_expires_at: Some(now - Duration::from_secs(60)),
-                write_cache_created_at: Some(now - Duration::from_secs(3600)),
-                ..Default::default()
-            },
-            ranges: vec![range_spec],
-            created_at: now - Duration::from_secs(3600),
-            expires_at: now + Duration::from_secs(3600),
-            ..Default::default()
-        };
-
-        let meta_path = manager.get_new_metadata_file_path(KEY);
-        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
-        std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-
-        let consolidator = manager.get_journal_consolidator().await.unwrap();
-        // Seed cached_objects=1 so the decrement this fix adds is observable.
-        let mut state = consolidator.load_size_state().await.unwrap();
-        state.cached_objects = 1;
-        consolidator
-            .seed_size_state_for_tests(&state)
-            .await
-            .unwrap();
-    }
-
-    /// Shown failing first: without the fix, both deltas stay (0, 0) and
-    /// `cached_objects` stays 1 after a lazy expiration that genuinely deleted the
-    /// `.bin` and the `.meta`.
-    #[tokio::test]
-    async fn lazy_expiration_debits_both_channels_and_decrements_cached_objects() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path());
-        plant_expired_staged_entry(&manager, temp.path()).await;
-
-        let invalidated = manager
-            .check_and_invalidate_expired_write_cache(KEY)
-            .await
-            .unwrap();
-        assert!(invalidated, "an expired staged entry must be invalidated");
-
-        assert_eq!(
-            deltas(&manager).await,
-            (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
-            "lazy expiration must debit both total_size and write_cache_size"
-        );
-        assert_eq!(
-            cached_objects(&manager).await,
-            0,
-            "the .meta is gone, so cached_objects must decrement"
-        );
-    }
-}
-
 /// a cancelled `invalidate_cache_hierarchy` must not release the key's slot while the
 /// thread doing its unlinks is still running, and must leave the entry and its accounting
 /// either wholly invalidated or wholly untouched.
@@ -31662,6 +32930,146 @@ mod graduation_clears_staged_membership_tests {
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("fixture: .meta must exist at {:?}: {}", path, e));
         serde_json::from_str(&content).expect("fixture: .meta must parse")
+    }
+
+    /// A write-through object that graduates is selectable by the read tier at once,
+    /// through the tail-delta, without a rolling pass or a lazy rebuild. Its shard's partition
+    /// was rebuilt before the PUT (and is too fresh to rebuild again), and the PUT published its
+    /// own `.meta`, so no admission record names it: only the graduation append can.
+    #[tokio::test]
+    async fn a_graduated_range_is_selected_through_the_tail_delta() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let cache_key = "test-bucket/graduates-into-the-index.bin";
+        let body = vec![5u8; BODY_LEN];
+        let (bucket, l1, _) = crate::cache_size_tracker::shard_and_leaf_of(cache_key).unwrap();
+        // The shard's partition, rebuilt just now and empty.
+        let path = crate::cache_size_tracker::tail_partition_path(temp.path(), &bucket, &l1);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        crate::cache_size_tracker::install_tail_checkpoint_fields_in(
+            temp.path(),
+            &bucket,
+            &l1,
+            0,
+            now_nanos,
+        );
+        put_write_cached(&manager, cache_key, &body).await;
+        let names_key = |dir: &std::path::Path| {
+            crate::cache_size_tracker::read_all_tail_delta_records(dir)
+                .iter()
+                .any(|r| r.record.cache_key == cache_key && !r.record.is_staged)
+        };
+        assert!(
+            !names_key(temp.path()),
+            "PRECONDITION: before graduation no read-tier delta record names the object"
+        );
+        assert!(manager.refresh_write_cache_ttl(cache_key).await.unwrap());
+        // An hour passes: the range leaves the admission window.
+        let mut meta = read_meta(&manager, cache_key);
+        for range in &mut meta.ranges {
+            range.last_accessed = SystemTime::now() - Duration::from_secs(3600);
+        }
+        std::fs::write(
+            manager.get_new_metadata_file_path(cache_key),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        let target = meta.ranges.iter().map(|r| r.compressed_size).sum::<u64>();
+
+        let work = manager
+            .select_pass_work(target, &ExclusionSet::new())
+            .await
+            .unwrap();
+        assert!(
+            !work.leaf_groups.is_empty(),
+            "the graduated range must be selected through the index: groups={} delta_names_it={}",
+            work.leaf_groups.len(),
+            names_key(temp.path())
+        );
+        let outcome = manager.select_eviction_candidates_bounded(target).await;
+        assert_eq!(
+            outcome.lazy_rebuilds, 0,
+            "the partition is too fresh to rebuild"
+        );
+        assert!(outcome.selected.iter().any(|(key, _)| key == cache_key));
+    }
+    /// The same through the other graduation producer, a revalidation that backfills
+    /// `Last-Modified` (`backfill_write_cache_last_modified`), which is the one a written-through
+    /// object's first GET takes against real S3.
+    #[tokio::test]
+    async fn a_range_graduated_by_revalidation_is_selected_through_the_tail_delta() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let cache_key = "test-bucket/graduates-by-revalidation.bin";
+        let body = vec![6u8; BODY_LEN];
+        let (bucket, l1, _) = crate::cache_size_tracker::shard_and_leaf_of(cache_key).unwrap();
+        let path = crate::cache_size_tracker::tail_partition_path(temp.path(), &bucket, &l1);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        crate::cache_size_tracker::install_tail_checkpoint_fields_in(
+            temp.path(),
+            &bucket,
+            &l1,
+            0,
+            now_nanos,
+        );
+        put_write_cached(&manager, cache_key, &body).await;
+        let names_key = |dir: &std::path::Path| {
+            crate::cache_size_tracker::read_all_tail_delta_records(dir)
+                .iter()
+                .any(|r| r.record.cache_key == cache_key && !r.record.is_staged)
+        };
+        assert!(
+            !names_key(temp.path()),
+            "PRECONDITION: before graduation no read-tier delta record names the object"
+        );
+        assert!(manager
+            .backfill_write_cache_last_modified(
+                cache_key,
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                None,
+            )
+            .await
+            .unwrap());
+        assert!(
+            read_meta(&manager, cache_key)
+                .ranges
+                .iter()
+                .all(|r| r.staged == Some(false)),
+            "PRECONDITION: the backfill graduated the object"
+        );
+        let mut meta = read_meta(&manager, cache_key);
+        for range in &mut meta.ranges {
+            range.last_accessed = SystemTime::now() - Duration::from_secs(3600);
+        }
+        std::fs::write(
+            manager.get_new_metadata_file_path(cache_key),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        let target = meta.ranges.iter().map(|r| r.compressed_size).sum::<u64>();
+        let outcome = manager.select_eviction_candidates_bounded(target).await;
+        assert!(
+            outcome.selected.iter().any(|(key, _)| key == cache_key),
+            "the range graduated by revalidation must be selected through the index: \
+             delta_names_it={} rebuilt={} selected={}",
+            names_key(temp.path()),
+            outcome.lazy_rebuilds,
+            outcome.selected_bytes
+        );
+        assert_eq!(
+            outcome.lazy_rebuilds, 0,
+            "the partition is too fresh to rebuild"
+        );
     }
 
     /// The direct assertion: after graduation every range records `Some(false)`.
@@ -32982,8 +34390,8 @@ mod eviction_phantom_debit_tests {
     use std::os::unix::fs::PermissionsExt;
 
     const RANGE_BYTES: u64 = 4096;
-    /// Older than the 60-second admission window in
-    /// `collect_candidates_from_metadata_file`, or the candidate is
+    /// Older than the 60-second admission window (`ADMISSION_WINDOW`, applied by
+    /// `verify_tail_candidate`), or the candidate is
     /// skipped and the pass has nothing to do.
     const AGE: Duration = Duration::from_secs(3600);
 
@@ -33158,6 +34566,8 @@ mod eviction_phantom_debit_tests {
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         metadata.ranges[0].staged = Some(true);
         metadata.object_metadata.is_write_cached = true;
+        // Expired: the read tier evicts a staged range only past its object's expiry (R5.5).
+        metadata.expires_at = SystemTime::now() - Duration::from_secs(60);
         std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
 
         let acquired = manager.try_acquire_global_eviction_lock().await.unwrap();
@@ -33192,6 +34602,8 @@ mod eviction_phantom_debit_tests {
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         metadata.ranges[0].staged = Some(true);
         metadata.object_metadata.is_write_cached = true;
+        // Expired: the read tier evicts a staged range only past its object's expiry (R5.5).
+        metadata.expires_at = SystemTime::now() - Duration::from_secs(60);
         std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     }
 
@@ -33210,18 +34622,30 @@ mod eviction_phantom_debit_tests {
     /// Delete each key's single range through the real `batch_evict_ranges`, exactly as a pass
     /// does, and return what it returned.
     async fn evict_keys(manager: &CacheManager, keys: &[&str]) -> Vec<(String, BatchEviction)> {
-        let candidates = manager
-            .collect_range_candidates_for_eviction()
-            .await
-            .unwrap();
         let mut out = Vec::new();
         for key in keys {
-            let ranges: Vec<RangeEvictionCandidate> = candidates
-                .iter()
-                .filter(|c| c.cache_key == *key)
-                .cloned()
-                .collect();
-            assert_eq!(ranges.len(), 1, "fixture: one candidate for {key}");
+            let path = manager.get_new_metadata_file_path(key);
+            let metadata: crate::cache_types::NewCacheMetadata =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(metadata.ranges.len(), 1, "fixture: one range for {key}");
+            let range = &metadata.ranges[0];
+            let ranges = vec![RangeEvictionCandidate {
+                cache_key: key.to_string(),
+                range_start: range.start,
+                range_end: range.end,
+                last_accessed: range.last_accessed,
+                size: range.compressed_size,
+                compressed_size: range.compressed_size,
+                access_count: range.access_count,
+                bin_file_path: manager.cache_dir.join("ranges").join(&range.file_path),
+                is_write_cached: metadata.object_metadata.is_write_cached,
+                staged: range.staged,
+                expires_at: CacheManager::stored_expiry_of(&metadata),
+                object_range_count: Some(1),
+                identity: Some(Arc::new(crate::disk_cache::ExpectedObjectIdentity::of(
+                    &metadata,
+                ))),
+            }];
             let eviction = manager.batch_evict_ranges(key, &ranges).await.unwrap();
             out.push((key.to_string(), eviction));
         }
@@ -34705,7 +36129,9 @@ mod eviction_executor_tests {
         );
         assert!(!bins[1].exists(), "fixture: batch 2's extent left the disk");
         // The process died: its unflushed delta dies with it.
-        consolidator.size_accumulator().reset();
+        consolidator
+            .size_accumulator()
+            .discard_unflushed_for_tests();
 
         let view = author_view(&manager).await;
         assert_eq!(
@@ -35162,16 +36588,12 @@ mod eviction_executor_tests {
     }
 }
 
-/// R13.2 — current byte-target eviction scans the complete candidate population before
-/// `group_candidates_by_object` can stop at the byte target.
+/// R13.2: byte-target eviction must not read the complete candidate population to reach its
+/// byte target.
 ///
 /// The fixture is deliberately mixed: the oldest 64 KiB range satisfies the 64 KiB
-/// target by itself, while 63 newer 4 KiB ranges remain. A bounded selector would
-/// therefore need one candidate; the current pass calls
-/// `collect_range_candidates_for_eviction` before it sorts and groups candidates, so
-/// it reads every `.meta` and stats every `.bin` first. The ignored test is the
-/// required red side and remains ignored until a bounded collector replaces that
-/// full-population path.
+/// target by itself, while 63 newer 4 KiB ranges remain, so the bounded selection needs one
+/// candidate and one `.meta` open.
 ///
 /// Spec: cache-eviction-at-scale. Requirements: 13.2, 13.4.
 #[cfg(test)]
@@ -35246,12 +36668,7 @@ mod eviction_byte_target_red_tests {
 
     fn mixed_fixture(cache_dir: &std::path::Path) -> CacheManager {
         let mut manager = setup(cache_dir);
-        // A floor below the smallest fixture range, so every planted record is legitimately a
-        // member: a 1 MiB default floor would make a real rebuild of this fixture write EMPTY
-        // partitions, and a fixture whose partitions no real rebuild would produce is not a
-        // fixture. Scaling the ranges up to clear 1 MiB instead would mean writing 316 MiB of
-        // `.bin` payload in a unit test.
-        manager.set_tail_config_for_tests(SMALL_RANGE_BYTES / 2, 4096, 4096);
+        manager.set_tail_config_for_tests(4096, 4096);
         let now = SystemTime::now();
         let old = now - 2 * AGE;
         let newer = now - AGE;
@@ -35278,9 +36695,9 @@ mod eviction_byte_target_red_tests {
     /// The same 64-object population, plus the Tail_Partitions a rolling visit would have built
     /// from it.
     ///
-    /// **This is an EXTENSION of `mixed_fixture`, not a replacement.** The green companion still
-    /// drives the full-population collector over the identical `.meta` tree, so the two paths are
-    /// compared on the same population rather than on two fixtures that might differ.
+    /// **This is an EXTENSION of `mixed_fixture`, not a replacement.** Both hold the identical
+    /// `.meta` tree, so tests built on either read the same population rather than two
+    /// fixtures that might differ.
     ///
     /// Partitions are derived from the planted `.meta` files through the same
     /// `shard_and_leaf_of` the writer uses, so a record's shard can never disagree with the
@@ -35290,7 +36707,6 @@ mod eviction_byte_target_red_tests {
         use crate::cache_size_tracker::{shard_and_leaf_of, TailRecord};
 
         let manager = mixed_fixture(cache_dir);
-        let floor = manager.tail_floor_bytes_in_force();
         let mut by_shard: std::collections::BTreeMap<(String, String), Vec<TailRecord>> =
             std::collections::BTreeMap::new();
 
@@ -35305,13 +36721,6 @@ mod eviction_byte_target_red_tests {
                 serde_json::from_str(&content).expect("fixture .meta must parse");
             let (bucket, l1, leaf) = shard_and_leaf_of(&key).expect("fixture key must shard");
             for range in &metadata.ranges {
-                assert!(
-                    range.compressed_size >= floor,
-                    "fixture: every planted record must clear the floor in force ({} >= {}), or \
-                     this fixture is one no real rebuild would produce",
-                    range.compressed_size,
-                    floor
-                );
                 by_shard
                     .entry((bucket.clone(), l1.clone()))
                     .or_default()
@@ -35528,7 +36937,7 @@ mod eviction_byte_target_red_tests {
     /// selected set must be the 4 KiB range, freeing 4 KiB rather than 64 KiB.
     ///
     /// The set's CARDINALITY is one either way, which is exactly the point: R3.7's harm is
-    /// byte overshoot, not candidate count, and `group_candidates_by_object` never overshot by a
+    /// byte overshoot, not candidate count, and the byte-target accumulation never overshot by a
     /// candidate at all (see `best_fit_final_swap`'s doc comment).
     ///
     /// Spec: cache-eviction-at-scale § 5.3. Requirements: 3.7, 13.4
@@ -35666,7 +37075,7 @@ mod eviction_byte_target_red_tests {
 
         let temp = tempfile::TempDir::new().unwrap();
         let mut manager = setup(temp.path());
-        manager.set_tail_config_for_tests(4096, 4096, 4096);
+        manager.set_tail_config_for_tests(4096, 4096);
         let now = systime_to_nanos(SystemTime::now());
 
         let compressible = TailRecord {
@@ -35772,37 +37181,22 @@ mod eviction_byte_target_red_tests {
     // ---- DR-EVICT task 42: `select_pass_work` ------------------------------------------------
 
     /// What `perform_eviction_with_lock` did inline before task 42, from the selection call to the
-    /// leaf grouping, transcribed from the pre-extraction source. Kept here so the extraction is
-    /// compared with the behaviour it replaced rather than with itself.
+    /// leaf grouping, without the full-population fallback, which is deleted. Kept here so the extraction
+    /// is compared with the behaviour it replaced rather than with itself.
     async fn inline_selection_as_before_task_42(
         manager: &CacheManager,
         bytes_to_free: u64,
-    ) -> (Vec<LeafEvictionGroup>, bool) {
+    ) -> Vec<LeafEvictionGroup> {
         let selection = manager
             .select_eviction_candidates_bounded(bytes_to_free)
             .await;
-        let mut fallback_ran = false;
-        let mut grouped = if !selection.selected.is_empty() {
-            selection.selected
-        } else {
-            fallback_ran = true;
-            let mut range_candidates = manager
-                .collect_range_candidates_for_eviction()
-                .await
-                .unwrap();
-            if range_candidates.is_empty() {
-                return (Vec::new(), fallback_ran);
-            }
-            manager.sort_byte_dimension_candidates(&mut range_candidates);
-            manager.group_candidates_by_object(range_candidates, bytes_to_free)
-        };
+        let mut grouped = selection.selected;
         let _ = manager.order_plans_whole_object_first(&mut grouped);
         if grouped.is_empty() {
-            return (Vec::new(), fallback_ran);
+            return Vec::new();
         }
-        (group_plans_by_leaf(grouped), fallback_ran)
+        group_plans_by_leaf(grouped)
     }
-
     type Shape = Vec<(EvictionLeaf, Vec<(String, Vec<(u64, u64, u64)>)>)>;
 
     /// Leaf, object and extent order, with each extent's size: everything the dispatch reads.
@@ -35857,312 +37251,9 @@ mod eviction_byte_target_red_tests {
         LARGE_RANGE_BYTES + 5 * SMALL_RANGE_BYTES,
     ];
 
-    /// The fan-out tests' population: `mixed_fixture` plus the two verdicts it has no object
-    /// for, so a concurrent read is compared with a serial one over candidates that are kept,
-    /// skipped and size-corrected rather than over 64 identical keeps.
-    ///
-    /// - one object last accessed now, which the 60-second admission window skips entirely;
-    /// - one object whose `.bin` is gone, so the size falls back to `compressed_size`.
-    fn mixed_verdict_fixture(cache_dir: &std::path::Path) -> CacheManager {
-        let manager = mixed_fixture(cache_dir);
-        let now = SystemTime::now();
-        plant_range(
-            &manager,
-            cache_dir,
-            "test-bucket/case9-inside-window.bin",
-            SMALL_RANGE_BYTES,
-            now,
-        );
-        plant_range(
-            &manager,
-            cache_dir,
-            "test-bucket/case9-no-bin.bin",
-            SMALL_RANGE_BYTES,
-            now - 2 * AGE,
-        );
-        let bin = crate::disk_cache::get_sharded_path(
-            &cache_dir.join("ranges"),
-            "test-bucket/case9-no-bin.bin",
-            &format!("_0-{}.bin", SMALL_RANGE_BYTES - 1),
-        )
-        .unwrap();
-        std::fs::remove_file(&bin).expect("fixture: the planted .bin must exist to be removed");
-        manager
-    }
-
-    /// Every candidate the selection chose, in order: the sequence a reordering would change.
-    fn selected_extents_in_order(work: &SelectedWork) -> Vec<(String, u64, u64, u64)> {
-        work.leaf_groups
-            .iter()
-            .flat_map(|(_, plans)| plans.iter())
-            .flat_map(|(key, ranges)| {
-                ranges
-                    .iter()
-                    .map(move |c| (key.clone(), c.range_start, c.range_end, c.size))
-            })
-            .collect()
-    }
-
-    /// the work the full-population path selects at fan-out 1 is the work it
-    /// selects at fan-out 8 -- same extents, same order, same leaf grouping.
-    ///
-    /// Order is the whole claim. `sort_byte_dimension_candidates` is a STABLE sort and this
-    /// fixture's 63 small ranges tie on expiry, size and coldness, so their relative order comes
-    /// straight out of the collector: if the concurrent reader yielded documents as they
-    /// completed rather than in enumeration order, the pass would evict a different subset of
-    /// the tied candidates. The target is sized to need about twenty of them, so a reordering
-    /// lands inside the selected set rather than past its end.
-    ///
-    /// Not vacuous: the fixture's `.meta` count is asserted to be several times the fan-out
-    /// (a fixture smaller than the fan-out cannot show an ordering error at all), and a tenth of
-    /// the documents are made slow, so the completion order and the enumeration order genuinely
-    /// differ.
-    ///
-    /// Red side: `.buffered(` in `collect_range_candidates_for_eviction` replaced by
-    /// `.buffer_unordered(`. The slow documents are then yielded last and the two sequences
-    /// differ at the first small range.
-    #[tokio::test]
-    async fn the_collector_selects_the_same_work_at_fan_out_1_and_8() {
-        const FANOUT: usize = 8;
-        const TARGET: u64 = LARGE_RANGE_BYTES + 20 * SMALL_RANGE_BYTES;
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = mixed_verdict_fixture(temp.path());
-        let meta_files = count_meta_files(temp.path());
-        assert!(
-            meta_files >= 4 * FANOUT,
-            "fixture: {meta_files} .meta files must exceed the fan-out several times over, or a \
-             reordering could not be seen"
-        );
-
-        selection_read_seam::arm(
-            temp.path(),
-            1,
-            Some("new-small-0"),
-            Duration::from_millis(20),
-        );
-        let serial = tokio::time::timeout(
-            Duration::from_secs(60),
-            manager.select_pass_work(TARGET, &ExclusionSet::new()),
-        )
-        .await
-        .expect("the serial selection finished")
-        .unwrap();
-        assert_eq!(
-            selection_read_seam::peak_in_flight(temp.path()),
-            1,
-            "apparatus: at fan-out 1 the collector must read one document at a time"
-        );
-        assert!(
-            serial.fallback_ran,
-            "fixture: the full-population collector must be the path under test"
-        );
-
-        selection_read_seam::arm(
-            temp.path(),
-            FANOUT,
-            Some("new-small-0"),
-            Duration::from_millis(20),
-        );
-        let concurrent = tokio::time::timeout(
-            Duration::from_secs(60),
-            manager.select_pass_work(TARGET, &ExclusionSet::new()),
-        )
-        .await
-        .expect("the concurrent selection finished")
-        .unwrap();
-        selection_read_seam::disarm(temp.path());
-
-        let serial_extents = selected_extents_in_order(&serial);
-        assert!(
-            serial_extents.len() > FANOUT,
-            "fixture: the target must select more extents ({}) than the fan-out, or the \
-             selected set cannot contain a reordering",
-            serial_extents.len()
-        );
-        assert_eq!(
-            selected_extents_in_order(&concurrent),
-            serial_extents,
-            "the concurrent collector must select the same extents in the same order"
-        );
-        assert_eq!(
-            shape_of(&concurrent.leaf_groups),
-            shape_of(&serial.leaf_groups),
-            "leaf grouping and plan order must be unchanged too"
-        );
-        assert_eq!(concurrent.fallback_ran, serial.fallback_ran);
-    }
-
-    /// the collector really does hold the fan-out of `.meta` reads in flight.
-    ///
-    /// Every document is made slow, so all eight are inside their blocking read together before
-    /// the first returns. The peak is observed from inside the read itself, keyed by this
-    /// fixture's cache directory, so a neighbour test in the same binary cannot supply it.
-    ///
-    /// Red side: `return fanout.max(1);` in `selection_meta_read_concurrency` replaced by
-    /// `return 1;`, which forces the fan-out to 1. The peak reads 1 against the 8 asserted.
-    #[tokio::test]
-    async fn the_collector_reads_the_fan_out_of_documents_at_once() {
-        const FANOUT: usize = 8;
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = mixed_fixture(temp.path());
-        let meta_files = count_meta_files(temp.path());
-        assert!(
-            meta_files > FANOUT,
-            "fixture: {meta_files} .meta files must exceed the fan-out"
-        );
-
-        selection_read_seam::arm(
-            temp.path(),
-            FANOUT,
-            Some(".meta"),
-            Duration::from_millis(50),
-        );
-        let candidates = tokio::time::timeout(
-            Duration::from_secs(60),
-            manager.collect_range_candidates_for_eviction(),
-        )
-        .await
-        .expect("the collector finished")
-        .unwrap();
-        let peak = selection_read_seam::peak_in_flight(temp.path());
-        selection_read_seam::disarm(temp.path());
-
-        assert_eq!(
-            candidates.len(),
-            SMALL_RANGE_COUNT + 1,
-            "apparatus: the collector must have read the whole fixture"
-        );
-        assert_eq!(
-            peak, FANOUT,
-            "the collector must hold the fan-out of .meta reads in flight"
-        );
-    }
-
-    /// the streamed collector selects the same work at the shipped fan-out as at
-    /// fan-out 1, over a population larger than one batch of it.
-    ///
-    /// The fan-out-8 test above fixes the order; this one fixes it where `buffered` has to
-    /// REFILL, which is the case streaming from the walk introduced: the fixture's documents
-    /// outnumber [`SELECTION_META_READ_CONCURRENCY`], so a reordering at a batch boundary lands
-    /// inside the selected set rather than past its end. A tenth of the documents are delayed,
-    /// so completion order and enumeration order genuinely differ.
-    ///
-    /// Red side: `.buffered(` in `collect_range_candidates_for_eviction` replaced by
-    /// `.buffer_unordered(`. The delayed documents are yielded last and the two sequences differ
-    /// at the first small range.
-    #[tokio::test]
-    async fn the_streamed_collector_selects_the_same_work_at_the_shipped_fan_out() {
-        const TARGET: u64 = LARGE_RANGE_BYTES + 20 * SMALL_RANGE_BYTES;
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = mixed_verdict_fixture(temp.path());
-        let meta_files = count_meta_files(temp.path());
-        assert!(
-            meta_files > SELECTION_META_READ_CONCURRENCY,
-            "fixture: {meta_files} .meta files must outnumber the shipped fan-out of {}, or the \
-             stream never refills and no batch boundary is crossed",
-            SELECTION_META_READ_CONCURRENCY
-        );
-        selection_read_seam::arm(
-            temp.path(),
-            1,
-            Some("new-small-0"),
-            Duration::from_millis(20),
-        );
-        let serial = tokio::time::timeout(
-            Duration::from_secs(60),
-            manager.select_pass_work(TARGET, &ExclusionSet::new()),
-        )
-        .await
-        .expect("the serial selection finished")
-        .unwrap();
-        assert!(
-            serial.fallback_ran,
-            "fixture: the full-population collector must be the path under test"
-        );
-        selection_read_seam::arm(
-            temp.path(),
-            SELECTION_META_READ_CONCURRENCY,
-            Some("new-small-0"),
-            Duration::from_millis(20),
-        );
-        let concurrent = tokio::time::timeout(
-            Duration::from_secs(60),
-            manager.select_pass_work(TARGET, &ExclusionSet::new()),
-        )
-        .await
-        .expect("the concurrent selection finished")
-        .unwrap();
-        selection_read_seam::disarm(temp.path());
-        let serial_extents = selected_extents_in_order(&serial);
-        assert!(
-            serial_extents.len() > 1,
-            "fixture: the target must select several extents ({}), or an order cannot differ",
-            serial_extents.len()
-        );
-        assert_eq!(
-            selected_extents_in_order(&concurrent),
-            serial_extents,
-            "the streamed collector must select the same extents in the same order at the \
-             shipped fan-out as at fan-out 1"
-        );
-    }
-
-    /// the collector holds at most the fan-out of `.meta` paths in memory, however
-    /// many the tree has.
-    ///
-    /// The seam counts a path in as [`MetaFileWalk`] yields it and out when its read returns, so
-    /// the peak is what the collector was holding. `buffered` pulls a path only when it has room
-    /// for another read, which is what bounds it: the collector that listed the tree into a
-    /// `Vec<PathBuf>` first held one path per resident object, gigabytes at the spec's
-    /// O(100 million) range design point, and could not start a read until the walk finished.
-    ///
-    /// Not vacuous: the fixture is several times the fan-out, and a peak of zero fails rather
-    /// than reading as bounded.
-    ///
-    /// Red side: `MetaFileWalk::new(&metadata_dir)` replaced by
-    /// `MetaFileWalk::new(&metadata_dir).collect::<Vec<_>>().into_iter()`, which is the shape
-    /// the first concurrent collector had. The peak then reads the whole fixture.
-    #[tokio::test]
-    async fn the_collector_holds_at_most_the_fan_out_of_paths_in_memory() {
-        const FANOUT: usize = 8;
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = mixed_fixture(temp.path());
-        let meta_files = count_meta_files(temp.path());
-        assert!(
-            meta_files >= 4 * FANOUT,
-            "fixture: {meta_files} .meta files must exceed the fan-out several times over, or a \
-             bound at the fan-out is not a bound on anything"
-        );
-        selection_read_seam::arm(temp.path(), FANOUT, Some(".meta"), Duration::from_millis(5));
-        let candidates = tokio::time::timeout(
-            Duration::from_secs(60),
-            manager.collect_range_candidates_for_eviction(),
-        )
-        .await
-        .expect("the collector finished")
-        .unwrap();
-        let peak_paths = selection_read_seam::peak_paths_live(temp.path());
-        selection_read_seam::disarm(temp.path());
-        assert_eq!(
-            candidates.len(),
-            SMALL_RANGE_COUNT + 1,
-            "apparatus: the collector must have read the whole fixture"
-        );
-        assert!(
-            peak_paths > 0,
-            "apparatus: the seam recorded no path at all, so this is not a reading of the \
-             collector"
-        );
-        assert!(
-            peak_paths <= FANOUT,
-            "the collector must hold at most the fan-out of .meta paths in memory: peak \
-             {peak_paths} against a fan-out of {FANOUT} over {meta_files} documents"
-        );
-    }
-
     /// Behaviour preservation (a): with nothing excluded, `select_pass_work` returns exactly the
-    /// plans, in exactly the order and leaf grouping, that the inline code produced, on the bounded
-    /// path and on the full-population fallback, for targets that need one, several and many
+    /// plans, in exactly the order and leaf grouping, that the inline code produced, with
+    /// partitions and without them (lazily rebuilt), for targets that need one, several and many
     /// candidates.
     #[tokio::test]
     async fn select_pass_work_with_an_empty_exclusion_equals_the_inline_selection() {
@@ -36174,8 +37265,7 @@ mod eviction_byte_target_red_tests {
                 mixed_fixture(temp.path())
             };
             for target in TARGETS {
-                let (expected, expected_fallback) =
-                    inline_selection_as_before_task_42(&manager, target).await;
+                let expected = inline_selection_as_before_task_42(&manager, target).await;
                 let work = manager
                     .select_pass_work(target, &ExclusionSet::new())
                     .await
@@ -36189,14 +37279,6 @@ mod eviction_byte_target_red_tests {
                     shape_of(&work.leaf_groups),
                     shape_of(&expected),
                     "partitions={with_partitions} target={target}: selected extents, order or leaf grouping changed"
-                );
-                assert_eq!(
-                    work.fallback_ran, expected_fallback,
-                    "partitions={with_partitions} target={target}"
-                );
-                assert_eq!(
-                    work.fallback_ran, !with_partitions,
-                    "fixture: partitions must decide which path ran"
                 );
             }
         }
@@ -36295,7 +37377,7 @@ mod eviction_byte_target_red_tests {
     /// than the next, so the selection order is fixed.
     fn uniform_fixture(cache_dir: &std::path::Path) -> CacheManager {
         let mut manager = setup(cache_dir);
-        manager.set_tail_config_for_tests(UNIFORM / 2, 4096, 4096);
+        manager.set_tail_config_for_tests(4096, 4096);
         let now = SystemTime::now();
         for index in 0..UNIFORM_COUNT {
             plant_range(
@@ -37923,13 +39005,16 @@ mod tail_selection_outcome_tests {
 
     const KIB: u64 = 1024;
 
-    fn setup(cache_dir: &std::path::Path, floor: u64, cap: usize) -> CacheManager {
+    fn setup(cache_dir: &std::path::Path, cap: usize) -> CacheManager {
         for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
             std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
         }
         let mut manager = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = manager.create_configured_disk_cache_manager();
-        manager.set_tail_config_for_tests(floor, cap, 4096);
+        manager.set_tail_config_for_tests(cap, 4096);
+        // No lazy rebuild by default here (a shard cap of 0), so the older tests below read one
+        // selection's verdicts and statuses. The lazy-rebuild tests lift it.
+        set_tail_test_limits(cache_dir, None, Some(0));
         manager
     }
 
@@ -38061,6 +39146,758 @@ mod tail_selection_outcome_tests {
             .unwrap();
     }
 
+    /// Every key from `prefix-00000` upwards whose object lands in shard `l1`, the first `n`.
+    fn keys_in_shard_for_tests(prefix: &str, l1: &str, n: usize) -> Vec<String> {
+        (0u64..)
+            .map(|i| format!("b/{prefix}-{i:05}"))
+            .filter(|k| crate::cache_size_tracker::shard_and_leaf_of(k).unwrap().1 == l1)
+            .take(n)
+            .collect()
+    }
+
+    /// A fresh volume — `.meta` files and the tail-delta records consolidation appended
+    /// for them, no Tail_Partition anywhere — answers a pass from the deltas. The full-population
+    /// collector does not run, no partition is rebuilt, and `.meta` opens stay at the handful the
+    /// target needs rather than the 200 on the volume.
+    #[tokio::test]
+    async fn a_fresh_volume_selects_from_the_deltas_without_the_fallback() {
+        let _guard = GUARD.lock().await;
+        reset_tail_selection_counters_for_tests();
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        let cold = SystemTime::now() - Duration::from_secs(3600);
+        let records: Vec<TailRecord> = (0..200u64)
+            .map(|i| {
+                seed_object(
+                    &manager,
+                    temp.path(),
+                    &format!("b/fresh-{i:03}"),
+                    8 * KIB,
+                    cold,
+                    None,
+                    false,
+                    None,
+                )
+            })
+            .collect();
+        plant_delta(temp.path(), &records, nanos(cold));
+        assert!(
+            crate::cache_size_tracker::enumerate_tail_shards(temp.path()).is_empty(),
+            "PRECONDITION: a fresh volume has no Tail_Partition"
+        );
+        let target = 3 * 8 * KIB;
+
+        // The selection first, so a lazy rebuild cannot have run before it reads.
+        let outcome = manager.select_eviction_candidates_bounded(target).await;
+        let work = manager
+            .select_pass_work(target, &ExclusionSet::new())
+            .await
+            .unwrap();
+        assert!(
+            !work.leaf_groups.is_empty(),
+            "a fresh volume must be answered from the tail-deltas: groups={}",
+            work.leaf_groups.len()
+        );
+        assert_eq!(
+            (outcome.status, outcome.lazy_rebuilds),
+            (TailSelectionStatus::Met, 0),
+            "the deltas alone hold the target, so nothing is rebuilt: {:?}",
+            (outcome.status, outcome.lazy_rebuilds, outcome.delta_records)
+        );
+        assert!(
+            crate::cache_size_tracker::enumerate_tail_shards(temp.path()).is_empty(),
+            "no partition may have been rebuilt by either call: the deltas answered both"
+        );
+        assert!(outcome.selected_bytes >= target);
+        assert!(
+            outcome.meta_files_opened <= 10,
+            "meta_files_opened must be bounded by what the target needs, not the 200 on the \
+             volume: {}",
+            outcome.meta_files_opened
+        );
+    }
+
+    /// A cache whose every range is under the old 1 MiB floor, with the empty
+    /// partitions a floored rolling pass built for it, is evicted through the index: the pass
+    /// rebuilds the exhausted shards lazily, now without a floor, and selects from them.
+    #[tokio::test]
+    async fn an_all_sub_floor_cache_is_selected_through_the_index() {
+        let _guard = GUARD.lock().await;
+        reset_tail_selection_counters_for_tests();
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        let cold = SystemTime::now() - Duration::from_secs(3600);
+        let mut shards = std::collections::BTreeSet::new();
+        for i in 0..64u64 {
+            let key = format!("b/small-{i:03}");
+            seed_object(
+                &manager,
+                temp.path(),
+                &key,
+                16 * KIB,
+                cold,
+                None,
+                false,
+                None,
+            );
+            let (bucket, l1, _) = crate::cache_size_tracker::shard_and_leaf_of(&key).unwrap();
+            shards.insert((bucket, l1));
+        }
+        // What a pre-3.0.6 rolling visit wrote for this cache: one EMPTY partition per shard.
+        for (bucket, l1) in &shards {
+            plant_partition(temp.path(), bucket, l1, &[]);
+        }
+        let target = 4 * 16 * KIB;
+
+        let work = manager
+            .select_pass_work(target, &ExclusionSet::new())
+            .await
+            .unwrap();
+        assert!(
+            !work.leaf_groups.is_empty(),
+            "an all-sub-floor cache must be selected through the index: groups={}",
+            work.leaf_groups.len()
+        );
+        let outcome = manager.select_eviction_candidates_bounded(target).await;
+        assert_eq!(outcome.status, TailSelectionStatus::Met);
+        assert!(outcome.selected_bytes >= target);
+    }
+
+    /// A shard whose partition is stale — every member gone, the live objects
+    /// admitted after it was built and in no delta — ends `CAP_EXHAUSTED`, is rebuilt lazily in
+    /// the same pass, and the pass selects the live objects without the fallback. The next
+    /// selection then succeeds from the rebuilt partition with no rebuild.
+    #[tokio::test]
+    async fn a_cap_exhausted_shard_is_rebuilt_lazily_and_the_next_selection_succeeds() {
+        let _guard = GUARD.lock().await;
+        reset_tail_selection_counters_for_tests();
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        let cold = SystemTime::now() - Duration::from_secs(3600);
+        let keys = keys_in_shard_for_tests("cap", "00", 12);
+        let (dead_keys, live_keys) = keys.split_at(4);
+        // The stale partition: four members whose `.meta` no longer exists, 8 KiB each.
+        let dead: Vec<TailRecord> = dead_keys
+            .iter()
+            .map(|k| TailRecord {
+                cache_key: k.clone(),
+                range_start: 0,
+                range_end: 8 * KIB - 1,
+                compressed_size: 8 * KIB,
+                last_accessed: nanos(cold),
+                expires_at: 0,
+                access_count: 0,
+                is_staged: false,
+                leaf: crate::cache_size_tracker::shard_and_leaf_of(k).unwrap().2,
+            })
+            .collect();
+        plant_partition(temp.path(), "b", "00", &dead);
+        for k in live_keys {
+            seed_object(&manager, temp.path(), k, 16 * KIB, cold, None, false, None);
+        }
+        // More than the dead members hold, so the read ends CAP_EXHAUSTED, not Met.
+        let target = 3 * 16 * KIB;
+
+        let work = manager
+            .select_pass_work(target, &ExclusionSet::new())
+            .await
+            .unwrap();
+        assert!(
+            !work.leaf_groups.is_empty(),
+            "the stale shard must be rebuilt lazily and selected from: groups={}",
+            work.leaf_groups.len()
+        );
+        let next = manager.select_eviction_candidates_bounded(target).await;
+        assert_eq!(
+            (next.status, next.lazy_rebuilds),
+            (TailSelectionStatus::Met, 0),
+            "the next selection must succeed from the rebuilt partition without rebuilding"
+        );
+        assert!(next.selected_bytes >= target);
+        assert!(next.selected.iter().all(|(key, _)| live_keys.contains(key)));
+    }
+
+    // ---- Deepening, the exhaustion report, the rejected-open bound, convergence ----
+
+    /// Seed `n` cold objects of `size` in shard `l1` of bucket `b`, and return their records.
+    fn seed_cold_in_shard(
+        manager: &CacheManager,
+        cache_dir: &std::path::Path,
+        prefix: &str,
+        l1: &str,
+        n: usize,
+        size: u64,
+    ) -> Vec<TailRecord> {
+        let cold = SystemTime::now() - Duration::from_secs(3600);
+        keys_in_shard_for_tests(prefix, l1, n)
+            .iter()
+            .map(|k| seed_object(manager, cache_dir, k, size, cold, None, false, None))
+            .collect()
+    }
+
+    /// Stamp shard `l1` of bucket `b` as rebuilt just now, with `entries` members.
+    fn stamp_rebuilt_now(cache_dir: &std::path::Path, l1: &str, entries: usize) {
+        crate::cache_size_tracker::install_tail_checkpoint_fields_in(
+            cache_dir,
+            "b",
+            l1,
+            entries,
+            nanos(SystemTime::now()),
+        );
+    }
+
+    /// (a) A selection whose prefix holds the target's bytes in records that do not verify
+    /// (every one hot by its `.meta`) reads deeper into the partition and finds the colder,
+    /// smaller ranges below them, rather than ending `Met` with nothing verified.
+    #[tokio::test]
+    async fn a_met_selection_with_nothing_verified_is_answered_by_deepening() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        let now = SystemTime::now();
+        let cold = now - Duration::from_secs(3600);
+        // 64 hot objects, the whole default prefix, each larger than every cold one. Their
+        // records say cold, so verification has to open the `.meta` to find them hot.
+        let mut records: Vec<TailRecord> = keys_in_shard_for_tests("hot", "00", 64)
+            .iter()
+            .map(|k| {
+                let mut r = seed_object(&manager, temp.path(), k, 32 * KIB, now, None, false, None);
+                r.last_accessed = nanos(cold);
+                r
+            })
+            .collect();
+        records.extend(seed_cold_in_shard(
+            &manager,
+            temp.path(),
+            "cold",
+            "00",
+            16,
+            16 * KIB,
+        ));
+        plant_for(temp.path(), &records);
+        let target = 2 * 16 * KIB;
+
+        let outcome = manager.select_eviction_candidates_bounded(target).await;
+        println!(
+            "deepening: status {:?} rounds {} depth {} deepened {} opened {} rejected {} selected {}",
+            outcome.status,
+            outcome.rounds,
+            outcome.final_depth,
+            outcome.deepened_rounds,
+            outcome.meta_files_opened,
+            outcome.rejected_opens,
+            outcome.selected_bytes
+        );
+        assert!(
+            outcome.selected_bytes >= target,
+            "the cold ranges below the hot prefix must be found by reading deeper: selected {} \
+             of {}, deepened {} round(s), status {:?}",
+            outcome.selected_bytes,
+            target,
+            outcome.deepened_rounds,
+            outcome.status
+        );
+        assert!(outcome.deepened_rounds >= 1);
+        assert!(outcome
+            .selected
+            .iter()
+            .all(|(key, _)| key.contains("/cold-")));
+        assert!(
+            outcome.meta_files_opened <= 64 + 2 + 3,
+            "the hot documents are read once, not once per round: {}",
+            outcome.meta_files_opened
+        );
+    }
+
+    /// (b) A read tier smaller than the target, with every shard partitioned, read to its end,
+    /// under the cap and rebuilt by this pass, is reported exhausted by the bounded selection,
+    /// with the shortfall a pass that evicted all of it would still have.
+    #[tokio::test]
+    async fn an_exhausted_read_tier_is_reported_by_the_bounded_selection() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        seed_cold_in_shard(&manager, temp.path(), "ex", "00", 3, 16 * KIB);
+        seed_cold_in_shard(&manager, temp.path(), "ex", "01", 3, 16 * KIB);
+        let target = 10 * 16 * KIB;
+
+        let work = manager
+            .select_pass_work(target, &ExclusionSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            work.exhausted_shortfall,
+            Some(target - 6 * 16 * KIB),
+            "a fully indexed, fresh read tier holding 6 of the 10 ranges the target needs must \
+             be reported exhausted by 4 ranges' bytes"
+        );
+        assert_eq!(
+            extents_in(&work.leaf_groups),
+            6,
+            "and every range is still freed"
+        );
+        // A second pass reads the same fresh partitions and reports the same.
+        let again = manager.select_eviction_candidates_bounded(target).await;
+        assert_eq!(
+            (again.lazy_rebuilds, again.exhausted_shortfall),
+            (0, Some(target - 6 * 16 * KIB))
+        );
+    }
+
+    /// (b) A tail-delta file holding more records than the read keeps still lets the report be
+    /// made: the dropped records' bytes are counted into `seen`, so the shortfall is smaller by
+    /// them. Here they repeat ranges the partition lists, so they are counted twice, the upper
+    /// bound's direction.
+    ///
+    /// RED SIDE: with `delta_dropped_bytes` left out of `seen`, the report reads exhausted by 4
+    /// ranges' bytes, as the fixture without the delta file does.
+    #[tokio::test]
+    async fn a_tail_delta_read_that_dropped_records_counts_their_bytes() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut manager = setup(temp.path(), 4096);
+        manager.set_tail_config_for_tests(4096, 1);
+        set_tail_test_limits(temp.path(), None, None);
+        // Partitioned and stamped fresh, so no lazy rebuild runs (a rebuild retires the delta
+        // records it covers, and the final selection would then read none).
+        let records = seed_cold_in_shard(&manager, temp.path(), "dd", "00", 3, 16 * KIB);
+        plant_partition(temp.path(), "b", "00", &records);
+        stamp_rebuilt_now(temp.path(), "00", records.len());
+        let other = seed_cold_in_shard(&manager, temp.path(), "dd", "01", 3, 16 * KIB);
+        plant_partition(temp.path(), "b", "01", &other);
+        stamp_rebuilt_now(temp.path(), "01", other.len());
+        let at = nanos(SystemTime::now());
+        let deltas: Vec<crate::cache_size_tracker::TailDeltaRecord> = records
+            .iter()
+            .map(|r| crate::cache_size_tracker::TailDeltaRecord {
+                bucket: "b".to_string(),
+                l1: "00".to_string(),
+                at,
+                instance_id: "fixture-peer".to_string(),
+                record: r.clone(),
+            })
+            .collect();
+        crate::cache_size_tracker::append_tail_delta_records(
+            temp.path(),
+            "fixture-peer",
+            &deltas,
+            4096,
+        )
+        .unwrap();
+        let target = 10 * 16 * KIB;
+        let outcome = manager.select_eviction_candidates_bounded(target).await;
+        assert_eq!(
+            (outcome.delta_records_dropped, outcome.lazy_rebuilds),
+            (2, 0),
+            "fixture: a delta file of 3 records read with a cap of 1, and no lazy rebuild"
+        );
+        assert_eq!(
+            (outcome.delta_dropped_bytes, outcome.exhausted_shortfall),
+            (2 * 16 * KIB, Some(target - 8 * 16 * KIB)),
+            "THE EXHAUSTION REPORT LEFT THE DROPPED DELTA RECORDS' BYTES OUT OF ITS SUM"
+        );
+    }
+
+    /// (d) The exhausted-shard rebuild tier is limited as the cap-bound tier is: within one
+    /// interval a second short selection rebuilds no stale exhausted shard, and a shard rebuilt
+    /// by the first still counts as fresh.
+    ///
+    /// RED SIDE: with the claim always granted, the second selection rebuilds the other shard.
+    #[tokio::test]
+    async fn the_exhausted_shard_tier_rebuilds_once_per_interval() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, Some(1));
+        for l1 in ["00", "01"] {
+            let records = seed_cold_in_shard(&manager, temp.path(), "xt", l1, 2, 16 * KIB);
+            plant_partition(temp.path(), "b", l1, &records);
+        }
+        let target = 10 * 16 * KIB;
+        let first = manager.select_eviction_candidates_bounded(target).await;
+        let second = manager.select_eviction_candidates_bounded(target).await;
+        println!(
+            "exhausted tier: first rebuilt {} (exhausted {:?}), second rebuilt {} (exhausted {:?})",
+            first.lazy_rebuilds,
+            first.exhausted_shards,
+            second.lazy_rebuilds,
+            second.exhausted_shards
+        );
+        assert_eq!(
+            (first.lazy_rebuilds, second.exhausted_shards.len()),
+            (1, 2),
+            "fixture: the first selection rebuilds one of the two exhausted shards, and both are \
+             still exhausted for the second"
+        );
+        assert_eq!(
+            second.lazy_rebuilds, 0,
+            "THE EXHAUSTED-SHARD TIER REBUILT AGAIN WITHIN ITS INTERVAL"
+        );
+    }
+
+    /// (b) The negative arms: a cap-bound partition, or a shard the rebuild budget did not
+    /// reach, leaves the report unset, so the default is "not exhausted".
+    #[tokio::test]
+    async fn a_cap_bound_or_partly_indexed_read_tier_is_not_reported_exhausted() {
+        let _guard = GUARD.lock().await;
+        // Cap-bound: three objects in a shard whose partitions hold two.
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 2);
+        set_tail_test_limits(temp.path(), None, None);
+        seed_cold_in_shard(&manager, temp.path(), "cb", "00", 3, 16 * KIB);
+        let outcome = manager
+            .select_eviction_candidates_bounded(10 * 16 * KIB)
+            .await;
+        assert!(
+            outcome.selected_bytes < 10 * 16 * KIB && !outcome.cap_bound_shards.is_empty(),
+            "fixture: short, with a cap-bound partition: {:?}",
+            (outcome.selected_bytes, &outcome.cap_bound_shards)
+        );
+        assert_eq!(
+            outcome.exhausted_shortfall, None,
+            "cap-bound is not exhausted"
+        );
+
+        // Partly indexed: two shards without partitions, one rebuild per selection.
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, Some(1));
+        seed_cold_in_shard(&manager, temp.path(), "pi", "00", 2, 16 * KIB);
+        seed_cold_in_shard(&manager, temp.path(), "pi", "01", 2, 16 * KIB);
+        let outcome = manager
+            .select_eviction_candidates_bounded(10 * 16 * KIB)
+            .await;
+        assert!(
+            outcome.index_incomplete,
+            "fixture: one shard still unindexed"
+        );
+        assert_eq!(
+            outcome.exhausted_shortfall, None,
+            "a fraction of the shards is not exhausted"
+        );
+
+        // A `.meta` the rebuild could not read: the shard's partition may miss its ranges.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        seed_cold_in_shard(&manager, temp.path(), "ur", "00", 3, 16 * KIB);
+        let unreadable =
+            manager.get_new_metadata_file_path(&keys_in_shard_for_tests("ur", "00", 1)[0]);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_as_us = std::fs::read(&unreadable).is_ok();
+        let outcome = manager
+            .select_eviction_candidates_bounded(10 * 16 * KIB)
+            .await;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if readable_as_us {
+            println!("SKIPPED the unreadable arm: this user reads a mode-000 file");
+        } else {
+            assert_eq!(
+                outcome.exhausted_shortfall, None,
+                "a rebuild that could not read a .meta is not exhausted"
+            );
+        }
+    }
+
+    /// (c) A futile demand stream does no O(N) read: in a read tier where nothing verifies
+    /// (every `.meta` hot), each pass opens at most the rejected-open budget of `.meta` files,
+    /// however many the volume holds, and a fresh partition is not rebuilt.
+    #[tokio::test]
+    async fn a_futile_selection_opens_at_most_the_rejected_open_budget() {
+        let _guard = GUARD.lock().await;
+        const BUDGET: usize = 8;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), Some(BUDGET), None);
+        let now = SystemTime::now();
+        let cold = now - Duration::from_secs(3600);
+        let records: Vec<TailRecord> = keys_in_shard_for_tests("futile", "00", 40)
+            .iter()
+            .map(|k| {
+                let mut r = seed_object(&manager, temp.path(), k, 16 * KIB, now, None, false, None);
+                r.last_accessed = nanos(cold);
+                r
+            })
+            .collect();
+        plant_for(temp.path(), &records);
+        stamp_rebuilt_now(temp.path(), "00", records.len());
+        let target = 100 * 16 * KIB;
+        for pass in 0..3 {
+            let outcome = manager.select_eviction_candidates_bounded(target).await;
+            println!(
+                "futile pass {pass}: opened {} rejected {} budget bound {} rebuilt {} parsed {}",
+                outcome.meta_files_opened,
+                outcome.rejected_opens,
+                outcome.verify_budget_bound,
+                outcome.lazy_rebuilds,
+                outcome.lazy_rebuild_metas_parsed
+            );
+            assert!(
+                outcome.meta_files_opened <= BUDGET,
+                "pass {pass}: a selection where nothing verifies must open at most the budget \
+                 of {BUDGET} .meta files, not the {} on the volume: opened {}",
+                records.len(),
+                outcome.meta_files_opened
+            );
+            assert_eq!(
+                outcome.lazy_rebuild_metas_parsed, 0,
+                "pass {pass}: a fresh partition is not rebuilt"
+            );
+            assert!(outcome.selected.is_empty());
+        }
+    }
+
+    /// (d) A volume with no partitions anywhere converges without a walk: each short selection
+    /// rebuilds what its budget allows, and once every shard is partitioned the index is
+    /// complete and later passes rebuild nothing.
+    #[tokio::test]
+    async fn an_unpartitioned_volume_converges_without_the_walk() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, Some(2));
+        for l1 in ["00", "01", "02", "03", "04", "05"] {
+            seed_cold_in_shard(&manager, temp.path(), "conv", l1, 2, 16 * KIB);
+        }
+        let target = 100 * 16 * KIB;
+        let mut trace = Vec::new();
+        for _ in 0..4 {
+            let outcome = manager.select_eviction_candidates_bounded(target).await;
+            trace.push((
+                outcome.lazy_rebuilds,
+                outcome.partitions_present,
+                outcome.index_incomplete,
+                outcome.selected_bytes / (16 * KIB),
+            ));
+        }
+        println!("convergence (rebuilt, present, incomplete, selected ranges) per pass: {trace:?}");
+        assert_eq!(
+            trace,
+            vec![
+                (2, 2, true, 4),
+                (2, 4, true, 8),
+                (2, 6, false, 12),
+                (0, 6, false, 12)
+            ],
+            "two shards a selection, every shard partitioned after three, none rebuilt after"
+        );
+    }
+
+    /// Review item 4: a cap-bound partition that is stale (its members gone, the live ranges
+    /// admitted after it was built) is answered only by the third rebuild tier, since it is
+    /// neither unpartitioned nor read to the end under the cap.
+    #[tokio::test]
+    async fn a_cap_bound_stale_partition_is_answered_by_the_third_tier() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 2);
+        set_tail_test_limits(temp.path(), None, None);
+        let cold = SystemTime::now() - Duration::from_secs(3600);
+        let keys = keys_in_shard_for_tests("tier3", "00", 5);
+        let (dead_keys, live_keys) = keys.split_at(2);
+        // The stale partition: the cap's worth of members whose `.meta` no longer exists.
+        let dead: Vec<TailRecord> = dead_keys
+            .iter()
+            .map(|k| TailRecord {
+                cache_key: k.clone(),
+                range_start: 0,
+                range_end: 32 * KIB - 1,
+                compressed_size: 32 * KIB,
+                last_accessed: nanos(cold),
+                expires_at: 0,
+                access_count: 0,
+                is_staged: false,
+                leaf: crate::cache_size_tracker::shard_and_leaf_of(k).unwrap().2,
+            })
+            .collect();
+        plant_partition(temp.path(), "b", "00", &dead);
+        for k in live_keys {
+            seed_object(&manager, temp.path(), k, 16 * KIB, cold, None, false, None);
+        }
+        let target = 2 * 16 * KIB;
+        let outcome = manager.select_eviction_candidates_bounded(target).await;
+        println!(
+            "tier 3: rebuilt {} selected {} status {:?}",
+            outcome.lazy_rebuilds, outcome.selected_bytes, outcome.status
+        );
+        assert_eq!(
+            outcome.lazy_rebuilds, 1,
+            "the cap-bound stale shard must be rebuilt by the third tier"
+        );
+        assert!(
+            outcome.selected_bytes >= target
+                && outcome
+                    .selected
+                    .iter()
+                    .all(|(key, _)| live_keys.contains(key)),
+            "and the pass selects the live ranges: {} of {}",
+            outcome.selected_bytes,
+            target
+        );
+    }
+
+    /// Write-cache R5.5 on the bounded path: an expired staged range is selected, and an
+    /// unexpired one beside it is not.
+    #[tokio::test]
+    async fn an_expired_staged_range_is_selected_and_an_unexpired_one_is_not() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        let now = SystemTime::now();
+        let cold = now - Duration::from_secs(3600);
+        let keys = keys_in_shard_for_tests("stg", "00", 2);
+        let expired = seed_object(
+            &manager,
+            temp.path(),
+            &keys[0],
+            16 * KIB,
+            cold,
+            Some(now - Duration::from_secs(60)),
+            true,
+            Some(true),
+        );
+        let _unexpired = seed_object(
+            &manager,
+            temp.path(),
+            &keys[1],
+            32 * KIB,
+            cold,
+            Some(now + Duration::from_secs(3600)),
+            true,
+            Some(true),
+        );
+        let outcome = manager.select_eviction_candidates_bounded(48 * KIB).await;
+        let selected: Vec<&str> = outcome.selected.iter().map(|(k, _)| k.as_str()).collect();
+        println!(
+            "staged selection: {selected:?} verdicts {:?}",
+            outcome.verdicts
+        );
+        assert_eq!(
+            selected,
+            vec![expired.cache_key.as_str()],
+            "only the expired staged range may be selected"
+        );
+    }
+
+    /// Condition 1 of option A: a staged range selected because its object had expired is not
+    /// deleted when the locked `.meta` shows the object refreshed since the selection, though
+    /// its identity (ETag, Last-Modified, created_at) is unchanged.
+    #[tokio::test]
+    async fn a_staged_range_refreshed_after_selection_is_not_deleted() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        let now = SystemTime::now();
+        let key = keys_in_shard_for_tests("refresh", "00", 1).remove(0);
+        seed_object(
+            &manager,
+            temp.path(),
+            &key,
+            16 * KIB,
+            now - Duration::from_secs(3600),
+            Some(now - Duration::from_secs(60)),
+            true,
+            Some(true),
+        );
+        let outcome = manager.select_eviction_candidates_bounded(16 * KIB).await;
+        let (_, ranges) = outcome
+            .selected
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .expect("fixture: the expired staged range is selected");
+        // A refresh between selection and delete: the expiry moves, nothing else does.
+        let path = manager.get_new_metadata_file_path(&key);
+        let mut meta: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        meta.expires_at = now + Duration::from_secs(3600);
+        std::fs::write(&path, serde_json::to_string(&meta).unwrap()).unwrap();
+        let eviction = manager.batch_evict_ranges(&key, &ranges).await.unwrap();
+        assert!(
+            eviction.identity_skipped && path.exists(),
+            "a staged range refreshed since its selection must not be deleted: skipped={} \
+             meta_exists={}",
+            eviction.identity_skipped,
+            path.exists()
+        );
+    }
+
+    /// A staged range selected because its object had expired is not deleted when a read
+    /// revalidated the object between the selection and the delete. The revalidation
+    /// graduates it (`refresh_write_cache_ttl`), so the locked `.meta` is no longer staged and
+    /// carries a fresh `get_ttl` expiry, and the executor's identity re-check, which compares
+    /// `is_write_cached`, refuses the delete.
+    #[tokio::test]
+    async fn a_staged_range_revalidated_after_selection_is_not_deleted() {
+        let _guard = GUARD.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path(), 4096);
+        set_tail_test_limits(temp.path(), None, None);
+        let now = SystemTime::now();
+        let key = keys_in_shard_for_tests("revalidated", "00", 1).remove(0);
+        seed_object(
+            &manager,
+            temp.path(),
+            &key,
+            16 * KIB,
+            now - Duration::from_secs(3600),
+            Some(now - Duration::from_secs(60)),
+            true,
+            Some(true),
+        );
+        // A Last-Modified, as a revalidation's `304` backfills, so the graduation can run.
+        let path = manager.get_new_metadata_file_path(&key);
+        let mut meta: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        meta.object_metadata.last_modified = "Wed, 21 Oct 2015 07:28:00 GMT".to_string();
+        std::fs::write(&path, serde_json::to_string(&meta).unwrap()).unwrap();
+        let outcome = manager.select_eviction_candidates_bounded(16 * KIB).await;
+        let (_, ranges) = outcome
+            .selected
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .expect("fixture: the expired staged range is selected");
+        let graduated = manager.refresh_write_cache_ttl(&key).await.unwrap();
+        let after: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            graduated && !after.object_metadata.is_write_cached && after.expires_at > now,
+            "FIXTURE: the read must graduate the object with a fresh expiry: graduated={} \
+             write_cached={} expires_at={:?}",
+            graduated,
+            after.object_metadata.is_write_cached,
+            after.expires_at
+        );
+        let eviction = manager.batch_evict_ranges(&key, &ranges).await.unwrap();
+        let listed = serde_json::from_str::<NewCacheMetadata>(
+            &std::fs::read_to_string(&path).unwrap_or_default(),
+        )
+        .map(|m| m.ranges.len())
+        .unwrap_or(0);
+        assert!(
+            eviction.identity_skipped && listed == after.ranges.len(),
+            "A REVALIDATED OBJECT WAS EVICTED AS EXPIRED: skipped={} listed {} of {} ranges",
+            eviction.identity_skipped,
+            listed,
+            after.ranges.len()
+        );
+    }
+
+    /// Extents in a work list.
+    fn extents_in(groups: &[LeafEvictionGroup]) -> usize {
+        groups
+            .iter()
+            .flat_map(|(_, plans)| plans.iter())
+            .map(|(_, ranges)| ranges.len())
+            .sum()
+    }
+
     /// A pass retires the tail-delta records whose ranges it has just read as gone, so the next
     /// pass's capped read reaches the live ones.
     ///
@@ -38080,9 +39917,9 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let mut manager = setup(temp.path(), KIB, 4096);
+        let mut manager = setup(temp.path(), 4096);
         // Delta read cap of 8: eight dead records fill it exactly.
-        manager.set_tail_config_for_tests(KIB, 4096, 8);
+        manager.set_tail_config_for_tests(4096, 8);
         let cold = SystemTime::now() - Duration::from_secs(3600);
 
         // A partition file must exist, or the selection reports `Unvisited` and never looks at
@@ -38204,8 +40041,8 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let mut manager = setup(temp.path(), KIB, 4096);
-        manager.set_tail_config_for_tests(KIB, 4096, 8);
+        let mut manager = setup(temp.path(), 4096);
+        manager.set_tail_config_for_tests(4096, 8);
         let cold = SystemTime::now() - Duration::from_secs(3600);
 
         plant_partition(temp.path(), "b", "00", &[]);
@@ -38260,8 +40097,8 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let mut manager = setup(temp.path(), KIB, 4096);
-        manager.set_tail_config_for_tests(KIB, 4096, 8);
+        let mut manager = setup(temp.path(), 4096);
+        manager.set_tail_config_for_tests(4096, 8);
         let cold = SystemTime::now() - Duration::from_secs(3600);
         plant_partition(temp.path(), "b", "00", &[]);
         let mk = |key: &str| TailRecord {
@@ -38319,7 +40156,7 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), KIB, 4096);
+        let manager = setup(temp.path(), 4096);
         let cold = SystemTime::now() - Duration::from_secs(3600);
         let rec = TailRecord {
             cache_key: "b/refilled".to_string(),
@@ -38376,7 +40213,7 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), KIB, 4096);
+        let manager = setup(temp.path(), 4096);
         seed_object(
             &manager,
             temp.path(),
@@ -38392,16 +40229,14 @@ mod tail_selection_outcome_tests {
         assert_eq!(outcome.status, TailSelectionStatus::Unvisited);
         assert!(
             outcome.selected.is_empty(),
-            "an unvisited volume yields nothing, so the caller falls back"
+            "an unvisited volume with no delta yields nothing"
         );
+        let work = manager
+            .select_pass_work(1024, &ExclusionSet::new())
+            .await
+            .unwrap();
+        assert!(work.leaf_groups.is_empty());
         let gauges = collect_tail_selection_gauges();
-        assert_eq!(gauges.eviction_fallback_unvisited_total, 1);
-        assert_eq!(
-            gauges.eviction_fallback_tail_empty_total, 0,
-            "TAIL_EMPTY is a claim about what the cache HOLDS. Nothing has looked, so it must \
-             not be made — R3.5 justifies the entry-dimension fallback only for a genuinely \
-             empty tail."
-        );
         assert_eq!(
             gauges.tail_coverage_ratio, None,
             "the ratio must be absent rather than 0.0 before any pass has measured it"
@@ -38414,7 +40249,7 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), KIB, 4096);
+        let manager = setup(temp.path(), 4096);
         plant_partition(temp.path(), "b", "00", &[]);
         plant_partition(temp.path(), "b", "01", &[]);
 
@@ -38426,9 +40261,11 @@ mod tail_selection_outcome_tests {
             outcome.meta_files_opened, 0,
             "an empty tail must cost ZERO .meta opens — there is nothing to verify"
         );
-        let gauges = collect_tail_selection_gauges();
-        assert_eq!(gauges.eviction_fallback_tail_empty_total, 1);
-        assert_eq!(gauges.eviction_fallback_unvisited_total, 0);
+        let work = manager
+            .select_pass_work(1024, &ExclusionSet::new())
+            .await
+            .unwrap();
+        assert!(work.leaf_groups.is_empty());
     }
 
     /// The prefix escalates `depth := depth * 4` and stops at `CAP_EXHAUSTED`.
@@ -38446,7 +40283,7 @@ mod tail_selection_outcome_tests {
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
         // Cap well above the default starting depth of 64, so there is room to escalate.
-        let manager = setup(temp.path(), KIB, 4096);
+        let manager = setup(temp.path(), 4096);
         // 300 records of 1 KiB in one shard. The first depth (64) reaches 64 KiB; the target is
         // 200 KiB, which needs 200 records, so depth must escalate 64 -> 256.
         let records: Vec<TailRecord> = (0..300)
@@ -38466,12 +40303,21 @@ mod tail_selection_outcome_tests {
 
         let outcome = manager.select_eviction_candidates_bounded(200 * KIB).await;
         assert_eq!(
-            outcome.rounds, 2,
+            outcome.rounds - outcome.deepened_rounds,
+            2,
             "a first depth of 64 holds 64 KiB against a 200 KiB target, so exactly one escalation \
-             is needed. Rounds: {}, final depth: {}",
-            outcome.rounds, outcome.final_depth
+             is needed before verification. Rounds: {}, deepened: {}, final depth: {}",
+            outcome.rounds,
+            outcome.deepened_rounds,
+            outcome.final_depth
         );
-        assert_eq!(outcome.final_depth, 256, "64 * 4");
+        // No record names a `.meta`, so verification at 256 leaves the target unmet and the
+        // selection reads once more, to 1024, which reaches every record.
+        assert_eq!(
+            (outcome.deepened_rounds, outcome.final_depth),
+            (1, 1024),
+            "64 * 4, then one deeper round"
+        );
         assert_eq!(outcome.status, TailSelectionStatus::Met);
 
         // Now a target no depth can meet: 300 records of 1 KiB hold 300 KiB.
@@ -38491,9 +40337,6 @@ mod tail_selection_outcome_tests {
              Rounds: {}",
             short.rounds
         );
-        let gauges = collect_tail_selection_gauges();
-        assert_eq!(gauges.eviction_fallback_cap_exhausted_total, 1);
-        assert_eq!(gauges.eviction_fallback_tail_empty_total, 0);
     }
 
     /// R3.6a: the 60-second admission window does not protect an EXPIRED range.
@@ -38513,7 +40356,7 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), KIB, 4096);
+        let manager = setup(temp.path(), 4096);
         let now = SystemTime::now();
         // Inside the 60-second window for BOTH objects.
         let just_now = now - Duration::from_secs(5);
@@ -38600,7 +40443,7 @@ mod tail_selection_outcome_tests {
         let _guard = GUARD.lock().await;
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), KIB, 4096);
+        let manager = setup(temp.path(), 4096);
         let cold = SystemTime::now() - Duration::from_secs(3600);
 
         // MetadataAbsent: a record for a key with no `.meta` at all.
@@ -38706,63 +40549,6 @@ mod tail_selection_outcome_tests {
         );
     }
 
-    /// R3.6a on the FALLBACK path too.
-    ///
-    /// The fallback is still the byte dimension, so R3.6a governs it as well — and it is the path a
-    /// deployment whose partitions have not been built yet takes on every pass, which is every
-    /// deployment on the release this ships in. Asserting only the bounded path would leave the
-    /// rule unimplemented where it is most often reached.
-    ///
-    /// Two-sided for the same reason as the bounded arm: the fresh range of identical age and size
-    /// must still be skipped, or the test passes on an implementation that deleted the window.
-    #[tokio::test]
-    async fn r3_6a_holds_on_the_full_population_collector_as_well() {
-        let _guard = GUARD.lock().await;
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), KIB, 4096);
-        let now = SystemTime::now();
-        let just_now = now - Duration::from_secs(5);
-
-        seed_object(
-            &manager,
-            temp.path(),
-            "b/legacy-expired",
-            32 * KIB,
-            just_now,
-            Some(now - Duration::from_secs(1)),
-            false,
-            Some(false),
-        );
-        seed_object(
-            &manager,
-            temp.path(),
-            "b/legacy-fresh",
-            32 * KIB,
-            just_now,
-            Some(now + Duration::from_secs(3600)),
-            false,
-            Some(false),
-        );
-
-        let candidates = manager
-            .collect_range_candidates_for_eviction()
-            .await
-            .unwrap();
-        let keys: Vec<&str> = candidates.iter().map(|c| c.cache_key.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec!["b/legacy-expired"],
-            "R3.6a: the full collector must admit the expired range despite the 60-second \
-             admission window, and must still refuse the fresh range of identical age and size. \
-             Collected: {:?}",
-            keys
-        );
-        assert!(
-            candidates[0].expires_at.is_some(),
-            "the candidate must carry the object's expiry, or § 5.2's comparator cannot sort on it"
-        );
-    }
-
     /// R3.4's coverage check, and `TAIL_COVERAGE_SHORT` by that name.
     ///
     /// # The name matters, and so does the reachability of `T_max`
@@ -38783,7 +40569,7 @@ mod tail_selection_outcome_tests {
         reset_tail_selection_counters_for_tests();
         let temp = tempfile::TempDir::new().unwrap();
         // Cap of 1 per shard and one shard, so the coverage budget is one range.
-        let manager = setup(temp.path(), KIB, 1);
+        let manager = setup(temp.path(), 1);
         {
             let mut inner = manager.inner.lock().unwrap();
             // 1 GiB max, default eviction_target_percent 80 => T_max = 200 MiB, 2 × T_max = 400 MiB.
@@ -38814,19 +40600,13 @@ mod tail_selection_outcome_tests {
             gauges.tail_coverage_short_total, 1,
             "the WARN is TAIL_COVERAGE_SHORT and it must fire once per check, not per target"
         );
-        assert_eq!(
-            gauges.eviction_fallback_cap_exhausted_total, 0,
-            "CAP_EXHAUSTED and TAIL_COVERAGE_SHORT are DIFFERENT emissions with different \
-             producers, triggers and remedies (§ 4.5's ruling). Short coverage on an empty tail \
-             must not be reported as a pass running out of prefix depth."
-        );
 
         // The healthy side: raise the cap so the coverage budget covers 2 × T_max, and confirm
         // the ratio moves and the WARN does not fire. Without this, the short assertion passes on
         // an implementation that warns unconditionally.
         reset_tail_selection_counters_for_tests();
-        let mut healthy = setup(temp.path(), KIB, 1_000_000);
-        healthy.set_tail_config_for_tests(KIB, 1_000_000, 4096);
+        let mut healthy = setup(temp.path(), 1_000_000);
+        healthy.set_tail_config_for_tests(1_000_000, 4096);
         {
             let mut inner = healthy.inner.lock().unwrap();
             inner.statistics.max_cache_size_limit = 1024 * 1024;
@@ -39710,68 +41490,6 @@ mod metadata_lock_discipline_tests {
         );
         let _ = manager.create_configured_disk_cache_manager();
         manager
-    }
-
-    /// Site 8, found by the enumeration: `check_and_invalidate_expired_write_cache`, the
-    /// lazy expiry reached from the size census.
-    #[tokio::test]
-    async fn expired_write_cache_check_refuses_while_a_peer_holds_the_slot_then_deletes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = setup(temp.path(), false).await;
-        let cache_key = "test-bucket/metalock-b1-expired-write-cache.bin";
-        let (peer_lock, meta_path, _lock_path) =
-            contended_single_range_fixture(&manager, cache_key).await;
-        let bin_path = fixture_bin_path(&manager, cache_key);
-
-        // Expire the write-cache entry behind the fixture's back. The peer holds the slot,
-        // so this is written directly — a `.meta` rewrite through the manager would wait
-        // on the fixture's own peer.
-        let mut meta = read_meta(&manager, cache_key);
-        assert!(
-            meta.object_metadata.is_write_cached,
-            "fixture: the entry must be write-cached or the check returns early"
-        );
-        meta.object_metadata.write_cache_expires_at =
-            Some(SystemTime::now() - Duration::from_secs(3600));
-        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-        assert!(
-            read_meta(&manager, cache_key)
-                .object_metadata
-                .is_write_cache_expired(),
-            "fixture: the entry must read as expired, or the check returns early"
-        );
-
-        let contended = manager
-            .check_and_invalidate_expired_write_cache(cache_key)
-            .await;
-        assert!(
-            contended.is_err(),
-            "check_and_invalidate_expired_write_cache must fail rather than delete while a \
-             peer holds the key's metadata slot lock. got={contended:?}"
-        );
-        assert!(
-            meta_path.exists() && bin_path.exists(),
-            "the entry was deleted while a peer held the slot. meta_exists={} bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
-
-        drop(peer_lock);
-        let expired = manager
-            .check_and_invalidate_expired_write_cache(cache_key)
-            .await
-            .expect("once the slot is free the check must proceed");
-        assert!(
-            expired,
-            "positive control: the expired entry must be reported invalidated"
-        );
-        assert!(
-            !meta_path.exists() && !bin_path.exists(),
-            "positive control: with the slot free the entry must be deleted. meta_exists={} \
-             bin_exists={}",
-            meta_path.exists(),
-            bin_path.exists()
-        );
     }
 
     /// The mechanical guard: no new `.meta.lock` unlink site may appear silently.
@@ -41335,7 +43053,12 @@ mod write_cache_count_eviction_tests {
         let after_reappend = apply().await;
 
         // ---- Staging eviction removes A and debits its write-tier bytes.
-        let freed = m.evict_staged_object(key_a, None).await.unwrap().unwrap();
+        let freed = m
+            .evict_staged_object(key_a, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .freed;
         assert_eq!(
             freed, a,
             "fixture: the eviction must free exactly A's bytes"
@@ -43527,7 +45250,7 @@ mod r3_9_whole_object_precedence_tests {
         }
         let mut cm = CacheManager::new_with_defaults(cache_dir.to_path_buf(), false, 0);
         let _ = cm.create_configured_disk_cache_manager();
-        cm.set_tail_config_for_tests(KIB, 4096, 4096);
+        cm.set_tail_config_for_tests(4096, 4096);
         cm
     }
 
@@ -44033,13 +45756,10 @@ mod r3_9_whole_object_precedence_tests {
 ///
 /// # Which selection path evicts a staged range
 ///
-/// Only the full-population collector (`collect_candidates_from_metadata_file`) offers a staged
-/// range as a candidate. The bounded Tail_Partition path skips it with
-/// `TailCandidateVerdict::Staged`. So production reaches this case when tail selection returns
-/// nothing and the pass falls back, which it does on every volume where no rolling visit has
-/// built partitions yet. The collector also skips any non-expired range accessed inside the
-/// 60 s admission window, so the fixture ages the target's `last_accessed` and leaves every
-/// filler inside the window: the target is the only candidate.
+/// Read-tier selection offers a staged range only when its object has expired (write-cache
+/// R5.5; `TailCandidateVerdict::Staged` covers the unexpired ones), so the fixture expires the
+/// target and leaves every filler unexpired and inside the 60 s admission window: the target is
+/// the only candidate.
 ///
 /// Spec: cache-eviction-at-scale § 16.6.9, "Dirty shards first".
 #[cfg(test)]
@@ -44252,6 +45972,8 @@ mod general_eviction_dirty_shard_tests {
         // target is the only candidate. The fold does not read `last_accessed`.
         let mut aged = meta.clone();
         aged.ranges[0].last_accessed = SystemTime::now() - Duration::from_secs(3600);
+        // Expired, so the read tier may take the staged range (write-cache R5.5).
+        aged.expires_at = SystemTime::now() - Duration::from_secs(60);
         std::fs::write(
             meta_path(dir, &target),
             serde_json::to_string(&aged).unwrap(),
@@ -45070,6 +46792,55 @@ mod eviction_delete_identity_tests {
         assert!(
             bins.is_empty(),
             "R10.2: THE PUT WRITE-CACHE STORE PUBLISHED A TEMP IT DID NOT WRITE: .bin files={bins:?}"
+        );
+    }
+    /// The streamed PUT's `.meta` expires at the `write_cache_expires_at` the request handler
+    /// stamped, not at a later clock read of its own.
+    ///
+    /// RED SIDE: with `expires_at: now + effective_put_ttl` back, the stored expiry is 30 s later
+    /// than `write_cache_expires_at`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_puts_expiry_is_its_write_cache_expiry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let key = "test-bucket/streamed-put-expiry.bin";
+        let mut sink = manager
+            .open_write_cache_sink(key, RANGE_BYTES)
+            .await
+            .unwrap()
+            .expect("capacity must admit the sink");
+        sink.write(&vec![0x56u8; RANGE_BYTES as usize]).unwrap();
+        let (range_spec, pending) = sink.finalize_unpublished().unwrap();
+        let mut object_metadata = v2_object_metadata(true);
+        let stamped = SystemTime::now() - Duration::from_secs(30);
+        object_metadata.write_cache_created_at = Some(stamped);
+        object_metadata.write_cache_expires_at = Some(stamped + Duration::from_secs(3600));
+        let _ = manager
+            .store_streamed_write_cache_metadata(
+                key,
+                range_spec,
+                object_metadata,
+                Duration::from_secs(3600),
+                pending,
+                None,
+            )
+            .await;
+        drop(sink);
+        let stored: crate::cache_types::NewCacheMetadata = serde_json::from_str(
+            &std::fs::read_to_string(manager.get_new_metadata_file_path(key))
+                .expect("the streamed PUT published its .meta"),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                stored.expires_at,
+                stored.object_metadata.write_cache_expires_at
+            ),
+            (
+                stamped + Duration::from_secs(3600),
+                Some(stamped + Duration::from_secs(3600))
+            ),
+            "THE STREAMED PUT'S .meta EXPIRES LATER THAN ITS write_cache_expires_at"
         );
     }
     /// R10.2 at the streamed PUT write-cache publish (`store_streamed_write_cache_metadata`):
@@ -46094,8 +47865,8 @@ mod invalidation_cached_objects_count_tests {
 
 /// The PUT-capacity figure is read narrowly and taken at startup.
 ///
-/// `put_usage_figure` must equal `get_cache_size_stats().total_cache_size` in both
-/// staged-authority epochs at non-zero `P`, and after `initialize()` plus
+/// `put_usage_figure` is `total_size + P` in both staged-authority epochs at non-zero `P`, equal
+/// to `get_cache_size_stats().total_cache_size` in the fold epoch, and after `initialize()` plus
 /// `start_put_usage_refresher()` the first `put_capacity_usage` must not wait on a read.
 ///
 /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
@@ -46164,9 +47935,10 @@ mod put_usage_narrowed_read_tests {
             .total_cache_size
     }
 
-    /// Phase L: `P` is on disk and the fold has a figure, but neither path counts `P`.
+    /// Phase L: `P` is on disk and the fold has a figure. The admission figure counts `P`,
+    /// because the parts are on the volume `max_cache_size` bounds; the stats path does not.
     #[tokio::test(flavor = "multi_thread")]
-    async fn narrowed_figure_equals_stats_total_in_phase_l() {
+    async fn narrowed_figure_counts_p_in_phase_l() {
         let temp = tempfile::TempDir::new().unwrap();
         let manager = setup(temp.path());
         seed_total_size(&manager, DISK_BYTES).await;
@@ -46184,11 +47956,11 @@ mod put_usage_narrowed_read_tests {
             "fixture: no epoch document means Phase L"
         );
 
-        let narrowed = manager.put_usage_figure().await.unwrap();
-        assert_eq!(narrowed, stats_total(&manager).await);
+        let narrowed = manager.put_usage_figure().await.unwrap().figure;
         assert_eq!(
-            narrowed, DISK_BYTES,
-            "Phase L: P must not be counted, as in the stats path's incumbent arm"
+            (narrowed, stats_total(&manager).await),
+            (DISK_BYTES + P_BYTES, DISK_BYTES),
+            "Phase L: the admission figure is total_size + P; the published total leaves P out"
         );
     }
 
@@ -46214,7 +47986,7 @@ mod put_usage_narrowed_read_tests {
             "fixture: the fold figure must be readable so the stats path takes its fold arm"
         );
 
-        let narrowed = manager.put_usage_figure().await.unwrap();
+        let narrowed = manager.put_usage_figure().await.unwrap().figure;
         assert_eq!(narrowed, stats_total(&manager).await);
         assert_eq!(
             narrowed,
@@ -49928,6 +51700,2351 @@ mod writer_identity_tests {
     }
 }
 
+/// The three `max_cache_size` admissions decide on one figure, and the read-tier eviction
+/// trigger counts the same `P` (release 3.0.6).
+///
+/// Each admission is probed through the call production makes: write-through component 1 through
+/// [`CacheManager::disk_safety_refusal`] (a PUT's cache tee and `CreateMultipartUpload` call it),
+/// the PUT router through [`CacheManager::put_capacity_usage`] handed to `check_cache_capacity`
+/// (as `HttpProxy` hands it to `SignedPutHandler`), and a read fill through [`read_fill_refusal`]
+/// (the fill boundaries in `disk_cache.rs` call it). Each is probed at the largest incoming size
+/// that fits `total_size + P + this proxy's unconsolidated bytes` and at one byte more. The
+/// fixture makes every plausible wrong figure disagree with that one: `P` is non-zero, this
+/// proxy's credit arrives after the snapshot, and `size_state.json` is rewritten after the
+/// snapshot with the refresher held, so a decision reading the document itself sees a different
+/// figure from one reading the snapshot.
+#[cfg(test)]
+mod one_whole_cache_admission_tests {
+    use super::*;
+    use crate::capacity_manager::{check_cache_capacity, CacheDecision};
+
+    const BOUND: Duration = Duration::from_secs(30);
+    const MAX: u64 = 10_000_000;
+    const TOTAL: u64 = 4_000_000;
+    const P_BYTES: u64 = 3_000_000;
+    const UNCONSOLIDATED: u64 = 1_000_000;
+    /// What `size_state.json` says once the snapshot has been taken.
+    const LATER_TOTAL: u64 = 50_000;
+
+    async fn manager_unstarted(
+        cache_dir: &Path,
+        max_cache_size: u64,
+        total_size: u64,
+        part_bytes: u64,
+        epoch_1: bool,
+    ) -> Arc<CacheManager> {
+        manager_unstarted_at(
+            cache_dir,
+            max_cache_size,
+            total_size,
+            part_bytes,
+            epoch_1,
+            95,
+        )
+        .await
+    }
+
+    /// [`manager_unstarted`] at `eviction_trigger_percent` `trigger_percent`, given to the
+    /// manager directly, so a trigger of 100 is not clamped by config validation.
+    async fn manager_unstarted_at(
+        cache_dir: &Path,
+        max_cache_size: u64,
+        total_size: u64,
+        part_bytes: u64,
+        epoch_1: bool,
+        trigger_percent: u8,
+    ) -> Arc<CacheManager> {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let mut cache_manager = CacheManager::new_with_shared_storage(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            max_cache_size,
+            crate::cache::CacheEvictionAlgorithm::default(),
+            1,
+            true,
+            std::time::Duration::from_secs(315_360_000),
+            std::time::Duration::from_secs(3_600),
+            std::time::Duration::from_secs(3_600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86_400),
+            crate::config::MetadataCacheConfig::default(),
+            trigger_percent,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            64,
+            std::time::Duration::from_secs(5),
+        );
+        // Component 2 (free space) off, so a decline can only be component 1's.
+        cache_manager.set_disk_safety_free_space_floor(0);
+        let cache_manager = Arc::new(cache_manager);
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        let consolidator = cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("fixture: a shared-storage manager has a consolidator");
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = total_size;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+        let part_dir = cache_dir
+            .join("mpus_in_progress")
+            .join("whole-cache-parts-in-progress");
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let info = crate::cache_types::CachedPartInfo::new(
+            1,
+            part_bytes,
+            "\"etag-whole-cache\"".to_string(),
+            crate::compression::CompressionAlgorithm::Lz4,
+        )
+        .with_compressed_size(part_bytes);
+        std::fs::write(
+            part_dir.join("part1.json"),
+            serde_json::to_string(&info).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::signed_put_handler::in_progress_part_bytes(cache_dir),
+            Some(part_bytes),
+            "fixture: P must be non-zero and readable on the volume, or the test is vacuous"
+        );
+        if epoch_1 {
+            crate::staged_fold::seed_shard_figure_for_tests(cache_dir, "test-bucket", "3f", 1, 1);
+            assert!(crate::staged_authority::activate(cache_dir, "host:test").unwrap());
+            assert!(
+                crate::staged_authority::fold_authority_active(cache_dir),
+                "fixture: epoch 1 must be active"
+            );
+        } else {
+            assert_eq!(
+                crate::staged_authority::read_epoch(cache_dir),
+                crate::staged_authority::EPOCH_LEGACY,
+                "fixture: no epoch document means epoch 0"
+            );
+        }
+        cache_manager
+    }
+
+    /// [`manager_unstarted`] with the startup read taken and every later refresh held, so the
+    /// snapshot the startup read published is the one the probes below must all read.
+    async fn manager(
+        cache_dir: &Path,
+        max_cache_size: u64,
+        total_size: u64,
+        part_bytes: u64,
+        epoch_1: bool,
+    ) -> Arc<CacheManager> {
+        manager_at(
+            cache_dir,
+            max_cache_size,
+            total_size,
+            part_bytes,
+            epoch_1,
+            95,
+        )
+        .await
+    }
+
+    /// [`manager`] at `eviction_trigger_percent` `trigger_percent`.
+    async fn manager_at(
+        cache_dir: &Path,
+        max_cache_size: u64,
+        total_size: u64,
+        part_bytes: u64,
+        epoch_1: bool,
+        trigger_percent: u8,
+    ) -> Arc<CacheManager> {
+        let cache_manager = manager_unstarted_at(
+            cache_dir,
+            max_cache_size,
+            total_size,
+            part_bytes,
+            epoch_1,
+            trigger_percent,
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cache_manager.start_put_usage_refresher(),
+        )
+        .await
+        .expect("start_put_usage_refresher must not hang");
+        cache_manager
+            .put_usage_read_delay_ms
+            .store(600_000, std::sync::atomic::Ordering::Relaxed);
+        cache_manager
+    }
+
+    /// `[component 1, router, read fill]`, each `true` when it declines `incoming`.
+    async fn declines(manager: &Arc<CacheManager>, cache_dir: &Path, incoming: u64) -> [bool; 3] {
+        let component_1 = tokio::time::timeout(BOUND, manager.disk_safety_refusal(incoming))
+            .await
+            .expect("disk_safety_refusal must not hang")
+            .is_some();
+        let usage = tokio::time::timeout(BOUND, manager.put_capacity_usage())
+            .await
+            .expect("put_capacity_usage must not hang")
+            .expect("the startup read published a snapshot");
+        let router = matches!(
+            check_cache_capacity(Some(incoming), usage, MAX),
+            CacheDecision::Bypass(_)
+        );
+        let read_fill = read_fill_refusal(cache_dir, incoming).is_some();
+        [component_1, router, read_fill]
+    }
+
+    async fn assert_one_figure(epoch_1: bool) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let manager = manager(dir, MAX, TOTAL, P_BYTES, epoch_1).await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        assert!(
+            consolidator.size_accumulator().add_range(
+                "whole-cache-bucket/unconsolidated",
+                0,
+                UNCONSOLIDATED - 1,
+                UNCONSOLIDATED
+            ),
+            "fixture: a fresh credit, not a dedup skip"
+        );
+        assert_eq!(
+            unconsolidated_addend_and_epoch(dir).0,
+            UNCONSOLIDATED,
+            "fixture: this proxy's credit must be in the addend"
+        );
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = LATER_TOTAL;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+        let fits = MAX - (TOTAL + P_BYTES + UNCONSOLIDATED);
+        let at_fit = declines(&manager, dir, fits).await;
+        let past = declines(&manager, dir, fits + 1).await;
+        println!(
+            "One whole-cache figure, epoch {}: declined (component 1, router, read fill) at {fits}: \
+             {at_fit:?}; at {}: {past:?}",
+            u8::from(epoch_1),
+            fits + 1
+        );
+        assert_eq!(
+            (at_fit, past),
+            ([false; 3], [true; 3]),
+            "every admission must decide on total_size + P + this proxy's unconsolidated bytes \
+             from the one snapshot: admit the largest object that fits and decline one byte more"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_three_admissions_decide_on_one_figure_at_epoch_1() {
+        assert_one_figure(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_three_admissions_decide_on_one_figure_at_epoch_0() {
+        assert_one_figure(false).await;
+    }
+
+    /// `total_size` under the read-tier trigger (95% of `MAX`) and `P` above the trigger's
+    /// headroom (5% of `MAX`), so every admission declines on `total_size + P` while
+    /// `total_size` alone is not over the trigger.
+    const UNDER_TRIGGER_TOTAL: u64 = 6_000_000;
+    const OVER_HEADROOM_P: u64 = 4_500_000;
+
+    /// Whenever the three admissions decline for size, the read-tier eviction trigger fires and
+    /// the pass it spawns gets past the size check in front of the eviction lock.
+    ///
+    /// The trigger is evaluated by a real consolidation cycle, which reaches the trigger site the
+    /// cycle's state selects (the idle one here: no journal and no delta file), and the count
+    /// read is the consolidator's own per-instance count of trigger decisions. The pass is the
+    /// one the trigger spawned. It creates `locks/global_eviction.lock` only once its own figure
+    /// is over the trigger, so a pass that re-read `total_size` without `P` leaves no lock file.
+    async fn assert_eviction_follows_the_declines(epoch_1: bool) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let manager = manager(dir, MAX, UNDER_TRIGGER_TOTAL, OVER_HEADROOM_P, epoch_1).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let lock_path = manager.get_global_eviction_lock_path();
+        const {
+            assert!(
+                UNDER_TRIGGER_TOTAL < MAX / 100 * 95 && UNDER_TRIGGER_TOTAL + OVER_HEADROOM_P > MAX,
+                "fixture: total_size under the trigger, total_size + P over max_cache_size"
+            )
+        };
+        assert!(!lock_path.exists(), "fixture: no eviction pass has run yet");
+        let declined = declines(&manager, dir, 1).await;
+        let fires_before = consolidator.eviction_trigger_fires();
+        tokio::time::timeout(BOUND, consolidator.run_consolidation_cycle())
+            .await
+            .expect("the consolidation cycle must not hang")
+            .expect("the consolidation cycle must succeed");
+        let fired = consolidator.eviction_trigger_fires() - fires_before;
+        let deadline = tokio::time::Instant::now() + BOUND;
+        while fired > 0 && !lock_path.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pass_took_the_lock = lock_path.exists();
+        println!(
+            "Eviction against declined admissions, epoch {}: total_size {UNDER_TRIGGER_TOTAL}, P \
+             {OVER_HEADROOM_P}, max {MAX}; declined (component 1, router, read fill) at 1 byte: \
+             {declined:?}; trigger fires {fired}; pass took the eviction lock: {pass_took_the_lock}",
+            u8::from(epoch_1)
+        );
+        assert_eq!(
+            (declined, fired, pass_took_the_lock),
+            ([true; 3], 1, true),
+            "with every admission declining on total_size + P, the read-tier trigger must fire \
+             and its pass must size on the same P"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eviction_follows_the_admissions_declining_on_p_at_epoch_1() {
+        assert_eviction_follows_the_declines(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eviction_follows_the_admissions_declining_on_p_at_epoch_0() {
+        assert_eviction_follows_the_declines(false).await;
+    }
+
+    /// Write-through component 1 has a figure whenever the PUT router has one.
+    ///
+    /// Component 1 admits while no `put_usage` snapshot is published (R7.5), and the first one
+    /// can take longer than `PUT_USAGE_FIRST_READ_BOUND`. Every production call of component 1
+    /// is made by a `SignedPutHandler`, which `HttpProxy` builds only after
+    /// `put_capacity_usage` returned a figure; without one it forwards the write uncached. This
+    /// pins the half of that argument a unit test reaches: the router and component 1 read one
+    /// registry, and a published snapshot never reverts, so once the router has a figure
+    /// component 1 decides on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn component_1_has_a_figure_whenever_the_router_has_one() {
+        const NEAR_FULL: u64 = 9_900_000;
+        const INCOMING: u64 = 200_000;
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let manager = manager_unstarted(dir, MAX, NEAR_FULL, 1_000, false).await;
+        // The first read takes longer than the router waits for it.
+        manager
+            .put_usage_read_delay_ms
+            .store(1_000, std::sync::atomic::Ordering::Relaxed);
+        let router_first = tokio::time::timeout(BOUND, manager.put_capacity_usage())
+            .await
+            .expect("put_capacity_usage must not hang");
+        let component_1_first = tokio::time::timeout(BOUND, manager.disk_safety_refusal(INCOMING))
+            .await
+            .expect("disk_safety_refusal must not hang")
+            .is_some();
+        let deadline = tokio::time::Instant::now() + BOUND;
+        let mut router_later = None;
+        while router_later.is_none() && tokio::time::Instant::now() < deadline {
+            router_later = tokio::time::timeout(BOUND, manager.put_capacity_usage())
+                .await
+                .expect("put_capacity_usage must not hang");
+        }
+        let component_1_later = tokio::time::timeout(BOUND, manager.disk_safety_refusal(INCOMING))
+            .await
+            .expect("disk_safety_refusal must not hang")
+            .is_some();
+        println!(
+            "Startup: router {router_first:?} then {router_later:?}; component 1 declined \
+             {INCOMING} bytes: {component_1_first} then {component_1_later}"
+        );
+        assert_eq!(
+            (
+                router_first,
+                component_1_first,
+                router_later.is_some(),
+                component_1_later
+            ),
+            (None, false, true, true),
+            "before the first snapshot the router forwards uncached and component 1 admits; once \
+             the router has a figure, component 1 must decline on the same one"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A size refusal makes the read tier evict room (refusal-driven eviction demand)
+    // -----------------------------------------------------------------------------------------
+
+    /// The demand cap at `MAX` and the default 80% target: half of `MAX` minus the target.
+    const DEMAND_CAP: u64 = (MAX - MAX / 100 * 80) / 2;
+    /// `total_size` and `P`: together 94% of `MAX`, under the 95% trigger and under 100%.
+    const DEMAND_TOTAL: u64 = 9_300_000;
+    const DEMAND_P: u64 = 100_000;
+    /// The refused object: 10% of `MAX`, the cap itself, so it is recorded.
+    const REFUSED: u64 = 1_000_000;
+    /// One evictable range, so the legacy pass has a candidate and publishes what it requested.
+    const EVICTABLE: u64 = 100_000;
+    /// The pass's target at the default 80%.
+    const DEMAND_TARGET: u64 = MAX / 100 * 80;
+
+    /// One cold, evictable read-cache range on `manager`'s volume, written as the eviction
+    /// witness test writes its fixture: a `.bin` and a `.meta` listing it.
+    fn store_evictable_range(manager: &CacheManager, cache_key: &str, len: u64) {
+        store_range_accessed(manager, cache_key, len, Duration::from_secs(3_600));
+    }
+
+    /// [`store_evictable_range`] with the range last read `accessed_ago` before now, so a range
+    /// read inside the selection's 60 s admission window can be stored.
+    fn store_range_accessed(
+        manager: &CacheManager,
+        cache_key: &str,
+        len: u64,
+        accessed_ago: Duration,
+    ) {
+        let now = SystemTime::now();
+        let ranges_base_dir = manager.get_cache_dir().join("ranges");
+        let suffix = format!("_0-{}.bin", len - 1);
+        let range_path =
+            crate::disk_cache::get_sharded_path(&ranges_base_dir, cache_key, &suffix).unwrap();
+        let relative = range_path
+            .strip_prefix(&ranges_base_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut range = crate::cache_types::RangeSpec::new(
+            0,
+            len - 1,
+            relative,
+            crate::compression::CompressionAlgorithm::Lz4,
+            len,
+            len,
+        );
+        range.created_at = now - Duration::from_secs(7_200);
+        range.last_accessed = now - accessed_ago;
+        range.access_count = 1;
+        let metadata = crate::cache_types::NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: crate::cache_types::ObjectMetadata::new(
+                "\"demand-evictable\"".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                len,
+                Some("application/octet-stream".to_string()),
+            ),
+            ranges: vec![range],
+            created_at: now - Duration::from_secs(7_200),
+            expires_at: now + Duration::from_secs(3_600),
+            compression_info: Default::default(),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(range_path.parent().unwrap()).unwrap();
+        std::fs::write(&range_path, vec![0u8; len as usize]).unwrap();
+        let metadata_path = manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// What one refusal followed by one consolidation cycle did, read at each comparison's own
+    /// evidence.
+    #[derive(Debug, PartialEq)]
+    struct DemandCycle {
+        /// The read fill declined `REFUSED`.
+        declined: bool,
+        /// `eviction_demand` right after the refusal.
+        demand: u64,
+        /// The trigger's own count of decisions to spawn (`maybe_trigger_eviction`, reached
+        /// through `read_tier_over_trigger` at the idle site).
+        fired: u64,
+        /// `locks/global_eviction.lock` exists: the pass got past its pre-lock gate.
+        took_lock: bool,
+        /// Work-list ticks run (authored, or a legacy fallback counted): the pass got past its
+        /// post-lock gate.
+        ticks: u64,
+        /// `bytes_requested` of the pass result published on the volume: the legacy pass got
+        /// past its own gate and sized its shortfall from this figure minus the target.
+        requested: Option<u64>,
+        /// `eviction_demand` once the pass has ended.
+        demand_after: u64,
+    }
+
+    fn author_ticks(dir: &Path) -> u64 {
+        let c = crate::eviction_worklist::counters(dir);
+        c.chunks_authored + c.author_fallback_not_capable + c.author_fallback_unknown
+    }
+
+    /// Run one consolidation cycle and wait for any pass it spawned to end. Returns the count of
+    /// trigger decisions to spawn it made.
+    async fn cycle_and_wait(
+        consolidator: &Arc<crate::journal_consolidator::JournalConsolidator>,
+    ) -> u64 {
+        let fires_before = consolidator.eviction_trigger_fires();
+        tokio::time::timeout(BOUND, consolidator.run_consolidation_cycle())
+            .await
+            .expect("the consolidation cycle must not hang")
+            .expect("the consolidation cycle must succeed");
+        let fired = consolidator.eviction_trigger_fires() - fires_before;
+        let deadline = tokio::time::Instant::now() + BOUND;
+        while consolidator.eviction_in_progress_for_test() && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !consolidator.eviction_in_progress_for_test(),
+            "the spawned pass must end within {BOUND:?}"
+        );
+        fired
+    }
+
+    /// A cache at 94% of `max_cache_size` (`total_size` plus `P`) refuses a 10% read fill, then
+    /// one real consolidation cycle runs. The refusal and the trigger read different figures,
+    /// so both are printed and asserted equal in this fixture: the refusal's `whole_cache_usage`
+    /// (the `put_usage` snapshot plus this process's unconsolidated credits) and the trigger's
+    /// `read_tier_eviction_size` (projected `total_size` plus the snapshot's `P`).
+    async fn refuse_then_cycle(
+        epoch_1: bool,
+        trigger_percent: u8,
+    ) -> (
+        DemandCycle,
+        tempfile::TempDir,
+        Arc<CacheManager>,
+        Arc<crate::journal_consolidator::JournalConsolidator>,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, epoch_1, trigger_percent).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        const {
+            assert!(
+                DEMAND_TOTAL + DEMAND_P <= MAX / 100 * 95
+                    && DEMAND_TOTAL + DEMAND_P + REFUSED > MAX
+                    && REFUSED == DEMAND_CAP,
+                "fixture: the figure under the 95% trigger, the refused object not fitting, and \
+                 the refused object at the demand cap"
+            )
+        };
+        assert!(!lock_path.exists(), "fixture: no eviction pass has run yet");
+        let refusal_figure = whole_cache_usage(&dir).map(WholeCacheUsage::total);
+        let trigger_figure = consolidator.read_tier_eviction_size().await;
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        println!(
+            "Refusal-driven eviction, trigger {trigger_percent}, epoch {}: refusal figure \
+             (whole_cache_usage) {refusal_figure:?}, trigger figure (read_tier_eviction_size) \
+             {trigger_figure:?}, max {MAX}, refused {REFUSED}; {run:?}",
+            u8::from(epoch_1)
+        );
+        assert_eq!(
+            (refusal_figure, trigger_figure),
+            (Some(DEMAND_TOTAL + DEMAND_P), Some(DEMAND_TOTAL + DEMAND_P)),
+            "fixture: the refusal and the trigger must read the same figure here, or the verdict \
+             below does not say which comparison decided"
+        );
+        (run, temp, manager, consolidator)
+    }
+
+    /// The pass's post-lock re-read counts `P`. With `total_size` under the 95% trigger, `P` over
+    /// it and no refusal recorded, only `P` makes the pass due once it holds the lock, so a tick
+    /// past the post-lock gate is the evidence.
+    ///
+    /// Red side: the post-lock read in `perform_eviction_with_lock` without `P`. The pass reads the
+    /// cache as under its trigger after taking the lock and runs no tick.
+    #[tokio::test]
+    async fn the_post_lock_reread_counts_in_progress_parts() {
+        const TOTAL: u64 = 9_450_000;
+        const P: u64 = 100_000;
+        const {
+            assert!(
+                TOTAL <= MAX / 100 * 95 && TOTAL + P > MAX / 100 * 95,
+                "fixture: under the trigger without P, over it with P"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, TOTAL, P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/p-only-evictable", EVICTABLE);
+        assert_eq!(
+            eviction_demand(&dir),
+            0,
+            "fixture: no refusal, so only the figure decides"
+        );
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let ticks = author_ticks(&dir) - ticks_before;
+        assert_eq!(
+            (fired, ticks),
+            (1, 1),
+            "(trigger decisions to spawn, ticks past the post-lock gate): THE PASS READ THE CACHE \
+             AS UNDER ITS TRIGGER AFTER TAKING THE LOCK, so its post-lock re-read dropped P"
+        );
+    }
+
+    fn expected_pass() -> DemandCycle {
+        DemandCycle {
+            declined: true,
+            demand: REFUSED,
+            fired: 1,
+            took_lock: true,
+            ticks: 1,
+            requested: Some(DEMAND_TOTAL + DEMAND_P - DEMAND_TARGET),
+            demand_after: 0,
+        }
+    }
+
+    async fn assert_a_refusal_evicts_room(epoch_1: bool, trigger_percent: u8) {
+        let (run, _temp, _manager, _consolidator) =
+            refuse_then_cycle(epoch_1, trigger_percent).await;
+        assert_eq!(
+            run,
+            expected_pass(),
+            "a refusal of an object up to the cap, with the figure under the trigger, must fire \
+             the trigger, pass every gate of the pass, and size the pass at figure - target"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_size_refusal_under_the_trigger_evicts_room_at_95_epoch_0() {
+        assert_a_refusal_evicts_room(false, 95).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_size_refusal_under_the_trigger_evicts_room_at_95_epoch_1() {
+        assert_a_refusal_evicts_room(true, 95).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_size_refusal_evicts_room_at_a_trigger_of_100() {
+        assert_a_refusal_evicts_room(false, 100).await;
+    }
+
+    /// One burst of refusals buys one pass: after it, a second identical cycle with no new
+    /// refusal does not fire.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn demand_clears_after_its_pass() {
+        let (run, _temp, _manager, consolidator) = refuse_then_cycle(false, 95).await;
+        assert_eq!(
+            (run.fired, run.took_lock, run.requested),
+            (1, true, expected_pass().requested),
+            "fixture: the first cycle's pass ran"
+        );
+        let figure = consolidator.read_tier_eviction_size().await;
+        let fired_again = cycle_and_wait(&consolidator).await;
+        println!(
+            "Second cycle without a refusal: trigger figure {figure:?}, demand {}, fired \
+             {fired_again}",
+            eviction_demand(_temp.path())
+        );
+        assert_eq!(
+            fired_again, 0,
+            "the pass consumed the demand, so the next cycle under the trigger must not fire"
+        );
+    }
+
+    /// A refusal larger than the cap records no demand and is counted apart; one at the cap,
+    /// through write-through component 1, is recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_above_the_cap_records_no_demand_and_is_counted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let manager = manager_at(dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let (_, over_before) = eviction_demand_counters(dir);
+        let over_declined = read_fill_refusal(dir, DEMAND_CAP + 1).is_some();
+        let demand_after_over = eviction_demand(dir);
+        let (_, over_after) = eviction_demand_counters(dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let at_cap_declined = tokio::time::timeout(BOUND, manager.disk_safety_refusal(DEMAND_CAP))
+            .await
+            .expect("disk_safety_refusal must not hang")
+            .is_some();
+        let demand_at_cap = eviction_demand(dir);
+        let observed = (
+            over_declined,
+            demand_after_over,
+            over_after - over_before,
+            fired,
+            at_cap_declined,
+            demand_at_cap,
+        );
+        println!(
+            "Demand cap {DEMAND_CAP}: (above-cap read fill declined, demand, above-cap count \
+             delta, cycle fired, component 1 declined at the cap, demand) = {observed:?}"
+        );
+        assert_eq!(
+            observed,
+            (true, 0, 1, 0, true, DEMAND_CAP),
+            "a refusal above the cap must record nothing and count once; one at the cap must \
+             record its size"
+        );
+    }
+    // -----------------------------------------------------------------------------------------
+    // Refusal demand on a fleet: the proxy that refused evaluates its own demand
+    // -----------------------------------------------------------------------------------------
+    /// A peer's uncollected delta file of zero bytes: it makes a cycle non-idle and moves no
+    /// figure.
+    fn plant_zero_peer_delta(dir: &Path) -> PathBuf {
+        let path = dir.join("size_tracking").join("delta_host-peer:7_0.json");
+        std::fs::write(
+            &path,
+            r#"{"delta":0,"write_cache_delta":0,"cached_objects_delta":0,"instance_id":"host-peer:7"}"#,
+        )
+        .unwrap();
+        path
+    }
+    /// What proxy B, the consolidation-lock holder, did while proxy A cycled: its own trigger
+    /// decisions and whether a pass of its own is running.
+    type PeerState = (u64, bool);
+    /// Proxy A (the refusing proxy, refresher started) and proxy B, a second `CacheManager` with
+    /// its own consolidator on the same volume, which takes the consolidation lock and runs
+    /// nothing else. A refuses, then runs one consolidation cycle, idle or (with a peer's zero
+    /// delta file waiting) non-idle.
+    ///
+    /// The demand registry is keyed by cache directory, so B's consolidator would read A's
+    /// demand if it ran a cycle. It never does: B's own decision count and pass flag are
+    /// returned, and must stay at zero, so a pass can only have come from A's cycle.
+    async fn refuse_on_the_lock_loser(
+        non_idle: bool,
+    ) -> (DemandCycle, PeerState, Option<bool>, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let a = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        a.set_cache_manager_in_consolidator().await;
+        let a_consolidator = a.get_journal_consolidator().await.unwrap();
+        let b = manager_unstarted_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        let b_consolidator = b.get_journal_consolidator().await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&a_consolidator, &b_consolidator),
+            "fixture: A and B must have two consolidators"
+        );
+        assert!(
+            b_consolidator
+                .try_acquire_global_consolidation_lock()
+                .unwrap(),
+            "fixture: B takes the consolidation lock"
+        );
+        assert!(
+            !a_consolidator
+                .try_acquire_global_consolidation_lock()
+                .unwrap(),
+            "fixture: A cannot take the consolidation lock while B holds it"
+        );
+        store_evictable_range(&a, "test-bucket/demand-evictable", EVICTABLE);
+        let delta = non_idle.then(|| plant_zero_peer_delta(&dir));
+        let lock_path = a.get_global_eviction_lock_path();
+        assert!(!lock_path.exists(), "fixture: no eviction pass has run yet");
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&a_consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        let peer = (
+            b_consolidator.eviction_trigger_fires(),
+            b_consolidator.eviction_in_progress_for_test(),
+        );
+        let delta_left = delta.as_ref().map(|p| p.exists());
+        println!(
+            "Lock loser, non-idle {non_idle}: A {run:?}; B (fires, pass running) {peer:?}; peer \
+             delta file still waiting {delta_left:?}"
+        );
+        (run, peer, delta_left, temp)
+    }
+    /// A refusal on a proxy whose non-idle cycle loses the consolidation lock starts a pass in
+    /// that one cycle: the bound is one `consolidation_interval`, whoever holds the lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_on_the_lock_loser_starts_a_pass_on_a_non_idle_cycle() {
+        let (run, peer, delta_left, _temp) = refuse_on_the_lock_loser(true).await;
+        assert_eq!(
+            (run, peer, delta_left),
+            (expected_pass(), (0, false), Some(true)),
+            "the proxy that refused must evaluate its own demand when a peer holds the \
+             consolidation lock, and its pass must run every gate; the peer must have decided \
+             nothing, and the peer's delta file must still wait for the lock holder"
+        );
+    }
+    /// The same on an idle cycle, whose trigger fires and then loses the consolidation lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_on_the_lock_loser_starts_a_pass_on_an_idle_cycle() {
+        let (run, peer, delta_left, _temp) = refuse_on_the_lock_loser(false).await;
+        assert_eq!(
+            (run, peer, delta_left),
+            (expected_pass(), (0, false), None),
+            "an idle cycle that loses the consolidation lock must still start this proxy's own \
+             demand pass; the peer must have decided nothing"
+        );
+    }
+    /// `bytes_requested` of a result document planted as a peer's earlier pass.
+    const PLANTED_REQUESTED: u64 = 7;
+    /// One refusal, then a read-tier result planted with `completed_at` at the demand's
+    /// `recorded_at` plus `offset` seconds, as a peer's pass leaves it, then one cycle on the
+    /// refusing proxy, which wins every lock.
+    async fn demand_pass_after_a_result(offset: i64) -> (DemandCycle, u64) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let recorded_at =
+            eviction_demand_recorded_at(&dir).expect("fixture: the refusal recorded its time");
+        let mut planted = crate::eviction_result::EvictionPassResult::new(
+            "host-peer:7".to_string(),
+            PLANTED_REQUESTED,
+            PLANTED_REQUESTED,
+            1,
+            Some(0),
+            None,
+        );
+        planted.completed_at = recorded_at.saturating_add_signed(offset);
+        planted.install(&dir).unwrap();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        let skips = eviction_demand_dedup_skips(&dir);
+        println!(
+            "Dedup, result completed_at = recorded_at {recorded_at} {offset:+}: {run:?}, dedup \
+             skips {skips}"
+        );
+        (run, skips)
+    }
+    /// One burst buys one pass: a demand pass that finds, under the eviction lock, a pass result
+    /// newer than its demand skips, clears the demand, and leaves the result alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_demand_pass_skips_when_a_pass_completed_after_the_demand() {
+        let run = demand_pass_after_a_result(1).await;
+        assert_eq!(
+            run,
+            (
+                DemandCycle {
+                    declined: true,
+                    demand: REFUSED,
+                    fired: 1,
+                    took_lock: true,
+                    ticks: 0,
+                    requested: Some(PLANTED_REQUESTED),
+                    demand_after: 0,
+                },
+                1
+            ),
+            "a pass that completed after the demand was recorded already ran for it: the demand \
+             pass must take the lock, skip before any tick, and clear the demand"
+        );
+    }
+    /// The comparison is `>`: a result from the same second as the demand, or older, does not
+    /// stop the pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_demand_pass_runs_when_the_last_pass_completed_before_or_with_the_demand() {
+        for offset in [0, -1] {
+            assert_eq!(
+                demand_pass_after_a_result(offset).await,
+                (expected_pass(), 0),
+                "a result {offset:+} s from the demand's recorded_at must not stop its pass"
+            );
+        }
+    }
+    /// A demand whose refusal read a higher figure than the projection now does: the projection
+    /// says the object fits, so the lock loser's cycle clears the demand and starts nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_demand_that_now_fits_is_cleared_without_a_pass() {
+        const FITS_TOTAL: u64 = 8_000_000;
+        const {
+            assert!(
+                FITS_TOTAL + DEMAND_P + REFUSED <= MAX && DEMAND_TOTAL + DEMAND_P + REFUSED > MAX,
+                "fixture: the object fits beside the projection and not beside the snapshot"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let a = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        a.set_cache_manager_in_consolidator().await;
+        let consolidator = a.get_journal_consolidator().await.unwrap();
+        let b = manager_unstarted_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        assert!(
+            b.get_journal_consolidator()
+                .await
+                .unwrap()
+                .try_acquire_global_consolidation_lock()
+                .unwrap(),
+            "fixture: B takes the consolidation lock"
+        );
+        plant_zero_peer_delta(&dir);
+        let lock_path = a.get_global_eviction_lock_path();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        // `size_state.json` falls; the snapshot the refusal read is held, as one refresh
+        // interval holds it on a fleet.
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = FITS_TOTAL;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+        let refusal_figure = whole_cache_usage(&dir).map(WholeCacheUsage::total);
+        let trigger_figure = consolidator.read_tier_eviction_size().await;
+        let fired = cycle_and_wait(&consolidator).await;
+        let observed = (
+            declined,
+            demand,
+            refusal_figure,
+            trigger_figure,
+            fired,
+            lock_path.exists(),
+            eviction_demand(&dir),
+        );
+        println!(
+            "Fitting demand: (declined, demand, refusal figure, trigger figure, fired, took \
+             lock, demand after) = {observed:?}"
+        );
+        assert_eq!(
+            observed,
+            (
+                true,
+                REFUSED,
+                Some(DEMAND_TOTAL + DEMAND_P),
+                Some(FITS_TOTAL + DEMAND_P),
+                0,
+                false,
+                0
+            ),
+            "a demand the projected figure says fits must be cleared, with no pass started"
+        );
+    }
+    /// The demand arm's boundary: figure + demand = `max_cache_size` fits, one byte more does
+    /// not. The figure is under the 95% trigger in both, so only the demand arm decides.
+    #[test]
+    fn the_demand_arm_fires_only_above_max_cache_size() {
+        let trigger = MAX / 100 * 95;
+        let at = MAX - REFUSED;
+        assert!(at < trigger, "fixture: the figure under the trigger");
+        let observed = (
+            read_tier_eviction_due(at, trigger, MAX, REFUSED),
+            read_tier_eviction_due(at + 1, trigger, MAX, REFUSED),
+        );
+        println!("Demand boundary at {at} and {}: {observed:?}", at + 1);
+        assert_eq!(
+            observed,
+            (false, true),
+            "figure + demand = max_cache_size must not fire, max_cache_size + 1 must"
+        );
+    }
+    /// The same boundary through a real idle cycle and its pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_demand_at_max_cache_size_does_not_fire_and_one_byte_over_does() {
+        let mut observed = Vec::new();
+        for figure in [MAX - REFUSED, MAX - REFUSED + 1] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let dir = temp.path().to_path_buf();
+            let manager = manager_at(&dir, MAX, figure - DEMAND_P, DEMAND_P, false, 95).await;
+            manager.set_cache_manager_in_consolidator().await;
+            let consolidator = manager.get_journal_consolidator().await.unwrap();
+            note_size_refusal(&dir, REFUSED);
+            let trigger_figure = consolidator.read_tier_eviction_size().await;
+            let fired = cycle_and_wait(&consolidator).await;
+            observed.push((
+                trigger_figure,
+                fired,
+                manager.get_global_eviction_lock_path().exists(),
+            ));
+        }
+        println!("Demand boundary cycles (trigger figure, fired, took lock): {observed:?}");
+        assert_eq!(
+            observed,
+            vec![
+                (Some(MAX - REFUSED), 0, false),
+                (Some(MAX - REFUSED + 1), 1, true)
+            ],
+            "figure + demand = max_cache_size must not start a pass, one byte over must"
+        );
+    }
+    /// An under-trigger verdict the idle cycle memoised without demand does not hold off a
+    /// refusal that follows it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_bypasses_the_idle_memo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        let first = cycle_and_wait(&consolidator).await;
+        let memo_live = consolidator.idle_eviction_memo_live_for_test();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        println!(
+            "Idle memo: first cycle fired {first}, memo live {memo_live}; after the refusal \
+             {run:?}"
+        );
+        assert_eq!(
+            (first, memo_live, run),
+            (0, true, expected_pass()),
+            "the first idle cycle memoises its under-trigger verdict; a refusal after it must \
+             start its pass on the next idle cycle, not after the memo's TTL"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A demand the read tier cannot make room for is futile until the usage changes
+    // -----------------------------------------------------------------------------------------
+    /// Refusals of one object the read tier cannot make room for, round after round. The cache
+    /// is at 94% with one 100,000-byte evictable range, so the pass leaves the figure 100,000
+    /// lower and the object still does not fit beside it. The first refusal starts one pass and
+    /// every later one starts none, because nothing has changed the usage since.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sustained_refusal_stream_starts_one_futile_pass_then_none() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let mut rounds = Vec::new();
+        for _ in 0..4 {
+            let declined = read_fill_refusal(&dir, REFUSED).is_some();
+            let demand = eviction_demand(&dir);
+            let ticks_before = author_ticks(&dir);
+            let fired = cycle_and_wait(&consolidator).await;
+            rounds.push((declined, demand, fired, author_ticks(&dir) - ticks_before));
+        }
+        let floor = crate::eviction_result::EvictionPassResult::load(&dir)
+            .map(|r| DEMAND_TARGET + r.shortfall_bytes);
+        let exhausted = crate::eviction_result::EvictionPassResult::load_with_evidence(&dir)
+            .and_then(|(_, evidence)| evidence.exhausted_shortfall_bytes);
+        println!(
+            "Futile stream: figure {}, target {DEMAND_TARGET}, max {MAX}, refused {REFUSED}; \
+             (declined, demand, fired, ticks) per round {rounds:?}; floor the pass left {floor:?}, \
+             exhausted shortfall {exhausted:?}",
+            DEMAND_TOTAL + DEMAND_P
+        );
+        assert_eq!(
+            exhausted,
+            Some(DEMAND_TOTAL + DEMAND_P - DEMAND_TARGET - EVICTABLE),
+            "the pass read the whole read tier, one evictable range, so it must publish the \
+             shortfall a pass evicting all of it still has"
+        );
+        assert!(
+            floor.is_some_and(|floor| floor + REFUSED > MAX),
+            "fixture: the pass must leave a floor the object does not fit beside, or the test is \
+             vacuous: {floor:?}"
+        );
+        assert_eq!(
+            rounds,
+            vec![
+                (true, REFUSED, 1, 1),
+                (true, 0, 0, 0),
+                (true, 0, 0, 0),
+                (true, 0, 0, 0)
+            ],
+            "a pass on demand alone that left no room for the object must not be followed by \
+             another for it until the usage changes"
+        );
+    }
+    /// A peer's pass that left no room for the object, completed before this proxy's refusal (the
+    /// case the dedup cannot see): the demand pass reads it under the eviction lock and skips
+    /// before any tick, and the size is marked, so the next refusal of it records nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peers_futile_pass_stops_a_later_demand_pass() {
+        const PEER_REQUESTED: u64 = 1_500_000;
+        const {
+            assert!(
+                DEMAND_TARGET + PEER_REQUESTED - EVICTABLE + REFUSED > MAX,
+                "fixture: the peer's pass left no room for the object"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let recorded_at =
+            eviction_demand_recorded_at(&dir).expect("fixture: the refusal recorded its time");
+        let mut planted = crate::eviction_result::EvictionPassResult::new(
+            "host-peer:7".to_string(),
+            PEER_REQUESTED,
+            EVICTABLE,
+            1,
+            Some(0),
+            None,
+        );
+        planted.completed_at = recorded_at.saturating_sub(5);
+        planted
+            .install_with_evidence(
+                &dir,
+                crate::eviction_result::PassEvidence {
+                    exhausted_shortfall_bytes: Some(planted.shortfall_bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        let again = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand_again = eviction_demand(&dir);
+        println!(
+            "Peer's futile pass, completed 5 s before the refusal: {run:?}; refused again \
+             {again}, demand {demand_again}"
+        );
+        assert_eq!(
+            (run, again, demand_again),
+            (
+                DemandCycle {
+                    declined: true,
+                    demand: REFUSED,
+                    fired: 1,
+                    took_lock: true,
+                    ticks: 0,
+                    requested: Some(PEER_REQUESTED),
+                    demand_after: 0,
+                },
+                true,
+                0
+            ),
+            "a peer's pass that left no room for the object must stop this proxy's demand pass \
+             under the eviction lock, and mark the size so the next refusal records nothing"
+        );
+    }
+    /// Review issue 1: a demand left recorded while a pass completed, then a refusal in a later
+    /// second than that pass. The later refusal is what the dedup compares, so its pass runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_after_a_completed_pass_on_a_lingering_demand_starts_a_pass() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        let first = read_fill_refusal(&dir, REFUSED).is_some();
+        let first_at =
+            eviction_demand_recorded_at(&dir).expect("fixture: the refusal recorded its time");
+        let mut planted = crate::eviction_result::EvictionPassResult::new(
+            "host-peer:7".to_string(),
+            PLANTED_REQUESTED,
+            PLANTED_REQUESTED,
+            1,
+            Some(0),
+            None,
+        );
+        planted.completed_at = first_at + 1;
+        planted.install(&dir).unwrap();
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while now() <= first_at + 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let recorded_at = eviction_demand_recorded_at(&dir);
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        println!(
+            "Lingering demand: first refusal at {first_at}, a pass completed at {}, second \
+             refusal stamped {recorded_at:?}; {run:?}",
+            first_at + 1
+        );
+        assert_eq!(
+            (first, recorded_at.map(|at| at > first_at + 1), run),
+            (true, Some(true), expected_pass()),
+            "a refusal after a completed pass must be stamped after it and buy a pass, even with \
+             an earlier demand still recorded"
+        );
+    }
+    /// Review issue 6: the lock loser's in-memory gate. A demand recorded against a figure that
+    /// has since fallen fits beside the refusal's own figure, so the cycle clears it and starts
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lock_losers_in_memory_gate_clears_a_demand_that_fits() {
+        const FITS_TOTAL: u64 = 8_000_000;
+        const {
+            assert!(
+                FITS_TOTAL + DEMAND_P + REFUSED <= MAX,
+                "fixture: the object fits beside the refusal's figure"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let a = manager_at(&dir, MAX, FITS_TOTAL, DEMAND_P, false, 95).await;
+        a.set_cache_manager_in_consolidator().await;
+        let consolidator = a.get_journal_consolidator().await.unwrap();
+        let b = manager_unstarted_at(&dir, MAX, FITS_TOTAL, DEMAND_P, false, 95).await;
+        assert!(
+            b.get_journal_consolidator()
+                .await
+                .unwrap()
+                .try_acquire_global_consolidation_lock()
+                .unwrap(),
+            "fixture: B takes the consolidation lock"
+        );
+        plant_zero_peer_delta(&dir);
+        let lock_path = a.get_global_eviction_lock_path();
+        note_size_refusal(&dir, REFUSED);
+        let demand = eviction_demand(&dir);
+        let usage = whole_cache_usage(&dir).map(WholeCacheUsage::total);
+        let fired = cycle_and_wait(&consolidator).await;
+        let observed = (
+            demand,
+            usage,
+            fired,
+            lock_path.exists(),
+            eviction_demand(&dir),
+        );
+        println!(
+            "In-memory gate: (demand, refusal figure, fired, took lock, demand after) = \
+             {observed:?}"
+        );
+        assert_eq!(
+            observed,
+            (REFUSED, Some(FITS_TOTAL + DEMAND_P), 0, false, 0),
+            "a demand that fits beside the refusal's own figure must be cleared by the lock \
+             loser's in-memory gate, with no pass started"
+        );
+    }
+    /// The argued amount: the refusals' figure falling to `max_cache_size` minus the futile size,
+    /// where the object fits, clears the mark, and one byte short of that does not. The figure then
+    /// climbs back, and the next refusal starts a pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_usage_fall_to_room_for_the_object_re_arms_its_demand() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let first_declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let first_fired = cycle_and_wait(&consolidator).await;
+        let marked = eviction_demand_futile(&dir);
+        let snapshot = register_read_fill_bound_for_test(&dir, MAX, None);
+        let mut fall = Vec::new();
+        for over_room in [1, 0] {
+            snapshot.send_replace(Some(PutUsageSnapshot {
+                figure: MAX - REFUSED + over_room,
+                in_progress_part_bytes: DEMAND_P,
+            }));
+            let usage = whole_cache_usage(&dir).map(WholeCacheUsage::total);
+            let fired = cycle_and_wait(&consolidator).await;
+            fall.push((usage, fired, eviction_demand_futile(&dir)));
+        }
+        snapshot.send_replace(Some(PutUsageSnapshot {
+            figure: DEMAND_TOTAL + DEMAND_P,
+            in_progress_part_bytes: DEMAND_P,
+        }));
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let trigger_figure = consolidator.read_tier_eviction_size().await;
+        let last_before = crate::eviction_result::EvictionPassResult::load(&dir)
+            .map(|r| (r.completed_at, r.bytes_requested));
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let ticks = author_ticks(&dir) - ticks_before;
+        let last_after = crate::eviction_result::EvictionPassResult::load(&dir)
+            .map(|r| (r.completed_at, r.bytes_requested));
+        let climb = (
+            declined,
+            demand,
+            fired,
+            last_after.map(|(_, requested)| requested),
+        );
+        println!(
+            "Usage fall: first refusal declined {first_declined}, fired {first_fired}, futile \
+             mark {marked}; (refusal figure, fired, mark) one byte over room and at room \
+             {fall:?}; climb back (declined, demand, fired, requested) {climb:?}, ticks {ticks}, trigger figure \
+             {trigger_figure:?}, usage changed at {}, last result (completed_at, requested) \
+             {last_before:?} then {last_after:?}, dedup skips {}",
+            eviction_usage_changed_at(&dir),
+            eviction_demand_dedup_skips(&dir)
+        );
+        assert_eq!(
+            (first_declined, first_fired, marked, fall, climb),
+            (
+                true,
+                1,
+                REFUSED,
+                vec![
+                    (Some(MAX - REFUSED + 1), 0, REFUSED),
+                    (Some(MAX - REFUSED), 0, 0)
+                ],
+                (
+                    true,
+                    REFUSED,
+                    1,
+                    Some(DEMAND_TOTAL + DEMAND_P - EVICTABLE - DEMAND_TARGET)
+                )
+            ),
+            "the mark must clear exactly when the futile size fits beside the figure, and a \
+             refusal after that must start a pass again"
+        );
+    }
+    /// Review issue 6: the idle cycle's `Err` arm. A directory stands at the consolidation lock
+    /// file's path, so opening it fails and the idle cycle's lock attempt errs; the proxy still
+    /// evaluates its own demand and its pass runs every gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_on_an_idle_cycle_whose_lock_attempt_errs_starts_a_pass() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        std::fs::create_dir_all(dir.join("locks").join("global_consolidation.lock")).unwrap();
+        let errs = consolidator
+            .try_acquire_global_consolidation_lock()
+            .is_err();
+        let lock_path = manager.get_global_eviction_lock_path();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        println!("Idle lock attempt errs {errs}: {run:?}");
+        assert_eq!(
+            (errs, run),
+            (true, expected_pass()),
+            "an idle cycle whose consolidation-lock attempt errs must still start this proxy's \
+             own demand pass"
+        );
+    }
+    /// Review issue 6: the dedup across two hosts' clocks. A peer's result stamped an hour after
+    /// this proxy's refusal (the peer's clock fast) skips the demand pass, which is the clock-skew
+    /// caveat; one stamped an hour before (the peer's clock slow) does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dedup_across_two_clocks_skips_ahead_and_runs_behind() {
+        let ahead = demand_pass_after_a_result(3_600).await;
+        let behind = demand_pass_after_a_result(-3_600).await;
+        assert_eq!(
+            (ahead, behind),
+            (
+                (
+                    DemandCycle {
+                        declined: true,
+                        demand: REFUSED,
+                        fired: 1,
+                        took_lock: true,
+                        ticks: 0,
+                        requested: Some(PLANTED_REQUESTED),
+                        demand_after: 0,
+                    },
+                    1
+                ),
+                (expected_pass(), 0)
+            ),
+            "a peer's result stamped after the refusal must skip the demand pass, and one stamped \
+             before it must not"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The futility rule's follow-ups: bounded selection, the unmarked proxy, the clear and the
+    // clocks
+    // -----------------------------------------------------------------------------------------
+
+    /// A proxy that holds no marker and skipped once on a peer's older futile result must not stay
+    /// suppressed: a fall to where any recordable demand fits stamps the change without a marker,
+    /// so after the climb back the peer's result is older than the change and the pass runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fall_to_room_for_any_demand_re_arms_a_proxy_that_holds_no_marker() {
+        const PEER_REQUESTED: u64 = 1_500_000;
+        const {
+            assert!(
+                DEMAND_TARGET + PEER_REQUESTED - EVICTABLE + REFUSED > MAX,
+                "fixture: the peer's pass left no room for the object"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        let snapshot = register_read_fill_bound_for_test(&dir, MAX, None);
+        let mut planted = crate::eviction_result::EvictionPassResult::new(
+            "host-peer:7".to_string(),
+            PEER_REQUESTED,
+            EVICTABLE,
+            1,
+            Some(0),
+            None,
+        );
+        planted.completed_at = unix_now_secs().saturating_sub(5);
+        planted
+            .install_with_evidence(
+                &dir,
+                crate::eviction_result::PassEvidence {
+                    exhausted_shortfall_bytes: Some(planted.shortfall_bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let changed_before = eviction_usage_changed_at(&dir);
+        snapshot.send_replace(Some(PutUsageSnapshot {
+            figure: MAX - DEMAND_CAP,
+            in_progress_part_bytes: DEMAND_P,
+        }));
+        let fall_fired = cycle_and_wait(&consolidator).await;
+        let changed_after = eviction_usage_changed_at(&dir);
+        snapshot.send_replace(Some(PutUsageSnapshot {
+            figure: DEMAND_TOTAL + DEMAND_P,
+            in_progress_part_bytes: DEMAND_P,
+        }));
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        println!(
+            "Unmarked proxy: peer result completed at {}, usage changed at {changed_before} then \
+             {changed_after}, fall cycle fired {fall_fired}; after the climb back {run:?}",
+            planted.completed_at
+        );
+        assert_eq!(
+            (
+                changed_before,
+                changed_after > planted.completed_at,
+                fall_fired,
+                run
+            ),
+            (0, true, 0, expected_pass()),
+            "a fall to where any recordable demand fits must stamp the usage change on a proxy \
+             with no marker, so the peer's older result no longer stops its pass"
+        );
+    }
+
+    /// The `over` arm of the clear: with the size marked futile, the figure crossing the trigger
+    /// clears the mark, so the next refusal records its demand again and starts a pass. The
+    /// figure never falls to where the object fits, so the `fits` arm cannot be what clears it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trigger_crossing_clears_a_futile_mark_and_re_arms_the_demand() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let first_declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let first_fired = cycle_and_wait(&consolidator).await;
+        let marked = eviction_demand_futile(&dir);
+        let snapshot = register_read_fill_bound_for_test(&dir, MAX, None);
+        snapshot.send_replace(Some(PutUsageSnapshot {
+            figure: MAX / 100 * 95 + 1,
+            in_progress_part_bytes: DEMAND_P,
+        }));
+        let over_fired = cycle_and_wait(&consolidator).await;
+        let cleared = eviction_demand_futile(&dir);
+        snapshot.send_replace(Some(PutUsageSnapshot {
+            figure: DEMAND_TOTAL + DEMAND_P,
+            in_progress_part_bytes: DEMAND_P,
+        }));
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        println!(
+            "Trigger crossing: first refusal declined {first_declined}, fired {first_fired}, mark \
+             {marked}; the cycle over the trigger fired {over_fired}, mark after it {cleared}; \
+             refusal after the figure came back (declined, demand, fired) \
+             {:?}",
+            (declined, demand, fired)
+        );
+        assert_eq!(
+            (
+                first_declined,
+                first_fired,
+                marked,
+                cleared,
+                declined,
+                demand,
+                fired
+            ),
+            (true, 1, REFUSED, 0, true, REFUSED, 1),
+            "the figure crossing the trigger must clear the futile mark, so a refusal after it \
+             records its demand and starts a pass"
+        );
+    }
+
+    /// The authored pass's own marking site: a work list that cannot make room for the demand
+    /// marks it futile when the pass ends, so the next refusal records nothing and starts no
+    /// pass, with no peer result involved. The first round's legacy pass leaves the journal and
+    /// the `.ready` record that make the second round's pass an authored one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_authored_pass_that_lists_too_little_marks_its_demand_futile() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let first_declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let first_fired = cycle_and_wait(&consolidator).await;
+        // The legacy pass of round one marked the size; the trigger crossing clears it, so round
+        // two's pass is the one under test.
+        observe_eviction_usage(&dir, MAX, MAX / 100 * 95, MAX);
+        let cleared = eviction_demand_futile(&dir);
+        let second_declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let second_demand = eviction_demand(&dir);
+        let second_fired = cycle_and_wait(&consolidator).await;
+        let second = crate::eviction_result::EvictionPassResult::load(&dir);
+        let marked = eviction_demand_futile(&dir);
+        let third_declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let third_demand = eviction_demand(&dir);
+        let third_fired = cycle_and_wait(&consolidator).await;
+        println!(
+            "Authored marking: round one (declined, fired) {:?}, mark cleared to {cleared}; round \
+             two (declined, demand, fired) {:?}, its result {second:?}, mark {marked}; round three \
+             (declined, demand, fired) {:?}",
+            (first_declined, first_fired),
+            (second_declined, second_demand, second_fired),
+            (third_declined, third_demand, third_fired)
+        );
+        assert_eq!(
+            (
+                second.map(|r| r.mode),
+                cleared,
+                marked,
+                (third_declined, third_demand, third_fired)
+            ),
+            (
+                Some(crate::eviction_result::EvictionMode::Authored),
+                0,
+                REFUSED,
+                (true, 0, 0)
+            ),
+            "fixture: round two must be an authored pass. The authored pass must mark the size \
+             futile when its list leaves no room, and the next refusal must start nothing"
+        );
+    }
+
+    /// One refusal after a usage change this process stamped, then a peer's futile result
+    /// completed `offset` seconds after that change, then one cycle. The refusal is stamped two
+    /// seconds after the change, so the result is older than the refusal and the dedup cannot be
+    /// what skips the pass at offset +1. Returns the cycle and the futile mark.
+    async fn demand_pass_after_a_futile_result(offset: i64) -> (DemandCycle, u64) {
+        const PEER_REQUESTED: u64 = 1_500_000;
+        const {
+            assert!(
+                DEMAND_TARGET + PEER_REQUESTED - EVICTABLE + REFUSED > MAX,
+                "fixture: the peer's pass left no room for the object"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        observe_eviction_usage(&dir, MAX, MAX / 100 * 95, MAX);
+        let changed_at = eviction_usage_changed_at(&dir);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while unix_now_secs() < changed_at + 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let recorded_at =
+            eviction_demand_recorded_at(&dir).expect("fixture: the refusal recorded its time");
+        assert!(
+            recorded_at >= changed_at + 2,
+            "fixture: the refusal must postdate the change by two seconds"
+        );
+        let mut planted = crate::eviction_result::EvictionPassResult::new(
+            "host-peer:7".to_string(),
+            PEER_REQUESTED,
+            EVICTABLE,
+            1,
+            Some(0),
+            None,
+        );
+        planted.completed_at = changed_at.saturating_add_signed(offset);
+        planted
+            .install_with_evidence(
+                &dir,
+                crate::eviction_result::PassEvidence {
+                    exhausted_shortfall_bytes: Some(planted.shortfall_bytes),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        let mark = eviction_demand_futile(&dir);
+        println!(
+            "Futile result across clocks, usage changed at {changed_at}, result completed at \
+             change {offset:+}, refusal at {recorded_at}: {run:?}, mark {mark}"
+        );
+        (run, mark)
+    }
+
+    /// The futile check compares a peer's `completed_at` with this host's `usage_changed_at`.
+    /// A result one second after the change is evidence and skips the pass; one an hour before
+    /// it (the peer's clock slow, or an old result) is not and does not; one an hour after it
+    /// (the peer's clock fast) skips, which is the clock-skew caveat.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_futile_check_across_two_clocks_skips_ahead_and_runs_behind() {
+        let skipped = |requested: u64| DemandCycle {
+            declined: true,
+            demand: REFUSED,
+            fired: 1,
+            took_lock: true,
+            ticks: 0,
+            requested: Some(requested),
+            demand_after: 0,
+        };
+        let just_after = demand_pass_after_a_futile_result(1).await;
+        let ahead = demand_pass_after_a_futile_result(3_600).await;
+        let behind = demand_pass_after_a_futile_result(-3_600).await;
+        assert_eq!(
+            (just_after, ahead, behind.0),
+            (
+                (skipped(1_500_000), REFUSED),
+                (skipped(1_500_000), REFUSED),
+                expected_pass()
+            ),
+            "a result completed after this host's usage change must skip the demand pass and \
+             mark the size, and one completed an hour before it must not"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Futility only on positive evidence that the read tier is exhausted
+    // -----------------------------------------------------------------------------------------
+    /// The bytes the fixture's first pass asks for: the 94% figure down to the 80% target.
+    const FIRST_REQUEST: u64 = DEMAND_TOTAL + DEMAND_P - DEMAND_TARGET;
+
+    /// Two refusal rounds of `REFUSED`, each followed by one cycle. Returns `(declined, demand,
+    /// fired, bytes_requested of the published result)` per round, and the futile mark and the
+    /// published floor (`target + shortfall_bytes`) after round 0. Before round 1 the result is
+    /// aged by one `consolidation_interval`, the demand backoff's first delay, so round 1 reads
+    /// the futility mark alone.
+    async fn two_refusal_rounds(
+        dir: &Path,
+        consolidator: &Arc<crate::journal_consolidator::JournalConsolidator>,
+    ) -> (Vec<(bool, u64, u64, Option<u64>)>, u64, Option<u64>) {
+        let mut rounds = Vec::new();
+        let mut first = (0, None);
+        for round in 0..2 {
+            if round == 1 {
+                rewrite_result(
+                    dir,
+                    crate::config::SharedStorageConfig::default()
+                        .consolidation_interval
+                        .as_secs(),
+                    None,
+                );
+            }
+            let declined = read_fill_refusal(dir, REFUSED).is_some();
+            let demand = eviction_demand(dir);
+            let fired = cycle_and_wait(consolidator).await;
+            let requested =
+                crate::eviction_result::EvictionPassResult::load(dir).map(|r| r.bytes_requested);
+            rounds.push((declined, demand, fired, requested));
+            if round == 0 {
+                first = (
+                    eviction_demand_futile(dir),
+                    crate::eviction_result::EvictionPassResult::load(dir)
+                        .map(|r| DEMAND_TARGET + r.shortfall_bytes),
+                );
+            }
+        }
+        (rounds, first.0, first.1)
+    }
+
+    /// The collector skips a range read inside its 60 s admission window. Those bytes are
+    /// evictable once the window passes, and here they are enough to make room, so the pass that
+    /// skipped them is not evidence of futility.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ranges_inside_the_admission_window_count_as_room_and_do_not_mark_futile() {
+        const RECENT: u64 = 300_000;
+        const {
+            assert!(
+                DEMAND_TARGET + (FIRST_REQUEST - EVICTABLE) + REFUSED > MAX
+                    && DEMAND_TARGET + (FIRST_REQUEST - EVICTABLE - RECENT) + REFUSED <= MAX,
+                "fixture: the cold range alone leaves no room, and with the recent one it does"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        store_range_accessed(
+            &manager,
+            "test-bucket/demand-recent",
+            RECENT,
+            Duration::ZERO,
+        );
+        let (rounds, mark, floor) = two_refusal_rounds(&dir, &consolidator).await;
+        println!(
+            "Admission window: (declined, demand, fired, requested) per round {rounds:?}; futile \
+             mark after round 0 {mark}; floor round 0 left {floor:?}"
+        );
+        assert!(
+            floor.is_some_and(|floor| floor + REFUSED > MAX),
+            "fixture: round 0 must leave a floor the object does not fit beside, or the test is \
+             vacuous: {floor:?}"
+        );
+        assert_eq!(
+            (mark, rounds),
+            (
+                0,
+                vec![
+                    (true, REFUSED, 1, Some(FIRST_REQUEST)),
+                    (true, REFUSED, 1, Some(FIRST_REQUEST - EVICTABLE))
+                ]
+            ),
+            "a pass whose collector skipped enough admission-window bytes to make room must not \
+             mark the size futile"
+        );
+    }
+
+    /// A result document as 3.0.5 writes it, the pass result alone, from a peer whose pass left
+    /// no room for the object. It says nothing about exhaustion, so it is not evidence of
+    /// futility and this proxy's demand pass runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peers_result_in_the_3_0_5_shape_is_not_futile() {
+        const PEER_REQUESTED: u64 = 1_500_000;
+        const {
+            assert!(
+                DEMAND_TARGET + PEER_REQUESTED - EVICTABLE + REFUSED > MAX,
+                "fixture: the peer's pass left no room for the object"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        let lock_path = manager.get_global_eviction_lock_path();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let demand = eviction_demand(&dir);
+        let recorded_at =
+            eviction_demand_recorded_at(&dir).expect("fixture: the refusal recorded its time");
+        let mut planted = crate::eviction_result::EvictionPassResult::new(
+            "host-peer:7".to_string(),
+            PEER_REQUESTED,
+            EVICTABLE,
+            1,
+            Some(0),
+            None,
+        );
+        planted.completed_at = recorded_at.saturating_sub(5);
+        let path = crate::eviction_result::EvictionPassResult::path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = serde_json::to_string_pretty(&planted).unwrap();
+        std::fs::write(&path, &body).unwrap();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let run = DemandCycle {
+            declined,
+            demand,
+            fired,
+            took_lock: lock_path.exists(),
+            ticks: author_ticks(&dir) - ticks_before,
+            requested: crate::eviction_result::EvictionPassResult::load(&dir)
+                .map(|r| r.bytes_requested),
+            demand_after: eviction_demand(&dir),
+        };
+        println!("Peer's 3.0.5-shape result {body}; then {run:?}");
+        assert_eq!(
+            run,
+            expected_pass(),
+            "a result document without the exhaustion field must not stop a demand pass"
+        );
+    }
+    // -----------------------------------------------------------------------------------------
+    // Demand passes that make no room back off; journal-only fills count as room
+    // -----------------------------------------------------------------------------------------
+
+    /// Set `path`'s permission bits.
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// One evictable range of `len` bytes under `cache_key` whose `.meta` this process cannot
+    /// read, an I/O error that a collection counts as a gap. Returns the `.meta` path, to be made
+    /// readable again before the volume is removed. The read is checked to fail: as root it would
+    /// not, and every test using this would be vacuous.
+    fn lock_meta(manager: &CacheManager, cache_key: &str, len: u64) -> PathBuf {
+        store_evictable_range(manager, cache_key, len);
+        let path = manager.get_new_metadata_file_path(cache_key);
+        chmod(&path, 0o000);
+        assert!(
+            std::fs::read(&path).is_err(),
+            "fixture: {path:?} must be unreadable; these tests must not run as root"
+        );
+        path
+    }
+
+    /// `(completed_at, demand_backoff_streak, exhausted_shortfall_bytes)` as the result document
+    /// on disk records them, read as JSON so the reading does not depend on the loader.
+    fn result_on_disk(dir: &Path) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let path = crate::eviction_result::EvictionPassResult::path(dir);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        (
+            v["completed_at"].as_u64(),
+            v["demand_backoff_streak"].as_u64(),
+            v["exhausted_shortfall_bytes"].as_u64(),
+        )
+    }
+
+    /// Rewrite the result document as if `ago` seconds had passed since its pass completed, and
+    /// with `streak` as its demand backoff streak when that is `Some`. Every other field stays as
+    /// written.
+    fn rewrite_result(dir: &Path, ago: u64, streak: Option<u64>) {
+        let path = crate::eviction_result::EvictionPassResult::path(dir);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["completed_at"] = serde_json::json!(unix_now_secs() - ago);
+        if let Some(streak) = streak {
+            v["demand_backoff_streak"] = serde_json::json!(streak);
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    }
+
+    /// Refusals of one object, round after round, where every demand pass ends short without
+    /// having read the whole read tier (one `.meta` it cannot read, an I/O gap), so none is
+    /// evidence of futility. A refusal starts the next pass only one `consolidation_interval`
+    /// after the last one completed, then two, then four; a refusal inside the delay takes the
+    /// eviction lock and skips before any tick. Each pass records one more in its row. Time is
+    /// moved by rewriting the result document's `completed_at`, the one time the backoff reads,
+    /// with 2 s of margin inside the delay for the second the check reads its clock in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sustained_refusal_stream_backs_its_demand_passes_off() {
+        const STEP: u64 = 10_000;
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let interval = manager.shared_storage.consolidation_interval.as_secs();
+        assert!(
+            interval >= 3,
+            "fixture: the ages below need 2 s of margin inside the delay, interval {interval} s"
+        );
+        let locked = lock_meta(&manager, "test-bucket/demand-locked", STEP);
+        let ages = [
+            None,
+            Some(interval - 2),
+            Some(interval),
+            Some(2 * interval - 2),
+            Some(2 * interval),
+            Some(4 * interval - 2),
+            Some(4 * interval),
+        ];
+        let mut rounds = Vec::new();
+        for (round, age) in ages.into_iter().enumerate() {
+            // A peer that cannot execute work lists keeps every pass the legacy one, so no
+            // round's author defers on an earlier round's unfinished chunks.
+            let now = crate::eviction_worklist::test_fleet::now();
+            crate::eviction_worklist::test_fleet::journal(&dir, "host-b:1", now);
+            crate::eviction_worklist::test_fleet::ready(&dir, "host-b:1", false, now);
+            store_evictable_range(&manager, &format!("test-bucket/demand-step-{round}"), STEP);
+            if let Some(age) = age {
+                rewrite_result(&dir, age, None);
+            }
+            let declined = read_fill_refusal(&dir, REFUSED).is_some();
+            let ticks_before = author_ticks(&dir);
+            let fired = cycle_and_wait(&consolidator).await;
+            let (_, streak, exhausted) = result_on_disk(&dir);
+            rounds.push((
+                declined,
+                fired,
+                author_ticks(&dir) > ticks_before,
+                streak,
+                exhausted,
+            ));
+        }
+        chmod(&locked, 0o644);
+        println!(
+            "Backoff stream, interval {interval} s, result ages before each round {ages:?}: \
+             (declined, fired, ticked, streak, exhausted) per round {rounds:?}"
+        );
+        assert_eq!(
+            rounds,
+            vec![
+                (true, 1, true, Some(1), None),
+                (true, 1, false, Some(1), None),
+                (true, 1, true, Some(2), None),
+                (true, 1, false, Some(2), None),
+                (true, 1, true, Some(3), None),
+                (true, 1, false, Some(3), None),
+                (true, 1, true, Some(4), None),
+            ],
+            "demand passes that make no room must start one, two, then four intervals after the \
+             last, and a refusal inside the delay must start none"
+        );
+    }
+
+    /// A fill whose metadata is still only a journal `Add` line, read by a demand pass on a proxy
+    /// whose cycle lost the consolidation lock, so nothing consolidated it first. Its bytes are in
+    /// the figure and in no `.meta`. They count as room: the exhausted shortfall the pass
+    /// publishes is smaller by them and leaves room for the object, so the size is not marked
+    /// futile. Without them the shortfall leaves none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_only_fill_counts_as_room_and_does_not_mark_futile() {
+        const PENDING: u64 = 400_000;
+        const FIRST: u64 = DEMAND_TOTAL + DEMAND_P - DEMAND_TARGET;
+        const {
+            assert!(
+                DEMAND_TARGET + (FIRST - EVICTABLE) + REFUSED > MAX
+                    && DEMAND_TARGET + (FIRST - EVICTABLE - PENDING) + REFUSED <= MAX,
+                "fixture: the shortfall without the journal's bytes leaves no room, with them it \
+                 does"
+            )
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let a = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        a.set_cache_manager_in_consolidator().await;
+        let a_consolidator = a.get_journal_consolidator().await.unwrap();
+        let b = manager_unstarted_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        assert!(
+            b.get_journal_consolidator()
+                .await
+                .unwrap()
+                .try_acquire_global_consolidation_lock()
+                .unwrap(),
+            "fixture: B takes the consolidation lock"
+        );
+        store_evictable_range(&a, "test-bucket/demand-evictable", EVICTABLE);
+        let relative = format!("test-bucket/demand-journal-only_0-{}.bin", PENDING - 1);
+        let entry = crate::journal_manager::JournalEntry {
+            timestamp: SystemTime::now(),
+            instance_id: "host-peer:7".to_string(),
+            cache_key: "test-bucket/demand-journal-only".to_string(),
+            range_spec: crate::cache_types::RangeSpec::new(
+                0,
+                PENDING - 1,
+                relative.clone(),
+                crate::compression::CompressionAlgorithm::Lz4,
+                PENDING,
+                PENDING,
+            ),
+            operation: crate::journal_manager::JournalOperation::Add,
+            range_file_path: relative,
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(3_600),
+            access_increment: None,
+            object_metadata: None,
+            fill_witness: None,
+        };
+        let journal = dir
+            .join("metadata")
+            .join("_journals")
+            .join("host-peer:7.journal");
+        let line = format!("{}\n", serde_json::to_string(&entry).unwrap());
+        std::fs::write(&journal, &line).unwrap();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let fired = cycle_and_wait(&a_consolidator).await;
+        let observed = (
+            declined,
+            fired,
+            crate::eviction_result::EvictionPassResult::load(&dir).map(|r| r.bytes_requested),
+            result_on_disk(&dir).2,
+            eviction_demand_futile(&dir),
+        );
+        let journal_kept = std::fs::read_to_string(&journal).is_ok_and(|kept| kept == line);
+        println!(
+            "Journal-only fill of {PENDING} bytes: (declined, fired, requested, exhausted \
+             shortfall, futile mark) {observed:?}; journal line kept {journal_kept}"
+        );
+        assert!(
+            journal_kept,
+            "fixture: nothing may consolidate the journal line, or the walk could see a .meta"
+        );
+        assert_eq!(
+            observed,
+            (true, 1, Some(FIRST), Some(FIRST - EVICTABLE - PENDING), 0),
+            "a pending journal Add's bytes must count as room, so the size is not marked futile"
+        );
+    }
+
+    /// The streak of the row on the author path: in an all-capable fleet (this proxy alone), the
+    /// second demand pass that makes no room is authored, not a fallback to the legacy pass, and
+    /// its result extends the row to 2. The first pass is the proxy's first tick, before its own
+    /// readiness record exists. The legacy-pass stream test cannot reach this write.
+    ///
+    /// Red side: the author's `demand_backoff_streak` set to `None`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_authored_demand_pass_that_makes_no_room_extends_the_streak() {
+        const STEP: u64 = 10_000;
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let interval = manager.shared_storage.consolidation_interval.as_secs();
+        let locked = lock_meta(&manager, "test-bucket/demand-locked", STEP);
+        store_evictable_range(&manager, "test-bucket/demand-step-0", STEP);
+        let first_declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let first_fired = cycle_and_wait(&consolidator).await;
+        let first_streak = result_on_disk(&dir).1;
+        // Past the first delay, so the second pass is not held.
+        rewrite_result(&dir, interval, None);
+        store_evictable_range(&manager, "test-bucket/demand-step-1", STEP);
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let before = crate::eviction_worklist::counters(&dir);
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let after = crate::eviction_worklist::counters(&dir);
+        let ticks = author_ticks(&dir) - ticks_before;
+        let fallbacks = (after.author_fallback_not_capable + after.author_fallback_unknown)
+            - (before.author_fallback_not_capable + before.author_fallback_unknown);
+        chmod(&locked, 0o644);
+        let streak = result_on_disk(&dir).1;
+        println!(
+            "Authored demand pass: first (declined, fired, streak) {:?}; second (declined, fired, \
+             author ticks, fallbacks to the legacy pass, streak) {:?}",
+            (first_declined, first_fired, first_streak),
+            (declined, fired, ticks, fallbacks, streak)
+        );
+        assert_eq!(
+            (
+                first_fired,
+                first_streak,
+                declined,
+                fired,
+                ticks,
+                fallbacks,
+                streak
+            ),
+            (1, Some(1), true, 1, 1, 0, Some(2)),
+            "an authored pass on demand alone that makes no room must extend the row"
+        );
+    }
+    /// The delay: one interval, doubling per pass in the row, capped at an hour; an interval
+    /// under a second counts as one, and part of a second rounds up.
+    #[test]
+    fn the_backoff_delay_doubles_from_one_interval_to_the_cap() {
+        let five = Duration::from_secs(5);
+        let delays: Vec<u64> = (1..=12).map(|s| demand_backoff_delay(s, five)).collect();
+        let edges = (
+            demand_backoff_delay(u32::MAX, five),
+            demand_backoff_delay(1, Duration::from_millis(500)),
+            demand_backoff_delay(1, Duration::from_millis(2_500)),
+        );
+        println!("Backoff delays at 5 s for streaks 1..=12 {delays:?}; edges {edges:?}");
+        assert_eq!(
+            (delays, edges),
+            (
+                vec![5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600, 3600],
+                (DEMAND_BACKOFF_CAP_SECS, 1, 3)
+            )
+        );
+    }
+
+    /// The backoff stops holding when this process sees the usage change by the futility rule's
+    /// test. A row of three passes that made no room, the last a second ago, holds the next for
+    /// four intervals; after a look at a usage over the trigger, the next refusal starts a pass,
+    /// and that pass begins a new row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_backoff_stops_holding_when_the_usage_changes() {
+        const STEP: u64 = 10_000;
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let locked = lock_meta(&manager, "test-bucket/demand-locked", STEP);
+        store_evictable_range(&manager, "test-bucket/demand-step-0", STEP);
+        read_fill_refusal(&dir, REFUSED);
+        let first = cycle_and_wait(&consolidator).await;
+        let first_streak = result_on_disk(&dir).1;
+        rewrite_result(&dir, 1, Some(3));
+        observe_eviction_usage(&dir, MAX, MAX / 100 * 95, MAX);
+        store_evictable_range(&manager, "test-bucket/demand-step-1", STEP);
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let after = (
+            declined,
+            fired,
+            author_ticks(&dir) - ticks_before,
+            result_on_disk(&dir).1,
+        );
+        chmod(&locked, 0o644);
+        println!(
+            "Usage change: first pass fired {first}, streak {first_streak:?}; after a row of 3 \
+             and a usage over the trigger, (declined, fired, ticks, streak) {after:?}"
+        );
+        assert_eq!(
+            (first, first_streak, after),
+            (1, Some(1), (true, 1, 1, Some(1))),
+            "a usage change must end the hold, and the pass after it must start a new row"
+        );
+    }
+
+    /// A pass that makes room for the demand ends the row: it records no streak, so the next pass
+    /// on demand alone waits for nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pass_that_makes_room_ends_the_backoff_row() {
+        const STEP: u64 = 10_000;
+        const ROOM: u64 = 1_500_000;
+        const { assert!(ROOM >= DEMAND_TOTAL + DEMAND_P - DEMAND_TARGET) };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let locked = lock_meta(&manager, "test-bucket/demand-locked", STEP);
+        store_evictable_range(&manager, "test-bucket/demand-step-0", STEP);
+        read_fill_refusal(&dir, REFUSED);
+        let first = cycle_and_wait(&consolidator).await;
+        let first_streak = result_on_disk(&dir).1;
+        // A row of three whose four-interval delay has run out.
+        rewrite_result(&dir, 3_600, Some(3));
+        store_evictable_range(&manager, "test-bucket/demand-room", ROOM);
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let after = (
+            declined,
+            fired,
+            author_ticks(&dir) - ticks_before,
+            crate::eviction_result::EvictionPassResult::load(&dir).map(|r| r.shortfall_bytes),
+            result_on_disk(&dir).1,
+        );
+        chmod(&locked, 0o644);
+        println!(
+            "Room made: first pass fired {first}, streak {first_streak:?}; then (declined, fired, \
+             ticks, shortfall, streak) {after:?}"
+        );
+        assert_eq!(
+            (first, first_streak, after),
+            (1, Some(1), (true, 1, 1, Some(0), None)),
+            "a pass that made room must record no streak"
+        );
+    }
+
+    /// While the backoff holds a demand pass, a cache over its trigger still runs its pass in the
+    /// next cycle. The over-trigger arm never reads the backoff, and the skipped demand pass
+    /// counts as progress, so the barren memo does not hold the tick either. The over-trigger
+    /// pass records no streak, which ends the row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_over_trigger_pass_is_not_delayed_by_the_backoff() {
+        const OVER_TOTAL: u64 = 9_600_000;
+        const { assert!(OVER_TOTAL + DEMAND_P > MAX / 100 * 95) };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        // A peer's row of eight: the next demand pass waits 128 intervals, capped at an hour.
+        crate::eviction_result::EvictionPassResult::new(
+            "host-peer:7".to_string(),
+            FIRST_REQUEST,
+            EVICTABLE,
+            1,
+            Some(0),
+            None,
+        )
+        .install_with_evidence(
+            &dir,
+            crate::eviction_result::PassEvidence {
+                demand_backoff_streak: Some(8),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let held = (declined, fired, author_ticks(&dir) - ticks_before);
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = OVER_TOTAL;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+        let ticks_before = author_ticks(&dir);
+        let fired = cycle_and_wait(&consolidator).await;
+        let over = (
+            fired,
+            author_ticks(&dir) - ticks_before,
+            crate::eviction_result::EvictionPassResult::load(&dir).map(|r| r.bytes_requested),
+            result_on_disk(&dir).1,
+        );
+        println!(
+            "Backoff then over the trigger: demand round (declined, fired, ticks) {held:?}; over \
+             round (fired, ticks, requested, streak) {over:?}"
+        );
+        assert_eq!(
+            (held, over),
+            (
+                (true, 1, 0),
+                (1, 1, Some(OVER_TOTAL + DEMAND_P - DEMAND_TARGET), None)
+            ),
+            "the backoff must hold the demand pass and must not delay the over-trigger pass"
+        );
+    }
+
+    /// A legacy pass decided over the trigger records no backoff streak, even when the figure it
+    /// is sized from after the drain guard is at or under the trigger. The decision is the
+    /// trigger check under the lock, not the later figure.
+    ///
+    /// Red side: the legacy end tests the size after the drain guard instead of the decision.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_pass_decided_over_the_trigger_records_no_streak() {
+        const OVER_TOTAL: u64 = 9_600_000;
+        const { assert!(OVER_TOTAL + DEMAND_P > MAX / 100 * 95) };
+        const { assert!(DEMAND_TOTAL + DEMAND_P <= MAX / 100 * 95) };
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let manager = manager_at(&dir, MAX, DEMAND_TOTAL, DEMAND_P, false, 95).await;
+        manager.set_cache_manager_in_consolidator().await;
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        store_evictable_range(&manager, "test-bucket/demand-evictable", EVICTABLE);
+        // A peer that cannot execute work lists keeps the pass the legacy one.
+        let now = crate::eviction_worklist::test_fleet::now();
+        crate::eviction_worklist::test_fleet::journal(&dir, "host-b:1", now);
+        crate::eviction_worklist::test_fleet::ready(&dir, "host-b:1", false, now);
+        let declined = read_fill_refusal(&dir, REFUSED).is_some();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = OVER_TOTAL;
+        consolidator
+            .seed_size_state_for_tests(&state)
+            .await
+            .unwrap();
+        *LEGACY_GUARD_SIZE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((dir.clone(), DEMAND_TOTAL + DEMAND_P));
+        let fired = cycle_and_wait(&consolidator).await;
+        *LEGACY_GUARD_SIZE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        let on_disk = result_on_disk(&dir);
+        println!(
+            "Legacy pass over the trigger at the lock, under it after the guard: (declined, \
+             fired) {:?}; (completed_at, streak, exhausted) {on_disk:?}",
+            (declined, fired)
+        );
+        assert_eq!(
+            (declined, fired, on_disk.0.is_some(), on_disk.1),
+            (true, 1, true, None),
+            "a pass decided over the trigger must record no streak"
+        );
+    }
+    // The five sites at which the full collector counts an I/O error as a gap, each reached for
+    // real where a test can set the error up (`chmod`, as a non-root user) and through
+    // `selection_read_seam` where it cannot.
+}
+
 /// **The `max_cache_size` soft stop on read fills.**
 ///
 /// Decision (Ed, 2026-10-14): "read caching should follow the same soft-stop logic as
@@ -50313,7 +54430,10 @@ mod read_fill_max_cache_size_soft_stop_tests {
         .expect("a fill below max_cache_size is admitted");
 
         // The cache crosses max_cache_size while the fill streams.
-        usage.send_replace(Some((std::time::Instant::now(), LIMIT)));
+        usage.send_replace(Some(PutUsageSnapshot {
+            figure: LIMIT,
+            in_progress_part_bytes: 0,
+        }));
 
         let declined_now = tokio::time::timeout(
             BOUND,
@@ -50434,7 +54554,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
     /// limit and will keep saying so for seconds. Four 40 KB fills land, and the fifth must be
     /// declined on them even though nothing the volume holds has changed.
     ///
-    /// Red side (verbatim): the count not added — drop `unconsolidated_admitted_bytes` from
+    /// Red side (verbatim): the count not added — drop the addend from
     /// `read_fill_refusal`'s total and the probe is admitted, because the frozen figure plus
     /// 100 KB is still under the limit.
     #[tokio::test]
@@ -50487,7 +54607,10 @@ mod read_fill_max_cache_size_soft_stop_tests {
 
         // The cycle: apply, persist, then delete the file it applied.
         std::fs::remove_file(&delta_file).expect("the delta file must be removable");
-        usage.send_replace(Some((std::time::Instant::now(), FOLDED_FIGURE)));
+        usage.send_replace(Some(PutUsageSnapshot {
+            figure: FOLDED_FIGURE,
+            in_progress_part_bytes: 0,
+        }));
         let consumed = tokio::time::timeout(BOUND, consumed_delta_files(temp.path()))
             .await
             .expect("the consumed-file read must not hang");
@@ -50496,7 +54619,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
         assert_eq!(
             (
                 consumed.len(),
-                unconsolidated_admitted_bytes(temp.path()),
+                unconsolidated_addend_and_epoch(temp.path()).0,
                 read_fill_refusal(temp.path(), PROBE_B).is_some(),
                 read_fill_refusal(temp.path(), PROBE_LARGE).is_some()
             ),
@@ -50536,7 +54659,10 @@ mod read_fill_max_cache_size_soft_stop_tests {
         let delta_file = sole_delta_file(temp.path());
 
         // A refresh, with the delta file still pending: no cycle has applied it.
-        usage.send_replace(Some((std::time::Instant::now(), PEER_FIGURE)));
+        usage.send_replace(Some(PutUsageSnapshot {
+            figure: PEER_FIGURE,
+            in_progress_part_bytes: 0,
+        }));
         let consumed = tokio::time::timeout(BOUND, consumed_delta_files(temp.path()))
             .await
             .expect("the consumed-file read must not hang");
@@ -50546,7 +54672,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
             (
                 delta_file.exists(),
                 consumed.len(),
-                unconsolidated_admitted_bytes(temp.path()),
+                unconsolidated_addend_and_epoch(temp.path()).0,
                 read_fill_refusal(temp.path(), PROBE_LARGE).is_some()
             ),
             (true, 0, 4 * ADMIT, true),
@@ -50597,11 +54723,11 @@ mod read_fill_max_cache_size_soft_stop_tests {
         );
         let key = "case35-bucket/chokepoint";
 
-        let before = unconsolidated_admitted_bytes(temp.path());
+        let before = unconsolidated_addend_and_epoch(temp.path()).0;
         let credited = accumulator.add_range(key, 0, ADMIT - 1, ADMIT);
-        let after_credit = unconsolidated_admitted_bytes(temp.path());
+        let after_credit = unconsolidated_addend_and_epoch(temp.path()).0;
         let deduped = accumulator.add_range(key, 0, ADMIT - 1, ADMIT);
-        let after_dedup = unconsolidated_admitted_bytes(temp.path());
+        let after_dedup = unconsolidated_addend_and_epoch(temp.path()).0;
 
         assert_eq!(
             (credited, deduped, before, after_credit, after_dedup),
@@ -50613,8 +54739,8 @@ mod read_fill_max_cache_size_soft_stop_tests {
 
     /// **Write-through admission takes the same correction.**
     ///
-    /// `disk_safety_refusal`'s component 1 compares `size_state.json`'s total against
-    /// `max_cache_size`, and that document has the same fold lag, so a run of uploads outran it
+    /// `disk_safety_refusal`'s component 1 compares the shared figure against
+    /// `max_cache_size`, and that figure has the same fold lag, so a run of uploads outran it
     /// the same way. The limit here is 200 KB and the figure is the real one for an empty
     /// volume, so the four admissions alone decide the verdict and no planted figure can be
     /// rewritten under the test by a consolidation cycle.
@@ -50736,7 +54862,10 @@ mod read_fill_max_cache_size_soft_stop_tests {
         // The cycle collected the newer file only, applied it, persisted the figure, and
         // deleted what it applied.
         std::fs::remove_file(&newer).expect("the newer delta file must be removable");
-        usage.send_replace(Some((std::time::Instant::now(), FIGURE + 2 * ADMIT)));
+        usage.send_replace(Some(PutUsageSnapshot {
+            figure: FIGURE + 2 * ADMIT,
+            in_progress_part_bytes: 0,
+        }));
         let consumed = tokio::time::timeout(BOUND, consumed_delta_files(temp.path()))
             .await
             .expect("the consumed-file read must not hang");
@@ -50746,7 +54875,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
             (
                 consumed.clone(),
                 older.exists(),
-                unconsolidated_admitted_bytes(temp.path()),
+                unconsolidated_addend_and_epoch(temp.path()).0,
                 read_fill_refusal(temp.path(), PROBE_LARGE).is_some()
             ),
             (vec![newer], true, 2 * ADMIT, true),
@@ -50762,8 +54891,9 @@ mod read_fill_max_cache_size_soft_stop_tests {
     ///
     /// `collect_deltas` renames an unparseable `delta_*.json` to `{name}.corrupt` and applies
     /// nothing from it, so the record's path is gone while the figure never absorbed its bytes.
-    /// Those bytes must stay counted until a validation census re-grounds the figure from the
-    /// volume, which is what `note_accounting_reground` does.
+    /// Those bytes must stay counted until a validation census brings them into the figure from
+    /// the volume, which is what `release_corrupt_delta_records` and `note_census_release_targets`
+    /// hand to the refresher.
     ///
     /// Red side (verbatim): absence alone releases — drop the `.corrupt` check from
     /// `consumed_delta_files`, so the rename releases bytes the figure never absorbed and the
@@ -50795,7 +54925,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
                 flushed.exists(),
                 aside.exists(),
                 consumed.len(),
-                unconsolidated_admitted_bytes(temp.path()),
+                unconsolidated_addend_and_epoch(temp.path()).0,
                 read_fill_refusal(temp.path(), PROBE_A).is_some()
             ),
             (false, true, 0, 4 * ADMIT, true),
@@ -50844,7 +54974,10 @@ mod read_fill_max_cache_size_soft_stop_tests {
                 // One consolidation cycle and one refresh, in production order: the cycle's
                 // delete, the figure that contains those bytes, then the release.
                 std::fs::remove_file(&hook_file).expect("the delta file must be removable");
-                usage.send_replace(Some((std::time::Instant::now(), FOLDED_FIGURE)));
+                usage.send_replace(Some(PutUsageSnapshot {
+                    figure: FOLDED_FIGURE,
+                    in_progress_part_bytes: 0,
+                }));
                 release_consumed_delta_files(&hook_dir, std::slice::from_ref(&hook_file));
                 hook_fired.store(true, std::sync::atomic::Ordering::SeqCst);
             }),
@@ -50855,7 +54988,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
         assert_eq!(
             (
                 fired.load(std::sync::atomic::Ordering::SeqCst),
-                unconsolidated_admitted_bytes(temp.path()),
+                unconsolidated_addend_and_epoch(temp.path()).0,
                 declined
             ),
             (true, 0, true),
@@ -50863,41 +54996,6 @@ mod read_fill_max_cache_size_soft_stop_tests {
              declined): {FIGURE} with the 160 KB counted and {FOLDED_FIGURE} with \
              nothing counted both decline this probe, so admitting it means the decision \
              paired the old figure with the released count"
-        );
-    }
-
-    /// (d). **A validation census releases every pending record.**
-    ///
-    /// `SizeAccumulator::reset` is called when a census installs a size read from the volume
-    /// itself, which already contains every byte written, and the same call deletes the delta
-    /// files without applying them. Without this release the discarded credits would be added
-    /// for the rest of the process's life.
-    #[tokio::test]
-    async fn o_a_census_reground_releases_every_pending_record() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let _usage = register_read_fill_bound_for_test(temp.path(), LIMIT, Some(FIGURE));
-        let accumulator = crate::journal_consolidator::SizeAccumulator::new(
-            temp.path(),
-            "case37-census".to_string(),
-        );
-
-        admit_n(&accumulator, "census-flushed", 2, ADMIT);
-        flush_once(&accumulator).await;
-        // A second pair credited but not yet flushed, so the reset has both shapes to clear.
-        admit_n(&accumulator, "census-unflushed", 2, ADMIT);
-        let before = unconsolidated_admitted_bytes(temp.path());
-
-        accumulator.reset();
-
-        assert_eq!(
-            (
-                before,
-                unconsolidated_admitted_bytes(temp.path()),
-                pending_delta_record_count(temp.path())
-            ),
-            (4 * ADMIT, 0, 0),
-            "(counted before the census, counted after, records left): the installed figure \
-             was read from the volume, so it already holds every byte credited here"
         );
     }
 
@@ -50920,7 +55018,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
             accumulator.add_range(key, 0, ADMIT - 1, ADMIT),
             "apparatus: the fixture range must be a fresh credit"
         );
-        let before = unconsolidated_admitted_bytes(temp.path());
+        let before = unconsolidated_addend_and_epoch(temp.path()).0;
         accumulator.subtract_range(key, 0, ADMIT - 1, ADMIT);
         flush_once(&accumulator).await;
 
@@ -50928,7 +55026,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
             (
                 before,
                 delta_files(temp.path()).len(),
-                unconsolidated_admitted_bytes(temp.path()),
+                unconsolidated_addend_and_epoch(temp.path()).0,
                 pending_delta_record_count(temp.path())
             ),
             (ADMIT, 0, 0, 0),
@@ -50964,7 +55062,7 @@ mod read_fill_max_cache_size_soft_stop_tests {
             (
                 delta_files(temp.path()).len(),
                 pending_delta_record_count(temp.path()),
-                unconsolidated_admitted_bytes(temp.path())
+                unconsolidated_addend_and_epoch(temp.path()).0
             ),
             (
                 flushes,
@@ -51633,7 +55731,11 @@ mod part_layout_version_tests {
             )
             .await
             .expect("the part store returns Ok whether or not it caches");
-        let after = read_meta(&manager, key);
+        // The part read another version, so the `.meta` is removed: no document, no layout.
+        let after = std::fs::read_to_string(manager.get_new_metadata_file_path(key))
+            .ok()
+            .and_then(|t| serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&t).ok())
+            .unwrap_or_default();
         let served = manager
             .lookup_part(key, 2, crate::origin_identity::OriginVerdict::Matches)
             .await
@@ -52094,6 +56196,57 @@ mod moved_fill_tests;
 static BEFORE_STAGING_REFOLD_HOOKS: std::sync::Mutex<
     Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>,
 > = std::sync::Mutex::new(Vec::new());
+/// The Write_Ledger entries a staging pass retires once it has released `global_eviction.lock`.
+struct StagingRetirement {
+    ledger: Arc<crate::write_ledger::WriteLedger>,
+    retired: std::collections::HashSet<(String, u64, u64, SystemTime, String)>,
+}
+#[cfg(test)]
+#[allow(clippy::type_complexity)] // a test-only registry; a named alias would be used once
+static BEFORE_STAGING_RETIRE_HOOKS: std::sync::Mutex<
+    Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>,
+> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn run_before_staging_retire_hook(cache_dir: &std::path::Path) {
+    let hook = {
+        let mut hooks = BEFORE_STAGING_RETIRE_HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        hooks
+            .iter()
+            .position(|(d, _)| d == cache_dir)
+            .map(|i| hooks.remove(i).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+#[cfg(test)]
+static STAGING_LEDGER_READ_DELAYS: std::sync::Mutex<Vec<(std::path::PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn take_staging_ledger_read_delay(cache_dir: &std::path::Path) -> Option<Duration> {
+    let mut delays = STAGING_LEDGER_READ_DELAYS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    delays
+        .iter()
+        .position(|(d, _)| d == cache_dir)
+        .map(|i| delays.remove(i).1)
+}
+#[cfg(test)]
+static STAGING_CANDIDATE_DELAYS: std::sync::Mutex<Vec<(std::path::PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn take_staging_candidate_delay(cache_dir: &std::path::Path) -> Option<Duration> {
+    let mut delays = STAGING_CANDIDATE_DELAYS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    delays
+        .iter()
+        .position(|(d, _)| d == cache_dir)
+        .map(|i| delays.remove(i).1)
+}
 #[cfg(test)]
 fn run_before_staging_refold_hook(cache_dir: &std::path::Path) {
     let hook = {
@@ -52234,7 +56387,7 @@ mod epoch_one_counter_guard {
         let expected: BTreeSet<String> = [
             // The epoch-0 arm, after `fold_authority_active` returns at epoch 1.
             "cache.rs::staged_authority",
-            // The epoch-0 arm of the post-lock sizing read.
+            // The epoch-0 upper bound of the post-lock sizing read.
             "cache.rs::staging_pass_sizing_figure",
             // Publication before this process's first complete derivation (a stand-in, never a
             // decision).
@@ -52255,6 +56408,394 @@ mod epoch_one_counter_guard {
             "the production callers of get_write_cache_size / get_projected_write_cache_size \
              changed; a new one must be an epoch-0 arm, the census, or pre-first-derivation \
              publication, and be added here with its reason"
+        );
+    }
+}
+
+#[cfg(test)]
+mod census_release_target_tests {
+    use super::*;
+
+    fn held(dir: &Path, record: &Path) -> Option<u64> {
+        with_unconsolidated(dir, |state| {
+            state
+                .pending
+                .iter()
+                .find(|(path, _)| path == record)
+                .map(|(_, bytes)| *bytes)
+        })
+    }
+
+    /// A release target replaced after the refresher read it is not applied: the newer one can sit
+    /// a byte higher, and the record must hold at least what the figure lacks. The next refresh
+    /// applies the newer target.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the stale target applied (the `Some(_) => continue` arm removed), the record drops to
+    /// 400 while the newer target says it must hold 401.
+    #[test]
+    fn a_target_replaced_after_it_was_read_is_left_for_the_next_refresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let record = dir
+            .join("size_tracking")
+            .join("delta_fixture-replaced.json");
+        note_delta_file_flushed(dir, Some(record.clone()), 1_000);
+        note_census_release_targets(dir, &[(record.clone(), 400)]);
+        let read = census_release_targets(dir);
+        note_census_release_targets(dir, &[(record.clone(), 401)]);
+        apply_census_release_targets(dir, &read);
+        assert_eq!(
+            held(dir, &record),
+            Some(1_000),
+            "A REPLACED RELEASE TARGET WAS APPLIED: the record must keep its bytes until the newer \
+             target is read"
+        );
+        apply_census_release_targets(dir, &census_release_targets(dir));
+        assert_eq!(
+            held(dir, &record),
+            Some(401),
+            "the next refresh applies the newer target"
+        );
+    }
+
+    /// The production usage refresher applies a census release target only after it publishes a
+    /// figure read after the target was noted. The refresher is paused just before its
+    /// publication: the record must still be held there, and released once it publishes.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `apply_census_release_targets` moved before the publication, the record is already
+    /// released at the pause.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_refresher_applies_release_targets_after_it_publishes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let manager = Arc::new(CacheManager::new_with_defaults(dir.to_path_buf(), false, 0));
+        let record = dir.join("size_tracking").join("delta_fixture-order.json");
+        note_delta_file_flushed(dir, Some(record.clone()), 1_000);
+        // Renamed aside as corrupt, so the record is not released as consumed.
+        std::fs::write(corrupt_aside_path(&record), b"torn").unwrap();
+        note_census_release_targets(dir, &[(record.clone(), 0)]);
+        let pause: RefresherPause =
+            Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        REFRESHER_PUBLISH_PAUSES
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), pause.clone());
+        manager.start_put_usage_refresher().await;
+        tokio::time::timeout(Duration::from_secs(60), pause.0.notified())
+            .await
+            .expect("the refresher reached its publication");
+        let at_publication = held(dir, &record);
+        REFRESHER_PUBLISH_PAUSES.lock().unwrap().remove(dir);
+        pause.1.notify_one();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while held(dir, &record).is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            (at_publication, held(dir, &record)),
+            (Some(1_000), None),
+            "(held just before the publication, held after it): THE REFRESHER RELEASED A RECORD \
+             BEFORE PUBLISHING a figure that contains its bytes, or never released it"
+        );
+    }
+}
+
+/// A staging pass holds `global_eviction.lock` for at most its time budget plus one stage, and
+/// runs its whole-volume Write_Ledger compaction after the release.
+#[cfg(test)]
+mod staging_pass_budget_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The `write_cache_count_eviction_tests` manager, with `eviction_lock_timeout` (the pass's
+    /// time budget) set directly. Configuration validation, which this bypasses, keeps
+    /// production values at 30 s or more.
+    fn manager(cache_dir: &std::path::Path, budget: Duration) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let m = CacheManager::new_with_shared_storage(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            10 * 1024 * 1024 * 1024,
+            CacheEvictionAlgorithm::TinyLFU,
+            1024,
+            true,
+            Duration::from_secs(315_360_000),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig {
+                eviction_lock_timeout: budget,
+                ..Default::default()
+            },
+            10.0,
+            true,
+            Duration::from_secs(86_400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            Duration::from_secs(60),
+            1_048_576,
+            false,
+            Duration::from_secs(10),
+            64,
+            Duration::from_secs(5),
+        );
+        let _ = m.create_configured_disk_cache_manager();
+        m
+    }
+
+    const BODY: usize = 4096;
+
+    /// One staged object, under the byte trigger and over the count trigger, so a pass takes the
+    /// lock and reaches its ledger read. Returns the object's `.meta` path.
+    async fn staged_over_the_count_trigger(
+        m: &CacheManager,
+        dir: &std::path::Path,
+        key: &str,
+    ) -> PathBuf {
+        m.store_put_as_write_cached_range(
+            key,
+            &vec![5u8; BODY],
+            "\"etag\"".to_string(),
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let meta_path =
+            crate::disk_cache::get_sharded_path(&dir.join("metadata"), key, ".meta").unwrap();
+        assert!(meta_path.exists(), "fixture: the object must be staged");
+        crate::staged_fold::seed_shard_figure_for_tests(
+            dir,
+            "seeded",
+            "01",
+            4_096,
+            crate::staged_fold::STAGED_RANGE_BUDGET,
+        );
+        crate::staged_fold::invalidate_budget_snapshot_for_tests(dir);
+        assert!(
+            crate::staged_fold::count_eviction_verdict(dir, 95, 80)
+                .await
+                .is_needed(),
+            "fixture: the count trigger must be over, or no pass takes the lock"
+        );
+        meta_path
+    }
+
+    /// Whether a second open of the lockfile can take its `flock`, which is what a peer's
+    /// acquisition attempts first.
+    fn lock_is_free(lock_path: &std::path::Path) -> bool {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        let free = fs4::FileExt::try_lock(&f).is_ok();
+        if free {
+            let _ = fs4::FileExt::unlock(&f);
+        }
+        free
+    }
+
+    /// The budget is 1 s and the ledger read is held for 10 s. Within the budget plus one stage
+    /// (sampled at 3 s) the holder has truncated the lockfile and a peer's
+    /// `try_acquire_global_eviction_lock` succeeds. Without the deadline the holder keeps the lock
+    /// for the whole 10 s and evicts afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn staging_pass_budget_a_held_ledger_read_releases_the_lock_within_the_budget() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let m = Arc::new(manager(dir, Duration::from_secs(1)));
+        m.initialize().await.expect("cache manager must initialize");
+        let meta_path =
+            staged_over_the_count_trigger(&m, dir, "bucket/budget-held-ledger-read.bin").await;
+        CacheManager::set_staging_ledger_read_delay_for_tests(dir, Duration::from_secs(10));
+
+        let started = std::time::Instant::now();
+        let pass = tokio::spawn({
+            let m = Arc::clone(&m);
+            async move { m.evict_staging_tier().await }
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let lock_path = m.get_global_eviction_lock_path();
+        let lockfile_len = std::fs::metadata(&lock_path).map(|md| md.len()).ok();
+        let peer = manager(dir, Duration::from_secs(60));
+        let peer_acquired = peer.try_acquire_global_eviction_lock().await.unwrap();
+        if peer_acquired {
+            peer.release_global_eviction_lock().await.unwrap();
+        }
+        let sampled_at = started.elapsed();
+        let freed = tokio::time::timeout(Duration::from_secs(20), pass)
+            .await
+            .expect("the pass must return")
+            .unwrap();
+
+        assert!(
+            peer_acquired && lockfile_len == Some(0),
+            "at {sampled_at:?}, 1 s budget plus one stage, the staging pass still held \
+             global_eviction.lock: peer_acquired={peer_acquired} lockfile_len={lockfile_len:?} \
+             (the pass returned freed={freed} after {:?})",
+            started.elapsed()
+        );
+        assert_eq!(freed, 0, "a pass stopped at its ledger read frees nothing");
+        assert!(
+            meta_path.exists(),
+            "and it evicted nothing: it stopped before assessing a candidate"
+        );
+        assert_eq!(m.eviction_lock_held_secs(), 0);
+    }
+
+    /// A pass the deadline stopped before its first candidate reclaimed nothing without having
+    /// looked at the population, so the next count verdict still asks for a pass. Latching on it
+    /// would disable the count trigger until the next fold install.
+    ///
+    /// A failure implicates the `deadline_hit.is_some()` argument to
+    /// `record_count_eviction_pass` in `evict_staging_tier_locked`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn staging_pass_budget_a_deadline_stopped_pass_does_not_latch_the_count_trigger() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let m = manager(dir, Duration::from_secs(1));
+        m.initialize().await.expect("cache manager must initialize");
+        let meta_path =
+            staged_over_the_count_trigger(&m, dir, "bucket/budget-deadline-latch.bin").await;
+        CacheManager::set_staging_candidate_delay_for_tests(dir, Duration::from_millis(1500));
+
+        let freed = tokio::time::timeout(Duration::from_secs(20), m.evict_staging_tier())
+            .await
+            .expect("the pass must return");
+
+        assert_eq!(
+            freed, 0,
+            "a pass stopped before its first candidate frees nothing"
+        );
+        assert!(meta_path.exists(), "and evicts nothing");
+        assert!(
+            crate::staged_fold::count_eviction_verdict(dir, 95, 80)
+                .await
+                .is_needed(),
+            "a pass the deadline stopped latched the count trigger off until the next fold install"
+        );
+    }
+
+    /// `eviction_lock_held_secs` reads the live hold while a hooked pass holds the lock, and 0
+    /// once the pass has released it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn staging_pass_budget_the_hold_age_gauge_reads_the_live_hold_and_zero_after() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let m = Arc::new(manager(dir, Duration::from_secs(30)));
+        m.initialize().await.expect("cache manager must initialize");
+        staged_over_the_count_trigger(&m, dir, "bucket/budget-gauge.bin").await;
+        assert_eq!(m.eviction_lock_held_secs(), 0, "no hold before the pass");
+        CacheManager::set_staging_ledger_read_delay_for_tests(dir, Duration::from_millis(2500));
+
+        let pass = tokio::spawn({
+            let m = Arc::clone(&m);
+            async move { m.evict_staging_tier().await }
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let during = m.eviction_lock_held_secs();
+        let held = !lock_is_free(&m.get_global_eviction_lock_path());
+        tokio::time::timeout(Duration::from_secs(20), pass)
+            .await
+            .expect("the pass must return")
+            .unwrap();
+        let after = m.eviction_lock_held_secs();
+        assert!(
+            held && during >= 1,
+            "while the pass held the lock (held={held}) the gauge read {during}, expected >= 1"
+        );
+        assert_eq!(after, 0, "the gauge must read 0 once the lock is released");
+    }
+
+    /// The whole-volume Write_Ledger compaction runs after `global_eviction.lock` is released,
+    /// and still retires what the pass consumed.
+    #[tokio::test]
+    async fn staging_pass_budget_the_ledger_compaction_runs_after_the_release() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let m = manager(dir, Duration::from_secs(60));
+        m.initialize().await.expect("cache manager must initialize");
+        let key = "bucket/budget-compaction-outside-lock.bin";
+        let meta_path = staged_over_the_count_trigger(&m, dir, key).await;
+        let ledger = m
+            .journal_consolidator
+            .read()
+            .await
+            .as_ref()
+            .expect("fixture: the consolidator must be wired")
+            .write_ledger()
+            .clone();
+        // An entry older than the retirement grace, so the eviction names it for retirement.
+        let aged_at = SystemTime::now()
+            - crate::write_ledger::ABSENT_RETIREMENT_GRACE
+            - Duration::from_secs(60);
+        ledger
+            .append_staged_entry(crate::write_ledger::WriteLedgerEntry {
+                timestamp: aged_at,
+                cache_key: key.to_string(),
+                range_start: 0,
+                range_end: BODY as u64 - 1,
+                compressed_size: 64,
+                instance_id: ledger.instance_id().to_string(),
+                seq: None,
+            })
+            .await
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(None::<(bool, Option<u64>)>));
+        let lock_path = m.get_global_eviction_lock_path();
+        CacheManager::set_before_staging_retire_hook_for_tests(
+            dir,
+            Box::new({
+                let seen = Arc::clone(&seen);
+                move || {
+                    let len = std::fs::metadata(&lock_path).map(|md| md.len()).ok();
+                    *seen.lock().unwrap() = Some((lock_is_free(&lock_path), len));
+                }
+            }),
+        );
+
+        m.evict_staging_tier().await;
+
+        let seen = *seen.lock().unwrap();
+        assert!(
+            !meta_path.exists(),
+            "fixture: the pass must evict the object, or it names nothing to retire"
+        );
+        assert_eq!(
+            seen,
+            Some((true, Some(0))),
+            "the compaction must start with global_eviction.lock released and its file truncated \
+             (lock free, lockfile length); None means it never ran"
+        );
+        let cutoff = SystemTime::now() - crate::write_ledger::ABSENT_RETIREMENT_GRACE;
+        let aged_left = ledger
+            .read_for_authority(usize::MAX)
+            .await
+            .expect("ledger must be readable")
+            .entries
+            .iter()
+            .filter(|e| e.cache_key == key && e.timestamp <= cutoff)
+            .count();
+        assert_eq!(
+            aged_left, 0,
+            "the compaction after the release must still retire the consumed entry"
         );
     }
 }

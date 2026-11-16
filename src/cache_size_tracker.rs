@@ -63,20 +63,14 @@ pub struct CacheSizeConfig {
     #[serde(skip)]
     pub validation_threshold_error: f64,
 
-    /// Minimum **compressed** range size for Tail_Partition membership, from
-    /// `cache.shared_storage.tail_floor_bytes` (default: 1 MiB).
+    /// Per-shard rank cap on Tail_Partition members, from
+    /// `cache.shared_storage.tail_max_entries` (default: 4096).
     ///
     /// Carried here because the rolling pass holds a `CacheSizeConfig` and nothing else that
     /// reaches the application configuration — the same reason
     /// [`crate::journal_consolidator::ConsolidationConfig::shard_fold_interval`] is carried
-    /// there. Without this line the field would be declarable in YAML and unread, which is the
-    /// shape of defect the `st_size` fold's own wiring had to go back and fix.
-    #[serde(default = "default_tail_floor_bytes")]
-    pub tail_floor_bytes: u64,
-
-    /// Per-shard rank cap on Tail_Partition members, from
-    /// `cache.shared_storage.tail_max_entries` (default: 4096). See
-    /// [`Self::tail_floor_bytes`] for why it is carried here.
+    /// there. There is no floor beside it: every range is a member, subject only to this cap
+    /// (`cache.shared_storage.tail_floor_bytes` is deprecated and has no effect).
     #[serde(default = "default_tail_max_entries")]
     pub tail_max_entries: usize,
 }
@@ -99,11 +93,6 @@ fn default_incomplete_upload_ttl() -> Duration {
 
 /// Read off `SharedStorageConfig::default()` rather than restated, so the figure has one source
 /// and cannot drift from the one `config/config.example.yaml` documents.
-fn default_tail_floor_bytes() -> u64 {
-    crate::config::SharedStorageConfig::default().tail_floor_bytes
-}
-
-/// See [`default_tail_floor_bytes`] for why this defers rather than restating 4096.
 fn default_tail_max_entries() -> usize {
     crate::config::SharedStorageConfig::default().tail_max_entries
 }
@@ -118,7 +107,6 @@ impl Default for CacheSizeConfig {
             validation_max_duration: Duration::from_secs(4 * 3600), // 4 hours
             validation_threshold_warn: 5.0,
             validation_threshold_error: 20.0,
-            tail_floor_bytes: default_tail_floor_bytes(),
             tail_max_entries: default_tail_max_entries(),
         }
     }
@@ -142,7 +130,6 @@ impl CacheSizeConfig {
             validation_max_duration: shared.validation_max_duration,
             validation_threshold_warn: shared.validation_threshold_warn,
             validation_threshold_error: shared.validation_threshold_error,
-            tail_floor_bytes: shared.tail_floor_bytes,
             tail_max_entries: shared.tail_max_entries,
             ..Self::default()
         }
@@ -159,7 +146,6 @@ mod from_shared_storage_tests {
             validation_max_duration: Duration::from_secs(1234),
             validation_threshold_warn: 7.5,
             validation_threshold_error: 33.0,
-            tail_floor_bytes: 2 * 1024 * 1024,
             tail_max_entries: 77,
             ..crate::config::SharedStorageConfig::default()
         };
@@ -168,7 +154,6 @@ mod from_shared_storage_tests {
         assert_eq!(c.validation_max_duration, Duration::from_secs(1234));
         assert_eq!(c.validation_threshold_warn, 7.5);
         assert_eq!(c.validation_threshold_error, 33.0);
-        assert_eq!(c.tail_floor_bytes, 2 * 1024 * 1024);
         assert_eq!(c.tail_max_entries, 77);
     }
 }
@@ -377,9 +362,7 @@ struct ScanFileResult {
     ///
     /// **This is set from `path.exists()`, deliberately, not from the return value of
     /// the deleting call.** Those return values do not answer the question the census
-    /// asks. `check_and_invalidate_expired_write_cache` returns `Ok(true)` even when
-    /// its own `remove_file` failed (`src/cache.rs:10933`, whose `metadata_deleted`
-    /// flag gates only the decrement), `invalidate_cache` returns `Ok(())` without
+    /// asks. `invalidate_cache` returns `Ok(())` without
     /// promising which paths went, and the unparseable arm's `remove_file` can fail on
     /// a read-only or contended volume. Each of those is a case where the `.meta`
     /// survives and must still be counted. Reading the filesystem asks the predicate
@@ -391,7 +374,7 @@ struct ScanFileResult {
     ///
     /// Spec: cache-eviction-at-scale. Requirements: 7.1
     meta_removed: bool,
-    /// This `.meta`'s above-floor ranges, as Tail_Partition records.
+    /// This `.meta`'s ranges, as Tail_Partition records.
     ///
     /// # Non-empty exactly when this arm counted the entry's real bytes
     ///
@@ -418,16 +401,16 @@ struct ScanFileResult {
     /// census describes the population before the pass's own debits, the same population
     /// its baseline counted. Without it the entry is debited twice.
     ///
-    /// The rolling pass must NOT add it back. Its install is absolute and is followed by
-    /// `reset_all_delta_files` and a reset of this instance's accumulator, so the arm's
-    /// pending debit is discarded and the post-removal census alone carries the removal.
-    /// Adding it back there counts the removal zero times. Pinned by
-    /// `rolling_self_debit_tests`.
+    /// The rolling pass adds it back too. Its install is relative to a snapshot read before
+    /// the cycle's first visit, so the arm's debit reaches `size_state.json` through the delta
+    /// files after that snapshot, as in the full scan. Leaving it out counts the removal
+    /// twice. Pinned by `rolling_self_debit_tests`.
     self_debit: ScanSelfDebit,
 }
 
 /// The figures a scan arm's own mutation debited through the size accumulator; see
-/// [`ScanFileResult::self_debit`]. Summed per pass by the full scan only.
+/// [`ScanFileResult::self_debit`]. Summed per pass by the full scan and per visit by the
+/// rolling pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ScanSelfDebit {
     /// Compressed bytes the arm's mutation debited from `total_size`.
@@ -455,10 +438,15 @@ struct ShardVisitResult {
     cache_skipped: u64,
     cache_errors: u64,
     staged_paths: Vec<PathBuf>,
+    /// What this visit's own arms debited; see [`ScanFileResult::self_debit`].
+    self_debit: ScanSelfDebit,
 }
 
 impl ShardVisitResult {
     fn absorb(&mut self, other: &ShardVisitResult) {
+        self.self_debit.bytes += other.self_debit.bytes;
+        self.self_debit.staged_bytes += other.self_debit.staged_bytes;
+        self.self_debit.objects += other.self_debit.objects;
         self.size_bytes += other.size_bytes;
         self.staged_bytes += other.staged_bytes;
         self.objects_visited += other.objects_visited;
@@ -506,26 +494,24 @@ impl PartialOrd for SmallestFirst {
 /// # The heap is bounded per SHARD, and that is the point
 ///
 /// At most `cap` records are resident for this shard at any moment, so a shard holding ten
-/// million above-floor ranges costs `cap` records of memory rather than ten million. A `Vec`
+/// million ranges costs `cap` records of memory rather than ten million. A `Vec`
 /// sorted at the end is the obvious shape and is the wrong one.
 #[derive(Debug)]
 struct ShardTailBuild {
     bucket: String,
     l1: String,
-    floor: u64,
     cap: usize,
     heap: std::collections::BinaryHeap<SmallestFirst>,
-    /// Above-floor ranges offered to this build, whether kept or discarded. The discriminator
-    /// between "this shard has few large ranges" and "the cap is binding".
+    /// Ranges offered to this build, whether kept or discarded. The discriminator between
+    /// "this shard has few ranges" and "the cap is binding".
     considered: u64,
 }
 
 impl ShardTailBuild {
-    fn new(bucket: String, l1: String, floor: u64, cap: usize) -> Self {
+    fn new(bucket: String, l1: String, cap: usize) -> Self {
         Self {
             bucket,
             l1,
-            floor,
             // A zero cap would make `push` pop what it just pushed forever. Configuration
             // validation rejects 0, so this only guards a hand-built literal in a test.
             cap: cap.max(1),
@@ -534,8 +520,8 @@ impl ShardTailBuild {
         }
     }
 
-    /// Offer one record. Sub-floor records are not offered — the caller filters, so
-    /// `considered` counts exactly the above-floor population.
+    /// Offer one record. Every range is offered, so `considered` counts the shard's whole
+    /// population as this build saw it.
     fn push(&mut self, record: TailRecord) {
         self.considered = self.considered.saturating_add(1);
         self.heap.push(SmallestFirst(record));
@@ -547,13 +533,22 @@ impl ShardTailBuild {
         }
     }
 
+    /// Merge another build of the same shard into this one, keeping the top `cap` of both.
+    fn absorb(&mut self, other: ShardTailBuild) {
+        let total = self.considered.saturating_add(other.considered);
+        for record in other.heap {
+            self.push(record.0);
+        }
+        // `push` counted `other`'s kept records again; the population both builds saw is this.
+        self.considered = total;
+    }
+
     /// The finished partition, `compressed_size` descending.
     fn finish(self) -> ShardTailPartition {
         let cap_bound = self.considered > self.cap as u64;
         ShardTailPartition {
             bucket: self.bucket,
             l1: self.l1,
-            floor: self.floor,
             cap: self.cap,
             considered: self.considered,
             cap_bound,
@@ -572,7 +567,6 @@ impl ShardTailBuild {
 struct ShardTailPartition {
     bucket: String,
     l1: String,
-    floor: u64,
     cap: usize,
     considered: u64,
     /// Whether the cap discarded anything for this shard on this rebuild.
@@ -613,7 +607,7 @@ pub(crate) fn tail_partition_path(cache_dir: &std::path::Path, bucket: &str, l1:
 /// `{cache_dir}/metadata/_shard_state/{instance_id}.tail-delta`.
 ///
 /// **Flat at the `_shard_state` root, not per shard.** The file holds every shard's recent
-/// above-floor admissions for one instance, which is what makes the append a single `O_APPEND`
+/// admissions for one instance, which is what makes the append a single `O_APPEND`
 /// write on the consolidation path rather than one file open per shard touched.
 pub(crate) fn tail_delta_path(cache_dir: &std::path::Path, instance_id: &str) -> PathBuf {
     cache_dir
@@ -712,6 +706,340 @@ pub(crate) fn tail_built_at_for(
         .and_then(|c| c.other.get("tail_built_at").and_then(|v| v.as_u64()))
 }
 
+/// Install `tail_floor`, `tail_entries` and `tail_built_at` into one shard's § 3.2 checkpoint,
+/// preserving every field this producer does not own.
+///
+/// # A third producer of one document, following the second producer's shape
+///
+/// `StagedShardCheckpoint` already has two producers: the staged fold owns five struct fields
+/// and the `st_size` fold owns six keys inside `other`. A partition rebuild is the third, and it
+/// owns three keys. So the install is a read-modify-write under the same per-document lock
+/// `crate::st_size_fold::install_fold_fields` takes, and for the same reasons — two
+/// unsynchronised read-modify-writes lose one producer's update silently, and the loser's write
+/// is a complete, parseable, wrong document.
+///
+/// **Not `staged_fold::install_preserving_foreign_fields`**, which is the staged fold's own
+/// installer: it takes a whole `StagedShardCheckpoint` and writes that value's five staged-owned
+/// fields, so a caller from here would have to invent them and would overwrite a real staged
+/// figure with a fabricated one.
+///
+/// `tail_floor` is always written as 0: the floor no longer exists, and the key stays so a
+/// reader of the document finds the floor the partition was built with.
+///
+/// `built_at` is when the rebuild STARTED reading `.meta` files, never when it finished. The
+/// cross-shard tail-delta sweep retires a record older than this, and a record appended after
+/// the rebuild read its `.meta` is not in the partition, so stamping the finish would retire it.
+/// The rolling pass passes its install time, which is its existing behaviour.
+///
+/// Best-effort, like the lock itself: a failure leaves the shard without these figures, which
+/// reads as "not yet rebuilt" rather than as a wrong figure.
+pub(crate) fn install_tail_checkpoint_fields_in(
+    cache_dir: &std::path::Path,
+    bucket: &str,
+    l1: &str,
+    entries: usize,
+    built_at: u64,
+) {
+    use crate::staged_fold::{lock_checkpoint_document, Shard, StagedShardCheckpoint};
+
+    let shard = Shard::new(bucket.to_string(), l1.to_string());
+    // Held until this function returns, which is after the install.
+    let _lock = lock_checkpoint_document(cache_dir, &shard);
+    let mut checkpoint = match StagedShardCheckpoint::load(cache_dir, &shard) {
+        Ok(Some(c)) => c,
+        Ok(None) => StagedShardCheckpoint::unfolded_for(&shard),
+        Err(e) => {
+            warn!(
+                "Tail_Partition {}: a checkpoint exists and could not be read ({}); not \
+                 installing tail_floor/tail_entries rather than overwriting it",
+                shard, e
+            );
+            return;
+        }
+    };
+    checkpoint
+        .other
+        .insert("tail_floor".to_string(), 0u64.into());
+    checkpoint
+        .other
+        .insert("tail_entries".to_string(), (entries as u64).into());
+    // A THIRD key, and § 3.2's record names only the two above. It is here because § 4.4's
+    // cross-shard tail-delta sweep has to compare a record's append time against this shard's
+    // last REBUILD, and neither existing timestamp is this producer's.
+    checkpoint
+        .other
+        .insert("tail_built_at".to_string(), built_at.into());
+    if let Err(e) = checkpoint.install(cache_dir) {
+        warn!(
+            "Tail_Partition {}: failed to install tail_floor/tail_entries: {}",
+            shard, e
+        );
+    }
+}
+
+/// Every `(bucket, XX)` shard directory under `metadata/`, partition or not.
+///
+/// One `read_dir` of `metadata/` plus one per bucket: `256 × buckets` entries, no `.meta` read.
+/// Names starting with `_` (`_journals`, `_shard_state`, `_write_ledger`) are not buckets.
+pub(crate) fn enumerate_metadata_shards(cache_dir: &std::path::Path) -> Vec<(String, String)> {
+    let root = cache_dir.join("metadata");
+    let mut out = Vec::new();
+    let Ok(buckets) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for bucket_entry in buckets.flatten() {
+        let Some(bucket) = bucket_entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if bucket.starts_with('_') || !bucket_entry.path().is_dir() {
+            continue;
+        }
+        let Ok(shards) = std::fs::read_dir(bucket_entry.path()) else {
+            continue;
+        };
+        for shard_entry in shards.flatten() {
+            if !crate::disk_cache::is_shard_subdirectory(&shard_entry) {
+                continue;
+            }
+            if let Some(l1) = shard_entry.file_name().to_str() {
+                out.push((bucket.clone(), l1.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// What one lazy partition rebuild read and wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LazyTailRebuild {
+    /// `.meta` files read and parsed: the rebuild's cost term.
+    pub metas_parsed: u64,
+    /// Members written.
+    pub entries: usize,
+    /// When the rebuild began reading, nanoseconds: the cut for
+    /// [`retire_delta_records_for_lazy_rebuilds`].
+    pub started_at: u64,
+    /// Leaf directories and `.meta` files the rebuild could not read (an I/O error other than
+    /// not-found). Non-zero means the partition may miss ranges the shard holds: it is then
+    /// installed with `tail_built_at` 0, so no selection reads it as freshly rebuilt and the
+    /// next short selection rebuilds it again, and no tail-delta record is retired against it.
+    pub read_gaps: u64,
+}
+
+/// Retire, in one pass over the tail-delta files, every record for a lazily rebuilt shard that
+/// was appended before that shard's rebuild began.
+///
+/// Such a record's range was in its `.meta` by the time the rebuild read it (the append follows
+/// the `.meta` write), so the partition holds it unless the rank cap dropped it or it has since
+/// gone. A record appended after the start is kept. One call per selection rather than one per
+/// shard, so a pass that rebuilds 64 shards reads each instance's delta once, not 64 times.
+pub(crate) fn retire_delta_records_for_lazy_rebuilds(
+    cache_dir: &std::path::Path,
+    rebuilt: &[(String, String, u64)],
+) -> u64 {
+    if rebuilt.is_empty() {
+        return 0;
+    }
+    let cut: std::collections::HashMap<(&str, &str), u64> = rebuilt
+        .iter()
+        .map(|(b, s, at)| ((b.as_str(), s.as_str()), *at))
+        .collect();
+    let retire: std::collections::HashSet<TailDeltaIdentity> =
+        read_all_tail_delta_records(cache_dir)
+            .into_iter()
+            .filter(|r| {
+                cut.get(&(r.bucket.as_str(), r.l1.as_str()))
+                    .is_some_and(|&started_at| r.at < started_at)
+            })
+            .map(|r| r.identity())
+            .collect();
+    retire_tail_delta_records(cache_dir, &retire)
+}
+
+/// Rebuild one shard's Tail_Partition from its `.meta` files, outside the rolling pass.
+///
+/// Called by read-tier selection when the index cannot answer a pass: the shard has no
+/// partition, or its partition was read to the end and the pass still fell short. The rolling
+/// pass rebuilds every shard once a rotation, which at the design point is days, so without
+/// this a shard's index is only as fresh as its last rolling visit.
+///
+/// # Cost
+///
+/// O(objects in the shard) `.meta` reads and parses and nothing else: no `stat` per range, no
+/// write beyond the partition, its checkpoint keys and the delta retire. The rolling pass's
+/// side effects (expiry deletes, self-heal, size installs) are not taken here; this is a read.
+///
+/// # Why it cannot cause a wrong deletion
+///
+/// The partition is a hint. Selection verifies every record against the `.meta` it reads
+/// (§ 5.4) and the executor deletes only what the `.meta` lists under the key's slot lock, so a
+/// rebuild racing a write, or two rebuilds racing each other, can only cost a skipped or a
+/// missing candidate. The file is published whole by `write_atomic`, whose temp name carries
+/// the host and pid, so two concurrent rebuilds publish one complete file or the other.
+///
+/// # The delta retire
+///
+/// Not done here: the caller retires the records of every shard it rebuilt in one call to
+/// [`retire_delta_records_for_lazy_rebuilds`], with the `started_at` this returns.
+///
+/// `None` when the shard directory could not be listed or the partition could not be written;
+/// nothing is retired then, and the previous partition (if any) stays in place.
+pub(crate) async fn rebuild_tail_partition_lazily(
+    cache_dir: &std::path::Path,
+    bucket: &str,
+    l1: &str,
+    cap: usize,
+) -> Option<LazyTailRebuild> {
+    let started_at = tail_now_nanos();
+    let dir = cache_dir.to_path_buf();
+    let (b, s) = (bucket.to_string(), l1.to_string());
+    let built =
+        tokio::task::spawn_blocking(move || build_shard_tail_partition_blocking(&dir, &b, &s, cap))
+            .await
+            .ok()
+            .flatten()?;
+    let (partition, metas_parsed, read_gaps) = built;
+
+    let path = tail_partition_path(cache_dir, bucket, l1);
+    let mut body = String::new();
+    for record in &partition.records {
+        if let Ok(line) = serde_json::to_string(record) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(
+                "Tail_Partition {}/{}: lazy rebuild could not create {:?}: {}",
+                bucket, l1, parent, e
+            );
+            return None;
+        }
+    }
+    if let Err(e) = crate::disk_cache::write_atomic(&path, body.as_bytes()).await {
+        warn!(
+            "Tail_Partition {}/{}: lazy rebuild failed to write {:?}: {}. The previous \
+             partition stays in place and no tail-delta record is retired.",
+            bucket, l1, path, e
+        );
+        return None;
+    }
+    record_tail_rebuild(&partition.records);
+    let entries = partition.records.len();
+
+    let dir = cache_dir.to_path_buf();
+    let (b, s) = (bucket.to_string(), l1.to_string());
+    // A rebuild with read gaps is not evidence of what the shard holds: stamped 0, it is never
+    // read as fresh, and the cross-shard sweep retires nothing against it.
+    let built_at = if read_gaps > 0 { 0 } else { started_at };
+    let _ = tokio::task::spawn_blocking(move || {
+        install_tail_checkpoint_fields_in(&dir, &b, &s, entries, built_at);
+    })
+    .await;
+    if partition.cap_bound {
+        debug!(
+            "Tail_Partition {}/{}: lazy rebuild kept the largest {} of {} ranges",
+            bucket, l1, partition.cap, partition.considered
+        );
+    }
+    Some(LazyTailRebuild {
+        metas_parsed,
+        entries,
+        started_at,
+        read_gaps,
+    })
+}
+
+/// The blocking half of [`rebuild_tail_partition_lazily`]: list `metadata/{bucket}/{XX}/*/`,
+/// parse every `.meta`, keep the largest `cap` ranges.
+///
+/// `None` when the shard directory itself cannot be listed: an empty partition would claim the
+/// shard holds nothing, and this read did not establish that. An unreadable leaf or document is
+/// skipped; the rebuild is a hint and the next one picks it up.
+fn build_shard_tail_partition_blocking(
+    cache_dir: &std::path::Path,
+    bucket: &str,
+    l1: &str,
+    cap: usize,
+) -> Option<(ShardTailPartition, u64, u64)> {
+    let l1_dir = cache_dir.join("metadata").join(bucket).join(l1);
+    let leaves = match std::fs::read_dir(&l1_dir) {
+        Ok(entries) => entries,
+        // No directory: the shard holds nothing, which IS established, so an empty partition is
+        // the truthful one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some((
+                ShardTailBuild::new(bucket.to_string(), l1.to_string(), cap).finish(),
+                0,
+                0,
+            ));
+        }
+        Err(_) => return None,
+    };
+    use rayon::prelude::*;
+
+    // The leaves are read in parallel on rayon's pool, as the rolling visit reads its shards:
+    // each `.meta` read is a round trip on shared storage, so a serial walk of one shard is
+    // latency-bound. Each worker keeps its own capped heap; the heaps are merged at the end, so
+    // memory stays `cap` records per worker whatever the shard holds.
+    let leaf_dirs: Vec<PathBuf> = leaves
+        .flatten()
+        .filter(crate::disk_cache::is_shard_subdirectory)
+        .map(|leaf| leaf.path())
+        .collect();
+    let new_build = || {
+        (
+            ShardTailBuild::new(bucket.to_string(), l1.to_string(), cap),
+            0u64,
+            0u64,
+        )
+    };
+    let (tail, parsed, gaps) = leaf_dirs
+        .par_iter()
+        .fold(new_build, |(mut tail, mut parsed, mut gaps), leaf| {
+            let files = match std::fs::read_dir(leaf) {
+                Ok(files) => files,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (tail, parsed, gaps),
+                Err(_) => return (tail, parsed, gaps + 1),
+            };
+            for file in files {
+                let Ok(file) = file else {
+                    gaps += 1;
+                    continue;
+                };
+                let path = file.path();
+                if path.extension().is_none_or(|ext| ext != "meta") {
+                    continue;
+                }
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(content) => content,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        gaps += 1;
+                        continue;
+                    }
+                };
+                parsed += 1;
+                let Ok(metadata) =
+                    serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content)
+                else {
+                    continue;
+                };
+                for record in CacheSizeTracker::tail_candidates_for(&metadata, &path) {
+                    tail.push(record);
+                }
+            }
+            (tail, parsed, gaps)
+        })
+        .reduce(new_build, |(mut a, pa, ga), (b, pb, gb)| {
+            a.absorb(b);
+            (a, pa + pb, ga + gb)
+        });
+    Some((tail.finish(), parsed, gaps))
+}
+
 /// Nanoseconds since the epoch. Never seconds — see [`TailDeltaRecord::at`].
 fn tail_now_nanos() -> u64 {
     SystemTime::now()
@@ -759,7 +1087,7 @@ fn systime_nanos(t: SystemTime) -> u64 {
 ///
 /// **Why the cap belongs here and not at the read.** § 4.5 reads all delta records for all
 /// instances on every pass, and the delta's length is
-/// `(above-floor admission rate) × (rotation period)` with § 16.5 making the rotation period grow
+/// `(admission rate) × (rotation period)` with § 16.5 making the rotation period grow
 /// with N — so the read is O(N) in the limit however bounded the partition prefixes are. Capping
 /// only the *read* does not work, because a prefix of an **append-ordered** file is an arbitrary
 /// subset rather than a top-N. The file itself has to be size-ordered-and-capped, and that means
@@ -1079,14 +1407,13 @@ static TAIL_ENTRIES_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// The smallest member `compressed_size` of the most recently rebuilt shard's partition, plus
 /// one, so 0 is "no rebuild yet, or the last rebuilt partition was empty".
 static TAIL_EFFECTIVE_MIN_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The floor and cap the tracker in this process was constructed with.
+/// The cap the tracker in this process was constructed with.
 ///
-/// Published so the values **in force** are readable from `/metrics` rather than inferred from
+/// Published so the value **in force** is readable from `/metrics` rather than inferred from
 /// the configuration file. A gauge that restated the default would be indistinguishable from one
 /// reporting a value the pass actually reads, which is the shape of the `st_size` fold's wiring
-/// defect; these are stored by [`CacheSizeTracker::new`] from its own `CacheSizeConfig`, so they
-/// are the same values the rebuild consults.
-static TAIL_FLOOR_IN_FORCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// defect; this is stored by [`CacheSizeTracker::new`] from its own `CacheSizeConfig`, so it is
+/// the value the rebuild consults.
 static TAIL_CAP_IN_FORCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn record_tail_rebuild(records: &[TailRecord]) {
@@ -1099,11 +1426,9 @@ fn record_tail_rebuild(records: &[TailRecord]) {
     TAIL_EFFECTIVE_MIN_LAST.store(min.map_or(0, |m| m.saturating_add(1)), Ordering::Relaxed);
 }
 
-/// Publish the floor and cap this process's tracker holds. Called once, from
-/// [`CacheSizeTracker::new`].
-fn publish_tail_config_in_force(floor: u64, cap: usize) {
+/// Publish the cap this process's tracker holds. Called once, from [`CacheSizeTracker::new`].
+fn publish_tail_config_in_force(cap: usize) {
     use std::sync::atomic::Ordering;
-    TAIL_FLOOR_IN_FORCE.store(floor, Ordering::Relaxed);
     TAIL_CAP_IN_FORCE.store(cap as u64, Ordering::Relaxed);
 }
 
@@ -1128,7 +1453,9 @@ fn publish_tail_config_in_force(floor: u64, cap: usize) {
 /// Spec: cache-eviction-at-scale § 4.2, § 4.4. Requirements: 3.4.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailPartitionGauges {
-    /// The floor **in force in this process**, from `cache.shared_storage.tail_floor_bytes`.
+    /// Always 0. Every range is a Tail_Partition member subject only to the rank cap;
+    /// `cache.shared_storage.tail_floor_bytes` is deprecated and has no effect. Still published
+    /// so a dashboard reading the series does not break.
     pub tail_floor_bytes: u64,
     /// The per-shard rank cap in force in this process.
     pub tail_max_entries: u64,
@@ -1139,8 +1466,8 @@ pub struct TailPartitionGauges {
     /// reading and must be distinguishable from "no rebuild yet".
     pub tail_entries_last_rebuild: Option<u64>,
     /// The smallest `compressed_size` in the most recently rebuilt shard's partition: that
-    /// shard's effective byte threshold, which is `tail_floor_bytes` only while the cap is not
-    /// binding. Per-instance, and one shard's figure, not a minimum across shards. `None` before
+    /// shard's effective byte threshold, which is above the shard's smallest range only while
+    /// the cap is binding. Per-instance, and one shard's figure, not a minimum across shards. `None` before
     /// this process has rebuilt a shard, or when the last rebuilt partition had no members.
     #[serde(default)]
     pub tail_effective_min_bytes: Option<u64>,
@@ -1159,7 +1486,7 @@ pub(crate) fn collect_tail_partition_gauges(cache_dir: &std::path::Path) -> Tail
     use std::sync::atomic::Ordering;
     let last = TAIL_ENTRIES_LAST.load(Ordering::Relaxed);
     TailPartitionGauges {
-        tail_floor_bytes: TAIL_FLOOR_IN_FORCE.load(Ordering::Relaxed),
+        tail_floor_bytes: 0,
         tail_max_entries: TAIL_CAP_IN_FORCE.load(Ordering::Relaxed),
         tail_rebuilds_total: TAIL_REBUILDS_TOTAL.load(Ordering::Relaxed),
         tail_entries_last_rebuild: last.checked_sub(1),
@@ -1223,8 +1550,8 @@ pub(crate) fn is_stub_metadata(metadata: &crate::cache_types::NewCacheMetadata) 
         && om.parts.is_empty()
 }
 
-/// Test-only hook into the full-scan walk, keyed by cache directory so concurrent
-/// tests on other `TempDir`s are unaffected.
+/// Test-only hooks into the full-scan walk and the rolling visit loop, keyed by cache
+/// directory so concurrent tests on other `TempDir`s are unaffected.
 #[cfg(test)]
 pub(crate) mod test_seams {
     use std::path::{Path, PathBuf};
@@ -1245,6 +1572,30 @@ pub(crate) mod test_seams {
     pub(crate) fn after_full_scan_walk(dir: &Path) {
         let hook = {
             let mut hooks = AFTER_FULL_SCAN_WALK.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(d, _)| d.as_path() == dir)
+                .map(|i| hooks.remove(i).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    static AFTER_ROLLING_VISIT: Mutex<Vec<(PathBuf, WalkHook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` once, after the next rolling visit under `dir` returns and before its write
+    /// phase: a write landing after the cycle's snapshot, in a slot the cycle has visited.
+    pub(crate) fn set_after_rolling_visit(dir: &Path, hook: WalkHook) {
+        AFTER_ROLLING_VISIT
+            .lock()
+            .unwrap()
+            .push((dir.to_path_buf(), hook));
+    }
+
+    pub(crate) fn after_rolling_visit(dir: &Path) {
+        let hook = {
+            let mut hooks = AFTER_ROLLING_VISIT.lock().unwrap();
             hooks
                 .iter()
                 .position(|(d, _)| d.as_path() == dir)
@@ -1303,7 +1654,6 @@ pub(crate) fn reset_tail_counters_for_tests() {
     TAIL_REBUILDS_TOTAL.store(0, Ordering::SeqCst);
     TAIL_ENTRIES_LAST.store(0, Ordering::SeqCst);
     TAIL_EFFECTIVE_MIN_LAST.store(0, Ordering::SeqCst);
-    TAIL_FLOOR_IN_FORCE.store(0, Ordering::SeqCst);
     TAIL_CAP_IN_FORCE.store(0, Ordering::SeqCst);
 }
 
@@ -1347,8 +1697,8 @@ const DEFAULT_TAIL_PREFIX_DEPTH: usize = 64;
 /// What a bounded prefix read of one shard's Tail_Partition found.
 ///
 /// **`Absent` and an empty `Present` are different states and § 4.1 rules on the difference**:
-/// a partition file that exists and holds zero records means the shard has no members above
-/// `tail_floor_bytes` (§ 4.3's regime, where `TAIL_EMPTY` is the correct selection outcome),
+/// a partition file that exists and holds zero records means the shard held no ranges when it
+/// was last rebuilt (where `TAIL_EMPTY` is the correct selection outcome until a rebuild),
 /// while an absent file means the shard has not been visited since the partition scheme was
 /// introduced and selection therefore has *no information* about it. Collapsing the two lets a
 /// cold volume report `TAIL_EMPTY` — a claim that the cache holds nothing large — when what it
@@ -1660,7 +2010,7 @@ pub(crate) fn initial_prefix_depth(
 ///
 /// § 4.5 as written reads **all** tail-delta records for all instances on every pass while every
 /// partition read is a bounded prefix, and the delta's size is
-/// `(above-floor admission rate) × (rotation period)` with § 16.5 making the rotation period grow
+/// `(admission rate) × (rotation period)` with § 16.5 making the rotation period grow
 /// with N. A bounded partition read beside an unbounded delta read is not a bounded pass, and
 /// that is the R3.3 violation this unit exists to remove.
 ///
@@ -1677,12 +2027,9 @@ pub(crate) fn initial_prefix_depth(
 /// Soundness is § 4.2's lemma, unchanged: per-instance admission sets are **disjoint**, since an
 /// instance appends only its own admissions, so each keeping its own top-`cap` means any range in
 /// the global top-K is present for `K <= cap`.
-pub(crate) fn read_tail_delta_candidates(
-    cache_dir: &std::path::Path,
-    cap: usize,
-) -> Vec<TailDeltaRecord> {
+pub(crate) fn read_tail_delta_candidates(cache_dir: &std::path::Path, cap: usize) -> TailDeltaRead {
     let cap = cap.max(1);
-    let mut out: Vec<TailDeltaRecord> = Vec::new();
+    let mut out = TailDeltaRead::default();
     for path in tail_delta_files(cache_dir) {
         let records = read_tail_delta_file(&path);
         if records.len() > cap.saturating_mul(2) {
@@ -1695,17 +2042,39 @@ pub(crate) fn read_tail_delta_candidates(
                 cap
             );
         }
+        out.dropped = out
+            .dropped
+            .saturating_add(records.len().saturating_sub(cap));
         let mut heap: std::collections::BinaryHeap<SmallestFirstDelta> =
             std::collections::BinaryHeap::new();
         for record in records {
             heap.push(SmallestFirstDelta(record));
             if heap.len() > cap {
-                heap.pop();
+                if let Some(dropped) = heap.pop() {
+                    out.dropped_bytes = out
+                        .dropped_bytes
+                        .saturating_add(dropped.0.record.compressed_size);
+                }
             }
         }
-        out.extend(heap.into_iter().map(|s| s.0));
+        out.records.extend(heap.into_iter().map(|s| s.0));
     }
     out
+}
+
+/// What [`read_tail_delta_candidates`] read.
+#[derive(Debug, Default)]
+pub(crate) struct TailDeltaRead {
+    /// Each instance's largest `cap` records.
+    pub records: Vec<TailDeltaRecord>,
+    /// Records a file held past `cap`, the smallest, which `records` omits. A file holds up to
+    /// `2 × cap` between compactions, so this is often non-zero on a busy proxy; a sum over
+    /// `records` then misses these records' bytes.
+    pub dropped: usize,
+    /// Σ `compressed_size` over the dropped records, staged or not and whether or not another
+    /// record names the same range: an upper bound on the evictable bytes they name, summed in
+    /// the same pass that keeps the largest `cap`.
+    pub dropped_bytes: u64,
 }
 
 /// A [`TailDeltaRecord`] ordered so a `BinaryHeap` of them is a **min**-heap on
@@ -1874,11 +2243,10 @@ const DRIFT_REASON_FIGURE_NOT_SUPPLIED: &str = "figure_not_supplied";
 /// the persisted counter, so the difference is the correction term rather than a disagreement
 /// between two producers.
 pub const DRIFT_REASON_REFERENCE_IS_EXTRAPOLATION: &str = "reference_is_extrapolation";
-/// `unevaluable_reason` for the write-cache figure of a full scan at staged-authority epoch 1:
-/// the scan's census is compared with the event-maintained counter, which is no longer the
-/// authority and is not debited at graduation, so the difference is the graduated bytes and not
-/// a disagreement between two producers.
-pub const DRIFT_REASON_WRITE_CACHE_AT_FOLD_EPOCH: &str = "staged_authority_epoch_1";
+/// `unevaluable_reason` for the write-cache figure of a full scan at staged-authority epoch 1
+/// when the recomputed staged figure could not be derived with the baseline: there is no term to
+/// compare the census with. With a figure, the census is compared with it.
+pub const DRIFT_REASON_STAGED_FIGURE_UNKNOWN: &str = "staged_figure_unknown";
 /// `unevaluable_reason` for the RATIO only: the reference figure is zero, so there is no
 /// denominator. The absolute `drift` is still published.
 const DRIFT_REASON_REFERENCE_ZERO: &str = "reference_zero";
@@ -1898,7 +2266,9 @@ const DRIFT_REASON_REFERENCE_ZERO: &str = "reference_zero";
 /// the two terms that could not be compared.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountingDriftGauge {
-    /// The running counter as it stood before this validation installed over it.
+    /// The running counter as it stood before this validation installed over it. For a full
+    /// scan's write-cache figure at staged-authority epoch 1, the recomputed staged figure read
+    /// with the baseline ([`AccountingDriftSample::compare_write_cache_with`]).
     pub persisted: Option<u64>,
     /// The figure the validation computed and installed.
     pub reference: Option<u64>,
@@ -1986,7 +2356,8 @@ pub struct AccountingDriftSample {
     pub sample_kind: String,
     /// `size_state.total_size` against the validation's total.
     pub total_size: AccountingDriftGauge,
-    /// `size_state.write_cache_size` against the validation's staged total.
+    /// `size_state.write_cache_size` against the validation's staged total, or at
+    /// staged-authority epoch 1 the recomputed staged figure against it.
     pub write_cache_size: AccountingDriftGauge,
     /// `size_state.cached_objects` against the validation's object count.
     ///
@@ -2027,6 +2398,14 @@ impl AccountingDriftSample {
             write_cache_size: AccountingDriftGauge::new(guard(p_write), r_write, blanket),
             cached_objects: AccountingDriftGauge::new(guard(p_objects), r_objects, blanket),
         }
+    }
+
+    /// Compare the write-cache census with `persisted` instead of the counter: at
+    /// staged-authority epoch 1 the figure eviction decisions use is the fold's, and graduation
+    /// does not debit the counter.
+    pub fn compare_write_cache_with(&mut self, persisted: u64) {
+        self.write_cache_size =
+            AccountingDriftGauge::new(Some(persisted), self.write_cache_size.reference, None);
     }
 
     /// Publish the write-cache figure as not evaluable for `reason`, whatever the comparison
@@ -2164,6 +2543,10 @@ pub struct CacheSizeMetrics {
 
     /// Current delta log size in bytes
     pub delta_log_size: u64,
+    /// Rolling validation cycles this process skipped, cursor unchanged and nothing installed,
+    /// because the cycle's snapshot could not take `global_consolidation.lock` within its
+    /// 12 x 250 ms budget.
+    pub rolling_snapshot_lock_aborts_total: u64,
 }
 
 /// Scan mode for the periodic validation scan.
@@ -2313,6 +2696,10 @@ pub struct CacheSizeTracker {
     /// The startup request the scheduler serves before its daily window, if any. See
     /// [`CacheSizeTracker::request_validation`].
     validation_request: Mutex<Option<ValidationRequest>>,
+    /// Rolling cycles this process skipped because the snapshot could not take
+    /// `global_consolidation.lock` inside `WRITE_PHASE_LOCK_ATTEMPTS`, published as
+    /// `cache_size.rolling_snapshot_lock_aborts_total`.
+    rolling_snapshot_lock_aborts: std::sync::atomic::AtomicU64,
 }
 
 /// The floor on the wait before retrying a validation pass that did not run (lost
@@ -2416,13 +2803,14 @@ impl CacheSizeTracker {
             validation_attempts: std::sync::atomic::AtomicU64::new(0),
             no_metadata_logged: std::sync::atomic::AtomicBool::new(false),
             validation_request: Mutex::new(None),
+            rolling_snapshot_lock_aborts: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Publish the Tail_Partition floor and cap this tracker holds, so `/metrics` reports the
         // values actually in force rather than restating a default. Taken from `config`, which is
         // the same struct the rebuild reads, so the gauge cannot agree with the rebuild while
         // both disagree with the operator.
-        publish_tail_config_in_force(config.tail_floor_bytes, config.tail_max_entries);
+        publish_tail_config_in_force(config.tail_max_entries);
 
         // Note: Size will be loaded from disk on first access
         // We can't call async get_size() here in the constructor
@@ -2530,6 +2918,9 @@ impl CacheSizeTracker {
             // eviction trigger reads, so the two dimensions' hysteresis cannot drift apart.
             checkpoint_count: 0, // Deprecated - consolidator handles persistence
             delta_log_size: 0,   // Deprecated - always 0; delta files exist but are not a log
+            rolling_snapshot_lock_aborts_total: self
+                .rolling_snapshot_lock_aborts
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -2973,6 +3364,55 @@ impl CacheSizeTracker {
     /// return tuple, which is `pub` and has existing unit-test call sites.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 6.3
+    /// What the corrupt records may still count after a rolling install over `slots` slots,
+    /// `records` being the records whose delta file was renamed aside as corrupt, with their
+    /// bytes, at the snapshot of a cycle that read `tracked_size`.
+    ///
+    /// # Exactly what the figure has not counted
+    ///
+    /// Had those files parsed, the snapshot would have read `tracked_size + lost`, `lost` being
+    /// the records' bytes, and nothing else in the cycle would differ: the census reads the
+    /// volume, which the files do not change, and every credit, debit and earlier install since
+    /// the snapshot is the same. The installs telescope to `C(snapshot)` plus what has applied
+    /// since, with `C(P) = P + census - floor(P * slots / 256)`
+    /// ([`Self::apply_proportional_correction`]), so the figure lacks
+    /// `C(tracked + lost) - C(tracked)` of what it would hold, which is
+    /// `lost - (floor((tracked + lost) * slots / 256) - floor(tracked * slots / 256))`. The
+    /// records keep that. `C` is non-decreasing in `P`, and its clamp at 0 and the install's carry
+    /// only shrink the difference, so the records never hold less than the figure lacks. A
+    /// record counts its file's credits, which can exceed the file's net delta; the shortfall is
+    /// non-decreasing in `lost`, so that only over-holds.
+    ///
+    /// A whole rotation in one cycle (`slots == 256`) leaves nothing, as a full scan does. A
+    /// rotation spread over several cycles does not: each cycle counts `slots / 256` of what its
+    /// snapshot lacked and the rest carries into the next snapshot, the carry the figure itself
+    /// has, so the records shrink by the same factor and reach zero as the figure counts the
+    /// bytes. Where on the volume the bytes sit does not enter, because the census term is the
+    /// same with the files parsed or not.
+    ///
+    /// The oldest records keep the remainder; the split does not matter, because the decisions
+    /// add the sum.
+    fn corrupt_release_targets(
+        records: &[(PathBuf, u64)],
+        tracked_size: u64,
+        slots: usize,
+    ) -> Vec<(PathBuf, u64)> {
+        let lost = records
+            .iter()
+            .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
+        let expected = |figure: u64| figure as u128 * slots.min(256) as u128 / 256;
+        let counted = expected(tracked_size.saturating_add(lost)) - expected(tracked_size);
+        let mut left = lost.saturating_sub(counted.min(u128::from(u64::MAX)) as u64);
+        records
+            .iter()
+            .map(|(path, bytes)| {
+                let keep = left.min(*bytes);
+                left -= keep;
+                (path.clone(), keep)
+            })
+            .collect()
+    }
+
     fn proportional_correction(scanned: u64, dirs_scanned: usize, tracked: u64) -> u64 {
         let expected = tracked as u128 * dirs_scanned as u128 / 256;
         let discrepancy = scanned as i64 - expected as i64;
@@ -3659,7 +4099,14 @@ impl CacheSizeTracker {
         // accounting leak observable in the logs — before this, `write_cache_size` was
         // never corrected at all (the call below passed `None`), so a leak accumulated
         // silently and indefinitely while `total_size` was reconciled every scan.
-        if staged_drift != 0 && crate::staged_authority::fold_authority_active(&self.cache_dir) {
+        // The epoch the baseline saw, as the install's sample judges it, so a scan spanning the
+        // 0 to 1 flip logs the line its sample reports. Without a baseline, the epoch read now.
+        if staged_drift != 0
+            && baseline.map_or_else(
+                || crate::staged_authority::fold_authority_active(&self.cache_dir),
+                |b| b.at_fold_epoch,
+            )
+        {
             // At staged-authority epoch 1 the staged figure is the fold's. This scan's census is
             // compared with the event-maintained counter, which graduation does not debit, so the
             // difference includes the graduated bytes and is not drift.
@@ -3800,11 +4247,12 @@ impl CacheSizeTracker {
 
     /// Take the figures a full scan's census is compared against: `size_state.json` plus every
     /// pending delta file, after flushing this instance's accumulator. `None` defers the
-    /// pass's install.
+    /// pass's install. A rolling cycle takes its snapshot here too, before its first visit.
     ///
     /// Read under `global_consolidation.lock`, which is released before the walk starts. It is
     /// held for one accumulator flush, one `size_state.json` read and one listing and read of
     /// `size_tracking/`'s delta files: a few small file operations, independent of cache size.
+    /// The staged figure is derived before the lock is taken and passed in.
     /// While it is held no cycle is between collecting a delta file and deleting it, so each
     /// pending credit is in exactly one of the two reads.
     ///
@@ -3814,10 +4262,13 @@ impl CacheSizeTracker {
         attempts: usize,
         delay: Duration,
     ) -> Option<crate::journal_consolidator::ValidationBaseline> {
+        // The staged figure is derived from every shard's checkpoint, so it is read before the
+        // fleet-wide lock is taken, not inside the lock window.
+        let staged = self.consolidator.read_staged_for_baseline().await;
         let lock_token = self
             .acquire_consolidation_lock_bounded(attempts, delay, "Cache validation baseline")
             .await?;
-        let baseline = self.consolidator.validation_baseline().await;
+        let baseline = self.consolidator.validation_baseline_with(staged).await;
         self.consolidator.release_consolidation_lock(lock_token);
         baseline
     }
@@ -3890,8 +4341,16 @@ impl CacheSizeTracker {
                 ValidationSampleKind::FullScan,
             )
             .await;
-        // `reset_all_delta_files` reaped these before the install became relative.
+        // A `delta_*.json.tmp` whose writer died between writing and renaming it.
         self.consolidator.reap_stale_delta_tmp_files().await;
+        if installed {
+            // This census counted the volume, so a delta file renamed aside as corrupt had its
+            // bytes brought into the figure by the correction while nothing took them out of
+            // this process's admission addend. The refresher releases them after its next
+            // publication. A rolling install releases the part it counted instead: see
+            // `corrupt_release_targets`.
+            crate::cache::release_corrupt_delta_records(&self.cache_dir).await;
+        }
         self.consolidator.release_consolidation_lock(lock_token);
         installed
     }
@@ -3972,29 +4431,55 @@ impl CacheSizeTracker {
             .estimate_batch_size(rolling_state.scan_rate, max_duration)
             .min(256);
 
-        // One consistent Size_State snapshot for the whole cycle. Every install recomputes
-        // the correction against THIS snapshot over a larger scanned subset, so a later
-        // install supersedes an earlier one rather than compounding on it.
+        // One snapshot for the whole cycle, read before the first visit under
+        // `global_consolidation.lock`: `size_state.json` plus every pending delta file, as the
+        // full scan's baseline. Every install recomputes the correction against THIS snapshot
+        // over a larger scanned subset and applies only its difference from the previous
+        // install, so a later install supersedes an earlier one rather than compounding on it,
+        // and no install deletes a delta file. See `write_phase_locked`.
         //
-        // `None` means `size_state.json` exists and could not be read or parsed. It is NOT a
-        // snapshot of zeros: with `tracked_* = 0` the proportional correction reduces to the
-        // scanned subset itself, so every install would write one shard's bytes, objects and
-        // staged bytes over the shared document as whole-cache figures. So the cycle installs
-        // nothing, publishes no results and persists no cursor, exactly as a failed pass
-        // leaves the schedule, and the next cycle retries from the same cursor. Pinned by
+        // An unreadable `size_state.json` is NOT a snapshot of zeros: with `tracked_* = 0` the
+        // proportional correction reduces to the scanned subset itself, so every install would
+        // add one shard's bytes, objects and staged bytes as whole-cache figures. So the cycle
+        // installs nothing, publishes no results and persists no cursor, exactly as a failed
+        // pass leaves the schedule, and the next cycle retries from the same cursor. A snapshot
+        // the lock prevented is skipped the same way. Pinned by
         // `rolling_validation_installs_nothing_when_size_state_is_unreadable`.
-        let Some(size_state) = self.consolidator.get_size_state().await else {
-            warn!(
-                "Rolling validation: size_state.json is unreadable, so this cycle has no \
-                 snapshot to correct against; skipping its corrections with the cursor \
-                 unchanged at {:02x}",
-                start_cursor
-            );
-            return Ok(());
+        let snapshot = match self
+            .take_full_scan_baseline(WRITE_PHASE_LOCK_ATTEMPTS, WRITE_PHASE_LOCK_RETRY_DELAY)
+            .await
+        {
+            Some(snapshot) if !snapshot.state_unreadable => snapshot,
+            Some(_) => {
+                warn!(
+                    "Rolling validation: size_state.json is unreadable, so this cycle has no \
+                     snapshot to correct against; skipping its corrections with the cursor \
+                     unchanged at {:02x}",
+                    start_cursor
+                );
+                return Ok(());
+            }
+            None => {
+                self.rolling_snapshot_lock_aborts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "Rolling validation: could not take this cycle's snapshot under the \
+                     consolidation lock; skipping its corrections with the cursor unchanged \
+                     at {:02x}",
+                    start_cursor
+                );
+                return Ok(());
+            }
         };
-        let tracked_size = size_state.total_size;
-        let tracked_objects = size_state.cached_objects;
-        let tracked_staged_size = size_state.write_cache_size;
+        // The corrupt records whose bytes this cycle's installs may count, with the bytes each
+        // holds now. See `corrupt_release_targets`.
+        let corrupt_at_snapshot = crate::cache::corrupt_delta_records(&self.cache_dir).await;
+        let tracked_size = snapshot.total_size;
+        let tracked_objects = snapshot.cached_objects;
+        let tracked_staged_size = snapshot.write_cache_size;
+        // The figures the last successful install of this cycle wrote, which the next install's
+        // increment is measured from. A failed install leaves them, so the next one catches up.
+        let mut installed = (tracked_size, tracked_staged_size, tracked_objects);
 
         info!(
             "Rolling validation: starting scan at cursor={:02x}, slot_cap={}, cached_objects={}, budget={}",
@@ -4056,6 +4541,9 @@ impl CacheSizeTracker {
                 }
             };
 
+            #[cfg(test)]
+            test_seams::after_rolling_visit(&self.cache_dir);
+
             // Accumulate into a CANDIDATE, and keep it only if the install happens. A
             // visit whose figures were not installed must not appear in this cycle's
             // counters either, or the recorded work and the durable cursor would disagree.
@@ -4074,6 +4562,8 @@ impl CacheSizeTracker {
                     tracked_size,
                     tracked_objects,
                     tracked_staged_size,
+                    &mut installed,
+                    &corrupt_at_snapshot,
                     cycle_started_at,
                     own_last_visit_at,
                     next_cursor,
@@ -4252,12 +4742,14 @@ impl CacheSizeTracker {
         let cache_expired = AtomicU64::new(0);
         let cache_skipped = AtomicU64::new(0);
         let cache_errors = AtomicU64::new(0);
+        let self_debit_bytes = AtomicU64::new(0);
+        let self_debit_staged = AtomicU64::new(0);
+        let self_debit_objects = AtomicU64::new(0);
         let staged_paths: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
         // One finished partition per `(bucket, L1)` this visit reached. Collected under a mutex
         // rather than accumulated into a shared heap, because a heap shared across buckets would
         // be a top-N over the wrong population — § 4.2's lemma is about a *per-shard* top-N.
         let tails: std::sync::Mutex<Vec<ShardTailPartition>> = std::sync::Mutex::new(Vec::new());
-        let floor = self.config.tail_floor_bytes;
         let cap = self.config.tail_max_entries;
 
         l1_dirs.par_iter().for_each(|l1_dir| {
@@ -4272,14 +4764,14 @@ impl CacheSizeTracker {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let mut tail = ShardTailBuild::new(bucket, l1, floor, cap);
+            let mut tail = ShardTailBuild::new(bucket, l1, cap);
 
             let l2_entries = match std::fs::read_dir(l1_dir) {
                 Ok(entries) => entries,
                 Err(_) => {
                     // The shard exists — the caller enumerated it — but could not be listed.
                     // Do NOT publish an empty partition for it: an empty file is a claim that
-                    // the shard holds no above-floor ranges, and this pass did not establish
+                    // the shard holds no ranges, and this pass did not establish
                     // that. Omitting it leaves the previous partition in place, which is a
                     // stale hint rather than a false one.
                     return;
@@ -4309,6 +4801,9 @@ impl CacheSizeTracker {
                     size_bytes.fetch_add(result.size_bytes, Ordering::Relaxed);
                     staged_bytes.fetch_add(result.staged_bytes, Ordering::Relaxed);
                     objects_visited.fetch_add(1, Ordering::Relaxed);
+                    self_debit_bytes.fetch_add(result.self_debit.bytes, Ordering::Relaxed);
+                    self_debit_staged.fetch_add(result.self_debit.staged_bytes, Ordering::Relaxed);
+                    self_debit_objects.fetch_add(result.self_debit.objects, Ordering::Relaxed);
                     if result.staged_bytes > 0 {
                         if let Ok(mut paths) = staged_paths.lock() {
                             paths.push(path.clone());
@@ -4330,7 +4825,7 @@ impl CacheSizeTracker {
             }
             // Every shard this visit LISTED gets a partition, including one with no members.
             // An absent file and an empty file are the same observation to a reader that
-            // checks presence, and § 4.5's reader distinguishes "no members above the floor"
+            // checks presence, and § 4.5's reader distinguishes "no members"
             // from "no partition here".
             if let Ok(mut out) = tails.lock() {
                 out.push(tail.finish());
@@ -4346,6 +4841,11 @@ impl CacheSizeTracker {
             cache_skipped: cache_skipped.into_inner(),
             cache_errors: cache_errors.into_inner(),
             staged_paths: staged_paths.into_inner().unwrap_or_default(),
+            self_debit: ScanSelfDebit {
+                bytes: self_debit_bytes.into_inner(),
+                staged_bytes: self_debit_staged.into_inner(),
+                objects: self_debit_objects.into_inner(),
+            },
         };
         (result, tails.into_inner().unwrap_or_default())
     }
@@ -4355,8 +4855,8 @@ impl CacheSizeTracker {
     /// # An empty partition is a WRITTEN file, not an absent one
     ///
     /// § 4.1 says the partition is "rewritten whole by the rolling pass" and is silent on the
-    /// zero-member case. It has to be a written file: § 4.5's reader distinguishes "no members
-    /// above the floor" — a real and expected state on a cache with no size skew — from "this
+    /// zero-member case. It has to be a written file: § 4.5's reader distinguishes "no members"
+    /// — a real state for a shard with no ranges — from "this
     /// shard has never been visited", and it cannot make that distinction from a missing file.
     /// The checkpoint's `tail_entries: 0` makes the same fact checkable without a presence test,
     /// which is the stronger of the two signals.
@@ -4407,17 +4907,11 @@ impl CacheSizeTracker {
         // figure cannot be wrong, where a ratio needs a `T_max` this pass cannot reach.
         if partition.cap_bound {
             warn!(
-                "Tail_Partition {}/{}: the per-shard cap is BINDING — {} above-floor ranges \
-                 were considered and tail_max_entries={} were kept, at tail_floor_bytes={}. \
-                 Eviction can only see the largest {} ranges in this shard; raise \
-                 cache.shared_storage.tail_max_entries or cache.shared_storage.tail_floor_bytes \
-                 if a byte target goes unmet.",
-                partition.bucket,
-                partition.l1,
-                partition.considered,
-                partition.cap,
-                partition.floor,
-                partition.cap,
+                "Tail_Partition {}/{}: the per-shard cap is BINDING — {} ranges were \
+                 considered and tail_max_entries={} were kept. Eviction can only see the largest \
+                 {} ranges in this shard; raise cache.shared_storage.tail_max_entries if a byte \
+                 target goes unmet.",
+                partition.bucket, partition.l1, partition.considered, partition.cap, partition.cap,
             );
         }
 
@@ -4445,46 +4939,13 @@ impl CacheSizeTracker {
     /// Best-effort, like the lock itself: a failure leaves the shard without this pass's two
     /// figures, which reads as "not yet rebuilt" rather than as a wrong figure.
     fn install_tail_checkpoint_fields(&self, partition: &ShardTailPartition) {
-        use crate::staged_fold::{lock_checkpoint_document, Shard, StagedShardCheckpoint};
-
-        let shard = Shard::new(partition.bucket.clone(), partition.l1.clone());
-        // Held until this function returns, which is after the install.
-        let _lock = lock_checkpoint_document(&self.cache_dir, &shard);
-        let mut checkpoint = match StagedShardCheckpoint::load(&self.cache_dir, &shard) {
-            Ok(Some(c)) => c,
-            Ok(None) => StagedShardCheckpoint::unfolded_for(&shard),
-            Err(e) => {
-                warn!(
-                    "Tail_Partition {}: a checkpoint exists and could not be read ({}); not \
-                     installing tail_floor/tail_entries rather than overwriting it",
-                    shard, e
-                );
-                return;
-            }
-        };
-        checkpoint
-            .other
-            .insert("tail_floor".to_string(), partition.floor.into());
-        checkpoint.other.insert(
-            "tail_entries".to_string(),
-            (partition.records.len() as u64).into(),
+        install_tail_checkpoint_fields_in(
+            &self.cache_dir,
+            &partition.bucket,
+            &partition.l1,
+            partition.records.len(),
+            tail_now_nanos(),
         );
-        // A THIRD key, and § 3.2's record names only the two above. It is here because § 4.4's
-        // cross-shard tail-delta sweep has to compare a record's append time against this
-        // shard's last REBUILD, and neither existing timestamp is this producer's: `scanned_at`
-        // belongs to the `st_size` fold and `staged_scanned_at` to the staged fold. Using either
-        // would compare against a different pass's cadence. Reported as a deviation from § 3.2
-        // rather than written into it.
-        checkpoint
-            .other
-            .insert("tail_built_at".to_string(), tail_now_nanos().into());
-
-        if let Err(e) = checkpoint.install(&self.cache_dir) {
-            warn!(
-                "Tail_Partition {}: failed to install tail_floor/tail_entries: {}",
-                shard, e
-            );
-        }
     }
 
     /// Retire the tail-delta records this visit's partitions now contain.
@@ -4549,6 +5010,8 @@ impl CacheSizeTracker {
         tracked_size: u64,
         tracked_objects: u64,
         tracked_staged_size: u64,
+        installed: &mut (u64, u64, u64),
+        corrupt_at_snapshot: &[(PathBuf, u64)],
         cycle_started_at: u64,
         own_last_visit_at: Option<u64>,
         next_cursor: u8,
@@ -4592,6 +5055,8 @@ impl CacheSizeTracker {
                 tracked_size,
                 tracked_objects,
                 tracked_staged_size,
+                installed,
+                corrupt_at_snapshot,
                 cycle_started_at,
                 own_last_visit_at,
                 next_cursor,
@@ -4633,6 +5098,8 @@ impl CacheSizeTracker {
         tracked_size: u64,
         tracked_objects: u64,
         tracked_staged_size: u64,
+        installed: &mut (u64, u64, u64),
+        corrupt_at_snapshot: &[(PathBuf, u64)],
         cycle_started_at: u64,
         own_last_visit_at: Option<u64>,
         next_cursor: u8,
@@ -4660,15 +5127,21 @@ impl CacheSizeTracker {
             }
         }
 
-        // Post-removal figures, with no `self_debit` term: this install is absolute and resets
-        // the accumulator holding the arms' debits, so the removal is counted here once. See
+        // The census of the slots visited so far, an entry this cycle's own arms deleted or
+        // healed counting at its pre-mutation figures: their debits reach `size_state.json`
+        // through the delta files after the snapshot, like any other removal. See
         // `ScanFileResult::self_debit`.
         let surviving_objects = cycle.objects_visited.saturating_sub(cycle.metas_removed);
+        let census_size = cycle.size_bytes.saturating_add(cycle.self_debit.bytes);
+        let census_staged = cycle
+            .staged_bytes
+            .saturating_add(cycle.self_debit.staged_bytes);
+        let census_objects = surviving_objects.saturating_add(cycle.self_debit.objects);
         let slots = slots_visited.min(256);
 
         let (corrected_size, corrected_objects) = self.apply_proportional_correction(
-            cycle.size_bytes,
-            surviving_objects,
+            census_size,
+            census_objects,
             slots,
             tracked_size,
             tracked_objects,
@@ -4683,7 +5156,7 @@ impl CacheSizeTracker {
         //     corrected (R5.3).
         //  2. A slot with no directory on disk still counts toward `slots`, so the numerator
         //     and denominator describe different things (R5.3).
-        //  3. Every instance installs its own extrapolation absolutely over the shared
+        //  3. Every instance installs its own extrapolation over the shared
         //     `size_state.json`. The lock held here serialises those writes, which is what
         //     § 6.2 buys; it does not make an extrapolation into a census.
         //
@@ -4696,27 +5169,68 @@ impl CacheSizeTracker {
         // Spec: cache-eviction-at-scale. Requirements: 7.1, 4.4, 4.5, 5.2, 5.3
         debug!(
             "Rolling validation: cached_objects {} -> {} is an EXTRAPOLATION from {} \
-             surviving objects over {} of 256 L1 index slots, not a census",
-            tracked_objects, corrected_objects, surviving_objects, slots
+             objects over {} of 256 L1 index slots, not a census",
+            tracked_objects, corrected_objects, census_objects, slots
         );
 
         let corrected_staged =
-            Self::proportional_correction(cycle.staged_bytes, slots, tracked_staged_size);
+            Self::proportional_correction(census_staged, slots, tracked_staged_size);
 
+        // Installed as the increment from the previous install of this cycle (the snapshot,
+        // before the first), applied to the CURRENT figure under `size_state.lock`. So the
+        // figure after the k-th install is the snapshot corrected over k slots plus every credit
+        // and debit issued since the snapshot, wherever in the pipeline each one is: applied to
+        // `size_state.json`, pending in a delta file or still in an accumulator. No delta file is
+        // deleted and no accumulator is reset. Its pending-carry clamp acts on the projected
+        // figure; see `JournalConsolidator::install_validation_correction`.
+        //
+        // Two populations are counted twice until the next pass over their slots: a credit
+        // issued after the snapshot for an object in a slot this cycle visits later (the
+        // census sees it too), and a debit the same way. So while the cache fills this
+        // over-states by up to the cycle's net ingest, and while it drains it under-states.
+        //
         // `RollingExtrapolation`, and the kind is what stops R12.6's gauge publishing a number
         // here. `apply_proportional_correction` computes `corrected_size` as
-        // `tracked_size + (scanned_size - tracked_size * slots / 256)`, so
+        // `tracked_size + (census_size - tracked_size * slots / 256)`, so
         // `corrected_size - tracked_size` is the correction term itself — a function of the
         // persisted counter rather than an independent producer's disagreement with it. R5.3 makes
         // the same point about why the extrapolation cannot converge.
-        self.consolidator
-            .update_size_from_validation_with_kind(
+        //
+        // Requirement 6.4's cut in `install_validation_correction` acts on the current figure,
+        // while `installed.1` keeps the uncut staged correction, so each install of a cycle
+        // whose projected write-cache figure exceeds its projected total can cut again. The cuts
+        // add up: for the rest of the cycle `write_cache_size` can read low by their sum, which
+        // is at most the cycle's last uncut staged correction, and the next cycle's snapshot
+        // starts from the cut figure.
+        let previous = crate::journal_consolidator::ValidationBaseline {
+            total_size: installed.0,
+            write_cache_size: installed.1,
+            cached_objects: installed.2,
+            state_unreadable: false,
+            staged_figure: None,
+            at_fold_epoch: false,
+        };
+        if self
+            .consolidator
+            .install_validation_correction(
                 corrected_size,
-                Some(corrected_staged),
-                Some(corrected_objects),
+                corrected_staged,
+                corrected_objects,
+                previous,
                 ValidationSampleKind::RollingExtrapolation,
             )
-            .await;
+            .await
+        {
+            *installed = (corrected_size, corrected_staged, corrected_objects);
+            // The figure now holds the part of each corrupt record's bytes this install counted;
+            // the refresher releases it after its next publication.
+            crate::cache::note_census_release_targets(
+                &self.cache_dir,
+                &Self::corrupt_release_targets(corrupt_at_snapshot, tracked_size, slots),
+            );
+        }
+        // A `delta_*.json.tmp` whose writer died between writing and renaming it.
+        self.consolidator.reap_stale_delta_tmp_files().await;
 
         // The Tail_Partitions this visit rebuilt, then their two checkpoint fields, then the
         // tail-delta records they supersede. Inside the lock because § 6.2's serialisation is
@@ -4889,8 +5403,8 @@ impl CacheSizeTracker {
     /// only for periodic validation scans.
     /// Returns `(total_size, cache_expired, cache_skipped, cache_errors, files_scanned,
     /// staged_size, staged_paths)`. `staged_size` is the write-tier subset of `total_size`
-    /// (Requirement 6.1) and is what the caller passes to
-    /// `update_size_from_validation_with_kind` in place of the `None` it used to pass.
+    /// (Requirement 6.1) and is what the caller passes to `install_validation_correction` as the
+    /// census's write-cache figure.
     ///
     /// `staged_paths` is the `.meta` path of every object the scan found still staged,
     /// which the caller feeds to [`Self::reappend_missing_ledger_entries`] (R2.7 / R6.6).
@@ -5285,13 +5799,13 @@ impl CacheSizeTracker {
         None
     }
 
-    /// Every above-floor range of one parsed `.meta`, as [`TailRecord`]s.
+    /// Every range of one parsed `.meta`, as [`TailRecord`]s. There is no floor: the per-shard
+    /// rank cap is the only membership bound.
     ///
-    /// # The floor is tested against `compressed_size`, and the two figures beside it are wrong
+    /// # The size is `compressed_size`, and the two figures beside it are wrong
     ///
     /// `RangeSpec::uncompressed_size` and the `.bin` filename's logical extent both sit within
-    /// reach and both differ from `compressed_size` for compressible data. Testing the floor
-    /// against either admits ranges whose on-disk size is below it, and sorting on either can
+    /// reach and both differ from `compressed_size` for compressible data. Sorting on either can
     /// rank a 100 MiB range that compresses to 10 MiB ahead of a 50 MiB incompressible one that
     /// frees five times more actual bytes. That is D4's defect, and § 4.4 states it as a
     /// correctness matter rather than an optimisation.
@@ -5309,7 +5823,6 @@ impl CacheSizeTracker {
     fn tail_candidates_for(
         metadata: &crate::cache_types::NewCacheMetadata,
         meta_path: &std::path::Path,
-        floor: u64,
     ) -> Vec<TailRecord> {
         // `{YYY}` is the `.meta`'s own parent directory. Taken from the path rather than
         // recomputed so a record's leaf and the directory its `.meta` actually sits in cannot
@@ -5324,7 +5837,6 @@ impl CacheSizeTracker {
         metadata
             .ranges
             .iter()
-            .filter(|r| r.compressed_size >= floor)
             .map(|r| TailRecord {
                 cache_key: metadata.cache_key.clone(),
                 range_start: r.start,
@@ -5524,8 +6036,7 @@ impl CacheSizeTracker {
 
         // The Tail_Partition candidates this `.meta` contributes, built ONCE from the parse
         // already in hand. Which arms below carry them is stated on `ScanFileResult`'s field.
-        let tail_candidates =
-            Self::tail_candidates_for(&metadata, path, self.config.tail_floor_bytes);
+        let tail_candidates = Self::tail_candidates_for(&metadata, path);
 
         // ── An empty-object-ETag entry left by a pre-3.0.0 zero-length publish. ─────────
         //
@@ -5702,146 +6213,9 @@ impl CacheSizeTracker {
             }
         }
 
-        // Check if write cache entry is expired (Requirements 5.3, 5.4)
-        // Write cache expiration is always checked, regardless of actively_remove_cached_data
-        // because incomplete uploads should always be cleaned up
-        if metadata.object_metadata.is_write_cached
-            && metadata.object_metadata.is_write_cache_expired()
-        {
-            info!(
-                "Write cache entry expired during validation: {}",
-                metadata.cache_key
-            );
-
-            // Get cache manager reference to delete the entry
-            let cache_manager = match self.cache_manager.lock().unwrap().as_ref() {
-                Some(weak_ref) => match weak_ref.upgrade() {
-                    Some(cm) => cm,
-                    None => {
-                        warn!("Cache manager reference is no longer valid for write cache cleanup");
-                        return ScanFileResult {
-                            size_bytes: total_size,
-                            staged_bytes: staged_size,
-                            cache_expired: false,
-                            cache_skipped: false,
-                            cache_error: true,
-                            meta_removed: false,
-                            tail_candidates: tail_candidates.clone(),
-                            self_debit: ScanSelfDebit::default(),
-                        };
-                    }
-                },
-                None => {
-                    // Cache manager not set, skip expiration
-                    return ScanFileResult {
-                        size_bytes: total_size,
-                        staged_bytes: staged_size,
-                        cache_expired: false,
-                        cache_skipped: false,
-                        cache_error: false,
-                        meta_removed: false,
-                        tail_candidates: tail_candidates.clone(),
-                        self_debit: ScanSelfDebit::default(),
-                    };
-                }
-            };
-
-            // Delete the expired write cache entry, through the handle CAPTURED IN THE
-            // ASYNC CALLER.
-            //
-            // This used to be `Handle::try_current().ok().and_then(|h| h.block_on(..))`,
-            // which cannot work from either place this function runs: a rayon worker
-            // carries no tokio context, so `try_current()` returns `Err` on every
-            // invocation, and a thread that IS inside the runtime panics on
-            // `Handle::block_on`. The deletion was therefore never performed in any
-            // release — and this scan is `check_and_invalidate_expired_write_cache`'s only
-            // production caller, so the callee had never executed at all.
-            //
-            // Safe to revive on shared storage because the callee decides where it
-            // mutates: it acquires the key's metadata slot lock BEFORE its own read, then
-            // re-parses and re-tests `is_write_cached` and `is_write_cache_expired()` under
-            // that lock, and removes the range files, debits both size channels and unlinks
-            // the `.meta` without ever releasing it. The unlocked read above is a filter
-            // only. A peer that republishes between the two reads makes the locked re-test
-            // decline and this pass returns `Some(false)`, so the failure mode of a stale
-            // filter is one deferred deletion rather than a lost publish.
-            //
-            // Spec: cache-eviction-at-scale, unit SIZE-TRACKER-BLOCK-ON-DEAD.
-            let Some(handle) = runtime else {
-                warn!(
-                    "Write cache entry {} is expired but this pass cannot delete it: no \
-                     captured runtime handle was supplied to the scan. Counted at its real \
-                     size and left in place; the next pass re-decides.",
-                    metadata.cache_key
-                );
-                return ScanFileResult {
-                    size_bytes: total_size,
-                    staged_bytes: staged_size,
-                    cache_expired: false,
-                    cache_skipped: false,
-                    cache_error: true,
-                    meta_removed: false,
-                    tail_candidates: tail_candidates.clone(),
-                    self_debit: ScanSelfDebit::default(),
-                };
-            };
-            let delete_result = Self::block_on_from_scan(handle, async {
-                cache_manager
-                    .check_and_invalidate_expired_write_cache(&metadata.cache_key)
-                    .await
-                    .ok()
-            });
-
-            match delete_result {
-                Some(true) => {
-                    debug!("Deleted expired write cache entry: {}", metadata.cache_key);
-                    let meta_removed = !path.exists();
-                    return ScanFileResult {
-                        size_bytes: 0,
-                        staged_bytes: 0,
-                        cache_expired: true,
-                        cache_skipped: false,
-                        cache_error: false,
-                        // `Ok(true)` does NOT mean the `.meta` went — that function
-                        // returns true on the expiry decision and gates only its own
-                        // decrement on `metadata_deleted`. Read the path instead.
-                        meta_removed,
-                        tail_candidates: Vec::new(),
-                        // The callee debited both size channels for the ranges it removed
-                        // and, when its unlink succeeded, `cached_objects`. Read from the
-                        // path, like `meta_removed`, for the same reason.
-                        self_debit: ScanSelfDebit {
-                            bytes: total_size,
-                            staged_bytes: staged_size,
-                            objects: u64::from(meta_removed),
-                        },
-                    };
-                }
-                Some(false) => {
-                    // Entry was not expired or not write-cached (shouldn't happen here)
-                    debug!(
-                        "Write cache entry not deleted (not expired?): {}",
-                        metadata.cache_key
-                    );
-                }
-                None => {
-                    warn!(
-                        "Failed to delete expired write cache entry: {}",
-                        metadata.cache_key
-                    );
-                    return ScanFileResult {
-                        size_bytes: total_size,
-                        staged_bytes: staged_size,
-                        cache_expired: false,
-                        cache_skipped: false,
-                        cache_error: true,
-                        meta_removed: false,
-                        tail_candidates: tail_candidates.clone(),
-                        self_debit: ScanSelfDebit::default(),
-                    };
-                }
-            }
-        }
+        // A write-cached entry past `put_ttl` is counted and left, as a read entry past
+        // `get_ttl` is: its next read revalidates it, and only eviction near `max_cache_size`
+        // reclaims it (staging eviction and read-tier eviction both take expired entries first).
 
         // Check if GET cache active expiration is enabled and entry is expired
         if self.actively_remove_cached_data && now > metadata.expires_at {
@@ -9007,7 +9381,9 @@ mod task30_scan_cost_attribution_tests {
                             .wrapping_add(m.ranges.iter().map(|r| r.compressed_size).sum::<u64>());
                         staged_total = staged_total.wrapping_add(m.staged_compressed_size());
                         if m.object_metadata.is_write_cached
-                            && m.object_metadata.is_write_cache_expired()
+                            && m.object_metadata
+                                .write_cache_expires_at
+                                .is_some_and(|at| std::time::SystemTime::now() > at)
                         {
                             expired_checks += 1;
                         }
@@ -9058,7 +9434,9 @@ mod task30_scan_cost_attribution_tests {
                     );
                     staged_total.fetch_add(m.staged_compressed_size(), Ordering::Relaxed);
                     if m.object_metadata.is_write_cached
-                        && m.object_metadata.is_write_cache_expired()
+                        && m.object_metadata
+                            .write_cache_expires_at
+                            .is_some_and(|at| std::time::SystemTime::now() > at)
                     {
                         expired_checks.fetch_add(1, Ordering::Relaxed);
                     }
@@ -9173,7 +9551,7 @@ mod task30_scan_cost_attribution_tests {
         let (t4, err4, sum4, staged4, checks4) = step4_plus_write_cache_expiry_check(&paths);
         let r4 = objects_per_s(n, t4);
         println!(
-            "STEP 4 + is_write_cached && is_write_cache_expired() check    : {:.3}s  {:.1} obj/s  errors={err4}  sum={sum4} staged={staged4} expired_checks={checks4}  (delta vs step3: {:+.1}%)",
+            "STEP 4 + is_write_cached && write_cache_expires_at check    : {:.3}s  {:.1} obj/s  errors={err4}  sum={sum4} staged={staged4} expired_checks={checks4}  (delta vs step3: {:+.1}%)",
             t4.as_secs_f64(), r4, (r4 / r3 - 1.0) * 100.0
         );
 
@@ -9755,7 +10133,7 @@ mod empty_object_etag_cold_repair_tests {
     }
 }
 
-/// The revived write-cache-expiry deletion on the validation pass.
+/// An expired write-cache entry on the validation pass: counted, and never deleted for its age.
 ///
 /// # The threading IS the fixture, and an async test body cannot see this defect
 ///
@@ -9932,12 +10310,7 @@ mod write_cache_expiry_revival_tests {
         let _logs = tracing::subscriber::set_default(subscriber);
         let ground = || async {
             consolidator
-                .update_size_from_validation_with_kind(
-                    census,
-                    Some(0),
-                    Some(1),
-                    crate::cache_size_tracker::ValidationSampleKind::FullScan,
-                )
+                .ground_size_state_for_tests(census, Some(0), Some(1))
                 .await;
         };
         // Epoch 0: the census (staged) against a tracked counter of 0 is drift, logged at WARN.
@@ -10018,17 +10391,11 @@ mod write_cache_expiry_revival_tests {
         (meta_path, bin)
     }
 
-    /// red side (c). The full scan deletes an expired write-cache entry, and the deletion
-    /// debits it through the accumulator. The relative install must count it once: the census
-    /// carries it at its pre-deletion figures (`ScanSelfDebit`) and the debit takes it out.
-    ///
-    /// # RED SIDE
-    ///
-    /// With the expiry arm's `self_debit` set to `ScanSelfDebit::default()`, the census omits
-    /// the entry AND its debit applies, so `total_size` reads the live object minus the
-    /// expired one.
+    /// A full scan counts an expired write-cache entry and leaves it: nothing debits it and
+    /// the installed total keeps it. `put_ttl` expiry deletes nothing, as `get_ttl` expiry
+    /// deletes nothing; the entry's next read revalidates it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_entry_the_full_scan_deletes_is_debited_exactly_once() {
+    async fn an_expired_write_cache_entry_survives_a_full_scan_and_stays_counted() {
         let temp = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(setup(temp.path()).await);
         let live_key = "wc-case39-bucket/live.bin";
@@ -10041,7 +10408,7 @@ mod write_cache_expiry_revival_tests {
             object_metadata(body.len() as u64, "\"case39-live\""),
         )
         .await;
-        let (expired_meta, _bin) = seed_write_cached(&manager, expired_key, true).await;
+        let (expired_meta, bin) = seed_write_cached(&manager, expired_key, true).await;
         let size_of = |key: &str| -> u64 {
             read_meta(&manager, key)
                 .ranges
@@ -10055,14 +10422,8 @@ mod write_cache_expiry_revival_tests {
 
         let tracker = production_tracker(&manager).await;
         let consolidator = tracker.consolidator.clone();
-        // Ground the tracked figures on both objects, discarding the publishes' credits.
         consolidator
-            .update_size_from_validation_with_kind(
-                live + expired,
-                Some(0),
-                Some(2),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(live + expired, Some(0), Some(2))
             .await;
 
         tokio::time::timeout(Duration::from_secs(60), tracker.perform_full_validation())
@@ -10070,17 +10431,19 @@ mod write_cache_expiry_revival_tests {
             .expect("the full scan must finish inside 60 s")
             .unwrap();
         assert!(
-            !expired_meta.exists(),
-            "FIXTURE: the pass must have deleted the expired entry"
+            expired_meta.exists() && bin.exists(),
+            "AN EXPIRED WRITE-CACHE ENTRY WAS DELETED FOR ITS AGE by the full scan: \
+             meta_exists={} bin_exists={}",
+            expired_meta.exists(),
+            bin.exists()
         );
 
-        // The next cycle's apply, by hand, so no journal processing intervenes.
         consolidator.size_accumulator().flush().await.unwrap();
         let next = consolidator.collect_deltas().await;
         assert_eq!(
-            next.delta,
-            -(expired as i64),
-            "FIXTURE: the deletion's own debit must be pending in a delta file"
+            next.delta, 0,
+            "nothing was removed, so no debit may be pending: delta={}",
+            next.delta
         );
         consolidator
             .atomic_update_size_delta(next.delta, next.write_cache_delta)
@@ -10090,38 +10453,38 @@ mod write_cache_expiry_revival_tests {
 
         let total = consolidator.get_size_state().await.unwrap().total_size;
         assert_eq!(
-            total, live,
-            "DOUBLE-DEBIT: total_size={} after the full scan and the next apply, expected the \
-             live object's {} (the expired entry's {} must be debited once)",
-            total, live, expired
+            total,
+            live + expired,
+            "total_size={} after the full scan, expected both objects' {} (live {} + expired {})",
+            total,
+            live + expired,
+            live,
+            expired
         );
     }
 
-    /// THE DEFECT. On a rayon-threaded pass the expired write-cache entry is deleted.
-    ///
-    /// Pre-fix this asserts a NEGATIVE that was true: the `.meta` and the `.bin` both
-    /// survive, because `try_current()` failed and the deletion was never attempted. The
-    /// failure message names that, so a red run says "the effect did not occur" rather than
-    /// merely "not equal".
+    /// One rayon-threaded visit of an expired write-cache entry counts it at its real size and
+    /// deletes nothing.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_expired_write_cache_entry_is_deleted_by_the_rayon_threaded_pass() {
+    async fn an_expired_write_cache_entry_is_counted_and_left_by_the_rayon_threaded_pass() {
         let temp = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(setup(temp.path()).await);
         let cache_key = "wc-revival-bucket/expired.bin";
         let (meta_path, bin) = seed_write_cached(&manager, cache_key, true).await;
 
-        // The branch's exact two inputs, before the pass — not an adjacent consequence.
         let before = read_meta(&manager, cache_key);
         assert!(
-            before.object_metadata.is_write_cached,
-            "PRECONDITION: the entry must be write-cached, or the branch is never entered"
-        );
-        assert!(
-            before.object_metadata.is_write_cache_expired(),
-            "PRECONDITION: write_cache_expires_at must already have passed. got={:?}",
+            before.object_metadata.is_write_cached
+                && before
+                    .object_metadata
+                    .write_cache_expires_at
+                    .is_some_and(|at| std::time::SystemTime::now() > at),
+            "PRECONDITION: the entry must be write-cached and past write_cache_expires_at. \
+             got={:?}",
             before.object_metadata.write_cache_expires_at
         );
         assert!(bin.exists(), "PRECONDITION: the range file must be on disk");
+        let expected_size: u64 = before.ranges.iter().map(|r| r.compressed_size).sum();
 
         let tracker = production_tracker(&manager).await;
         let result = scan_via_rayon(
@@ -10132,42 +10495,22 @@ mod write_cache_expiry_revival_tests {
         );
 
         assert!(
-            !meta_path.exists(),
-            "THE DEFECT: the pass left the expired write-cache entry's .meta in place at \
-             {:?}. This is what `Handle::try_current()` produced on a rayon worker — it \
-             returns Err there, so the deletion was never attempted and the entry outlives \
-             its own expiry indefinitely, since nothing else in production calls \
-             check_and_invalidate_expired_write_cache.",
-            meta_path
-        );
-        assert!(
-            !bin.exists(),
-            "THE DEFECT: the .meta went but the range file survived at {:?}, which is an \
-             unaccounted leak referenced by nothing.",
-            bin
-        );
-        assert!(
-            result.cache_expired,
-            "a deletion on the expiry branch must be reported as an expiry, since \
-             cache_entries_expired in validation.json is what an operator reads to see the \
-             pass doing this work"
-        );
-        assert!(
-            result.meta_removed,
-            "the .meta is gone, so the object census must stop counting this object; \
-             reporting it present biases the census UPWARD"
+            meta_path.exists() && bin.exists(),
+            "AN EXPIRED WRITE-CACHE ENTRY WAS DELETED FOR ITS AGE by the scan: meta_exists={} \
+             bin_exists={}",
+            meta_path.exists(),
+            bin.exists()
         );
         assert_eq!(
-            (result.size_bytes, result.staged_bytes),
-            (0, 0),
-            "a deleted entry contributes nothing to the size census. got size_bytes={} \
-             staged_bytes={}",
-            result.size_bytes,
-            result.staged_bytes
+            result.size_bytes, expected_size,
+            "the entry must be counted at its real size"
         );
         assert!(
-            !result.cache_error,
-            "a successful deletion is not an error for the pass's counters"
+            !result.cache_expired && !result.meta_removed && !result.cache_error,
+            "nothing expired, nothing removed, no error. expired={} meta_removed={} error={}",
+            result.cache_expired,
+            result.meta_removed,
+            result.cache_error
         );
     }
 
@@ -10191,7 +10534,11 @@ mod write_cache_expiry_revival_tests {
              as the defect fixture and differs ONLY in whether its expiry has passed"
         );
         assert!(
-            !before.object_metadata.is_write_cache_expired(),
+            !(before.object_metadata.is_write_cached
+                && before
+                    .object_metadata
+                    .write_cache_expires_at
+                    .is_some_and(|at| std::time::SystemTime::now() > at)),
             "PRECONDITION: the control's expiry must NOT have passed"
         );
         let expected_size: u64 = before.ranges.iter().map(|r| r.compressed_size).sum();
@@ -10242,74 +10589,16 @@ mod write_cache_expiry_revival_tests {
         );
     }
 
-    /// THE CAPTURED HANDLE IS LOAD-BEARING, not decorative.
-    ///
-    /// Same fixture and same rayon topology as the defect test, with the one input that
-    /// distinguishes fixed from broken removed: no handle. If the deletion could somehow
-    /// still happen here, the handle would not be what revived it and the defect test would
-    /// be passing for some other reason. It asserts the pre-fix outcome positively — the
-    /// entry survives — and that the pass says so rather than reporting a clean visit.
+    /// The same verdict on the topology rayon does not split (one L1 shard directory), where
+    /// the scan runs inline on a tokio runtime thread.
     #[tokio::test(flavor = "multi_thread")]
-    async fn without_a_captured_handle_the_expired_entry_survives_and_is_flagged() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let manager = Arc::new(setup(temp.path()).await);
-        let cache_key = "wc-revival-bucket/no-handle.bin";
-        let (meta_path, bin) = seed_write_cached(&manager, cache_key, true).await;
-
-        let before = read_meta(&manager, cache_key);
-        assert!(
-            before.object_metadata.is_write_cache_expired(),
-            "PRECONDITION: identical fixture to the defect test — already expired"
-        );
-        let expected_size: u64 = before.ranges.iter().map(|r| r.compressed_size).sum();
-
-        let tracker = production_tracker(&manager).await;
-        let result = scan_via_rayon(&tracker, &meta_path, None, Topology::PoolWorker);
-
-        assert!(
-            meta_path.exists() && bin.exists(),
-            "with no captured handle the pass has nothing to block on, so it must leave the \
-             entry alone. If it deleted anyway, the handle is not what revived the deletion \
-             and the defect test proves nothing."
-        );
-        assert!(
-            result.cache_error,
-            "finding an expired entry it cannot act on is damage the pass must report; \
-             silence would make an unwired scan indistinguishable from a clean cache"
-        );
-        assert_eq!(
-            result.size_bytes, expected_size,
-            "nothing was mutated, so the entry's real bytes are still the ones to count"
-        );
-        assert!(
-            !result.cache_expired && !result.meta_removed,
-            "nothing expired and nothing was removed. expired={} meta_removed={}",
-            result.cache_expired,
-            result.meta_removed
-        );
-    }
-
-    /// A CAPTURED HANDLE IS NOT ENOUGH ON ITS OWN — the single-shard batch.
-    ///
-    /// When a batch holds one L1 shard directory, rayon does not split, `for_each` never
-    /// calls `join`, and the fold runs inline on the calling thread. Both production passes
-    /// call `par_iter().for_each` from an `async fn`, so that thread is inside the runtime,
-    /// and a bare `handle.block_on` there panics with "Cannot start a runtime from within a
-    /// runtime" — aborting the whole validation pass rather than one entry.
-    ///
-    /// This is reachable on any cache whose objects occupy a single L1 shard, which includes
-    /// a new volume and a small one. The same fixture and the same assertions as the defect
-    /// test, on the other topology.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_deletion_survives_a_batch_rayon_does_not_split() {
+    async fn an_expired_write_cache_entry_is_left_by_a_batch_rayon_does_not_split() {
         let temp = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(setup(temp.path()).await);
         let cache_key = "wc-revival-bucket/unsplit.bin";
         let (meta_path, bin) = seed_write_cached(&manager, cache_key, true).await;
 
         let tracker = production_tracker(&manager).await;
-        // `Topology::CallerInsideRuntime` is asserted inside the helper, so this test fails
-        // naming the fixture if rayon ever stops folding an unsplit batch on the caller.
         let result = scan_via_rayon(
             &tracker,
             &meta_path,
@@ -10318,27 +10607,18 @@ mod write_cache_expiry_revival_tests {
         );
 
         assert!(
-            !meta_path.exists() && !bin.exists(),
-            "the expired entry survived an unsplit batch. A captured handle alone does not \
-             make the scan's blocking call legal: on this topology the scan runs on a tokio \
-             runtime thread, so the blocking work has to be handed to a thread that carries \
-             no runtime context."
+            meta_path.exists() && bin.exists(),
+            "AN EXPIRED WRITE-CACHE ENTRY WAS DELETED FOR ITS AGE on an unsplit batch"
         );
         assert!(
-            result.cache_expired && result.meta_removed,
-            "the unsplit topology must reach the same verdict as the split one — the thread \
-             the scan happens to land on is not part of the expiry decision. expired={} \
-             meta_removed={}",
+            !result.cache_expired && !result.meta_removed && !result.cache_error,
+            "the unsplit topology reaches the same verdict. expired={} meta_removed={} error={}",
             result.cache_expired,
-            result.meta_removed
-        );
-        assert!(
-            !result.cache_error,
-            "a successful deletion is not an error, whichever topology it ran on"
+            result.meta_removed,
+            result.cache_error
         );
     }
 }
-
 /// The Tail_Partition rebuild: membership, order, the cap, the sub-floor arm, and the tail-delta.
 ///
 /// # Why these are inline rather than in `tests/`
@@ -10383,7 +10663,6 @@ mod tail_partition_tests {
     use tempfile::TempDir;
 
     const MIB: u64 = 1024 * 1024;
-    const FLOOR: u64 = MIB;
 
     /// Serialises every test in this module, because [`TailPartitionGauges`]' inputs are
     /// PROCESS-GLOBAL atomics and libtest runs a binary's tests as parallel threads in one
@@ -10546,7 +10825,6 @@ mod tail_partition_tests {
             // Generous, so the budget check never aborts a cycle mid-fixture and the failure
             // mode of a slow machine is a slow test rather than a flaky one.
             validation_max_duration: Duration::from_secs(3600),
-            tail_floor_bytes: FLOOR,
             tail_max_entries: cap,
             ..CacheSizeConfig::default()
         };
@@ -10599,7 +10877,7 @@ mod tail_partition_tests {
     ///
     /// A failure implicates the `filter` in `CacheSizeTracker::tail_candidates_for`.
     #[tokio::test]
-    async fn a_mixed_shard_admits_only_ranges_whose_compressed_size_clears_the_floor() {
+    async fn a_mixed_shard_admits_every_range_ordered_by_compressed_size() {
         let _serial = TAIL_TEST_GUARD.lock().await;
         let (tracker, temp) = tracker_with_cap(4096).await;
         let cache_dir = temp.path().to_path_buf();
@@ -10628,28 +10906,21 @@ mod tail_partition_tests {
         let sizes: Vec<u64> = records.iter().map(|r| r.compressed_size).collect();
         assert_eq!(
             sizes,
-            vec![2 * MIB, MIB],
-            "only the two ranges whose COMPRESSED size clears the {} byte floor may be members, \
-             largest first. Got {:?}. A 512 KiB range present here means the floor was tested \
-             against the extent or against uncompressed_size.",
-            FLOOR,
+            vec![2 * MIB, MIB, 512 * 1024, 4096],
+            "every range is a member (there is no floor), largest COMPRESSED size first. Got \
+             {:?}. The compressible range listed at 4 MiB means the record carried \
+             uncompressed_size or the extent rather than compressed_size (the D4 defect).",
             records
-        );
-        assert!(
-            !records.iter().any(|r| r.range_start == 8 * MIB),
-            "the compressible range at offset {} cleared the floor on EXTENT only and must be \
-             absent; its presence is the D4 defect",
-            8 * MIB
         );
         assert_eq!(
             checkpoint_field(&cache_dir, "bucket-mixed", "00", "tail_entries"),
-            Some(serde_json::json!(2)),
+            Some(serde_json::json!(4)),
             "the checkpoint's tail_entries must equal the members written"
         );
         assert_eq!(
             checkpoint_field(&cache_dir, "bucket-mixed", "00", "tail_floor"),
-            Some(serde_json::json!(FLOOR)),
-            "the checkpoint must record the floor this partition was built with"
+            Some(serde_json::json!(0)),
+            "the checkpoint must record the floor this partition was built with, which is 0"
         );
     }
 
@@ -10702,17 +10973,53 @@ mod tail_partition_tests {
         assert_eq!(records[1].compressed_size, 10 * MIB);
     }
 
-    /// An all-sub-floor shard gets a WRITTEN partition holding zero records.
+    /// A shard whose objects hold no range gets a WRITTEN partition holding zero records.
     ///
     /// Asserting `!path.exists()` here would pass on an implementation that wrote nothing **and**
     /// on one that never ran, which is why the assertion is existence plus emptiness plus the
-    /// checkpoint's `tail_entries: 0`. § 4.5's reader has to tell "no members above the floor"
-    /// from "this shard has never been visited", and it cannot do that from a missing file.
+    /// checkpoint's `tail_entries: 0`. § 4.5's reader has to tell "no members" from "this shard
+    /// has never been visited", and it cannot do that from a missing file: an empty shard left
+    /// without a partition keeps the index incomplete until a lazy rebuild writes one.
     ///
     /// A failure implicates `CacheSizeTracker::write_tail_partition` returning early on an empty
     /// member list.
     #[tokio::test]
-    async fn an_all_sub_floor_shard_writes_an_empty_partition_rather_than_none() {
+    async fn a_zero_range_shard_gets_an_empty_partition() {
+        let _serial = TAIL_TEST_GUARD.lock().await;
+        let (tracker, temp) = tracker_with_cap(4096).await;
+        let cache_dir = temp.path().to_path_buf();
+        seed_meta(
+            &cache_dir,
+            "bucket-empty",
+            "04",
+            "ddd",
+            "rangeless",
+            false,
+            &[],
+        );
+        tracker.perform_rolling_validation().await.unwrap();
+        let path = tail_partition_path(&cache_dir, "bucket-empty", "04");
+        assert!(
+            path.exists(),
+            "a shard with no range must still have a partition FILE at {:?}",
+            path
+        );
+        assert_eq!(
+            read_partition(&cache_dir, "bucket-empty", "04")
+                .unwrap()
+                .len(),
+            0,
+            "and it holds no record"
+        );
+        assert_eq!(
+            checkpoint_field(&cache_dir, "bucket-empty", "04", "tail_entries"),
+            Some(serde_json::json!(0)),
+            "tail_entries is the checkable form of the same fact"
+        );
+    }
+    /// A shard of ranges all under the old 1 MiB floor lists every one, largest first.
+    #[tokio::test]
+    async fn an_all_sub_floor_shard_lists_every_range() {
         let _serial = TAIL_TEST_GUARD.lock().await;
         let (tracker, temp) = tracker_with_cap(4096).await;
         let cache_dir = temp.path().to_path_buf();
@@ -10740,16 +11047,19 @@ mod tail_partition_tests {
             path
         );
         let records = read_partition(&cache_dir, "bucket-subfloor", "02").unwrap();
-        assert!(
-            records.is_empty(),
-            "no range clears the floor, so the file must hold no records: {:?}",
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.compressed_size)
+                .collect::<Vec<_>>(),
+            vec![900 * 1024, 64 * 1024, 4096],
+            "every range under the old 1 MiB floor is now a member, largest first: {:?}",
             records
         );
         assert_eq!(
             checkpoint_field(&cache_dir, "bucket-subfloor", "02", "tail_entries"),
-            Some(serde_json::json!(0)),
-            "tail_entries: 0 is the checkable form of the same fact, and does not need a \
-             presence test"
+            Some(serde_json::json!(3)),
+            "tail_entries is the checkable form of the same fact"
         );
     }
 
@@ -10781,10 +11091,6 @@ mod tail_partition_tests {
             "PRECONDITION: the tracker must hold the configured cap of 3, not the default. \
              Got {}. Every assertion below is vacuous at 4096.",
             tracker.config.tail_max_entries
-        );
-        assert_eq!(
-            tracker.config.tail_floor_bytes, FLOOR,
-            "PRECONDITION: the configured floor must be in force"
         );
 
         seed_meta(
@@ -11674,7 +11980,7 @@ mod tail_selection_read_tests {
         );
 
         // And the bounded read is bounded regardless of what is on disk.
-        let read = read_tail_delta_candidates(dir, cap);
+        let read = read_tail_delta_candidates(dir, cap).records;
         assert!(
             read.len() <= cap,
             "the read keeps at most `cap` per instance: {} records",
@@ -11735,7 +12041,7 @@ mod tail_selection_read_tests {
             "the fixture must be on disk whole, or the retention under test never happens"
         );
 
-        let kept = read_tail_delta_candidates(dir, 4);
+        let kept = read_tail_delta_candidates(dir, 4).records;
         let mut keys: Vec<String> = kept.iter().map(|r| r.record.cache_key.clone()).collect();
         keys.sort();
         assert_eq!(
@@ -11861,7 +12167,7 @@ mod tail_selection_read_tests {
         }
         std::fs::write(&path, body).unwrap();
 
-        let read = read_tail_delta_candidates(dir, 16);
+        let read = read_tail_delta_candidates(dir, 16).records;
         assert_eq!(read.len(), 16, "the read is capped whatever the file holds");
         assert_eq!(
             read.iter().map(|r| r.record.compressed_size).max().unwrap(),
@@ -12048,12 +12354,7 @@ mod validation_scheduler_fleet_tests {
         let peer = consolidator_on(&dir, "install-peer").await;
 
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(0),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(0), Some(1))
             .await;
         plant_delta(&dir, "pre_scan", 200);
 
@@ -12090,6 +12391,8 @@ mod validation_scheduler_fleet_tests {
                     write_cache_size: 0,
                     cached_objects: 1,
                     state_unreadable: false,
+                    staged_figure: None,
+                    at_fold_epoch: false,
                 },
                 40,
                 Duration::from_millis(25),
@@ -12120,17 +12423,16 @@ mod validation_scheduler_fleet_tests {
     }
 
     /// GitHub issue 29, on the path production takes: the full scan's relative install. At
-    /// staged-authority epoch 1 its census is compared with the event-maintained write-cache
-    /// counter, which graduation does not debit, so the difference is the graduated bytes. The
-    /// sample publishes no numeric write-cache drift and names the epoch; the total's drift is
-    /// unchanged.
+    /// staged-authority epoch 1 the scan's staged census is compared with the recomputed staged
+    /// figure read with the baseline, the figure eviction decisions use, so a known drift reads as
+    /// that drift. The counter (8,000,000 here, inflated by graduated bytes) is not a term.
     ///
     /// # RED SIDE
     ///
-    /// With `at_fold_epoch` forced to `false` in `install_full_scan_figures`'s closure,
-    /// `write_cache_size.drift` reads `Some(-3000000)`.
+    /// With the epoch-1 arm marking the figure not evaluable instead of comparing (the 3.0.4
+    /// path), `write_cache_size.drift` reads `None`.
     #[tokio::test]
-    async fn a_full_scan_at_epoch_1_publishes_no_numeric_write_cache_drift() {
+    async fn a_full_scan_at_epoch_1_compares_the_census_with_the_staged_figure() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let (tracker, consolidator) = tracker_on(&dir, "issue29-tracker").await;
@@ -12140,24 +12442,20 @@ mod validation_scheduler_fleet_tests {
             "FIXTURE: activation must flip the epoch"
         );
         consolidator
-            .update_size_from_validation_with_kind(
-                20_000_000,
-                Some(8_000_000),
-                Some(10),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(20_000_000, Some(8_000_000), Some(10))
             .await;
+        let baseline = consolidator.validation_baseline().await.unwrap();
+        assert_eq!(
+            (baseline.write_cache_size, baseline.staged_figure),
+            (8_000_000, Some(4_444_444)),
+            "FIXTURE: the baseline carries the counter and the fold's figure"
+        );
         let installed = tracker
             .install_full_scan_figures(
                 20_000_000,
                 5_000_000,
                 10,
-                crate::journal_consolidator::ValidationBaseline {
-                    total_size: 20_000_000,
-                    write_cache_size: 8_000_000,
-                    cached_objects: 10,
-                    state_unreadable: false,
-                },
+                baseline,
                 3,
                 Duration::from_millis(10),
             )
@@ -12165,23 +12463,172 @@ mod validation_scheduler_fleet_tests {
         assert!(installed, "FIXTURE: the install must happen");
         let sample = AccountingDriftSample::load(&dir).expect("the scan published a drift sample");
         println!(
-            "ISSUE-29 epoch 1 relative install: write_cache drift={:?} reason={:?} total drift={:?}",
+            "ISSUE-29 epoch 1 relative install: write_cache persisted={:?} drift={:?} reason={:?} \
+             total drift={:?}",
+            sample.write_cache_size.persisted,
             sample.write_cache_size.drift,
             sample.write_cache_size.unevaluable_reason,
             sample.total_size.drift
         );
         assert_eq!(
-            sample.write_cache_size.drift, None,
-            "an epoch-1 scan published the graduated bytes as write-cache drift"
-        );
-        assert_eq!(
-            sample.write_cache_size.unevaluable_reason.as_deref(),
-            Some("staged_authority_epoch_1")
+            (
+                sample.write_cache_size.persisted,
+                sample.write_cache_size.drift,
+                sample.write_cache_size.unevaluable_reason.as_deref()
+            ),
+            (Some(4_444_444), Some(5_000_000 - 4_444_444), None),
+            "AN EPOCH-1 SCAN DID NOT COMPARE ITS STAGED CENSUS WITH THE STAGED FIGURE"
         );
         assert_eq!(
             sample.total_size.drift,
             Some(0),
             "the total's drift is unchanged"
+        );
+    }
+
+    /// At epoch 1 with no recomputed staged figure (a damaged shard checkpoint), the write-cache
+    /// figure is published as not evaluable and names why; the counter is never the term.
+    #[tokio::test]
+    async fn a_full_scan_at_epoch_1_with_no_staged_figure_names_it_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (tracker, consolidator) = tracker_on(&dir, "issue29-unknown").await;
+        crate::staged_fold::seed_shard_figure_for_tests(&dir, "test-bucket", "3f", 4_444_444, 9);
+        assert!(
+            crate::staged_authority::activate(&dir, "host:test").unwrap(),
+            "FIXTURE: activation must flip the epoch"
+        );
+        std::fs::write(
+            dir.join("metadata/_shard_state/checkpoints/test-bucket/3f.json"),
+            "{\"schema\":1,\"bucket\":\"te",
+        )
+        .unwrap();
+        consolidator
+            .ground_size_state_for_tests(20_000_000, Some(8_000_000), Some(10))
+            .await;
+        let baseline = consolidator.validation_baseline().await.unwrap();
+        assert_eq!(
+            baseline.staged_figure, None,
+            "FIXTURE: a damaged checkpoint leaves the staged figure unknown"
+        );
+        let installed = tracker
+            .install_full_scan_figures(
+                20_000_000,
+                5_000_000,
+                10,
+                baseline,
+                3,
+                Duration::from_millis(10),
+            )
+            .await;
+        assert!(installed, "FIXTURE: the install must happen");
+        let sample = AccountingDriftSample::load(&dir).expect("the scan published a drift sample");
+        assert_eq!(
+            (
+                sample.write_cache_size.drift,
+                sample.write_cache_size.unevaluable_reason.as_deref()
+            ),
+            (None, Some("staged_figure_unknown"))
+        );
+    }
+
+    /// The staged figure is derived before `global_consolidation.lock` is taken.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `take_full_scan_baseline` taking the lock first and deriving inside it (the shape before
+    /// the figure was read outside it), a peer cannot take the lock while the derivation is held.
+    #[tokio::test]
+    async fn the_staged_figure_is_derived_outside_the_consolidation_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (tracker, consolidator) = tracker_on(&dir, "baseline-outside-tracker").await;
+        let peer = consolidator_on(&dir, "baseline-outside-peer").await;
+        crate::staged_fold::seed_shard_figure_for_tests(&dir, "test-bucket", "3f", 4_444_444, 9);
+        assert!(
+            crate::staged_authority::activate(&dir, "host:test").unwrap(),
+            "FIXTURE: activation must flip the epoch"
+        );
+        consolidator
+            .ground_size_state_for_tests(20_000_000, Some(8_000_000), Some(10))
+            .await;
+        let hold = crate::journal_consolidator::staged_read_hold::arm(&dir);
+        let tracker = Arc::new(tracker);
+        let task = {
+            let tracker = tracker.clone();
+            tokio::spawn(async move {
+                tracker
+                    .take_full_scan_baseline(3, Duration::from_millis(10))
+                    .await
+            })
+        };
+        let mut waited = 0;
+        while !hold.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(waited < 500, "FIXTURE: the derivation never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        let peer_took_lock = peer.try_acquire_global_consolidation_lock().unwrap();
+        if peer_took_lock {
+            peer.release_global_consolidation_lock();
+        }
+        hold.release.add_permits(1);
+        let baseline = task.await.unwrap().expect("the baseline must be taken");
+        assert!(
+            peer_took_lock,
+            "global_consolidation.lock was held across the staged-figure derivation"
+        );
+        assert_eq!(
+            (baseline.staged_figure, baseline.at_fold_epoch),
+            (Some(4_444_444), true),
+            "the figure read before the lock must reach the baseline"
+        );
+    }
+
+    /// A baseline taken at epoch 0 and installed after the flip compares the
+    /// census with the event-maintained counter, and does not report an unknown staged figure.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the install re-reading `fold_authority_active` (the shape before the baseline carried its epoch), the sample's
+    /// `unevaluable_reason` reads `staged_figure_unknown`.
+    #[tokio::test]
+    async fn an_epoch_flip_between_baseline_and_install_is_not_an_unknown_figure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (tracker, consolidator) = tracker_on(&dir, "baseline-flip-tracker").await;
+        consolidator
+            .ground_size_state_for_tests(20_000_000, Some(8_000_000), Some(10))
+            .await;
+        let baseline = consolidator.validation_baseline().await.unwrap();
+        assert!(
+            !baseline.at_fold_epoch,
+            "FIXTURE: the baseline is taken at epoch 0"
+        );
+        crate::staged_fold::seed_shard_figure_for_tests(&dir, "test-bucket", "3f", 4_444_444, 9);
+        assert!(
+            crate::staged_authority::activate(&dir, "host:test").unwrap(),
+            "FIXTURE: activation must flip the epoch"
+        );
+        let installed = tracker
+            .install_full_scan_figures(
+                20_000_000,
+                5_000_000,
+                10,
+                baseline,
+                3,
+                Duration::from_millis(10),
+            )
+            .await;
+        assert!(installed, "FIXTURE: the install must happen");
+        let sample = AccountingDriftSample::load(&dir).expect("the scan published a drift sample");
+        assert_eq!(
+            (
+                sample.write_cache_size.drift,
+                sample.write_cache_size.unevaluable_reason.as_deref()
+            ),
+            (Some(5_000_000 - 8_000_000), None),
+            "a figure never attempted must not be reported as unknown"
         );
     }
 
@@ -12193,12 +12640,7 @@ mod validation_scheduler_fleet_tests {
         let (tracker, consolidator) = tracker_on(&dir, "defer-tracker").await;
         let peer = consolidator_on(&dir, "defer-peer").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(0),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(0), Some(1))
             .await;
 
         assert!(peer.try_acquire_global_consolidation_lock().unwrap());
@@ -12212,6 +12654,8 @@ mod validation_scheduler_fleet_tests {
                     write_cache_size: 0,
                     cached_objects: 1,
                     state_unreadable: false,
+                    staged_figure: None,
+                    at_fold_epoch: false,
                 },
                 3,
                 Duration::from_millis(10),
@@ -12241,12 +12685,7 @@ mod validation_scheduler_fleet_tests {
         let (tracker, consolidator) = tracker_on(&dir, "drift-tracker").await;
         let peer = consolidator_on(&dir, "drift-peer").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(0),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(0), Some(1))
             .await;
 
         assert!(peer.try_acquire_global_consolidation_lock().unwrap());
@@ -12292,12 +12731,7 @@ mod validation_scheduler_fleet_tests {
             4096,
         );
         consolidator
-            .update_size_from_validation_with_kind(
-                4096,
-                Some(0),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(4096, Some(0), Some(1))
             .await;
     }
 
@@ -12349,8 +12783,8 @@ mod validation_scheduler_fleet_tests {
     ///
     /// # RED SIDE
     ///
-    /// With the absolute install (`update_size_from_validation_with_kind` in
-    /// `install_full_scan_figures`), the install deletes the peer's file and `total_size` reads
+    /// With the absolute install (since deleted) in `install_full_scan_figures`, the install
+    /// deletes the peer's file and `total_size` reads
     /// 4096.
     #[tokio::test]
     async fn a_put_credited_after_the_walk_passed_its_shard_survives_the_install() {
@@ -12439,12 +12873,7 @@ mod validation_scheduler_fleet_tests {
         let dir = tmp.path().to_path_buf();
         let consolidator = consolidator_on(&dir, "case44-clamp").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(0),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(0), Some(1))
             .await;
         plant_delta(&dir, "stalled_a", 4000);
         let baseline = consolidator
@@ -12531,6 +12960,71 @@ mod validation_scheduler_fleet_tests {
         assert!(
             live.exists(),
             "LIVE-DELTA-DELETED: the full scan deleted an unapplied delta file"
+        );
+    }
+
+    /// (fix 4). A delta file renamed aside as corrupt stops declining this process's admissions
+    /// once the next full scan's install brings its bytes into the figure from the volume, and
+    /// not before the refresher has published a figure read after that install.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the release call removed from `install_full_scan_figures`, the aside file's bytes
+    /// stay in the admission addend for the rest of the process's life. With the record dropped
+    /// at the install, as the release first did, the addend reads 0 before the refresher has published
+    /// the installed figure.
+    #[tokio::test]
+    async fn the_full_scan_releases_the_record_of_a_delta_file_renamed_aside_as_corrupt() {
+        const CREDIT: u64 = 2_000_000;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (tracker, consolidator) = tracker_on(&dir, "case45-corrupt").await;
+        let _usage = crate::cache::register_read_fill_bound_for_test(&dir, 1 << 30, Some(4096));
+        grounded_on_one_object(&dir, &consolidator).await;
+        // This process flushed a delta file that no cycle can parse, so `collect_deltas` renames
+        // it aside and applies nothing from it.
+        let delta = dir.join("size_tracking").join("delta_case45-corrupt.json");
+        std::fs::write(&delta, b"{ truncated mid-write").unwrap();
+        crate::cache::note_delta_file_flushed(&dir, Some(delta.clone()), CREDIT);
+        let _ = consolidator.collect_deltas().await;
+        let aside = dir
+            .join("size_tracking")
+            .join("delta_case45-corrupt.json.corrupt");
+        assert!(
+            aside.exists() && !delta.exists(),
+            "FIXTURE: the unparseable delta file must have been renamed aside"
+        );
+        let before = crate::cache::unconsolidated_addend_and_epoch(&dir).0;
+
+        tokio::time::timeout(Duration::from_secs(60), tracker.perform_full_validation())
+            .await
+            .expect("the full scan must finish inside 60 s")
+            .unwrap();
+        assert!(
+            !tracker
+                .read_validation_metadata()
+                .await
+                .unwrap()
+                .size_install_deferred,
+            "FIXTURE: the install must have happened, not deferred"
+        );
+
+        let at_install = crate::cache::unconsolidated_addend_and_epoch(&dir).0;
+        super::rolling_relative_install_tests::refresher_tick(&dir).await;
+        assert_eq!(
+            (
+                before,
+                at_install,
+                crate::cache::unconsolidated_addend_and_epoch(&dir).0,
+                crate::cache::pending_delta_record_count(&dir),
+                aside.exists()
+            ),
+            (CREDIT, CREDIT, 0, 0, true),
+            "(counted before the scan, counted at the install, counted after the refresher's \
+             publication, records left, the aside file kept): the census counted the volume, so \
+             the aside file's bytes are in the figure it installed and counting them here as well \
+             declines admissions by their size until the process restarts; released before the \
+             publication, they are missing from the published figure and the addend both"
         );
     }
 }
@@ -12662,12 +13156,7 @@ mod startup_census_tests {
         );
         let consolidator = consolidator_on(&dir, "case45-a").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                5000,
-                Some(0),
-                Some(7),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(5000, Some(0), Some(7))
             .await;
         write_validation_json(&dir, Duration::from_secs(48 * 3600));
         let tracker = tracker_on(&dir, consolidator.clone()).await;
@@ -12826,12 +13315,7 @@ mod startup_census_tests {
         );
         let consolidator = consolidator_on(&dir, "case45-c-a").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1500,
-                Some(0),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1500, Some(0), Some(1))
             .await;
         write_validation_json(&dir, Duration::from_secs(48 * 3600));
         let a = tracker_on(&dir, consolidator.clone()).await;
@@ -12889,12 +13373,7 @@ mod startup_census_tests {
         let dir = tmp.path().to_path_buf();
         let consolidator = consolidator_on(&dir, "case45-subset").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(500),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(500), Some(1))
             .await;
         plant_delta(&dir, "stalled_b", 4000, 0);
         let baseline = consolidator
@@ -12946,12 +13425,7 @@ mod startup_census_tests {
         let dir = tmp.path().to_path_buf();
         let consolidator = consolidator_on(&dir, "case45-cap").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(0),
-                Some(1),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(0), Some(1))
             .await;
         let baseline = consolidator
             .validation_baseline()
@@ -12959,7 +13433,9 @@ mod startup_census_tests {
             .expect("FIXTURE: size_state.json must be readable");
         plant_delta(&dir, "cap_debit", -1000, 0);
         apply_pending(&consolidator).await;
-        consolidator.size_accumulator().add(4000);
+        consolidator
+            .size_accumulator()
+            .add_range("fixture-credit-1", 0, 3999, 4000);
         assert!(
             consolidator
                 .install_validation_correction(500, 0, 1, baseline, ValidationSampleKind::FullScan)
@@ -13109,12 +13585,7 @@ mod review_followups_tests {
         let recent = write_head_only(&dir, "case46-h", "recent", Duration::from_secs(3600));
         let consolidator = consolidator_on(&dir, "case46-h").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(0),
-                Some(3),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(0), Some(3))
             .await;
         let tracker = tracker_on(&dir, consolidator.clone()).await;
 
@@ -13168,12 +13639,7 @@ mod review_followups_tests {
         let stale = write_head_only(&dir, "case46-s", "stale", Duration::from_secs(2 * 86_400));
         let consolidator = consolidator_on(&dir, "case46-s").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(0),
-                Some(2),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(0), Some(2))
             .await;
         let tracker = tracker_on(&dir, consolidator.clone()).await;
 
@@ -13336,12 +13802,7 @@ mod review_followups_tests {
         );
         let a_consolidator = consolidator_on(&dir, "case46-pa").await;
         a_consolidator
-            .update_size_from_validation_with_kind(
-                5000,
-                Some(0),
-                Some(9),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(5000, Some(0), Some(9))
             .await;
         let a = tracker_on(&dir, a_consolidator.clone()).await;
         let b = tracker_on(&dir, consolidator_on(&dir, "case46-pb").await).await;
@@ -13409,12 +13870,7 @@ mod review_followups_tests {
         );
         let a_consolidator = consolidator_on(&dir, "case46-da").await;
         a_consolidator
-            .update_size_from_validation_with_kind(
-                5000,
-                Some(0),
-                Some(9),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(5000, Some(0), Some(9))
             .await;
         let a = tracker_on(&dir, a_consolidator.clone()).await;
         let b = tracker_on(&dir, consolidator_on(&dir, "case46-db").await).await;
@@ -13472,19 +13928,18 @@ mod review_followups_tests {
 mod rolling_self_debit_tests {
     //! a rolling cycle whose own scan arms remove or heal an entry counts it once.
     //!
-    //! The arms (stale HEAD-only removal, write-cache expiry, empty-object-ETag repair) debit
+    //! The arms (stale HEAD-only removal, empty-object-ETag repair) debit
     //! through this instance's size accumulator while the pass reports the entry at its
-    //! post-mutation figures. The rolling install is absolute and is followed by
-    //! `reset_all_delta_files` plus `size_accumulator.reset()`, so the pending debit is
-    //! discarded and the census alone carries the removal. Adding `self_debit` back, as the
-    //! full scan's relative install must, would count the removal zero times here.
+    //! post-mutation figures. The rolling install is relative to a snapshot read before the
+    //! first visit and keeps the pending debit, so the census adds `self_debit` back, as the
+    //! full scan's does. Leaving it out would count the removal twice.
     //!
     //! Every fixture seeds `schedule.json` with a tiny scan rate so the first cycle visits all
     //! 256 slots: the last install then has `slots == 256`, the proportional correction is the
     //! scanned figure itself, and the assertions read a census rather than an extrapolation.
     //! Each tracked total carries `INSTALL_MARK` extra bytes, so a figure without them proves
-    //! the absolute install ran (with no install, the accumulator debit alone gives the
-    //! "counted once" object figure too).
+    //! the install ran (with no install, the accumulator debit alone gives the "counted once"
+    //! object figure too).
     use super::*;
     use crate::cache::zero_length_arm_orphan_tests::{
         incompressible_body, object_metadata, read_meta, seed_full_object, setup,
@@ -13664,8 +14119,8 @@ mod rolling_self_debit_tests {
     /// Arm 1. A rolling cycle removes one stale HEAD-only entry; `cached_objects` after the
     /// install and the next cycle's apply counts the removal once.
     ///
-    /// Readings: once = 2, twice (accumulator debit applied on top of the install) = 1,
-    /// never (`self_debit` added back to the rolling census) = 3.
+    /// Readings: once = 2, twice (`self_debit` left out of the rolling census) = 1, never
+    /// (the pending debit discarded by the install) = 3.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rolling_cycle_counts_a_stale_head_only_removal_once() {
         let _tail_serial = TAIL_TEST_GUARD.lock().await;
@@ -13680,12 +14135,7 @@ mod rolling_self_debit_tests {
         let recent = write_head_only(&dir, "case47-h", "recent", Duration::from_secs(3600));
         let consolidator = consolidator_on(&dir, "case47-h").await;
         consolidator
-            .update_size_from_validation_with_kind(
-                1000 + INSTALL_MARK,
-                Some(0),
-                Some(3),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000 + INSTALL_MARK, Some(0), Some(3))
             .await;
         let tracker = tracker_on(&dir, consolidator.clone()).await;
         seed_whole_rotation(&dir);
@@ -13716,13 +14166,12 @@ mod rolling_self_debit_tests {
         );
     }
 
-    /// Arm 2. A rolling cycle deletes one expired write-cache entry; total and write-cache
-    /// bytes, and `cached_objects`, count the deletion once.
+    /// A rolling cycle leaves an expired write-cache entry in place and counted: total and
+    /// write-cache bytes, and `cached_objects`, keep both objects.
     ///
-    /// Readings: once = (live, live, 1), twice = (live - expired, live - expired, 0),
-    /// never = (live + expired, live + expired, 2).
+    /// Readings: kept = (live + expired, live + expired, 2), deleted once = (live, live, 1).
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_rolling_cycle_counts_a_write_cache_expiry_once() {
+    async fn a_rolling_cycle_keeps_an_expired_write_cache_entry_counted() {
         let _tail_serial = TAIL_TEST_GUARD.lock().await;
         let temp = TempDir::new().unwrap();
         let manager = Arc::new(setup(temp.path()).await);
@@ -13737,7 +14186,7 @@ mod rolling_self_debit_tests {
             seed_staged(&manager, "case47-wc/expired.bin", &body_of(&[24]), true).await;
         assert!(
             live > expired && expired > 0,
-            "FIXTURE: live ({}) must exceed expired ({}) so a double debit stays above zero",
+            "FIXTURE: live ({}) must exceed expired ({})",
             live,
             expired
         );
@@ -13745,35 +14194,32 @@ mod rolling_self_debit_tests {
         let tracker = production_tracker(&manager).await;
         let consolidator = tracker.consolidator.clone();
         consolidator
-            .update_size_from_validation_with_kind(
+            .ground_size_state_for_tests(
                 live + expired + INSTALL_MARK,
                 Some(live + expired),
                 Some(2),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
             )
             .await;
         seed_whole_rotation(temp.path());
 
         rolling_whole_rotation(&tracker).await;
         assert!(
-            !expired_meta.exists(),
-            "FIXTURE: the rolling cycle must have deleted the expired write-cache entry"
+            expired_meta.exists(),
+            "AN EXPIRED WRITE-CACHE ENTRY WAS DELETED FOR ITS AGE by the rolling cycle"
         );
 
         let figures = figures_after_next_cycle(&consolidator).await;
         assert_eq!(
             figures,
-            (live, live, 1),
-            "ROLLING-SELF-DEBIT: (total, write_cache, cached_objects)={:?} after the rolling \
-             install and the next cycle, expected ({}, {}, 1). ({}, {}, 0) is a double \
-             count, ({}, {}, 2) none; a total carrying +{} means no install ran",
+            (live + expired, live + expired, 2),
+            "(total, write_cache, cached_objects)={:?} after the rolling install and the next \
+             cycle, expected ({}, {}, 2). ({}, {}, 1) is the age-only deletion; a total \
+             carrying +{} means no install ran",
             figures,
-            live,
-            live,
-            live - expired,
-            live - expired,
             live + expired,
             live + expired,
+            live,
+            live,
             INSTALL_MARK
         );
     }
@@ -13821,12 +14267,7 @@ mod rolling_self_debit_tests {
         let tracker = production_tracker(&manager).await;
         let consolidator = tracker.consolidator.clone();
         consolidator
-            .update_size_from_validation_with_kind(
-                live + superseded + INSTALL_MARK,
-                Some(0),
-                Some(2),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(live + superseded + INSTALL_MARK, Some(0), Some(2))
             .await;
         seed_whole_rotation(temp.path());
 
@@ -13848,6 +14289,625 @@ mod rolling_self_debit_tests {
             live - superseded,
             live + superseded,
             INSTALL_MARK
+        );
+    }
+}
+
+/// The rolling install is relative: each visit applies the difference between this visit's
+/// corrected figures and the previous install's, both computed against one snapshot taken
+/// before the cycle's first visit from `size_state.json` plus every pending delta file. So it
+/// deletes no delta file, resets no accumulator, and keeps every credit that lands after the
+/// snapshot, whichever stage of the pipeline it is in when the install runs.
+///
+/// Fixtures place `.meta` files at chosen L1 slots and set the next cycle's slot cap through
+/// `schedule.json`'s scan rate. Each figure is read as the next consolidation cycle will
+/// persist it: `size_state.json` plus every pending delta file, after a flush.
+#[cfg(test)]
+mod rolling_relative_install_tests {
+    use super::*;
+    use crate::journal_consolidator::{ConsolidationConfig, JournalConsolidator, SizeState};
+    use crate::journal_manager::JournalManager;
+    use crate::metadata_lock_manager::MetadataLockManager;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    async fn consolidator_on(dir: &std::path::Path) -> Arc<JournalConsolidator> {
+        std::fs::create_dir_all(dir.join("metadata/_journals")).unwrap();
+        std::fs::create_dir_all(dir.join("size_tracking")).unwrap();
+        std::fs::create_dir_all(dir.join("locks")).unwrap();
+        let journal_manager = Arc::new(JournalManager::new(dir.to_path_buf(), "c4-self".into()));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            dir.join("locks"),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = Arc::new(JournalConsolidator::new(
+            dir.to_path_buf(),
+            journal_manager,
+            lock_manager,
+            ConsolidationConfig::default(),
+        ));
+        consolidator.initialize().await.unwrap();
+        consolidator
+    }
+
+    /// A tracker whose time of day is six hours out, so the daily window never runs a pass.
+    async fn tracker_on(
+        dir: &std::path::Path,
+        consolidator: Arc<JournalConsolidator>,
+    ) -> Arc<CacheSizeTracker> {
+        use chrono::{Duration as ChronoDuration, Local, Timelike};
+        let target = Local::now() + ChronoDuration::hours(6);
+        let config = CacheSizeConfig {
+            validation_time_of_day: format!("{:02}:{:02}", target.hour(), target.minute()),
+            ..CacheSizeConfig::default()
+        };
+        Arc::new(
+            CacheSizeTracker::new(dir.to_path_buf(), config, false, consolidator)
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn meta_at(dir: &std::path::Path, slot: u8, name: &str, size: u64) {
+        super::tests::write_valid_meta(
+            &dir.join(format!("metadata/c4/{:02x}/000/{}.meta", slot, name)),
+            &format!("c4/{}", name),
+            size,
+        );
+    }
+
+    /// The next cycle visits `cap` slots: `slot_cap = floor(budget / rate)`. Keeps the cursor.
+    fn set_cap(tracker: &CacheSizeTracker, cap: usize) {
+        let path = tracker.cache_dir.join("size_tracking/schedule.json");
+        let mut json = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .unwrap_or_else(|| serde_json::json!({ "rolling_cursor": 0 }));
+        let budget = tracker.config.validation_max_duration.as_secs_f64();
+        json["rolling_scan_rate"] = serde_json::json!(budget / (cap as f64 + 0.5));
+        std::fs::write(&path, json.to_string()).unwrap();
+    }
+
+    async fn one_cycle(tracker: &Arc<CacheSizeTracker>, cap: usize) {
+        set_cap(tracker, cap);
+        let before = tracker.read_rolling_state().unwrap().cursor as usize;
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            tracker.perform_rolling_validation(),
+        )
+        .await
+        .expect("the rolling cycle must finish inside 120 s")
+        .unwrap();
+        let after = tracker.read_rolling_state().unwrap().cursor as usize;
+        assert_eq!(
+            (after + 256 - before) % 256,
+            cap % 256,
+            "FIXTURE: the cycle must have visited exactly {} slots",
+            cap
+        );
+    }
+
+    /// `(total_size, write_cache_size, cached_objects)` as the next consolidation cycle will
+    /// persist them. Nothing is applied.
+    async fn projected(consolidator: &JournalConsolidator) -> (u64, u64, u64) {
+        consolidator.size_accumulator().flush().await.unwrap();
+        let state = consolidator.get_size_state().await.unwrap();
+        let next = consolidator.collect_deltas().await;
+        (
+            state.total_size.saturating_add_signed(next.delta),
+            state
+                .write_cache_size
+                .saturating_add_signed(next.write_cache_delta),
+            state
+                .cached_objects
+                .saturating_add_signed(next.cached_objects_delta),
+        )
+    }
+
+    async fn seed(consolidator: &JournalConsolidator, total: u64, objects: u64) {
+        consolidator
+            .seed_size_state_for_tests(&SizeState {
+                total_size: total,
+                cached_objects: objects,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    /// As [`meta_at`], with the object write-cached and its one range staged, so a visit counts
+    /// its bytes in `staged_bytes` as well as `size_bytes`. The write-cache expiry is the
+    /// object's own far-future `expires_at`, so the expiry arm is not involved.
+    fn staged_meta_at(dir: &std::path::Path, slot: u8, name: &str, size: u64) {
+        meta_at(dir, slot, name, size);
+        let path = dir.join(format!("metadata/c4/{:02x}/000/{}.meta", slot, name));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["object_metadata"]["is_write_cached"] = serde_json::json!(true);
+        json["object_metadata"]["write_cache_expires_at"] = json["expires_at"].clone();
+        for range in json["ranges"].as_array_mut().unwrap() {
+            range["staged"] = serde_json::json!(true);
+        }
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+    }
+    async fn seed_with_staged(
+        consolidator: &JournalConsolidator,
+        total: u64,
+        staged: u64,
+        objects: u64,
+    ) {
+        consolidator
+            .seed_size_state_for_tests(&SizeState {
+                total_size: total,
+                write_cache_size: staged,
+                cached_objects: objects,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    /// One iteration of the usage refresher's release, as `spawn_put_usage_refresher` runs it
+    /// around its publication: targets and consumed files read first, applied after.
+    pub(super) async fn refresher_tick(dir: &std::path::Path) {
+        let targets = crate::cache::census_release_targets(dir);
+        let consumed = crate::cache::consumed_delta_files(dir).await;
+        crate::cache::release_consumed_delta_files(dir, &consumed);
+        crate::cache::apply_census_release_targets(dir, &targets);
+    }
+
+    /// This process's own delta file, flushed with `credit` bytes and recorded in the admission
+    /// addend. `parseable: false` writes a torn file, which `collect_deltas` renames aside.
+    async fn own_delta(
+        dir: &std::path::Path,
+        consolidator: &JournalConsolidator,
+        name: &str,
+        credit: u64,
+        parseable: bool,
+    ) -> PathBuf {
+        let path = dir.join(format!("size_tracking/delta_{}.json", name));
+        let body = if parseable {
+            serde_json::json!({
+                "delta": credit,
+                "write_cache_delta": 0,
+                "cached_objects_delta": 1,
+                "instance_id": "c4-self",
+            })
+            .to_string()
+        } else {
+            "{ truncated mid-write".to_string()
+        };
+        std::fs::write(&path, body).unwrap();
+        crate::cache::note_delta_file_flushed(dir, Some(path.clone()), credit);
+        if !parseable {
+            let _ = consolidator.collect_deltas().await;
+            assert!(
+                !path.exists()
+                    && dir
+                        .join(format!("size_tracking/delta_{}.json.corrupt", name))
+                        .exists(),
+                "FIXTURE: the torn delta file must have been renamed aside"
+            );
+        }
+        path
+    }
+
+    fn peer_delta(dir: &std::path::Path, bytes: i64, objects: i64) -> PathBuf {
+        let path = dir.join("size_tracking/delta_c4-peer_1.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "delta": bytes,
+                "write_cache_delta": 0,
+                "cached_objects_delta": objects,
+                "instance_id": "c4-peer",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
+    /// T7a. A peer cached an object (on disk, in a slot this rotation visits) and its credit
+    /// is still in its delta file when the cycle starts. The install keeps the file, and the
+    /// figure is the census: the credit counts once.
+    ///
+    /// Readings after one whole-rotation cycle: kept and once = file present, (9000, 0, 3).
+    /// The absolute install deletes the file (9000 with the file gone). A snapshot read from
+    /// `size_state.json` alone counts the pending credit twice: (14000, 0, 4).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rolling_install_keeps_a_peers_pending_delta_file() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        meta_at(&dir, 0x00, "a", 1000);
+        meta_at(&dir, 0x80, "b", 3000);
+        meta_at(&dir, 0xc0, "peer", 5000);
+        let consolidator = consolidator_on(&dir).await;
+        seed(&consolidator, 4000, 2).await;
+        let peer = peer_delta(&dir, 5000, 1);
+        let tracker = tracker_on(&dir, consolidator.clone()).await;
+
+        one_cycle(&tracker, 256).await;
+
+        assert!(
+            peer.exists(),
+            "RELATIVE-INSTALL: the rolling install deleted a peer's pending delta file"
+        );
+        let figures = projected(&consolidator).await;
+        assert_eq!(
+            figures,
+            (9000, 0, 3),
+            "RELATIVE-INSTALL: (total, write_cache, cached_objects)={:?} after a whole \
+             rotation with a peer's 5000-byte credit pending, expected the census (9000, 0, 3). \
+             (14000, 0, 4) counts the pending credit twice: the snapshot left it out",
+            figures
+        );
+    }
+
+    /// T7b. Two installs in one cycle apply increments: after two slots the figure is the
+    /// snapshot corrected over both slots, not the first correction plus the second.
+    ///
+    /// Snapshot 25600 bytes and 512 objects; slots 0 and 1 hold 1000 and 3000 bytes. Expected
+    /// after the two-slot cycle: 25600 + 4000 - 200 = 29400, and 512 + 2 - 4 = 510 objects.
+    /// A baseline fixed at the snapshot for every install reads 30300 and 509.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_installs_in_one_cycle_apply_increments_not_sums() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        meta_at(&dir, 0x00, "a", 1000);
+        meta_at(&dir, 0x01, "b", 3000);
+        meta_at(&dir, 0x80, "c", 4000);
+        let consolidator = consolidator_on(&dir).await;
+        seed(&consolidator, 25_600, 512).await;
+        let tracker = tracker_on(&dir, consolidator.clone()).await;
+
+        one_cycle(&tracker, 2).await;
+
+        let (total, _, objects) = projected(&consolidator).await;
+        assert_eq!(
+            (total, objects),
+            (29_400, 510),
+            "RELATIVE-INSTALL: (total, cached_objects)=({}, {}) after two installs, expected \
+             (29400, 510). (30300, 509) applies the first correction twice",
+            total,
+            objects
+        );
+    }
+
+    /// T7c. A consolidation cycle applies a credit to `size_state.json` after the snapshot and
+    /// before the next install, for an object written into a slot the cycle has already
+    /// visited. The install keeps it: the figure is the census plus the credit.
+    ///
+    /// Readings: kept = (4700, 0, 3); the absolute install overwrites it, (4000, 0, 2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_applied_cycle_delta_survives_a_rolling_install() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        meta_at(&dir, 0x00, "a", 1000);
+        meta_at(&dir, 0x80, "b", 3000);
+        let consolidator = consolidator_on(&dir).await;
+        seed(&consolidator, 4000, 2).await;
+        let tracker = tracker_on(&dir, consolidator.clone()).await;
+        let hook_dir = dir.clone();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        test_seams::set_after_rolling_visit(
+            &dir,
+            Box::new(move || {
+                meta_at(&hook_dir, 0x00, "late", 700);
+                let path = hook_dir.join("size_tracking/size_state.json");
+                let mut state: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                let add =
+                    |v: &serde_json::Value, n: u64| serde_json::json!(v.as_u64().unwrap() + n);
+                state["total_size"] = add(&state["total_size"], 700);
+                state["cached_objects"] = add(&state["cached_objects"], 1);
+                std::fs::write(&path, state.to_string()).unwrap();
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        one_cycle(&tracker, 256).await;
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "FIXTURE: the after-visit hook must have run"
+        );
+
+        let figures = projected(&consolidator).await;
+        assert_eq!(
+            figures,
+            (4700, 0, 3),
+            "RELATIVE-INSTALL: (total, write_cache, cached_objects)={:?}, expected (4700, 0, 3): \
+             the census (4000, 2) plus a 700-byte credit applied after the snapshot for an \
+             object in an already-visited slot. (4000, 0, 2) means the install overwrote it",
+            figures
+        );
+    }
+
+    /// T7d. A credit still in this instance's accumulator when an install runs, for an object
+    /// written into a slot the cycle has already visited, counts once.
+    ///
+    /// Readings: kept = (4700, 0, 3); an install that resets the accumulator, (4000, 0, 2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rolling_install_keeps_this_instances_unflushed_credit() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        meta_at(&dir, 0x00, "a", 1000);
+        meta_at(&dir, 0x80, "b", 3000);
+        let consolidator = consolidator_on(&dir).await;
+        seed(&consolidator, 4000, 2).await;
+        let tracker = tracker_on(&dir, consolidator.clone()).await;
+        let hook_dir = dir.clone();
+        let accumulator = Arc::clone(consolidator.size_accumulator());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        test_seams::set_after_rolling_visit(
+            &dir,
+            Box::new(move || {
+                meta_at(&hook_dir, 0x00, "late", 700);
+                assert!(accumulator.add_range("c4/late", 0, 699, 700));
+                accumulator.add_cached_objects(1);
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        one_cycle(&tracker, 256).await;
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "FIXTURE: the after-visit hook must have run"
+        );
+
+        let figures = projected(&consolidator).await;
+        assert_eq!(
+            figures,
+            (4700, 0, 3),
+            "RELATIVE-INSTALL: (total, write_cache, cached_objects)={:?}, expected (4700, 0, 3): \
+             the census plus a 700-byte credit still in this instance's accumulator at the \
+             install. (4000, 0, 2) means the install reset the accumulator",
+            figures
+        );
+    }
+
+    /// `write_cache_size` is installed the same way as `total_size`: as the increment from the
+    /// cycle's snapshot, against a census that counts the staged bytes on the volume.
+    ///
+    /// One staged object of 2000 bytes and one read-tier object of 3000, both on disk, against a
+    /// snapshot that over-states both figures: total 6000, staged 3000, two objects. A whole
+    /// rotation makes every install's correction the census itself, so the figure lands on
+    /// (5000, 2000, 2).
+    ///
+    /// Readings: the census or the install dropping the staged member leaves write_cache_size at
+    /// 0 (the whole snapshot figure taken out) or at 5000 (the census added to the current
+    /// figure instead of replacing it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rolling_install_corrects_write_cache_size_from_the_staged_census() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        staged_meta_at(&dir, 0x00, "staged", 2000);
+        meta_at(&dir, 0x80, "read", 3000);
+        let consolidator = consolidator_on(&dir).await;
+        seed_with_staged(&consolidator, 6000, 3000, 2).await;
+        let tracker = tracker_on(&dir, consolidator.clone()).await;
+
+        one_cycle(&tracker, 256).await;
+
+        let figures = projected(&consolidator).await;
+        assert_eq!(
+            figures,
+            (5000, 2000, 2),
+            "STAGED-INSTALL: (total, write_cache, cached_objects)={:?}, expected (5000, 2000, \
+             2): the staged object's 2000 bytes are on the volume, so the census carries them \
+             and the install moves write_cache_size by the census's difference from the \
+             snapshot",
+            figures
+        );
+    }
+
+    /// A rotation split across two cycles of 128 slots: each cycle snapshots the figure it
+    /// starts from, and each slot's increment is applied once. A peer's credit for an object
+    /// in a slot the first cycle visited lands between the cycles and stays pending.
+    ///
+    /// Snapshot 25600 bytes and 512 objects; slot 0x10 holds 1000 bytes, slot 0x90 3000, and
+    /// the peer's object 2000 bytes in slot 0x20. After cycle 1: 25600 - 12800 + 1000 =
+    /// 13800 and 512 - 256 + 1 = 257. Cycle 2 snapshots 13800 + 2000 = 15800 and 258, so it
+    /// ends at 15800 - 7900 + 3000 = 10900 and 258 - 129 + 1 = 130, with the peer's file kept.
+    /// The absolute install deletes the file and ends at 9900; a second cycle whose first
+    /// baseline is the first cycle's last install applies the peer's credit twice, 12900.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rotation_split_across_two_cycles_applies_each_slots_increment_once() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        meta_at(&dir, 0x10, "a", 1000);
+        meta_at(&dir, 0x90, "b", 3000);
+        let consolidator = consolidator_on(&dir).await;
+        seed(&consolidator, 25_600, 512).await;
+        let tracker = tracker_on(&dir, consolidator.clone()).await;
+
+        one_cycle(&tracker, 128).await;
+        let (total, _, objects) = projected(&consolidator).await;
+        assert_eq!(
+            (total, objects),
+            (13_800, 257),
+            "RELATIVE-INSTALL: (total, cached_objects)=({}, {}) after the first 128-slot cycle, \
+             expected (13800, 257)",
+            total,
+            objects
+        );
+
+        meta_at(&dir, 0x20, "peer", 2000);
+        let peer = peer_delta(&dir, 2000, 1);
+        one_cycle(&tracker, 128).await;
+
+        assert!(
+            peer.exists(),
+            "RELATIVE-INSTALL: the second cycle deleted a peer's pending delta file"
+        );
+        let (total, _, objects) = projected(&consolidator).await;
+        assert_eq!(
+            (total, objects),
+            (10_900, 130),
+            "RELATIVE-INSTALL: (total, cached_objects)=({}, {}) after the second cycle, \
+             expected (10900, 130). 12900 applies the peer's credit twice",
+            total,
+            objects
+        );
+        assert_eq!(
+            tracker.read_rolling_state().unwrap().full_rotation_count,
+            1,
+            "FIXTURE: the two cycles must make one rotation"
+        );
+    }
+
+    /// A delta file of this process renamed aside as corrupt leaves the admission addend as the
+    /// rolling installs count its bytes, never faster, on a volume that never runs a full scan.
+    ///
+    /// Twin volumes: on A the 2000-byte credit for `lost` is in a torn file, on B it reached
+    /// `size_state.json`. Both hold the same `.meta` files and a parseable pending file of this
+    /// process with a 700-byte credit, and run the same cycles. What the `max_cache_size`
+    /// decisions read is `size_state.json`'s total plus the addend, so after each refresher
+    /// publication A's must equal B's: less admits bytes the figure does not hold, more declines
+    /// bytes it does. Per cycle the tuple is (A total, A addend at the install, A addend after
+    /// the publication, B total, B addend).
+    ///
+    /// Two 128-slot cycles make a rotation and count 1000 then 500 of the 2000; a 256-slot cycle
+    /// counts the last 500 and the record is gone.
+    ///
+    /// # RED SIDE
+    ///
+    /// With no rolling release, A's addend after the first publication reads 2700.
+    /// With every corrupt record released at any rolling install, it reads 700, and A's sum is
+    /// 1000 below B's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_corrupt_records_bytes_leave_the_addend_as_rolling_installs_count_them() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let mut sides = Vec::new();
+        for (tmp, corrupt) in [(&tmp_a, true), (&tmp_b, false)] {
+            let dir = tmp.path().to_path_buf();
+            meta_at(&dir, 0x10, "a", 1000);
+            meta_at(&dir, 0x20, "lost", 2000);
+            meta_at(&dir, 0x30, "pending", 700);
+            meta_at(&dir, 0x90, "b", 3000);
+            let consolidator = consolidator_on(&dir).await;
+            let usage = crate::cache::register_read_fill_bound_for_test(&dir, 1 << 30, Some(4096));
+            seed(&consolidator, if corrupt { 4000 } else { 6000 }, 2).await;
+            let pending = own_delta(&dir, &consolidator, "c4b-pending", 700, true).await;
+            if corrupt {
+                own_delta(&dir, &consolidator, "c4b-lost", 2000, false).await;
+            }
+            let tracker = tracker_on(&dir, consolidator.clone()).await;
+            sides.push((dir, consolidator, tracker, usage, pending));
+        }
+        let mut readings = Vec::new();
+        for cap in [128usize, 128, 256] {
+            let mut reading = Vec::new();
+            for (dir, consolidator, tracker, _, _) in &sides {
+                one_cycle(tracker, cap).await;
+                let total = consolidator.get_size_state().await.unwrap().total_size;
+                let at_install = crate::cache::unconsolidated_addend_and_epoch(dir).0;
+                refresher_tick(dir).await;
+                reading.push((
+                    total,
+                    at_install,
+                    crate::cache::unconsolidated_addend_and_epoch(dir).0,
+                ));
+            }
+            readings.push((
+                reading[0].0,
+                reading[0].1,
+                reading[0].2,
+                reading[1].0,
+                reading[1].2,
+            ));
+        }
+        assert!(
+            sides.iter().all(|side| side.4.exists()),
+            "FIXTURE: the parseable pending files must survive every install"
+        );
+        assert_eq!(
+            readings,
+            vec![
+                (5350, 2700, 1700, 6350, 700),
+                (5325, 1700, 1200, 5825, 700),
+                (6000, 1200, 700, 6000, 700),
+            ],
+            "CORRUPT-ROLLING: per cycle (A total, A addend at the install, A addend after the \
+             publication, B total, B addend). A total + A addend after the publication must equal \
+             B total + B addend: below it the decisions admit bytes the figure does not hold, above \
+             it they decline bytes it does"
+        );
+        assert_eq!(
+            crate::cache::pending_delta_record_count(&sides[0].0),
+            1,
+            "CORRUPT-ROLLING: the whole-rotation cycle counted the last of the torn file's bytes, \
+             so only the parseable pending file's record may remain"
+        );
+    }
+
+    /// A cycle whose snapshot cannot take `global_consolidation.lock` within its budget
+    /// installs nothing, leaves the cursor where it was and is counted on `/metrics`.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the increment removed from the abort arm, the count reads 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cycle_whose_snapshot_lock_times_out_changes_nothing_and_is_counted() {
+        let _tail_serial = TAIL_TEST_GUARD.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        meta_at(&dir, 0x00, "a", 1000);
+        let consolidator = consolidator_on(&dir).await;
+        seed(&consolidator, 9000, 5).await;
+        let tracker = tracker_on(&dir, consolidator.clone()).await;
+        let journal_manager = Arc::new(JournalManager::new(dir.clone(), "c4-holder".into()));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            dir.join("locks"),
+            Duration::from_secs(30),
+            3,
+        ));
+        let holder = JournalConsolidator::new(
+            dir.clone(),
+            journal_manager,
+            lock_manager,
+            ConsolidationConfig::default(),
+        );
+        holder.initialize().await.unwrap();
+        set_cap(&tracker, 256);
+        let cursor_before = tracker.read_rolling_state().unwrap().cursor;
+        assert!(
+            holder.try_acquire_global_consolidation_lock().unwrap(),
+            "FIXTURE: the holder must take the consolidation lock"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            tracker.perform_rolling_validation(),
+        )
+        .await
+        .expect("the aborted cycle must return inside 60 s")
+        .unwrap();
+        holder.release_global_consolidation_lock();
+        let state = consolidator.get_size_state().await.unwrap();
+        assert_eq!(
+            (
+                tracker.read_rolling_state().unwrap().cursor,
+                state.total_size,
+                state.cached_objects,
+                tracker
+                    .get_metrics()
+                    .await
+                    .rolling_snapshot_lock_aborts_total
+            ),
+            (cursor_before, 9000, 5, 1),
+            "SNAPSHOT-ABORT: (cursor, total_size, cached_objects, aborts counted) after a cycle \
+             whose snapshot could not take the consolidation lock"
         );
     }
 }

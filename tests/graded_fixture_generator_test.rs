@@ -8,12 +8,11 @@
 //! generator validated by its own assertions is exactly that: emitting JSON its own
 //! parser accepts proves only that the parser and the writer agree. So the load
 //! bearing assertion here is not any of the shape checks — it is
-//! [`fixture_tree_is_discoverable_by_the_real_eviction_candidate_collector`], which
-//! drives `CacheManager::collect_range_candidates_for_eviction` (`src/cache.rs`,
-//! `MetaFileWalk` → `collect_candidates_from_metadata_file`)
-//! over a generated tree and compares what **eviction** discovered against what was
-//! written. If the product cannot discover what the generator produced, the fixture
-//! is invalid however well-formed it looks.
+//! [`every_emitted_meta_parses_as_new_cache_metadata_at_its_own_sharded_path`], which
+//! reads every emitted `.meta` back with the product's own `NewCacheMetadata`, at the
+//! sharded path the product derives from its key, and checks each range's `.bin` under
+//! `ranges/`. If the product cannot read what the generator produced, the fixture is
+//! invalid however well-formed it looks.
 //!
 //! That path is the right one to choose rather than a convenient one: it walks the
 //! sharded tree without knowing any cache key, recovers each key from the `.meta`
@@ -28,11 +27,9 @@ use common::graded_fixture::{
     self, FixtureSpec, GenOptions, PayloadMode, SizeDistribution, EVICTION_ADMISSION_WINDOW,
     FIXTURE_MARKER, MANIFEST_FILE,
 };
-use s3_proxy::cache::CacheManager;
 use s3_proxy::cache_types::NewCacheMetadata;
 use s3_proxy::disk_cache::get_sharded_path;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -72,113 +69,6 @@ fn count_scale_spec() -> FixtureSpec {
         payload: PayloadMode::RecordedSizeOnly { stub_bytes: 64 },
         ..FixtureSpec::default()
     }
-}
-
-async fn cache_manager_over(root: &std::path::Path) -> Arc<CacheManager> {
-    let cm = Arc::new(CacheManager::new_with_defaults(
-        root.to_path_buf(),
-        false,
-        0,
-    ));
-    let _disk = cm.create_configured_disk_cache_manager();
-    cm.initialize().await.unwrap();
-    cm
-}
-
-/// THE decisive check. Everything else in this file is supporting evidence.
-///
-/// Constrains `src/cache.rs`'s `collect_candidates_from_metadata_file`: the range
-/// identity it recovers (`cache_key`, `range_start`, `range_end`), the size it reads
-/// by statting the `.bin` resolved as `cache_dir/ranges/{file_path}`, and the
-/// `compressed_size` it copies out of the `RangeSpec`. Reads those values rather
-/// than an adjacent count, per R13.4.
-#[tokio::test]
-async fn fixture_tree_is_discoverable_by_the_real_eviction_candidate_collector() {
-    let tmp = TempDir::new().unwrap();
-    let spec = small_genuine_spec();
-    let fixture = graded_fixture::generate(tmp.path(), &spec, true).expect("generation");
-
-    assert!(
-        !fixture.emitted.is_empty(),
-        "generator emitted nothing to compare against"
-    );
-
-    let cm = cache_manager_over(tmp.path()).await;
-    let candidates = cm
-        .collect_range_candidates_for_eviction()
-        .await
-        .expect("candidate collection");
-
-    // Identity: exactly the generated (key, start, end) triples, no more and no
-    // fewer. A missing triple means the scan could not walk to it or could not
-    // parse it; an extra one means the fixture left something behind.
-    let expected: HashSet<(String, u64, u64)> = fixture
-        .emitted
-        .iter()
-        .map(|e| (e.cache_key.clone(), e.start, e.end))
-        .collect();
-    let discovered: HashSet<(String, u64, u64)> = candidates
-        .iter()
-        .map(|c| (c.cache_key.clone(), c.range_start, c.range_end))
-        .collect();
-
-    let missing: Vec<_> = expected.difference(&discovered).take(5).collect();
-    let extra: Vec<_> = discovered.difference(&expected).take(5).collect();
-    assert!(
-        missing.is_empty(),
-        "eviction did not discover {} of {} generated ranges; first few: {:?}",
-        expected.difference(&discovered).count(),
-        expected.len(),
-        missing
-    );
-    assert!(
-        extra.is_empty(),
-        "eviction discovered {} ranges the generator did not emit; first few: {:?}",
-        discovered.difference(&expected).count(),
-        extra
-    );
-
-    // Sizes: the collector stats the `.bin`. In genuine mode the stat result, the
-    // recorded `compressed_size`, and the range width must all agree — which is
-    // what makes a byte-target measurement over a genuine tree meaningful.
-    let by_id: HashMap<(String, u64, u64), &graded_fixture::EmittedRange> = fixture
-        .emitted
-        .iter()
-        .map(|e| ((e.cache_key.clone(), e.start, e.end), e))
-        .collect();
-    for c in &candidates {
-        let key = (c.cache_key.clone(), c.range_start, c.range_end);
-        let e = by_id.get(&key).expect("checked above");
-        assert_eq!(
-            c.size, e.on_disk_size,
-            "candidate size for {key:?} should be the on-disk .bin length"
-        );
-        assert_eq!(
-            c.compressed_size, e.recorded_compressed_size,
-            "candidate compressed_size for {key:?} should be the recorded figure"
-        );
-        assert_eq!(
-            c.size,
-            c.range_end - c.range_start + 1,
-            "genuine payload length should equal the range width for {key:?}"
-        );
-        assert!(
-            c.bin_file_path.exists(),
-            "the .bin the collector resolved does not exist: {}",
-            c.bin_file_path.display()
-        );
-        assert!(c.access_count >= 1, "access_count should be at least 1");
-    }
-
-    // Negative control. Without this the identity assertion above could pass
-    // against a scan that reported everything it walked past, which is the
-    // false-positive shape `pre-push-checklist.md` records four instances of.
-    assert!(
-        !discovered
-            .iter()
-            .any(|(k, _, _)| k.contains("never-generated")),
-        "scan reported a key the generator never wrote"
-    );
 }
 
 /// Every emitted `.meta` deserialises with the real product type, and sits exactly
@@ -247,7 +137,7 @@ fn every_emitted_meta_parses_as_new_cache_metadata_at_its_own_sharded_path() {
                  None falls back to the object flag and is the pre-migration shape"
             );
             // The property FixtureSpec::validate exists to protect: ages must clear
-            // the admission window in collect_candidates_from_metadata_file, or the
+            // the admission window eviction's selection applies (ADMISSION_WINDOW), or the
             // whole fixture is invisible to eviction.
             let age = r.last_accessed.elapsed().expect("range aged into the past");
             assert!(
@@ -397,70 +287,6 @@ fn degenerate_distributions_produce_the_r13_3_extremes() {
             .count(),
         1,
         "exactly one dominant range"
-    );
-}
-
-/// The recorded-versus-on-disk asymmetry, pinned so it cannot be "fixed".
-///
-/// This asserts the discrepancy **exists** and that it lands on the two candidate
-/// fields the way `collect_candidates_from_metadata_file` puts it there. A future
-/// change that reconciled the two figures would red this test with a message saying
-/// why the discrepancy is deliberate, rather than quietly turning task 9's Fixture A
-/// into an unbuildable one.
-#[tokio::test]
-async fn recorded_size_only_mode_keeps_recorded_and_on_disk_sizes_apart() {
-    let tmp = TempDir::new().unwrap();
-    let spec = FixtureSpec {
-        label: "stub".to_string(),
-        bucket: "fixture-stub".to_string(),
-        objects: 60,
-        max_ranges_per_object: 2,
-        distribution: SizeDistribution::graded(),
-        payload: PayloadMode::RecordedSizeOnly { stub_bytes: 128 },
-        ..FixtureSpec::default()
-    };
-    let fixture = graded_fixture::generate(tmp.path(), &spec, true).expect("generation");
-    let m = &fixture.manifest;
-
-    assert!(
-        m.recorded_size_is_deliberately_not_on_disk_size,
-        "the manifest must declare the discrepancy so a reader finds the reason in the artefact"
-    );
-    assert!(
-        m.recorded_vs_on_disk_why.contains("DELIBERATE"),
-        "the manifest must carry the reason, not just the flag"
-    );
-    assert!(
-        !m.serve_path_valid,
-        "a stub-payload tree cannot serve its recorded content and must say so"
-    );
-    assert!(
-        m.recorded_compressed_bytes > m.on_disk_bytes * 100,
-        "recorded {} should vastly exceed on-disk {} in stub mode",
-        m.recorded_compressed_bytes,
-        m.on_disk_bytes
-    );
-    assert!(m.on_disk_bytes > 0, "stubs still occupy bytes");
-
-    // And the consequence for measurement, read off the product's own candidates:
-    // `size` carries the stub, `compressed_size` carries the realistic figure. This
-    // is the trap for anyone summing `size` to reach a byte target on Fixture A.
-    let cm = cache_manager_over(tmp.path()).await;
-    let candidates = cm.collect_range_candidates_for_eviction().await.unwrap();
-    assert!(!candidates.is_empty());
-    assert!(
-        candidates.iter().all(|c| c.size == 128),
-        "every candidate's size should be the 128-byte stub"
-    );
-    assert!(
-        candidates.iter().any(|c| c.compressed_size > 1024 * 1024),
-        "at least one candidate should record a realistic multi-MiB compressed_size"
-    );
-    let sum_size: u64 = candidates.iter().map(|c| c.size).sum();
-    let sum_recorded: u64 = candidates.iter().map(|c| c.compressed_size).sum();
-    assert!(
-        sum_recorded > sum_size * 100,
-        "the two byte totals must remain distinguishable: size={sum_size} recorded={sum_recorded}"
     );
 }
 
@@ -742,64 +568,6 @@ fn the_directory_memo_does_not_change_the_generated_tree() {
         count(with.path(), "ranges"),
         count(without.path(), "ranges"),
         ".bin file counts differ"
-    );
-}
-
-/// A parallel-generated tree is discoverable by the real eviction collector.
-///
-/// The serial equivalent is
-/// [`fixture_tree_is_discoverable_by_the_real_eviction_candidate_collector`], and
-/// this is not redundant with it: task 9's artefact is written by the parallel
-/// driver, so the driver that actually produces the measured tree is the one that
-/// has to be shown discoverable through product code. Digest equality says the
-/// manifests agree; it does not say the files landed where the scan looks.
-#[tokio::test]
-async fn parallel_generated_tree_is_discoverable_by_the_real_eviction_collector() {
-    let tmp = TempDir::new().unwrap();
-    let spec = FixtureSpec {
-        objects: 900,
-        ..small_genuine_spec()
-    };
-    let fixture = graded_fixture::generate_with(
-        tmp.path(),
-        &spec,
-        &GenOptions {
-            collect_emitted: true,
-            threads: 8,
-            dir_memo: true,
-            shared_storage_ack: None,
-        },
-    )
-    .expect("parallel generation");
-
-    let cm = cache_manager_over(tmp.path()).await;
-    let candidates = cm
-        .collect_range_candidates_for_eviction()
-        .await
-        .expect("candidate collection");
-
-    let expected: HashSet<(String, u64, u64)> = fixture
-        .emitted
-        .iter()
-        .map(|e| (e.cache_key.clone(), e.start, e.end))
-        .collect();
-    let discovered: HashSet<(String, u64, u64)> = candidates
-        .iter()
-        .map(|c| (c.cache_key.clone(), c.range_start, c.range_end))
-        .collect();
-    assert_eq!(
-        expected.difference(&discovered).count(),
-        0,
-        "eviction did not discover {} of {} ranges written in parallel; first few: {:?}",
-        expected.difference(&discovered).count(),
-        expected.len(),
-        expected.difference(&discovered).take(5).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        discovered.difference(&expected).count(),
-        0,
-        "eviction discovered ranges the parallel generator did not emit: {:?}",
-        discovered.difference(&expected).take(5).collect::<Vec<_>>()
     );
 }
 

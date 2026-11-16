@@ -2407,7 +2407,7 @@ impl ApiHandler {
                     evaluate_conditions_from_cache: r.evaluate_conditions_from_cache,
                     page_widening: r.page_widening,
                     page_size: r.page_size,
-                    hedging_enabled: r.hedging_enabled,
+                    hedging_enabled: displayed_hedging_enabled(r),
                     hedge_trigger_after: r
                         .hedge_trigger_after
                         .map(crate::bucket_settings::format_duration),
@@ -3091,6 +3091,12 @@ struct RuleStatsEntry {
     pub get_miss_count: u64,
 }
 
+/// A rule's hedging switch as the proxy resolves it: a budget of 0 resolves as hedging off
+/// (`ResolvedSettings` in `bucket_settings.rs`), so the dashboard shows it off too.
+fn displayed_hedging_enabled(rule: &crate::bucket_settings::CacheRule) -> Option<bool> {
+    rule.hedging_enabled
+        .map(|on| on && rule.hedge_max_per_request != Some(0))
+}
 /// Validate log query parameters
 pub fn validate_log_params(params: &LogQueryParams) -> Option<String> {
     // Check limit bounds
@@ -3239,7 +3245,37 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    /// A rule with `hedging_enabled: true` and `hedge_max_per_request: 0` resolves as hedging
+    /// off, so the bucket stats show it off; a nonzero budget, and a rule that does not set
+    /// the switch, read as before.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the entry showing the rule's raw `hedging_enabled`, the first case reads
+    /// `Some(true)`.
+    #[test]
+    fn a_rule_with_a_zero_hedge_budget_shows_hedging_off() {
+        let rule = |json: &str| -> crate::bucket_settings::CacheRule {
+            serde_json::from_str(json).unwrap()
+        };
+        assert_eq!(
+            displayed_hedging_enabled(&rule(
+                r#"{"pattern": "a/**", "hedging_enabled": true, "hedge_max_per_request": 0}"#
+            )),
+            Some(false),
+            "A RULE WITH hedge_max_per_request: 0 WAS SHOWN WITH HEDGING ON"
+        );
+        assert_eq!(
+            displayed_hedging_enabled(&rule(
+                r#"{"pattern": "a/**", "hedging_enabled": true, "hedge_max_per_request": 2}"#
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            displayed_hedging_enabled(&rule(r#"{"pattern": "a/**", "hedge_max_per_request": 0}"#)),
+            None
+        );
+    }
     /// Task 9.3 — `/api/bucket-traffic` response shape test.
     ///
     /// Directly constructs the `BucketTrafficResponse` that `get_bucket_traffic()`
@@ -3754,12 +3790,7 @@ mod tests {
             .expect("consolidator set by create_configured_disk_cache_manager");
         consolidator.initialize().await.unwrap();
         consolidator
-            .update_size_from_validation_with_kind(
-                4096,
-                None,
-                Some(7),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(4096, None, Some(7))
             .await;
 
         let readable = cache_stats_json(&cache_manager).await;

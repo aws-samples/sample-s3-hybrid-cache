@@ -281,8 +281,8 @@ async fn a_created_meta_takes_the_newest_etag_carrying_fill() {
             .iter()
             .map(|r| (r.start, r.end))
             .collect::<Vec<_>>(),
-        vec![(10, 19)],
-        "only the newer version's fill may be listed under its ETag"
+        Vec::<(u64, u64)>::new(),
+        "a pass that met two versions' fills lists neither"
     );
 }
 

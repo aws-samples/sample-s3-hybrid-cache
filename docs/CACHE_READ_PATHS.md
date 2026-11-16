@@ -256,9 +256,9 @@ A write-cached object starts on its own TTL and moves to the read TTL the first 
 - On the PUT, the TTL is `put_ttl` (default 1 hour).
 - On the first GET, the entry moves from `put_ttl` to `get_ttl`. The move runs before the freshness check, so with `get_ttl: 0` that first GET revalidates against S3.
 - The move needs a known `Last-Modified`. An entry whose `Last-Modified` is not yet known stays on `put_ttl`, in the write cache, until a revalidation learns it (see the `Last-Modified` header above), and then moves as part of that same operation. This keeps the revalidation trigger from clearing the flag it depends on before it fires.
-- An object not read within its TTL expires and is removed.
+- An object not read within `put_ttl` stays cached. Its next read revalidates it with S3, and eviction reclaims such objects first when it needs room.
 
-Frequently read uploads therefore stay cached, and uploads nobody reads expire.
+Frequently read uploads therefore stay cached, and uploads nobody reads are reclaimed first.
 
 #### Capacity management
 
@@ -634,7 +634,7 @@ A waiter waits up to `wait_timeout_secs` for the fetcher to finish:
 
 - **The fetcher succeeds**: the waiter tries the cache first, since the fetcher should have cached the data. On a hit, it serves the response from disk or RAM with no S3 request. If the lookup misses, for example because the metadata is not yet consolidated, it makes its own S3 fetch.
 - **The fetcher fails**: the waiter makes its own S3 fetch.
-- **The wait times out**: the waiter waits on the same fetch again, up to `max_waiter_resubscriptions` times (default `3`). After that, the waiter makes its own S3 fetch, whether it asked for a full object, a range or a part.
+- **The wait times out**: the waiter waits on the same fetch again, up to `max_waiter_resubscriptions` times (default `3`). After that, the waiter makes its own S3 fetch, whether it asked for a full object, a range or a part. A whole-object GET or HEAD waiter makes it after at most 30 seconds of waiting in total, whatever `wait_timeout_secs` says.
 
 ```yaml
 cache:

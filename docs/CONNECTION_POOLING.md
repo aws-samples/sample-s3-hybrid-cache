@@ -96,7 +96,7 @@ An excluded address returns to rotation only when a probe confirms it is reachab
 ### 6. Error recovery
 
 - A connection error removes the failed connection from the pool.
-- Connection errors (a failed connect among them) and timeouts are retried on a new connection, up to 3 retries for GET and HEAD. The waits before them are 100, 200 and 400 ms, and every retry counts against that limit. With IP distribution on, each retry takes the next address. A signed range GET that still fails is sent up to twice more, after waits of 100 ms and 200 ms, with the same retries each time.
+- Connection errors (a failed connect among them) and timeouts are retried on a new connection, up to 3 retries for GET and HEAD. The waits before them are 100, 200 and 400 ms, and every retry counts against that limit. With IP distribution on, each retry takes the next address.
 - An error response from S3, `5xx` and `429` included, is not retried; the proxy returns it to the client. The AWS SDKs and the AWS CLI retry transient server errors and throttling errors, such as `503 SlowDown`, with backoff. On a partial range hit or a page fill, a sub-fetch that gets an error response makes the proxy fetch the client's range once instead.
 - A key whose cache rule turns hedging on follows different rules; see [Hedging](HEDGING.md#connection-diversity).
 - A GET or HEAD without a body whose established connection is lost after the request went out is first retried once, immediately, on a new connection that bypasses the pool. The usual cause is a pooled connection that S3 had already closed while it was idle. That first loss does not count toward `ip_failure_threshold`, since S3 closes idle connections on every address alike; a loss on the retry does. Requests with a body are never retried this way.
@@ -113,12 +113,12 @@ This sets the client's pool idle timeout and its idle connections per host to 0,
 
 ## Upstream idle watchdog
 
-The proxy detects a stalled upstream connection and ends it, rather than leaving the client to wait for its own read timeout (60 seconds by default in the AWS CLI and botocore). It does so on the cache-miss fetches it streams: full-object GETs, part-number GET misses, complete range misses and signed ranges. Some fetches have no timer once their response headers arrive, among them the buffered fetches of a partial range hit or a page fill and requests forwarded without caching. Such a fetch lasts until the origin finishes or the client disconnects.
+The proxy detects a stalled upstream connection and ends it, rather than leaving the client to wait for its own read timeout (60 seconds by default in the AWS CLI and botocore). It does so on the cache-miss fetches it streams: full-object GETs, part-number GET misses, complete range misses and signed ranges. The buffered fetches of a partial range hit, a page fill or a fallback refetch use the same timeout between body chunks, and a stall there fails as a timeout that is retried. Requests forwarded without caching have no timer once their response headers arrive.
 
 ### Two-phase detection
 
 1. **Before the first byte** of a full-object GET, a part-number GET or a HEAD (`upstream_first_byte_timeout`, default `5s`): if no response byte arrives within the timeout, the attempt is aborted and retried, up to `upstream_idle_retries` times. When the retries run out, the proxy answers `504 Gateway Timeout`.
-2. **Mid-stream** (`upstream_idle_timeout`, default `5s`): once the upstream has started sending, if no new chunk arrives within the timeout, the proxy closes the client connection and the body ends early. The client's own retry logic takes over. [Cache safety](#cache-safety) describes what is cached.
+2. **Mid-stream** (`upstream_idle_timeout`, default `5s`): once the upstream has started sending, if no new chunk arrives within the timeout, the proxy closes the client connection, so the body ends short of its `Content-Length`. A client that checks the length reports the short body as an error, which the application can retry. [Cache safety](#cache-safety) describes what is cached.
 
 ```yaml
 connection_pool:

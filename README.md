@@ -48,7 +48,7 @@ Hybrid Cache for Amazon S3 provides a caching layer that serves repeat reads loc
 - Content-aware LZ4 compression stores compressible content compressed and skips formats that are already compressed
 - TinyLFU-like eviction keeps data that is read often ahead of data read once
 - Separate TTLs for HEAD and GET requests. Expired cached objects are automatically revalidated with S3 using If-None-Match, avoiding re-download when unchanged
-- Choose lazy expiration for fixed-capacity storage or active expiration for elastic storage
+- Expired entries stay on disk and are revalidated on the next read; set `max_cache_size` to the amount to keep, so eviction frees the space
 
 **Unified Range Storage**
 - All cached data is stored in one format, so full objects, byte ranges, and multipart parts are interchangeable

@@ -667,3 +667,159 @@ async fn a_graduation_is_in_the_graduating_proxys_own_figure_before_its_cycle_fl
     .await
     .expect("T4i timed out");
 }
+
+/// Make each key's `.meta` directory read-only, so the `.meta` unlink fails while the range files
+/// (under `ranges/`) and the slot locks stay writable. Returns the directories and their modes for
+/// [`thaw`], or `None` when this user can still write a read-only directory (root), in which case
+/// the failed-unlink fixture cannot be built.
+fn freeze_meta_dirs(dir: &Path, keys: &[String]) -> Option<Vec<(std::path::PathBuf, u32)>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut frozen: Vec<(std::path::PathBuf, u32)> = Vec::new();
+    for key in keys {
+        let meta = get_sharded_path(&dir.join("metadata"), key, ".meta").unwrap();
+        let parent = meta.parent().unwrap().to_path_buf();
+        if frozen.iter().any(|(p, _)| *p == parent) {
+            continue;
+        }
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        frozen.push((parent, mode));
+    }
+    let probe = frozen[0].0.join("fixture-write-probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        thaw(frozen);
+        return None;
+    }
+    Some(frozen)
+}
+
+fn thaw(frozen: Vec<(std::path::PathBuf, u32)>) {
+    use std::os::unix::fs::PermissionsExt;
+    for (dir, mode) in frozen {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+/// A staging pass whose `.meta` unlinks fail removes the range files and debits nothing: the
+/// `.meta`s are still on disk, the fold still counts them, and the next pass removes them. The re-fold
+/// is held busy, so only the debit decides the figure.
+///
+/// # RED SIDE
+///
+/// With the pass debiting every eviction (the `meta_removed` arm removed), the figure reads the
+/// census less the evicted objects' bytes while every `.meta` is still on disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staging_eviction_whose_meta_unlink_failed_debits_nothing() {
+    tokio::time::timeout(BOUND, async {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let m = manager(dir).await;
+        let keys = stage(&m, 7).await;
+        let (trigger, _) = m.get_staging_eviction_thresholds();
+        let before = derived(&m).await;
+        assert!(
+            before == census(dir, &keys) && before > trigger,
+            "fixture: the folded figure is the census and over the trigger (before={before}, \
+             trigger={trigger})"
+        );
+        let Some(frozen) = freeze_meta_dirs(dir, &keys) else {
+            println!("SKIPPED: this user can write a read-only directory");
+            return;
+        };
+        claim_all(dir, &keys).await;
+        let freed = m.evict_staging_tier().await;
+        release_claims(dir);
+        thaw(frozen);
+        let surviving = keys.iter().filter(|k| meta_of(dir, k).is_some()).count();
+        let truth = census(dir, &keys);
+        let figure = derived(&m).await;
+        println!(
+            "failed .meta unlink: before={before} freed={freed} surviving={surviving} \
+             truth={truth} figure={figure}"
+        );
+        assert!(
+            freed > 0 && surviving == keys.len(),
+            "fixture: the pass removed range files and every .meta survived (freed={freed}, \
+             surviving={surviving})"
+        );
+        assert_eq!(
+            figure, truth,
+            "A STAGING PASS DEBITED OBJECTS WHOSE .meta IT FAILED TO UNLINK: the figure must be the \
+             census of the .metas still on disk (before={before}, freed={freed})"
+        );
+    })
+    .await
+    .expect("failed-unlink staging test timed out");
+}
+
+/// A DELETE whose `.meta` unlink failed debits nothing from the staged figure: the `.meta` is
+/// still on disk and still in the fold's figure, and the next removal of the key debits it once.
+/// The size accumulator gives back the range files the DELETE did unlink, since those bytes are
+/// off the volume and no later removal finds them.
+///
+/// # RED SIDE
+///
+/// With the removal debit recorded before the unlink's result is known (`&& metadata_deleted`
+/// removed from the dirty-mark guard), the figure reads the census less the object's bytes. With
+/// the accumulator debit gated on the `.meta` unlink, the accumulator does not move.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_whose_meta_unlink_failed_debits_nothing() {
+    tokio::time::timeout(BOUND, async {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let m = manager(dir).await;
+        let keys = stage(&m, 7).await;
+        let before = derived(&m).await;
+        assert_eq!(
+            before,
+            census(dir, &keys),
+            "fixture: the folded figure is the census"
+        );
+        let victim = keys[..1].to_vec();
+        let Some(frozen) = freeze_meta_dirs(dir, &victim) else {
+            println!("SKIPPED: this user can write a read-only directory");
+            return;
+        };
+        let consolidator = m.get_journal_consolidator().await.expect("consolidator");
+        let accumulator = consolidator.size_accumulator();
+        let victim_bytes = census(dir, &victim);
+        let acc_before = (
+            accumulator.current_delta(),
+            accumulator.current_write_cache_delta(),
+        );
+        let deleted = m.invalidate_cache_hierarchy(&victim[0]).await;
+        let acc_after = (
+            accumulator.current_delta(),
+            accumulator.current_write_cache_delta(),
+        );
+        thaw(frozen);
+        let truth = census(dir, &keys);
+        let figure = derived(&m).await;
+        println!(
+            "failed .meta unlink on DELETE: accumulator before={acc_before:?} after={acc_after:?} \
+             victim={victim_bytes}"
+        );
+        assert_eq!(
+            (acc_before.0 - acc_after.0, acc_before.1 - acc_after.1),
+            (victim_bytes as i64, victim_bytes as i64),
+            "A DELETE WHOSE .meta UNLINK FAILED LEFT THE RANGE FILES IT UNLINKED IN THE SIZE \
+             ACCUMULATOR (victim={victim_bytes})"
+        );
+        println!(
+            "failed .meta unlink on DELETE: before={before} truth={truth} figure={figure} \
+             result={deleted:?}"
+        );
+        assert!(
+            meta_of(dir, &victim[0]).is_some(),
+            "fixture: the victim's .meta survived the DELETE"
+        );
+        assert_eq!(
+            figure, truth,
+            "A DELETE DEBITED AN OBJECT WHOSE .meta IT FAILED TO UNLINK: the figure must be the \
+             census of the .metas still on disk (before={before})"
+        );
+    })
+    .await
+    .expect("failed-unlink DELETE test timed out");
+}

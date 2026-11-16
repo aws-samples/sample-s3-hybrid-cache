@@ -41,6 +41,17 @@ static LAST_UNDERFLOW_WARN: AtomicU64 = AtomicU64::new(0);
 static UNDERFLOWS: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// What [`WriteCacheManager::evict_write_cached_object_if_unchanged`] removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StagingEviction {
+    /// Compressed bytes of the range files removed.
+    pub(crate) freed: u64,
+    /// The `.meta` was unlinked. When it was not, the object is still in the staged fold's
+    /// figure and in the staged-entry gauge, and a later pass removes it again, so the caller
+    /// debits nothing for it.
+    pub(crate) meta_removed: bool,
+}
+
 /// Which staged object a `.meta` describes: its ETag and the time it was published staged.
 ///
 /// Every staged writer stamps `write_cache_created_at` with the publish time, so a replacing
@@ -746,12 +757,14 @@ impl WriteCacheManager {
     /// nothing touched: no file removed, no debit, no counter moved. The caller must then not
     /// retire the candidate's ledger entries, since nothing was consumed.
     ///
-    /// `Ok(Some(freed))` is an eviction; `expected: None` never declines.
+    /// `Ok(Some(eviction))` is an eviction; `expected: None` never declines. An eviction whose
+    /// `.meta` unlink failed reports `meta_removed: false` and leaves the staged-entry gauge
+    /// alone, because the object is still staged on disk.
     pub(crate) async fn evict_write_cached_object_if_unchanged(
         &self,
         cache_key: &str,
         expected: Option<&StagedObjectIdentity>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<StagingEviction>> {
         // Read metadata to get range files
         let metadata_path = self.get_metadata_path(cache_key)?;
 
@@ -954,7 +967,7 @@ impl WriteCacheManager {
         // if it was staged to begin with. A caller evicting an already-graduated
         // read-cache entry must not decrement a gauge it was never counted in.
         // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
-        if metadata.object_metadata.is_write_cached {
+        if metadata_deleted && metadata.object_metadata.is_write_cached {
             self.decrement_staged_entries();
         }
 
@@ -970,7 +983,10 @@ impl WriteCacheManager {
                 .fetch_add(total_freed, Ordering::Relaxed);
         }
 
-        Ok(Some(total_freed))
+        Ok(Some(StagingEviction {
+            freed: total_freed,
+            meta_removed: metadata_deleted,
+        }))
     }
 
     /// `evict_write_cached_object_if_unchanged` with no identity check, reporting freed bytes.
@@ -981,7 +997,7 @@ impl WriteCacheManager {
         Ok(self
             .evict_write_cached_object_if_unchanged(cache_key, None)
             .await?
-            .unwrap_or(0))
+            .map_or(0, |eviction| eviction.freed))
     }
 
     /// Get metadata file path for a cache key
@@ -1563,7 +1579,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(freed, Some(size));
+        assert_eq!(freed.map(|eviction| eviction.freed), Some(size));
         assert!(!meta_path.exists());
     }
 
@@ -1868,12 +1884,7 @@ mod tests {
         // Establish a known non-zero starting point, so a subtraction would be visible
         // as a change rather than being indistinguishable from the default of 0.
         consolidator
-            .update_size_from_validation_with_kind(
-                100_000,
-                Some(50_000),
-                Some(7),
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(100_000, Some(50_000), Some(7))
             .await;
         let before = consolidator.get_size_state().await.unwrap();
         assert_eq!(before.total_size, 100_000, "precondition");

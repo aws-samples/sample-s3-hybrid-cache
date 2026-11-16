@@ -31,7 +31,7 @@ fn create_test_metadata(etag: &str, content_length: u64) -> CacheMetadata {
 /// Backdate the recorded `last_accessed` of every range of one cached entry so the
 /// entry is past the eviction admission window.
 ///
-/// `collect_range_candidates_for_eviction` applies an unconditional 60-second
+/// Read-tier selection applies an unconditional 60-second
 /// admission window, so a range stored moments ago is skipped as *ineligible*.
 /// Ageing the entry first keeps the assertion about **discoverability** rather than
 /// about admission policy.
@@ -141,20 +141,24 @@ async fn test_cache_entry_identification_new_format() -> Result<()> {
 
     // Verify eviction can identify all entries.
     //
-    // Eviction does not know the cache keys. It has to find entries by traversing the
-    // sharded cache tree and recover each key from the `.meta` contents, so this asks a
-    // different question from the `read_stored_object` loop above, which derives a path
-    // from a key it already has. A new-format key that hashed into a directory the scan
-    // does not walk, or wrote a `.meta` the scan cannot parse, would still be served
-    // above while being invisible to eviction.
+    // Eviction does not know the cache keys. With no shard index on this fresh volume it
+    // rebuilds each shard's index from the `.meta` files it lists and recovers each key from
+    // their contents, so this asks a different question from the `read_stored_object` loop
+    // above, which derives a path from a key it already has. A new-format key that hashed
+    // into a directory the rebuild does not list, or wrote a `.meta` it cannot parse, would
+    // still be served above while being invisible to eviction.
     for (cache_key, _) in &test_cases {
         age_entry_past_admission_window(temp_dir.path(), cache_key);
     }
 
-    let candidates = cache_manager
-        .collect_range_candidates_for_eviction()
-        .await?;
-    let discovered: Vec<&str> = candidates.iter().map(|c| c.cache_key.as_str()).collect();
+    let outcome = cache_manager
+        .select_eviction_candidates_bounded(u64::MAX)
+        .await;
+    let discovered: Vec<&str> = outcome
+        .selected
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
 
     for (cache_key, _) in &test_cases {
         assert!(

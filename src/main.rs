@@ -1120,6 +1120,10 @@ async fn async_main() -> Result<()> {
     // Give server tasks a moment to finish after receiving their shutdown signals
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Connections already open keep serving requests after the coordinator's flush, which also
+    // stopped the flush timer, so their access-log records are written here.
+    s3_proxy::shutdown::flush_access_log_at_exit(&logger_manager).await;
+
     info!("Hybrid Cache for Amazon S3 shutdown complete");
     Ok(())
 }
@@ -1163,6 +1167,34 @@ mod tests {
         assert!(
             body_start + spawn < test_module,
             "the spawn must be in production code, not in the test module"
+        );
+    }
+
+    /// Red side (wiring half): `async_main` flushes the access log after the shutdown
+    /// coordinator has finished and the server tasks have drained, so a request answered after
+    /// the coordinator's own flush is written. The flush itself is tested in `logging.rs`
+    /// (`a_request_answered_after_the_shutdown_flush_is_written_at_exit`). Red side: removing
+    /// the call from `async_main` fails this test.
+    #[test]
+    fn async_main_flushes_the_access_log_after_the_server_drain() {
+        let source = include_str!("main.rs");
+        let body_start = source
+            .find("async fn async_main()")
+            .expect("async_main must exist");
+        let tests_start = source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("test module marker");
+        let body = &source[body_start..tests_start];
+        let drain = body
+            .find("shutdown_task.await")
+            .expect("async_main must await the shutdown task");
+        let flush = body.find("flush_access_log_at_exit(").expect(
+            "async_main must flush the access log after the shutdown coordinator, or records of \
+             requests answered during the shutdown are lost",
+        );
+        assert!(
+            flush > drain,
+            "the exit flush must come after the shutdown task and the server drain"
         );
     }
 

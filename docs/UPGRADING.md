@@ -10,11 +10,11 @@ see different memory use, connection counts, network exposure, or on-disk layout
 binary swap. The tables below list the releases that do one of those things, so you can
 read only the ones between your current version and your target.
 
-For 3.0.0 to 3.0.5, each release's section below, from [Upgrading to 3.0.5](#upgrading-to-305) to [Upgrading to 3.0.0](#upgrading-to-300), and the guides it links carry the detail, and
+For 3.0.0 to 3.0.6, each release's section below, from [Upgrading to 3.0.6](#upgrading-to-306) to [Upgrading to 3.0.0](#upgrading-to-300), and the guides it links carry the detail, and
 the [changelog](../CHANGELOG.md) summarizes each release. For every release up to 2.8.4,
 the detail is in the [pre-3.0.0 changelog](../changelog-pre-v3.md).
 
-3.0.0 upgrades in place from any 2.8 release, and 3.0.1 to 3.0.5 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
+3.0.0 upgrades in place from any 2.8 release, and 3.0.1 to 3.0.6 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
 After 3.0.0, restart a fleet one proxy at a time. Clients that fail over, such as CRT-based ones, retry on another proxy while one restarts, and the cache volume survives restarts.
 Releases from before 1.0.0 are not covered. Upgrading from a pre-1.0.0 build is not a
 supported path; start from a fresh cache directory and a config derived from the
@@ -49,6 +49,7 @@ corrupted.
 
 | Version | Change on a binary-only upgrade |
 |---|---|
+| 3.0.6 | Operators with a cache near `max_cache_size`, multipart uploads, alerts on eviction or write cache figures, a set `eviction_lock_timeout`, or clients of the HTTPS passthrough and `CONNECT` tunnels see changed behavior; see [Upgrading to 3.0.6](#upgrading-to-306). |
 | 3.0.4 | Deployments that cache multipart uploads keep an unread completed one for `put_ttl` (default `1h`) instead of a day, and some write cache metrics change meaning; see [Upgrading to 3.0.4](#upgrading-to-304). |
 | 3.0.3 | Write cache reclamation removes nothing by size while the recomputed staged figure cannot be read, and `write_cache.inflight_bytes` counts only uploads in flight; see [Upgrading to 3.0.3](#upgrading-to-303). |
 | 3.0.1 | Ranges a 2.x release cached, and part layouts recorded before 3.0.1, are fetched from S3 once, on first read; see [Upgrading to 3.0.1](#upgrading-to-301). |
@@ -87,6 +88,36 @@ corrupted.
 Releases not listed above require no action and change no defaults: internal fixes,
 performance work, additive opt-in features that stay disabled until configured, and
 dependency bumps.
+
+## Upgrading to 3.0.6
+
+3.0.6 upgrades in place from 3.0.5 and needs no configuration change and no manual step. When upgrading from 3.0.4 or earlier, take those releases' steps as well. It lets a cache near its limit evict to make room for objects it declined, keeps an unread upload cached past `put_ttl`, and refuses every tunnel until the proxy has read its own addresses.
+
+### What you will see after upgrading to 3.0.6
+
+- A cache at or under `cache.eviction_trigger_percent` evicts when it declines an object no larger than half the gap between `max_cache_size` and `cache.eviction_target_percent`, 10% of `max_cache_size` at the defaults. While such objects keep arriving, it evicts more and holds less data ([Room for a declined object](EVICTION.md#room-for-a-declined-object)).
+- `cache.eviction_trigger_percent: 100` runs as 99 and logs a warning at startup, for the read cache and the write cache, and a target of 99 then runs as 89. Set 99 or lower to remove the warning.
+- Admission and read cache eviction count multipart uploads in progress against `max_cache_size` at both staged-authority epochs. A cache near its limit with uploads in progress stops caching new objects sooner and evicts to make room, and an abandoned upload counts until `cache.incomplete_upload_ttl` (one day by default) removes it.
+- `cache.shared_storage.eviction_lock_timeout` also sets how long a write cache eviction pass may hold the eviction lock, and the pass releases it once the stage it is in finishes; the next one continues. A configuration that sets a long value, such as the `300s` in `docs/examples/config-production.yaml`, gives the pass that long ([Coordination across proxies](EVICTION.md#coordination-across-proxies)). On a cache volume where a write cache pass cannot finish reading what is staged within that time, read cache eviction can reclaim unread uploads once they pass `put_ttl`.
+- A write-cached object left unread past `put_ttl` stays cached, and the validation scan leaves it in place, until its next read revalidates it with S3, or until eviction reclaims it, expired objects first. On a quiet or write-mostly cache, disk use and the write cache figures on `/metrics` rise toward the write cache's share of `max_cache_size`, and the write cache reclamation counters start to move.
+- Read cache eviction selects only from each cache shard's range index, which lists ranges of every size, up to `tail_max_entries` per shard. A pass rebuilds a missing or exhausted index, starting no new shard after 5 seconds, so until each shard's index has been rebuilt, a pass can free less than its target ([What a pass reads](EVICTION.md#what-a-pass-reads)).
+- `cache.shared_storage.tail_floor_bytes` has no effect, and a configuration that sets it logs a warning at startup; delete the field to remove the warning. A value outside 4 KiB to 1 GiB still fails startup, and `tail_floor_bytes` on `/metrics` reads `0`.
+- The `/metrics` counters `eviction_fallback_tail_empty_total`, `eviction_fallback_cap_exhausted_total` and `eviction_fallback_unvisited_total` are removed. Remove alerts and panels that read them.
+- At `write_cache.staged_authority_epoch` `1`, `cache_size.accounting_drift.write_cache_size` publishes a full scan's drift against the recomputed staged figure. Its `unevaluable_reason` reads `staged_figure_unknown` only when that figure could not be read, so move alerts keyed on `staged_authority_epoch_1` to it.
+- At `write_cache.staged_authority_epoch` `0`, write cache reclamation sizes its passes from the recomputed staged figure, capped by the event-maintained one. On a cache volume upgraded straight from a 2.x release, it can remove less than it should for up to a day, until the proxy has recomputed every shard's staged figure.
+- In rolling mode, the validation scan applies its correction on top of the size changes proxies record meanwhile, so the cache size can read high mid-rotation and eviction can start earlier. The `Updated size state from validation:` log line has the same fields in both modes, with `baseline_write_cache_size` and `census_write_cache_size` in place of `old_write_cache_size` and `new_write_cache_size`.
+- An unhedged signed range GET is sent at most 5 times, up to 30 seconds each, before the proxy answers `502` or `504`, where 3.0.5 could send it 12 times. A hedged one whose attempts both fail fails at once, as a complete range miss does ([Hedging](HEDGING.md#connection-diversity)).
+- A whole-object GET or HEAD waiting on another request's fetch waits at most 30 seconds in total, then fetches from S3 itself. With `download_coordination.wait_timeout_secs` above 30, expect more S3 GETs for whole objects, while range and part waiters still follow the setting.
+- With `connection_pool.ip_distribution_enabled: false`, uploads and other writes connect to the first address of each lookup, as reads do. A host named by an exact `endpoint_overrides` entry keeps its rotation.
+- Until the proxy has read its interface addresses once, the HTTPS passthrough and `CONNECT` tunnels refuse every destination, and the proxy reads them again on the next tunnel. Under the shipped systemd unit the proxy reads them without a netlink socket, so a tunnel to the host's own non-loopback address, which 3.0.5 relayed, is refused. A client that relied on it connects to the proxy's listener instead ([Destination policy](ARCHITECTURE.md#destination-policy-ssrf-protection)).
+
+### During a rolling upgrade to 3.0.6
+
+3.0.6 uses the cache volume as 3.0.5 does, so 3.0.5 and 3.0.6 proxies can share it while the fleet is upgraded one proxy at a time. These differences last until the last 3.0.5 proxy is upgraded:
+
+- A 3.0.5 proxy starts no eviction for an object it declines.
+- When the daily validation scan runs on a 3.0.5 proxy, it still deletes write-cached objects left unread past `put_ttl`.
+- A 3.0.5 proxy's read cache eviction still scans every `.meta` file when its index falls short.
 
 ## Upgrading to 3.0.5
 
@@ -268,7 +299,7 @@ Rolling back to 3.0.0 needs no step. 3.0.1 adds one field to an object's cached 
 
 A proxy can be rolled back to an earlier release in place until the cache volume switches to the write-cache size figure that 3.0.0 recomputes from the cache's metadata. The switch is checked only on a consolidation cycle that has something to record: an upload, overwrite or delete that changes the cache's size, a miss that caches data, a GET served from the cache, or a revalidation with S3 that refreshes an entry. An overwrite that leaves an object's stored size unchanged usually records nothing. The volume switches on the first such cycle once all of these hold:
 
-- Every proxy that has written to the volume runs 3.0.0 and has published that it is ready, or has not changed its files on the volume for one day. After an upgrade, this means at least a day after the last 2.8 proxy stopped writing. The day restarts whenever 3.0.0 clears an entry of that proxy's, which happens on the next compaction or eviction pass after one of its staged objects is read, overwritten, deleted or evicted.
+- Every proxy that has written to the volume runs 3.0.0 and has published that it is ready, or has not changed its files on the volume for one day. After an upgrade, this means at least a day after the last 2.8 proxy stopped writing. The day restarts whenever 3.0.0 clears an entry of that proxy's, which happens on the next compaction or eviction pass, on any proxy, after one of its staged objects is read, overwritten, deleted or evicted.
 - The proxies, between them, have refreshed every cache shard's write-cache figure and checked every shard's write-cache records within the last day. Each proxy checks at least one shard every 5 minutes, and the proxies share the shards. `ledger_repair_projected_rotation_secs` is the time one proxy would take alone: `ledger_repair_observed_shards` × 300 s below 288 shards, about 86,400 s above. With several proxies, divide it by their number. New shards, created as new objects are cached, add to it.
 - The volume has cached at least one upload.
 
@@ -291,7 +322,7 @@ first read. Log directories are separate settings from `cache_dir` and need no c
 
 ### If the epoch stays at 0
 
-`write_cache.staged_authority_activation_blocker` names what the switch is waiting for ([Metrics reference](METRICS_REFERENCE.md) lists the labels). The usual reason after an upgrade is a proxy you removed or replaced, named by `write_cache.staged_authority_activation_blocking_instance`. The switch stops waiting for it once its files on the volume have been unchanged for one day, and the day restarts whenever 3.0.0 clears an entry of that proxy's. `rotation_incomplete` means the write-cache figure has not been refreshed for every shard: read `staged_shard_authority_age_secs` against 86,400 and `staged_fold_shards_beyond_max_age`. `staged_fold_shards` at `0` means no upload is cached yet. `repair_rotation_incomplete` means the write-cache record check has not finished: compare `ledger_repair_swept_shards` with `ledger_repair_observed_shards`.
+`write_cache.staged_authority_activation_blocker` names what the switch is waiting for ([Metrics reference](METRICS_REFERENCE.md) lists the labels). The usual reason after an upgrade is a proxy you removed or replaced, named by `write_cache.staged_authority_activation_blocking_instance`. The switch stops waiting for it once its files on the volume have been unchanged for one day. The day restarts whenever 3.0.0 clears an entry of that proxy's, which a compaction or eviction pass on any proxy does after one of its staged objects is read, overwritten, deleted or evicted. `rotation_incomplete` means the write-cache figure has not been refreshed for every shard: read `staged_shard_authority_age_secs` against 86,400 and `staged_fold_shards_beyond_max_age`. `staged_fold_shards` at `0` means no upload is cached yet. `repair_rotation_incomplete` means the write-cache record check has not finished: compare `ledger_repair_swept_shards` with `ledger_repair_observed_shards`.
 
 ## Upgrading to 2.0.0 (per-bucket `_settings.json` removed)
 

@@ -34,6 +34,9 @@ pub struct S3Client {
     fresh_client: Client<CustomHttpsConnector, Full<Bytes>>,
     pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     request_timeout: Duration,
+    /// How long a buffered response body may send nothing between frames
+    /// (`connection_pool.upstream_idle_timeout`). See `collect_body_within_idle`.
+    upstream_idle_timeout: Duration,
     keepalive_enabled: bool,
     ip_distribution_enabled: bool,
     metrics_manager:
@@ -128,18 +131,14 @@ pub enum S3ResponseBody {
 }
 
 impl S3ResponseBody {
-    /// Convert to buffered bytes, collecting stream if necessary
-    pub async fn into_bytes(self) -> Result<Bytes> {
+    /// Convert to buffered bytes, collecting a streaming body if necessary. The upstream may
+    /// send nothing for at most `idle_timeout` between frames
+    /// (`connection_pool.upstream_idle_timeout`, from [`S3ClientApi::upstream_idle_timeout`]);
+    /// past that the collection fails with `TimeoutError`. See `collect_body_within_idle`.
+    pub async fn into_bytes(self, idle_timeout: Duration) -> Result<Bytes> {
         match self {
             S3ResponseBody::Buffered(bytes) => Ok(bytes),
-            S3ResponseBody::Streaming(body) => {
-                let bytes = body
-                    .collect()
-                    .await
-                    .map_err(|e| ProxyError::HttpError(format!("Failed to collect stream: {}", e)))?
-                    .to_bytes();
-                Ok(bytes)
-            }
+            S3ResponseBody::Streaming(body) => collect_body_within_idle(body, idle_timeout).await,
         }
     }
 
@@ -150,6 +149,61 @@ impl S3ResponseBody {
             S3ResponseBody::Streaming(_) => None,
         }
     }
+}
+
+/// Collect `body` into one buffer. Fails with `TimeoutError` when the upstream sends no frame
+/// for `idle_timeout` (`connection_pool.upstream_idle_timeout`), and with `HttpError` when the
+/// body read fails.
+///
+/// The 30 s request timeout ends when the response head arrives, so without this an origin
+/// that sends its head and then stops would hold the request, its concurrency permit, its
+/// download-coordination slot and its connection until the client disconnected. The bound is
+/// between frames, as `TeeStream`'s watchdog is on the streamed paths, so the same upstream
+/// silence fails a buffered fetch and a streamed one alike, and a slow body that keeps moving
+/// is never cut. `forward_request`'s ladder retries the `TimeoutError` like any other timeout.
+pub(crate) async fn collect_body_within_idle<B>(
+    mut body: B,
+    idle_timeout: Duration,
+) -> Result<Bytes>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let mut chunks: Vec<Bytes> = Vec::new();
+    loop {
+        let frame = match tokio::time::timeout(idle_timeout, body.frame()).await {
+            Err(_) => {
+                return Err(ProxyError::TimeoutError(format!(
+                    "Upstream sent no response body bytes for {:?} (connection_pool.upstream_idle_timeout)",
+                    idle_timeout
+                )))
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                return Err(ProxyError::HttpError(format!(
+                    "Failed to read response body: {}",
+                    e
+                )))
+            }
+            Ok(Some(Ok(frame))) => frame,
+        };
+        if let Ok(data) = frame.into_data() {
+            if !data.is_empty() {
+                chunks.push(data);
+            }
+        }
+    }
+    Ok(match chunks.len() {
+        0 => Bytes::new(),
+        1 => chunks.pop().unwrap_or_default(),
+        _ => {
+            let mut joined = bytes::BytesMut::with_capacity(chunks.iter().map(Bytes::len).sum());
+            for chunk in &chunks {
+                joined.extend_from_slice(chunk);
+            }
+            joined.freeze()
+        }
+    })
 }
 
 /// S3 response from forwarded request
@@ -263,6 +317,18 @@ pub trait S3ClientApi: Send + Sync {
     fn ip_health_tracker(&self) -> Option<Arc<crate::connection_pool::IpHealthTracker>> {
         None
     }
+    /// How long a buffered response body may send nothing between frames
+    /// (`connection_pool.upstream_idle_timeout`), for callers that collect a streaming body
+    /// with [`S3ResponseBody::into_bytes`]. Defaults to the configuration default.
+    fn upstream_idle_timeout(&self) -> Duration {
+        crate::config::default_upstream_idle_timeout()
+    }
+    /// `connection_pool.ip_distribution_enabled`. With it off no distributor is refreshed
+    /// and no excluded address is probed, so the signed-write path seeds none. Defaults to
+    /// `true`, the configuration default.
+    fn ip_distribution_enabled(&self) -> bool {
+        true
+    }
     /// True when the client was built with endpoint overrides (PrivateLink
     /// destinations). Consumers use this to decide whether to lock outbound
     /// TLS to 1.2.
@@ -336,6 +402,12 @@ impl S3ClientApi for S3Client {
     }
     fn ip_health_tracker(&self) -> Option<Arc<crate::connection_pool::IpHealthTracker>> {
         Some(Arc::clone(&self.health_tracker))
+    }
+    fn upstream_idle_timeout(&self) -> Duration {
+        self.upstream_idle_timeout
+    }
+    fn ip_distribution_enabled(&self) -> bool {
+        self.ip_distribution_enabled
     }
     fn has_endpoint_overrides(&self) -> bool {
         S3Client::has_endpoint_overrides(self)
@@ -487,6 +559,7 @@ impl S3Client {
             fresh_client,
             pool_manager,
             request_timeout: Duration::from_secs(30),
+            upstream_idle_timeout: config.upstream_idle_timeout,
             keepalive_enabled: config.keepalive_enabled,
             ip_distribution_enabled: config.ip_distribution_enabled,
             metrics_manager: metrics_ref,
@@ -935,7 +1008,7 @@ impl S3Client {
             // Buffering_Site (allow_streaming == false): reserve against the
             // in-flight ledger before collecting. A declared content_length is
             // used as the reservation size; a body with no declared length (or
-            // a lying one) is still bounded because `collect()` cannot exceed
+            // a lying one) is still bounded because collection cannot exceed
             // the actual bytes on the wire, but we reserve what we know up
             // front so the Admission_Check happens before allocation.
             // Requirements: IMA 1.2, 1.3, 2.1, 2.5, 4.5
@@ -950,11 +1023,7 @@ impl S3Client {
                 }
             };
 
-            let body_bytes = body
-                .collect()
-                .await
-                .map_err(|e| ProxyError::HttpError(format!("Failed to read response body: {}", e)))?
-                .to_bytes();
+            let body_bytes = collect_body_within_idle(body, self.upstream_idle_timeout).await?;
 
             if body_bytes.is_empty() {
                 None
@@ -1207,11 +1276,7 @@ impl S3Client {
                 "Buffering response body (Content-Length: {:?} bytes)",
                 content_length
             );
-            let body_bytes = body
-                .collect()
-                .await
-                .map_err(|e| ProxyError::HttpError(format!("Failed to read response body: {}", e)))?
-                .to_bytes();
+            let body_bytes = collect_body_within_idle(body, self.upstream_idle_timeout).await?;
 
             if body_bytes.is_empty() {
                 None
@@ -1331,13 +1396,8 @@ impl S3Client {
                 // Retry on specific HTTP errors that indicate temporary issues
                 msg.contains("connection") || msg.contains("timeout") || msg.contains("reset")
             }
-            ProxyError::S3Error(msg) => {
-                // Retry on S3 server errors (5xx) but not client errors (4xx)
-                msg.contains("503")
-                    || msg.contains("500")
-                    || msg.contains("502")
-                    || msg.contains("429")
-            }
+            // S3's own responses, 5xx and 429 included, arrive as `Ok` and go to the client
+            // unretried; the SDKs back off and retry them.
             _ => false,
         }
     }
@@ -3040,6 +3100,153 @@ mod lost_connection_tests {
         }
     }
 
+    /// Loopback upstream that answers every request with a head declaring 100 bytes, sends
+    /// three of them and then sends nothing more, holding the connection open.
+    async fn start_stalling_upstream() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut got = 0usize;
+                while !buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf[got..]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                    .await;
+                held.push(sock);
+            }
+        });
+        port
+    }
+
+    /// An origin that sends its response head and then stalls fails a buffered fetch with
+    /// `TimeoutError` within the ladder's bound: four attempts, each ended after
+    /// `upstream_idle_timeout` of body silence, plus the 100, 200 and 400 ms waits. A
+    /// streamed body collected by `into_bytes` fails the same way. Before the bound, both
+    /// waited for as long as the origin held the connection.
+    #[tokio::test]
+    async fn a_buffered_body_that_stalls_after_its_head_fails_within_the_idle_bound() {
+        let port = start_stalling_upstream().await;
+        let idle = Duration::from_millis(300);
+        let mut config = ConnectionPoolConfig {
+            ip_distribution_enabled: false,
+            upstream_idle_timeout: idle,
+            ..Default::default()
+        };
+        config.upstream_overrides.insert(
+            format!("127.0.0.1:{port}"),
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: false,
+            },
+        );
+        let client = S3Client::new(&config, None).expect("client builds");
+        let bound = 4 * idle + Duration::from_millis(700);
+        let start = Instant::now();
+        let buffered =
+            tokio::time::timeout(Duration::from_secs(10), client.forward_request(request(port, Method::GET, None)))
+                .await
+                .expect("A BUFFERED BODY THAT STALLED AFTER ITS HEAD WAS NOT ENDED: the fetch was still waiting after 10 s");
+        let elapsed = start.elapsed();
+        let error = failure(buffered);
+        assert!(
+            matches!(error, ProxyError::TimeoutError(_)),
+            "a stalled body must fail as a timeout, got {error:?}"
+        );
+        assert!(
+            elapsed < bound + Duration::from_secs(1),
+            "the stalled fetch took {elapsed:?}, over the bound {bound:?}"
+        );
+        let mut streamed = request(port, Method::GET, None);
+        streamed.allow_streaming = true;
+        let response = client
+            .forward_request(streamed)
+            .await
+            .unwrap_or_else(|e| panic!("the streamed head must arrive: {e}"));
+        let collected = tokio::time::timeout(
+            Duration::from_secs(10),
+            response
+                .body
+                .expect("a body")
+                .into_bytes(client.upstream_idle_timeout),
+        )
+        .await
+        .expect("A STREAMED BODY COLLECTED BY into_bytes THAT STALLED WAS NOT ENDED after 10 s");
+        assert!(
+            matches!(collected, Err(ProxyError::TimeoutError(_))),
+            "into_bytes on a stalled body must fail as a timeout, got {:?}",
+            collected.err()
+        );
+    }
+
+    /// Loopback upstream that holds its first three connections silent after reading the
+    /// request head, drops the fourth `drop_after` after reading it, and holds every later one
+    /// silent. Returns the port and the accept count.
+    async fn start_black_hole_then_a_late_drop(drop_after: Duration) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let mut got = 0usize;
+                    while !buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf[got..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => got += read,
+                        }
+                    }
+                    if n == 4 {
+                        tokio::time::sleep(drop_after).await;
+                        return;
+                    }
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (port, accepts)
+    }
+    /// A GET to an origin that never answers fails within the ladder's bound: three sends end
+    /// at the 30 s request timeout, a connection lost just before the fourth send's deadline
+    /// gets one replay on a fresh connection, and that replay times out. That is 5 sends and
+    /// about 4 x 30 s + 30 s + 0.7 s of waits, the figure `forward_range_with_coordination`'s
+    /// comment states. Time is paused, so the 150 s costs no wall time.
+    #[tokio::test(start_paused = true)]
+    async fn a_black_holed_origin_ends_a_get_within_the_ladders_bound() {
+        let (port, accepts) =
+            start_black_hole_then_a_late_drop(Duration::from_millis(29_900)).await;
+        let client = client_for(port, Duration::from_secs(55));
+        let start = tokio::time::Instant::now();
+        let error = failure(
+            client
+                .forward_request(request(port, Method::GET, None))
+                .await,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(error, ProxyError::TimeoutError(_)),
+            "a black-holed origin must end as a timeout, got {error:?}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            5,
+            "THE LADDER MADE AN UNEXPECTED NUMBER OF SENDS: three timeouts, a lost connection and its replay are 5 connections"
+        );
+        let bound = Duration::from_millis(150_700);
+        assert!(
+            elapsed <= bound + Duration::from_millis(100) && elapsed >= Duration::from_secs(149),
+            "the black-holed fetch took {elapsed:?}, outside 149 s to the stated bound {bound:?}"
+        );
+    }
     /// Two pooled connections, both lost: the retry still succeeds, because it dials a
     /// new connection instead of taking the second (equally dead) pooled one.
     /// Mutation that must break this: retry on `self.client` instead of `fresh_client`.

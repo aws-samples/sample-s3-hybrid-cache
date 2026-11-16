@@ -1470,6 +1470,72 @@ mod tests {
         }
     }
 
+    /// A request answered after the shutdown coordinator's flush, which also stops the flush
+    /// timer, is in the access log once the process's exit flush has run.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `shutdown::flush_access_log_at_exit` doing nothing (no flush after the
+    /// coordinator's), the record stays in the buffer and no file holds it.
+    #[tokio::test]
+    async fn a_request_answered_after_the_shutdown_flush_is_written_at_exit() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let buffer = Arc::new(AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(1000),
+            None,
+        ));
+        let mut logger = LoggerManager::new(LoggingConfig {
+            access_log_dir: log_dir.clone(),
+            app_log_dir: log_dir.join("app"),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: "test-host".to_string(),
+            log_level: "info".to_string(),
+            access_log_flush_interval: Duration::from_secs(3600),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: 30,
+            app_log_retention_days: 30,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        });
+        logger.access_log_buffer = Some(buffer.clone());
+        let logger = Arc::new(tokio::sync::Mutex::new(logger));
+        let mut coordinator = crate::shutdown::ShutdownCoordinator::new(Duration::from_secs(5));
+        coordinator.set_logger_manager(logger.clone());
+        coordinator.initiate_shutdown().await.unwrap();
+        const KEY: &str = "answered-after-the-shutdown-flush";
+        buffer.log(create_test_entry("bucket", KEY)).await.unwrap();
+        assert_eq!(
+            buffer.buffer_len(),
+            1,
+            "fixture: the record is buffered after the coordinator's flush"
+        );
+        crate::shutdown::flush_access_log_at_exit(&logger).await;
+        let written = walkdir::WalkDir::new(&log_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .any(|e| {
+                std::fs::read_to_string(e.path())
+                    .map(|body| body.contains(KEY))
+                    .unwrap_or(false)
+            });
+        println!(
+            "exit flush: buffered={} written={}",
+            buffer.buffer_len(),
+            written
+        );
+        assert!(
+            written && buffer.buffer_len() == 0,
+            "A REQUEST ANSWERED AFTER THE SHUTDOWN FLUSH IS NOT IN THE ACCESS LOG (buffered={})",
+            buffer.buffer_len()
+        );
+    }
+
     // =========================================================================
     // Unit tests for AccessLogBuffer
     // =========================================================================

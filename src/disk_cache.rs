@@ -473,6 +473,11 @@ pub(crate) struct DeleteExpectation<'a> {
     /// Whether the caller selected any staged range. When false, a selected extent that the
     /// locked read shows as staged skips the key.
     pub staged_selected: bool,
+    /// `Some(now)` from a caller that may take a staged range only past its object's expiry
+    /// (read-tier eviction, write-cache R5.5): a selected extent that the locked read shows as
+    /// staged skips the key unless the locked `.meta`'s expiry is at or before `now`. So a
+    /// refresh between selection and delete, which keeps the identity, still stops the delete.
+    pub staged_expired_at: Option<SystemTime>,
 }
 
 /// Write `data` to the temp file at `path` and flush it to storage before returning.
@@ -872,6 +877,7 @@ impl PreparedRangeFill {
             pending,
             slot_wait,
             &fill_witness,
+            journal_consolidator.as_ref(),
         )
         .await
         .inspect_err(|e| {
@@ -2648,6 +2654,7 @@ async fn heal_damaged_range_once(
             listed,
             meta.object_metadata.is_write_cached,
         ),
+        staged_expired_at: None,
     };
     let deletion = match locator
         .batch_delete_ranges_expecting(
@@ -5032,6 +5039,7 @@ impl PreparedIncrementalCommit {
                     pending,
                     SlotWait::WithinBudget,
                     &fill_witness,
+                    journal_consolidator.as_ref(),
                 )
                 .await?
                 {
@@ -5684,16 +5692,10 @@ impl DiskCacheManager {
                         .await;
                 }
 
-                // Check write cache expiration (lazy expiration - Requirements 5.3, 5.4)
-                if metadata.object_metadata.is_write_cached
-                    && metadata.object_metadata.is_write_cache_expired()
-                {
-                    info!(
-                        "Write cache entry expired (lazy expiration): key={}, write_cache_expires_at={:?}, result=cache_miss",
-                        cache_key, metadata.object_metadata.write_cache_expires_at
-                    );
-                    return Ok(None);
-                }
+                // A write-cached entry past `put_ttl` is returned as a read entry past `get_ttl`
+                // is. Callers judge it by its stored expiry (`expires_at`, which a staged
+                // producer sets to the write time plus `put_ttl`) or by a live verdict, so it
+                // is revalidated before it is served rather than read as absent.
 
                 let total_duration = operation_start.elapsed();
                 debug!(
@@ -5739,8 +5741,13 @@ impl DiskCacheManager {
 /// its bytes under that `.meta`'s ETag. Under the slot lock (the lock consolidation and
 /// eviction take), this reads the `.meta` and:
 ///
-/// - its ETag differs from `fill_etag` (quote-insensitive): drop the `.tmp`, return `None`.
-///   The caller journals nothing and credits nothing;
+/// - its ETag differs from `fill_etag` (quote-insensitive): the fill read another object
+///   version from S3 than the one cached. ETags carry no order, so either may be current:
+///   remove the cached version inside this hold
+///   ([`crate::cache::CacheManager::remove_other_version_locked`]), drop the `.tmp` and return
+///   `None`, so neither version stays cached. The caller journals nothing and credits nothing.
+///   With an empty ETag on either side there is nothing to compare, and the fill is only
+///   dropped;
 /// - the extent is already listed under the same ETag and its `.bin` is present: drop the
 ///   `.tmp`, return `None` (no overwrite, no credit);
 /// - otherwise rename inside the hold and return `Some(range_already_existed)`.
@@ -5763,6 +5770,7 @@ async fn publish_range_fill_under_slot_lock_at(
     pending: PendingRangePublish,
     slot_wait: SlotWait,
     fill_witness: &crate::cache::FillWitness,
+    journal_consolidator: Option<&Arc<crate::journal_consolidator::JournalConsolidator>>,
 ) -> Result<Option<PublishedFill>> {
     #[cfg(test)]
     range_rename_pause::before_publish(cache_key).await;
@@ -5885,6 +5893,28 @@ async fn publish_range_fill_under_slot_lock_at(
     if let Some(meta) = published {
         if !crate::revalidation::etags_equal_ignoring_quotes(&meta.object_metadata.etag, fill_etag)
         {
+            if !meta.object_metadata.etag.is_empty() && !fill_etag.is_empty() {
+                let was_staged = crate::cache::CacheManager::remove_other_version_locked(
+                    cache_dir,
+                    cache_key,
+                    meta_path,
+                    &meta,
+                    journal_consolidator,
+                    &_slot,
+                )
+                .await;
+                drop(_slot);
+                fill_witness
+                    .after_version_change(cache_key, was_staged)
+                    .await;
+                info!(
+                    "Range fill read another object version than the cached one; the cached \
+                     version was removed and neither is cached: key={}, range={}-{}, \
+                     meta_etag={}, fill_etag={}",
+                    cache_key, start, end, meta.object_metadata.etag, fill_etag
+                );
+                return Ok(None);
+            }
             debug!(
                 "Range fill dropped (version differs from published .meta): key={}, \
                      range={}-{}, meta_etag={}, fill_etag={}",
@@ -6303,7 +6333,8 @@ impl DiskCacheManager {
         // The expectation, owned. `DeleteExpectation` borrows the identity from the caller's
         // candidate; the recheck now runs on another thread, so it carries a clone of exactly
         // that value and compares the same way.
-        let owned_expected = expected.map(|e| (e.identity.clone(), e.staged_selected));
+        let owned_expected =
+            expected.map(|e| (e.identity.clone(), e.staged_selected, e.staged_expired_at));
 
         let locked_section = move || {
             Self::delete_ranges_under_slot_lock(
@@ -6373,7 +6404,7 @@ impl DiskCacheManager {
         meta_lock: crate::metadata_lock_manager::MetadataLock,
         cache_key: &str,
         ranges_to_delete: &[(u64, u64)],
-        expected: Option<(ExpectedObjectIdentity, bool)>,
+        expected: Option<(ExpectedObjectIdentity, bool, Option<SystemTime>)>,
         metadata_file_path: &Path,
         metadata_tmp_path: &Path,
         candidate_paths: &std::collections::HashMap<(u64, u64), PathBuf>,
@@ -6431,18 +6462,25 @@ impl DiskCacheManager {
         // while this call waited for the slot) has published a different version at paths
         // this call would otherwise unlink, since the `.bin` path does not depend on the
         // version.
-        if let Some((expected_identity, staged_selected)) = &expected {
+        if let Some((expected_identity, staged_selected, staged_expired_at)) = &expected {
             let identity_matches = ExpectedObjectIdentity::of(&metadata) == *expected_identity;
-            let newly_staged = !staged_selected
-                && metadata.ranges.iter().any(|r| {
-                    ranges_set.contains(&(r.start, r.end))
-                        && crate::cache_types::is_staged_range_spec(r, object_is_write_cached)
+            let selects_staged = metadata.ranges.iter().any(|r| {
+                ranges_set.contains(&(r.start, r.end))
+                    && crate::cache_types::is_staged_range_spec(r, object_is_write_cached)
+            });
+            let newly_staged = !staged_selected && selects_staged;
+            // Read-tier eviction takes a staged range only past its object's expiry, judged here
+            // from the locked document: the epoch is the "no expiry" sentinel.
+            let staged_unexpired = selects_staged
+                && staged_expired_at.is_some_and(|now| {
+                    metadata.expires_at == SystemTime::UNIX_EPOCH || metadata.expires_at > now
                 });
-            if !identity_matches || newly_staged {
+            if !identity_matches || newly_staged || staged_unexpired {
                 info!(
                     "[RANGE_EVICTION] Skipping key, rewritten since selection: cache_key={}, \
-                     identity_matches={}, newly_staged={}, action=nothing_deleted_nothing_debited",
-                    cache_key, identity_matches, newly_staged
+                     identity_matches={}, newly_staged={}, staged_unexpired={}, \
+                     action=nothing_deleted_nothing_debited",
+                    cache_key, identity_matches, newly_staged, staged_unexpired
                 );
                 return Ok(BatchRangeDeletion {
                     identity_mismatch: true,
@@ -8337,7 +8375,7 @@ impl DiskCacheManager {
             update_duration.as_secs_f64() * 1000.0
         );
 
-        // Write updated metadata in-place (Requirement 7.2, 7.3)
+        // Write updated metadata by temp + rename (Requirement 7.2, 7.3)
         let write_start = std::time::Instant::now();
         let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
             error!(
@@ -8347,7 +8385,7 @@ impl DiskCacheManager {
             ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
         })?;
 
-        std::fs::write(&metadata_path, json).map_err(|e| {
+        write_atomic_blocking(&metadata_path, json.as_bytes()).map_err(|e| {
             crate::disk_cache::note_disk_full(&e, "range_access.meta");
             error!(
                 "Failed to write metadata for access update: key={}, path={:?}, error={}",
@@ -8579,7 +8617,7 @@ impl DiskCacheManager {
                     );
                 })?;
         } else {
-            std::fs::write(&metadata_path, json).map_err(|e| {
+            write_atomic_blocking(&metadata_path, json.as_bytes()).map_err(|e| {
                 crate::disk_cache::note_disk_full(&e, "object_ttl_refresh.meta");
                 error!(
                     "Failed to write metadata for object TTL refresh: key={}, path={:?}, error={}",
@@ -8748,14 +8786,18 @@ impl DiskCacheManager {
                     ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
                 })?;
 
-                std::fs::write(&metadata_path, json).map_err(|e| {
-                    crate::disk_cache::note_disk_full(&e, "range_removal.meta");
-                    error!(
-                        "Failed to write metadata after range removal: key={}, path={:?}, error={}",
-                        cache_key, metadata_path, e
-                    );
-                    ProxyError::CacheError(format!("Failed to write metadata: {}", e))
-                })?;
+                // Temp + rename, under the slot lock held above: a peer or this proxy's
+                // collector reading the `.meta` now sees the old document or the new one whole,
+                // never the empty file an in-place `std::fs::write` leaves between its truncate
+                // and its write.
+                write_atomic(&metadata_path, json.as_bytes())
+                    .await
+                    .inspect_err(|e| {
+                        error!(
+                            "Failed to write metadata after range removal: key={}, path={:?}, error={}",
+                            cache_key, metadata_path, e
+                        );
+                    })?;
 
                 debug!(
                     "Metadata updated after range removal: key={}, remaining_ranges={}",
@@ -10131,24 +10173,7 @@ pub(crate) async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result
         })?;
     }
 
-    let tmp = {
-        let host = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown".to_string())
-            .replace(['/', '\\'], "_");
-        // Bounded to NAME_MAX: this also stages key-derived `.meta` names (the TTL
-        // refresh after an origin `304`), which reach 205 bytes before the suffix.
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        path.with_file_name(crate::cache::bounded_instance_tmp_name(
-            &name,
-            "",
-            &host,
-            std::process::id(),
-        ))
-    };
+    let tmp = atomic_tmp_path(path);
 
     let write_result = async {
         let mut file = tokio::fs::File::create(&tmp).await?;
@@ -10161,6 +10186,7 @@ pub(crate) async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result
     .await;
 
     if let Err(e) = write_result {
+        crate::disk_cache::note_disk_full(&e, "write_atomic");
         // Best effort — a surviving temp is reaped by the background sweep, but leaving one
         // behind on every failure would accumulate on a volume nobody is watching.
         let _ = tokio::fs::remove_file(&tmp).await;
@@ -10172,6 +10198,39 @@ pub(crate) async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result
     Ok(())
 }
 
+/// The temporary file [`write_atomic`] and [`write_atomic_blocking`] stage `path` at.
+fn atomic_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let host = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+        .replace(['/', '\\'], "_");
+    // Bounded to NAME_MAX: this also stages key-derived `.meta` names (the TTL
+    // refresh after an origin `304`), which reach 205 bytes before the suffix.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    path.with_file_name(crate::cache::bounded_instance_tmp_name(
+        &name,
+        "",
+        &host,
+        std::process::id(),
+    ))
+}
+/// [`write_atomic`] for a caller that holds a non-blocking lock and must not yield while it
+/// does: the single-instance `.meta` rewrites (`update_range_access_direct`,
+/// `refresh_object_ttl_direct`). Writes a temporary file and renames it over `path`, so a
+/// reader sees the old document or the new one whole. No `sync_all`: those rewrites keep their
+/// "no fsync for performance" contract (Requirement 7.3), and a crash before the data reaches
+/// the disk can leave a short document, which the read path classifies as a miss.
+fn write_atomic_blocking(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = atomic_tmp_path(path);
+    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
 /// Normalize cache key by removing leading slashes and ensuring consistent format
 ///
 /// This function ensures cache keys are in a consistent format regardless of
@@ -11288,6 +11347,193 @@ mod tests {
         }
     }
 
+    /// A consolidator over `dir`, as the cold-key fixture builds one.
+    fn version_change_consolidator(dir: &Path) -> crate::journal_consolidator::JournalConsolidator {
+        crate::journal_consolidator::JournalConsolidator::new(
+            dir.to_path_buf(),
+            Arc::new(crate::journal_manager::JournalManager::new(
+                dir.to_path_buf(),
+                "journal-consolidator".to_string(),
+            )),
+            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
+                dir.to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            crate::journal_consolidator::ConsolidationConfig::default(),
+        )
+    }
+    fn version_change_meta(etag: &str) -> crate::cache_types::ObjectMetadata {
+        crate::cache_types::ObjectMetadata {
+            etag: etag.to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 131072,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 131072,
+            ..Default::default()
+        }
+    }
+    /// A range fill that reads another object version from S3 than the published `.meta`
+    /// names removes the cached version and publishes neither, and the next fill of the
+    /// current version publishes and is served.
+    #[tokio::test]
+    async fn a_fill_of_another_version_removes_the_cached_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut mgr = hybrid_disk_cache_as(dir, "journal-p1");
+        mgr.initialize().await.unwrap();
+        let consolidator = version_change_consolidator(dir);
+        let key = "test-bucket/version-change";
+        let ttl = Duration::from_secs(3600);
+        let v1 = vec![0xAAu8; 65536];
+        let v2 = vec![0xBBu8; 65536];
+        mgr.prepare_range_store_witnessed(
+            key,
+            0,
+            65535,
+            &v1,
+            version_change_meta("\"V1\""),
+            ttl,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("fixture: the v1 fill is prepared")
+        .finish()
+        .await
+        .expect("the v1 fill publishes");
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the v1 fold");
+        let cached = cold_key_read_listing(&mgr, key).await;
+        assert!(
+            cached.contains("etag=\"V1\" served 65536 bytes of 0xaa"),
+            "FIXTURE: v1 must be cached and served: {cached}"
+        );
+        let v1_bin = mgr.get_new_range_file_path(key, 0, 65535);
+        // S3 now holds v2: a miss for the uncached half fills it.
+        mgr.prepare_range_store_witnessed(
+            key,
+            65536,
+            131071,
+            &v2,
+            version_change_meta("\"V2\""),
+            ttl,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("fixture: the v2 fill is prepared")
+        .finish()
+        .await
+        .expect("the v2 fill returns Ok");
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the fold after the v2 fill");
+        let after = cold_key_read_listing(&mgr, key).await;
+        assert_eq!(
+            after,
+            "no .meta",
+            "THE OLDER VERSION IS STILL CACHED after a fill read another version: {after}; \
+             v1 .bin present={}",
+            v1_bin.exists()
+        );
+        assert!(!v1_bin.exists(), "the v1 range file must be removed");
+        mgr.prepare_range_store_witnessed(
+            key,
+            0,
+            65535,
+            &v2,
+            version_change_meta("\"V2\""),
+            ttl,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("fixture: the next v2 fill is prepared")
+        .finish()
+        .await
+        .expect("the next v2 fill publishes");
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the v2 fold");
+        let next = cold_key_read_listing(&mgr, key).await;
+        assert!(
+            next.contains("etag=\"V2\" served 65536 bytes of 0xbb"),
+            "the next fill of the current version must be cached and served: {next}"
+        );
+    }
+    /// Two proxies' fills of different versions publish on a cold key, so neither met the
+    /// other's `.meta` at its publish. The fold that meets both keeps neither version's bytes.
+    #[tokio::test]
+    async fn a_fold_that_meets_a_fill_of_another_version_keeps_neither() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut mgr_p1 = hybrid_disk_cache_as(dir, "journal-p1");
+        mgr_p1.initialize().await.unwrap();
+        let mut mgr_p2 = hybrid_disk_cache_as(dir, "journal-p2");
+        let key = "test-bucket/fold-version-change";
+        let ttl = Duration::from_secs(3600);
+        let fill_v1 = mgr_p1
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                65535,
+                &vec![0xAAu8; 65536],
+                version_change_meta("\"V1\""),
+                ttl,
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the v1 fill is prepared");
+        let fill_v2 = mgr_p2
+            .prepare_range_store_witnessed(
+                key,
+                65536,
+                131071,
+                &vec![0xBBu8; 65536],
+                version_change_meta("\"V2\""),
+                ttl,
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the v2 fill is prepared");
+        fill_v1.finish().await.expect("the v1 fill publishes");
+        fill_v2.finish().await.expect("the v2 fill publishes");
+        let bins = [
+            mgr_p1.get_new_range_file_path(key, 0, 65535),
+            mgr_p1.get_new_range_file_path(key, 65536, 131071),
+        ];
+        assert!(
+            bins.iter().all(|b| b.exists()),
+            "FIXTURE: both cold-key fills must have published"
+        );
+        version_change_consolidator(dir)
+            .consolidate_object(key)
+            .await
+            .expect("the fold");
+        let meta = mgr_p1.get_metadata(key).await.expect("the .meta reads");
+        let listed: Vec<(u64, u64)> = meta
+            .as_ref()
+            .map(|m| m.ranges.iter().map(|r| (r.start, r.end)).collect())
+            .unwrap_or_default();
+        assert!(
+            listed.is_empty(),
+            "THE FOLD KEPT ONE VERSION'S EXTENTS after meeting a fill of another version: \
+             etag={:?} listed={listed:?}",
+            meta.as_ref().map(|m| m.object_metadata.etag.clone())
+        );
+        assert!(
+            bins.iter().all(|b| !b.exists()),
+            "both versions' range files must be removed: {:?}",
+            bins.iter().map(|b| b.exists()).collect::<Vec<_>>()
+        );
+    }
     /// Control: the same race with the two files' mtimes more than 1 ms apart. The
     /// identity check refuses the X listing over Y's file today; with the cold-key check the
     /// second fill is dropped and X is served. Never Y's bytes.
@@ -13196,11 +13442,18 @@ mod tests {
         // Write expired write-cache metadata directly
         cache_manager.seed_metadata_for_tests(&metadata);
 
-        // Try to get metadata - should return None because write cache is expired
+        // The entry is returned, as an expired read entry is: a reader revalidates it.
         let result = cache_manager.get_metadata(cache_key).await.unwrap();
         assert!(
-            result.is_none(),
-            "Should return None for expired write-cache metadata"
+            result
+                .as_ref()
+                .is_some_and(|m| m.object_metadata.is_write_cached
+                    && m.object_metadata
+                        .write_cache_expires_at
+                        .is_some_and(|at| std::time::SystemTime::now() > at)),
+            "an expired write-cache entry must be returned for revalidation, not read as \
+             absent: got {:?}",
+            result.map(|m| m.object_metadata.write_cache_expires_at)
         );
     }
 

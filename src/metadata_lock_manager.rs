@@ -27,15 +27,16 @@
 //! before the partition, discarding B's publish. A believed throughout that it held the lock,
 //! nothing refused its rename, and neither side logs an error.
 //!
-//! Some callers do not publish by tmp-and-rename. `DiskCacheManager::{update_range_access_direct, refresh_object_ttl_direct,
-//! remove_invalidated_range}` rewrite `{key}.meta` in place under the slot
-//! lock, with no temp file. The clobber above applies to them unchanged. They also carry a
-//! failure mode the rename shape cannot: `std::fs::write` truncates before it writes, so a
-//! write that fails partway leaves a zero-length `.meta` where a failed rename would have left
-//! the previous document intact. That needs no partition and no peer, only a failed write.
-//! The read path absorbs both. `disk_cache::read_and_parse_metadata_blocking` classifies an
-//! empty or size-changing document `TransientMiss`, which is an ordinary miss.
-//! Of the callers named here, only `remove_invalidated_range` is reachable in production.
+//! Every `.meta` writer publishes by temp-and-rename, under the slot lock: the same
+//! `DiskCacheManager::{update_range_access_direct, refresh_object_ttl_direct,
+//! remove_invalidated_range}` rewrote `{key}.meta` in place with `std::fs::write` until they
+//! moved to `disk_cache::write_atomic` (and `write_atomic_blocking`, for the two that must not
+//! yield while they hold their non-blocking lock). The in-place form truncates before it writes, so a
+//! reader in that window, or a write that fails partway, saw a zero-length `.meta` where a
+//! rename shows the previous document or the new one whole. The clobber above applies to
+//! both shapes. The read path still absorbs an empty or size-changing document:
+//! `disk_cache::read_and_parse_metadata_blocking` classifies it `TransientMiss`, which is an
+//! ordinary miss.
 //!
 //! Nothing detects this, and the reason is structural rather than an oversight. Once `flock`
 //! returns, no code performs any further operation on the locked descriptor: the slot file

@@ -2,7 +2,7 @@
 //!
 //! The generator lives in `tests/common/graded_fixture.rs` and is included here with
 //! `#[path]`. It has to be reachable from `tests/`, because the fixture is validated by reading
-//! it back through the proxy's own code (`CacheManager::collect_range_candidates_for_eviction`)
+//! it back through the proxy's own code (`NewCacheMetadata` at its sharded path)
 //! inside the test suite, and `cargo test` does not run `#[test]` functions that live in an
 //! example. One copy of the generator with two entry points keeps the command-line path and the
 //! tested path the same code.

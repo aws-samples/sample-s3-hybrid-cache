@@ -334,6 +334,28 @@ impl ShutdownSignal {
     }
 }
 
+/// Write the access-log records still buffered when the process exits.
+///
+/// The coordinator flushes the buffer at the start of its teardown and stops the flush timer, but
+/// connections already open keep serving requests until the runtime stops, and their records
+/// would otherwise be flushed only by a later request. `async_main` calls this as its last step,
+/// after the server tasks' drain.
+pub async fn flush_access_log_at_exit(logger_manager: &Arc<Mutex<LoggerManager>>) {
+    let flush = async { logger_manager.lock().await.force_flush().await };
+    match timeout(Duration::from_secs(5), flush).await {
+        Ok(Ok(result)) => {
+            if !result.skipped && !result.already_in_progress {
+                info!(
+                    "Access log buffer flushed at exit: {} entries written to disk",
+                    result.entries_flushed
+                );
+            }
+        }
+        Ok(Err(e)) => warn!("Failed to flush the access log buffer at exit: {}", e),
+        Err(_) => warn!("Access log buffer flush at exit timed out"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

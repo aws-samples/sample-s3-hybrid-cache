@@ -16,15 +16,18 @@ Eviction runs from two places:
 1. **At startup**, the proxy checks whether the cache is already over `max_cache_size` and
    evicts if it is.
 2. **During and after every consolidation cycle**, the journal consolidator compares the cache's
-   size against `cache.eviction_trigger_percent` and starts a pass if the size is over it. The
+   size against `cache.eviction_trigger_percent` and starts a pass if the size is over it, or if
+   an object the cache declined for space would not fit beside it (see
+   [Room for a declined object](#room-for-a-declined-object)). The
    comparison runs every `cache.shared_storage.consolidation_interval` while the cycle processes
    keys, and once more when it finishes, so a cycle that spends its whole budget on a journal
-   backlog still starts a pass within one interval. Only the proxy holding the consolidation
-   lock starts a pass, and each proxy runs one pass at a time: while a pass is in flight, the
-   comparison is skipped. A cycle with no journal entries or size changes to apply still
-   checks. It reads the stored size at most once a minute while the cache is under the trigger,
-   and takes the lock only when the cache is over it, so an idle fleet that is over its trigger
-   evicts without waiting for new traffic.
+   backlog still starts a pass within one interval. The proxy holding the consolidation lock
+   makes the comparison, and a proxy that has declined an object makes it for itself on every
+   cycle. Each proxy runs one pass at a time: while a pass is in flight, the comparison is
+   skipped. A cycle with no journal entries or size changes to apply still checks. It reads
+   the stored size at most once a minute while the cache is under the trigger and no declined
+   object is waiting for room. So an idle fleet that is over its trigger evicts without
+   waiting for new traffic.
 
    **Both capacity limits use that cadence**, each on its own figure: the byte limit above and
    the write cache's bounds (see [Write cache reclamation](#write-cache-reclamation)). A
@@ -34,7 +37,8 @@ Eviction runs from two places:
 
    After a pass that reclaimed nothing, the next comparison waits instead of repeating at once.
    A pass reclaims nothing when another proxy holds the eviction lock, when the shortfall came
-   out at zero, or when the previous round of removals has not finished. In each case, finding
+   out at zero, when the previous round of removals has not finished, or when a pass for a
+   declined object finds that a pass has already run since the decline. In each case, finding
    that out costs cache volume reads that are not worth repeating every interval. The byte
    comparison waits until this proxy's own eviction work moves on: a new round of removals is
    listed, this proxy runs a pass alone because the work list is not in use, or this proxy
@@ -61,11 +65,47 @@ Storing new data does not check capacity itself: a write is never blocked or del
 an eviction decision. The consolidation cycle runs on its own schedule, independent of request
 traffic, so capacity is checked regularly rather than only when a write happens to trigger it.
 
+### Room for a declined object
+
+With the cache at or under its trigger, an object larger than the space left below
+`max_cache_size` is served, or forwarded to S3, without being cached
+([Staying within `max_cache_size`](#staying-within-max_cache_size)). The proxy that declined it
+records its size. Within one `consolidation_interval`, that proxy then starts a pass if the
+cache's size plus the object would exceed `max_cache_size`, whether or not it holds the
+consolidation lock. The pass frees down to `eviction_target_percent`, as an over-trigger pass
+does, so the next copy of the object can be cached.
+
+A declined object starts a pass when it is no larger than half the gap between `max_cache_size`
+and the target, which is 10% of `max_cache_size` at the default target. GET-miss fills and
+uploads both count. A larger object starts no pass, and
+`cache.eviction_demand_refusals_over_cap_total` counts it.
+
+Under the eviction lock, a pass for declined objects skips when the last read cache pass, on any
+proxy, completed after the latest decline it is for. A pass that has already run for those
+declines is therefore not repeated. When another proxy ran that pass, the comparison uses both hosts'
+clocks, so keep proxy clocks synchronized.
+
+When a pass that read the whole read cache still leaves too little room, objects of that size or
+larger start no pass until the cache's usage changes. The usage has changed once it goes over
+the trigger, or falls far enough for them to fit. Staged objects inside their `put_ttl` and multipart uploads in
+progress are not read cache candidates, so a cache mostly holding them reaches this state. Then
+`cache.read_fills_declined_max_cache_size_total` keeps rising while
+`cache.eviction_demand_passes_total` stays flat.
+
+A pass for declined objects that makes no room for them delays the next one, on any proxy. The
+delay starts at one `consolidation_interval` after the pass completed and doubles with each such
+pass in a row, up to 1 hour. A pass that makes room ends it, and so does the cache going over its
+trigger or falling to where the objects fit. Passes over the trigger never wait. The evidence
+both rules read is recorded in `metadata/_shard_state/eviction_last_result.json`, and `/metrics`
+does not show it.
+
 ## Thresholds
 
-Eviction starts at `cache.eviction_trigger_percent` of `max_cache_size` (default `95`), and a
-pass selects enough ranges to bring the recorded size down to `cache.eviction_target_percent`
-(default `80`). The target sets the byte budget of one pass. Usage need not reach it: new data
+Eviction starts at `cache.eviction_trigger_percent` of `max_cache_size` (default `95`), or when
+a declined object would not fit. A pass selects enough ranges to bring the recorded size,
+plus the bytes of multipart uploads in progress, down to `cache.eviction_target_percent`
+(default `80`). A trigger above 99 runs as 99, with a warning at startup, and the write cache
+uses the same two values. The target sets the byte budget of one pass. Usage need not reach it: new data
 arrives while the pass deletes, so under sustained fills usage can stay above the target. Both
 values are configurable; see the [eviction configuration](CONFIGURATION.md#eviction-configuration)
 for their valid ranges.
@@ -130,20 +170,19 @@ object's metadata is updated once, with all evicted ranges removed.
 ## Eviction flow
 
 ```text
-1. Collect  → Read a bounded prefix of each cache shard's large-range index, plus each
-              proxy's record of ranges cached since that index was last rebuilt. Fall back to
-              scanning all .meta files when no index exists yet, when no indexed range clears
-              `tail_floor_bytes`, or when the index cannot meet the target. The fallback reads
-              up to 64 .meta files at a time as it walks the cache volume, and considers them
-              in the same order either way. It holds that many documents at once rather than
-              one per cached object, but the candidate list it returns has one entry per
-              resident range, so its memory grows with the number of cached ranges.
+1. Collect  → Read a bounded prefix of each cache shard's range index, plus each proxy's
+              record of ranges cached since that index was last rebuilt. When the ranges read
+              cannot meet the target, read deeper into every shard's index, up to
+              `tail_max_entries` records each. Rebuild the index of a shard that has none, or
+              whose index ran out, from its .meta files, starting no new shard after 5
+              seconds.
 2. Sort     → Expired first, then largest compressed size first, then by TinyLFU score
               (lowest score first)
 3. Group    → Batch ranges by object, so each object's metadata is updated once
 4. Evict    → Under the object's metadata lock, re-read its .meta. If the object has been
               rewritten since it was selected (a different ETag, Last-Modified or creation
-              time, or a selected range now staged), skip it: nothing is deleted and nothing is
+              time, a selected range now staged, or a selected staged range whose object has
+              not expired), skip it: nothing is deleted and nothing is
               subtracted. Otherwise delete the .bin files. If every range of the object was
               evicted, unlink its .meta (one unlink, with no rewrite first). Otherwise rewrite
               the .meta atomically, keeping the ranges that survive: one write per object, not
@@ -260,12 +299,12 @@ dead data resident in preference to live data, which a short `get_ttl` makes rea
 
 ### What a pass reads
 
-A pass picks its candidates from a bounded prefix of each cache shard's large-range index
-(`tail_max_entries` entries per shard, default `4096`), so the metadata it reads to choose what
-to delete is set by configuration rather than by how many objects the volume holds. It reads
-every `.meta` file only when the index cannot serve the pass, as described in
-[Eviction flow](#eviction-flow), and that walk's duration then depends on the volume's metadata
-read rate (see [Sizing the metadata rate](SHARED_STORAGE.md#sizing-the-metadata-rate)).
+A pass picks its candidates from a bounded prefix of each cache shard's range index
+(`tail_max_entries` records per shard, default `4096`), so the metadata it reads to choose what
+to delete is set by configuration rather than by how many objects the volume holds. It opens a
+`.meta` file only to confirm a candidate. Rebuilding a shard's index reads that shard's `.meta`
+files, as described in [Eviction flow](#eviction-flow), so its duration depends on the volume's
+metadata read rate (see [Sizing the metadata rate](SHARED_STORAGE.md#sizing-the-metadata-rate)).
 Measured with one proxy reading `.meta` files from an idle volume, that rate is 2,900-3,800 obj/s on EFS,
 29,000-31,000 obj/s on FSx for OpenZFS, and 28,500 obj/s on FSx for NetApp ONTAP at 32 reads outstanding,
 rising to 45,000 at 64. On ONTAP the fleet aggregate kept rising up to 24 proxies, the largest fleet
@@ -437,9 +476,9 @@ one with a shard that has never been scanned, and one whose shard records cannot
 
 The fold leaves out two things on purpose:
 
-- **In-progress multipart uploads.** Those bytes are on the volume but eviction cannot reclaim
-  them while the upload is live, so including them in a figure that drives eviction would give a
-  trigger that fires and frees nothing.
+- **In-progress multipart uploads.** Eviction cannot reclaim those bytes while the upload is
+  live, so the fold leaves them out. The read cache's trigger and the target of its pass add them
+  from the figure admission reads ([Thresholds](#thresholds)).
 - **Subtracting range files that no metadata names.** Its total covers every range file present,
   and the gap between that and the metadata-derived total is the measure of how many such files
   exist. Subtracting them would remove the only signal that they are accumulating.
@@ -460,11 +499,15 @@ first" over a population where nothing has been read.
 
 | | Read cache | Write cache |
 |---|---|---|
-| Trigger | `eviction_trigger_percent` of `max_cache_size` | `eviction_trigger_percent` of the write cache allocation and of the staged range limit |
+| Trigger | `eviction_trigger_percent` of `max_cache_size`, or a declined object that would not fit | `eviction_trigger_percent` of the write cache allocation and of the staged range limit |
 | Target | `eviction_target_percent` of `max_cache_size` | `eviction_target_percent` of the allocation and of the limit |
 | Order | TinyLFU score, lowest first | oldest staged first; objects past `put_ttl` and still unread go first |
 | Candidate discovery | cache index | append-only record of staged objects |
 | Runs on the request path | no | no |
+
+Read cache eviction leaves an unread write-cached object alone until its `put_ttl` has passed.
+After that, the object's ranges are read cache candidates too, and they sort first because they
+have expired.
 
 ### Two bounds, two triggers
 
@@ -563,12 +606,15 @@ persistent gap between them means entries are being lost or reclamation is not k
 
 Write cache reclamation takes the same eviction lock as read cache eviction, so only one proxy
 reclaims at a time. After taking the lock it re-reads the staged total, in case another proxy
-has already brought the write cache under its trigger. The holder keeps the lock until its
-pass ends, and a peer cannot take it over from a live holder; the exception is a holder whose
-NFS lease expires ([Distributed eviction](SHARED_STORAGE.md#distributed-eviction)). On EFS, a
-pass that removed about 4,800 staged objects held it for about 275 s. A peer that finds the lock older than
-`eviction_lock_timeout` logs `Eviction lock is stale` at `info`, tries once more, and skips its
-pass when the holder still has it.
+has already brought the write cache under its trigger. A write cache pass holds the lock for at
+most `eviction_lock_timeout` (default `60s`) plus the stage in progress. It then publishes what
+it removed, releases the lock, and the next pass continues. A read cache pass holds the lock
+until it ends. A peer cannot take the lock over from a live holder; the exception is a holder
+whose NFS lease expires ([Distributed eviction](SHARED_STORAGE.md#distributed-eviction)). A peer
+that finds the lock older than `eviction_lock_timeout` logs `Eviction lock is stale` at `info`,
+tries once more, and skips its pass when the holder still has it.
+`eviction_coordination.eviction_lock_held_secs` on `/metrics` reports how long this proxy has
+held the lock.
 `eviction_coordination.staging_evictions_skipped_lock_held` counts passes skipped because the
 lock was held. The decision to reclaim is taken from shared state because the deletes land on
 the cache volume; a proxy acting on a private view of usage could delete data another proxy had
@@ -612,8 +658,9 @@ the cache's own `.meta` files and there is no drift to recover from; see
 
 An inflated `cache.write_cache_size` (reported as `write_cache.resident_bytes`) can sit above the
 [`write_cache_percent`](CONFIGURATION.md#capacity-management) allocation while little is staged.
-PUT requests are still cached; the effect is that write cache reclamation runs when it does not
-need to, removing staged objects early. Recovery removes no cached object and discards nothing;
+PUT requests are still cached; the effect is that write cache reclamation starts when it does
+not need to. Each pass sizes itself from the recomputed figure, never above the inflated one, so
+it removes only what the recomputed figure shows over the target. Recovery removes no cached object and discards nothing;
 only the figure is wrong.
 
 ### Automatic recovery
@@ -667,6 +714,9 @@ What this means for an operator:
   can also understate, as
   [When the recomputed figure cannot be read](#when-the-recomputed-figure-cannot-be-read)
   describes.
+- **At epoch `0`, reclamation also sizes its passes from the recomputed figure**, capped by the
+  event-maintained one, so the two items below apply at both epochs. The checks that start a pass
+  read the event-maintained figure at epoch `0`.
 - **After a pass removes objects, the next pass sizes itself without them.** The pass records
   what it removed from each shard before it recomputes those shards
   ([Coordination across proxies](#coordination-across-proxies)), and every proxy subtracts the
@@ -698,7 +748,8 @@ when a proxy appending to its pending-credit file holds that file's lock for mor
 and sizes itself from that alone. The staged range count limit reads the same pending-credit
 files, so it can stop removing staged ranges in that pass too.
 
-The check that decides whether to start a pass reads the last figure the proxy recomputed,
+At epoch `1`, the check that decides whether to start a pass reads the last figure the proxy
+recomputed,
 whatever its age, and so do the consolidation cycle's checks that start a pass. That figure can
 understate by up to what was staged since, so a pass can start late by that interval. Before the
 proxy has recomputed any figure, these checks start no pass by size. `/metrics` shows the same
@@ -711,10 +762,10 @@ row point to a persistent cause.
 While neither limit removes staged objects, staged bytes can grow until the proxy stops caching
 new uploads at `max_cache_size` ([Staying within `max_cache_size`](#staying-within-max_cache_size)).
 Read caching is displaced on the way. The signature is `write_cache.staging_figure_unknown_seconds`
-above `0` while `cache.read_cache_size` falls, and an alert on the two together catches it. The
-daily validation scan removes staged objects older than `put_ttl`; in rolling mode it reaches
-each directory once per rotation, which can take several days on a large cache. Uploads are
-still forwarded to S3 and reads are still served.
+above `0` while `cache.read_cache_size` falls, and an alert on the two together catches it. Read
+cache eviction then reclaims staged objects left unread past `put_ttl` first, as
+[Write cache reclamation](#write-cache-reclamation) describes. Uploads are still forwarded to S3
+and reads are still served.
 
 `write_cache.staging_figure_unknown_seconds` shows how long the proxy has been unable to
 recompute the figure, counted from the last figure it recomputed. The metrics collector
@@ -722,10 +773,8 @@ recomputes it every `metrics.collection_interval` whether or not a pass runs, so
 or returns to `0`, within that interval plus one recomputation of the cause appearing or
 clearing. The collector runs while `/metrics`, OTLP or the dashboard is enabled. With all three
 off, write cache reclamation, the staged range budget and `/health` requests still recompute the
-figure. At epoch `0` the gauge reports the same condition, so it can read above `0` and the error
-below can fire when a recomputation fails. The byte limit there sizes passes from the
-event-maintained counter and keeps removing staged objects, so the error's words "removes
-nothing by size" are true at epoch `1` only.
+figure. At epoch `0` the gauge and the error below report the same condition, and a pass there also
+removes nothing by size until a recomputation produces a figure.
 
 The gauge also reads above `0` while a recomputation has been running for 60 s or more, which is
 how one that never finishes shows on `/metrics`. A recomputation's time grows with the number of

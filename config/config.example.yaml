@@ -140,7 +140,7 @@ cache:
   # without being cached.
   write_cache_max_object_size: 268435456  # 256 MiB in bytes
 
-  # How long an object in the write cache stays cached before its first GET (default:
+  # How long an object in the write cache stays valid before its first GET (default:
   # 1h; at most 315360000s). The first GET moves the entry to get_ttl, once only. That
   # needs the object's Last-Modified, which S3's write responses omit, so the first GET
   # revalidates with S3 to learn it.
@@ -163,7 +163,7 @@ cache:
   # cache_rules.json.
   get_ttl: "1d"  # 1 day (default)
   head_ttl: "60s"  # How long a cached HEAD response is served without contacting S3 (default: 60s)
-  actively_remove_cached_data: false  # false (default) removes expired entries when next requested; true also removes them in the background
+  actively_remove_cached_data: false  # Keep false (default): expired entries stay cached until read or evicted
 
   # Window for recent access by other proxies (default: 10s; range 10-600s, and a value
   # outside it falls back to 10s with a warning). Despite the name, it governs no flush.
@@ -199,10 +199,12 @@ cache:
 
     # The eviction lock lets one proxy at a time choose what to evict, so the fleet does
     # not evict more than it needs. It is a flock, never taken over while held: it is
-    # released when its holder finishes or exits. After this long, a proxy that found
-    # the lock held tries once more, which succeeds only if the holder has let go in the
-    # meantime (counted by eviction_coordination.stale_locks_recovered in /metrics).
-    # Changing it never lets two proxies evict at once. Default: 60s; range 30-3600s.
+    # released when its holder finishes or exits. A write cache eviction pass holds it
+    # for at most this long plus the stage in progress, then releases it and the next
+    # pass continues. After this long, a proxy that found the lock held tries once more,
+    # which succeeds only if the holder has let go in the meantime (counted by
+    # eviction_coordination.stale_locks_recovered in /metrics). Changing it never lets
+    # two proxies evict at once. Default: 60s; range 30-3600s.
     # See docs/SHARED_STORAGE.md, "Distributed eviction".
     eviction_lock_timeout: "60s"
 
@@ -257,18 +259,11 @@ cache:
     # one. The per-shard scan ages show which is which.
     shard_fold_max_duration: "30m"
 
-    # Smallest compressed range, in bytes, that eviction's index of large ranges holds
-    # (default: 1048576, 1 MiB; range 4096 to 1073741824). The index lets an eviction
-    # pass find the largest ranges in each shard without reading every metadata file.
-    # The size is the compressed size, which is what evicting the range frees.
-    # tail_max_entries decides which ranges the index keeps; this floor only keeps tiny
-    # ranges out. Raise it on a cache of very large objects to shrink the index. Lower it
-    # on a cache of mostly sub-MiB objects, where the default leaves the index empty and
-    # eviction has nothing to choose from.
-    tail_floor_bytes: 1048576
-
-    # Number of the largest indexed ranges kept per cache shard (default: 4096; range
-    # 1-1048576). Because the cap is per shard, a shard's index stays the same size
+    # Number of the largest ranges kept in eviction's index of each cache shard
+    # (default: 4096; range 1-1048576). The index lets an eviction pass find the largest
+    # ranges in each shard without reading every metadata file. The size is the
+    # compressed size, which is what evicting the range frees. Because the cap is per
+    # shard, a shard's index stays the same size
     # however much the shard holds. Raise it if eviction reports that it could not free
     # as much as it was asked to while the cache is full.
     tail_max_entries: 4096
@@ -296,16 +291,20 @@ cache:
     # value outside it is clamped with a warning). If the fetch is still running, the
     # waiter waits on the same fetch again, up to max_waiter_resubscriptions times
     # (default: 3). After that, the waiter fetches from S3 itself, as it does when the
-    # fetch it waits on fails or goes away.
+    # fetch it waits on fails or goes away. A whole-object GET or HEAD waits at most
+    # 30 s in total, then fetches from S3 itself, so a value above 30 applies only to
+    # range and part waiters.
     wait_timeout_secs: 30
 
   # Range merge gap threshold (default: 1 MiB).
   range_merge_gap_threshold: 1048576  # 1 MiB in bytes
 
-  # Eviction starts when the cache reaches eviction_trigger_percent of max_cache_size
-  # and stops when it is down to eviction_target_percent. The gap between them keeps
-  # eviction from starting and stopping repeatedly near the limit.
-  # eviction_trigger_percent: default 95; values outside 50-100 are clamped.
+  # Eviction starts when the cache reaches eviction_trigger_percent of max_cache_size,
+  # or when an object it declined for space would not fit, and stops when it is down
+  # to eviction_target_percent. The gap between them keeps eviction from starting and
+  # stopping repeatedly near the limit.
+  # eviction_trigger_percent: default 95; values outside 50-99 are clamped, so 100
+  # runs as 99.
   # eviction_target_percent: default 80; values outside 50-99 are clamped. A target at
   # or above the trigger is set to the trigger minus 10 (at least 50), with a warning.
   eviction_trigger_percent: 95

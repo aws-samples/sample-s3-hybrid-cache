@@ -90,12 +90,9 @@ fn bytes_to_free(current: u64, max: u64) -> u64 {
 
 /// R13.3: each of R1.3's extremes gets an eviction test.
 ///
-/// The constrained line is the full-population arm of `perform_eviction_with_lock`
-/// (`collect_range_candidates_for_eviction` → `sort_byte_dimension_candidates` →
-/// `group_candidates_by_object(range_candidates, bytes_to_free)`). Neither fixture has a
-/// Tail_Partition, because no rolling pass has run, so selection reports UNVISITED and this
-/// arm is the mechanism under test. That is also the uniform extreme's production state:
-/// with every size below `tail_floor_bytes` the partition is empty by construction.
+/// The constrained line is `perform_eviction_with_lock`'s bounded selection. Neither fixture
+/// has a Tail_Partition, because no rolling pass has run, so the pass rebuilds the shards'
+/// partitions lazily before it selects.
 mod r13_3_extremes {
     use super::*;
 

@@ -410,7 +410,7 @@ Each proxy works independently; the cache volume is the only integration point.
 **Accumulator-Based Size Tracking**:
 - Size recorded immediately at write/eviction time via atomic operations
 - Each proxy flushes its accumulated delta to its own file every 5 seconds
-- Consolidator sums all delta files under global lock, updates `size_state.json`, and deletes each file after applying it. A zero-valued file is deleted, and an unparseable one is renamed to `<name>.corrupt` with its delta not applied. After a rolling validation cycle installs a corrected size, every remaining delta file is deleted along with `delta_*.json.tmp` files older than an hour. A full validation scan leaves live delta files alone and removes only `delta_*.json.tmp` files more than an hour old, which a writer left behind when it stopped before renaming them
+- Consolidator sums all delta files under global lock, updates `size_state.json`, and deletes each file after applying it. A zero-valued file is deleted, and an unparseable one is renamed to `<name>.corrupt` with its delta not applied. A validation scan, full or rolling, leaves live delta files alone and removes only `delta_*.json.tmp` files more than an hour old, which a writer left behind when it stopped before renaming them
 - Size deltas come from the delta files; journal entries update metadata
 - Eviction triggered automatically when cache exceeds capacity
 
@@ -558,7 +558,7 @@ The proxy is a shared cache. It does not authenticate clients or authorize reque
 cache:
   get_ttl: "0s"
   head_ttl: "0s"
-  actively_remove_cached_data: false  # Required - must use lazy expiration
+  actively_remove_cached_data: false  # Lazy expiration (default)
 ```
 
 **Behavior with TTL>0 (expired)**: When a cached object's TTL has elapsed, the next request triggers the same conditional revalidation flow described below. See [Cache Revalidation](CACHE_FRESHNESS.md#get-ttl-get_ttl) in the Caching documentation for full details including 304, 200, and 403 outcomes.
@@ -572,7 +572,7 @@ cache:
 - S3 returns 200 OK if changed → fresh data fetched and cached
 - S3 returns 403 Forbidden if client lacks access → error returned, cache unchanged
 
-**Important**: TTL=0 requires `actively_remove_cached_data: false` (lazy expiration). With active expiration enabled, cached data would be immediately deleted after storage, defeating the purpose.
+**Important**: With TTL=0, an expired entry stays on disk for revalidation under either value of `actively_remove_cached_data`; keep the default `false` (lazy expiration).
 
 **Use cases**:
 - **Per-request IAM authentication and authorization**: Ensures every client's credentials are validated by S3, preventing unauthorized access to cached data
@@ -675,7 +675,7 @@ The proxy includes a destination policy engine that prevents SSRF attacks by val
 
 **Endpoint override carve-out**: IPs listed in `connection_pool.endpoint_overrides` are exempted from the prohibited-range check, allowing PrivateLink ENIs in private address space. List an address you need from `64:ff9b:1::/48` there too.
 
-**Destinations that lead back to a proxy**: after the policy, the `CONNECT` and port-443 SNI passthrough paths refuse a destination when any address they would connect to leads back to a proxy, carved-out addresses included. Such an address is on the proxy host's interfaces, is loopback or unspecified, or is listed in `server.tls.tunnel_refused_addresses`, in IPv4, IPv4-mapped or NAT64 form. List there the addresses that reach a proxy without being on its interfaces, such as an EC2 public IPv4 or Elastic IP address. The passthrough closes the connection, `CONNECT` answers `403`, and the proxy logs a warning at most once every 10 seconds. The check does not look at ports, so it refuses an own address even when `https_port` is not 443. The proxy reads its interface addresses again once its last read is 30 seconds old. If the proxy cannot read its interface addresses when it starts, it logs a warning and, until a read succeeds, refuses only loopback, unspecified and `tunnel_refused_addresses` destinations.
+**Destinations that lead back to a proxy**: after the policy, the `CONNECT` and port-443 SNI passthrough paths refuse a destination when any address they would connect to leads back to a proxy, carved-out addresses included. Such an address is on the proxy host's interfaces, is loopback or unspecified, or is listed in `server.tls.tunnel_refused_addresses`, in IPv4, IPv4-mapped or NAT64 form. List there the addresses that reach a proxy without being on its interfaces, such as an EC2 public IPv4 or Elastic IP address. The passthrough closes the connection, `CONNECT` answers `403`, and the proxy logs a warning at most once every 10 seconds. The check does not look at ports, so it refuses an own address even when `https_port` is not 443. The proxy reads its interface addresses again once its last read is 30 seconds old, and refuses every tunnel until its first read succeeds.
 
 **S3 endpoints**: All public S3 IPs pass the policy. The check has no impact on normal S3 traffic.
 

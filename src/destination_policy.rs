@@ -344,17 +344,25 @@ const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// address, a public IPv4 address on the interface), nor for one an `endpoint_overrides`
 /// entry carves out, so this check runs after the policy and applies to both.
 ///
-/// Interface addresses come from `getifaddrs`, read again on the first check after the
+/// Interface addresses come from `getifaddrs`, or on Linux when that fails from
+/// `SIOCGIFCONF` and `/proc/net/if_inet6` (the shipped systemd unit's
+/// `RestrictAddressFamilies` refuses the netlink socket glibc's `getifaddrs` opens). They
+/// are read again on the first check after the
 /// snapshot is 30 seconds old: an address added since is not refused for up to that long.
-/// A failed read keeps the previous snapshot. Addresses are compared in canonical form,
-/// so `::ffff:a.b.c.d` and the NAT64 `64:ff9b::a.b.c.d` match `a.b.c.d`.
+/// A failed read keeps the previous snapshot for another 30 seconds. Until a read has
+/// succeeded there is no snapshot, so every tunnel is refused and the next check reads
+/// again, warning at most once per ten seconds. Addresses are compared in canonical form, so `::ffff:a.b.c.d` and the NAT64
+/// `64:ff9b::a.b.c.d` match `a.b.c.d`.
 pub struct OwnAddresses {
     configured: HashSet<IpAddr>,
     read_interfaces: bool,
+    /// Reads this host's interface addresses: `interface_addresses` outside tests.
+    read: fn() -> std::io::Result<HashSet<IpAddr>>,
     snapshot: Mutex<Option<(Instant, Arc<HashSet<IpAddr>>)>>,
     refusal_log: Mutex<RefusalLog>,
+    /// Throttle for the warning that no interface read has succeeded yet.
+    read_failure_log: Mutex<RefusalLog>,
 }
-
 struct RefusalLog {
     last: Option<Instant>,
     suppressed: u64,
@@ -373,34 +381,55 @@ impl OwnAddresses {
         Self::build(configured, false)
     }
 
+    /// The production interface read with `read` in place of `interface_addresses`, so a
+    /// test can make the read fail.
+    #[cfg(test)]
+    pub(crate) fn with_reader(read: fn() -> std::io::Result<HashSet<IpAddr>>) -> Self {
+        Self {
+            read,
+            ..Self::build(&[], true)
+        }
+    }
+
     fn build(configured: &[IpAddr], read_interfaces: bool) -> Self {
         Self {
             configured: configured.iter().map(|ip| canonical(*ip)).collect(),
             read_interfaces,
+            read: interface_addresses,
             snapshot: Mutex::new(None),
             refusal_log: Mutex::new(RefusalLog {
+                last: None,
+                suppressed: 0,
+            }),
+            read_failure_log: Mutex::new(RefusalLog {
                 last: None,
                 suppressed: 0,
             }),
         }
     }
 
-    /// Whether a tunnel to `ip` would lead back to a proxy.
+    /// Whether a tunnel to `ip` would lead back to a proxy. True for every address while no
+    /// interface read has succeeded.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        let interfaces = self.interfaces();
-        self.is_own(&interfaces, ip)
+        match self.interfaces() {
+            Some(interfaces) => self.is_own(&interfaces, ip),
+            None => true,
+        }
     }
 
     /// Refuse a tunnel when any of its candidate addresses leads back to a proxy.
     /// `Err` carries the refused addresses; `Ok` returns the list unchanged. One own
     /// address refuses the whole list, because the name resolves to a host that answers
     /// on it and a dial to the others could still loop through the first on a retry
-    /// or a different resolution.
+    /// or a different resolution. While no interface read has succeeded the whole list is
+    /// refused, because any address in it could be this host's.
     pub fn filter_tunnel_targets(
         &self,
         ips: Vec<IpAddr>,
     ) -> std::result::Result<Vec<IpAddr>, Vec<IpAddr>> {
-        let interfaces = self.interfaces();
+        let Some(interfaces) = self.interfaces() else {
+            return Err(ips);
+        };
         let own: Vec<IpAddr> = ips
             .iter()
             .copied()
@@ -451,9 +480,11 @@ impl OwnAddresses {
         loopback_or_unspecified || self.configured.contains(&ip) || interfaces.contains(&ip)
     }
 
-    fn interfaces(&self) -> Arc<HashSet<IpAddr>> {
+    /// This host's interface addresses, or `None` while no read has succeeded. A failed
+    /// read with no earlier snapshot caches nothing, so the next check reads again.
+    fn interfaces(&self) -> Option<Arc<HashSet<IpAddr>>> {
         if !self.read_interfaces {
-            return Arc::default();
+            return Some(Arc::default());
         }
         let mut snapshot = self
             .snapshot
@@ -462,24 +493,54 @@ impl OwnAddresses {
         let now = Instant::now();
         if let Some((taken, set)) = snapshot.as_ref() {
             if now.duration_since(*taken) < OWN_ADDRESS_REFRESH {
-                return Arc::clone(set);
+                return Some(Arc::clone(set));
             }
         }
-        let set = match interface_addresses() {
-            Ok(set) => Arc::new(set.into_iter().map(canonical).collect()),
-            Err(e) => {
-                tracing::warn!(
-                    "Could not read this host's interface addresses, keeping the previous set for tunnel loop refusal: {}",
-                    e
-                );
-                snapshot
-                    .as_ref()
-                    .map(|(_, set)| Arc::clone(set))
-                    .unwrap_or_default()
+        match (self.read)() {
+            Ok(set) => {
+                let set: Arc<HashSet<IpAddr>> = Arc::new(set.into_iter().map(canonical).collect());
+                *snapshot = Some((now, Arc::clone(&set)));
+                Some(set)
             }
-        };
-        *snapshot = Some((now, Arc::clone(&set)));
-        set
+            Err(e) => match snapshot.as_mut() {
+                Some((taken, set)) => {
+                    tracing::warn!(
+                        "Could not read this host's interface addresses, keeping the previous set for tunnel loop refusal: {}",
+                        e
+                    );
+                    *taken = now;
+                    Some(Arc::clone(set))
+                }
+                None => {
+                    // Every check reads again and fails again, so log at most once per
+                    // `REFUSAL_LOG_INTERVAL`, counting the ones in between into the next.
+                    let suppressed = {
+                        let mut log = self
+                            .read_failure_log
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if log
+                            .last
+                            .is_some_and(|last| now.duration_since(last) < REFUSAL_LOG_INTERVAL)
+                        {
+                            log.suppressed += 1;
+                            None
+                        } else {
+                            log.last = Some(now);
+                            Some(std::mem::take(&mut log.suppressed))
+                        }
+                    };
+                    if let Some(suppressed) = suppressed {
+                        tracing::warn!(
+                            suppressed_since_last = suppressed,
+                            "Could not read this host's interface addresses, and no earlier read succeeded: refusing every CONNECT and passthrough tunnel until a read succeeds: {}",
+                            e
+                        );
+                    }
+                    None
+                }
+            },
+        }
     }
 }
 
@@ -504,6 +565,202 @@ fn canonical(ip: IpAddr) -> IpAddr {
 /// Every IPv4 and IPv6 address on this host's interfaces, loopback included.
 #[cfg(unix)]
 fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    read_interface_addresses(getifaddrs_addresses)
+}
+
+/// `getifaddrs`, then on Linux, if it fails, [`netlink_free_addresses`]. glibc's
+/// `getifaddrs` opens an `AF_NETLINK` socket, which the shipped systemd unit's
+/// `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` refuses with `EAFNOSUPPORT`.
+/// `getifaddrs` stays first so a host that can open a netlink socket reads what it read
+/// before. The read succeeds when either method does; when both fail the error names both.
+#[cfg(target_os = "linux")]
+fn read_interface_addresses(
+    getifaddrs: fn() -> std::io::Result<HashSet<IpAddr>>,
+) -> std::io::Result<HashSet<IpAddr>> {
+    getifaddrs().or_else(|getifaddrs_error| {
+        netlink_free_addresses().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("getifaddrs: {getifaddrs_error}; without netlink: {e}"),
+            )
+        })
+    })
+}
+
+/// `getifaddrs` alone off Linux.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_interface_addresses(
+    getifaddrs: fn() -> std::io::Result<HashSet<IpAddr>>,
+) -> std::io::Result<HashSet<IpAddr>> {
+    getifaddrs()
+}
+
+/// `SIOCGIFCONF`'s first buffer, in entries; it doubles until the list fits.
+#[cfg(target_os = "linux")]
+const SIOCGIFCONF_FIRST_ENTRIES: usize = 64;
+
+/// The most entries `SIOCGIFCONF` is given room for (2.5 MiB of 40-byte `ifreq`s on
+/// 64-bit Linux). A host with more IPv4 addresses than this fails the read.
+#[cfg(target_os = "linux")]
+const SIOCGIFCONF_MAX_ENTRIES: usize = 1 << 16;
+
+/// This host's addresses without a netlink socket: IPv4 from `SIOCGIFCONF` on an
+/// `AF_INET` socket, IPv6 from `/proc/net/if_inet6`. Fails if either half fails.
+#[cfg(target_os = "linux")]
+fn netlink_free_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    let mut addresses = siocgifconf_ipv4(SIOCGIFCONF_FIRST_ENTRIES)?;
+    addresses.extend(proc_net_ipv6()?);
+    Ok(addresses)
+}
+
+/// Every IPv4 address `SIOCGIFCONF` returns: one entry per address on every interface,
+/// secondary addresses included, each named by its address label. The buffer starts at
+/// `first_entries` and doubles while the kernel fills it, since a full buffer may have
+/// been truncated; the list is whole once the returned length is below the buffer's.
+#[cfg(target_os = "linux")]
+fn siocgifconf_ipv4(first_entries: usize) -> std::io::Result<HashSet<IpAddr>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: `socket` takes no pointers.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a descriptor `socket` just returned and nothing else owns; `OwnedFd`
+    // closes it once.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    let entry = std::mem::size_of::<libc::ifreq>();
+    let mut entries = first_entries.clamp(1, SIOCGIFCONF_MAX_ENTRIES);
+    loop {
+        let mut buf: Vec<libc::ifreq> = std::iter::repeat_with(|| {
+            // SAFETY: all-zero bytes are a valid `ifreq`: its fields are a byte array and a
+            // union of a `sockaddr`, integers, byte arrays and a pointer.
+            unsafe { std::mem::zeroed() }
+        })
+        .take(entries)
+        .collect();
+        let len = entries * entry;
+        let mut conf = libc::ifconf {
+            ifc_len: libc::c_int::try_from(len).map_err(std::io::Error::other)?,
+            ifc_ifcu: libc::__c_anonymous_ifc_ifcu {
+                ifcu_req: buf.as_mut_ptr(),
+            },
+        };
+        // SAFETY: `conf` points at `buf`, which holds `ifc_len` bytes and outlives the call.
+        // The kernel writes at most `ifc_len` bytes there and sets `ifc_len` to the number
+        // it wrote.
+        let rc = unsafe {
+            libc::ioctl(
+                socket.as_raw_fd(),
+                libc::SIOCGIFCONF as _,
+                std::ptr::addr_of_mut!(conf),
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let returned = usize::try_from(conf.ifc_len).unwrap_or(len).min(len);
+        if returned < len {
+            let mut addresses = HashSet::new();
+            for req in &buf[..returned / entry] {
+                // SAFETY: `SIOCGIFCONF` sets `ifru_addr` in every entry it returns.
+                let addr = unsafe { req.ifr_ifru.ifru_addr };
+                if libc::c_int::from(addr.sa_family) == libc::AF_INET {
+                    // SAFETY: an AF_INET `sockaddr` holds a `sockaddr_in`, and both are 16
+                    // bytes; the unaligned read copes with `sockaddr`'s 2-byte alignment.
+                    let sin: libc::sockaddr_in =
+                        unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(addr).cast()) };
+                    addresses.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                        sin.sin_addr.s_addr,
+                    ))));
+                }
+            }
+            return Ok(addresses);
+        }
+        if entries == SIOCGIFCONF_MAX_ENTRIES {
+            return Err(std::io::Error::other(format!(
+                "SIOCGIFCONF filled a buffer of {SIOCGIFCONF_MAX_ENTRIES} entries"
+            )));
+        }
+        entries = (entries * 2).min(SIOCGIFCONF_MAX_ENTRIES);
+    }
+}
+
+/// Every IPv6 address in `/proc/net/if_inet6`, whose lines each start with an address as
+/// 32 hex digits. A kernel booted without IPv6 has no such file, and then no `AF_INET6`
+/// stream socket opens either, so no IPv6 tunnel can be dialled: that reads as no IPv6
+/// address. A missing file while an `AF_INET6` stream socket opens, or an unparsable line,
+/// fails the read.
+#[cfg(target_os = "linux")]
+fn proc_net_ipv6() -> std::io::Result<HashSet<IpAddr>> {
+    proc_net_ipv6_from(
+        std::fs::read_to_string("/proc/net/if_inet6"),
+        open_ipv6_socket,
+    )
+}
+
+/// [`proc_net_ipv6`] over the file read's result, with `open` opening an `AF_INET6` socket
+/// of the given type.
+#[cfg(target_os = "linux")]
+fn proc_net_ipv6_from(
+    read: std::io::Result<String>,
+    open: fn(libc::c_int) -> std::io::Result<()>,
+) -> std::io::Result<HashSet<IpAddr>> {
+    let text = match read {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !ipv6_tunnels_can_dial(open) => {
+            return Ok(HashSet::new());
+        }
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("/proc/net/if_inet6: {e}"),
+            ))
+        }
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let hex = line.split_whitespace().next().unwrap_or_default();
+            if hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                if let Ok(bits) = u128::from_str_radix(hex, 16) {
+                    return Ok(IpAddr::V6(Ipv6Addr::from(bits)));
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("/proc/net/if_inet6: unparsable line {line:?}"),
+            ))
+        })
+        .collect()
+}
+
+/// Whether this process can open an `AF_INET6` stream socket, the type a tunnel dials
+/// (tokio's `TcpStream::connect`). Only `EAFNOSUPPORT` means it cannot; any other error
+/// counts as can, so the read fails.
+#[cfg(target_os = "linux")]
+fn ipv6_tunnels_can_dial(open: fn(libc::c_int) -> std::io::Result<()>) -> bool {
+    match open(libc::SOCK_STREAM) {
+        Ok(()) => true,
+        Err(e) => e.raw_os_error() != Some(libc::EAFNOSUPPORT),
+    }
+}
+
+/// Open an `AF_INET6` socket of `kind`, then close it.
+#[cfg(target_os = "linux")]
+fn open_ipv6_socket(kind: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `socket` takes no pointers.
+    let fd = unsafe { libc::socket(libc::AF_INET6, kind | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is the descriptor `socket` just returned, closed once.
+    unsafe { libc::close(fd) };
+    Ok(())
+}
+
+/// Every IPv4 and IPv6 address `getifaddrs` lists.
+#[cfg(unix)]
+fn getifaddrs_addresses() -> std::io::Result<HashSet<IpAddr>> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` writes the head of a list it allocates, freed below.
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -511,9 +768,8 @@ fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
     }
     let mut addresses = HashSet::new();
     let mut node = head;
-    while !node.is_null() {
-        // SAFETY: `node` is an element of the list `getifaddrs` returned, not yet freed.
-        let ifa = unsafe { &*node };
+    // SAFETY: `node` is null or an element of the list `getifaddrs` returned, not yet freed.
+    while let Some(ifa) = unsafe { node.as_ref() } {
         if !ifa.ifa_addr.is_null() {
             // SAFETY: `ifa_addr` is non-null and its family says which sockaddr it is.
             let family = libc::c_int::from(unsafe { (*ifa.ifa_addr).sa_family });
@@ -1094,6 +1350,122 @@ mod own_address_tests {
         );
     }
 
+    fn interface_address() -> IpAddr {
+        ip("192.0.2.9")
+    }
+
+    static FAILS_THEN_READS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    /// Fails on its first call, then lists [`interface_address`].
+    fn fails_then_reads() -> std::io::Result<HashSet<IpAddr>> {
+        if FAILS_THEN_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Err(std::io::Error::other("fixture: getifaddrs failed"))
+        } else {
+            Ok([interface_address()].into_iter().collect())
+        }
+    }
+
+    /// While no interface read has succeeded, a tunnel to an interface address is refused,
+    /// and the failure is not cached: the next check reads again and refuses only the
+    /// host's own addresses.
+    #[test]
+    fn a_tunnel_is_refused_while_no_interface_read_has_succeeded() {
+        let own = OwnAddresses::with_reader(fails_then_reads);
+        assert_eq!(
+            own.filter_tunnel_targets(vec![interface_address()]),
+            Err(vec![interface_address()]),
+            "A TUNNEL TO AN INTERFACE ADDRESS WAS RELAYED WHILE NO INTERFACE READ HAD SUCCEEDED"
+        );
+        assert_eq!(
+            own.filter_tunnel_targets(vec![interface_address()]),
+            Err(vec![interface_address()]),
+            "after a successful read the interface address is refused"
+        );
+        assert_eq!(
+            own.filter_tunnel_targets(vec![ip("192.0.2.10")]),
+            Ok(vec![ip("192.0.2.10")]),
+            "A FAILED FIRST INTERFACE READ WAS CACHED: an address that is not this host's is still refused"
+        );
+    }
+
+    fn always_fails() -> std::io::Result<HashSet<IpAddr>> {
+        Err(std::io::Error::other("fixture: getifaddrs failed"))
+    }
+    /// The WARN-level output of `f`.
+    fn capture_warn<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let r = tracing::subscriber::with_default(subscriber, f);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, out)
+    }
+    /// With no read ever succeeding, every check reads again and fails again, and the warning
+    /// is one line per ten seconds, the rate `warn_refused` uses.
+    ///
+    /// # RED SIDE
+    ///
+    /// With the warning unthrottled, 20 checks emit 20 lines.
+    #[test]
+    fn the_no_interface_read_warning_is_rate_limited() {
+        let own = OwnAddresses::with_reader(always_fails);
+        let (_, out) = capture_warn(|| {
+            for _ in 0..20 {
+                assert!(own.contains(interface_address()));
+            }
+        });
+        let lines = out.matches("no earlier read succeeded").count();
+        assert_eq!(
+            lines, 1,
+            "THE NO-INTERFACE-READ WARNING WAS NOT RATE LIMITED: 20 checks emitted {lines} lines"
+        );
+    }
+    static READS_THEN_FAILS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    /// Lists [`interface_address`] on its first call, then fails.
+    fn reads_then_fails() -> std::io::Result<HashSet<IpAddr>> {
+        if READS_THEN_FAILS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Ok([interface_address()].into_iter().collect())
+        } else {
+            Err(std::io::Error::other("fixture: getifaddrs failed"))
+        }
+    }
+
+    /// A failed read after a successful one keeps the previous set.
+    #[test]
+    fn a_failed_read_keeps_the_previous_set() {
+        let own = OwnAddresses::with_reader(reads_then_fails);
+        assert!(own.contains(interface_address()));
+        // Age the snapshot so the next check reads again, and fails.
+        if let Some((taken, _)) = own.snapshot.lock().unwrap().as_mut() {
+            *taken -= OWN_ADDRESS_REFRESH;
+        }
+        assert!(
+            own.contains(interface_address()),
+            "the previous set must be kept"
+        );
+        assert!(!own.contains(ip("192.0.2.10")));
+        assert_eq!(
+            READS_THEN_FAILS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
     /// Every 127/8 address, 0.0.0.0, :: and ::1 count as own under the production
     /// interface read, listed or not on an interface.
     #[test]
@@ -1110,5 +1482,135 @@ mod own_address_tests {
             assert!(own.contains(ip(a)), "{a} must count as own");
         }
         assert!(!own.contains(ip("192.0.2.44")));
+    }
+
+    /// The netlink-free read lists loopback and a non-loopback address, and the same set
+    /// `getifaddrs` lists on this host; `SIOCGIFCONF` grown from a one-entry buffer lists
+    /// what it lists from the default one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_netlink_free_read_lists_what_getifaddrs_lists() {
+        let without_netlink = netlink_free_addresses().expect("the netlink-free read");
+        let getifaddrs = getifaddrs_addresses().expect("getifaddrs");
+        assert!(
+            without_netlink.contains(&ip("127.0.0.1")),
+            "no loopback in {without_netlink:?}"
+        );
+        assert!(
+            without_netlink.iter().any(|a| !a.is_loopback()),
+            "no non-loopback address in {without_netlink:?}"
+        );
+        assert_eq!(
+            without_netlink, getifaddrs,
+            "THE NETLINK-FREE READ DIFFERS FROM getifaddrs"
+        );
+        assert_eq!(
+            siocgifconf_ipv4(1).expect("SIOCGIFCONF from one entry"),
+            siocgifconf_ipv4(SIOCGIFCONF_FIRST_ENTRIES).expect("SIOCGIFCONF"),
+            "SIOCGIFCONF GROWN FROM A ONE-ENTRY BUFFER LOST AN ADDRESS"
+        );
+    }
+
+    /// `getifaddrs` as the shipped unit's `RestrictAddressFamilies` leaves it.
+    #[cfg(target_os = "linux")]
+    fn getifaddrs_without_netlink() -> std::io::Result<HashSet<IpAddr>> {
+        Err(std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+    }
+    #[cfg(target_os = "linux")]
+    fn read_under_the_shipped_unit() -> std::io::Result<HashSet<IpAddr>> {
+        read_interface_addresses(getifaddrs_without_netlink)
+    }
+
+    /// `/proc/net/if_inet6` as a kernel or sandbox without it leaves the read.
+    #[cfg(target_os = "linux")]
+    fn if_inet6_absent() -> std::io::Result<String> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+    /// A sandbox that refuses `AF_INET6` datagram sockets and allows stream sockets.
+    #[cfg(target_os = "linux")]
+    fn ipv6_stream_only(kind: libc::c_int) -> std::io::Result<()> {
+        if kind == libc::SOCK_STREAM {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+        }
+    }
+    /// A kernel booted without IPv6: every `AF_INET6` socket fails with `EAFNOSUPPORT`.
+    #[cfg(target_os = "linux")]
+    fn ipv6_absent(_kind: libc::c_int) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+    }
+    /// A sandbox that refuses `AF_INET6` stream sockets and allows datagram sockets.
+    #[cfg(target_os = "linux")]
+    fn ipv6_datagram_only(kind: libc::c_int) -> std::io::Result<()> {
+        if kind == libc::SOCK_STREAM {
+            Err(std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+        } else {
+            Ok(())
+        }
+    }
+    /// A filter that refuses `AF_INET6` sockets with `EPERM` rather than `EAFNOSUPPORT`.
+    #[cfg(target_os = "linux")]
+    fn ipv6_refused_eperm(_kind: libc::c_int) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    /// With `/proc/net/if_inet6` absent, the IPv6 half fails the read while a tunnel could
+    /// dial IPv6, and reads as no IPv6 address only when no `AF_INET6` stream socket opens.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `ipv6_tunnels_can_dial` probing `SOCK_DGRAM`, the stream-only sandbox reads as
+    /// no IPv6 address and the first assertion fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_if_inet6_fails_the_read_while_ipv6_tunnels_can_dial() {
+        assert!(
+            proc_net_ipv6_from(if_inet6_absent(), ipv6_stream_only).is_err(),
+            "A MISSING /proc/net/if_inet6 READ AS NO IPv6 ADDRESS WHILE IPv6 STREAM SOCKETS OPEN"
+        );
+        assert!(
+            proc_net_ipv6_from(if_inet6_absent(), ipv6_refused_eperm).is_err(),
+            "an AF_INET6 refusal other than EAFNOSUPPORT must fail the read"
+        );
+        assert_eq!(
+            proc_net_ipv6_from(if_inet6_absent(), ipv6_absent).expect("a kernel without IPv6"),
+            HashSet::new(),
+            "A KERNEL WITHOUT IPv6 FAILED THE READ: every tunnel would be refused"
+        );
+        assert_eq!(
+            proc_net_ipv6_from(if_inet6_absent(), ipv6_datagram_only)
+                .expect("no IPv6 stream socket"),
+            HashSet::new()
+        );
+    }
+
+    /// With `getifaddrs` failing as it does under the shipped unit, the gate holds this
+    /// host's addresses: a tunnel elsewhere is relayed and one to an interface address is
+    /// refused.
+    ///
+    /// # RED SIDE
+    ///
+    /// With `read_interface_addresses` calling `getifaddrs` alone, every tunnel is refused
+    /// and the first assertion fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn under_the_shipped_unit_the_gate_holds_this_hosts_addresses() {
+        let own = OwnAddresses::with_reader(read_under_the_shipped_unit);
+        assert_eq!(
+            own.filter_tunnel_targets(vec![ip("192.0.2.44")]),
+            Ok(vec![ip("192.0.2.44")]),
+            "EVERY TUNNEL IS REFUSED WHEN getifaddrs FAILS WITH EAFNOSUPPORT"
+        );
+        let local = getifaddrs_addresses()
+            .expect("getifaddrs")
+            .into_iter()
+            .find(|a| !a.is_loopback() && !a.is_unspecified())
+            .expect("a non-loopback interface address");
+        assert_eq!(
+            own.filter_tunnel_targets(vec![local]),
+            Err(vec![local]),
+            "A TUNNEL TO AN INTERFACE ADDRESS WAS RELAYED UNDER THE SHIPPED UNIT"
+        );
     }
 }

@@ -88,7 +88,8 @@ async fn an_idle_peer_collects_a_stopped_instances_delta_file_within_one_cycle()
 
     {
         let b = consolidator(tmp.path(), "instance-b");
-        b.size_accumulator().add(PEER_DELTA);
+        b.size_accumulator()
+            .add_range("fixture-peer-1", 0, PEER_DELTA - 1, PEER_DELTA);
         // `shutdown` step 0, and the eviction sites, flush exactly like this: outside a cycle.
         b.size_accumulator().flush().await.unwrap();
         // B stops here. Dropped with no final cycle of its own.
@@ -153,7 +154,8 @@ async fn shutdown_collects_the_delta_its_own_flush_wrote() {
 
     let b = consolidator(tmp.path(), "instance-b");
     b.initialize().await.unwrap();
-    b.size_accumulator().add(PEER_DELTA);
+    b.size_accumulator()
+        .add_range("fixture-peer-2", 0, PEER_DELTA - 1, PEER_DELTA);
     b.shutdown().await.unwrap();
 
     assert_eq!(
@@ -177,7 +179,8 @@ async fn non_delta_size_tracking_files_leave_the_cycle_idle() {
     // lock-taking return (the real size) are distinguishable.
     let a = consolidator(tmp.path(), "instance-a");
     a.initialize().await.unwrap();
-    a.size_accumulator().add(PEER_DELTA);
+    a.size_accumulator()
+        .add_range("fixture-peer-3", 0, PEER_DELTA - 1, PEER_DELTA);
     let seeded = a.run_consolidation_cycle().await.unwrap();
     assert_eq!(
         seeded.current_size, PEER_DELTA,

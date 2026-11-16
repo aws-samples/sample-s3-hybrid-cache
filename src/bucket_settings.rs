@@ -556,6 +556,10 @@ impl RuleSet {
         };
         let hedge_max_per_request =
             first_usize(&|r| r.hedge_max_per_request).unwrap_or(DEFAULT_HEDGE_MAX_PER_REQUEST);
+        // A budget of 0 sends no hedge, but a hedged fetch would still tie each attempt to an
+        // address, which skips `S3Client::forward_request`'s retry ladder, and count every
+        // slow request as suppressed. So 0 means hedging off.
+        let hedging_enabled = hedging_enabled && hedge_max_per_request > 0;
 
         // Post-resolution invariants (unchanged from prior behaviour):
         // - Zero get_ttl → RAM range cache ineligible (RAM cache bypasses revalidation)
@@ -1794,6 +1798,24 @@ mod tests {
         assert_eq!(r.hedge_max_per_request, DEFAULT_HEDGE_MAX_PER_REQUEST);
     }
 
+    /// `hedge_max_per_request: 0` resolves as hedging off, so the key's fetches take the
+    /// unhedged path and keep the connect-retry ladder.
+    #[tokio::test]
+    async fn a_hedge_budget_of_zero_resolves_as_hedging_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "hot/**", "hedging_enabled": true, "hedge_max_per_request": 0}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("hot/key.parquet").await;
+        assert!(
+            !r.hedging_enabled,
+            "A KEY WITH hedge_max_per_request: 0 RESOLVED WITH HEDGING ON: its attempts are tied to addresses and skip the retry ladder"
+        );
+        assert_eq!(r.hedge_max_per_request, 0);
+    }
     #[tokio::test]
     async fn resolve_hedging_enabled_false_for_non_matching_key() {
         let tmp = tempfile::tempdir().unwrap();

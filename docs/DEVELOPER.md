@@ -269,6 +269,9 @@ the real S3 addresses, avoids routing loops and lets the pool spread requests ac
 4. Close the connection pools.
 5. Final cleanup.
 
+After the coordinator finishes, `async_main` gives the server tasks 500 ms to drain and then
+flushes the access log buffer once more, so requests answered during shutdown are logged.
+
 ## Optimizations
 
 ### Range request gap consolidation

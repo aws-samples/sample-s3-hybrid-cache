@@ -68,9 +68,10 @@ The read is answered from S3, and the proxy removes the range so the next read c
 
 - range data files, whether written whole or streamed from a GET response, including multipart parts assembled into the cache;
 - `.meta` files written on the request path: range stores, TTL refreshes, HEAD metadata and range removals;
-- journal appends.
+- journal appends;
+- the eviction index, eviction work lists and orphan reclamation checkpoints.
 
-Not counted: `.meta` writes made by the journal consolidator, cache-hit journal flushes, and the accounting state files under `metadata/_shard_state/` and `metadata/_write_ledger/`.
+Not counted: `.meta` writes made by the journal consolidator, cache-hit journal flushes, and the other accounting state files under `metadata/_shard_state/` and `metadata/_write_ledger/`.
 
 **What the proxy does**: it logs a WARN naming the write that failed, with the running total, removes the write's temporary file where it has one, and counts the event in `disk_full_events_total`. The request is still served from S3, and no range file is published for the failed write. Caching resumes once eviction or the operator frees space.
 
@@ -115,12 +116,12 @@ To monitor it:
 
 ### 7. Stalled upstream responses (mid-stream idle watchdog)
 
-**Detection**: no bytes arrive from the upstream within `upstream_idle_timeout` (default `5s`) while the proxy is trying to read. The watchdog covers the cache-miss fetches the proxy streams: full-object GETs, part-number GET misses, complete range misses and signed ranges; see [Upstream idle watchdog](CONNECTION_POOLING.md#upstream-idle-watchdog). Backpressure from a slow client does not count as an idle upstream.
+**Detection**: no bytes arrive from the upstream within `upstream_idle_timeout` (default `5s`) while the proxy is trying to read. The watchdog covers the cache-miss fetches the proxy streams: full-object GETs, part-number GET misses, complete range misses and signed ranges; see [Upstream idle watchdog](CONNECTION_POOLING.md#upstream-idle-watchdog). Time spent waiting on a slow client or a bandwidth limit does not count as an idle upstream.
 
 **What the proxy does**:
 
 - **Before the first byte** of a full-object GET, a part-number GET or a HEAD: it retries up to `upstream_idle_retries` times (default 2), failing over through the connection pool. When the retries run out, it answers `504 Gateway Timeout`.
-- **Mid-stream**: it closes the client connection, ending the body early, and the client's own retry logic takes over. The requested range is never cached as if it had arrived whole.
+- **Mid-stream**: it closes the client connection, ending the body short of its `Content-Length`. A client that checks the length reports an error, which the application can retry. The requested range is never cached as if it had arrived whole.
 
 The idle timer measures a gap with no bytes, not the total transfer time, so a slow transfer that keeps making progress is never aborted. While the cache writer cannot keep up, the proxy stops asking the upstream for data and the timer pauses. An aborted fetch never publishes a truncated `.bin` under the requested bounds. If at least `cache.partial_range_commit_ratio` (default `0.5`) of the requested bytes arrived in order, the proxy caches them as a smaller valid range; otherwise it deletes the temporary file. See [Cache safety](CONNECTION_POOLING.md#cache-safety). The watchdog does not apply while a request waits for another request's fetch of the same object, which has its own coordination timeout.
 
@@ -198,7 +199,7 @@ A steady non-zero reading on either means the write cache is being skipped, so P
 
 The capacity figure a PUT checks is refreshed by a background task every 5 seconds, not read per request. It can be up to one refresh interval stale on a healthy volume, and as stale as the stall on an unhealthy one. The `max_cache_size` check each upload passes adds what this proxy has written since a consolidation cycle last folded its own additions into the shared total. One proxy's burst is therefore measured against a figure that includes it. GET-miss fills take the same soft stop and count the same way.
 
-What a proxy adds is what it has admitted, not the net of what it has also evicted since the total was folded. A cache sitting at `max_cache_size` with eviction keeping pace can therefore decline some uploads and fills it has room for, until the next consolidation cycle. A record the proxy renamed aside as corrupt, or retired at its 256-record cap, can keep that over-decline going for longer. An upload's check reads this proxy's additions before the shared total, and does not pair the two reads the way a fill's check does. Around a consolidation cycle it can therefore decline an upload that a fill would have passed.
+What a proxy adds is what it has admitted, not the net of what it has also evicted since the total was folded. A cache sitting at `max_cache_size` with eviction keeping pace can therefore decline some uploads and fills it has room for, until the next consolidation cycle. A record the proxy renamed aside as corrupt, or retired at its 256-record cap, can keep that over-decline going for longer.
 
 A fleet stays within a bound made of three terms. They are `max_cache_size`, the uploads and fills in flight on each proxy, and what each other proxy admits at its own offered (attempted) rate over the age of the figure it reads. That age is the 5-second refresh plus the time one consolidation cycle takes: close to `cache.shared_storage.consolidation_interval` on a healthy volume, and several times longer when admission alone saturates a small file system. Eviction reclaims the overshoot.
 

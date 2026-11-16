@@ -663,8 +663,7 @@ pub fn test_tls_config() -> Option<TlsConfig> {
 /// that calls `initialize()` on a temp cache dir starts a full validation scan
 /// immediately, racing whatever the test does next.
 ///
-/// `perform_full_validation` re-grounds the size state from its own disk snapshot and
-/// calls `SizeAccumulator::reset()`. So a test that writes cache files and then asserts
+/// `perform_full_validation` corrects the size state from its own disk snapshot. So a test that writes cache files and then asserts
 /// on a size figure can have its result overwritten by a scan whose snapshot predates
 /// those writes, and it fails reporting zero.
 ///

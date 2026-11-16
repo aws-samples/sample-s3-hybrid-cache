@@ -770,11 +770,11 @@ impl CacheInitializationCoordinator {
         //    the recreated path gets a *different inode* and therefore an *independent* lock. So
         //    the removal did not recover a stuck lock — it manufactured concurrent validation.
         //
-        // Concurrent validation is not a cosmetic problem. `update_size_from_validation_with_kind` is an
-        // absolute install of `total_size`, `write_cache_size` and `cached_objects` that takes no
-        // lock of its own, and it also calls `reset_all_delta_files()` and
-        // `size_accumulator.reset()`. Two overlapping passes therefore discard each other's
-        // post-scan deltas, and a rolling pass's *extrapolated* figures can land on top of a full
+        // Concurrent validation is not a cosmetic problem. The validation install was then an
+        // absolute install of `total_size`, `write_cache_size` and `cached_objects` that took no
+        // lock of its own and also deleted every delta file and reset the accumulator, so two
+        // overlapping passes discarded each other's post-scan deltas. The install is relative
+        // now, but a rolling pass's *extrapolated* figures can still land on top of a full
         // pass's census. This `flock` is the only thing serialising them.
         //
         // # There is no such thing as a stale `flock`, which is why the removal recovers nothing
@@ -1458,7 +1458,7 @@ impl CacheInitializationCoordinator {
         // figure comparable to a residency figure — there is no correct expected
         // relationship between them at all. The accounting invariant that DOES matter,
         // `write_cache_size <= total_size`, is enforced where it belongs, by the clamp in
-        // `JournalConsolidator::update_size_from_validation_with_kind` (R6.4).
+        // `JournalConsolidator::install_validation_correction` (R6.4).
         //
         // Both figures are still reported, so the information is not lost, and
         // `/metrics` exposes them separately as `write_cache.inflight_bytes` and
@@ -2406,12 +2406,7 @@ mod tests {
         consolidator.initialize().await.unwrap();
         // Set write cache size to match manager
         consolidator
-            .update_size_from_validation_with_kind(
-                512,
-                Some(512),
-                None,
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(512, Some(512), None)
             .await;
 
         // Create size tracker with consolidator reference
@@ -2509,12 +2504,7 @@ mod tests {
         consolidator.initialize().await.unwrap();
         // 1000 resident staged bytes on the shared volume.
         consolidator
-            .update_size_from_validation_with_kind(
-                1000,
-                Some(1000),
-                None,
-                crate::cache_size_tracker::ValidationSampleKind::FullScan,
-            )
+            .ground_size_state_for_tests(1000, Some(1000), None)
             .await;
 
         let size_config = CacheSizeConfig {

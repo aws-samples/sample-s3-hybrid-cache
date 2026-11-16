@@ -114,9 +114,12 @@ pub struct UpstreamHealth {
 
 impl UpstreamHealth {
     /// Record one connect outcome for `ip`. A failure that reaches the tracker's
-    /// threshold removes `ip` from the host's distributor, as the GET path does; the
-    /// recovery probe re-admits it.
-    fn record(&self, ip: IpAddr, connected: bool) {
+    /// threshold removes `ip` from the host's distributor, as the GET path does. A
+    /// transport carries this whenever its connect address came from a distributor: with
+    /// IP distribution on, and with it off for an exact `endpoint_overrides` host's
+    /// startup distributor. The recovery probe, which re-admits an excluded address, runs
+    /// only with IP distribution on; with it off the address stays out until a restart.
+    pub(crate) fn record(&self, ip: IpAddr, connected: bool) {
         if connected {
             self.tracker.record_success(&ip);
             return;
