@@ -767,7 +767,14 @@ impl RangeHandler {
 
                     // Requirements 2.2, 2.3: Invalidate stale ranges and log the action
                     let ranges_count = metadata.ranges.len();
-                    if let Err(e) = disk_cache.invalidate_all_ranges(cache_key).await {
+                    // `invalidate_all_ranges` stamps the key's write-order marker; a stamp that
+                    // did not land goes to the background retry.
+                    let invalidated = disk_cache.invalidate_all_ranges(cache_key).await;
+                    if !matches!(invalidated, Ok(true)) {
+                        self.cache_manager
+                            .spawn_origin_change_stamp_retry(cache_key);
+                    }
+                    if let Err(e) = invalidated {
                         warn!(
                             "Failed to invalidate stale ranges: cache_key={}, error={}, treating as missing anyway",
                             cache_key, e

@@ -33,10 +33,11 @@
 //! already on disk before GET #2, with no consolidation cycle having run. So the
 //! in-process harness does NOT reproduce the fleet's 5-8 s window.
 //!
-//! That is a finding, and the likely reason is the stub, not the product: the
-//! shared `StubS3Client` always returns `S3ResponseBody::Buffered`, so GET #1
-//! takes the BUFFERED fill path, which wrote the `.meta` synchronously here. An
-//! 8 MiB GET against real S3 returns a streaming body and fills through
+//! That is a finding, and the reason was the stub, not the product: the shared
+//! `StubS3Client` then returned `S3ResponseBody::Buffered`, so GET #1 took a
+//! buffered fill path, which wrote the `.meta` synchronously here and has since been
+//! deleted. The shared stub now streams its body whenever the request allows it, as
+//! `S3Client` does. An 8 MiB GET against real S3 returns a streaming body and fills through
 //! `DiskCacheManager::commit_incremental_range_shared`, which writes only a journal entry
 //! (`WriteMode::JournalOnly`).
 //!
@@ -277,7 +278,8 @@ impl Outcome {
 /// Which upstream body shape the stub returns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BodyShape {
-    /// `S3ResponseBody::Buffered` — what the shared `StubS3Client` always returns.
+    /// The shared `StubS3Client`, which streams its body over a loopback `Incoming` as
+    /// `S3Client` does, so this arm fills through the same streamed path as `Streaming`.
     Buffered,
     /// `S3ResponseBody::Streaming(Incoming)` — what the real `S3Client` returns for
     /// a GET (`build_s3_request_context` sets `allow_streaming: true`).

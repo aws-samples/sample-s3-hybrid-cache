@@ -5,7 +5,7 @@ security model the software assumes, the risks that model leaves with you, and t
 yourself against this repository.
 
 
-**Applies to release 3.0.6. Last reviewed 2026-11-16.**
+**Applies to release 3.0.7. Last reviewed 2026-11-25.**
 
 Confirm the release you are reading with `grep '^version' Cargo.toml`. If it does not match the release
 named above, this document was written against a different release than the code in front of you.
@@ -323,8 +323,9 @@ release wrote to. A deployment whose objects are each written once is exposed to
 - **`cache.trust_unverified_ranges: true` where objects are overwritten in place outside the
   proxy.** Ranges and pending journal entries with no file identity are then served and consolidated
   unchecked, as 3.0.0 did, including another version's bytes and non-XML error bodies that a 2.x
-  release cached. Unmarked part layouts are kept. No time limit ends such a serve: while the cached
-  metadata names the version S3 holds now, every revalidation gets `304` and renews the entry.
+  release cached. A part layout entry recorded before 3.0.7 is still cleared the first time that
+  part is read by part number. No time limit ends such a serve: while the cached metadata names
+  the version S3 holds now, every revalidation gets `304` and renews the entry.
 - **A 2.x proxy on the same cache volume.** A 2.x proxy compares no versions when it fills,
   consolidates or reads, so it keeps creating and serving listings of another version's bytes. It
   also locks different files from 3.x proxies, so their metadata writes are not ordered against each

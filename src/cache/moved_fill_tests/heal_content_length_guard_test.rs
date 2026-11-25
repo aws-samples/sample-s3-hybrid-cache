@@ -3,10 +3,8 @@
 //!
 //! # The defect
 //!
-//! Two metadata writers derive a full object's `content_length` from its single range when
-//! the document's own `content_length` is `0`:
-//! `HybridMetadataWriter::add_or_update_range` and
-//! `JournalConsolidator::apply_journal_entries`. The blocks were byte-identical, and
+//! The consolidator derives a full object's `content_length` from its single range when the
+//! document's own `content_length` is `0` (`JournalConsolidator::apply_journal_entries`), and
 //! `content_length == 0` is ambiguous — it means "unknown" on a defaulted document and
 //! "this object is zero bytes" on a published one.
 //!
@@ -31,14 +29,10 @@
 //! nowhere on that route. `unpublished_document_still_derives_its_length_from_its_range`
 //! below is the positive control that the legitimate derivation is preserved.
 //!
-//! Each site is driven through its OWN production entry point: the consolidator through
-//! `consolidate_object`, the writer through `write_range_metadata_witnessed` with the
-//! `WriteMode::Hybrid` the orphan sweep's `add_range_to_metadata` uses. A test driving one
-//! proves nothing about the other.
+//! The consolidator is driven through its production entry point, `consolidate_object`.
 
 use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 use crate::compression::CompressionAlgorithm;
-use crate::hybrid_metadata_writer::{HybridMetadataWriter, WriteMode};
 use crate::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use crate::journal_manager::{JournalEntry, JournalManager, JournalOperation};
 use crate::metadata_lock_manager::MetadataLockManager;
@@ -298,130 +292,6 @@ async fn unpublished_document_still_derives_its_length_from_its_range() {
         "an unpublished document must still have its length derived from its single \
          range — refusing here would break every legitimately defaulted document. \
          ranges={:?}",
-        after.ranges
-    );
-}
-
-/// SITE 2 — `HybridMetadataWriter::add_or_update_range`, via `write_range_metadata_witnessed` with
-/// the `WriteMode::Hybrid` that the orphan sweep's `add_range_to_metadata` passes.
-///
-/// This site's ONLY production route is that sweep, which already declines a range a
-/// published `content_length` cannot contain, so this is defence in depth rather than a live
-/// hole. It is asserted anyway because the two copies of this logic drifted once already —
-/// one guarded, one not — which is what the shared predicate exists to prevent.
-#[tokio::test]
-async fn the_writer_does_not_derive_a_length_for_a_published_empty_object() {
-    let temp = TempDir::new().unwrap();
-    let cache_dir = temp.path();
-    let cache_key = "guard-bucket/writer-empty-object";
-
-    let meta_path = write_meta(cache_dir, &published_empty_object(cache_key)).await;
-
-    let mut writer = HybridMetadataWriter::new(
-        cache_dir.to_path_buf(),
-        Arc::new(MetadataLockManager::new(
-            cache_dir.to_path_buf(),
-            Duration::from_secs(30),
-            3,
-        )),
-        Arc::new(JournalManager::new(
-            cache_dir.to_path_buf(),
-            "guard-test-instance".to_string(),
-        )),
-    );
-
-    let before = read_meta(&meta_path).await;
-    assert_eq!(
-        before.object_metadata.content_length, 0,
-        "precondition: the published document must record content_length 0"
-    );
-    assert_eq!(
-        before.object_metadata.etag, EMPTY_OBJECT_ETAG,
-        "precondition: the published document must carry the empty object's ETag"
-    );
-
-    writer
-        .write_range_metadata_witnessed(
-            cache_key,
-            superseded_range(cache_dir, cache_key),
-            WriteMode::Hybrid,
-            None,
-            Duration::from_secs(3600),
-            None,
-        )
-        .await
-        .unwrap();
-
-    let after = read_meta(&meta_path).await;
-    assert_eq!(
-        after.ranges.len(),
-        1,
-        "fixture: the range must have been added, or the derivation was never reached \
-         and the assertion below is vacuous. ranges={:?}",
-        after.ranges
-    );
-    assert_eq!(
-        after.ranges[0].start, 0,
-        "fixture: the range must start at 0"
-    );
-    assert_eq!(
-        after.object_metadata.content_length, 0,
-        "the writer derived content_length={} from range 0-{} for a document that had \
-         already published content_length 0 under the empty object's ETag {}.",
-        after.object_metadata.content_length, after.ranges[0].end, after.object_metadata.etag
-    );
-    assert_eq!(
-        after.object_metadata.etag, EMPTY_OBJECT_ETAG,
-        "the published ETag must be left alone"
-    );
-}
-
-/// POSITIVE CONTROL for site 2, same distinct signature as site 1's control.
-#[tokio::test]
-async fn the_writer_still_derives_a_length_for_an_unpublished_document() {
-    let temp = TempDir::new().unwrap();
-    let cache_dir = temp.path();
-    let cache_key = "guard-bucket/writer-unpublished-object";
-
-    let mut writer = HybridMetadataWriter::new(
-        cache_dir.to_path_buf(),
-        Arc::new(MetadataLockManager::new(
-            cache_dir.to_path_buf(),
-            Duration::from_secs(30),
-            3,
-        )),
-        Arc::new(JournalManager::new(
-            cache_dir.to_path_buf(),
-            "guard-test-instance".to_string(),
-        )),
-    );
-
-    // No `.meta` at all, so `load_or_create_metadata` builds one from
-    // `ObjectMetadata::default()` — the unpublished case, reached here through the same
-    // production call the sweep makes.
-    writer
-        .write_range_metadata_witnessed(
-            cache_key,
-            superseded_range(cache_dir, cache_key),
-            WriteMode::Hybrid,
-            None,
-            Duration::from_secs(3600),
-            None,
-        )
-        .await
-        .unwrap();
-
-    let base = cache_dir.join("metadata");
-    let meta_path = crate::disk_cache::get_sharded_path(&base, cache_key, ".meta").unwrap();
-    let after = read_meta(&meta_path).await;
-    assert!(
-        after.object_metadata.etag.is_empty(),
-        "precondition: a freshly created document must carry no published identity"
-    );
-    assert_eq!(
-        after.object_metadata.content_length, SUPERSEDED_LEN,
-        "a document with no published identity must still have its length derived from \
-         its single full-object range. ranges={:?}",
         after.ranges
     );
 }

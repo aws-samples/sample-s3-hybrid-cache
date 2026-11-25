@@ -450,12 +450,14 @@ impl Fixture {
                 parts_count: None,
                 part_ranges: HashMap::new(),
                 part_layout_verified: false,
+                part_layout_marked: Default::default(),
                 upload_id: None,
                 is_write_cached,
                 write_cache_expires_at: write_cache_anchor.map(|t| t + Duration::from_secs(86400)),
                 write_cache_created_at: write_cache_anchor,
                 write_cache_last_accessed: write_cache_anchor,
                 graduation_accounted: false,
+                checksums_object_scoped: false,
             },
             ranges: range_specs,
             created_at,
@@ -466,6 +468,7 @@ impl Fixture {
             head_access_count: 0,
             head_cached_at: None,
             last_validated_at: None,
+            write_expired_at: None,
         };
 
         let meta_path = self.meta_path(cache_key);
@@ -1006,4 +1009,108 @@ pub fn assert_all_new(body: &[u8], expected_len: usize, context: &str) {
         expected_len,
         fill_summary(body)
     );
+}
+
+/// One version of an object as [`model_s3_responder`] holds it.
+#[derive(Clone)]
+pub struct OriginVersion {
+    pub etag: String,
+    pub last_modified: String,
+    pub body: Vec<u8>,
+}
+
+impl OriginVersion {
+    /// A version of `len` bytes whose byte at each offset depends on the offset and on
+    /// `seed`, so a window at the wrong offset, a prefix or another version's bytes all
+    /// compare unequal. Distinct from the fixture's single-byte cached fills.
+    pub fn patterned(etag: &str, len: u64, seed: u64) -> Self {
+        Self {
+            etag: etag.to_string(),
+            last_modified: "Fri, 20 Nov 2026 00:00:00 GMT".to_string(),
+            body: (0..len)
+                .map(|i| ((i.wrapping_mul(131) + seed.wrapping_mul(17) + i / 251) % 251) as u8)
+                .collect(),
+        }
+    }
+}
+
+/// S3's resolution of a `Range` value against a length: `Some(Some((start, end)))` for a
+/// satisfiable single byte range, `Some(None)` for an unsatisfiable one (`416`), and `None`
+/// for a value S3 ignores (it answers `200` with the whole object).
+pub fn s3_resolve_range(value: &str, len: u64) -> Option<Option<(u64, u64)>> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() {
+        let n: u64 = b.parse().ok()?;
+        if n == 0 || len == 0 {
+            return Some(None);
+        }
+        return Some(Some((len.saturating_sub(n), len - 1)));
+    }
+    let start: u64 = a.parse().ok()?;
+    let end: u64 = if b.is_empty() {
+        u64::MAX
+    } else {
+        b.parse().ok()?
+    };
+    if end < start {
+        return None;
+    }
+    if start >= len {
+        return Some(None);
+    }
+    Some(Some((start, end.min(len - 1))))
+}
+
+/// An origin that answers as S3 does for one current version: an `If-Match` naming another
+/// ETag is `412`, an `If-None-Match` naming this one is `304`, a `Range` is resolved
+/// against this version's length ([`s3_resolve_range`]) and answered `206` with a truthful
+/// `Content-Range`, or `416`, and a request with no `Range` is `200` with the whole body.
+pub fn model_s3_responder(
+    version: OriginVersion,
+) -> impl Fn(&s3_proxy::S3RequestContext) -> Option<super::StubResponse> + Send + Sync + 'static {
+    move |context| {
+        let header = |name: &str| {
+            context
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        let same = |v: &str| v.trim_matches('"') == version.etag.trim_matches('"');
+        if let Some(if_match) = header("if-match") {
+            if !same(&if_match) {
+                return Some(super::StubResponse::with_status(
+                    StatusCode::PRECONDITION_FAILED,
+                ));
+            }
+        }
+        if let Some(inm) = header("if-none-match") {
+            if same(&inm) {
+                return Some(super::StubResponse::not_modified_with_etag(&version.etag));
+            }
+        }
+        let len = version.body.len() as u64;
+        let base = |status: StatusCode| {
+            super::StubResponse::with_status(status)
+                .with_header("etag", &version.etag)
+                .with_header("last-modified", &version.last_modified)
+                .with_header("accept-ranges", "bytes")
+        };
+        let resolved = header("range").and_then(|v| s3_resolve_range(&v, len));
+        Some(match resolved {
+            None => base(StatusCode::OK).with_body(Bytes::from(version.body.clone())),
+            Some(None) => super::StubResponse::with_status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .with_header("content-range", format!("bytes */{}", len)),
+            Some(Some((start, end))) => base(StatusCode::PARTIAL_CONTENT)
+                .with_header("content-range", format!("bytes {}-{}/{}", start, end, len))
+                .with_body(Bytes::from(
+                    version.body[start as usize..=end as usize].to_vec(),
+                )),
+        })
+    }
 }

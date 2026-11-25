@@ -327,7 +327,7 @@ async fn test_put_overwrite_then_get() -> Result<()> {
     let metadata_v2 = create_test_metadata("etag-v2", data_v2.len() as u64);
 
     // Invalidate old cache entry (simulating what happens in real PUT)
-    cache_manager.invalidate_cache(cache_key).await?;
+    cache_manager.invalidate_cache_hierarchy(cache_key).await?;
 
     store_write_cache_entry_unified(&cache_manager, cache_key, data_v2, &metadata_v2).await?;
 

@@ -43,6 +43,15 @@ pub const AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/2026010
 /// Bound on one request or one wait for a fill to land.
 pub const STEP: Duration = Duration::from_secs(20);
 
+/// S3's `500 InternalError` document: a request S3 may or may not have processed.
+pub const INTERNAL_ERROR: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message><RequestId>4442587FB7D0A2F9</RequestId></Error>";
+
+/// S3's `503 SlowDown` document: a request S3 refused for its rate.
+pub const SLOW_DOWN: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message><RequestId>4442587FB7D0A2FA</RequestId></Error>";
+
+/// A `5xx` body with no error code in it.
+pub const NO_CODE: &str = "upstream failure";
+
 /// Position-dependent bytes: `* 3` is injective modulo 256, so no two offsets in one period
 /// carry the same byte and a window read from the wrong offset cannot equal the window asked
 /// for.
@@ -65,7 +74,25 @@ struct MockState {
     hits: HashMap<String, usize>,
     /// The ETag every response carries, when set; otherwise [`etag_of`] the request path.
     etag: Option<String>,
+    /// Answer `x-amz-te: append-md5` with a trailer that is not the MD5 of the bytes before it.
+    corrupt_trailer: bool,
+    /// The status and body every request other than GET and HEAD is answered with; `None`
+    /// answers them `501`.
+    write_reply: Option<(u16, String)>,
+    /// Every request other than GET and HEAD that reached the origin: method and path.
+    writes: Vec<(String, String)>,
+    /// Answer a GET or HEAD whose `If-None-Match` names the current ETag `304`.
+    honour_if_none_match: bool,
+    /// The `If-None-Match` of each GET and HEAD that reached the origin, per path, in order
+    /// (`None` for a request without one).
+    if_none_match: HashMap<String, Vec<Option<String>>>,
+    /// Answer CreateMultipartUpload with upload ID [`UPLOAD_ID`] and UploadPart `200` with ETag
+    /// `"part-etag-N"`, ahead of `write_reply`.
+    stage_uploads: bool,
 }
+
+/// The upload ID the origin gives every CreateMultipartUpload while it stages uploads.
+pub const UPLOAD_ID: &str = "upload-1";
 
 /// The origin. Clone shares state.
 #[derive(Clone, Default)]
@@ -115,14 +142,59 @@ impl MockOrigin {
         self.state.lock().unwrap().etag = Some(etag.to_string());
     }
 
+    /// Send a wrong MD5 as the `append-md5` trailer from now on.
+    pub fn set_corrupt_trailer(&self, on: bool) {
+        self.state.lock().unwrap().corrupt_trailer = on;
+    }
+
     /// GET and HEAD requests that reached the origin for `raw_path`.
     pub fn hits(&self, raw_path: &str) -> usize {
         *self.state.lock().unwrap().hits.get(raw_path).unwrap_or(&0)
     }
 
+    /// Answer every request other than GET and HEAD with `status` and `body` from now on
+    /// (`None` restores `501`). The object is not changed: a test that wants the write applied
+    /// changes it itself.
+    pub fn set_write_reply(&self, reply: Option<(u16, &str)>) {
+        self.state.lock().unwrap().write_reply = reply.map(|(s, b)| (s, b.to_string()));
+    }
+
+    /// Requests other than GET and HEAD that reached the origin, as `(method, path)`.
+    pub fn writes(&self) -> Vec<(String, String)> {
+        self.state.lock().unwrap().writes.clone()
+    }
+
+    /// Answer a GET or HEAD whose `If-None-Match` names the current ETag `304`, from now on.
+    pub fn set_honour_if_none_match(&self, on: bool) {
+        self.state.lock().unwrap().honour_if_none_match = on;
+    }
+
+    /// The `If-None-Match` of each GET and HEAD that reached the origin for `raw_path`.
+    pub fn if_none_match(&self, raw_path: &str) -> Vec<Option<String>> {
+        self.state
+            .lock()
+            .unwrap()
+            .if_none_match
+            .get(raw_path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Remove `raw_path`, so a GET or HEAD of it is answered `404 NoSuchKey`.
+    pub fn remove(&self, raw_path: &str) {
+        self.state.lock().unwrap().objects.remove(raw_path);
+    }
+
+    /// Answer CreateMultipartUpload and UploadPart from now on, so a client can stage an upload
+    /// (see `MockState::stage_uploads`).
+    pub fn set_stage_uploads(&self, on: bool) {
+        self.state.lock().unwrap().stage_uploads = on;
+    }
+
     async fn handle(self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
         let part_number = req.uri().query().and_then(|q| {
             q.split('&')
                 .find_map(|p| p.strip_prefix("partNumber=")?.parse::<usize>().ok())
@@ -132,19 +204,74 @@ impl MockOrigin {
             .get("range")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let header_is = |name: &str, value: &str| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case(value))
+        };
+        let append_md5 = header_is("x-amz-te", "append-md5");
+        let checksum_mode = header_is("x-amz-checksum-mode", "ENABLED");
+        let if_none_match = req
+            .headers()
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let _body = req.into_body().collect().await?.to_bytes();
         if method != Method::GET && method != Method::HEAD {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_IMPLEMENTED)
-                .body(Full::new(Bytes::new()))
-                .unwrap());
+            let (reply, stage_uploads) = {
+                let mut st = self.state.lock().unwrap();
+                st.writes.push((method.to_string(), path.clone()));
+                (st.write_reply.clone(), st.stage_uploads)
+            };
+            let has = |name: &str| query.split('&').any(|p| p.split('=').next() == Some(name));
+            if stage_uploads && method == Method::POST && has("uploads") {
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>{}</Key><UploadId>{UPLOAD_ID}</UploadId></InitiateMultipartUploadResult>",
+                    path.trim_start_matches("/bucket/")
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/xml")
+                    .header("content-length", xml.len().to_string())
+                    .body(Full::new(Bytes::from(xml)))
+                    .unwrap());
+            }
+            if stage_uploads && method == Method::PUT && has("uploadId") {
+                if let Some(n) = part_number {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("etag", format!("\"part-etag-{n}\""))
+                        .header("content-length", "0")
+                        .body(Full::new(Bytes::new()))
+                        .unwrap());
+                }
+            }
+            return Ok(match reply {
+                Some((status, body)) => Response::builder()
+                    .status(status)
+                    .header("content-type", "application/xml")
+                    .header("content-length", body.len().to_string())
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::NOT_IMPLEMENTED)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            });
         }
-        let (data, etag) = {
+        let (data, etag, corrupt_trailer, honour_if_none_match) = {
             let mut st = self.state.lock().unwrap();
             *st.hits.entry(path.clone()).or_insert(0) += 1;
+            st.if_none_match
+                .entry(path.clone())
+                .or_default()
+                .push(if_none_match.clone());
             (
                 st.objects.get(&path).cloned(),
                 st.etag.clone().unwrap_or_else(|| etag_of(&path)),
+                st.corrupt_trailer,
+                st.honour_if_none_match,
             )
         };
         let Some(data) = data else {
@@ -156,6 +283,14 @@ impl MockOrigin {
                 .body(Full::new(Bytes::from_static(xml.as_bytes())))
                 .unwrap());
         };
+        if honour_if_none_match && if_none_match.as_deref() == Some(etag.as_str()) {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("etag", etag)
+                .header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+                .body(Full::new(Bytes::new()))
+                .unwrap());
+        }
         let total = data.len();
         let half = total / 2;
         let range = match part_number {
@@ -181,6 +316,24 @@ impl MockOrigin {
             },
             None => (StatusCode::OK, data.clone(), None),
         };
+        // S3's answer to `x-amz-te: append-md5` on a GET, as measured in eu-central-1 on
+        // 2026-11-14: the body followed by the MD5 of that body, `Content-Length`
+        // covering both, and `x-amz-transfer-encoding: append-md5`. A ranged or `partNumber`
+        // request is answered `200`, with no `Content-Range` and the slice in
+        // `x-amz-content-range`. HEAD ignores the header.
+        let (status, body, content_range, amz_content_range) =
+            if append_md5 && method == Method::GET {
+                use md5::Digest;
+                let mut digest = md5::Md5::digest(&body).to_vec();
+                if corrupt_trailer {
+                    digest[15] ^= 0xff;
+                }
+                let mut wire = body.to_vec();
+                wire.extend_from_slice(&digest);
+                (StatusCode::OK, Bytes::from(wire), None, content_range)
+            } else {
+                (status, body, content_range, None)
+            };
         let mut builder = Response::builder()
             .status(status)
             .header("content-length", body.len().to_string())
@@ -191,8 +344,29 @@ impl MockOrigin {
         if let Some(cr) = content_range {
             builder = builder.header("content-range", cr);
         }
+        if let Some(cr) = amz_content_range {
+            builder = builder.header("x-amz-content-range", cr);
+        }
+        if append_md5 && method == Method::GET {
+            builder = builder.header("x-amz-transfer-encoding", "append-md5");
+        }
         if part_number.is_some() {
             builder = builder.header("x-amz-mp-parts-count", "2");
+        }
+        // Checksum mode, measured the same day: a whole-object GET carries the object's composite checksum,
+        // which for this two-part object ends `-2`; a part GET carries that part's checksum,
+        // with no suffix; a ranged GET carries none.
+        if checksum_mode && method == Method::GET {
+            let value = match part_number {
+                Some(n) => Some(format!("part{n}-crc32==")),
+                None if range.is_none() => Some("whole-crc32==-2".to_string()),
+                None => None,
+            };
+            if let Some(value) = value {
+                builder = builder
+                    .header("x-amz-checksum-crc32", value)
+                    .header("x-amz-checksum-type", "COMPOSITE");
+            }
         }
         let body = if method == Method::HEAD {
             Bytes::new()
@@ -240,6 +414,8 @@ pub struct RigOptions {
     pub get_ttl: Duration,
     /// Enable the RAM cache tier.
     pub ram_cache: bool,
+    /// `cache.write_cache_enabled`.
+    pub write_cache: bool,
 }
 
 impl Default for RigOptions {
@@ -249,6 +425,7 @@ impl Default for RigOptions {
             compression: true,
             get_ttl: Duration::from_secs(3600),
             ram_cache: false,
+            write_cache: true,
         }
     }
 }
@@ -262,6 +439,8 @@ pub struct Rig {
     pub disk: Arc<tokio::sync::RwLock<DiskCacheManager>>,
     pub cache_manager: Arc<CacheManager>,
     pub range_handler: Arc<RangeHandler>,
+    /// The proxy's metrics manager (cache-bypass counters and the like).
+    pub metrics: Arc<tokio::sync::RwLock<s3_proxy::metrics::MetricsManager>>,
     consolidate: bool,
     _mock_shutdown: oneshot::Sender<()>,
     _proxy_shutdown: oneshot::Sender<()>,
@@ -277,7 +456,7 @@ impl Rig {
         let mut config = Config::default();
         config.cache.cache_dir = dir.path().to_path_buf();
         config.cache.ram_cache_enabled = options.ram_cache;
-        config.cache.write_cache_enabled = true;
+        config.cache.write_cache_enabled = options.write_cache;
         config.cache.read_cache_enabled = true;
         config.cache.download_coordination.enabled = false;
         config.cache.get_ttl = options.get_ttl;
@@ -353,6 +532,10 @@ impl Rig {
         let (proxy_shutdown, mut rx) = oneshot::channel::<()>();
         let serve_cache_manager = Arc::clone(&cache_manager);
         let serve_range_handler = Arc::clone(&range_handler);
+        let metrics = Arc::new(tokio::sync::RwLock::new(
+            s3_proxy::metrics::MetricsManager::new(),
+        ));
+        let serve_metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -364,6 +547,7 @@ impl Rig {
                         let s3_client = Arc::clone(&s3_client);
                         let inflight_tracker = Arc::clone(&inflight_tracker);
                         let request_semaphore = Arc::clone(&request_semaphore);
+                        let metrics = Arc::clone(&serve_metrics);
                         tokio::spawn(async move {
                             let service = service_fn(move |req: Request<Incoming>| {
                                 let config = Arc::clone(&config);
@@ -373,10 +557,11 @@ impl Rig {
                                 let inflight_tracker = Arc::clone(&inflight_tracker);
                                 let request_semaphore = Arc::clone(&request_semaphore);
                                 let inflight_ledger = s3_client.get_inflight_ledger();
+                                let metrics = Arc::clone(&metrics);
                                 async move {
                                     HttpProxy::handle_request(
                                         req, peer, config, cache_manager, s3_client, range_handler,
-                                        request_semaphore, None, None, inflight_tracker, None,
+                                        request_semaphore, Some(metrics), None, inflight_tracker, None,
                                         None, None, inflight_ledger,
                                     )
                                     .await
@@ -399,6 +584,7 @@ impl Rig {
             disk,
             cache_manager,
             range_handler,
+            metrics,
             consolidate: options.consolidate,
             _mock_shutdown: mock_shutdown,
             _proxy_shutdown: proxy_shutdown,
@@ -412,6 +598,18 @@ impl Rig {
         path_and_query: &str,
         headers: &[(&str, String)],
     ) -> (StatusCode, Bytes) {
+        self.send_body(method, path_and_query, headers, Bytes::new())
+            .await
+    }
+
+    /// [`Self::send`] with a request body.
+    pub async fn send_body(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        headers: &[(&str, String)],
+        body: Bytes,
+    ) -> (StatusCode, Bytes) {
         let fut = async {
             let stream = TcpStream::connect(self.proxy).await.expect("connect");
             let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -424,12 +622,12 @@ impl Rig {
                 .method(method)
                 .uri(path_and_query)
                 .header("host", self.mock_host.as_str())
-                .header("content-length", "0");
+                .header("content-length", body.len().to_string());
             for (k, v) in headers {
                 builder = builder.header(*k, v.as_str());
             }
             let resp = sender
-                .send_request(builder.body(Full::new(Bytes::new())).unwrap())
+                .send_request(builder.body(Full::new(body)).unwrap())
                 .await
                 .expect("proxy request");
             let status = resp.status();
@@ -451,6 +649,36 @@ impl Rig {
     /// The cache key the proxy files `raw_path` under.
     pub fn cache_key(raw_path: &str) -> String {
         CacheManager::generate_cache_key(raw_path, None)
+    }
+
+    /// Put `len` bytes at `raw_path` on the origin and cache the whole object through a signed
+    /// GET, waiting for its `.meta`. Returns the bytes.
+    pub async fn seed_object(&self, raw_path: &str, len: usize) -> Bytes {
+        let data = self.mock.put(raw_path, len);
+        let (status, body) = self.get(raw_path, &[]).await;
+        assert_eq!(status, StatusCode::OK, "seeding {raw_path}");
+        assert_eq!(body, data, "seeding {raw_path}");
+        self.wait_meta(raw_path).await;
+        data
+    }
+
+    /// The key's `.meta` as it is on disk, or `None`.
+    pub async fn entry(&self, raw_path: &str) -> Option<s3_proxy::cache_types::NewCacheMetadata> {
+        self.cache_manager
+            .get_metadata_from_disk(&Self::cache_key(raw_path))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// The contents of the key's write-order marker (`.wtok`), or `None`.
+    pub async fn marker(&self, raw_path: &str) -> Option<String> {
+        let meta = self
+            .disk
+            .read()
+            .await
+            .get_new_metadata_file_path(&Self::cache_key(raw_path));
+        std::fs::read_to_string(meta.with_extension("wtok")).ok()
     }
 
     /// Make `raw_path` hold `start..=end` in the cache: a ranged GET that misses, forwarded to
@@ -495,6 +723,23 @@ impl Rig {
                 tokio::time::Instant::now() < until,
                 "no .meta for {raw_path} within {STEP:?}"
             );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait until the key's `.meta` satisfies `done`, or fail naming `what`.
+    pub async fn wait_entry(
+        &self,
+        raw_path: &str,
+        what: &str,
+        done: impl Fn(Option<&s3_proxy::cache_types::NewCacheMetadata>) -> bool,
+    ) {
+        let until = tokio::time::Instant::now() + STEP;
+        loop {
+            if done(self.entry(raw_path).await.as_ref()) {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < until, "{raw_path}: {what}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }

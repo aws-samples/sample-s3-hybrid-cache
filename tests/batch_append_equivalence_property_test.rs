@@ -27,14 +27,13 @@ struct ArbitraryJournalEntry(JournalEntry);
 
 impl Arbitrary for ArbitraryJournalEntry {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate operation type (0-4)
-        let op_seed = u8::arbitrary(g) % 5;
+        // Generate operation type (0-3)
+        let op_seed = u8::arbitrary(g) % 4;
         let operation = match op_seed {
             0 => JournalOperation::Add,
-            1 => JournalOperation::Update,
-            2 => JournalOperation::Remove,
-            3 => JournalOperation::TtlRefresh,
-            4 => JournalOperation::AccessUpdate,
+            1 => JournalOperation::Remove,
+            2 => JournalOperation::TtlRefresh,
+            3 => JournalOperation::AccessUpdate,
             _ => unreachable!(),
         };
 

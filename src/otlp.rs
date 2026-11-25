@@ -254,6 +254,8 @@ struct Instruments {
     cache_st_size_folds_declined_overlap_total: Gauge<u64>,
     cache_st_size_fold_last_duration_secs: Gauge<u64>,
     cache_st_size_fold_oldest_shard_scan_age_secs: Gauge<u64>,
+    cache_shard_sum_bytes: Gauge<u64>,
+    cache_shard_sum_drift_bytes: Gauge<i64>,
     // -- eviction: the Tail_Partition mechanism, build side --
     //
     // `tail_floor_bytes` is always 0: the floor is deprecated and has no effect. Kept so a
@@ -970,6 +972,8 @@ impl OtlpExporter {
             cache_st_size_fold_oldest_shard_scan_age_secs: g_u64!(
                 "cache.st_size_fold_oldest_shard_scan_age_secs"
             ),
+            cache_shard_sum_bytes: g_u64!("cache.shard_sum_bytes"),
+            cache_shard_sum_drift_bytes: g_i64!("cache.shard_sum_drift_bytes"),
             // eviction: Tail_Partition, build side
             cache_tail_floor_bytes: g_u64!("cache.tail_floor_bytes"),
             cache_tail_max_entries: g_u64!("cache.tail_max_entries"),
@@ -2016,6 +2020,14 @@ impl OtlpExporter {
             // that is the opposite of healthy.
             if let Some(v) = c.st_size_fold.st_size_fold_oldest_shard_scan_age_secs {
                 i.cache_st_size_fold_oldest_shard_scan_age_secs.record(v, a);
+            }
+            // Skipped when unknown, not zeroed: `null` is an incomplete shard set, and a zero
+            // sum or a zero drift would read as a converged, empty cache.
+            if let Some(v) = c.st_size_fold.shard_sum_bytes {
+                i.cache_shard_sum_bytes.record(v, a);
+            }
+            if let Some(v) = c.st_size_fold.shard_sum_drift_bytes {
+                i.cache_shard_sum_drift_bytes.record(v, a);
             }
 
             // eviction: Tail_Partition, build side. The floor and the cap are the values in force
@@ -3396,6 +3408,8 @@ mod tests {
                 )),
                 st_size_fold: crate::st_size_fold::StSizeFoldGauges {
                     st_size_fold_oldest_shard_scan_age_secs: Some(30),
+                    shard_sum_bytes: Some(4096),
+                    shard_sum_drift_bytes: Some(-64),
                     ..Default::default()
                 },
                 tail_partition: crate::cache_size_tracker::TailPartitionGauges {

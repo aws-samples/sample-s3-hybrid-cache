@@ -252,6 +252,16 @@ impl BufferedResponse {
         self.parts.status
     }
 
+    /// S3's `<Code>` in this response's body, when the status is a `5xx` and the code can be
+    /// read ([`s3_error_code`]).
+    pub(crate) fn s3_server_error_code(&self) -> Option<String> {
+        if self.parts.status.is_server_error() {
+            s3_error_code(&self.body)
+        } else {
+            None
+        }
+    }
+
     /// The head, the body, and the reservation, for a caller that reads the body
     /// and then answers with [`Self::respond`].
     pub(crate) fn into_parts(
@@ -272,10 +282,17 @@ impl BufferedResponse {
     }
 
     pub(crate) fn respond(
-        parts: hyper::http::response::Parts,
+        mut parts: hyper::http::response::Parts,
         body: Bytes,
         reservation: crate::inflight_ledger::Reservation,
     ) -> Response<BoxBody<Bytes, hyper::Error>> {
+        // Every response built here is S3's own answer, so a `5xx` is marked as S3's and
+        // carries its error code for [`write_effect`]. A `5xx` the proxy builds has no mark.
+        if parts.status.is_server_error() {
+            parts.extensions.insert(S3ServerError {
+                code: s3_error_code(&body),
+            });
+        }
         let body =
             crate::permit_body::PermitBody::new(crate::permit_body::ChunkedBytes::new(body), None)
                 .with_reservation(reservation);
@@ -456,6 +473,90 @@ pub(crate) fn write_outcome_unknown(e: &ProxyError) -> bool {
 /// response rather than the error.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WriteOutcomeUnknown;
+
+/// Response extension on a `5xx` that S3 itself sent: the S3-origin marker, with S3's error
+/// code when its body could be read. Set by [`BufferedResponse::respond`], which builds every
+/// client response from an upstream answer to a signed write; a `502`, `503` or `504` the
+/// proxy builds never carries it.
+#[derive(Clone, Debug)]
+pub(crate) struct S3ServerError {
+    pub(crate) code: Option<String>,
+}
+
+/// The most body bytes [`s3_error_code`] scans for `<Code>`. S3's error documents are well
+/// under 1 KiB; a code past this is reported as unreadable.
+pub(crate) const S3_ERROR_CODE_SCAN_BOUND: usize = 16 * 1024;
+
+/// S3's error code in an error document: the text of the first `<Code>` element within the
+/// first [`S3_ERROR_CODE_SCAN_BOUND`] bytes. `None` when there is none or it is empty: an
+/// unreadable code.
+pub(crate) fn s3_error_code(body: &[u8]) -> Option<String> {
+    let scanned = &body[..body.len().min(S3_ERROR_CODE_SCAN_BOUND)];
+    let text = String::from_utf8_lossy(scanned);
+    let start = text.find("<Code>")? + "<Code>".len();
+    let end = start + text[start..].find("</Code>")?;
+    let code = text[start..end].trim();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
+/// What a write's response says about whether S3 applied the write, which decides what the
+/// cache does with the key's entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteEffect {
+    /// S3 answered `2xx`, or the request was sent in full and no answer was read
+    /// ([`WriteOutcomeUnknown`]): the entry is invalidated.
+    Applied,
+    /// S3 answered a `5xx` that leaves the write possibly applied: `500 InternalError` to any
+    /// write, and any S3 `5xx` to a DELETE. The entry is kept, expired, so the next read
+    /// revalidates it.
+    MayHaveApplied,
+    /// Anything else: a `4xx`, an S3 `5xx` to a write other than DELETE whose code is
+    /// `SlowDown`, another throttling or unavailable code, or unreadable, and every `5xx` the
+    /// proxy built itself. The entry is left as it is.
+    NotApplied,
+}
+
+/// [`WriteEffect`] of an S3 `5xx` answer with error code `code`, to a DELETE when `delete`.
+/// S3 documents that a request answered `InternalError` may or may not have been processed.
+pub(crate) fn s3_server_error_effect(code: Option<&str>, delete: bool) -> WriteEffect {
+    if delete || code == Some("InternalError") {
+        WriteEffect::MayHaveApplied
+    } else {
+        WriteEffect::NotApplied
+    }
+}
+
+/// [`WriteEffect`] of `response`, the client response to a write (a DELETE when `delete`).
+pub(crate) fn write_effect(
+    response: &Response<BoxBody<Bytes, hyper::Error>>,
+    delete: bool,
+) -> WriteEffect {
+    if response.status().is_success()
+        || response.extensions().get::<WriteOutcomeUnknown>().is_some()
+    {
+        return WriteEffect::Applied;
+    }
+    match response.extensions().get::<S3ServerError>() {
+        Some(error) if response.status().is_server_error() => {
+            s3_server_error_effect(error.code.as_deref(), delete)
+        }
+        _ => WriteEffect::NotApplied,
+    }
+}
+
+/// [`write_effect`] of a forward's result: an `Err` is [`WriteEffect::Applied`] when the
+/// request was sent in full ([`write_outcome_unknown`]) and [`WriteEffect::NotApplied`]
+/// otherwise.
+pub(crate) fn write_effect_of(
+    forwarded: &Result<Response<BoxBody<Bytes, hyper::Error>>>,
+    delete: bool,
+) -> WriteEffect {
+    match forwarded {
+        Ok(response) => write_effect(response, delete),
+        Err(e) if write_outcome_unknown(e) => WriteEffect::Applied,
+        Err(_) => WriteEffect::NotApplied,
+    }
+}
 
 /// Map an upstream I/O error in `phase` to a `TimeoutError` naming the phase when
 /// the idle bound expired, and otherwise to the `HttpError` it always was.
@@ -5570,5 +5671,123 @@ mod signed_write_health_tests {
             !health.tracker.is_unhealthy(&refused.ip()),
             "a connect that succeeds clears the address's record"
         );
+    }
+}
+
+#[cfg(test)]
+mod write_effect_tests {
+    use super::*;
+
+    const INTERNAL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>";
+
+    /// A client response built from an upstream answer, as every signed write's is.
+    fn from_s3(status: u16, body: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+        let reservation = crate::inflight_ledger::Reservation::none();
+        let (parts, ()) = Response::builder()
+            .status(status)
+            .body(())
+            .unwrap()
+            .into_parts();
+        BufferedResponse::respond(parts, Bytes::from(body.to_string()), reservation)
+    }
+
+    /// A response the proxy built itself.
+    fn from_proxy(status: u16) -> Response<BoxBody<Bytes, hyper::Error>> {
+        Response::builder()
+            .status(status)
+            .body(
+                Full::new(Bytes::from_static(INTERNAL.as_bytes()))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn the_error_code_is_read_from_the_body() {
+        assert_eq!(
+            s3_error_code(INTERNAL.as_bytes()).as_deref(),
+            Some("InternalError")
+        );
+        assert_eq!(
+            s3_error_code(b"<Error><Code> SlowDown </Code></Error>").as_deref(),
+            Some("SlowDown")
+        );
+        assert_eq!(s3_error_code(b"upstream failure"), None);
+        assert_eq!(s3_error_code(b"<Error><Code></Code></Error>"), None);
+        assert_eq!(s3_error_code(b"<Error><Code>InternalError"), None);
+        let mut past_the_bound = vec![b' '; S3_ERROR_CODE_SCAN_BOUND];
+        past_the_bound.extend_from_slice(INTERNAL.as_bytes());
+        assert_eq!(s3_error_code(&past_the_bound), None);
+    }
+
+    #[test]
+    fn s3s_code_decides_a_writes_effect() {
+        let cases = [
+            (from_s3(500, INTERNAL), false, WriteEffect::MayHaveApplied),
+            (
+                from_s3(503, "<Error><Code>SlowDown</Code></Error>"),
+                false,
+                WriteEffect::NotApplied,
+            ),
+            (
+                from_s3(503, "<Error><Code>ServiceUnavailable</Code></Error>"),
+                false,
+                WriteEffect::NotApplied,
+            ),
+            (
+                from_s3(500, "upstream failure"),
+                false,
+                WriteEffect::NotApplied,
+            ),
+            (from_s3(200, ""), false, WriteEffect::Applied),
+            (
+                from_s3(403, "<Error><Code>AccessDenied</Code></Error>"),
+                false,
+                WriteEffect::NotApplied,
+            ),
+            // Any S3 5xx to a DELETE.
+            (
+                from_s3(503, "<Error><Code>SlowDown</Code></Error>"),
+                true,
+                WriteEffect::MayHaveApplied,
+            ),
+            (
+                from_s3(500, "upstream failure"),
+                true,
+                WriteEffect::MayHaveApplied,
+            ),
+            (
+                from_s3(403, "<Error><Code>AccessDenied</Code></Error>"),
+                true,
+                WriteEffect::NotApplied,
+            ),
+        ];
+        for (i, (response, delete, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(write_effect(&response, delete), expected, "case {i}");
+        }
+    }
+
+    #[test]
+    fn a_5xx_the_proxy_built_is_not_applied_whatever_its_body() {
+        for status in [500, 502, 503, 504] {
+            for delete in [false, true] {
+                assert_eq!(
+                    write_effect(&from_proxy(status), delete),
+                    WriteEffect::NotApplied,
+                    "{status}, delete {delete}"
+                );
+            }
+        }
+        let mut unknown = from_proxy(502);
+        unknown.extensions_mut().insert(WriteOutcomeUnknown);
+        assert_eq!(write_effect(&unknown, false), WriteEffect::Applied);
+    }
+
+    #[tokio::test]
+    async fn the_rebuilt_response_carries_s3s_body_unchanged() {
+        let response = from_s3(500, INTERNAL);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), INTERNAL.as_bytes());
     }
 }

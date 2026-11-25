@@ -150,6 +150,15 @@ mod r13_3_extremes {
 
         let m = manager(tmp.path(), total);
         seed_total(&m, total).await;
+        // The pass rebuilds the shards' partitions lazily before it selects, inside a wall-time
+        // budget checked between shards. On a loaded machine the default budget ran out part-way
+        // through this fixture's shards, and the selection then saw only the shards rebuilt so
+        // far. An hour is longer than any load makes the rebuild, so the verdict is the
+        // selection's alone.
+        s3_proxy::cache::set_lazy_tail_rebuild_budget_for_tests(
+            tmp.path(),
+            Duration::from_secs(3600),
+        );
         let need = bytes_to_free(total, total);
         assert!(need > SIZE, "fixture: the target must need several ranges");
 
@@ -207,6 +216,15 @@ mod r13_3_extremes {
 
         let m = manager(tmp.path(), total);
         seed_total(&m, total).await;
+        // The pass rebuilds the shards' partitions lazily before it selects, inside a wall-time
+        // budget checked between shards. On a loaded machine the default budget ran out part-way
+        // through this fixture's shards, and the selection then saw only the shards rebuilt so
+        // far. An hour is longer than any load makes the rebuild, so the verdict is the
+        // selection's alone.
+        s3_proxy::cache::set_lazy_tail_rebuild_budget_for_tests(
+            tmp.path(),
+            Duration::from_secs(3600),
+        );
         let need = bytes_to_free(total, total);
         assert!(
             need > background_total,

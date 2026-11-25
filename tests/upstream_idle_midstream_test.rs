@@ -5,6 +5,8 @@
 //! - Slow-but-steady transfer (bytes every < timeout) completes and caches.
 //! - Backpressure (slow cache writer) does NOT trigger idle abort.
 
+mod common;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use hyper::{Method, StatusCode};
@@ -37,7 +39,7 @@ impl CompleteResponseClient {
 
 #[async_trait]
 impl S3ClientApi for CompleteResponseClient {
-    async fn forward_request(&self, _context: S3RequestContext) -> Result<S3Response> {
+    async fn forward_request(&self, context: S3RequestContext) -> Result<S3Response> {
         let data = vec![0xCDu8; self.body_size];
         let mut headers = HashMap::new();
         headers.insert("content-length".to_string(), self.body_size.to_string());
@@ -50,7 +52,12 @@ impl S3ClientApi for CompleteResponseClient {
         Ok(S3Response {
             status: StatusCode::OK,
             headers,
-            body: Some(S3ResponseBody::Buffered(Bytes::from(data))),
+            body: Some(if context.allow_streaming {
+                // As `S3Client` answers a request that allows streaming.
+                S3ResponseBody::Streaming(common::loopback_incoming(Bytes::from(data)).await)
+            } else {
+                S3ResponseBody::Buffered(Bytes::from(data))
+            }),
             request_duration: Duration::from_millis(10),
         })
     }
@@ -198,8 +205,9 @@ async fn test_response_with_matching_length_cached() {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Give cache writer time to finalize
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The fill is written as the body streams: read it to the end, then wait for the fill.
+    let _ = http_body_util::BodyExt::collect(response.into_body()).await;
+    common::wait_for_fill(&cache_manager, "test-bucket/matching-length.bin").await;
 
     // The response should be cached
     let cache_dir = temp_dir.path();
@@ -249,8 +257,9 @@ async fn test_complete_response_cached() {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Give cache writer time to finalize
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The fill is written as the body streams: read it to the end, then wait for the fill.
+    let _ = http_body_util::BodyExt::collect(response.into_body()).await;
+    common::wait_for_fill(&cache_manager, "test-bucket/complete-object.bin").await;
 
     // The complete response should be cached (content-length matches body)
     let cache_dir = temp_dir.path();

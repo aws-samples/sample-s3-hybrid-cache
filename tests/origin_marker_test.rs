@@ -450,6 +450,7 @@ async fn s3_claimed_bucket() -> S3ClaimedBucket {
          request reaches the mismatch branch rather than the one under test: {}",
         marker
     );
+    common::wait_for_fill(&cache_manager, &expected_cache_key()).await;
     let (_s, headers, _b) = proxy_get(server.addr, S3_HOST, &object_path(), AUTH_A).await;
     assert_eq!(
         x_cache(&headers),
@@ -783,6 +784,7 @@ async fn a_second_origin_is_forwarded_and_never_served_the_first_origins_bytes()
         "the first request for an unclaimed bucket must claim the marker"
     );
 
+    common::wait_for_fill(&cache_manager, &expected_cache_key()).await;
     let (status, headers, body) = proxy_get(server.addr, ORIGIN_A, &object_path(), AUTH_A).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_ref(), BODY_A);
@@ -910,6 +912,7 @@ async fn a_mismatched_delete_does_not_invalidate_but_a_matching_one_does() {
     // Origin A caches the object.
     let (_s, _h, body) = proxy_get(server.addr, ORIGIN_A, &object_path(), AUTH_A).await;
     assert_eq!(body.as_ref(), BODY_A);
+    common::wait_for_fill(&cache_manager, &expected_cache_key()).await;
     let (_s, headers, _b) = proxy_get(server.addr, ORIGIN_A, &object_path(), AUTH_A).await;
     assert_eq!(
         x_cache(&headers),
@@ -1007,6 +1010,7 @@ async fn one_aws_bucket_reached_two_ways_does_not_bypass() {
     assert_eq!(body.as_ref(), BODY_A);
 
     // Virtual-hosted must be a HIT on the same entry.
+    common::wait_for_fill(&cache_manager, &expected_cache_key()).await;
     let (status, headers, body) = proxy_get(
         server.addr,
         &virtual_hosted_host,
@@ -1062,6 +1066,7 @@ async fn an_entry_cached_before_markers_existed_still_serves_and_the_bucket_is_c
     // cached entries present, no marker anywhere.
     let (_s, _h, body) = proxy_get(server.addr, ORIGIN_A, &object_path(), AUTH_A).await;
     assert_eq!(body.as_ref(), BODY_A);
+    common::wait_for_fill(&cache_manager, &expected_cache_key()).await;
     let files_before = cache_files(tmp.path());
     assert!(
         !files_before.is_empty(),
@@ -1149,6 +1154,7 @@ async fn an_unparseable_marker_bypasses_and_is_counted_apart() {
 
     // Cache the object first, so a bypass is distinguishable from having nothing to serve.
     let (_s, _h, _b) = proxy_get(server.addr, ORIGIN_A, &object_path(), AUTH_A).await;
+    common::wait_for_fill(&cache_manager, &expected_cache_key()).await;
     let (_s, headers, _b) = proxy_get(server.addr, ORIGIN_A, &object_path(), AUTH_A).await;
     assert_eq!(
         x_cache(&headers),
@@ -1634,6 +1640,7 @@ async fn the_claiming_origin_is_served_pre_existing_entries_it_did_not_write() {
     let (status, _h, body) = proxy_get(server.addr, ORIGIN_A, &object_path(), AUTH_A).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_ref(), BODY_A, "origin A must receive its own bytes");
+    common::wait_for_fill(&cache_manager, &expected_cache_key()).await;
     let files_after_a = cache_files(tmp.path());
     assert!(
         !files_after_a.is_empty(),

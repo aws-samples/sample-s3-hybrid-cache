@@ -11,6 +11,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every release up to and including 2.8.4 is in the [pre-3.0.0 changelog](changelog-pre-v3.md),
 which is closed. Look there for the history of any 0.x, 1.x or 2.x release.
 
+## [3.0.7] - 2026-11-25
+
+3.0.7 fixes several ways a client could receive the wrong bytes, including objects first read with the AWS SDK for Java 2.x. It keeps the write cache within `cache.write_cache_percent`, evicts staged uploads from many cache shards in parallel, and applies `wait_timeout_secs` to every request that waits on another request's fetch.
+
+**Upgrade impact:** Operators with AWS SDK for Java 2.x clients, `cache.download_coordination` settings or alerts on `/metrics`, or a fleet upgraded one proxy at a time, should read [Upgrading to 3.0.7](docs/UPGRADING.md#upgrading-to-307) before upgrading.
+
+### Fixed
+
+- Previously, in every release up to 3.0.6, an object first read with the AWS SDK for Java 2.x, which asks S3 to append a 16-byte MD5 trailer by default, was cached with the trailer. Other clients then read 16 extra bytes, or the wrong bytes from a suffix range, with no error. The proxy now caches the object's own bytes, checks the trailer against them, and fetches again on first read any entry an earlier release cached this way.
+- Previously, in every release up to 3.0.6, a Java SDK 2.x client reading such an entry could fail checksum validation on a ranged read, or get 16 extra bytes from the RAM cache. Cache hits no longer carry S3's trailer headers.
+- Previously, in every release up to 3.0.6, a `partNumber` read of an uncached object with the AWS SDK for Java 2.x was cached as the whole object, so later whole-object reads got one part. Parts are now cached at their own offsets, and each part an earlier release cached is fetched from S3 once on its first `partNumber` read, whatever `cache.trust_unverified_ranges` says.
+- Previously, in every release up to 3.0.6, after `partNumber` reads in checksum mode, whole-object reads failed checksum validation in boto3 and the AWS CLI, because the proxy cached a part's checksum as the object's. Part checksums are no longer cached, and an entry an earlier release cached is served without checksum headers when its stored checksum may be a part's.
+- Previously, in 1.14.0 to 3.0.6, after an overwrite that bypassed the proxies, a GET with no `Range` of a partly cached object could get `206` with the new version cut to the old length. In every release up to 3.0.6, an unsigned ranged GET, such as one from a presigned URL, could likewise get a range clamped to the old length. Once S3 shows the cached version has changed, the proxy now sends S3 the client's own request.
+- Previously, in every release up to 3.0.6, a range of an object's old version cached while a GET or HEAD learned that S3 held a newer version, or none, could be served until `get_ttl`. The proxy now records the change on the cache volume before it answers, so no proxy publishes or serves such a range, and a `404` removes every cached range of the object.
+- Previously, in every release up to 3.0.6, a range or part read waiting on another request's fetch kept the old cached entry, a cache hit until `get_ttl`, when S3's answer showed a newer version. It now removes the entry.
+- Previously, in 3.0.0 to 3.0.6, when the cache volume refused to delete a cached file with an error other than file-not-found, proxies could keep serving an overwritten, deleted or changed object's previous version. The proxy now marks what it could not delete as never to be served, and the proxy that handled the change retries the removal and sends the key to S3 until it lands.
+- Previously, in 3.0.1 to 3.0.6 with `cache.trust_unverified_ranges: true`, and in 3.0.0, consolidation could replace a range the proxy had stopped serving with one a 2.x release had recorded. The proxy then served another version's bytes under this object's headers. Such a range is now never replaced.
+- Previously, in 3.0.5 and 3.0.6, a HEAD could return the previous version's ETag, length and Last-Modified for up to `head_ttl` after the proxy found the cached version out of date. That happened when a range file could not be deleted, or in 3.0.6 when consolidation met a range of another version. The next HEAD now asks S3.
+- Previously, in 3.0.6, an upload declined for space near `cache.max_cache_size` started read cache eviction even when the write cache had no room for it. Such an upload now starts no eviction and is forwarded to S3 uncached; read fills are unchanged.
+- Previously, in 3.0.4 to 3.0.6, the proxy could log that the staged figure was unknown with no fault present. That happened after one failed recomputation on an idle proxy, or on a new cache volume before its first shard checkpoints. It now logs this only after two recomputations in a row fail and the figure has been unknown for 60 seconds, or 15 minutes on a new volume.
+
+### Changed
+
+- Write cache eviction runs one pass across cache shards at once, up to 32 objects at a time, removing the oldest staged objects first within each shard in proportion to its staged bytes. The pass no longer compacts the whole record of staged objects, so the `Write-ledger compacted` log line is gone. See [Write cache reclamation](docs/EVICTION.md#write-cache-reclamation).
+- The write cache stays within `cache.write_cache_percent` of `cache.max_cache_size`: once staged uploads reach it, new uploads go straight to S3 until write cache eviction frees room, counting them as `staging_bound` in `signed_put.skipped_puts_total`. Uploads are never refused or delayed. See [Uploads past the bound](docs/EVICTION.md#uploads-past-the-bound).
+- Every part of a multipart upload whose `CreateMultipartUpload` was not cached is forwarded to S3 without being staged.
+- Every request waiting on another request's fetch of the same object, range, part or page waits one `cache.download_coordination.wait_timeout_secs` (default `30`), then fetches from S3 itself. `cache.download_coordination.max_waiter_resubscriptions` is deprecated and has no effect, and a configuration that sets it to anything but `3` logs a warning at startup.
+- `cache.actively_remove_cached_data` is deprecated, and a configuration that sets it to `true` logs a warning at startup. It already had no effect, so delete the field.
+- A write that S3 answers `500 InternalError`, and a DELETE or DeleteObjects that S3 answers with any `5xx`, now expire the cached entries, so the next GET or HEAD revalidates them with S3. DeleteObjects keys that S3 reports with `InternalError` are expired too. Form POST uploads, which invalidated on any `5xx`, follow the write rule, and other `5xx` answers to a write, such as `503 SlowDown`, leave the entry as it is.
+- `metadata_heal_overwrite_total` also counts an unparseable `.meta` that a GET's range fill removes so that its journal record can rebuild the document.
+- [Memory impact](docs/CONFIGURATION.md#memory-impact) now gives the measured memory a cache miss holds while its cache write runs slower than S3: about 46 MiB at the default `cache.compression_batch_size`.
+- [AWS deployment](docs/AWS_DEPLOYMENT.md#dns-route-53-private-hosted-zones) now describes Route 53 AZ-affinity routing for the proxy name and for the zones that resolve S3's hostnames, following the [Route 53 AZ-affinity announcement](https://aws.amazon.com/about-aws/whats-new/2026/11/route-53-affinity-routing/).
+- Updated `url` to 2.5.9 and `form_urlencoded` to 1.2.3 (RUSTSEC-2026-0592).
+
+### Added
+
+- `cache.shard_sum_bytes` and `cache.shard_sum_drift_bytes`, on `/metrics` and OTLP, report the sum of the per-shard byte aggregates and that sum minus the persisted range-file total. Both are `null` unless every shard has a figure, and nothing reads them yet: they show whether the two figures converge.
+- `signed_put.skipped_puts_total` gains the key `staging_bound`, and `cache.cache_bypasses_by_reason` gains `metadata_unreadable`, for a GET forwarded uncached because its `.meta` could not be read.
+
 ## [3.0.6] - 2026-11-16
 
 3.0.6 lets a cache near `max_cache_size` evict to make room for an object it declined, and keeps each eviction pass's metadata reads within a bound set by configuration. It keeps an unread upload cached past `put_ttl` until its next read revalidates it, and fixes several upstream timeout, retry and tunnel cases.

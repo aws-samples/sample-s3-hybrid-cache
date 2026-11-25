@@ -281,6 +281,7 @@ async fn a_streamed_disk_hit_read_to_the_end_promotes_to_ram() {
     let (status, _, len) = full_request(server.addr, None).await;
     assert!(status.is_success(), "warm GET: {status}");
     assert_eq!(len, OBJECT_SIZE);
+    common::wait_for_fill(&cache_manager, CACHE_KEY).await;
     let whole = format!("bytes=0-{}", OBJECT_SIZE - 1);
     let mut cached = false;
     for _ in 0..100 {

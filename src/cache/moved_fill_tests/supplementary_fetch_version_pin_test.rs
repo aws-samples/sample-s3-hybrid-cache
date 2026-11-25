@@ -340,12 +340,14 @@ async fn seed_v1_extent_of(
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         },
         ranges: vec![RangeSpec {
             start,
@@ -372,6 +374,7 @@ async fn seed_v1_extent_of(
         head_access_count: 0,
         head_cached_at: None,
         last_validated_at: None,
+        write_expired_at: None,
     };
     let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
     std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();

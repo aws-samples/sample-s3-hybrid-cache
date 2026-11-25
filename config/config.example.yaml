@@ -28,8 +28,9 @@ server:
   # longer.
   # A streamed cache hit whose client reads slowly holds about 3.9 MiB (measured): 512 KiB
   # chunks in a queue of four, plus hyper's write queue. A cache miss whose client reads
-  # slowly holds about 46 KiB (measured); one whose cache write stalls can hold up to
-  # about 40 MiB (derived, not measured). See Memory impact in docs/CONFIGURATION.md.
+  # slowly holds about 46 KiB (measured); one whose cache write runs slower than S3
+  # holds up to about 46 MiB at the default compression_batch_size (measured). See
+  # Memory impact in docs/CONFIGURATION.md.
   # Proxy memory is about 200 MiB + max_concurrent_requests x 3.9 MiB if every request
   # is a streamed hit with a slow client: 980 MiB at 200, 2,150 MiB at 500, 4,100 MiB at
   # 1000 and 8,000 MiB at 2000. Paths that buffer a whole body or range are bounded
@@ -109,10 +110,11 @@ cache:
   write_cache_enabled: true
 
   # Share of max_cache_size reserved for the write cache, in percent (default: 10.0).
-  # The proxy uses the value as set, with no clamp or range check. It is a reclamation target.
-  # Uploads are still cached when the share is full, and the proxy reclaims the excess
-  # in the background, from eviction_trigger_percent down to eviction_target_percent of
-  # the share. Objects whose put_ttl expired unread go first, then the oldest.
+  # The proxy uses the value as set, with no clamp or range check. Once staged uploads
+  # reach it, new uploads are forwarded to S3 uncached until reclamation frees room.
+  # The proxy reclaims staged objects in the background, from eviction_trigger_percent
+  # down to eviction_target_percent of the share. Objects whose put_ttl expired unread
+  # go first, then the oldest within each cache shard.
   # Raise it if a larger set of written but unread objects should stay cached.
   # An upload is not cached when caching it would take the cache past max_cache_size, or
   # would leave less free space than disk_safety_free_space_floor. The upload itself
@@ -163,7 +165,6 @@ cache:
   # cache_rules.json.
   get_ttl: "1d"  # 1 day (default)
   head_ttl: "60s"  # How long a cached HEAD response is served without contacting S3 (default: 60s)
-  actively_remove_cached_data: false  # Keep false (default): expired entries stay cached until read or evicted
 
   # Window for recent access by other proxies (default: 10s; range 10-600s, and a value
   # outside it falls back to 10s with a warning). Despite the name, it governs no flush.
@@ -288,12 +289,9 @@ cache:
     enabled: true
 
     # How long a waiting request waits for the fetch (default: 30s; range 5-120s, and a
-    # value outside it is clamped with a warning). If the fetch is still running, the
-    # waiter waits on the same fetch again, up to max_waiter_resubscriptions times
-    # (default: 3). After that, the waiter fetches from S3 itself, as it does when the
-    # fetch it waits on fails or goes away. A whole-object GET or HEAD waits at most
-    # 30 s in total, then fetches from S3 itself, so a value above 30 applies only to
-    # range and part waiters.
+    # value outside it is clamped with a warning). If the fetch is still running then,
+    # the waiter fetches from S3 itself, as it does when the fetch it waits on fails or
+    # goes away. Keep it at 60 or less, within the AWS CLI's 60-second read timeout.
     wait_timeout_secs: 30
 
   # Range merge gap threshold (default: 1 MiB).

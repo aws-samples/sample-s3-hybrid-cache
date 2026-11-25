@@ -1078,9 +1078,11 @@ pub(crate) mod range_rename_pause {
     }
 }
 
-/// Unlink a range `.bin`. The single call through which the producers that must keep a range
-/// listed when its unlink fails (`retire_other_version_fills`, `invalidate_all_ranges`) remove
-/// the file, so a test can fail one path's unlink through [`unlink_fault`].
+/// Unlink a range `.bin`, or a `.meta`. The single call through which the producers that must
+/// keep a range listed when its unlink fails (`retire_other_version_fills`,
+/// `invalidate_all_ranges`, `CacheManager::delete_object_entry_locked`,
+/// `CacheManager::remove_other_version_locked`) remove the file, and through which the last
+/// two remove the `.meta`, so a test can fail one path's unlink through [`unlink_fault`].
 pub(crate) fn remove_range_file(path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(e) = unlink_fault::take(path) {
@@ -2567,6 +2569,11 @@ enum HealCause {
     /// error document ([`looks_like_s3_error_document`]), which a release before 3.0.0 could
     /// store from an error reply. Not counted as corruption.
     LegacyErrorBody,
+    /// The listing's extent is that of a part layout entry the part lookup refuses
+    /// (`CacheManager::listing_pairs_untrusted_part_entry`): a release before 3.0.7 may have
+    /// stored the part with S3's MD5 trailer there. Removed with that entry, so a ranged fill of
+    /// the extent is listed again. Not counted as corruption.
+    UntrustedPartListing,
 }
 
 /// The body of [`heal_damaged_range`].
@@ -2736,6 +2743,14 @@ async fn heal_damaged_range_once(
     if cause == HealCause::LegacyErrorBody {
         return RangeHealOutcome::Healed;
     }
+    if cause == HealCause::UntrustedPartListing {
+        debug!(
+            "Range listing paired with an untrusted part layout entry removed with the entry, \
+             the next read refills it: key={}, range={}-{}, file={}",
+            cache_key, damaged.start, damaged.end, damaged.file_path
+        );
+        return RangeHealOutcome::Healed;
+    }
     if cause == HealCause::UnverifiedPrefix {
         debug!(
             "Unverified pre-3.0.0 range listing removed, the next read refills it: key={}, \
@@ -2755,15 +2770,25 @@ async fn heal_damaged_range_once(
     );
     RangeHealOutcome::Healed
 }
-/// Unparseable `.meta` documents replaced by a freshly fetched one. Published as
+/// Unparseable `.meta` documents taken out of service by a fill. Published as
 /// `cache.metadata_heal_overwrite_total`. Per-instance, monotone since process start.
 ///
-/// Counted only after the replacement is renamed into place, at the three writes that read
-/// the existing document under the key's metadata lock and replace it when it does not
-/// parse: [`DiskCacheManager::prepare_range_store`], the full-object fill
-/// (`CacheManager::store_full_object_as_range_witnessed`) and its zero-length arm.
+/// Counted once per document, by the one writer that finds it unparseable under the key's
+/// lock, and nothing finds it again:
+///
+/// - after the replacement is renamed into place, at the three writes that replace the
+///   document: [`DiskCacheManager::prepare_range_store`], the full-object fill
+///   (`CacheManager::store_full_object_as_range_witnessed`) and its zero-length arm, and at a
+///   consolidation that folds a fill into one;
+/// - at the unlink, when a streamed GET range fill's publish removes it under the slot lock
+///   (`publish_range_fill_under_slot_lock_at`, [`note_metadata_heal_removed`]). The fill's
+///   journal entry rebuilds the document when consolidation folds it. A publish that then
+///   declines, because the final path holds a range file under the orphan rotation's 600 s
+///   publish window, leaves the key with no document until a later fill publishes, which is
+///   not counted again.
+///
 /// The denominator is `cache.corruption_metadata_total`: a detection that
-/// is never followed by a full-object fill of that key is never healed.
+/// is never followed by a fill of that key is never healed.
 static METADATA_HEAL_OVERWRITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Record one healed `.meta`. Call only once the replacement is in place.
@@ -2771,6 +2796,16 @@ pub(crate) fn note_metadata_heal_overwrite(cache_key: &str) {
     let total = METADATA_HEAL_OVERWRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     info!(
         "[METADATA_HEAL] Unparseable .meta replaced: cache_key={}, metadata_heal_overwrite_total={}",
+        cache_key, total
+    );
+}
+/// Record one unparseable `.meta` a range fill's publish removed under the key's slot lock, on
+/// `cache.metadata_heal_overwrite_total`. Call only once the file is gone.
+pub(crate) fn note_metadata_heal_removed(cache_key: &str) {
+    let total = METADATA_HEAL_OVERWRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    info!(
+        "[METADATA_HEAL] Unparseable .meta removed by a range fill's publish; the next published \
+         fill of the key rebuilds it: cache_key={}, metadata_heal_overwrite_total={}",
         cache_key, total
     );
 }
@@ -3157,6 +3192,23 @@ impl DiskCacheManager {
         )
         .await
     }
+    /// Remove `range_spec`, the listing paired with a part layout entry the part lookup refuses
+    /// (`CacheManager::listing_pairs_untrusted_part_entry`), with its `.bin`, its accounting and
+    /// that layout entry, as [`Self::drop_unverified_prefix_listing`] removes an R13.1 listing.
+    /// A ranged fill of the extent is then listed again instead of being declined as listed.
+    async fn drop_untrusted_part_listing(&self, range_spec: &crate::cache_types::RangeSpec) {
+        heal_damaged_range_once(
+            &self.cache_dir,
+            self.journal_consolidator.as_ref(),
+            self.metadata_cache.as_ref(),
+            &self.range_heal_limiter,
+            range_spec,
+            None,
+            false,
+            HealCause::UntrustedPartListing,
+        )
+        .await;
+    }
     /// Remove `range_spec`, a listing written before 3.0.0 whose bytes are an S3 error
     /// document, with its `.bin` and its accounting, as [`Self::drop_unverified_prefix_listing`]
     /// does. The caller serves the request from S3 and the refill records its file identity,
@@ -3473,6 +3525,7 @@ impl DiskCacheManager {
                 }
                 if let Some(m) = entry.object_metadata.as_ref() {
                     if m.content_length > 0
+                        && !crate::cache::CacheManager::is_append_md5_entry(m)
                         && crate::revalidation::etags_equal_ignoring_quotes(&m.etag, etag)
                     {
                         return m.content_length;
@@ -3573,6 +3626,11 @@ impl DiskCacheManager {
         // kept, which is lossless: a marker can only suppress an `Add` whose extent it
         // matches exactly, and such an `Add` overlaps the request by construction.
         let mut removal_markers: Vec<(u64, u64, std::time::SystemTime)> = Vec::new();
+        // The key's write-order marker token, read at the first `Add` that carries a fill
+        // witness and not at all when none does. `None` until read; `Some(None)` when the key
+        // has no readable marker.
+        let mut marker_token: Option<Option<String>> = None;
+        let meta_path = self.get_new_metadata_file_path(cache_key);
 
         // Scan all .journal files
         let journal_entries = match std::fs::read_dir(&journals_dir) {
@@ -3643,6 +3701,37 @@ impl DiskCacheManager {
                     {
                         note_unverified_prefix_refetch(cache_key, range.start, range.end);
                         note_unverified_ranges_refused(1);
+                        continue;
+                    }
+                    // A pending fill of an append-md5 response by a release before 3.0.7 (an
+                    // older proxy sharing the volume): its bytes carry S3's MD5 trailer, so it
+                    // is never coverage.
+                    crate::journal_manager::JournalOperation::Add
+                        if entry
+                            .object_metadata
+                            .as_ref()
+                            .is_some_and(crate::cache::CacheManager::is_append_md5_entry) =>
+                    {
+                        continue;
+                    }
+                    // A range fill whose version witness the key's write-order marker no
+                    // longer holds: an acknowledged write or DELETE, or a version change that
+                    // stamped, has superseded it. The consolidator retires such an `Add`
+                    // (`JournalConsolidator::partition_superseded_fills`); this is the same rule
+                    // applied at the read, so the bytes are not coverage while the `Add` waits
+                    // for its fold. An empty witness (none could be established) never holds.
+                    crate::journal_manager::JournalOperation::Add
+                        if entry.fill_witness.as_deref().is_some_and(|witness| {
+                            let current = marker_token.get_or_insert_with(|| {
+                                crate::cache::read_write_marker(&meta_path).map(|m| m.token)
+                            });
+                            witness.is_empty() || current.as_deref() != Some(witness)
+                        }) =>
+                    {
+                        debug!(
+                            "[JOURNAL_LOOKUP] Skipping a pending range superseded by the write-order marker: cache_key={}, range={}-{}, journal_file={}",
+                            cache_key, range.start, range.end, file_name
+                        );
                         continue;
                     }
                     crate::journal_manager::JournalOperation::Add => {
@@ -5210,6 +5299,10 @@ impl DiskCacheManager {
         }
 
         let expected_size = writer.end - writer.start + 1;
+        // This check is also what keeps an `x-amz-te: append-md5` answer out of the cache on
+        // `stream_range_from_s3_with_caching`'s whole-object `200` arm: its body is the object
+        // plus S3's 16-byte MD5 trailer, more than `expected_size`, and only a SHORTER body is
+        // ever salvaged below.
         if writer.bytes_written != expected_size {
             // Incomplete range. Decide whether to salvage the received contiguous
             // prefix as a clamped sub-range (read/GET path) or discard it (exact-only).
@@ -5733,6 +5826,29 @@ impl DiskCacheManager {
     }
 }
 
+/// [`crate::cache::stamp_fresh_write_marker_locked`] on the blocking pool, so its directory create
+/// and file write never hold a tokio worker on a slow shared volume. The slot lock moves to the
+/// blocking thread and back, so the hold is unbroken. The outer `Err` means the task itself
+/// failed, which dropped and so released the lock; the inner result is the stamp's.
+async fn stamp_fresh_write_marker_off_worker(
+    meta_path: PathBuf,
+    cache_key: &str,
+    meta_lock: crate::metadata_lock_manager::MetadataLock,
+) -> Result<(crate::metadata_lock_manager::MetadataLock, Result<()>)> {
+    let key = cache_key.to_string();
+    tokio::task::spawn_blocking(move || {
+        let stamp = crate::cache::stamp_fresh_write_marker_locked(&meta_path, &key, &meta_lock);
+        (meta_lock, stamp)
+    })
+    .await
+    .map_err(|e| {
+        ProxyError::CacheError(format!(
+            "Write-marker stamp task failed: cache_key={}, error={}",
+            cache_key, e
+        ))
+    })
+}
+
 /// Publish a journal-only GET range fill's `.bin` under the key's slot lock, or drop it.
 ///
 /// Range paths are `{key}_{start}-{end}.bin` whatever the object version, and these fills
@@ -5824,12 +5940,12 @@ async fn publish_range_fill_under_slot_lock_at(
     // it is confidently corrupt, unlink it, so this fill publishes as if no document existed.
     // The fill's journal entry carries `object_metadata`, so consolidation builds a fresh
     // document holding only the ranges the journal names; the old document's range files are
-    // listed by nothing and are left to the orphan rotation.
+    // listed by nothing and are left to the orphan rotation. The removal counts one heal.
     if published.is_none() && text.is_some() {
-        if let MetadataReadOutcome::Parsed(meta) =
-            remove_unloadable_meta_under_slot_lock(meta_path, cache_key).await
-        {
-            published = Some(*meta);
+        match remove_unloadable_meta_under_slot_lock(meta_path, cache_key).await {
+            MetadataReadOutcome::Parsed(meta) => published = Some(*meta),
+            MetadataReadOutcome::Corrupt { .. } => note_metadata_heal_removed(cache_key),
+            MetadataReadOutcome::Missing | MetadataReadOutcome::TransientMiss => {}
         }
     }
     // No parseable `.meta` and the final path already holds a
@@ -6653,6 +6769,35 @@ impl DiskCacheManager {
         metadata
             .ranges
             .retain(|r| !ranges_deleted_set.contains(&(r.start, r.end)));
+        // A part layout entry the part lookup refuses goes with the listing of exactly its
+        // extent: left behind, it would pair a refill of that extent, which would then be no
+        // coverage either.
+        let untrusted_parts: Vec<u32> = metadata
+            .object_metadata
+            .part_ranges
+            .iter()
+            .filter(|&(&part_number, &extent)| {
+                ranges_deleted_set.contains(&extent)
+                    && crate::cache::CacheManager::listing_pairs_untrusted_part_entry(
+                        &metadata.object_metadata,
+                        extent.0,
+                        extent.1,
+                    )
+                    && !crate::cache::CacheManager::part_layout_entry_trusted(
+                        &metadata.object_metadata,
+                        part_number,
+                        extent,
+                    )
+            })
+            .map(|(&part_number, _)| part_number)
+            .collect();
+        for part_number in untrusted_parts {
+            metadata.object_metadata.part_ranges.remove(&part_number);
+            metadata
+                .object_metadata
+                .part_layout_marked
+                .remove(&part_number);
+        }
 
         // Requirement 15.3: the `.meta` is deleted only when no `.bin` survives.
         //
@@ -7101,6 +7246,11 @@ impl DiskCacheManager {
             }
         };
 
+        // An append-md5 entry of a release before 3.0.7 is no coverage (see
+        // `CacheManager::get_metadata_cached`); the journal fallback below skips such `Add`s too.
+        let metadata = metadata
+            .filter(|m| !crate::cache::CacheManager::is_append_md5_entry(&m.object_metadata));
+
         // If no metadata, check journals for pending ranges (shared storage mode)
         if metadata.is_none() {
             let journal_ranges = self
@@ -7153,6 +7303,20 @@ impl DiskCacheManager {
             self.drop_unverified_prefix_listing(cache_key, range_spec)
                 .await;
         }
+        // The listing paired with a part layout entry the part lookup refuses is removed the
+        // same way, with that entry, so a ranged fill of its extent is listed again. It is still
+        // skipped below for this lookup.
+        for range_spec in metadata.ranges.iter().filter(|r| {
+            !r.unservable
+                && !unverified_listing_refused(r, content_length)
+                && crate::cache::CacheManager::listing_pairs_untrusted_part_entry(
+                    &metadata.object_metadata,
+                    r.start,
+                    r.end,
+                )
+        }) {
+            self.drop_untrusted_part_listing(range_spec).await;
+        }
 
         // Object-level stored expiry (lazy expiration - Requirement 1.4).
         // `get_metadata()` does not check `expires_at` for range lookups; the
@@ -7169,32 +7333,35 @@ impl DiskCacheManager {
         //   caller is about to consult live TTL and, if expired, send a
         //   conditional request carrying these validators. Hiding the coverage
         //   here is what made that path unreachable (issue #17).
-        let stored_freshness = if std::time::SystemTime::now() > metadata.expires_at {
-            match purpose {
-                RangeLookupPurpose::FreshServe => {
-                    debug!(
-                        "Object expired during range lookup: key={}, expires_at={:?}, \
+        // An entry a write expired is past stored expiry whatever `expires_at` says: a TTL
+        // refresh that is not an origin `304` can move `expires_at` without clearing it.
+        let stored_freshness =
+            if std::time::SystemTime::now() > metadata.expires_at || metadata.is_write_expired() {
+                match purpose {
+                    RangeLookupPurpose::FreshServe => {
+                        debug!(
+                            "Object expired during range lookup: key={}, expires_at={:?}, \
                          purpose=FreshServe, stored_freshness=expired, result=no_ranges",
-                        cache_key, metadata.expires_at
-                    );
-                    return Ok(RangeLookupResult::empty());
-                }
-                RangeLookupPurpose::RevalidationCandidate => {
-                    // Requirement 5.3: the Stored_Expired-candidate-selected
-                    // outcome is distinguishable in the logs from a fresh serve
-                    // and from a rejection.
-                    debug!(
-                        "Object expired during range lookup: key={}, expires_at={:?}, \
+                            cache_key, metadata.expires_at
+                        );
+                        return Ok(RangeLookupResult::empty());
+                    }
+                    RangeLookupPurpose::RevalidationCandidate => {
+                        // Requirement 5.3: the Stored_Expired-candidate-selected
+                        // outcome is distinguishable in the logs from a fresh serve
+                        // and from a rejection.
+                        debug!(
+                            "Object expired during range lookup: key={}, expires_at={:?}, \
                          purpose=RevalidationCandidate, stored_freshness=expired, \
                          result=candidate_retained_for_live_ttl_evaluation",
-                        cache_key, metadata.expires_at
-                    );
-                    StoredFreshness::Expired
+                            cache_key, metadata.expires_at
+                        );
+                        StoredFreshness::Expired
+                    }
                 }
-            }
-        } else {
-            StoredFreshness::Fresh
-        };
+            } else {
+                StoredFreshness::Fresh
+            };
 
         // Find all overlapping ranges
         let mut overlapping_ranges = Vec::new();
@@ -7204,7 +7371,16 @@ impl DiskCacheManager {
             // bytes may be another version's. It is never coverage: skipping it here makes it
             // read as missing on every lookup purpose and both metadata sources, so the
             // request refetches.
-            if range_spec.unservable || unverified_listing_refused(range_spec, content_length) {
+            // The listing of a part layout entry the part lookup refuses may hold the part plus
+            // S3's MD5 trailer at offset 0; it is no coverage until that lookup retires it.
+            if range_spec.unservable
+                || unverified_listing_refused(range_spec, content_length)
+                || crate::cache::CacheManager::listing_pairs_untrusted_part_entry(
+                    &metadata.object_metadata,
+                    range_spec.start,
+                    range_spec.end,
+                )
+            {
                 debug!(
                     "[RANGE_OVERLAP] Skipping unservable extent: cache_key={}, cached_range={}-{}",
                     cache_key, range_spec.start, range_spec.end
@@ -8483,10 +8659,15 @@ impl DiskCacheManager {
     /// orders the write against every other `.meta` writer, in this process and in its peers,
     /// so callers hold the manager's read lock. Under the write lock every revalidated hit in
     /// the process queued behind every reader, journal scans included (the lock is fair).
+    ///
+    /// `asked_at` is when the conditional request was sent. A `304` does not clear an expiry
+    /// a write recorded at or after it (`NewCacheMetadata::record_origin_validation_asked_at`),
+    /// and then nothing is written.
     pub(crate) async fn record_origin_validation(
         &self,
         cache_key: &str,
         new_ttl: std::time::Duration,
+        asked_at: std::time::SystemTime,
     ) -> Result<()> {
         // `fill_visibility.hits_total`, as in `refresh_object_ttl`: this serve is counted here
         // because no live-TTL `Fresh` verdict counted it.
@@ -8500,7 +8681,8 @@ impl DiskCacheManager {
                 }
             }
         }
-        self.write_object_ttl_locked(cache_key, new_ttl, true).await
+        self.write_object_ttl_locked(cache_key, new_ttl, Some(asked_at))
+            .await
     }
 
     /// Directly refresh the object-level TTL by loading metadata, updating expires_at, and writing back.
@@ -8509,18 +8691,18 @@ impl DiskCacheManager {
         cache_key: &str,
         new_ttl: std::time::Duration,
     ) -> Result<()> {
-        self.write_object_ttl_locked(cache_key, new_ttl, false)
-            .await
+        self.write_object_ttl_locked(cache_key, new_ttl, None).await
     }
 
     /// The locked `.meta` read-modify-write behind [`Self::refresh_object_ttl_direct`] and
-    /// [`Self::record_origin_validation`]. `origin_validated` selects whether the live GET
-    /// age re-anchors as well as stored expiry.
+    /// [`Self::record_origin_validation`]. `origin_validated` is the instant an origin `304`'s
+    /// conditional request was sent, and selects whether the live GET age re-anchors as well
+    /// as stored expiry.
     async fn write_object_ttl_locked(
         &self,
         cache_key: &str,
         new_ttl: std::time::Duration,
-        origin_validated: bool,
+        origin_validated: Option<std::time::SystemTime>,
     ) -> Result<()> {
         let operation_start = std::time::Instant::now();
         info!(
@@ -8589,8 +8771,15 @@ impl DiskCacheManager {
         };
 
         // Refresh the object-level TTL, and on an origin `304` the live GET age too.
-        if origin_validated {
-            metadata.record_origin_validation(new_ttl);
+        if let Some(asked_at) = origin_validated {
+            if !metadata.record_origin_validation_asked_at(new_ttl, asked_at) {
+                debug!(
+                    "Origin 304 predates a write that expired the entry, leaving it expired: \
+                     key={}",
+                    cache_key
+                );
+                return Ok(());
+            }
         } else {
             metadata.refresh_object_ttl(new_ttl);
         }
@@ -8604,7 +8793,7 @@ impl DiskCacheManager {
             ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
         })?;
 
-        if origin_validated {
+        if origin_validated.is_some() {
             // Reached in shared-storage mode as well, where a peer may read this `.meta` at
             // any moment, so publish by temp + rename rather than an in-place write that a
             // reader could observe half-written.
@@ -9129,7 +9318,12 @@ impl DiskCacheManager {
         let no_validator_at_all = metadata.object_metadata.etag.trim().is_empty()
             && metadata.object_metadata.effective_last_modified().is_none();
 
-        let expired = ttl_expired || missing_write_cache_last_modified || no_validator_at_all;
+        // An entry a write that S3 answered `5xx` expired (`expire_for_write`) is revalidated
+        // whatever its age, until an origin `304` sent after the expiry clears it.
+        let expired = ttl_expired
+            || missing_write_cache_last_modified
+            || no_validator_at_all
+            || metadata.is_write_expired();
 
         if no_validator_at_all {
             warn!(
@@ -9435,8 +9629,9 @@ impl DiskCacheManager {
         // (R1.6): a journal-derived failure and a `.meta`-derived one have different causes.
         let mut failed_removals: Vec<(u64, u64, &'static str, String)> = Vec::new();
         // The `.meta`-named subset of `failed_removals`, which `invalidate_all_ranges` keeps
-        // listed. A journal-named survivor keeps its unfolded `Add` (no marker is written for
-        // it), so consolidation still names it.
+        // listed. A journal-named survivor gets the same `Remove` marker as a removed file, so
+        // neither a lookup nor the fold treats its unfolded `Add` as coverage; the file is left
+        // unlisted for the orphan rotation.
         let mut failed_meta_extents: Vec<(u64, u64)> = Vec::new();
         // `(cache_key, start, end, size, relative_bin_path)`, the shape
         // `write_eviction_journal_entries` takes. Accumulated during the loop and written
@@ -9482,11 +9677,20 @@ impl DiskCacheManager {
                         );
                     }
                     Err(e) => {
-                        if matches!(
-                            candidate.source,
-                            RemovalCandidateSource::ConsolidatedMetadata
-                        ) {
-                            failed_meta_extents.push((candidate.start, candidate.end));
+                        match candidate.source {
+                            RemovalCandidateSource::ConsolidatedMetadata => {
+                                failed_meta_extents.push((candidate.start, candidate.end));
+                            }
+                            // The caller has decided this version is stale. With no marker the
+                            // `Add` would stay coverage: a lookup would serve its bytes, and the
+                            // next fold would list them.
+                            RemovalCandidateSource::Journal => marker_entries.push((
+                                cache_key.to_string(),
+                                candidate.start,
+                                candidate.end,
+                                candidate.compressed_size,
+                                candidate.relative_path.clone(),
+                            )),
                         }
                         failed_removals.push((
                             candidate.start,
@@ -9552,9 +9756,11 @@ impl DiskCacheManager {
         // deletion gap this spec puts out of scope (range-invalidation-completeness:R5.4,
         // owned by cache-eviction-at-scale) as a side effect of a marker write.
         //
-        // No marker is written for a failed removal: that `.bin` is still on disk, and
-        // suppressing coverage for a present file is the one direction this ordering exists
-        // to avoid.
+        // No marker is written for a `.meta`-named file whose removal failed: the kept document
+        // marks that extent unservable instead, and a later removal retries the unlink. A
+        // journal-named file whose removal failed does get one (see the loop): the caller has
+        // decided its version is stale, so its bytes must stop being coverage even though the
+        // file stays on disk.
         //
         // Spec: range-invalidation-completeness. Requirements: 3.2, 3.3, 5.4
         if !marker_entries.is_empty() {
@@ -9614,16 +9820,19 @@ impl DiskCacheManager {
     /// Requirements: 2.2, 2.3 - ETag validation and range invalidation
     ///
     /// This method:
-    /// 1. Snapshots every instance's unfolded journal `Add` entries for the key, unlocked
-    /// 2. Acquires the key's metadata slot lock, held from the `.meta` read to its unlink
-    /// 3. Removes the range files the `.meta` and the journal snapshot name between them, and
+    /// 1. Snapshots every instance's unfolded journal `Add` entries for the key, unlocked, then
+    ///    acquires the key's metadata slot lock, held from the `.meta` read to its unlink, and
+    ///    stamps a fresh write-order marker for the key in that hold
+    /// 2. Removes the range files the `.meta` and the journal snapshot name between them, and
     ///    writes a `JournalOperation::Remove` marker for each — see the completeness limit below
     /// 4. Removes the object's sharded `.meta`, plus any legacy flat `.meta`, then releases
     /// 5. Logs the invalidation action, distinguishing a partial removal from a complete one
     /// 6. Handles partial failures gracefully
     ///
     /// It debits nothing and touches no RAM tier: size accounting follows the `Remove` markers,
-    /// and callers clear RAM ranges with `CacheManager::invalidate_ram_ranges`.
+    /// and callers clear RAM ranges with `CacheManager::invalidate_ram_ranges`. Returns whether
+    /// the marker was stamped; a caller hands a `false`, or an `Err`, to the background stamp
+    /// retry (`CacheManager::spawn_origin_change_stamp_retry`).
     ///
     /// # What this does NOT reach, and why the log says `complete` rather than `all`
     ///
@@ -9642,8 +9851,8 @@ impl DiskCacheManager {
     /// # The lock, and what it orders
     ///
     /// Every `.meta` **publisher** holds the key's metadata slot lock:
-    /// `CacheManager::store_new_metadata`, `JournalConsolidator::write_metadata_to_disk` and
-    /// `HybridMetadataWriter::write_metadata_to_disk` each take `&MetadataLock` as a parameter,
+    /// `CacheManager::store_new_metadata` and `JournalConsolidator::write_metadata_to_disk` each
+    /// take `&MetadataLock` as a parameter,
     /// so a caller that publishes without one does not compile. This unlink used to take no
     /// lock, so it could land between a publisher's read and its `rename` and be undone: the
     /// publisher then republished a document derived from the pre-unlink one, resurrecting a
@@ -9696,7 +9905,7 @@ impl DiskCacheManager {
     /// decision is still the caller's ETag comparison against a possibly-RAM document, so a
     /// stale instance now deletes a peer's fresh entry *without racing a publisher* instead of
     /// while racing one. Registered separately; see the `INVALIDATE-META-SLOT-LOCK` return.
-    pub async fn invalidate_all_ranges(&self, cache_key: &str) -> Result<()> {
+    pub async fn invalidate_all_ranges(&self, cache_key: &str) -> Result<bool> {
         let operation_start = std::time::Instant::now();
         debug!(
             "Starting range invalidation: key={}, operation=invalidate_all_ranges",
@@ -9730,11 +9939,38 @@ impl DiskCacheManager {
         // read-and-parse per journal file, and it is read-only. Holding the slot lock across it
         // never froze the journals — `PreparedRangeFill::finish` appends without it. Taking
         // the snapshot earlier is equivalent to an `Add` landing just after this call, which the
-        // lock never excluded; see `remove_ranges_with_journal_candidates`..
+        // lock never excluded; see `remove_ranges_with_journal_candidates`.
+        //
+        // It stays although the stamp below retires every witnessed `Add`: an `Add` with no fill
+        // witness, which a release before witnesses writes on a fleet being upgraded, is
+        // retired by no stamp, and this removes its file and marks it.
         let journal_candidates = self.enumerate_journal_add_ranges(cache_key).await;
-
         let meta_lock = self.acquire_meta_slot_lock(cache_key).await?;
-
+        // Every caller has decided the cached version is stale: S3 showed another version (a
+        // `412` on the proxy's own pin, a refetch naming another ETag), or two readings of the
+        // document disagree. Stamp a fresh write-order marker first, in this hold, as an
+        // acknowledged write does. A fill of the key whose S3 request began before this then
+        // cannot publish, and every witnessed `Add` such a fill journals, before this call or
+        // after it, is refused by the journal fallback and retired by the fold, on every proxy.
+        // Without the stamp, an `Add` appended after the enumeration above was neither removed
+        // nor marked, and once the `.meta` was gone the next fold rebuilt the old version's
+        // document from it, served until `get_ttl`.
+        let (meta_lock, stamp) = stamp_fresh_write_marker_off_worker(
+            self.get_new_metadata_file_path(cache_key),
+            cache_key,
+            meta_lock,
+        )
+        .await?;
+        let stamped = match stamp {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Range invalidation could not stamp the key's write marker: key={}, error={}",
+                    cache_key, e
+                );
+                false
+            }
+        };
         // First remove the range files both enumerations name. The `get_metadata` this calls
         // takes no lock of its own, so this is not a nested acquisition.
         //
@@ -9748,6 +9984,29 @@ impl DiskCacheManager {
         let removal = self
             .remove_ranges_with_journal_candidates(cache_key, journal_candidates)
             .await?;
+        // A range file this removal could not unlink keeps its bytes on the volume, and its
+        // journal `Add` is retired only by a best-effort `Remove`-marker append. A fresh marker
+        // token, in this hold, retires every earlier `Add` of the key at the read and at the
+        // fold, and ends every proxy's fill-visibility entry for it. The stamp above, when it
+        // landed, already did.
+        let meta_lock = if removal.failed_count > 0 && !stamped {
+            let (meta_lock, stamp) = stamp_fresh_write_marker_off_worker(
+                self.get_new_metadata_file_path(cache_key),
+                cache_key,
+                meta_lock,
+            )
+            .await?;
+            if let Err(e) = stamp {
+                warn!(
+                    "Range invalidation could not unlink a range file and could not stamp the \
+                     key's write marker either: key={}, error={}",
+                    cache_key, e
+                );
+            }
+            meta_lock
+        } else {
+            meta_lock
+        };
         let removed_count = removal.removed_count;
         let size_freed = removal.size_freed;
 
@@ -9775,6 +10034,12 @@ impl DiskCacheManager {
         // R15.2: a `.meta`-named `.bin` whose unlink failed is still on the volume. Removing the
         // `.meta` would leave it named by nothing; keep the document listing exactly those
         // extents, so they stay counted, evictable, and a candidate for the next invalidation.
+        // The caller has decided the cached version is stale and the file may still hold its
+        // bytes, so each kept extent is marked unservable and the document expired, as
+        // `retire_other_version_fills` does: the next GET misses and fills from S3, and
+        // consolidation retries the unlink (`retire_unservable_extents`). The HEAD fields are
+        // unset, so the next HEAD asks S3: HEAD freshness (`is_head_fresh`) tests only that
+        // `head_expires_at` is set, never its value.
         // Whether the sharded `.meta` this call unlinked was parseable, so counted in
         // `cached_objects`; debited after the slot is released.
         let mut counted_meta_unlinked = false;
@@ -9784,6 +10049,12 @@ impl DiskCacheManager {
             self.get_metadata(cache_key).await?.map(|mut meta| {
                 meta.ranges
                     .retain(|r| removal.failed_meta_extents.contains(&(r.start, r.end)));
+                for r in &mut meta.ranges {
+                    r.mark_unservable();
+                }
+                meta.expires_at = std::time::SystemTime::now();
+                meta.head_expires_at = None;
+                meta.head_cached_at = None;
                 meta
             })
         };
@@ -9892,8 +10163,7 @@ impl DiskCacheManager {
             size_freed,
             total_duration.as_secs_f64() * 1000.0
         );
-
-        Ok(())
+        Ok(stamped)
     }
 
     // ============================================================================
@@ -11009,7 +11279,6 @@ mod tests {
             1_048_576,
         ));
         let key = "scn1-bucket/scn1-object";
-
         *JOURNAL_ENUMERATION_DELAY_FOR_TESTS.lock().unwrap() =
             Some((cache_dir.clone(), Duration::from_millis(1500)));
 
@@ -11117,22 +11386,139 @@ mod tests {
         );
     }
 
+    /// The extent `invalidate_all_ranges` keeps listed because its unlink failed still holds
+    /// the bytes of the version the caller has decided is stale (a 412 on a proxy-injected
+    /// precondition, a recovery refetch). It must never be coverage, from either metadata
+    /// source, and the document must read expired, so the next GET misses and fills from S3
+    /// and the next HEAD asks S3. A refill by the current version never serves the stale bytes.
+    #[tokio::test]
+    async fn invalidate_all_ranges_never_serves_an_extent_whose_unlink_failed() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+        let cache_key = "test-bucket/invalidate-retained/stale";
+        let version = |etag: &str| crate::cache_types::ObjectMetadata {
+            etag: etag.to_string(),
+            last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+            content_length: 1024,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 1024,
+            ..Default::default()
+        };
+        let stale_bytes = vec![1u8; 1024];
+        cache_manager
+            .store_range_witnessed(
+                cache_key,
+                0,
+                1023,
+                &stale_bytes,
+                version("\"etag-v1\""),
+                Duration::from_secs(3600),
+                true,
+            )
+            .await
+            .unwrap();
+        let listed = cache_manager
+            .get_metadata(cache_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let bin = temp_dir
+            .path()
+            .join("ranges")
+            .join(&listed.ranges[0].file_path);
+
+        // The caller has seen S3 answer for another version; the `.bin` unlink then fails
+        // with something other than ENOENT.
+        unlink_fault::arm(&bin);
+        cache_manager
+            .invalidate_all_ranges(cache_key)
+            .await
+            .unwrap();
+        assert!(
+            bin.exists(),
+            "fixture: the injected failure must leave the .bin"
+        );
+        let kept = cache_manager
+            .get_metadata(cache_key)
+            .await
+            .unwrap()
+            .expect("fixture: the .meta stays, listing the extent whose unlink failed");
+        assert_eq!(kept.ranges.len(), 1, "fixture: the survivor stays listed");
+
+        for (source, preloaded) in [("disk", None), ("preloaded", Some(&kept))] {
+            for purpose in [
+                RangeLookupPurpose::FreshServe,
+                RangeLookupPurpose::RevalidationCandidate,
+            ] {
+                let result = cache_manager
+                    .find_cached_ranges(cache_key, 0, 1023, preloaded, purpose)
+                    .await
+                    .unwrap();
+                for range in &result.ranges {
+                    let served = cache_manager.load_range_data(range).await.unwrap();
+                    assert_ne!(
+                        served, stale_bytes,
+                        "source={source} purpose={purpose:?}: a GET after the invalidation \
+                         served the stale version's bytes from the extent whose unlink failed"
+                    );
+                }
+                assert!(
+                    result.ranges.is_empty(),
+                    "source={source} purpose={purpose:?}: the extent whose unlink failed \
+                     counted as coverage after the invalidation (unservable={}, \
+                     expires_at={:?})",
+                    kept.ranges[0].unservable,
+                    kept.expires_at
+                );
+            }
+        }
+        assert!(
+            kept.expires_at <= std::time::SystemTime::now(),
+            "the kept document must read expired, so the next HEAD and GET ask S3 \
+             (expires_at={:?})",
+            kept.expires_at
+        );
+
+        // The next read fills from S3 with the current version. Whatever that fill leaves
+        // listed, the stale bytes are not among it.
+        let current_bytes = vec![2u8; 1024];
+        cache_manager
+            .store_range_witnessed(
+                cache_key,
+                0,
+                1023,
+                &current_bytes,
+                version("\"etag-v2\""),
+                Duration::from_secs(3600),
+                true,
+            )
+            .await
+            .unwrap();
+        let result = cache_manager
+            .find_cached_ranges(cache_key, 0, 1023, None, RangeLookupPurpose::FreshServe)
+            .await
+            .unwrap();
+        for range in &result.ranges {
+            let served = cache_manager.load_range_data(range).await.unwrap();
+            assert_eq!(
+                served, current_bytes,
+                "after the refill, a lookup served bytes other than the refill's"
+            );
+        }
+    }
+
     /// A `DiskCacheManager` with a hybrid writer, so range fills take the journal-only arm.
     fn hybrid_disk_cache(dir: &std::path::Path) -> DiskCacheManager {
         std::fs::create_dir_all(dir.join("metadata").join("_journals")).unwrap();
         let mut dc = DiskCacheManager::new(dir.to_path_buf(), true, 1024, false, 1_048_576);
-        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
-            dir.to_path_buf(),
-            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
-                dir.to_path_buf(),
-                Duration::from_secs(30),
-                3,
-            )),
-            Arc::new(crate::journal_manager::JournalManager::new(
+        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(Arc::new(
+            crate::journal_manager::JournalManager::new(
                 dir.to_path_buf(),
                 "case50-instance".to_string(),
-            )),
-        );
+            ),
+        ));
         dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
         dc
     }
@@ -11202,18 +11588,9 @@ mod tests {
     fn hybrid_disk_cache_as(dir: &std::path::Path, instance: &str) -> DiskCacheManager {
         std::fs::create_dir_all(dir.join("metadata").join("_journals")).unwrap();
         let mut dc = DiskCacheManager::new(dir.to_path_buf(), true, 1024, false, 1_048_576);
-        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
-            dir.to_path_buf(),
-            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
-                dir.to_path_buf(),
-                Duration::from_secs(30),
-                3,
-            )),
-            Arc::new(crate::journal_manager::JournalManager::new(
-                dir.to_path_buf(),
-                instance.to_string(),
-            )),
-        );
+        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(Arc::new(
+            crate::journal_manager::JournalManager::new(dir.to_path_buf(), instance.to_string()),
+        ));
         dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
         dc
     }
@@ -11464,6 +11841,232 @@ mod tests {
         assert!(
             next.contains("etag=\"V2\" served 65536 bytes of 0xbb"),
             "the next fill of the current version must be cached and served: {next}"
+        );
+    }
+    /// A range fill that reads another object version removes the cached one
+    /// (`CacheManager::remove_other_version_locked`). When the cached extent's `.bin` unlink
+    /// and the `.meta` unlink both fail (any error but `ENOENT`), no reader of the volume may be
+    /// served the cached version from what is left, and the next fill of another version that
+    /// meets the document repeats the removal.
+    #[tokio::test]
+    async fn a_version_change_never_leaves_the_old_version_servable_when_both_unlinks_fail() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut mgr = hybrid_disk_cache_as(dir, "journal-p1");
+        mgr.initialize().await.unwrap();
+        let consolidator = version_change_consolidator(dir);
+        let key = "test-bucket/version-change-double-unlink-failure";
+        let ttl = Duration::from_secs(3600);
+        let v1 = vec![0xAAu8; 65536];
+        let v2 = vec![0xBBu8; 65536];
+        mgr.prepare_range_store_witnessed(
+            key,
+            0,
+            65535,
+            &v1,
+            version_change_meta("\"V1\""),
+            ttl,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("fixture: the v1 fill is prepared")
+        .finish()
+        .await
+        .expect("the v1 fill publishes");
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the v1 fold");
+        // The consolidation cycle's cleanup of the folded line, which `consolidate_object` alone
+        // does not run: a folded `Add` left in the journal is journal-fallback coverage for an
+        // extent the `.meta` stops listing as servable.
+        std::fs::remove_file(
+            dir.join("metadata")
+                .join("_journals")
+                .join("journal-p1.journal"),
+        )
+        .expect("fixture: p1 journalled the v1 fill");
+        let cached = cold_key_read_listing(&mgr, key).await;
+        assert!(
+            cached.contains("etag=\"V1\" served 65536 bytes of 0xaa"),
+            "FIXTURE: v1 must be cached and served: {cached}"
+        );
+        let v1_bin = mgr.get_new_range_file_path(key, 0, 65535);
+        let meta_path = mgr.get_new_metadata_file_path(key);
+        unlink_fault::arm(&v1_bin);
+        unlink_fault::arm(&meta_path);
+        // S3 now holds v2: a miss for the uncached half fills it and meets the v1 `.meta`.
+        mgr.prepare_range_store_witnessed(
+            key,
+            65536,
+            131071,
+            &v2,
+            version_change_meta("\"V2\""),
+            ttl,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("fixture: the v2 fill is prepared")
+        .finish()
+        .await
+        .expect("the v2 fill returns Ok");
+        assert!(
+            v1_bin.exists() && meta_path.exists(),
+            "fixture: the injected failures must leave the v1 .bin and the .meta"
+        );
+        let left = mgr.get_metadata(key).await.unwrap();
+        for purpose in [
+            RangeLookupPurpose::FreshServe,
+            RangeLookupPurpose::RevalidationCandidate,
+        ] {
+            let found = mgr
+                .find_cached_ranges(key, 0, 65535, None, purpose)
+                .await
+                .unwrap();
+            for range in &found.ranges {
+                let served = mgr.load_range_data(range).await.unwrap();
+                assert_ne!(
+                    served,
+                    v1,
+                    "purpose={purpose:?}: AFTER A FILL READ ANOTHER VERSION, A READ WAS SERVED THE \
+                     CACHED VERSION'S BYTES from the extent whose unlink failed (document left: \
+                     {:?})",
+                    left.as_ref().map(|m| (
+                        m.expires_at,
+                        m.ranges
+                            .iter()
+                            .map(|r| (r.start, r.unservable))
+                            .collect::<Vec<_>>()
+                    ))
+                );
+            }
+            assert!(
+                found.ranges.is_empty(),
+                "purpose={purpose:?}: the extent whose unlink failed counted as coverage after \
+                 the version change"
+            );
+        }
+        // The fault has cleared. The next miss fills v2 and meets the document again.
+        mgr.prepare_range_store_witnessed(
+            key,
+            0,
+            65535,
+            &v2,
+            version_change_meta("\"V2\""),
+            ttl,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("fixture: the next v2 fill is prepared")
+        .finish()
+        .await
+        .expect("the next v2 fill returns Ok");
+        assert!(
+            !meta_path.exists() && !v1_bin.exists(),
+            "the next fill of another version must repeat the removal once the fault clears \
+             (.meta present={}, v1 .bin present={})",
+            meta_path.exists(),
+            v1_bin.exists()
+        );
+    }
+    /// A fold that meets a fill of another version expires the document. A HEAD must then ask
+    /// S3: the cached HEAD fields are unset, which is what HEAD freshness reads as not cached.
+    /// Setting `head_expires_at` to the fold's time left the HEAD answered from the `.meta` with
+    /// the cached version's ETag, length and Last-Modified for up to `head_ttl`.
+    #[tokio::test]
+    async fn a_fold_that_meets_a_fill_of_another_version_leaves_no_cached_head() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let mut mgr_p1 = hybrid_disk_cache_as(dir, "journal-p1");
+        mgr_p1.initialize().await.unwrap();
+        let mut mgr_p2 = hybrid_disk_cache_as(dir, "journal-p2");
+        let key = "test-bucket/fold-version-change-head";
+        let ttl = Duration::from_secs(3600);
+        let fill_v1 = mgr_p1
+            .prepare_range_store_witnessed(
+                key,
+                0,
+                65535,
+                &vec![0xAAu8; 65536],
+                version_change_meta("\"V1\""),
+                ttl,
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the v1 fill is prepared");
+        let fill_v2 = mgr_p2
+            .prepare_range_store_witnessed(
+                key,
+                65536,
+                131071,
+                &vec![0xBBu8; 65536],
+                version_change_meta("\"V2\""),
+                ttl,
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("fixture: the v2 fill is prepared");
+        fill_v1.finish().await.expect("the v1 fill publishes");
+        fill_v2.finish().await.expect("the v2 fill publishes");
+        // The pass that creates the `.meta` sees only p1's journal.
+        let p2_journal = dir
+            .join("metadata")
+            .join("_journals")
+            .join("journal-p2.journal");
+        let aside = dir.join("journal-p2.journal.aside");
+        std::fs::rename(&p2_journal, &aside).expect("fixture: p2 journalled its fill");
+        let consolidator = version_change_consolidator(dir);
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the creating pass");
+        std::fs::rename(&aside, &p2_journal).unwrap();
+        // A HEAD cached the v1 headers just before.
+        let meta_path = mgr_p1.get_new_metadata_file_path(key);
+        let mut meta: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta.object_metadata.etag, "\"V1\"", "FIXTURE: v1 published");
+        let now = std::time::SystemTime::now();
+        meta.head_cached_at = Some(now);
+        meta.head_expires_at = Some(now + Duration::from_secs(60));
+        std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+        let cache_manager =
+            crate::cache::CacheManager::new_with_defaults(dir.to_path_buf(), false, 0);
+        let head_ttl = Duration::from_secs(60);
+        assert!(
+            cache_manager
+                .get_head_cache_entry_unified(key, head_ttl)
+                .await
+                .unwrap()
+                .is_some(),
+            "FIXTURE: the v1 HEAD is answered from cache before the fold"
+        );
+        consolidator
+            .consolidate_object(key)
+            .await
+            .expect("the pass that meets the v2 fill");
+        let after: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert!(
+            after.expires_at <= std::time::SystemTime::now(),
+            "FIXTURE: the fold's other-version arm must have expired the document"
+        );
+        // A proxy with no RAM copy of the document, so the lookup reads the `.meta`.
+        let head = crate::cache::CacheManager::new_with_defaults(dir.to_path_buf(), false, 0)
+            .get_head_cache_entry_unified(key, head_ttl)
+            .await
+            .unwrap();
+        assert!(
+            head.is_none(),
+            "AFTER THE FOLD MET A FILL OF ANOTHER VERSION, A HEAD WAS ANSWERED FROM CACHE with the \
+             cached version's headers (head_expires_at={:?}, head_cached_at={:?})",
+            after.head_expires_at,
+            after.head_cached_at
         );
     }
     /// Two proxies' fills of different versions publish on a cold key, so neither met the
@@ -19972,18 +20575,12 @@ mod identity_less_fill_publish_tests {
     fn hybrid_disk_cache(dir: &std::path::Path) -> DiskCacheManager {
         std::fs::create_dir_all(dir.join("metadata").join("_journals")).unwrap();
         let mut dc = DiskCacheManager::new(dir.to_path_buf(), true, 1024, false, 1_048_576);
-        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
-            dir.to_path_buf(),
-            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
-                dir.to_path_buf(),
-                Duration::from_secs(30),
-                3,
-            )),
-            Arc::new(crate::journal_manager::JournalManager::new(
+        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(Arc::new(
+            crate::journal_manager::JournalManager::new(
                 dir.to_path_buf(),
                 "r12-instance".to_string(),
-            )),
-        );
+            ),
+        ));
         dc.set_hybrid_metadata_writer(Arc::new(Mutex::new(writer)));
         dc
     }
@@ -20152,5 +20749,47 @@ mod identity_less_fill_publish_tests {
             log
         );
         println!("{}", about_identity[0]);
+    }
+    /// A pending fill of an append-md5 response by a release before 3.0.7 (an older proxy on
+    /// the shared volume, before any `.meta` lists it) is no coverage for any journal
+    /// fallback; the same fill without the fingerprint is.
+    #[tokio::test]
+    async fn a_pending_append_md5_fill_is_not_coverage() {
+        let mut found = Vec::new();
+        for fingerprinted in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let mut dc = hybrid_disk_cache(temp.path());
+            dc.initialize().await.unwrap();
+            let key = "test-bucket/pending-append-md5";
+            let mut om = object_metadata();
+            if fingerprinted {
+                om.response_headers.insert(
+                    "x-amz-transfer-encoding".to_string(),
+                    "append-md5".to_string(),
+                );
+            }
+            let _ = dc
+                .store_range_witnessed(
+                    key,
+                    0,
+                    4095,
+                    &[0x5au8; 4096],
+                    om,
+                    Duration::from_secs(3600),
+                    true,
+                )
+                .await;
+            found.push(
+                dc.find_pending_journal_ranges(key, 0, 4095)
+                    .await
+                    .unwrap()
+                    .len(),
+            );
+        }
+        assert_eq!(
+            found,
+            vec![1, 0],
+            "(pending Adds found as coverage for the clean fill, for the append-md5 fill)"
+        );
     }
 }

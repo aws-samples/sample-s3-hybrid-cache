@@ -126,6 +126,19 @@ const MIB: usize = 1024 * 1024;
 /// whole-extent load measured 142-157 MB here against a 64 MiB extent, and that figure
 /// grows with the extent while this one does not.
 const STREAM_ALLOWANCE: usize = 16 * MIB;
+/// Allowed heap growth for one GET miss, a request S3 answers while the proxy fills the cache.
+///
+/// A miss holds more than a hit, and the figure is bounded by fixed queues, not by the object:
+/// the response streams to the client while the GET-miss cache channel holds up to 100 frames
+/// from S3 (up to 408 KiB each) for the cache writer, which fills whenever the writer is slower
+/// than S3, plus the compression batch (`compression_batch_size`, 1 MiB by default, up to
+/// 16 MiB) and its output. Measured by `za_streamed_get_miss_is_within_the_miss_allowance` on
+/// the shipped path (a real `S3Client` over HTTP to a loopback origin, the default batch, a
+/// client that drains as fast as it reads, compression on as shipped): 48,172,529 to 48,890,311
+/// bytes for a 192 MiB incompressible object, over three runs each of a ranged and a plain GET
+/// miss (2026-11-21). The allowance is the highest of those plus 20 percent. A larger
+/// `compression_batch_size` raises the figure; this allowance holds only at the default.
+const MISS_ALLOWANCE: usize = 56 * MIB;
 const LARGE_OBJECT_SIZE: usize = 64 * MIB;
 const SMALL_OBJECT_SIZE: usize = 100 * 1024;
 
@@ -149,6 +162,13 @@ fn test_config(cache_dir: std::path::PathBuf) -> Arc<Config> {
 }
 
 async fn make_cache_infra(config: &Arc<Config>) -> (Arc<CacheManager>, Arc<RangeHandler>) {
+    make_cache_infra_with_compression(config, false).await
+}
+/// [`make_cache_infra`] with the cache's compression setting chosen.
+async fn make_cache_infra_with_compression(
+    config: &Arc<Config>,
+    compression_enabled: bool,
+) -> (Arc<CacheManager>, Arc<RangeHandler>) {
     let cache_manager = Arc::new(CacheManager::new_with_shared_storage(
         config.cache.cache_dir.clone(),
         config.cache.ram_cache_enabled,
@@ -156,7 +176,7 @@ async fn make_cache_infra(config: &Arc<Config>) -> (Arc<CacheManager>, Arc<Range
         config.cache.max_cache_size,
         CacheEvictionAlgorithm::TinyLFU,
         1024,
-        false,
+        compression_enabled,
         config.cache.get_ttl,
         config.cache.head_ttl,
         config.cache.put_ttl,
@@ -730,8 +750,7 @@ fn covered_bytes(mut ranges: Vec<(u64, u64)>) -> u64 {
 }
 /// Make each extent of `path` resident the way production does: a ranged GET that misses,
 /// forwarded over HTTP to an origin, so the streamed range fill the request path makes
-/// publishes it. A stub that answers in process hands the proxy a buffered body, which a ranged
-/// miss does not cache, so the origin is a real HTTP server; it answers with the ETag and
+/// publishes it. The origin is a real HTTP server; it answers with the ETag and
 /// headers `stub_for` does, so the serve phase's stub describes the same object version. The
 /// proxy and the origin are dropped when this returns; a consolidation loop then folds every
 /// fill into the key's `.meta`, which the serve path reads.
@@ -1047,6 +1066,16 @@ fn assert_bounded(what: &str, delta: usize) {
         STREAM_ALLOWANCE
     );
 }
+/// [`assert_bounded`] for a request S3 answers while the cache fills: [`MISS_ALLOWANCE`].
+fn assert_miss_bounded(what: &str, delta: usize) {
+    assert!(
+        delta < MISS_ALLOWANCE,
+        "{}: peak heap growth {} bytes (GET-miss allowance {})",
+        what,
+        delta,
+        MISS_ALLOWANCE
+    );
+}
 
 // (f) two adjacent 40 MiB extents, request spanning both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1124,21 +1153,18 @@ async fn h_gap_over_bound_forwarded_uncached_and_bounded() {
         1,
         "(h) the stub must see the request forwarded with its own Range"
     );
-    assert_bounded("(h) gap over the bound", delta);
+    assert_miss_bounded("(h) gap over the bound", delta);
     assert_healing_refetch(healing_before, "(h)");
     eprintln!(
-        "SCN3 (h): .bin files {} -> {} (the stub's buffered body is not teed into the cache)",
+        "SCN3 (h): .bin files {} -> {}",
         bins_before,
         count_bin_files(fixture.cache_dir())
     );
 }
 
 /// The over-bound degrade took the streamed cache-miss path
-/// (`stream_range_from_s3_with_caching`) rather than the uncached forward. The
-/// stub answers with a buffered body, which that path serves without writing a
-/// range (only a streamed S3 body is teed into the cache), so the stored range
-/// and the repeat hit are not observable in-process; the fleet test superset
-/// probe is where they are.
+/// (`stream_range_from_s3_with_caching`) rather than the uncached forward, which fills
+/// the cache as a miss does, so the request is held to [`MISS_ALLOWANCE`].
 fn assert_healing_refetch(healing_before: u64, what: &str) {
     assert_eq!(
         s3_proxy::http_proxy::buffered_serve_healing_refetches_total(),
@@ -1172,7 +1198,7 @@ async fn i_partial_containment_forwarded_and_bounded() {
         1,
         "(i) forwarded with its own Range"
     );
-    assert_bounded("(i) partial containment", delta);
+    assert_miss_bounded("(i) partial containment", delta);
     assert_healing_refetch(healing_before, "(i)");
 }
 
@@ -1194,7 +1220,7 @@ async fn j_exact_match_missing_bin_forwarded_and_bounded() {
     );
     assert!(resp.status.is_success(), "(j) status {}", resp.status);
     assert!(resp.matched, "(j) byte-exact, got {} bytes", resp.len);
-    assert_bounded("(j) exact-match arm with missing .bin", delta);
+    assert_miss_bounded("(j) exact-match arm with missing .bin", delta);
 }
 
 // (k) a within-bound multi-extent merge (two 2 MiB extents) still takes the merge path.
@@ -1803,8 +1829,7 @@ async fn t_widened_page_of_three_extents_is_bounded() {
 // with a Range header would answer this no-Range request with a `206`.
 //
 // The repeat-request half of this property (a second identical request is a single-extent
-// HIT) is NOT observable in-process: `StubS3Client` answers with a buffered body and only
-// a STREAMED S3 body is teed into the cache, the same limitation `(h)`/`(i)` record.
+// HIT) is not asserted here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn u_full_object_stream_failure_heals_and_is_bounded() {
     let _guard = ALLOC_LOCK.lock().await;
@@ -1866,7 +1891,7 @@ async fn u_full_object_stream_failure_heals_and_is_bounded() {
         "(u) the upstream fetch must carry no Range header, or S3 answers a 206"
     );
     assert_healing_refetch(healing_before, "(u)");
-    assert_bounded("(u) no-Range full-object degrade heals", delta);
+    assert_miss_bounded("(u) no-Range full-object degrade heals", delta);
 }
 
 // (v) The per-stream decoder floor, measured before and after the change in one test under one
@@ -2401,4 +2426,160 @@ async fn z_uncached_over_bound_forward_carries_proxy_referer() {
         Some(REFERER),
         "(z) the uncached over-bound forward must carry the configured proxy Referer"
     );
+}
+
+// (za) A GET miss on the shipped streamed path, against MISS_ALLOWANCE. The other miss cases
+// here, (j) and (u), go through `StubS3Client`; this one uses a real `S3Client` over HTTP, so
+// the body S3 sends arrives as the stream the production fill reads. 192 MiB is three times the
+// 64 MiB objects elsewhere in this file, so a figure that grew with the object would show.
+const MISS_OBJECT_SIZE: usize = 192 * MIB;
+async fn drained_request_for_host(
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    range: &str,
+    expected: &[u8],
+) -> DrainedResponse {
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}{}", addr, path))
+        .header("host", host)
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=AKIA-TEST/20250101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=sig",
+        );
+    if !range.is_empty() {
+        builder = builder.header("range", range);
+    }
+    let response = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.request(
+            builder
+                .body(Full::new(Bytes::new()))
+                .expect("build request"),
+        ),
+    )
+    .await
+    .expect("proxy request timed out")
+    .expect("proxy request failed");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut body = response.into_body();
+    let (mut len, mut matched) = (0usize, true);
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(60), body.frame())
+        .await
+        .expect("body frame timed out")
+    {
+        let Ok(frame) = frame else {
+            matched = false;
+            break;
+        };
+        if let Ok(data) = frame.into_data() {
+            let end = len + data.len();
+            if end > expected.len() || expected[len..end] != data[..] {
+                matched = false;
+            }
+            len = end;
+        }
+    }
+    DrainedResponse {
+        status,
+        headers,
+        len,
+        matched: matched && len == expected.len(),
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn za_streamed_get_miss_is_within_the_miss_allowance() {
+    let _guard = ALLOC_LOCK.lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let body = incompressible_body(MISS_OBJECT_SIZE);
+    let paths = [
+        "/mybucket/za-ranged-miss.dat",
+        "/mybucket/za-plain-miss.dat",
+    ];
+    let dir = TempDir::new().unwrap();
+    let config = test_config(dir.path().to_path_buf());
+    assert_eq!(
+        config.cache.compression_batch_size,
+        Config::default().cache.compression_batch_size,
+        "precondition: the default compression_batch_size, which the allowance is measured at"
+    );
+    // Compression as shipped (`compression.enabled` defaults on), unlike the hit cases above.
+    let (cache_manager, range_handler) =
+        make_cache_infra_with_compression(&config, config.compression.enabled).await;
+    let origin = proxy_rig::MockOrigin::default();
+    for p in paths {
+        origin.put_bytes(p, body.clone());
+    }
+    origin.set_etag("\"za-etag\"");
+    let (origin_addr, _origin_shutdown) = origin.clone().spawn().await;
+    let origin_host = format!("127.0.0.1:{}", origin_addr.port());
+    let mut proxy_config = (*config).clone();
+    proxy_config.connection_pool.upstream_overrides.insert(
+        origin_host.clone(),
+        UpstreamOverrideConfig {
+            scheme: UpstreamScheme::Http,
+            validate_tls: true,
+        },
+    );
+    let proxy_config = Arc::new(proxy_config);
+    let ledger = Arc::new(s3_proxy::inflight_ledger::InflightLedger::new(
+        proxy_config.server.max_inflight_buffer_bytes,
+    ));
+    let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(
+        s3_proxy::s3_client::S3Client::new(&proxy_config.connection_pool, None)
+            .expect("s3 client")
+            .with_inflight_ledger(ledger),
+    );
+    let server = spawn_proxy_server(proxy_config, cache_manager, range_handler, s3_client).await;
+    let whole = range_header(0, MISS_OBJECT_SIZE - 1);
+    let mut figures = Vec::new();
+    for (label, path, range) in [
+        ("ranged miss of the whole object", paths[0], whole.as_str()),
+        ("plain GET miss", paths[1], ""),
+    ] {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let bins_before = count_bin_files(dir.path());
+        let baseline = reset_peak();
+        let resp = drained_request_for_host(server.addr, &origin_host, path, range, &body).await;
+        // The cache write can finish after the response ends; its peak counts too.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while count_bin_files(dir.path()) == bins_before && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let delta = peak_delta(baseline);
+        eprintln!(
+            "SCN (za) {}: status {} matched {} len {} peak delta {} bytes (allowance {}), .bin files {} -> {}",
+            label,
+            resp.status,
+            resp.matched,
+            resp.len,
+            delta,
+            MISS_ALLOWANCE,
+            bins_before,
+            count_bin_files(dir.path())
+        );
+        assert!(
+            resp.status.is_success() && resp.matched,
+            "(za) {}: status {}, byte-exact {}",
+            label,
+            resp.status,
+            resp.matched
+        );
+        assert!(
+            count_bin_files(dir.path()) > bins_before,
+            "(za) {}: precondition: the miss must fill the cache, or no fill was measured",
+            label
+        );
+        figures.push((label, delta));
+    }
+    for (label, delta) in figures {
+        assert_miss_bounded(&format!("(za) {}", label), delta);
+    }
 }

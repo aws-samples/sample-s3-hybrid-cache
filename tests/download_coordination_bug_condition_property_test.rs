@@ -299,14 +299,16 @@ async fn prime_cache_with_expired_entry(
         status.is_success(),
         "PRECONDITION MISSING: the priming GET returned {status:?}"
     );
-    if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
-        consolidator
-            .consolidate_object(cache_key)
-            .await
-            .expect("fold the priming fill's journal entry");
-    }
+    // The streamed fill commits after the response ends, so its journal entry is folded on
+    // every try, not once.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
+        if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
+            consolidator
+                .consolidate_object(cache_key)
+                .await
+                .expect("fold the priming fill's journal entry");
+        }
         let meta = cache_manager
             .get_metadata_from_disk(cache_key)
             .await
@@ -649,12 +651,16 @@ fn prop_case_b_expired_cache_stampede(participant_count: u8) -> TestResult {
             .with_response_for_etag(
                 CACHED_ETAG,
                 StubResponse::ok(Bytes::from_static(FETCHER_BODY))
-                    .with_header("etag", "\"fetcher-etag\"")
+                    .with_header("etag", CACHED_ETAG)
                     .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT"),
             )
+            // The cached version, unchanged at the origin: the stampede on an expired entry.
+            // A fill of another version replaces the entry through the journal, so a
+            // waiter on the same proxy finds no `.meta` and fetches for itself; that is a
+            // different case from the one this property is about.
             .with_default(
                 StubResponse::ok(Bytes::from_static(FETCHER_BODY))
-                    .with_header("etag", "\"fetcher-etag\"")
+                    .with_header("etag", CACHED_ETAG)
                     .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
                     .with_delay(FETCHER_FLIGHT_HOLD),
             );
@@ -746,4 +752,84 @@ fn prop_case_b_expired_cache_stampede(participant_count: u8) -> TestResult {
 
         TestResult::passed()
     })
+}
+
+/// A stampede on an expired entry whose object has since been overwritten. The fill of the new
+/// version replaces the entry through the journal, so a waiter on the same proxy can find no
+/// `.meta` and fetch for itself. This records how many authoritative round-trips that costs
+/// today: one per participant, four for four, on five of five runs (the fleet probe that
+/// prompted it saw two). The property above covers the unchanged object, where the bound is
+/// one.
+#[test]
+#[ignore = "records today's cost, one authoritative round-trip per participant, on a changed object; fewer is not yet the contract here"]
+fn changed_object_stampede_authoritative_count() {
+    const N: usize = 4;
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let config = zero_ttl_config();
+        let (_temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
+        let range_handler = Arc::new(RangeHandler::new(
+            Arc::clone(&cache_manager),
+            Arc::clone(&disk_cache_manager),
+        ));
+        let inflight_tracker = Arc::new(InFlightTracker::new());
+        let cache_key = "bucket-case-b/changed-object-target.bin".to_string();
+        prime_cache_with_expired_entry(&cache_manager, &range_handler, &config, &cache_key).await;
+        let new_version = |stub: StubResponse| {
+            stub.with_header("etag", "\"fetcher-etag\"")
+                .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+        };
+        let stub = StubS3Client::new()
+            .with_response_for_etag(
+                CACHED_ETAG,
+                new_version(StubResponse::ok(Bytes::from_static(FETCHER_BODY))),
+            )
+            .with_default(
+                new_version(StubResponse::ok(Bytes::from_static(FETCHER_BODY)))
+                    .with_delay(FETCHER_FLIGHT_HOLD),
+            );
+        let s3_client = stub.clone().into_trait_object();
+        let uri: hyper::Uri = "/bucket-case-b/changed-object-target.bin"
+            .parse()
+            .expect("uri");
+        let participants: Vec<HashMap<String, String>> = (0..N)
+            .map(|i| {
+                signed_get_headers(&format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIA-PART-{i:03}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=01"
+                ))
+            })
+            .collect();
+        let results = launch_concurrent_gets(
+            participants,
+            uri,
+            "s3.amazonaws.com".to_string(),
+            cache_key,
+            Arc::clone(&cache_manager),
+            s3_client,
+            Arc::clone(&inflight_tracker),
+            Arc::clone(&range_handler),
+            Arc::clone(&config),
+        )
+        .await;
+        for (i, (status, _body)) in results.iter().enumerate() {
+            assert!(
+                status.is_success(),
+                "participant #{i} received {status:?}"
+            );
+        }
+        let captured = stub.captured();
+        let authoritative = captured
+            .iter()
+            .filter(|r| classify_request(r) == RequestClass::Authoritative)
+            .count();
+        assert_eq!(
+            authoritative,
+            N,
+            "authoritative round-trips for {N} participants on a changed object; captured={:?}",
+            captured
+                .iter()
+                .map(|r| (r.authorization(), classify_request(r)))
+                .collect::<Vec<_>>(),
+        );
+    });
 }

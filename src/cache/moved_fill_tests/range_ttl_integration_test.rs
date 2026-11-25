@@ -45,12 +45,14 @@ async fn test_range_stored_with_configured_ttl() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store range with a 10-year TTL (the validated maximum)
@@ -132,12 +134,14 @@ async fn test_range_with_short_ttl_expires() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store range with a 2-second TTL
@@ -209,12 +213,14 @@ async fn a_later_fill_does_not_change_the_objects_expiry() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store first range with long TTL

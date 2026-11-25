@@ -168,14 +168,14 @@ fn is_non_object_put(query: &str, headers: &HeaderMap) -> bool {
             .iter()
             .any(|name| headers.contains_key(*name))
 }
-/// Whether S3 may have executed the write a forward answered: it succeeded, or the
-/// request was sent in full and its answer never arrived or was refused (see
-/// [`crate::signed_request_proxy::write_outcome_unknown`]).
-fn write_may_have_executed(response: &Result<Response<BoxBody<Bytes, hyper::Error>>>) -> bool {
-    match response {
-        Ok(resp) => resp.status().is_success(),
-        Err(e) => crate::signed_request_proxy::write_outcome_unknown(e),
-    }
+/// What a forward's result says about whether S3 applied the write
+/// ([`crate::signed_request_proxy::write_effect_of`]): applied on a `2xx` or when the
+/// request was sent in full and its answer never arrived or was refused, possibly applied on
+/// S3's `500 InternalError`, and not applied otherwise.
+fn write_effect(
+    response: &Result<Response<BoxBody<Bytes, hyper::Error>>>,
+) -> crate::signed_request_proxy::WriteEffect {
+    crate::signed_request_proxy::write_effect_of(response, false)
 }
 
 /// Whether an S3 response carries an `ETag` with something other than quotes in it. A
@@ -1445,10 +1445,12 @@ impl SignedPutHandler {
                 )
                 .await;
                 // Nothing else invalidates on this arm: no cache task is spawned.
-                if write_may_have_executed(&response) {
-                    self.invalidate_prior_version_before_response(&cache_key, "PUT")
-                        .await;
-                }
+                self.settle_prior_version_before_response(
+                    &cache_key,
+                    "PUT",
+                    write_effect(&response),
+                )
+                .await;
                 response
             }
             CacheDecision::StreamWithCapacityCheck => {
@@ -1520,10 +1522,8 @@ impl SignedPutHandler {
             STREAMED_BODY_CAP,
         )
         .await;
-        if write_may_have_executed(&response) {
-            self.invalidate_prior_version_before_response(&cache_key, "PUT")
-                .await;
-        }
+        self.settle_prior_version_before_response(&cache_key, "PUT", write_effect(&response))
+            .await;
         response
     }
 
@@ -1548,7 +1548,8 @@ impl SignedPutHandler {
             self.current_cache_usage,
             self.max_cache_capacity,
         );
-        // A size refusal asks the read tier to evict room for this object.
+        // A size refusal asks the read tier to evict room for this object, when the write
+        // cache could hold it (`note_upload_size_refusal`).
         if let CacheDecision::Bypass(
             crate::capacity_manager::BypassReason::ContentLengthExceedsCapacity {
                 content_length,
@@ -1556,7 +1557,7 @@ impl SignedPutHandler {
             },
         ) = &decision
         {
-            crate::cache::note_size_refusal(&self.cache_dir, *content_length);
+            crate::cache::note_upload_size_refusal(&self.cache_dir, *content_length);
         }
         decision
     }
@@ -1674,12 +1675,11 @@ impl SignedPutHandler {
         // The same call stamps the key's write-order marker; its token goes to the cache task
         // with the S3 result, so the task can publish only while no newer write of the key
         // has been acknowledged.
-        let write_guard = if write_may_have_executed(&s3_response) {
-            self.invalidate_prior_version_before_response(&cache_key, "PUT")
-                .await
-        } else {
-            WriteGuard::Unavailable
-        };
+        // A `500 InternalError` expires the entry instead, and its store gets no token: it
+        // discards on the non-`2xx` either way.
+        let write_guard = self
+            .settle_prior_version_before_response(&cache_key, "PUT", write_effect(&s3_response))
+            .await;
 
         // Deliver the S3 result (status + headers, or error) to the background cache
         // task through the oneshot, exactly as the buffered path did. On success the
@@ -1717,6 +1717,54 @@ impl SignedPutHandler {
     /// The same slot-lock hold stamps the key's write-order marker; the returned guard
     /// is what this write's store must carry. On failure it is `Unavailable` and the store
     /// declines.
+    /// Apply a write's [`crate::signed_request_proxy::WriteEffect`] to `cache_key` before its
+    /// response returns: [`Self::invalidate_prior_version_before_response`] when S3 applied
+    /// it, [`Self::expire_prior_version_before_response`] when it may have, and nothing
+    /// otherwise. The guard is what this write's store carries; only an applied write's
+    /// invalidation hands one out.
+    async fn settle_prior_version_before_response(
+        &self,
+        cache_key: &str,
+        operation: &str,
+        effect: crate::signed_request_proxy::WriteEffect,
+    ) -> WriteGuard {
+        use crate::signed_request_proxy::WriteEffect;
+        match effect {
+            WriteEffect::Applied => {
+                self.invalidate_prior_version_before_response(cache_key, operation)
+                    .await
+            }
+            WriteEffect::MayHaveApplied => {
+                self.expire_prior_version_before_response(cache_key, operation)
+                    .await;
+                WriteGuard::Unavailable
+            }
+            WriteEffect::NotApplied => WriteGuard::Unavailable,
+        }
+    }
+
+    /// Expire `cache_key`'s cached version on the response path, after S3 answered the write
+    /// with a `5xx` that leaves it possibly applied
+    /// ([`crate::cache::CacheManager::expire_for_write_within`]): the entry stays, and the
+    /// next GET or HEAD revalidates it with its ETag. A failure is logged; the key then goes to
+    /// the background stamp retry, which invalidates it, and the response still returns.
+    async fn expire_prior_version_before_response(&self, cache_key: &str, operation: &str) {
+        let Some(cache_manager) = &self.cache_manager else {
+            return;
+        };
+        if let Err(e) = cache_manager
+            .expire_for_write_within(cache_key, operation, &self.cache_delay_budget)
+            .await
+        {
+            warn!(
+                "Failed to expire the cached version after S3 answered a {} with a 5xx that may \
+                 have applied it: cache_key={}, error={}; it is invalidated in the background \
+                 instead",
+                operation, cache_key, e
+            );
+        }
+    }
+
     async fn invalidate_prior_version_before_response(
         &self,
         cache_key: &str,
@@ -1866,6 +1914,19 @@ impl SignedPutHandler {
         tokio::spawn(async move {
             let setup_manager = cache_manager.clone();
             let setup_key = task_key.clone();
+            // The staged-share cap, before disk safety, so an upload over the Staging_Bound
+            // records no eviction demand. Declining drops the cache side here, before any
+            // sink opens, and the forward continues uncached (Req 7.2). An admitted upload's
+            // declared size counts against the bound until its store commits or aborts.
+            let staging_admission = match setup_manager.staging_bound_admission(decoded_len) {
+                Ok(admission) => admission,
+                Err(reason) => {
+                    if let Some(metrics) = &metrics_manager {
+                        metrics.read().await.record_skipped_put(reason).await;
+                    }
+                    return;
+                }
+            };
             // The permit lives inside the setup future, so a setup abandoned at the bound
             // (which runs on and may still open the `.tmp` and batch buffer) holds it until
             // it finishes; the late result, permit included, drops with the detached handle.
@@ -1907,9 +1968,9 @@ impl SignedPutHandler {
                         // `open_write_cache_sink` returns `Ok(None)` for two distinct
                         // reasons, distinguished here rather than inside it so its control
                         // flow stays untouched. `capacity_refused` is deliberately not one of
-                        // them: the Staging_Bound stopped being an admission gate in 2.7.0
-                        // (R3.1), so the remaining refusals are the per-object size cap and the
-                        // Disk_Safety_Bound.
+                        // them: the Staging_Bound refuses no upload (R3.1), and its staged-share
+                        // cap is counted before setup, so the remaining refusals are the
+                        // per-object size cap and the Disk_Safety_Bound.
                         let max_object_size = cache_manager.get_write_cache_max_object_size().await;
                         let reason = if decoded_len > max_object_size {
                             "object_too_large"
@@ -1941,6 +2002,7 @@ impl SignedPutHandler {
                 Some(cache_manager),
                 s3_client,
                 permit,
+                staging_admission,
             );
             setup_ready.store(true, std::sync::atomic::Ordering::Release);
         });
@@ -2133,8 +2195,8 @@ impl SignedPutHandler {
         // `mpus_in_progress/`, which eviction cannot reach. The check reads the shared volume
         // (`size_state.json`, then `statvfs`), so it runs on the tracker task below, inside the
         // same bound as the tracker write, and never in front of the forward. A refusal writes
-        // no tracker; parts may still stage, and CompleteMultipartUpload then declines to cache
-        // the upload and removes them. Checked with a zero incoming-bytes reservation: the
+        // no tracker, so the upload's parts are not staged and CompleteMultipartUpload declines
+        // to cache the upload. Checked with a zero incoming-bytes reservation: the
         // object size is unknown at CreateMultipartUpload.
         // Spec: cache-eviction-at-scale. Requirements: 16.9, 16.10, 16.11, 16.14.
 
@@ -2196,6 +2258,24 @@ impl SignedPutHandler {
                         tokio::spawn(async move {
                             let _pending_permit = pending_permit;
                             let (bucket, key) = parse_cache_key(&task_key);
+                            // The staged-share cap, with no incoming bytes: at the Staging_Bound
+                            // no tracker is written, so the upload is not cached.
+                            if let Some(reason) = writer
+                                .cache_manager
+                                .as_ref()
+                                .and_then(|manager| manager.staging_bound_admission(0).err())
+                            {
+                                if let Some(metrics) = &writer.metrics_manager {
+                                    metrics.read().await.record_skipped_put(reason).await;
+                                }
+                                info!(
+                                    "CreateMultipartUpload: declining write-through caching for this upload, \
+                                     staged uploads have reached the staging bound: bucket={}, key={}. The \
+                                     upload itself is unaffected and streams to S3.",
+                                    bucket, key
+                                );
+                                return;
+                            }
                             if writer.create_disk_safety_refused().await {
                                 if let Some(metrics) = &writer.metrics_manager {
                                     metrics
@@ -3314,6 +3394,18 @@ impl SignedPutHandler {
                 key,
                 status.as_u16()
             );
+            // S3's `500 InternalError` may have completed the upload: expire the replaced
+            // object without finalizing. The staged parts stay for the client's retry, whose
+            // `200` invalidates and finalizes under a newer token.
+            if status.is_server_error()
+                && crate::signed_request_proxy::s3_server_error_effect(
+                    s3_response.s3_server_error_code().as_deref(),
+                    false,
+                ) == crate::signed_request_proxy::WriteEffect::MayHaveApplied
+            {
+                self.expire_prior_version_before_response(&cache_key, "CompleteMultipartUpload")
+                    .await;
+            }
             Ok(s3_response.into_response())
         }
     }
@@ -4302,12 +4394,17 @@ impl SignedPutHandler {
             part_ranges,
             // The completed upload's own layout, under the key's slot lock.
             part_layout_verified: true,
+            part_layout_marked: byte_offsets
+                .iter()
+                .map(|(part_number, _, _)| *part_number)
+                .collect(),
             upload_id: None,
             is_write_cached: true, // Mark as write-cached
             write_cache_expires_at: Some(now + write_ttl),
             write_cache_created_at: Some(now),
             write_cache_last_accessed: Some(now),
             graduation_accounted: false,
+            checksums_object_scoped: false,
         };
 
         // Record per-range staging membership before the `.meta` is written.
@@ -5152,11 +5249,14 @@ impl SignedPutHandler {
         cache_manager: Option<Arc<crate::cache::CacheManager>>,
         s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
         pending_permit: tokio::sync::OwnedSemaphorePermit,
+        staging_admission: crate::cache::StagingAdmission,
     ) {
         tokio::spawn(async move {
             // Released when the store's last step (`record_cached_put`, a failure path,
             // or `drop(sink)`) has run, i.e. when this task ends.
             let _pending_permit = pending_permit;
+            // Counted against the Staging_Bound until the store has committed or aborted.
+            let _staging_admission = staging_admission;
             let _ = Self::run_streaming_cache_write(
                 cache_key,
                 sink,
@@ -5753,6 +5853,21 @@ impl SignedPutHandler {
         Option<tokio::sync::mpsc::Sender<Bytes>>,
         Option<tokio::sync::oneshot::Sender<Result<ResponseInfo>>>,
     ) {
+        // As for an upload whose CreateMultipartUpload wrote its tracker: a part of an upload
+        // with none is not staged, which would decline every part these tests drive.
+        if !mpu_upload_dir(&self.cache_dir, upload_id)
+            .join("upload.meta")
+            .exists()
+        {
+            self.create_multipart_upload_tracker_with_content_type(
+                cache_key,
+                upload_id,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .expect("fixture: the upload's tracker is written");
+        }
         let (tee, result, _setup_done) = self
             .setup_upload_part_cache_tee_tracked(
                 cache_key,
@@ -5770,10 +5885,9 @@ impl SignedPutHandler {
     /// the background setup has finished, whether it opened the sink or declined.
     ///
     /// `handle_upload_part` waits on it, for at most [`WRITE_CACHE_SETUP_WAIT_BOUND`],
-    /// before answering the client. The part's upload directory is created by that setup,
-    /// and `CompleteMultipartUpload` declines to cache an upload whose directory does not
-    /// exist, so answering a small part before its setup finished would let a client's
-    /// immediate Complete find no directory and leave the object uncached.
+    /// before answering the client. The part's sink is opened by that setup, so answering a
+    /// small part before its setup finished would let a client's immediate Complete find the
+    /// part missing and leave the object uncached.
     async fn setup_upload_part_cache_tee_tracked(
         &self,
         cache_key: &str,
@@ -5836,30 +5950,57 @@ impl SignedPutHandler {
             let setup_manager = cache_manager.clone();
             let setup_key = task_key.clone();
             let setup_upload = task_upload.clone();
+            // The staged-share cap, before the tracking admission and the sink open. A declined
+            // part is not staged, so the upload can no longer be cached: its staging directory
+            // is removed, as for a full tracking cap, and its Complete then finds no tracker
+            // and forwards uncached. A part of the same upload past admission may recreate the
+            // directory; Complete, Abort or the sweep removes it.
+            let staging_admission =
+                match setup_manager.staging_bound_admission(decoded_len.unwrap_or(0)) {
+                    Ok(admission) => admission,
+                    Err(reason) => {
+                        if let Some(metrics) = &metrics_manager {
+                            metrics.read().await.record_skipped_put(reason).await;
+                        }
+                        drop(permit);
+                        let upload_dir = mpu_upload_dir(&cache_dir, &task_upload);
+                        let upload = task_upload.clone();
+                        tokio::spawn(async move {
+                            remove_upload_dir_aside(&upload_dir, &upload).await;
+                        });
+                        return;
+                    }
+                };
             // As for a PUT: the permit lives inside the setup future, so an abandoned setup
             // holds it until it finishes, and on success it moves into the store task.
             // Every early return below releases it.
             let budget_dir = cache_dir.clone();
             let opened = bounded_cache_setup(WRITE_CACHE_SETUP_BOUND, &task_key, async move {
                 let permit = permit;
+                // A part of an upload with no tracker is not staged. Its CreateMultipartUpload
+                // wrote none (declined by the staged-share cap, disk safety, the backlog or the
+                // tracking cap, a failed write, or never seen by this fleet), or a declined part
+                // removed it, so its Complete declines to cache the upload whatever is staged,
+                // and staged parts would only hold bytes against the Staging_Bound until then.
+                let tracked = tokio::fs::try_exists(
+                    mpu_upload_dir(&budget_dir, &setup_upload).join("upload.meta"),
+                )
+                .await
+                .unwrap_or(false);
+                if !tracked {
+                    return (Ok(None), permit);
+                }
                 // Admitted before the sink opens, so a refused part creates nothing under
-                // `mpus_in_progress/` (MAX_TRACKED_MULTIPART_ENTRIES).
-                // A part whose upload directory does not exist yet creates it as well as its
-                // record, so it is charged both entries.
-                let directory_exists =
-                    tokio::fs::try_exists(mpu_upload_dir(&budget_dir, &setup_upload))
-                        .await
-                        .unwrap_or(false);
-                let charged = if directory_exists { 1 } else { 2 };
-                let tracking_slot =
-                    match tracked_multipart_budget::admit(&budget_dir, charged).await {
-                        Ok(slot) => slot,
-                        Err(refusal) => return (Err(refusal), permit),
-                    };
+                // `mpus_in_progress/` (MAX_TRACKED_MULTIPART_ENTRIES). The upload directory
+                // exists, since its tracker does, so the part is charged its record only.
+                let tracking_slot = match tracked_multipart_budget::admit(&budget_dir, 1).await {
+                    Ok(slot) => slot,
+                    Err(refusal) => return (Err(refusal), permit),
+                };
                 let opened = setup_manager
                     .open_multipart_part_sink(&setup_key, &setup_upload, part_number, decoded_len)
                     .await;
-                (Ok((opened, tracking_slot)), permit)
+                (Ok(Some((opened, tracking_slot))), permit)
             })
             .await;
             // Every early return below drops `tee_rx` and `s3_result_rx`: the relay sees a
@@ -5868,7 +6009,15 @@ impl SignedPutHandler {
                 return;
             };
             let (opened, tracking_slot) = match opened {
-                Ok(admitted) => admitted,
+                Ok(Some(admitted)) => admitted,
+                Ok(None) => {
+                    debug!(
+                        "Streaming UploadPart: the upload has no tracker, so the part is not \
+                         staged (upload unaffected): cache_key={}, upload_id={}, part_number={}",
+                        task_key, task_upload, part_number
+                    );
+                    return;
+                }
                 Err(refusal) => {
                     note_tracked_multipart_refusal(
                         &metrics_manager,
@@ -5936,6 +6085,7 @@ impl SignedPutHandler {
                 capacity_budget,
                 permit,
                 tracking_slot,
+                staging_admission,
             );
             setup_ready.store(true, std::sync::atomic::Ordering::Release);
         });
@@ -5961,10 +6111,13 @@ impl SignedPutHandler {
         capacity_budget: Option<StreamingCapacityBudget>,
         pending_permit: tokio::sync::OwnedSemaphorePermit,
         tracking_slot: tracked_multipart_budget::Slot,
+        staging_admission: crate::cache::StagingAdmission,
     ) {
         tokio::spawn(async move {
             // Counted against MAX_TRACKED_MULTIPART_ENTRIES until this task ends.
             let _tracking_slot = tracking_slot;
+            // Counted against the Staging_Bound until the part store has committed or aborted.
+            let _staging_admission = staging_admission;
             // Released when the part store's last step has run: when this task ends, or,
             // if the part finalize outlives its timeout, when that blocking step ends.
             let _ = Self::run_streaming_part_cache_write(
@@ -6574,8 +6727,9 @@ const TRACKED_MULTIPART_REFUSAL_WARN_INTERVAL: std::time::Duration =
 ///   `in flight` those still running. Both count an admission whether or not it left an entry,
 ///   so this process's own error is an over-count until the next walk, the safe direction.
 /// - An admission is charged every entry it can create: one for a tracker write, one for a part
-///   record, and one more when the part's upload directory does not exist yet, because the part
-///   store creates it.
+///   record. A part is staged only into an upload whose tracker exists, so its directory exists
+///   too; a part admitted just before a sibling's decline removes the directory recreates it
+///   uncharged, counted from the next walk.
 ///
 /// Overshoot: another proxy's admissions since this proxy's walk began are not seen until the
 /// next walk. Each proxy stops admitting once its own figure reaches the cap, so between two
@@ -10153,6 +10307,61 @@ mod tests {
         );
     }
 
+    /// An upload refused for size records eviction demand only when the write cache's allocation
+    /// could hold it: staged bytes plus its size within `write_cache_percent` x `max_cache_size`.
+    /// Beyond that it records nothing, so the read tier evicts nothing for an upload that would
+    /// be forwarded uncached anyway.
+    #[test]
+    fn a_router_size_refusal_records_demand_only_within_the_write_cache_allocation() {
+        const MAX: u64 = 10_000_000;
+        const WRITE_CACHE_BOUND: u64 = 1_000_000; // 10% of MAX
+        const STAGED: u64 = 600_000;
+        let temp_dir = TempDir::new().unwrap();
+        crate::cache::register_eviction_demand(temp_dir.path(), MAX, 80);
+        crate::cache::register_upload_allocation(temp_dir.path(), WRITE_CACHE_BOUND);
+        crate::cache::note_staged_bytes(temp_dir.path(), STAGED);
+        let handler = SignedPutHandler::new(
+            temp_dir.path().to_path_buf(),
+            CompressionHandler::new(1024, true),
+            9_800_000,
+            MAX,
+            None,
+            10 * 1024 * 1024,
+            5,
+        );
+        let bypassed = |d: &CacheDecision| matches!(d, CacheDecision::Bypass(_));
+        // 600,000 staged + 700,000 is over the 1,000,000 allocation.
+        let beyond = handler.should_cache(Some(700_000));
+        let after_beyond = crate::cache::eviction_demand(temp_dir.path());
+        // 600,000 staged + 300,000 fits.
+        let within = handler.should_cache(Some(300_000));
+        let after_within = crate::cache::eviction_demand(temp_dir.path());
+        // A read fill's refusal is unchanged: it records whatever the write cache holds.
+        crate::cache::note_size_refusal(temp_dir.path(), 700_000);
+        let after_read_fill = crate::cache::eviction_demand(temp_dir.path());
+        let observed = (
+            bypassed(&beyond),
+            after_beyond,
+            bypassed(&within),
+            after_within,
+            after_read_fill,
+        );
+        assert_eq!(
+            observed,
+            (true, 0, true, 300_000, 700_000),
+            "(refused beyond the allocation, demand after it, refused within it, demand after \
+             it, demand after a read fill's refusal of the larger size)"
+        );
+    }
+    /// With no staged figure known yet, an upload refusal records demand as before (fail open).
+    #[test]
+    fn an_upload_refusal_records_demand_before_any_staged_figure_is_known() {
+        let temp_dir = TempDir::new().unwrap();
+        crate::cache::register_eviction_demand(temp_dir.path(), 10_000_000, 80);
+        crate::cache::register_upload_allocation(temp_dir.path(), 1_000_000);
+        crate::cache::note_upload_size_refusal(temp_dir.path(), 900_000);
+        assert_eq!(crate::cache::eviction_demand(temp_dir.path()), 900_000);
+    }
     #[test]
     fn test_should_cache_without_content_length() {
         let temp_dir = TempDir::new().unwrap();
@@ -17688,6 +17897,16 @@ mod tests {
         let part_body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
         let part_etag = "\"scnb-part-etag-1\"";
 
+        // The CreateMultipartUpload record, without which no part stages and Complete does not cache.
+        handler
+            .create_multipart_upload_tracker_with_content_type(
+                cache_key,
+                DOTDOT_UPLOAD_ID,
+                None,
+                &HashMap::from([("content-type".to_string(), DEFAULT_CONTENT_TYPE.to_string())]),
+            )
+            .await
+            .unwrap();
         // ---- UploadPart ----
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -17721,17 +17940,6 @@ mod tests {
         .expect("UploadPart must reach the mock upstream");
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
-
-        // The CreateMultipartUpload record, without which Complete does not cache.
-        handler
-            .create_multipart_upload_tracker_with_content_type(
-                cache_key,
-                DOTDOT_UPLOAD_ID,
-                None,
-                &HashMap::from([("content-type".to_string(), DEFAULT_CONTENT_TYPE.to_string())]),
-            )
-            .await
-            .unwrap();
 
         // ---- CompleteMultipartUpload ----
         let complete_body = format!(
@@ -19230,6 +19438,19 @@ mod tests {
             let part_body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
             let part_etag = "\"case74-part-etag-1\"";
 
+            // The CreateMultipartUpload record, without which no part stages and Complete does not cache.
+            handler
+                .create_multipart_upload_tracker_with_content_type(
+                    &cache_key,
+                    &upload_id,
+                    None,
+                    &HashMap::from([(
+                        "content-type".to_string(),
+                        DEFAULT_CONTENT_TYPE.to_string(),
+                    )]),
+                )
+                .await
+                .unwrap();
             // Stage part 1. Its store takes the one permit and returns it when it ends.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -19280,20 +19501,6 @@ mod tests {
                 None
             };
             let skipped_before = skipped_put_count(&metrics, BACKLOG_FULL_SKIP_REASON).await;
-
-            // The CreateMultipartUpload record, without which Complete does not cache.
-            handler
-                .create_multipart_upload_tracker_with_content_type(
-                    &cache_key,
-                    &upload_id,
-                    None,
-                    &HashMap::from([(
-                        "content-type".to_string(),
-                        DEFAULT_CONTENT_TYPE.to_string(),
-                    )]),
-                )
-                .await
-                .unwrap();
 
             let complete_body = format!(
                 "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
@@ -19534,9 +19741,12 @@ mod tests {
                 await_permit(permits.clone()).await,
                 "fixture: the part store never returned its permit"
             );
-            assert!(
-                mpu_upload_dir(&cache_dir, &upload_id).exists(),
-                "fixture: the part staged (parts stage without a tracker)"
+            assert_eq!(
+                mpu_upload_dir(&cache_dir, &upload_id)
+                    .join("part1.json")
+                    .exists(),
+                !full_at_create,
+                "fixture: the part stages only into an upload whose Create wrote its tracker"
             );
 
             // ---- CompleteMultipartUpload ----
@@ -19745,7 +19955,829 @@ mod tests {
         );
     }
 
-    /// the fleet-wide cap on in-progress multipart entries
+    /// The staged-share admission cap (`CacheManager::staging_bound_admission`): once the fold's
+    /// staged figure reaches the Staging_Bound, write-through caching is declined and the upload
+    /// is forwarded and answered unchanged.
+    mod staging_bound_cap {
+        use super::*;
+        /// `max_cache_size`; the fixture's `write_cache_percent` is 10, so the bound is 4 MiB.
+        const MAX_CACHE_SIZE: u64 = 40 * 1024 * 1024;
+        const BOUND: u64 = MAX_CACHE_SIZE / 10;
+        const HOST: &str = "test-bucket.s3.amazonaws.com";
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        struct Fixture {
+            _temp: TempDir,
+            dir: std::path::PathBuf,
+            manager: Arc<crate::cache::CacheManager>,
+            handler: SignedPutHandler,
+            metrics: Arc<RwLock<MetricsManager>>,
+        }
+
+        async fn fixture() -> Fixture {
+            let temp = TempDir::new().unwrap();
+            let dir = temp.path().to_path_buf();
+            // Free-space floor 0, so the host's free space is no input to any verdict below.
+            let manager =
+                initialized_accounting_cache_manager_with_floor(dir.clone(), MAX_CACHE_SIZE, 0)
+                    .await;
+            assert_eq!(
+                manager.get_staging_bound_bytes(),
+                BOUND,
+                "fixture precondition: the Staging_Bound is 10% of max_cache_size"
+            );
+            let mut handler = write_through_handler(&dir, &manager, u64::MAX);
+            let metrics = Arc::new(RwLock::new(MetricsManager::new()));
+            handler.set_metrics_manager(metrics.clone());
+            Fixture {
+                _temp: temp,
+                dir,
+                manager,
+                handler,
+                metrics,
+            }
+        }
+
+        /// The staged figure a derivation started now reads, `F + post-cut pending + P`, and
+        /// leaves in this process's memo for the cap.
+        async fn staged_now(dir: &std::path::Path) -> u64 {
+            crate::staged_fold::invalidate_authority_snapshot_for_tests(dir);
+            let figure = crate::staged_fold::authority_figure_for_tests(dir)
+                .await
+                .expect("the fixture's checkpoint set is complete, so the figure must derive");
+            figure.resident_staged_bytes + figure.in_progress_part_bytes
+        }
+
+        /// Seed a shard checkpoint of `bytes` staged bytes on a bucket no test writes, and
+        /// derive the figure into the memo. Returns the derived figure, which also holds what
+        /// earlier writes in the test staged.
+        async fn seed_staged(dir: &std::path::Path, bytes: u64) -> u64 {
+            crate::staged_fold::seed_shard_figure_for_tests(dir, "seed-bucket", "01", bytes, 1);
+            crate::staged_fold::invalidate_budget_snapshot_for_tests(dir);
+            let staged = staged_now(dir).await;
+            assert!(
+                staged >= bytes,
+                "fixture precondition: the memo must hold the seeded figure, read {staged} \
+                 against {bytes} seeded"
+            );
+            staged
+        }
+
+        /// `len` pseudo-random bytes. The staged figure counts the bytes stored, after LZ4, and a
+        /// periodic body compresses to almost nothing, so a fill that must move the figure by its
+        /// offered size needs bytes that do not compress.
+        fn incompressible(len: usize, seed: u64) -> Vec<u8> {
+            let mut state = seed | 1;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect()
+        }
+
+        async fn staging_bound_skips(f: &Fixture) -> u64 {
+            skipped_put_count(&f.metrics, crate::cache::STAGING_BOUND_SKIP_REASON).await
+        }
+
+        /// Wait until `staging_bound` has counted `n` declines, at most 5 s.
+        async fn wait_for_skips(f: &Fixture, n: u64) -> u64 {
+            let mut seen = 0;
+            for _ in 0..100 {
+                seen = staging_bound_skips(f).await;
+                if seen >= n {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            seen
+        }
+
+        /// Wait until a GET of `key` is served `want` from the cache, at most 5 s.
+        async fn wait_until_served(dir: &std::path::Path, key: &str, want: &[u8]) -> bool {
+            for _ in 0..100 {
+                if served_from_cache(dir, key).await.as_deref() == Some(want) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        /// One single-part PUT of `test-bucket/{name}` against a stub S3 that answers 200 with
+        /// its own ETag. Returns the status and the ETag the client received.
+        async fn put(f: &mut Fixture, name: &str, body: Vec<u8>) -> (StatusCode, Option<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let etag = format!("\"{name}-etag\"");
+            let upstream = tokio::spawn(accept_drain_and_reply(
+                listener,
+                body.len(),
+                put_ok_reply(&etag),
+            ));
+            let (req, _keepalive) =
+                incoming_request_with_method("PUT", &format!("/{name}"), body).await;
+            let resp = tokio::time::timeout(
+                WAIT,
+                f.handler.handle_signed_put(
+                    req,
+                    format!("test-bucket/{name}"),
+                    HOST.to_string(),
+                    transport_for(addr),
+                ),
+            )
+            .await
+            .expect("PUT did not finish within 60s")
+            .expect("PUT must reach the stub S3");
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            (resp.status(), etag)
+        }
+
+        async fn upload_part(
+            f: &mut Fixture,
+            key: &str,
+            path: &str,
+            upload_id: &str,
+            part_number: u32,
+            body: Vec<u8>,
+        ) -> (StatusCode, Option<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let etag = format!("\"part-{part_number}-etag\"");
+            let upstream = tokio::spawn(accept_drain_and_reply(
+                listener,
+                body.len(),
+                format!("HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: 0\r\n\r\n")
+                    .into_bytes(),
+            ));
+            let (req, _keepalive) = incoming_upload_part_request(
+                &format!("{path}?uploadId={upload_id}&partNumber={part_number}"),
+                body,
+            )
+            .await;
+            let resp = tokio::time::timeout(
+                WAIT,
+                f.handler.handle_upload_part(
+                    req,
+                    key.to_string(),
+                    HOST.to_string(),
+                    transport_for(addr),
+                    upload_id.to_string(),
+                    part_number,
+                ),
+            )
+            .await
+            .expect("UploadPart did not finish within 60s")
+            .expect("UploadPart must reach the stub S3");
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            (resp.status(), etag)
+        }
+
+        async fn create_upload(f: &mut Fixture, key: &str, path: &str, upload_id: &str) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(accept_and_reply_initiate_multipart(
+                listener,
+                upload_id.to_string(),
+            ));
+            let (req, _keepalive) =
+                incoming_request_with_method("POST", &format!("{path}?uploads"), Vec::new()).await;
+            let resp = tokio::time::timeout(
+                WAIT,
+                f.handler.handle_create_multipart_upload(
+                    req,
+                    key.to_string(),
+                    HOST.to_string(),
+                    transport_for(addr),
+                ),
+            )
+            .await
+            .expect("CreateMultipartUpload did not finish within 60s")
+            .expect("CreateMultipartUpload must reach the stub S3");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "the client gets S3's CreateMultipartUpload answer"
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
+        }
+
+        /// The cap's PUT site: at the bound, a PUT is forwarded uncached, the client gets S3's
+        /// answer, the staged figure does not move, and `staging_bound` counts it once.
+        #[tokio::test]
+        async fn a_put_at_the_staging_bound_is_forwarded_uncached_and_adds_no_staged_bytes() {
+            let mut f = fixture().await;
+            let before = seed_staged(&f.dir, BOUND).await;
+            let body: Vec<u8> = (0..65_536u32).map(|i| (i % 251) as u8).collect();
+            let (status, etag) = put(&mut f, "over-cap", body).await;
+            assert_eq!(status, StatusCode::OK, "the PUT succeeds at S3");
+            assert_eq!(
+                etag.as_deref(),
+                Some("\"over-cap-etag\""),
+                "the client receives S3's answer unchanged"
+            );
+            // Wait for the decline to be counted (at most 5 s), then give a store that was
+            // started anyway time to publish, so "not cached" is not "not cached yet".
+            let counted = wait_for_skips(&f, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert_eq!(
+                served_from_cache(&f.dir, "test-bucket/over-cap").await,
+                None,
+                "a PUT at the staging bound must not be write-through cached"
+            );
+            assert_eq!(
+                staged_now(&f.dir).await,
+                before,
+                "a declined PUT must add no staged bytes"
+            );
+            assert_eq!(
+                counted, 1,
+                "the declined store must be counted under staging_bound"
+            );
+            assert_eq!(
+                staging_bound_skips(&f).await,
+                1,
+                "one declined store moves the counter exactly once"
+            );
+            assert_eq!(
+                skipped_put_count(&f.metrics, crate::cache::DISK_SAFETY_SKIP_REASON).await,
+                0,
+                "the decline is the cap's, not disk safety's"
+            );
+        }
+
+        /// Control: below the bound a PUT is still write-through cached and its bytes enter
+        /// the staged figure.
+        #[tokio::test]
+        async fn a_put_below_the_staging_bound_is_still_staged() {
+            let mut f = fixture().await;
+            let body: Vec<u8> = (0..65_536u32).map(|i| (i % 241) as u8).collect();
+            let before = seed_staged(&f.dir, BOUND - 4 * body.len() as u64).await;
+            let (status, _) = put(&mut f, "under-cap", body.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                wait_until_served(&f.dir, "test-bucket/under-cap", &body).await,
+                "a PUT below the staging bound must be write-through cached"
+            );
+            // The PUT's credit reaches the figure through the Write_Ledger's pending stage, on
+            // its own task, which can land after the entry is first served when the binary is
+            // loaded. Wait for the figure to rise, bounded, rather than read it once.
+            let started = std::time::Instant::now();
+            let mut after = staged_now(&f.dir).await;
+            while after <= before && started.elapsed() < std::time::Duration::from_secs(10) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                after = staged_now(&f.dir).await;
+            }
+            assert!(
+                after > before,
+                "the cached PUT's bytes must enter the staged figure: {before} -> {after} \
+                 (waited {:?})",
+                started.elapsed()
+            );
+            assert_eq!(staging_bound_skips(&f).await, 0, "nothing was declined");
+        }
+
+        /// Fail open: with no staged figure known in this process, the cap admits. Once a
+        /// figure is known, the same over-bound state declines.
+        #[tokio::test]
+        async fn before_any_staged_figure_is_known_the_cap_admits() {
+            let mut f = fixture().await;
+            crate::staged_fold::seed_shard_figure_for_tests(
+                &f.dir,
+                "seed-bucket",
+                "01",
+                2 * BOUND,
+                1,
+            );
+            crate::staged_fold::invalidate_budget_snapshot_for_tests(&f.dir);
+            crate::staged_fold::invalidate_authority_snapshot_for_tests(&f.dir);
+            assert!(
+                crate::staged_fold::authority_memo_or_last_complete(&f.dir).is_none(),
+                "fixture precondition: no staged figure is known in this process"
+            );
+            let body: Vec<u8> = (0..32_768u32).map(|i| (i % 239) as u8).collect();
+            let (status, _) = put(&mut f, "unknown-figure", body.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                wait_until_served(&f.dir, "test-bucket/unknown-figure", &body).await,
+                "with no staged figure known the cap must fail open and cache the PUT"
+            );
+            assert_eq!(staging_bound_skips(&f).await, 0, "nothing was declined");
+            // The admission started a derivation; once its figure is installed the cap engages.
+            let mut known = false;
+            for _ in 0..100 {
+                if crate::staged_fold::authority_memo_or_last_complete(&f.dir).is_some() {
+                    known = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(
+                known,
+                "an admission with no figure must start its derivation"
+            );
+            let (status, _) = put(&mut f, "known-figure", body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                wait_for_skips(&f, 1).await,
+                1,
+                "once the over-bound figure is known, the next PUT is declined"
+            );
+        }
+
+        /// The cap's CreateMultipartUpload site: at the bound no tracker is written, so the
+        /// upload is not cached, and the client gets S3's answer.
+        #[tokio::test]
+        async fn create_multipart_upload_at_the_staging_bound_writes_no_tracker() {
+            let mut f = fixture().await;
+            seed_staged(&f.dir, BOUND).await;
+            let upload_id = "cap-create-upload";
+            create_upload(&mut f, "test-bucket/cap-create", "/cap-create", upload_id).await;
+            let counted = wait_for_skips(&f, 1).await;
+            assert!(
+                !mpu_upload_dir(&f.dir, upload_id)
+                    .join("upload.meta")
+                    .exists(),
+                "at the staging bound CreateMultipartUpload must write no upload tracker"
+            );
+            assert_eq!(
+                counted, 1,
+                "the declined CreateMultipartUpload is counted once under staging_bound"
+            );
+            assert_eq!(
+                skipped_put_count(&f.metrics, crate::cache::DISK_SAFETY_SKIP_REASON).await,
+                0,
+                "the decline is the cap's, not disk safety's"
+            );
+        }
+
+        /// The cap's UploadPart site: an upload whose first part staged below the bound and
+        /// whose second part arrives at it. The second part is not staged, the upload's staged
+        /// parts are removed, the client gets S3's answers, and nothing is published at
+        /// Complete, so a GET misses and is served by S3.
+        #[tokio::test]
+        async fn a_multipart_upload_crossing_the_staging_bound_is_not_cached() {
+            let mut f = fixture().await;
+            let key = "test-bucket/cap-cross";
+            let path = "/cap-cross";
+            let upload_id = "cap-cross-upload";
+            let upload_dir = mpu_upload_dir(&f.dir, upload_id);
+            seed_staged(&f.dir, BOUND - 1024 * 1024).await;
+            create_upload(&mut f, key, path, upload_id).await;
+            assert!(
+                upload_dir.join("upload.meta").exists(),
+                "fixture precondition: below the bound the upload tracker is written"
+            );
+            let part1: Vec<u8> = (0..65_536u32).map(|i| (i % 233) as u8).collect();
+            let part2: Vec<u8> = (0..65_536u32).map(|i| (i % 229) as u8).collect();
+            let (status, _) = upload_part(&mut f, key, path, upload_id, 1, part1).await;
+            assert_eq!(status, StatusCode::OK);
+            let mut staged = false;
+            for _ in 0..100 {
+                if upload_dir.join("part1.json").exists() {
+                    staged = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(
+                staged,
+                "fixture precondition: part 1 stages below the bound"
+            );
+
+            // The staged share reaches the bound.
+            seed_staged(&f.dir, BOUND).await;
+            let (status, etag) = upload_part(&mut f, key, path, upload_id, 2, part2).await;
+            assert_eq!(status, StatusCode::OK, "part 2 succeeds at S3");
+            assert_eq!(
+                etag.as_deref(),
+                Some("\"part-2-etag\""),
+                "the client receives S3's UploadPart answer unchanged"
+            );
+            let counted = wait_for_skips(&f, 1).await;
+            let mut removed = false;
+            for _ in 0..100 {
+                if !upload_dir.exists() {
+                    removed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            let complete_body = b"<CompleteMultipartUpload>\
+                 <Part><PartNumber>1</PartNumber><ETag>\"part-1-etag\"</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>\"part-2-etag\"</ETag></Part>\
+                 </CompleteMultipartUpload>"
+                .to_vec();
+            let result_xml = "<CompleteMultipartUploadResult><Bucket>test-bucket</Bucket>\
+                              <Key>cap-cross</Key><ETag>\"cap-cross-2\"</ETag>\
+                              </CompleteMultipartUploadResult>";
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(accept_drain_and_reply(
+                listener,
+                complete_body.len(),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+                    result_xml.len(),
+                    result_xml
+                )
+                .into_bytes(),
+            ));
+            let (req, _keepalive) = incoming_request_with_method(
+                "POST",
+                &format!("{path}?uploadId={upload_id}"),
+                complete_body,
+            )
+            .await;
+            let resp = tokio::time::timeout(
+                WAIT,
+                f.handler.handle_complete_multipart_upload(
+                    req,
+                    key.to_string(),
+                    HOST.to_string(),
+                    transport_for(addr),
+                    upload_id.to_string(),
+                ),
+            )
+            .await
+            .expect("CompleteMultipartUpload did not finish within 60s")
+            .expect("CompleteMultipartUpload must reach the stub S3");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                body.as_ref(),
+                result_xml.as_bytes(),
+                "the client receives S3's CompleteMultipartUpload answer unchanged"
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
+            // Time for a finalization that runs anyway to publish.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert_eq!(
+                served_from_cache(&f.dir, key).await,
+                None,
+                "an upload with a part declined at the staging bound must not be cached, so a \
+                 GET misses and S3 serves the object"
+            );
+            assert!(
+                removed,
+                "a part declined at the staging bound must remove the upload's staged parts"
+            );
+            assert_eq!(
+                counted, 1,
+                "the declined part is counted once under staging_bound"
+            );
+            assert_eq!(
+                staging_bound_skips(&f).await,
+                1,
+                "Complete does not count under staging_bound"
+            );
+        }
+
+        /// Uploads admitted concurrently against one figure: S3 accepts none of them until every
+        /// admission has been decided, so none commits first and the figure sees none of them.
+        /// The admitted uploads' declared sizes count against the bound, so once they have all
+        /// committed the staged total is within the bound itself, whatever the concurrency.
+        #[tokio::test]
+        async fn concurrent_uploads_admitted_against_one_figure_stay_within_the_bound() {
+            const UPLOADS: usize = 6;
+            // Not a power of two, so the admitted uploads leave room below the bound for any
+            // per-file overhead the stored figure counts.
+            const PUT_BYTES: usize = 1_000_000;
+            let f = fixture().await;
+            assert_eq!(
+                seed_staged(&f.dir, 0).await,
+                0,
+                "fixture precondition: the figure is known and empty"
+            );
+            assert!(
+                (UPLOADS * PUT_BYTES) as u64 > BOUND,
+                "fixture: the uploads together must exceed the bound, or the test is vacuous"
+            );
+            let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+            let mut puts = Vec::new();
+            for i in 0..UPLOADS {
+                let mut handler = write_through_handler(&f.dir, &f.manager, u64::MAX);
+                handler.set_metrics_manager(f.metrics.clone());
+                let body = incompressible(PUT_BYTES, 0x5eed_0000 + i as u64);
+                let mut release = release_rx.clone();
+                puts.push(tokio::spawn(async move {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let name = format!("concurrent-{i}");
+                    let etag = format!("\"{name}-etag\"");
+                    let len = body.len();
+                    // S3 takes the connection only once released, so no upload commits before
+                    // every admission has been decided.
+                    let upstream = tokio::spawn(async move {
+                        while !*release.borrow_and_update() {
+                            if release.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        accept_drain_and_reply(listener, len, put_ok_reply(&etag)).await
+                    });
+                    let (req, keepalive) =
+                        incoming_request_with_method("PUT", &format!("/{name}"), body).await;
+                    let resp = tokio::time::timeout(
+                        WAIT,
+                        handler.handle_signed_put(
+                            req,
+                            format!("test-bucket/{name}"),
+                            HOST.to_string(),
+                            transport_for(addr),
+                        ),
+                    )
+                    .await
+                    .expect("PUT did not finish within 60s")
+                    .expect("PUT must reach the stub S3");
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
+                    drop(keepalive);
+                    resp.status()
+                }));
+            }
+            let mut decided = 0;
+            for _ in 0..200 {
+                let admitted = f.manager.staging_admitted_bytes_for_tests() / PUT_BYTES as u64;
+                decided = admitted + staging_bound_skips(&f).await;
+                if decided >= UPLOADS as u64 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                decided, UPLOADS as u64,
+                "fixture precondition: every upload's admission is decided while S3 holds its \
+                 answer"
+            );
+            let admitted_bytes = f.manager.staging_admitted_bytes_for_tests();
+            release_tx.send(true).unwrap();
+            for put in puts {
+                assert_eq!(put.await.unwrap(), StatusCode::OK, "every upload succeeds");
+            }
+            let mut released = false;
+            for _ in 0..200 {
+                if f.manager.staging_admitted_bytes_for_tests() == 0 {
+                    released = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(
+                released,
+                "every admitted store must release its admission once it commits"
+            );
+            let staged = staged_now(&f.dir).await;
+            let declined = staging_bound_skips(&f).await;
+            println!(
+                "concurrent admission: staged {staged}, bound {BOUND}, admitted {admitted_bytes} \
+                 bytes in flight at once, {declined} of {UPLOADS} declined"
+            );
+            assert!(
+                staged >= PUT_BYTES as u64,
+                "fixture: the admitted uploads must be staged, staged {staged}"
+            );
+            assert!(
+                staged <= BOUND,
+                "uploads admitted against one figure must stay within the bound: staged \
+                 {staged}, bound {BOUND}, {admitted_bytes} admitted at once, {declined} of \
+                 {UPLOADS} declined"
+            );
+        }
+        /// Parts of an upload whose CreateMultipartUpload the cap declined are not staged, even
+        /// once the figure is back below the bound: the upload has no tracker, so its Complete
+        /// declines to cache it whatever is staged, and staged parts would only hold bytes
+        /// against the bound until then.
+        #[tokio::test]
+        async fn parts_of_an_upload_whose_create_the_cap_declined_are_not_staged() {
+            let mut f = fixture().await;
+            let key = "test-bucket/cap-declined-create";
+            let path = "/cap-declined-create";
+            let upload_id = "cap-declined-create-upload";
+            let upload_dir = mpu_upload_dir(&f.dir, upload_id);
+            seed_staged(&f.dir, BOUND).await;
+            create_upload(&mut f, key, path, upload_id).await;
+            assert_eq!(
+                wait_for_skips(&f, 1).await,
+                1,
+                "fixture precondition: the cap declined the CreateMultipartUpload"
+            );
+            assert!(
+                !upload_dir.join("upload.meta").exists(),
+                "fixture precondition: the declined Create wrote no tracker"
+            );
+            // Staging eviction has brought the figure back below the bound.
+            let before = seed_staged(&f.dir, 0).await;
+            let part = incompressible(256 * 1024, 0x0dd_ba11);
+            assert!(
+                before + part.len() as u64 <= BOUND,
+                "fixture precondition: the cap would admit the part, figure {before}"
+            );
+            let (status, etag) = upload_part(&mut f, key, path, upload_id, 1, part).await;
+            assert_eq!(status, StatusCode::OK, "the part succeeds at S3");
+            assert_eq!(
+                etag.as_deref(),
+                Some("\"part-1-etag\""),
+                "the client receives S3's UploadPart answer unchanged"
+            );
+            // Time for a part store that was started anyway to record the part.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert!(
+                !upload_dir.join("part1.json").exists(),
+                "a part of an upload with no tracker must not be staged: {:?}",
+                std::fs::read_dir(&upload_dir)
+                    .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            );
+            assert_eq!(
+                staged_now(&f.dir).await,
+                before,
+                "the part must add nothing to the staged figure"
+            );
+            assert_eq!(
+                staging_bound_skips(&f).await,
+                1,
+                "the part is not counted as a cap decline"
+            );
+        }
+        /// The cap runs before disk safety, so an upload it declines records no eviction demand
+        /// even when disk safety would refuse it too: evicting read-cache data cannot make room
+        /// in the write cache. The end of the test shows disk safety's own refusal of the same
+        /// upload does record demand, so the unchanged figure is not a fixture that records none.
+        #[tokio::test]
+        async fn an_upload_the_cap_declines_records_no_eviction_demand_when_disk_safety_also_refuses(
+        ) {
+            const UPLOAD: usize = 64 * 1024;
+            let mut f = fixture().await;
+            // The whole cache is at max_cache_size, so disk safety refuses any upload.
+            let state = crate::journal_consolidator::SizeState {
+                total_size: MAX_CACHE_SIZE,
+                ..crate::journal_consolidator::SizeState::default()
+            };
+            let size_dir = f.dir.join("size_tracking");
+            std::fs::create_dir_all(&size_dir).unwrap();
+            std::fs::write(
+                size_dir.join("size_state.json"),
+                serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                f.manager.start_put_usage_refresher(),
+            )
+            .await
+            .expect("the usage refresher's first read must finish within 30s");
+            seed_staged(&f.dir, BOUND).await;
+            let demand_before = crate::cache::eviction_demand(&f.dir);
+            let body = incompressible(UPLOAD, 0xdead_beef);
+            let (status, _) = put(&mut f, "cap-and-disk-safety", body).await;
+            assert_eq!(status, StatusCode::OK, "the PUT succeeds at S3");
+            assert_eq!(
+                wait_for_skips(&f, 1).await,
+                1,
+                "the cap declines the upload"
+            );
+            assert_eq!(
+                (
+                    crate::cache::eviction_demand(&f.dir),
+                    skipped_put_count(&f.metrics, crate::cache::DISK_SAFETY_SKIP_REASON).await
+                ),
+                (demand_before, 0),
+                "(eviction demand, disk_safety skips): an upload the cap declines must record no \
+                 eviction demand and not reach disk safety"
+            );
+            // Control: disk safety refusing the same upload records demand in this fixture.
+            assert_eq!(
+                f.manager.disk_safety_refusal(UPLOAD as u64).await,
+                Some(crate::cache::DISK_SAFETY_SKIP_REASON),
+                "fixture precondition: disk safety refuses the upload"
+            );
+            assert!(
+                crate::cache::eviction_demand(&f.dir) > demand_before,
+                "fixture precondition: disk safety's refusal records eviction demand here, \
+                 demand {} against {demand_before} before",
+                crate::cache::eviction_demand(&f.dir)
+            );
+        }
+        /// The cap's level is the bound itself, not the eviction trigger: with the figure past
+        /// the trigger, an upload that brings it to exactly the bound is admitted and one byte
+        /// more is declined. While the admitted upload is in flight the figure counts as at the
+        /// bound; once it is dropped (an abort) its bytes are free again.
+        #[tokio::test]
+        async fn the_cap_admits_up_to_the_bound_exactly_and_not_past_it() {
+            const UPLOAD: u64 = 64 * 1024;
+            let f = fixture().await;
+            let staged = seed_staged(&f.dir, BOUND - UPLOAD).await;
+            assert_eq!(
+                staged,
+                BOUND - UPLOAD,
+                "fixture precondition: nothing else is staged"
+            );
+            let (trigger, _) = f.manager.get_staging_eviction_thresholds();
+            assert!(
+                staged > trigger,
+                "fixture precondition: the figure is past the eviction trigger, {staged} against \
+                 {trigger}"
+            );
+            assert!(
+                f.manager.staging_bound_admission(UPLOAD + 1).is_err(),
+                "an upload that would pass the bound by one byte must be declined: staged \
+                 {staged}, bound {BOUND}"
+            );
+            let exact = f.manager.staging_bound_admission(UPLOAD);
+            assert!(
+                exact.is_ok(),
+                "an upload that brings the staged figure to exactly the bound must be admitted: \
+                 staged {staged}, bound {BOUND}, trigger {trigger}"
+            );
+            assert!(
+                f.manager.staging_bound_admission(1).is_err(),
+                "with the admitted upload in flight the figure is at the bound, so one more byte \
+                 is declined"
+            );
+            drop(exact);
+            assert!(
+                f.manager.staging_bound_admission(UPLOAD).is_ok(),
+                "an admission dropped at abort frees its bytes"
+            );
+        }
+        /// Fill offered well past the bound, at a paced rate, for longer than the figure's
+        /// age: the staged total stays within the stated bound, `bound + W x (TTL + 2 s)`.
+        /// `W` is the offered rate (the admitted rate is at most that), the TTL is the memo's,
+        /// and the 2 s cover the second rounding of the memo's age, one derivation and the
+        /// stores' admission-to-commit time, each well under a second on a local disk.
+        #[tokio::test]
+        async fn the_staged_total_stays_within_the_stated_bound_under_fill_past_the_cap() {
+            const PUT_BYTES: usize = 128 * 1024;
+            const FILL: std::time::Duration = std::time::Duration::from_secs(16);
+            let mut f = fixture().await;
+            assert_eq!(
+                seed_staged(&f.dir, 0).await,
+                0,
+                "fixture precondition: the figure is known and empty"
+            );
+            // Eviction that cannot keep up, at its limit: the eviction lock is held, as by a
+            // peer's long pass, so no staging pass frees anything during the fill. On a local
+            // disk an unobstructed pass keeps up and the cap is never reached.
+            assert!(
+                f.manager.try_acquire_global_eviction_lock().await.unwrap(),
+                "fixture precondition: the test holds the eviction lock"
+            );
+            let body = incompressible(PUT_BYTES, 0x9e37_79b9_7f4a_7c15);
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(62));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let started = std::time::Instant::now();
+            let mut offered: u64 = 0;
+            let mut n = 0u32;
+            while started.elapsed() < FILL {
+                tick.tick().await;
+                let (status, _) = put(&mut f, &format!("fill-{n}"), body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "every upload succeeds");
+                offered += PUT_BYTES as u64;
+                n += 1;
+            }
+            let rate = offered as f64 / started.elapsed().as_secs_f64();
+            // Every admitted store has published well within this on a local disk.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let staged = staged_now(&f.dir).await;
+            let stated = BOUND as f64
+                + rate * (crate::staged_fold::AUTHORITY_SNAPSHOT_TTL_SECS as f64 + 2.0);
+            let declined = staging_bound_skips(&f).await;
+            println!(
+                "fill past the cap: staged {staged}, stated {stated:.0}, bound {BOUND}, offered \
+                 {offered} at {rate:.0} B/s, {n} PUTs, {declined} declined"
+            );
+            let (evictions, _) = f.manager.get_write_cache_eviction_counters().await;
+            assert_eq!(evictions, 0, "fixture: no staging pass ran during the fill");
+            assert!(
+                offered as f64 > stated,
+                "fixture: the fill must exceed the stated bound, or the bound is vacuous: \
+                 offered {offered}, stated {stated:.0}"
+            );
+            assert!(
+                staged as f64 <= stated,
+                "the staged total must stay within bound + W x (TTL + 2 s): staged {staged}, \
+                 stated {stated:.0}, bound {BOUND}, offered {offered} at {rate:.0} B/s, \
+                 {n} PUTs, {declined} declined"
+            );
+            assert!(
+                declined > 0,
+                "the fill must reach the cap: {n} PUTs, none declined, staged {staged}"
+            );
+        }
+    }
+    /// Tests of the fleet-wide cap on in-progress multipart entries
     /// ([`MAX_TRACKED_MULTIPART_ENTRIES`]). Each test owns its cache directory, so the budget's
     /// per-directory state and the cap seam cannot couple parallel tests.
     mod tracked_multipart_cap {
@@ -20073,11 +21105,12 @@ mod tests {
                     StatusCode::OK,
                     true,
                     false,
-                    2,
+                    1,
                 ),
                 "(Create status, tracker written, UploadPart status, part ETag, S3 received the \
                  part's bytes, upload directory exists after the part, Complete status, Complete \
-                 unchanged both ways, object cached, multipart_tracking_full skips): an upload past \
+                 unchanged both ways, object cached, multipart_tracking_full skips, the Create's only: \
+                 its part is declined for having no tracker): an upload past \
                  MAX_TRACKED_MULTIPART_ENTRIES must create nothing under mpus_in_progress/, reach \
                  S3 unchanged and not be cached"
             );
@@ -20348,62 +21381,6 @@ mod tests {
                 "(part 2 status, part 2 ETag, S3 received part 2's bytes, staged part 1 removed, \
                  multipart_tracking_unknown skips, multipart_tracking_full skips): a count whose \
                  listing failed must refuse as unknown and keep the parts already staged"
-            );
-        }
-
-        /// A part for an upload with no directory creates the directory and its record, two walk
-        /// entries, so it is charged two. Room for two entries, one taken by a tracked upload: a
-        /// part of an untracked upload must not fit.
-        #[tokio::test]
-        async fn a_part_that_creates_its_upload_directory_is_charged_both_entries() {
-            let temp = TempDir::new().unwrap();
-            let dir = temp.path();
-            let (_cache_manager, mut handler, metrics) = fixture(dir, Some(2)).await;
-            let (key_a, path_a, id_a) = (
-                "test-bucket/case48-f1-a",
-                "/case48-f1-a",
-                "case48-f1-a-upload",
-            );
-            assert_eq!(create(&handler, key_a, path_a, id_a).await, StatusCode::OK);
-            assert!(
-                wait_until(
-                    || mpu_upload_dir(dir, id_a).join("upload.meta").exists(),
-                    10
-                )
-                .await,
-                "fixture precondition: upload A is tracked, holding one entry"
-            );
-            let (key_b, path_b, id_b) = (
-                "test-bucket/case48-f1-b",
-                "/case48-f1-b",
-                "case48-f1-b-upload",
-            );
-            let body = part_body(31);
-            let (status, _, received) = upload_part(
-                &mut handler,
-                key_b,
-                path_b,
-                id_b,
-                1,
-                &body,
-                "\"case48-f1-p1\"",
-            )
-            .await;
-            let record_b = mpu_upload_dir(dir, id_b).join("part1.json");
-            let staged_b = wait_until(|| record_b.exists(), 3).await;
-            let full = skipped_put_count(&metrics, MULTIPART_TRACKING_FULL_SKIP_REASON).await;
-            assert_eq!(
-                (
-                    status,
-                    received == body,
-                    staged_b,
-                    tracked_multipart_budget::count_entries(dir),
-                    full
-                ),
-                (StatusCode::OK, true, false, Some(1), 1),
-                "(part status, S3 received the part, part of untracked upload B staged, entries on \
-                 disk, multipart_tracking_full skips): a part that would create its upload \
-                 directory must be charged both entries, or the volume holds more than the cap"
             );
         }
 

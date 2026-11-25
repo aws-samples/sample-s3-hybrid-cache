@@ -14,7 +14,6 @@ use crate::cache_types::{ObjectMetadata, UploadState};
 use crate::disk_cache::DiskCacheManager;
 use crate::hybrid_metadata_writer::HybridMetadataWriter;
 use crate::journal_manager::JournalManager;
-use crate::metadata_lock_manager::MetadataLockManager;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -44,21 +43,12 @@ async fn setup_disk_cache_with_journal(temp_dir: &std::path::Path) -> DiskCacheM
     let mut cache_manager = DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
-    let lock_manager = Arc::new(MetadataLockManager::new(
-        cache_dir.clone(),
-        Duration::from_secs(30),
-        3,
-    ));
     let journal_manager = Arc::new(JournalManager::new(
         cache_dir.clone(),
         "test-instance".to_string(),
     ));
 
-    let hybrid_writer = Arc::new(Mutex::new(HybridMetadataWriter::new(
-        cache_dir,
-        lock_manager,
-        journal_manager,
-    )));
+    let hybrid_writer = Arc::new(Mutex::new(HybridMetadataWriter::new(journal_manager)));
 
     cache_manager.set_hybrid_metadata_writer(hybrid_writer);
     cache_manager

@@ -46,7 +46,9 @@ six volume-derived `write_cache.ledger_repair_*` figures (`rotation_complete`,
 `stalest_age_secs`, `observed_shards`, `swept_shards`, `rotation_reachable`,
 `projected_rotation_secs`), `write_cache.ledger_entries` with its age,
 `cache.st_size_fold_oldest_shard_scan_age_secs`, and `cache.in_progress_part_bytes` with
-`cache.in_progress_part_bytes_age_secs`. `volume_snapshot.collected_at_unix_secs` and
+`cache.in_progress_part_bytes_age_secs`, and `cache.shard_sum_bytes` (its drift,
+`cache.shard_sum_drift_bytes`, subtracts the persisted range-file total from that sum).
+`volume_snapshot.collected_at_unix_secs` and
 `volume_snapshot.age_secs` say when that collection ran. Both are `null` until the first
 collection after startup completes, and until then those figures read `null` rather than
 zero.
@@ -246,6 +248,8 @@ The size fold is the maintenance pass that re-grounds the per-shard byte aggrega
 | `st_size_fold_last_duration_secs` | gauge | Seconds the last completed pass this proxy ran took. `0` before one completes, and also `0` for a pass that finished inside a second: whole seconds only, so a zero is not evidence that nothing ran. A proxy whose peers always fold first never runs a pass of its own and reads `0` indefinitely; read `st_size_fold_oldest_shard_scan_age_secs` for the volume | **this proxy only** |
 | `st_size_folds_declined_overlap_total` | counter | Scheduling ticks declined because a pass was already running. **Non-zero is not an error**: it is the never-overlap rule working, and it says the interval is shorter than this volume can sustain | **this proxy only** |
 | `st_size_fold_oldest_shard_scan_age_secs` | gauge (nullable) | `max` over shards of `now − ` the shard's own scan timestamp, seconds: the age of the stalest shard contributing to the aggregate. **`null` means UNREADABLE or INCOMPLETE**, never zero: a shard's record could not be read, no shard has been folded yet, or at least one shard has no scan timestamp. A maximum over a subset of shards is indistinguishable from a fresher cache | fleet-wide |
+| `shard_sum_bytes` | gauge (nullable) | The sum of the per-shard byte aggregates the size fold installs, bytes: the shard documents' own total, published beside the accounted cache size so the two can be compared. It counts every range file under the shards, orphans included, so it can exceed the accounted size by the orphan bytes. It omits legacy flat range files at the `ranges/` root, which belong to no shard. **`null` means UNREADABLE or INCOMPLETE**, never zero and never a partial sum: no shard document exists, one could not be read, or at least one has no byte aggregate yet. Taken from the latest background collection. No decision reads it in this release | fleet-wide |
+| `shard_sum_drift_bytes` | gauge (nullable, signed) | `shard_sum_bytes` minus the accounted range-file size, bytes. That size is the persisted range-file total (`size_tracking/size_state.json` `total_size`), which is not published on its own. It equals `total_cache_size` at epoch `0`; at epoch `1` `total_cache_size` also includes the fold's in-progress part term, which no shard document counts, so the drift subtracts the persisted total rather than `total_cache_size` and an upload in progress does not move it. Positive means the shard documents hold more than the accounted size. Expected near zero once every shard has been folded, plus the orphan bytes. It reads low by the legacy flat range-file bytes at the `ranges/` root, if any, when the accounted size includes them. A scrape subtracts the live accounted size from the latest collection's sum, so between collections it also moves with the size. `null` exactly when `shard_sum_bytes` is. No decision reads it in this release | fleet-wide |
 
 > **Read the decline counter first when the aggregate looks stale.** This pass's
 > characteristic failure is silent: a tick that finds a pass already running is a normal
@@ -572,7 +576,7 @@ All counters, per-proxy, exported over OTLP as `cache.*` series.
 
 | Field | Meaning |
 |---|---|
-| `metadata_heal_overwrite_total` | Unparseable `.meta` documents replaced by a fresh one fetched from S3: a full-object fill, a zero-length fill or a range store over a document that did not parse. Read it against `corruption_metadata_total`: detections that are never followed by a fill of the same key stay unhealed, and every request for such a key is served from S3 until one arrives |
+| `metadata_heal_overwrite_total` | Unparseable `.meta` documents a fill took out of service. A full-object fill, a zero-length fill, a range store or a consolidation that folds a fill into one replaces the document; a range fill removes it, and its journal record then rebuilds it. Each document is counted once. Read it against `corruption_metadata_total`: detections that are never followed by a fill of the same key stay unhealed, and every request for such a key is served from S3 until one arrives |
 | `upstream_idle_abort_total_mid_stream` | GET-miss responses cut off because S3 sent no bytes for `connection_pool.upstream_idle_timeout` part-way through the body. Each one is a truncated client response the client has to retry |
 | `upstream_idle_abort_total_pre_stream` | GET and HEAD misses answered `504` because every attempt missed `connection_pool.upstream_first_byte_timeout` |
 | `upstream_idle_retry_total` | First-byte timeouts that were retried, at most `connection_pool.upstream_idle_retries` per request. Retries with few pre-stream aborts mean the retry is absorbing the stalls |
@@ -618,6 +622,8 @@ metadata or list operation, and these:
 - `write_stamp_pending`: a GET or HEAD forwarded uncached because this proxy acknowledged a write
   of the key and the write's invalidation has not landed yet. Once this proxy can no longer track
   such keys one by one, every key of a cache directory counts here.
+- `metadata_unreadable`: a GET forwarded uncached because the key's `.meta` exists and could not be
+  read, after retries, to check it for an MD5 trailer.
 
 A `CreateMultipartUpload` that uses SSE-C counts under `sse-c`; see
 [Operations that bypass the cache](CACHING.md#operations-that-bypass-cache).
@@ -687,7 +693,7 @@ Eleven figures, all per-proxy:
 
 | Field | Kind | Meaning |
 |---|---|---|
-| `cache.write_stamp_retried_total` | counter | Acknowledged writes whose write-order file could not be written and were handed to the background retry. Non-zero means the cache volume refused or timed out lock requests, or removing a key from this proxy's RAM cache failed |
+| `cache.write_stamp_retried_total` | counter | Acknowledged writes, and GET or HEAD responses that found a cached object changed at S3, whose write-order file could not be written and were handed to the background retry. Non-zero means the cache volume refused or timed out lock requests or refused to delete a `.meta` file, or removing a key from this proxy's RAM cache failed |
 | `cache.write_stamp_retry_landed_total` | counter | Keys whose write-order file the retry has since written. It moves once per key, and several failed writes of one key can share one retry, so it can stay below `write_stamp_retried_total` with nothing pending. Keys still pending are `write_stamp_retry_active_keys` plus `write_stamp_retry_overflow_keys` |
 | `cache.write_stamp_retry_overflow_keys` | gauge | Keys waiting now in memory for one of the 4,096 retry workers. The queue holds up to 128 MiB of keys, about 500,000 keys of 100 bytes; keys past it wait in the local log only and are reloaded as the queue drains |
 | `cache.write_stamp_retry_active_keys` | gauge | Keys a retry worker holds now, one per worker. Keys still pending a retry are this plus `write_stamp_retry_overflow_keys`. A worker that fails four times on one key while others are queued puts it back at the end of the queue and takes the next |
@@ -984,7 +990,7 @@ write cache.
 | `staging_evictions_total` | counter | Objects evicted from the write cache. Separate from `cache.evictions`, which counts read-cache eviction only |
 | `staging_eviction_bytes_total` | counter | Compressed bytes freed by write-cache eviction |
 | `ledger_entries` | gauge (nullable) | Write-ledger length: records across every ledger file under `metadata/_write_ledger/`, which holds one file per cache shard per proxy (`{bucket}/{XX}/{instance}.ledger`). **`null` means UNREADABLE, not zero**: a directory listing or file read that failed. `0` is the healthy drained value, so alarm on `null` separately from `0`. Counts the same population as `staged_entries` by a different route: that one is a per-proxy in-memory gauge, and this is a count of records on the cache volume. A **persistent** gap between them is the signal that appends are being lost or compaction is not keeping up. A transient gap is normal. Compaction visits the ledger a shard at a time and starts a full pass every 5 minutes. On a ledger too large for one pass (10 seconds by default), it resumes once a minute until the pass completes. That cadence is fleet-wide: the proxies share one rotation, so the fleet runs one pass per interval, not one per proxy. Not the accounting authority; `resident_bytes` is, and a ledger figure must never be reported as a cache size |
-| `ledger_entries_age_secs` | gauge (nullable), seconds | How long ago `ledger_entries` was observed. The count is taken by staging eviction and by the background collection rather than on each scrape, and is kept no older than 300 s in the steady state. `null` exactly when `ledger_entries` is. It keeps counting up at scrape time, so a figure far past 300 s means the count is not being refreshed. Two scrapes showing the same `ledger_entries` with a growing age are the same observation reported twice, not a stable count |
+| `ledger_entries_age_secs` | gauge (nullable), seconds | How long ago `ledger_entries` was observed. The count is re-taken by a traversal of the ledger once it is older than 300 s, rather than on each scrape, so it is no older than about 300 s in the steady state. `null` exactly when `ledger_entries` is. It keeps counting up at scrape time, so a figure far past 300 s means the count is not being refreshed. Two scrapes showing the same `ledger_entries` with a growing age are the same observation reported twice, not a stable count |
 | `setup_abandoned_total_put` | counter | Streamed PUT and UploadPart write-cache setups abandoned because the setup did not finish within 5 s, or had not finished up to 500 ms after the request-body buffer filled. Setup covers opening the cache writer, reserving capacity, creating the temporary file and looking up the TTL. **Per-proxy.** Each is an upload forwarded to S3 uncached because the cache setup, which runs beside the upload, did not finish; the upload itself succeeds. A WARN is logged at most once a minute. Its counterpart once the body is streaming is `cache.tee_abandoned_total_put`. Read it beside the three `pending_lock_*` rows: a rise in both at once points at contention on the per-proxy pending-credit lock, a rise here alone points elsewhere, such as a slow cache volume |
 | `mpu_completion_ledger_declines_total` | counter | Completed multipart uploads left uncached because a write-ledger record could not be written before the object was published. **Per-proxy.** The upload itself succeeds on S3; a WARN names each one. A steady rise means the ledger directory (`metadata/_write_ledger/`) is failing and the write cache is effectively off for multipart uploads, while single-part PUTs keep caching |
 | `pending_lock_waits_total` | counter | Acquisitions of a per-proxy pending-credit lock (`{instance}.pending.lock`) that did not succeed on the first try. **Per-proxy.** This is the only cross-proxy lock on the write-cache admission path for PUTs; its holders include every peer's own credit appends, the fold's cleanup after a pass, and the startup reaper. **This is not a per-credit figure.** A credit append takes the lock once per batch of up to 1,024 credits, so a busy proxy publishes far fewer waits here than it commits writes, and the rate falls as batches grow. Divide by `write_ledger.pending_batches_total` to read it as a fraction of lock holds that waited; a rate read per PUT understates contention by the mean batch size |
@@ -1216,8 +1222,9 @@ line is not logged until the proxy has recomputed its first staged figure, becau
 **`resident_bytes` and `inflight_bytes` are different quantities and are allowed to
 diverge.** `resident_bytes` is fleet-wide and read from the cache volume;
 `inflight_bytes` is this proxy's total of uploads in flight, held in memory, and reads `0` when
-no upload is in flight. Neither figure declines caching an upload: past `staging_bound_bytes`
-the proxy keeps caching and reclaims staged objects in the background.
+no upload is in flight. Past `staging_bound_bytes`, the proxy forwards new uploads uncached
+(`staging_bound` in [`skipped_puts_total`](#skipped_puts_total)) and reclaims staged objects in
+the background.
 
 **Two log lines make write-cache drift visible without diffing state files:** a full
 validation scan logs the write-cache drift it corrected, at WARN when non-zero, and the
@@ -1402,8 +1409,8 @@ Nullable in type, always present in practice. Download coordination.
 | `fetcher_completions_success` | counter | Fetches by the request that other requests were waiting on, which completed and notified its waiters of success |
 | `fetcher_completions_error` | counter | Such fetches that notified their waiters of a failure instead. Recorded when the fetcher's conditional revalidation of a cached entry got `401`/`403`, an unexpected status, or a transport error. The application log names which, at debug level. A `401`/`403` here is a credentials problem, and the cached entry is kept |
 | `waiter_conditional_304` | counter | Waiter revalidation returned 304: the cached copy was served, or, when the client sent its own `If-None-Match` or `If-Modified-Since`, S3's `304` was returned to it |
-| `waiter_conditional_200` | counter | Object changed mid-flight; waiter served S3's fresh body |
-| `waiter_conditional_4xx` | counter | Auth or client error; returned to client, cache preserved |
+| `waiter_conditional_200` | counter | Object changed mid-flight; waiter served S3's fresh body and removed the out-of-date cached entry |
+| `waiter_conditional_4xx` | counter | Auth or client error, returned to the client. The cached entry is kept, except after a `404`, which removes it |
 | `waiter_conditional_error` | counter | 5xx or transport error; degraded cache-serve fallback |
 
 `s3_fetches_saved_total` is the direct benefit figure. See
@@ -1435,8 +1442,10 @@ Nullable: `null` until the cache manager has finished initializing, which is whe
 tracker is created. In practice that means a brief window at startup rather than a permanent
 state.
 
-`current_size` and `write_cache_size` duplicate `cache.total_cache_size` and
-`cache.write_cache_size`, which come from a different accessor. `last_validation`,
+`current_size` duplicates `cache.total_cache_size`, which comes from a different accessor.
+`write_cache_size` is the event-maintained write-cache counter, the same figure as
+`cache.write_cache_size` at `write_cache.staged_authority_epoch` `0`. At epoch `1` no decision reads
+it, and `write_cache.resident_bytes` is the write-cache figure to watch. `last_validation`,
 `last_validation_drift` and `accounting_drift` are published only here.
 
 `last_validation` reports when the last scan finished, in either mode. A rolling scan
@@ -1459,7 +1468,7 @@ size-state lock to update it.
 | Field | Kind | Meaning |
 |---|---|---|
 | `current_size` | gauge | Tracked total bytes |
-| `write_cache_size` | gauge | Tracked write-cache bytes |
+| `write_cache_size` | gauge | Event-maintained write-cache bytes; at epoch `1`, read `write_cache.resident_bytes` instead |
 | `last_checkpoint` | **placeholder** | Always the current time, set to `now()` on every read. Not a checkpoint timestamp |
 | `last_validation` | gauge | Unix seconds, or `null` if no scan has run |
 | `last_validation_drift` | gauge | Signed byte drift the last scan found, or `null` if none has run |
@@ -1823,7 +1832,8 @@ Reason keys:
 |---|---|
 | `write_cache_disabled` | Caching disabled by rule for this key. Also counts a `CreateMultipartUpload` on such a key |
 | `unknown_length` | Decoded content length could not be determined (e.g. chunked-encoded signed PUTs) |
-| `disk_safety` | The write cache skipped the object because caching it would take the cache past `max_cache_size`, or would leave less free space on the cache volume than `cache.disk_safety_free_space_floor`. That floor defaults to 1 GiB, and `0` disables this check. The only capacity-shaped refusal, and the remedy is more disk or a lower `max_cache_size` rather than a different `write_cache_percent`. While this is being recorded, `/health` reports the cache component `Degraded`, a recency signal that clears 300 s after the last refusal, so it reflects "happening now" rather than "happened once". The upload itself always succeeds and is never affected |
+| `disk_safety` | The write cache skipped the object because caching it would take the cache past `max_cache_size`, or would leave less free space on the cache volume than `cache.disk_safety_free_space_floor`. That floor defaults to 1 GiB, and `0` disables this check. The remedy is more disk or a lower `max_cache_size` rather than a different `write_cache_percent`. While this is being recorded, `/health` reports the cache component `Degraded`, a recency signal that clears 300 s after the last refusal, so it reflects "happening now" rather than "happened once". The upload itself always succeeds and is never affected |
+| `staging_bound` | Staged uploads had reached the staging bound (`write_cache_percent` of `max_cache_size`), or this upload would have taken them past it, so the write was forwarded to S3 uncached. Counts each declined PUT, `UploadPart` and `CreateMultipartUpload`. A declined `UploadPart` stops its upload being cached, and the parts the upload had staged are removed. Sustained counts mean staging eviction is not keeping pace with uploads. The upload itself always succeeds, and the key's previous cached version is still invalidated |
 | `object_too_large` | Upload exceeds `write_cache_max_object_size` |
 | `commit_failed` | The write-cache commit failed after the object was already streamed to S3 |
 | `capacity_unknown` | No cache-size figure had been read since the proxy started and the first read did not finish within 250 ms, so the write was forwarded uncached. The key's previous cached version is still invalidated |
@@ -1836,7 +1846,7 @@ Reason keys:
 | `hostname_not_unique` | Another running proxy holds this one's whole identity, the same hostname and the same process id, so the two would write the same per-proxy accounting files. This proxy stops caching writes for the life of the process: the write is forwarded to S3 and served normally, and the key's previous cached version is still invalidated. Reads are unaffected. A deployment error, not a transient: see [Each proxy needs its own hostname](SHARED_STORAGE.md#each-proxy-needs-its-own-hostname) and `cache.hostname_collisions_total` |
 | `superseded` | Another PUT, CompleteMultipartUpload or DELETE of the same key was acknowledged, on any proxy sharing the cache volume, after this write but before its cache store published, so the store did not publish. The newer write's own store, or the next GET, caches the current object. Occasional counts are expected when one key is overwritten in quick succession |
 | `temporary_replaced` | The temporary file this write's cache store wrote was replaced or removed before the store could publish it, or the store had no record of what it wrote, so it did not publish. The upload itself succeeded, and the next GET caches the object |
-| `multipart_tracking_full` | The cache volume already held 5,000 in-progress multipart entries, counting each upload the write cache is tracking and each of its uploaded parts, across every proxy sharing the volume. A `CreateMultipartUpload` counted here writes no tracker, so the upload is not cached. An `UploadPart` counted here is not staged, its upload stops being cached, and the parts the upload had staged are removed. The upload itself completes at S3 as usual, and its CompleteMultipartUpload still invalidates the key's previous cached version. An `UploadPart` whose upload has no staging directory yet counts as two entries, because staging it creates the directory too. The cap keeps the walk of in-progress uploads short: the metrics collector makes it once per collection interval, and the readers that decide on its figure up to once every 5 seconds. Sustained counts mean more multipart uploads are running at once than the write cache can track |
+| `multipart_tracking_full` | The cache volume already held 5,000 in-progress multipart entries, counting each upload the write cache is tracking and each of its uploaded parts, across every proxy sharing the volume. A `CreateMultipartUpload` counted here writes no tracker, so the upload is not cached and its parts are forwarded unstaged. An `UploadPart` counted here is not staged, its upload stops being cached, and the parts the upload had staged are removed. The upload itself completes at S3 as usual, and its CompleteMultipartUpload still invalidates the key's previous cached version. The cap keeps the walk of in-progress uploads short: the metrics collector makes it once per collection interval, and the readers that decide on its figure up to once every 5 seconds. Sustained counts mean more multipart uploads are running at once than the write cache can track |
 | `multipart_tracking_unknown` | The count of in-progress multipart entries could not be read, because a listing of `mpus_in_progress/` failed, so the `CreateMultipartUpload` or `UploadPart` was forwarded uncached. Unlike `multipart_tracking_full`, the parts the upload had already staged are kept, though the upload is then not cached because a part is missing. The application log names the listing error. Sustained counts mean the cache volume cannot list `mpus_in_progress/` |
 
 A PUT counted here still succeeds against S3; these are write-cache skips, not

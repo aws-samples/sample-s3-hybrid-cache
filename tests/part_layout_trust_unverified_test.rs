@@ -1,6 +1,7 @@
-//! `cache.trust_unverified_ranges` keeps a part layout recorded before 3.0.1: with the
-//! override on, an unmarked layout is served as 3.0.0 served it. Its own `[[test]]` target,
-//! because the override is process-global.
+//! `cache.trust_unverified_ranges` does not keep a part layout entry 3.0.7 did not mark: an
+//! entry a release before 3.0.7 recorded may name a part stored with S3's MD5 trailer at offset
+//! 0, and no setting serves it. Its own `[[test]]` target, because the override is
+//! process-global.
 
 mod common;
 
@@ -12,7 +13,7 @@ use s3_proxy::origin_identity::OriginVerdict;
 const OBJECT_SIZE: u64 = 4096;
 
 #[tokio::test]
-async fn an_unmarked_part_layout_is_served_with_the_override_on() {
+async fn an_unmarked_part_layout_is_cleared_with_the_override_on() {
     s3_proxy::disk_cache::set_trust_unverified_ranges(true);
     let fixture = Fixture::new(test_config(OBJECT_SIZE)).await;
     let key = "bucket/unmarked-layout-override.bin";
@@ -47,18 +48,14 @@ async fn an_unmarked_part_layout_is_served_with_the_override_on() {
         .lookup_part(key, 2, OriginVerdict::Matches)
         .await
         .expect("lookup_part must not error");
-    assert!(
-        part.as_ref()
-            .is_some_and(|p| p.start == 2048 && p.end == 4095),
-        "with cache.trust_unverified_ranges on, an unmarked part layout must be served as \
-         3.0.0 served it: {:?}",
-        part.as_ref().map(|p| (p.start, p.end))
-    );
     let after = fixture.read_meta(key).expect(".meta");
+    let mut parts: Vec<u32> = after.object_metadata.part_ranges.keys().copied().collect();
+    parts.sort();
     assert_eq!(
-        after.object_metadata.part_ranges.len(),
-        2,
-        "the override keeps the unmarked layout"
+        (part.map(|p| (p.start, p.end)), parts, after.ranges.len()),
+        (None, vec![1], 1),
+        "(the part served with cache.trust_unverified_ranges on, the layout entries left, the \
+         listings left): the lookup clears the unmarked entry it was asked for, and only that \
+         one, and keeps the whole-object listing"
     );
-    assert!(!after.object_metadata.part_layout_verified);
 }

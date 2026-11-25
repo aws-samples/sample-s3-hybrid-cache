@@ -531,7 +531,8 @@ cannot disagree about what is cached.
 
 The journal fallback (`find_pending_journal_ranges`, used when metadata is absent or has no
 overlapping extent) is reported `Fresh`, because a journal record carries no `expires_at` that
-could have passed.
+could have passed. It skips a record whose fill began before the key's latest write-order change,
+so a fill that a later write or version change made out of date is never served.
 
 The marker travels with the coverage, rather than being recomputed by the caller, because the
 caller may hold a different copy of the metadata (its own preloaded one, or a second disk read).
@@ -654,7 +655,10 @@ cache_dir/
 
 Every successful PUT, CompleteMultipartUpload and DELETE of an object writes its
 `{object_key}.wtok` file, so a background cache store can tell whether a newer write of the same
-object was acknowledged after its own, and decline to publish. When the cache volume refuses the
+object was acknowledged after its own, and decline to publish. A GET or HEAD that learns from S3
+that a cached object has changed or been deleted writes it too, before it answers, and so does a
+removal that cannot delete one of the key's range files
+([Write-order file cost](../README.md#write-order-file-cost)). When the cache volume refuses the
 key's metadata lock, the write still succeeds and the proxy retries the file in the background;
 [Write-through ordering](CACHING.md#write-through-ordering) says what holds until the retry lands
 and when a write is not retried. A GET or HEAD miss also creates the file when the key has none,

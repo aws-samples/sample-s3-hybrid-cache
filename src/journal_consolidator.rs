@@ -146,7 +146,7 @@ static RETAINED_UNPARSEABLE_JOURNAL_LINES: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn retained_unparseable_journal_lines() -> u64 {
     RETAINED_UNPARSEABLE_JOURNAL_LINES.load(Ordering::Relaxed)
 }
-/// Range `Add` and `Update` journal entries discarded because their range file was still absent after
+/// Range `Add` journal entries discarded because their range file was still absent after
 /// `stale_entry_timeout_secs`, so the credit they carried was never applied. Published as
 /// `atomic_metadata.journal_validation_failures`. Per-instance, monotone since process start.
 ///
@@ -3446,9 +3446,8 @@ fn nanos_since_epoch(t: SystemTime) -> u64 {
 }
 
 /// Whether folding `entry` would list a range whose file nothing can verify: a range fill
-/// (`Add` or `Update`, the only operations that put a `RangeSpec` into a `.meta`'s `ranges`;
-/// `Add` appends one, `Update` replaces the listing at the same offsets) that records no
-/// `file_identity`.
+/// (`Add`, the only operation that puts a `RangeSpec` into a `.meta`'s `ranges`) that records
+/// no `file_identity`.
 ///
 /// Every 2.x writer journals its fills with no identity, and so did a 3.0.0 writer whose
 /// `identity_after_close` failed. A listing with no identity is read unverified, so when another
@@ -3460,14 +3459,24 @@ fn nanos_since_epoch(t: SystemTime) -> u64 {
 /// This is the one place the decision is made (R12.1). `cache.trust_unverified_ranges`
 /// (R13.2) turns it off: such an entry is folded, as 3.0.0 folded it.
 fn entry_lists_unverified_range(entry: &JournalEntry) -> bool {
-    matches!(
-        entry.operation,
-        JournalOperation::Add | JournalOperation::Update
-    ) && entry.range_spec.file_identity.is_none()
+    matches!(entry.operation, JournalOperation::Add)
+        && entry.range_spec.file_identity.is_none()
         && !crate::disk_cache::trust_unverified_ranges()
 }
 
-/// Whether `entry` can be the source of a new `.meta` when none exists: an `Add` or `Update`
+/// Whether `entry` is a range fill a release before 3.0.7 stored from an append-md5 response:
+/// an `Add` whose `object_metadata` carries the trailer fingerprint
+/// ([`crate::cache::CacheManager::is_append_md5_entry`]). Its bytes include S3's MD5 trailer,
+/// and for a part answer they are the part at offset 0, so it is never folded.
+fn entry_is_append_md5_fill(entry: &JournalEntry) -> bool {
+    matches!(entry.operation, JournalOperation::Add)
+        && entry
+            .object_metadata
+            .as_ref()
+            .is_some_and(crate::cache::CacheManager::is_append_md5_entry)
+}
+
+/// Whether `entry` can be the source of a new `.meta` when none exists: an `Add`
 /// that carries the S3 response's `object_metadata` (and, by type, a range).
 ///
 /// Every production range fill journals an `Add` with `object_metadata` (the `JournalOnly`
@@ -3475,10 +3484,7 @@ fn entry_lists_unverified_range(entry: &JournalEntry) -> bool {
 /// describe an object that already has a document, and an `Add` without `object_metadata`
 /// gives no ETag or headers to serve under, so none of them may create one.
 fn entry_can_create_document(entry: &JournalEntry) -> bool {
-    matches!(
-        entry.operation,
-        JournalOperation::Add | JournalOperation::Update
-    ) && entry.object_metadata.is_some()
+    matches!(entry.operation, JournalOperation::Add) && entry.object_metadata.is_some()
 }
 
 /// True when the key's `.meta` is absent and no entry can create it, so folding them would
@@ -3533,7 +3539,7 @@ mod meta_unlink_seam {
     }
 }
 
-/// What the range fills (`Add`/`Update`) of one consolidation batch say about the extents they
+/// What the range fills (`Add`) of one consolidation batch say about the extents they
 /// share ([`disputed_fill_extents`]).
 #[derive(Debug, Default)]
 struct FillDisputes {
@@ -3574,10 +3580,7 @@ fn disputed_fill_extents(entries: &[JournalEntry], meta_existed: bool) -> FillDi
     let mut unidentified: HashSet<(u64, u64)> = HashSet::new();
     let mut identified: HashMap<(u64, u64), Vec<RangeSpec>> = HashMap::new();
     for entry in entries {
-        if !matches!(
-            entry.operation,
-            JournalOperation::Add | JournalOperation::Update
-        ) {
+        if !matches!(entry.operation, JournalOperation::Add) {
             continue;
         }
         let extent = (entry.range_spec.start, entry.range_spec.end);
@@ -3623,7 +3626,7 @@ fn disputed_fill_extents(entries: &[JournalEntry], meta_existed: bool) -> FillDi
     disputes
 }
 
-/// Split `entries` into those that may fold into `metadata` and range fills (`Add`/`Update`)
+/// Split `entries` into those that may fold into `metadata` and range fills (`Add`)
 /// whose recorded ETag names a different object version than `metadata`'s.
 ///
 /// An entry with no `object_metadata`, or a `.meta` with no ETag, gives nothing to compare
@@ -3637,10 +3640,7 @@ fn partition_other_version_fills(
         return (entries, Vec::new());
     }
     entries.into_iter().partition(|entry| {
-        let is_fill = matches!(
-            entry.operation,
-            JournalOperation::Add | JournalOperation::Update
-        );
+        let is_fill = matches!(entry.operation, JournalOperation::Add);
         match (&entry.object_metadata, is_fill) {
             (Some(om), true) if !om.etag.is_empty() => {
                 crate::revalidation::etags_equal_ignoring_quotes(&om.etag, meta_etag)
@@ -4952,6 +4952,15 @@ impl JournalConsolidator {
         // Write batched entries per cache key
         for (cache_key, entries) in &grouped {
             let entry_count = entries.len();
+            #[cfg(test)]
+            if remove_marker_append_fault::take(cache_key) {
+                error_count += entry_count;
+                warn!(
+                    "Injected Remove-marker append failure: cache_key={}, entry_count={}",
+                    cache_key, entry_count
+                );
+                continue;
+            }
             match self
                 .journal_manager
                 .append_range_entries_batch(cache_key, entries.clone())
@@ -6712,8 +6721,10 @@ impl JournalConsolidator {
     /// All the real decisions — is the tier over its trigger, is the lock free, which
     /// candidates — live in `CacheManager::evict_staging_tier`. This is only the wake-up.
     ///
+    /// `source` names the call site (`idle`, `loop` or `cycle`) for the pass's pre-lock log line.
+    ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 3.1, 3.2
-    async fn maybe_trigger_staging_eviction(&self) {
+    async fn maybe_trigger_staging_eviction(&self, source: &'static str) {
         let cache_manager = {
             let guard = match self.cache_manager.lock() {
                 Ok(g) => g,
@@ -6731,7 +6742,7 @@ impl JournalConsolidator {
             }
         };
         self.staging_trigger_nudges.fetch_add(1, Ordering::Relaxed);
-        cache_manager.nudge_staging_eviction();
+        cache_manager.nudge_staging_eviction(source);
     }
 
     /// Compact the Write_Ledger, dropping entries that can never become evictable.
@@ -6760,11 +6771,11 @@ impl JournalConsolidator {
     /// lock is a **fleet-wide singleton election**, so one instance compacts at a time instead
     /// of every proxy re-reading the same ledger files and contending with appends for their
     /// per-file locks. It is not what makes rewriting other instances' files safe: that is
-    /// [`crate::write_ledger::WriteLedger::retire_identities`]'s per-file `fs4` lock, held
+    /// [`crate::write_ledger::WriteLedger::retire_identities_in`]'s per-file `fs4` lock, held
     /// across each file's read, filter, temp write and rename (the lock every append takes),
     /// together with naming removals rather than a retain set. Staging eviction already runs
-    /// the same rewrite under a different lock (`global_eviction.lock`), concurrently with this
-    /// pass, on that argument. Moving this pass off the consolidation lock therefore needs a
+    /// the same rewrite after it releases `global_eviction.lock`, concurrently with this pass,
+    /// on that argument. Moving this pass off the consolidation lock therefore needs a
     /// separate lease or per-shard claim for efficiency, not for correctness.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 2.6
@@ -8094,7 +8105,7 @@ impl JournalConsolidator {
         let eviction_triggered =
             bytes_over && self.maybe_trigger_eviction_gated(Some(trigger_size)).await;
         if staging_over {
-            self.maybe_trigger_staging_eviction().await;
+            self.maybe_trigger_staging_eviction("idle").await;
         }
         if eviction_triggered {
             info!(
@@ -8652,7 +8663,7 @@ impl JournalConsolidator {
         if staging_over {
             let freed_before = self.staging_eviction_bytes_total().await;
             let nudges_before = self.staging_trigger_nudges.load(Ordering::Relaxed);
-            self.maybe_trigger_staging_eviction().await;
+            self.maybe_trigger_staging_eviction("loop").await;
             if self.staging_trigger_nudges.load(Ordering::Relaxed) != nudges_before {
                 state.staging_freed_at_nudge = freed_before;
                 state.staging_check_not_before = None;
@@ -8953,7 +8964,7 @@ impl JournalConsolidator {
                     self.maybe_trigger_eviction_gated(Some(trigger_size)).await;
                 // The staging tier too, as the end-of-cycle return does. Write-through PUTs append no
                 // journal keys, so a write-only workload's cycles all end here or at the idle check.
-                self.maybe_trigger_staging_eviction().await;
+                self.maybe_trigger_staging_eviction("cycle").await;
                 // The size delta was applied above, before discovery ran, so this cycle did real
                 // work even though discovery failed. Log the same completion summary as the
                 // no-keys return below, and report the applied delta in the result, which
@@ -8998,7 +9009,7 @@ impl JournalConsolidator {
             let eviction_triggered = self.maybe_trigger_eviction_gated(Some(trigger_size)).await;
             // The staging tier too, as the end-of-cycle return does. Write-through PUTs append no
             // journal keys, so a write-only workload's cycles all end here or at the idle check.
-            self.maybe_trigger_staging_eviction().await;
+            self.maybe_trigger_staging_eviction("cycle").await;
             // A cycle that won the lock and applied a size delta did real work, so it logs the
             // same completion summary as the end of the function, with the same fields in the
             // same order. Without this, a delta-only cycle logged `SIZE_ACCUM collect_total` and
@@ -9255,7 +9266,7 @@ impl JournalConsolidator {
         // compare-exchange when a pass is already in flight, and `evict_staging_tier` is
         // where the figure is read on this path.
         // Requirements 3.1, 3.2
-        self.maybe_trigger_staging_eviction().await;
+        self.maybe_trigger_staging_eviction("cycle").await;
 
         // Keep the Write_Ledger proportional to the staged set. Interval-gated inside,
         // so this is a cheap no-op on most cycles. Requirement 2.6
@@ -9494,6 +9505,22 @@ impl JournalConsolidator {
             self.unlink_retired_fill_files(cache_key, &unverified_fills, &all_entries);
         }
         stale_entries.extend(unverified_fills);
+        // A range fill an older proxy stored from an append-md5 response is never folded
+        // ([`entry_is_append_md5_fill`]). Its bytes may be a part plus S3's MD5 trailer at
+        // offset 0, which a document of the same ETag would otherwise list as the object's
+        // bytes. Retired like an identity-less fill, as the journal scan skips it.
+        let (valid_entries, append_md5_fills): (Vec<_>, Vec<_>) = valid_entries
+            .into_iter()
+            .partition(|e| !entry_is_append_md5_fill(e));
+        if !append_md5_fills.is_empty() {
+            debug!(
+                "Retiring {} range-fill journal entries stored from an append-md5 response: cache_key={}",
+                append_md5_fills.len(),
+                cache_key
+            );
+            self.unlink_retired_fill_files(cache_key, &append_md5_fills, &all_entries);
+        }
+        stale_entries.extend(append_md5_fills);
         let stale_count = stale_entries.len();
         // Pending entries are those with missing range files but recent timestamps
         // They are NOT in valid_entries or stale_entries - they stay in journal for retry
@@ -9645,9 +9672,10 @@ impl JournalConsolidator {
         // slot lock eviction takes is held, so this cannot race a locked unlinker.
         self.retire_other_version_fills(&mut metadata, &other_version_entries);
         // A fill of another version shows the cached version may not be current, and ETags
-        // carry no order. So the document's read-tier extents are retired too and the document
-        // expired: the next read misses and fills from S3, the next HEAD asks S3, and a fill of
-        // another version then removes the `.meta` at its publish. Staged extents stay: a
+        // carry no order. So the document's read-tier extents are retired too, the document
+        // expired and its HEAD fields unset: the next read misses and fills from S3, the next
+        // HEAD asks S3 (HEAD freshness tests only that `head_expires_at` is set, never its
+        // value), and a fill of another version then removes the `.meta` at its publish. Staged extents stay: a
         // staged `.meta` comes from a write acknowledged through the fleet, whose marker stamp
         // retires every fill that began before it (`partition_superseded_fills`).
         if !other_version_entries.is_empty() {
@@ -9666,11 +9694,9 @@ impl JournalConsolidator {
                 metadata.object_metadata.etag
             );
             self.retire_disagreeing_fills(&mut metadata, &read_tier);
-            let now = std::time::SystemTime::now();
-            metadata.expires_at = now;
-            if metadata.head_expires_at.is_some() {
-                metadata.head_expires_at = Some(now);
-            }
+            metadata.expires_at = std::time::SystemTime::now();
+            metadata.head_expires_at = None;
+            metadata.head_cached_at = None;
         }
         // Two fills in this batch disagree about an extent. Their ETags differ: which one's
         // bytes the `.bin` holds is unknown, whatever `created_at` says, so unlist and unlink
@@ -10150,7 +10176,7 @@ impl JournalConsolidator {
                         .iter_mut()
                         .filter(|r| r.start == start && r.end == end)
                     {
-                        r.unservable = true;
+                        r.mark_unservable();
                     }
                     warn!(
                         "Kept a range fill of another object version listed as unservable \
@@ -10267,7 +10293,7 @@ impl JournalConsolidator {
                         .iter_mut()
                         .filter(|r| r.start == start && r.end == end)
                     {
-                        r.unservable = true;
+                        r.mark_unservable();
                     }
                     warn!(
                         "Kept an extent two fills disagree about listed as unservable (path \
@@ -10296,7 +10322,7 @@ impl JournalConsolidator {
                         .iter_mut()
                         .filter(|r| r.start == start && r.end == end)
                     {
-                        r.unservable = true;
+                        r.mark_unservable();
                     }
                     warn!(
                         "Kept an extent two fills disagree about listed as unservable (unlink \
@@ -10371,7 +10397,7 @@ impl JournalConsolidator {
 
     /// Resolve conflicts between metadata and journal entries
     ///
-    /// This only applies to Add/Update/Remove operations which carry full range data.
+    /// This only applies to Add and Remove operations, which carry full range data.
     /// TtlRefresh and AccessUpdate operations are incremental updates that should not
     /// replace existing range data - they only modify specific fields.
     pub(crate) async fn resolve_conflicts(
@@ -10382,7 +10408,7 @@ impl JournalConsolidator {
         let mut conflicts_resolved = 0;
 
         // Group journal entries by range (start, end), but only for operations that
-        // carry full range data (Add, Update, Remove). TtlRefresh, AccessUpdate and
+        // carry full range data (Add, Remove). TtlRefresh, AccessUpdate and
         // Graduation are object-level updates that should not replace existing ranges.
         let mut journal_ranges: HashMap<(u64, u64), &JournalEntry> = HashMap::new();
         for entry in journal_entries {
@@ -10419,6 +10445,24 @@ impl JournalConsolidator {
         // Check for conflicts with existing metadata ranges
         for (range_key, journal_entry) in &journal_ranges {
             let (start, end) = *range_key;
+
+            // A listing marked unservable is never replaced here, as the `Add` arm of
+            // `apply_journal_entries` never replaces it: a newer `Add` may describe an older
+            // fill whose file another version has since overwritten, and one with no file
+            // identity would then be served under `cache.trust_unverified_ranges`.
+            // `retire_unservable_extents` unlists the extent once its file is unlinked.
+            if metadata
+                .ranges
+                .iter()
+                .any(|r| r.start == start && r.end == end && r.unservable)
+            {
+                debug!(
+                    "Kept a listing marked unservable over a journal entry: cache_key={}, \
+                     range={}-{}",
+                    metadata.cache_key, start, end
+                );
+                continue;
+            }
 
             // Find existing range in metadata
             if let Some(existing_range) = metadata
@@ -10744,19 +10788,6 @@ impl JournalConsolidator {
                         // Range already exists in metadata - skip (don't count size)
                         debug!(
                             "ADD journal entry skipped (range already in metadata): cache_key={}, range={}-{}",
-                            entry.cache_key, entry.range_spec.start, entry.range_spec.end
-                        );
-                    }
-                }
-                JournalOperation::Update => {
-                    // Find and update existing range
-                    if let Some(existing_range) = metadata.ranges.iter_mut().find(|r| {
-                        r.start == entry.range_spec.start && r.end == entry.range_spec.end
-                    }) {
-                        *existing_range = entry.range_spec.clone();
-                        entries_applied += 1;
-                        debug!(
-                            "Applied UPDATE journal entry: cache_key={}, range={}-{}",
                             entry.cache_key, entry.range_spec.start, entry.range_spec.end
                         );
                     }
@@ -11637,8 +11668,9 @@ impl JournalConsolidator {
 
         crate::disk_cache::get_sharded_path(&base_dir, cache_key, &suffix)
     }
-    /// Unlink the `.bin` of each retired identity-less `Add` (R12.1) that can only be that fill's
-    /// own file, and return how many were unlinked.
+    /// Unlink the `.bin` of each retired identity-less `Add` (R12.1), or retired `Add` stored from
+    /// an append-md5 response ([`entry_is_append_md5_fill`]), that can only be that fill's own
+    /// file, and return how many were unlinked.
     ///
     /// Retiring a 2.x journal backlog leaves one unlisted `.bin` per `Add`. Those files count
     /// toward the cache's size, eviction cannot reach them, and the orphan rotation visits at most
@@ -11675,7 +11707,8 @@ impl JournalConsolidator {
         batch: &[JournalEntry],
     ) -> usize {
         let is_retired_add = |e: &JournalEntry| {
-            matches!(e.operation, JournalOperation::Add) && entry_lists_unverified_range(e)
+            matches!(e.operation, JournalOperation::Add)
+                && (entry_lists_unverified_range(e) || entry_is_append_md5_fill(e))
         };
         let listed: std::collections::HashSet<String> = match self
             .get_metadata_file_path(cache_key)
@@ -12047,7 +12080,7 @@ mod tests {
     }
 
     /// With the `.meta` gone between validation and the fold (a peer's eviction),
-    /// only an `Add` or `Update` carrying `object_metadata` creates a document. One case per
+    /// only an `Add` carrying `object_metadata` creates a document. One case per
     /// `JournalOperation`, plus an `Add` without `object_metadata` and a mixed
     /// AccessUpdate + Remove key. Every case's valid entries are returned for journal cleanup.
     ///
@@ -12066,7 +12099,7 @@ mod tests {
                 ..Default::default()
             })
         };
-        // (case, entries for the key, Add/Update carries object_metadata, expect a document)
+        // (case, entries for the key, the Add carries object_metadata, expect a document)
         type Case = (&'static str, Vec<JournalOperation>, Option<bool>, bool);
         let cases: Vec<Case> = vec![
             (
@@ -12106,12 +12139,6 @@ mod tests {
                 Some(true),
                 true,
             ),
-            (
-                "update-with-metadata",
-                vec![JournalOperation::Update],
-                Some(true),
-                true,
-            ),
         ];
         for (case, ops, metadata_flag, expect_document) in cases {
             let key = format!("test-bucket/scn2/{case}");
@@ -12135,7 +12162,7 @@ mod tests {
                     JournalOperation::Graduation => {
                         entry = graduation_entry(&key, 4096, "test-instance");
                     }
-                    JournalOperation::Add | JournalOperation::Update => {
+                    JournalOperation::Add => {
                         if metadata_flag == Some(true) {
                             entry.object_metadata = with_metadata();
                         }
@@ -12225,18 +12252,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("metadata").join("_journals")).unwrap();
         let mut dc =
             crate::disk_cache::DiskCacheManager::new(dir.clone(), true, 1024, false, 1_048_576);
-        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
-            dir.clone(),
-            Arc::new(MetadataLockManager::new(
-                dir.clone(),
-                Duration::from_secs(30),
-                3,
-            )),
-            Arc::new(JournalManager::new(
-                dir.clone(),
-                "scn3-instance".to_string(),
-            )),
-        );
+        let writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(Arc::new(
+            JournalManager::new(dir.clone(), "scn3-instance".to_string()),
+        ));
         dc.set_hybrid_metadata_writer(Arc::new(tokio::sync::Mutex::new(writer)));
         dc.initialize().await.unwrap();
         let consolidator = graduation_test_consolidator(&temp_dir);
@@ -23281,5 +23299,28 @@ pub(crate) mod explicit_unlock_tests {
             "a takeover must unlock the flock itself; a forked child's copy of the descriptor \
              otherwise keeps it held"
         );
+    }
+}
+
+/// Test seam: refuse the next `Remove`-marker append for an armed cache key, once per arm.
+#[cfg(test)]
+pub(crate) mod remove_marker_append_fault {
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(cache_key: &str) {
+        ARMED.lock().unwrap().push(cache_key.to_string());
+    }
+
+    pub(super) fn take(cache_key: &str) -> bool {
+        let mut armed = ARMED.lock().unwrap();
+        match armed.iter().position(|k| k == cache_key) {
+            Some(i) => {
+                armed.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 }

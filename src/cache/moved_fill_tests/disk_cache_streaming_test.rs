@@ -34,12 +34,14 @@ async fn test_stream_range_data_8mib_uncompressed() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store the 8 MiB range on disk
@@ -143,12 +145,14 @@ async fn test_stream_range_data_compressed() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store the range (compression enabled, so it should be compressed on disk)

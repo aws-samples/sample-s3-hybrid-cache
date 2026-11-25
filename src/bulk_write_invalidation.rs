@@ -163,14 +163,17 @@ fn declaration_is_readable(attrs: &str) -> bool {
 /// holding `--`, an unterminated comment, an unknown entity, mismatched or unclosed tags,
 /// a second root element, and text that is not UTF-8. AWS SDKs and the CLI send none of
 /// those. Line endings are normalised as XML 1.0 requires.
-fn read_keys(xml: &[u8]) -> Option<(String, Vec<(String, String)>)> {
+fn read_keys(xml: &[u8]) -> Option<(String, Vec<Leaf>)> {
     let raw = std::str::from_utf8(xml).ok()?;
     let normalised = raw.replace("\r\n", "\n").replace('\r', "\n");
     let xml = normalised.as_str();
-    let mut stack: Vec<String> = Vec::new();
+    // Each open element with its number in document order.
+    let mut stack: Vec<(String, usize)> = Vec::new();
+    let mut next_id = 0usize;
     let mut root: Option<String> = None;
-    let mut keys = Vec::new();
-    let mut key_text: Option<String> = None;
+    let mut leaves = Vec::new();
+    // The leaf being read: whether it is a `Code`, and its text so far.
+    let mut leaf: Option<(bool, String)> = None;
     let mut i = 0;
     // One declaration, only at offset 0, holding no markup.
     if xml.starts_with("<?xml") && xml[5..].starts_with(|c: char| c.is_ascii_whitespace()) {
@@ -184,7 +187,7 @@ fn read_keys(xml: &[u8]) -> Option<(String, Vec<(String, String)>)> {
         let rest = &xml[i..];
         if let Some(comment) = rest.strip_prefix("<!--") {
             // A comment inside a key would leave the key text to a reading of its own.
-            if key_text.is_some() {
+            if leaf.is_some() {
                 return None;
             }
             let end = comment.find("-->")?;
@@ -199,27 +202,41 @@ fn read_keys(xml: &[u8]) -> Option<(String, Vec<(String, String)>)> {
         } else if rest.starts_with("</") {
             let end = tag_end(xml, i)?;
             let name = local_name(xml[i + 2..end].trim());
-            if stack.pop().as_deref() != Some(name) {
+            if stack.pop().map(|(open, _)| open).as_deref() != Some(name) {
                 return None;
             }
-            if name == "Key" {
-                let text = key_text.take()?;
-                keys.push((stack.last().cloned().unwrap_or_default(), text));
+            // Nothing opens inside a leaf, so the element this closes is the leaf.
+            if let Some((code, text)) = leaf.take() {
+                let (parent, parent_id) = stack.last().cloned().unwrap_or_default();
+                leaves.push(Leaf {
+                    parent,
+                    parent_id,
+                    code,
+                    text,
+                });
             }
             i = end + 1;
         } else if rest.starts_with('<') {
             let end = tag_end(xml, i)?;
             let inner = &xml[i + 1..end];
             let name = local_name(inner).to_string();
-            if name.is_empty() || key_text.is_some() {
+            if name.is_empty() || leaf.is_some() {
                 return None;
             }
+            let is_leaf = name == "Key"
+                || (name == "Code" && stack.last().is_some_and(|(open, _)| open == "Error"));
             if inner.ends_with('/') {
                 if stack.is_empty() && root.is_some() {
                     return None; // a second root element
                 }
-                if name == "Key" {
-                    keys.push((stack.last().cloned().unwrap_or_default(), String::new()));
+                if is_leaf {
+                    let (parent, parent_id) = stack.last().cloned().unwrap_or_default();
+                    leaves.push(Leaf {
+                        parent,
+                        parent_id,
+                        code: name == "Code",
+                        text: String::new(),
+                    });
                 }
                 if root.is_none() {
                     root = Some(name);
@@ -230,15 +247,16 @@ fn read_keys(xml: &[u8]) -> Option<(String, Vec<(String, String)>)> {
                 } else if stack.is_empty() {
                     return None; // a second root element
                 }
-                if name == "Key" {
-                    key_text = Some(String::new());
+                if is_leaf {
+                    leaf = Some((name == "Code", String::new()));
                 }
-                stack.push(name);
+                stack.push((name, next_id));
+                next_id += 1;
             }
             i = end + 1;
         } else {
             let next = rest.find('<').map(|p| i + p).unwrap_or(xml.len());
-            if let Some(text) = key_text.as_mut() {
+            if let Some((_, text)) = leaf.as_mut() {
                 unescape_into(&xml[i..next], text)?;
             }
             i = next;
@@ -247,19 +265,30 @@ fn read_keys(xml: &[u8]) -> Option<(String, Vec<(String, String)>)> {
     if !stack.is_empty() {
         return None;
     }
-    Some((root?, keys))
+    Some((root?, leaves))
+}
+
+/// An element [`read_keys`] collects the text of: every `Key`, and a `Code` whose parent is an
+/// `Error`. `parent_id` numbers the parent element in document order, so the `Key` and the
+/// `Code` of one `<Error>` entry share it.
+struct Leaf {
+    parent: String,
+    parent_id: usize,
+    code: bool,
+    text: String,
 }
 
 /// The object keys a DeleteObjects request body names, or `None` when it cannot be read.
 pub(crate) fn parse_delete_request(xml: &[u8]) -> Option<Vec<String>> {
-    let (root, keys) = read_keys(xml)?;
+    let (root, leaves) = read_keys(xml)?;
     if root != "Delete" {
         return None;
     }
     Some(
-        keys.into_iter()
-            .filter(|(parent, _)| parent == "Object")
-            .map(|(_, key)| key)
+        leaves
+            .into_iter()
+            .filter(|leaf| !leaf.code && leaf.parent == "Object")
+            .map(|leaf| leaf.text)
             .collect(),
     )
 }
@@ -307,22 +336,36 @@ pub(crate) fn refusal_cause(xml: &[u8]) -> &'static str {
 pub(crate) struct DeleteResultKeys {
     /// `<Deleted><Key>`: listed only in non-quiet mode.
     pub(crate) deleted: Vec<String>,
-    /// `<Error><Key>`: listed in both modes. S3 did not delete these.
+    /// `<Error><Key>`: listed in both modes. S3 reports it did not delete these.
     pub(crate) errors: Vec<String>,
+    /// The `<Key>` of each `<Error>` whose `<Code>` is `InternalError`, also listed in
+    /// `errors`. S3 documents that a request answered `InternalError` may or may not have been
+    /// processed, so S3 may have deleted these.
+    pub(crate) internal_errors: Vec<String>,
 }
 
 /// The keys a DeleteObjects result document reports, or `None` when it is not a
 /// `DeleteResult` this reader understands (including a whole-request `<Error>` document).
 pub(crate) fn parse_delete_result(xml: &[u8]) -> Option<DeleteResultKeys> {
-    let (root, keys) = read_keys(xml)?;
+    let (root, leaves) = read_keys(xml)?;
     if root != "DeleteResult" {
         return None;
     }
+    let internal: HashSet<usize> = leaves
+        .iter()
+        .filter(|leaf| leaf.code && leaf.text.trim() == "InternalError")
+        .map(|leaf| leaf.parent_id)
+        .collect();
     let mut result = DeleteResultKeys::default();
-    for (parent, key) in keys {
-        match parent.as_str() {
-            "Deleted" => result.deleted.push(key),
-            "Error" => result.errors.push(key),
+    for leaf in leaves.into_iter().filter(|leaf| !leaf.code) {
+        match leaf.parent.as_str() {
+            "Deleted" => result.deleted.push(leaf.text),
+            "Error" => {
+                if internal.contains(&leaf.parent_id) {
+                    result.internal_errors.push(leaf.text.clone());
+                }
+                result.errors.push(leaf.text);
+            }
             _ => {}
         }
     }
@@ -339,6 +382,9 @@ pub(crate) fn parse_delete_result(xml: &[u8]) -> Option<DeleteResultKeys> {
 /// * A `2xx` with an unreadable result, a `5xx`, or no response at all: every requested
 ///   key, since S3 may have deleted any of them.
 /// * Any other status: none. S3 rejected the request before deleting.
+///
+/// A key left out because of its `<Error>` entries is expired instead when one of them is
+/// `InternalError` ([`keys_to_expire`]).
 pub(crate) fn keys_to_invalidate(
     status: Option<hyper::StatusCode>,
     requested: Option<&[String]>,
@@ -373,6 +419,36 @@ pub(crate) fn keys_to_invalidate(
     let mut seen = HashSet::new();
     out.retain(|k| seen.insert(k.clone()));
     out
+}
+
+/// The keys a `2xx` DeleteObjects result leaves possibly deleted: each requested key that
+/// [`keys_to_invalidate`] leaves out because S3 reported an `<Error>` for every entry naming it,
+/// when the `<Code>` of one of those errors is `InternalError`. Each is expired, as a single
+/// DELETE answered `500 InternalError` is. A key whose errors carry other codes is left. Empty
+/// for any other status and for an unreadable result, where [`keys_to_invalidate`] already
+/// names every requested key or none.
+pub(crate) fn keys_to_expire(
+    status: Option<hyper::StatusCode>,
+    requested: Option<&[String]>,
+    result: Option<&DeleteResultKeys>,
+) -> Vec<String> {
+    let (Some(s), Some(result)) = (status, result) else {
+        return Vec::new();
+    };
+    if !s.is_success() {
+        return Vec::new();
+    }
+    let invalidated: HashSet<String> = keys_to_invalidate(status, requested, Some(result))
+        .into_iter()
+        .collect();
+    let mut seen = HashSet::new();
+    requested
+        .unwrap_or(&[])
+        .iter()
+        .filter(|k| !invalidated.contains(*k) && result.internal_errors.contains(k))
+        .filter(|k| seen.insert((*k).clone()))
+        .cloned()
+        .collect()
 }
 
 // ── Form POST ──────────────────────────────────────────────────────────────
@@ -1077,6 +1153,7 @@ mod tests {
         let result = DeleteResultKeys {
             deleted: vec![],
             errors: vec!["k".into(), "j".into()],
+            ..Default::default()
         };
         assert_eq!(
             keys_to_invalidate(Some(StatusCode::OK), Some(&requested), Some(&result)),
@@ -1086,6 +1163,7 @@ mod tests {
         let result = DeleteResultKeys {
             deleted: vec![],
             errors: vec!["k".into(), "k".into()],
+            ..Default::default()
         };
         assert_eq!(
             keys_to_invalidate(Some(StatusCode::OK), Some(&requested), Some(&result)),
@@ -1187,7 +1265,8 @@ mod tests {
             parse_delete_result(xml).unwrap(),
             DeleteResultKeys {
                 deleted: vec!["a".into()],
-                errors: vec!["b".into()]
+                errors: vec!["b".into()],
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -1197,12 +1276,69 @@ mod tests {
     }
 
     #[test]
+    fn a_key_s3_reports_internal_error_for_is_expired_not_invalidated() {
+        use hyper::StatusCode;
+        let requested: Vec<String> = ["gone", "internal", "denied", "versions", "both"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // `Code` before `Key` in one entry, after it in the others; `versions` is requested
+        // twice and only one of its entries failed; `both` failed twice, once InternalError.
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult>\
+            <Deleted><Key>gone</Key></Deleted>\
+            <Error><Code>InternalError</Code><Key>internal</Key><Message>m</Message></Error>\
+            <Error><Key>denied</Key><Code>AccessDenied</Code></Error>\
+            <Error><Key>versions</Key><Code>InternalError</Code></Error>\
+            <Error><Key>both</Key><Code>AccessDenied</Code></Error>\
+            <Error><Key>both</Key><Code> InternalError </Code></Error>\
+            </DeleteResult>";
+        let result = parse_delete_result(xml).expect("a readable result");
+        assert_eq!(
+            result.internal_errors,
+            vec!["internal", "versions", "both"],
+            "the keys of the InternalError entries"
+        );
+        let mut requested_twice = requested.clone();
+        requested_twice.push("versions".to_string());
+        requested_twice.push("both".to_string());
+        let status = Some(StatusCode::OK);
+        assert_eq!(
+            (
+                keys_to_invalidate(status, Some(&requested_twice), Some(&result)),
+                keys_to_expire(status, Some(&requested_twice), Some(&result)),
+            ),
+            (
+                vec!["gone".to_string(), "versions".to_string()],
+                vec!["internal".to_string(), "both".to_string()],
+            ),
+            "(invalidated, expired): a key with an entry S3 did not refuse is invalidated, one \
+             refused with InternalError is expired, one refused otherwise is left"
+        );
+        // Only a readable `2xx` result names keys to expire.
+        assert!(keys_to_expire(status, Some(&requested), None).is_empty());
+        assert!(keys_to_expire(
+            Some(StatusCode::INTERNAL_SERVER_ERROR),
+            Some(&requested),
+            Some(&result)
+        )
+        .is_empty());
+        assert!(keys_to_expire(None, Some(&requested), Some(&result)).is_empty());
+        // A `Code` outside an `<Error>` names nothing.
+        let stray = parse_delete_result(
+            b"<DeleteResult><Deleted><Key>a</Key><Code>InternalError</Code></Deleted></DeleteResult>",
+        )
+        .expect("readable");
+        assert!(stray.internal_errors.is_empty());
+    }
+
+    #[test]
     fn keys_to_invalidate_by_status_and_result() {
         use hyper::StatusCode;
         let requested = vec!["a".to_string(), "b".to_string()];
         let result = DeleteResultKeys {
             deleted: vec![],
             errors: vec!["b".into()],
+            ..Default::default()
         };
         assert_eq!(
             keys_to_invalidate(Some(StatusCode::OK), Some(&requested), Some(&result)),
@@ -1225,6 +1361,7 @@ mod tests {
         let deleted_only = DeleteResultKeys {
             deleted: vec!["z".into()],
             errors: vec![],
+            ..Default::default()
         };
         assert_eq!(
             keys_to_invalidate(Some(StatusCode::OK), None, Some(&deleted_only)),

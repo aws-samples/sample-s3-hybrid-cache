@@ -449,12 +449,14 @@ async fn seed_v1_extent_with_etag(
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         },
         ranges: vec![RangeSpec {
             start,
@@ -481,6 +483,7 @@ async fn seed_v1_extent_with_etag(
         head_access_count: 0,
         head_cached_at: None,
         last_validated_at: None,
+        write_expired_at: None,
     };
     let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
     std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
@@ -1665,10 +1668,171 @@ async fn a_full_object_waiter_on_a_slow_fill_gets_its_head_before_the_sdk_read_t
         response.status()
     );
 }
+/// A whole-object GET waiter waits the configured `wait_timeout_secs` for the fill, not a fixed
+/// 30 s: at 45 its head comes 45 s after the request, when it stops waiting and fetches for
+/// itself.
+#[tokio::test(start_paused = true)]
+async fn a_full_object_waiter_waits_the_configured_wait_timeout() {
+    let h = Harness::with_wait_timeout(45).await;
+    let key = "bucket/slow-fill-waiter-45.bin";
+    let s3 = VersionedS3::new(0, OBJECT_SIZE, Duration::ZERO).await;
+    let _fill = match h.tracker.try_register(&InFlightTracker::make_full_key(key)) {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let start = tokio::time::Instant::now();
+    let served = h.full_get(key, HashMap::new(), s3.clone()).await;
+    let head_after = start.elapsed();
+    assert!(
+        head_after >= Duration::from_secs(45) && head_after < Duration::from_secs(46),
+        "A FULL-OBJECT WAITER WITH wait_timeout_secs 45 STOPPED WAITING AFTER {head_after:?}, \
+         not 45 s (status {})",
+        served.status
+    );
+    assert!(
+        !s3.seen().is_empty(),
+        "the waiter must have fetched for itself"
+    );
+}
+/// With the default coordination settings, a range waiter on a fill that has not answered
+/// waits one `wait_timeout_secs` (30 s) and fetches for itself, so its head comes before the
+/// AWS SDKs' 60 s read timeout.
+#[tokio::test(start_paused = true)]
+async fn a_range_waiter_on_a_slow_fill_gets_its_head_before_the_sdk_read_timeout() {
+    let h = Harness::with_default_coordination().await;
+    let key = "bucket/slow-fill-range-waiter.bin";
+    seed_v1_extent(key, &h.cache_manager, 0, PAGE_SIZE - 1, OBJECT_SIZE).await;
+    let s3 = VersionedS3::new(0, OBJECT_SIZE, Duration::ZERO).await;
+    // The flight key of the whole requested range: the cache key, then `:start-end`.
+    let _fill = match h
+        .tracker
+        .try_register(&format!("{key}:0-{}", OBJECT_SIZE - 1))
+    {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let start = tokio::time::Instant::now();
+    let served = h
+        .range_get(
+            key,
+            &format!("bytes=0-{}", OBJECT_SIZE - 1),
+            HashMap::new(),
+            ResolvedSettings::default(),
+            false,
+            s3.clone(),
+        )
+        .await;
+    let head_after = start.elapsed();
+    assert!(
+        head_after >= Duration::from_secs(30) && head_after < Duration::from_secs(60),
+        "A RANGE WAITER ON A SLOW FILL GOT ITS HEAD AFTER {head_after:?}: one 30 s wait, then \
+         its own fetch, is under the SDKs' 60 s read timeout (status {})",
+        served.status
+    );
+    assert!(
+        !s3.seen().is_empty(),
+        "the waiter must have fetched for itself"
+    );
+}
+/// The same for a widened page's waiter (`fill_page`): one `wait_timeout_secs`, then its own
+/// fetch, not a re-subscription and a second wait.
+#[tokio::test(start_paused = true)]
+async fn a_page_waiter_on_a_slow_fill_gets_its_head_before_the_sdk_read_timeout() {
+    let h = Harness::with_default_coordination().await;
+    let key = "bucket/slow-fill-page-waiter.bin";
+    // Page 1 cached, so the object's size is known; page 0, which the request widens to, is not.
+    seed_v1_extent(
+        key,
+        &h.cache_manager,
+        PAGE_SIZE,
+        2 * PAGE_SIZE - 1,
+        OBJECT_SIZE,
+    )
+    .await;
+    let s3 = VersionedS3::new(0, OBJECT_SIZE, Duration::ZERO).await;
+    // The page's flight key: the cache key, then `:start-end` of the page.
+    let _fill = match h
+        .tracker
+        .try_register(&format!("{key}:0-{}", PAGE_SIZE - 1))
+    {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let start = tokio::time::Instant::now();
+    let served = tokio::time::timeout(
+        Duration::from_secs(300),
+        h.range_get(
+            key,
+            "bytes=10-20",
+            HashMap::new(),
+            widened(),
+            false,
+            s3.clone(),
+        ),
+    )
+    .await;
+    let head_after = start.elapsed();
+    let status = served.as_ref().map(|s| s.status).ok();
+    assert!(
+        head_after >= Duration::from_secs(30) && head_after < Duration::from_secs(60),
+        "A PAGE WAITER ON A SLOW FILL GOT ITS HEAD AFTER {head_after:?}: one 30 s wait, then \
+         its own fetch, is under the SDKs' 60 s read timeout (status {status:?}; None is no head \
+         within 300 s)"
+    );
+    assert!(
+        !s3.seen().is_empty(),
+        "the waiter must have fetched for itself"
+    );
+}
+/// The same for a `partNumber` waiter.
+#[tokio::test(start_paused = true)]
+async fn a_part_waiter_on_a_slow_fill_gets_its_head_before_the_sdk_read_timeout() {
+    let h = Harness::with_default_coordination().await;
+    let key = "bucket/slow-fill-part-waiter.bin";
+    let s3 = VersionedS3::new(0, OBJECT_SIZE, Duration::ZERO).await;
+    // The part flight key: the cache key, then `:part{N}`.
+    let _fill = match h.tracker.try_register(&format!("{key}:part1")) {
+        s3_proxy::inflight_tracker::FetchRole::Fetcher(g) => g,
+        _ => panic!("expected the fetcher role"),
+    };
+    let s3_client: Arc<dyn s3_proxy::S3ClientApi + Send + Sync> = s3.clone();
+    let start = tokio::time::Instant::now();
+    let response = HttpProxy::forward_part_with_coordination(
+        Method::GET,
+        format!("/{key}?partNumber=1").parse().unwrap(),
+        "s3.us-west-2.amazonaws.com".to_string(),
+        HashMap::new(),
+        key.to_string(),
+        1,
+        Arc::clone(&h.cache_manager),
+        s3_client,
+        Arc::clone(&h.tracker),
+        Arc::clone(&h.range_handler),
+        Arc::clone(&h.config),
+        true,
+        h.config.cache.download_coordination.wait_timeout(),
+        None,
+        &ResolvedSettings::default(),
+        &None,
+        None,
+    )
+    .await
+    .expect("Infallible");
+    let head_after = start.elapsed();
+    assert!(
+        head_after >= Duration::from_secs(30) && head_after < Duration::from_secs(60),
+        "A PART WAITER ON A SLOW FILL GOT ITS HEAD AFTER {head_after:?}: one 30 s wait, then \
+         its own fetch, is under the SDKs' 60 s read timeout (status {})",
+        response.status()
+    );
+    assert!(
+        !s3.seen().is_empty(),
+        "the waiter must have fetched for itself"
+    );
+}
 // ---------------------------------------------------------------------------
 // A range waiter's fallback over a version change during its wait
 // ---------------------------------------------------------------------------
-
 /// How a waiter's wait ends: its leader goes away without an answer, or its budget runs out
 /// while the leader is still working.
 #[derive(Clone, Copy)]
@@ -1686,6 +1850,23 @@ impl Harness {
     async fn with_default_coordination() -> Self {
         let mut config = Config::default();
         config.cache.download_coordination.enabled = true;
+        config.cache.ram_cache_enabled = false;
+        config.cache.full_object_check_threshold = 512;
+        let config = Arc::new(config);
+        let (t, cache_manager, range_handler) = make_infra(&config).await;
+        Self {
+            _t: t,
+            cache_manager,
+            range_handler,
+            config,
+            tracker: Arc::new(InFlightTracker::new()),
+        }
+    }
+    /// A harness with the default download-coordination settings except `wait_timeout_secs`.
+    async fn with_wait_timeout(wait_secs: u64) -> Self {
+        let mut config = Config::default();
+        config.cache.download_coordination.enabled = true;
+        config.cache.download_coordination.wait_timeout_secs = wait_secs;
         config.cache.ram_cache_enabled = false;
         config.cache.full_object_check_threshold = 512;
         let config = Arc::new(config);

@@ -2161,6 +2161,7 @@ async fn suffix_read_size_known_widens_to_page_and_slices_exact_suffix() {
         head_access_count: 0,
         head_cached_at: None,
         last_validated_at: None,
+        write_expired_at: None,
     };
     cache_manager
         .get_metadata_cache()

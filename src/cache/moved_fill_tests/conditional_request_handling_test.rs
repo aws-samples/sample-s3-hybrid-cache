@@ -200,7 +200,7 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
     assert!(entry.is_some());
 
     // Invalidate cache
-    cache_manager.invalidate_cache(cache_key).await?;
+    cache_manager.invalidate_cache_hierarchy(cache_key).await?;
 
     // Verify entry is gone
     let entry_after_invalidation = cache_manager

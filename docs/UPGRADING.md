@@ -10,11 +10,11 @@ see different memory use, connection counts, network exposure, or on-disk layout
 binary swap. The tables below list the releases that do one of those things, so you can
 read only the ones between your current version and your target.
 
-For 3.0.0 to 3.0.6, each release's section below, from [Upgrading to 3.0.6](#upgrading-to-306) to [Upgrading to 3.0.0](#upgrading-to-300), and the guides it links carry the detail, and
+For 3.0.0 to 3.0.7, each release's section below, from [Upgrading to 3.0.7](#upgrading-to-307) to [Upgrading to 3.0.0](#upgrading-to-300), and the guides it links carry the detail, and
 the [changelog](../CHANGELOG.md) summarizes each release. For every release up to 2.8.4,
 the detail is in the [pre-3.0.0 changelog](../changelog-pre-v3.md).
 
-3.0.0 upgrades in place from any 2.8 release, and 3.0.1 to 3.0.6 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade) and [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) before upgrading a fleet one proxy at a time.
+3.0.0 upgrades in place from any 2.8 release, and 3.0.1 to 3.0.7 from 3.0.0 or any 2.8 release; a fleet on an older release first upgrades to a 2.8 release. Where objects are overwritten in place, read [During a rolling upgrade](#during-a-rolling-upgrade), [Upgrading a fleet to 3.0.1](#upgrading-a-fleet-to-301) and [During a rolling upgrade to 3.0.7](#during-a-rolling-upgrade-to-307) before upgrading a fleet one proxy at a time.
 After 3.0.0, restart a fleet one proxy at a time. Clients that fail over, such as CRT-based ones, retry on another proxy while one restarts, and the cache volume survives restarts.
 Releases from before 1.0.0 are not covered. Upgrading from a pre-1.0.0 build is not a
 supported path; start from a fresh cache directory and a config derived from the
@@ -27,6 +27,7 @@ cannot be read.
 
 | Version | Action |
 |---|---|
+| 3.0.7 | Deployments with AWS SDK for Java 2.x clients, and fleets where objects are overwritten in place, have a step to take; see [Upgrading to 3.0.7](#upgrading-to-307). |
 | 3.0.5 | Deployments whose DNS64 resolver uses the local-use NAT64 range `64:ff9b:1::/48`, clients that reach a proxy's own addresses through the HTTPS passthrough or `CONNECT`, and fleets that set `connection_pool.ip_failure_threshold` against the old count have a step to take; see [Upgrading to 3.0.5](#upgrading-to-305). |
 | 3.0.2 | Operators with an allowlist and S3 on private addresses, S3 Select clients, or alarms on removed `/metrics` fields, and code built on the `s3_proxy` library, have a step to take; see [Upgrading to 3.0.2](#upgrading-to-302). |
 | 3.0.1 | Fleets where objects are overwritten in place, and proxies whose clocks may differ from the cache volume's file server by 10 minutes or more, have a step to take; see [Upgrading to 3.0.1](#upgrading-to-301). |
@@ -88,6 +89,45 @@ corrupted.
 Releases not listed above require no action and change no defaults: internal fixes,
 performance work, additive opt-in features that stay disabled until configured, and
 dependency bumps.
+
+## Upgrading to 3.0.7
+
+3.0.7 upgrades in place from 3.0.6 and needs no configuration change. When upgrading from 3.0.5 or earlier, take those releases' steps as well. It fixes several ways a client could receive the wrong bytes, keeps the write cache within `cache.write_cache_percent`, and evicts staged uploads from many cache shards in parallel.
+
+### Before upgrading to 3.0.7
+
+- If clients use the AWS SDK for Java 2.x, set `ResponseChecksumValidation.WHEN_REQUIRED` on the client, or enable checksum mode on each GetObject, until every proxy runs 3.0.7. Either stops S3 appending the MD5 trailer that earlier releases cache as part of the object.
+
+### After upgrading to 3.0.7
+
+- If clients read objects by `partNumber` with the AWS SDK for Java 2.x, remove those buckets' cached data once every proxy runs 3.0.7 ([Removing one bucket's cached data](CACHING.md#removing-one-buckets-cached-data)). An earlier release can have cached a part with S3's MD5 trailer in a form 3.0.7 cannot recognize.
+
+### What you will see after upgrading to 3.0.7
+
+- Entries an earlier release cached from AWS SDK for Java 2.x reads, with S3's MD5 trailer, are fetched from S3 again on their first read. The first `partNumber` read of each part cached before 3.0.7 is fetched from S3 once, whatever `cache.trust_unverified_ranges` says, and logs `Cleared a part layout entry recorded before 3.0.7` at `info`.
+- An entry an earlier release cached for an object of more than one part, whose stored checksum has no `-N` suffix, is served without checksum headers ([Header restoration on cache hits](CACHE_FRESHNESS.md#header-restoration-on-cache-hits)). Entries 3.0.7 caches keep them.
+- Every waiting request, for an object, a range, a part or a page, waits one `cache.download_coordination.wait_timeout_secs` (default `30`), then fetches from S3 itself. With a value above 60, whole-object reads can wait past the AWS CLI's 60-second read timeout, so keep it at 60 or less. With the defaults, range and part waiters fetch from S3 after 30 seconds instead of up to 120, so S3 sees more GETs when a fetch is slow.
+- The waiter WARN lines read `Download coordination: waiter had no answer from the fill within wait_timeout_secs, fetching from S3 itself`, naming `part`, `range` or `page` waiters where they apply. Update log filters that match the lines about re-subscriptions.
+- `cache.actively_remove_cached_data` and `cache.download_coordination.max_waiter_resubscriptions` still parse and have no effect, so delete them from your config. A configuration that sets `actively_remove_cached_data: true`, or `max_waiter_resubscriptions` to anything but `3`, logs a warning at startup.
+- Once staged uploads reach `write_cache_percent` of `max_cache_size`, new uploads are forwarded to S3 uncached and counted as `staging_bound` in `signed_put.skipped_puts_total`, with one WARN a minute. Under sustained uploads past that bound, fewer reads after a write are cache hits ([Uploads past the bound](EVICTION.md#uploads-past-the-bound)).
+- Every part of a multipart upload whose `CreateMultipartUpload` was not cached is forwarded unstaged, so such parts do not count in `cache.in_progress_part_bytes`.
+- Write cache eviction runs across cache shards at once and removes the oldest staged objects first within each shard, so an unread upload can be removed before an older one in another shard. Count-driven passes can run on more consolidation cycles, so expect more eviction lock acquisitions by write cache passes ([Write cache reclamation](EVICTION.md#write-cache-reclamation)).
+- A write that S3 answers `500 InternalError`, or a DELETE that S3 answers with any `5xx`, expires the cached entry, so the next GET or HEAD sends S3 a conditional request. A DeleteObjects request that S3 answers with any `5xx` expires every key it names, and keys that S3 reports with `InternalError` are expired the same way.
+- A GET or HEAD that learns from S3 that a cached object has changed or been deleted writes the key's write-order file before it answers. That adds one small file write on the cache volume to those responses ([Write-order file cost](../README.md#write-order-file-cost)).
+- `metadata_heal_overwrite_total` also counts unparseable `.meta` files that a GET's range fill removes, so rebaseline any alert on its ratio to `corruption_metadata_total`.
+- An upload declined for space near `max_cache_size` starts read cache eviction only when the write cache has room for it.
+- A GET whose `.meta` exists but cannot be read is forwarded to S3 uncached, with a WARN, and counted as `metadata_unreadable` in `cache.cache_bypasses_by_reason`.
+
+### During a rolling upgrade to 3.0.7
+
+3.0.6 and 3.0.7 proxies can share a cache volume, so a fleet can be upgraded one proxy at a time. Where objects are overwritten in place, upgrade every proxy on the volume in one pass instead, as [During a rolling upgrade](#during-a-rolling-upgrade) describes.
+
+- Until it is upgraded, a 3.0.6 proxy keeps caching uploads past the write cache's bound, and can still serve the wrong bytes that 3.0.7 fixes.
+- If S3 answers a write or delete with a `5xx` during a rolling upgrade or before a rollback, every proxy serves the object as S3 holds it once a retry succeeds. Otherwise a proxy can serve the object's previous version for up to `get_ttl` (default `1d`) after that answer, or until you remove the bucket's cached data ([Removing one bucket's cached data](CACHING.md#removing-one-buckets-cached-data)).
+
+## Rolling back from 3.0.7
+
+Rolling back to 3.0.6 needs no step on the cache volume. A 3.0.6 proxy starts on a volume that 3.0.7 has written, serves what 3.0.7 cached, and drops the fields 3.0.7 adds to an object's cached metadata when it rewrites the entry. After upgrading again, 3.0.7 treats such an entry as one an earlier release cached ([What you will see after upgrading to 3.0.7](#what-you-will-see-after-upgrading-to-307)). While 3.0.6 runs, configure AWS SDK for Java 2.x clients as [Before upgrading to 3.0.7](#before-upgrading-to-307) describes. For a write or delete that S3 answered with a `5xx` before the rollback, see [During a rolling upgrade to 3.0.7](#during-a-rolling-upgrade-to-307).
 
 ## Upgrading to 3.0.6
 
@@ -293,6 +333,8 @@ Rolling back to 3.0.0 needs no step. 3.0.1 adds one field to an object's cached 
 - Log lines that parsers may match change shape. `Consolidation cycle complete` and `Consolidation cycle:` gain `write_cache_delta=`. `Range invalidation completed`, `Bulk range removal completed` and `Write-ledger compaction` gain fields. `Updated size state from validation:` reports `baseline_*` and `census_*` fields in place of `old_write_cache_size` and `new_write_cache_size`. Accept failures log `Accept failed; the listener keeps running`. Each bucket cached before the upgrade logs one warning as its origin is recorded.
 
 ### Configuration fields that are now ignored
+
+- `cache.actively_remove_cached_data` and `cache.download_coordination.max_waiter_resubscriptions` have no effect and are deprecated from 3.0.7 ([What you will see after upgrading to 3.0.7](#what-you-will-see-after-upgrading-to-307)).
 - `health.check_interval` and `cache.initialization.parallel_scan`, `scan_timeout` and `progress_logging` (environment variables `PARALLEL_SCAN`, `SCAN_TIMEOUT` and `PROGRESS_LOGGING`; flags `--parallel-scan`, `--no-parallel-scan`, `--scan-timeout`, `--progress-logging` and `--no-progress-logging`) still parse and have no effect. Public 2.8.4 did not read them either. 3.0.0 logs one startup warning naming each one set to a value other than its default, and no longer refuses to start over an out-of-range `scan_timeout`. Delete them from your config.
 - Public 2.8.4 ran an orphan re-adoption sweep, which orphan cleanup replaces. `orphan_recovery_enabled`, `orphan_recovery_interval`, `orphan_scan_timeout`, `orphan_max_per_cycle` and `shared_storage.recovery_max_concurrent` still load and are ignored, so the sweep no longer runs. The `RECOVERY_MAX_CONCURRENT` variable and the `--recovery-max-concurrent` flag are ignored too. The four orphan fields share one startup warning, logged when any is set to a non-default value; each of the others logs its own warning when set.
 ## Rolling back from 3.0.0

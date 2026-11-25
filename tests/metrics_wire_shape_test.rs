@@ -65,6 +65,8 @@ const FLATTENED_CACHE_FIELDS: &[&str] = &[
     "st_size_fold_last_duration_secs",
     "st_size_folds_declined_overlap_total",
     "st_size_fold_oldest_shard_scan_age_secs",
+    "shard_sum_bytes",
+    "shard_sum_drift_bytes",
     // TailPartitionGauges
     "tail_floor_bytes",
     "tail_max_entries",

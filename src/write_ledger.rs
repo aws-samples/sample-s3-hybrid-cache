@@ -236,13 +236,9 @@ const LEDGER_EXT: &str = "ledger";
 /// on a 5-minute interval. So the useful resolution of this figure was already one compaction
 /// interval; bounding the observation to the same interval takes nothing away.
 ///
-/// It is also `LEDGER_COMPACTION_INTERVAL_SECS`'s value, which is deliberate:
-/// [`WriteLedger::retire_identities`] **donates** the figure it already computes (whole-volume,
-/// under each file's lock, off the request path), so on a fleet where compaction is running the
-/// scrape path re-takes nothing at all and the traversal disappears rather than merely becoming
-/// less frequent. The scrape-path re-take is the fallback for the cases compaction does not
-/// cover: a freshly started process, and a drained ledger, for which
-/// `maybe_compact_write_ledger` returns before calling `retire_identities`.
+/// It is also `LEDGER_COMPACTION_INTERVAL_SECS`'s value. Nothing donates the figure: the staging
+/// pass and the compaction rotation both retire shard by shard, and a partial read is not the
+/// ledger's length, so the scrape path re-takes the traversal at most once per this interval.
 ///
 /// **The age is published**, as `write_cache.ledger_entries_age_secs`, so the staleness is
 /// visible rather than inferred — an operator reading the same value from two scrapes 15 seconds
@@ -479,7 +475,7 @@ static IDENTITY_SHARED_REFUSAL_LOGGED: std::sync::atomic::AtomicBool =
 /// Updating it per append would make an append a read-modify-write of a file as long as the
 /// staged set, which is precisely the O(staged)-per-PUT shape this module exists to avoid.
 /// So the header is written when the file is created (seeding the sequence) and rewritten by
-/// [`WriteLedger::retire_identities`], and it is legitimately *stale* in between.
+/// [`WriteLedger::retire_identities_in`], and it is legitimately *stale* in between.
 ///
 /// # When the header and the entries disagree
 ///
@@ -784,16 +780,6 @@ pub struct LedgerReadOutcome {
     /// Observed over everything read, **before** any cap truncation, so a capped read still
     /// reports where each instance's file actually ended.
     pub max_seq_per_instance: BTreeMap<String, u64>,
-
-    /// Legacy flat `{instance}.ledger` files still present, i.e. participants that have not
-    /// been converted to the per-shard layout.
-    ///
-    /// **Not part of [`Self::is_complete`]**, deliberately. Every other field here is
-    /// "something this read could not see"; this one is "a participant whose entries name no
-    /// shard". Both make an installed figure short, and they have different remedies — one is
-    /// retry, the other is finish the rolling deploy — so the fold refuses on it under its own
-    /// name rather than being folded into a completeness verdict.
-    pub legacy_files_present: usize,
 }
 
 impl LedgerReadOutcome {
@@ -807,8 +793,9 @@ impl LedgerReadOutcome {
     /// # Scope: "the whole ledger" is no longer the only thing this can mean
     ///
     /// There are two authority readers, and this predicate is relative to the one that produced
-    /// the value rather than absolute. [`WriteLedger::read_for_authority`] is asked to cover the
-    /// whole volume, so a complete outcome from it means what it always did.
+    /// the value rather than absolute. The whole-volume reader (`read_for_authority_for_tests`,
+    /// test-only) is asked to cover the whole volume, so a complete outcome from it means what
+    /// it always did.
     /// [`WriteLedger::read_shard_for_authority`] is asked to cover one shard, so a complete
     /// outcome from it means that shard's ledger was wholly readable and says nothing about any
     /// other shard — which is exactly the precondition for installing that shard's figure.
@@ -816,8 +803,8 @@ impl LedgerReadOutcome {
     /// **No second predicate was added, deliberately.** The fields are all counts scoped to the
     /// read's own file set (`files_expected` is the caller's listing length), so one predicate
     /// over them is already scope-correct; a `is_complete_for_volume()` beside it would be true
-    /// or false depending on data this value does not carry. Every pre-existing caller reads a
-    /// value produced by `read_for_authority` and therefore means precisely what it meant.
+    /// or false depending on data this value does not carry. A test that reads the whole-volume
+    /// view's value means precisely what it always did.
     pub fn is_complete(&self) -> bool {
         self.files_unreadable == 0
             && self.malformed_lines == 0
@@ -845,7 +832,7 @@ struct ParsedLedgerFile {
     /// eviction trigger fire late.
     ///
     /// A count cannot fix that, because a rewrite has to be able to put the lines back. So the text
-    /// is carried, and compaction quarantines it — see `retire_identities`.
+    /// is carried, and compaction quarantines it — see `retire_identities_in`.
     ///
     /// Blank lines are counted in `malformed` but deliberately **not** collected here: a blank line
     /// is what a torn write looks like once its partial bytes are gone, so there is nothing in it to
@@ -1091,6 +1078,38 @@ impl LedgerSyncProbe {
     }
 }
 
+/// What [`WriteLedger::read_shard_prefix`] read from one shard.
+#[derive(Debug, Default)]
+pub(crate) struct ShardPrefixRead {
+    /// The selected entries, oldest first.
+    pub(crate) entries: Vec<WriteLedgerEntry>,
+    /// Ledger files in the shard.
+    pub(crate) files: usize,
+    /// Lines read across the shard's files.
+    pub(crate) lines_read: u64,
+    /// Header lines read and passed over.
+    pub(crate) lines_skipped: u64,
+    /// A file could not be opened, locked or read, or a line was neither an entry nor a header:
+    /// the caller evicts nothing from the shard.
+    pub(crate) incomplete: bool,
+    /// The read stopped at its quota with entries left in some file: the shard has candidates
+    /// the read did not reach.
+    pub(crate) more: bool,
+}
+/// Every ledger file an authority read opened, in this test process.
+#[cfg(test)]
+static AUTHORITY_FILES_READ: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// The ledger files under `root` that authority reads have opened, in this test process.
+#[cfg(test)]
+pub(crate) fn authority_files_read_under_for_tests(root: &Path) -> Vec<PathBuf> {
+    AUTHORITY_FILES_READ
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|p| p.starts_with(root))
+        .cloned()
+        .collect()
+}
 /// `sync_data` on a ledger file after an append, before the file is dropped.
 fn sync_append(file: &std::fs::File, path: &Path, probe: &LedgerSyncProbe) -> std::io::Result<()> {
     #[cfg(test)]
@@ -1116,17 +1135,19 @@ fn sync_append(file: &std::fs::File, path: &Path, probe: &LedgerSyncProbe) -> st
 ///
 /// # The sequence stays PER INSTANCE, not per shard file, and that is load-bearing
 ///
-/// A per-shard sequence looks natural once the files are per shard, and it is **unsafe while
-/// the fold's cut is derived from a per-instance maximum**. `read_for_authority` reports
-/// `max_seq_per_instance` as the maximum across every one of that instance's files, and the
-/// fold applies it as the cut for *every* shard. So if shard `A`'s sequence stood at 5,000 and
-/// shard `B`'s at 10, `B`'s next credits would be compared against a cut of 5,000 and filtered
-/// as already-folded while no fold had read their `.meta` — bytes in neither term, which is
-/// § 16.6.1's forbidden outcome, permanently rather than transiently.
+/// A per-shard sequence looks natural once the files are per shard. The fold's cut is
+/// shard-local: [`WriteLedger::read_shard_for_authority`] reports `max_seq_per_instance` across
+/// one shard's files, and the fold raises that shard's cut to it by `max`, carrying forward the
+/// cut of an instance whose file in the shard is gone. A pending credit at or below its shard's
+/// cut is filtered as already folded, so every new credit must sit above every cut its instance
+/// has justified in that shard, a drained shard with a cut and no file included; otherwise its
+/// bytes are in neither term, which is § 16.6.1's forbidden outcome.
 ///
-/// One monotone per-instance counter makes every credit's coordinate strictly above every cut
-/// that counter has ever justified, for every shard, including a shard whose file does not
-/// exist yet. That is the whole invariant, and it holds without the fold changing at all.
+/// One monotone per-instance counter, floored by the persistent `{instance}.ledger.mark`, makes
+/// every credit's coordinate strictly above every cut that counter has ever justified, for every
+/// shard, including a shard whose file does not exist yet. A per-shard counter would need the
+/// same mark as a floor for the drained shard, so it would add state without removing that
+/// dependency. See the cut computation in `staged_fold`.
 #[derive(Debug, Clone, Copy)]
 struct SequenceState {
     /// The next `Ledger_Seq` to issue.
@@ -1874,12 +1895,12 @@ impl WriteLedger {
     /// layout's 1. That is the cost of confining a ledger file to a shard, and it is paid by
     /// the whole-volume readers only — [`Self::read_shard_for_authority`] lists one shard
     /// directory, and [`Self::ledger_shards`] lists `1 + B` directories and opens nothing.
-    /// **Neither the fold nor the completeness-repair rotation calls this any more**; its
-    /// remaining callers are the hint readers, compaction, and staging eviction's candidate
-    /// merge, none of which runs per fold pass. Compaction is the one that pays it on a fixed
-    /// interval, and it pays the listing to visit every file under its lock — which is what makes
-    /// "an entry this pass never read is never removed" a statement about the volume rather than
-    /// about a rotation. See `retire_identities`.
+    /// **The fold, the completeness-repair rotation, compaction and the staging pass no longer
+    /// call this**: each reads or rewrites one shard's files at a time, and compaction the
+    /// legacy flat files as one more unit. Its callers are the
+    /// whole-volume readers through [`Self::all_ledger_files`] and test-only views. An entry a
+    /// compaction never read is never removed because a retire names what it removes
+    /// ([`Self::retire_identities_in`]), not because it visits every file.
     async fn shard_ledger_files(&self) -> Result<Vec<PathBuf>> {
         let root = self.ledger_dir();
         let mut files = Vec::new();
@@ -1918,7 +1939,7 @@ impl WriteLedger {
     /// # It is a SUPERSET of "shards with ledger entries", and that is the safe direction
     ///
     /// A shard whose entries have all been retired keeps a header-only file (see
-    /// `retire_identities`), so its directory survives and it is still selected — which is
+    /// `retire_identities_in`), so its directory survives and it is still selected — which is
     /// required, because a shard whose staged set has fully drained must still be visited to
     /// have its figure moved to zero. Extra visits cost one `readdir` and one file read each;
     /// a missed shard keeps a stale figure forever.
@@ -1953,9 +1974,10 @@ impl WriteLedger {
     ///
     /// This is what the **hint** readers and compaction use, so a legacy file's entries stay
     /// visible to staging eviction and retirable by compaction for the whole conversion
-    /// window. [`Self::read_for_authority`] deliberately does not use it: an authority read
-    /// must not silently mix a shard-attributed file with one whose shard is unknown, and it
-    /// reports the legacy file's *presence* instead so the fold can retain.
+    /// window. The authority read ([`Self::read_shard_for_authority`]) deliberately does not
+    /// use it: it must not silently mix a shard-attributed file with one whose shard is
+    /// unknown, so it reads one shard's directory, which a legacy file is not in, and the
+    /// fold checks for legacy files once per pass.
     async fn all_ledger_files(&self) -> Result<Vec<PathBuf>> {
         let mut files = self.shard_ledger_files().await?;
         files.extend(self.legacy_ledger_files().await?);
@@ -1989,7 +2011,7 @@ impl WriteLedger {
     /// `staged_bytes` from `metadata.staged_compressed_size()` and `staged_range_count` from
     /// the `.meta`'s own `ranges`, never from an entry's `compressed_size`; `group_by_key`
     /// collapses every entry naming one key into **one** candidate, hence one `.meta` read;
-    /// `max_seq_ever` is a max, so duplicating it is a no-op; and `retire_identities` takes a
+    /// `max_seq_ever` is a max, so duplicating it is a no-op; and `retire_identities_in` takes a
     /// `HashSet`, so a duplicate identity retires once. No field of `StagedCandidate` sums an
     /// entry's `compressed_size`, so a duplicate entry doubles nothing at all.
     ///
@@ -2296,7 +2318,7 @@ impl WriteLedger {
 
     /// The hint read of one ledger file: an unopenable file is an empty one.
     ///
-    /// Callers that need to tell those apart must use [`Self::read_for_authority`].
+    /// Callers that need to tell those apart must use [`Self::read_shard_for_authority`].
     async fn read_file(path: &Path) -> Vec<WriteLedgerEntry> {
         match tokio::fs::read_to_string(path).await {
             Ok(content) => Self::parse_content(path, &content).entries,
@@ -2352,7 +2374,7 @@ impl WriteLedger {
     /// verified against its `.meta` before anything is deleted, and where refusing to act
     /// because one file was briefly unreadable would be worse than acting on a shorter
     /// list. A caller that needs to *install* something derived from the ledger must use
-    /// [`Self::read_for_authority`] instead.
+    /// [`Self::read_shard_for_authority`] instead.
     ///
     /// Test-only since the compaction pass moved to a shard rotation and reads one unit at a
     /// time through [`Self::read_files_hint`]; the tests use it as a whole-volume view.
@@ -2375,41 +2397,22 @@ impl WriteLedger {
         Ok(all)
     }
 
-    /// The AUTHORITY read: every file under its own `fs4` lock, with completeness
-    /// reported rather than discarded.
-    ///
-    /// Differs from the hint reader ([`Self::read_files_hint`]) in exactly two ways, and both are
-    /// the point:
-    ///
-    /// - each file is read while holding the same lock appends and compaction take, so
-    ///   the content cannot be a partial view of an append in flight; and
-    /// - what the read could not see survives the return in [`LedgerReadOutcome`], so
-    ///   "complete and empty" and "failed and therefore empty" are different values.
-    ///
-    /// `cap` behaves as it does for the hint reader, except that hitting it sets
-    /// [`LedgerReadOutcome::truncated`]. `max_seq_per_instance` is observed over
-    /// everything read, before truncation.
-    ///
-    /// Spec: cache-eviction-at-scale § 16.6.3.
-    pub async fn read_for_authority(&self, cap: usize) -> Result<LedgerReadOutcome> {
+    /// A whole-volume authority read: every shard's ledger files, each under its own `fs4` lock,
+    /// merged oldest-first with completeness reported. Test-only since the staging pass reads one
+    /// chunk's shards at a time ([`Self::read_shard_for_authority`]); tests use it as a
+    /// whole-volume view.
+    #[cfg(test)]
+    pub(crate) async fn read_for_authority_for_tests(
+        &self,
+        cap: usize,
+    ) -> Result<LedgerReadOutcome> {
         let files = self.shard_ledger_files().await?;
-        let legacy = self.legacy_ledger_files().await?;
-        if !legacy.is_empty() {
-            warn!(
-                legacy_files = legacy.len(),
-                "Write-ledger authority read found unconverted legacy flat ledger file(s). \
-                 Their entries name no shard, so a figure installed now would be short by \
-                 whatever they hold. The caller must retain rather than install."
-            );
-        }
-        let mut outcome = Self::read_files_for_authority(files, cap).await;
-        outcome.legacy_files_present = legacy.len();
-        Ok(outcome)
+        Ok(Self::read_files_for_authority(files, cap).await)
     }
 
     /// The AUTHORITY read for **one shard**: `{bucket}/{l1}/*.ledger` and nothing else.
     ///
-    /// # Why this exists beside [`Self::read_for_authority`] rather than replacing it
+    /// # Why this reads one shard rather than the whole volume
     ///
     /// A fold pass visits a bounded number of shards, so reading every shard's ledger file
     /// before the visit loop made the pass's cost `O(shards existing)` rather than
@@ -2418,13 +2421,11 @@ impl WriteLedger {
     /// directory and opens only the files in it: one `readdir` plus one file per instance
     /// that has ever credited that shard.
     ///
-    /// The whole-volume reader stays for **one** consumer that genuinely needs the whole volume:
-    /// staging eviction's candidate merge, which ranks candidates against each other in
-    /// fleet-wide insertion order and so cannot be assembled a shard at a time. It runs on a
-    /// trigger rather than per pass. The ledger-completeness repair rotation used to be the
-    /// second such consumer and now calls **this** reader instead, once per shard it visits —
-    /// see `ledger_repair`'s "Complete-or-refuse" section for why its scope could narrow and
-    /// what checks the equivalence that makes it safe.
+    /// The staging pass reads its candidates through this reader too, one chunk's shards at a
+    /// time: each shard gives up its own oldest entries, so the order across shards is
+    /// approximately oldest first. The ledger-completeness repair rotation calls it once per
+    /// shard it visits — see `ledger_repair`'s "Complete-or-refuse" section for why its scope
+    /// could narrow and what checks the equivalence that makes it safe.
     ///
     /// # What this read's completeness means, and what it deliberately cannot see
     ///
@@ -2435,11 +2436,9 @@ impl WriteLedger {
     /// any other shard. That is the whole point: one shard's unreadable ledger file used to
     /// retain the entire pass.
     ///
-    /// [`LedgerReadOutcome::legacy_files_present`] is left at **0** here, and that is not an
-    /// omission. A legacy flat `{instance}.ledger` sits at the ledger root and names no shard,
-    /// so it cannot be attributed to this shard or to any other — there is no shard-scoped
-    /// answer to give. Its presence is a property of the volume and the caller checks it once
-    /// per pass; see `staged_fold::run_staged_fold_scoped`.
+    /// A legacy flat `{instance}.ledger` sits at the ledger root and names no shard, so it cannot
+    /// be attributed to this shard or to any other. Its presence is a property of the volume and
+    /// the fold checks it once per pass; see `staged_fold::run_staged_fold_scoped`.
     ///
     /// `cap` behaves as it does for the whole-volume reader, applied to **this shard's**
     /// entries.
@@ -2459,6 +2458,135 @@ impl WriteLedger {
         Ok(outcome)
     }
 
+    /// The oldest entries of one shard, read only as far as the staging pass needs: each
+    /// instance's file in `{bucket}/{l1}/` is read from its start under that file's lock, the
+    /// files are merged oldest first by their next entry, and the read stops once the selected
+    /// entries' `compressed_size` reaches `want_bytes` and their count reaches `want_ranges`.
+    ///
+    /// Appends go to the end of a file stamped at creation, so a file is close to timestamp
+    /// order and its oldest entries are at its start; the ledger repair's re-appends at the tail
+    /// are the exception, and are evicted later than their age warrants. So the lines read are
+    /// at most the entries selected, plus the header lines passed over, plus one entry per file
+    /// read ahead of the merge, rather than every staged entry of the shard.
+    ///
+    /// Complete-or-refuse: a file that cannot be opened, locked or read, or a line that is
+    /// neither an entry nor a header, marks the read `incomplete`, and the caller evicts nothing
+    /// from the shard. Every file is locked in path order for the whole read and unlocked at the
+    /// end, so each file's prefix is a view no append is half-way through.
+    pub(crate) async fn read_shard_prefix(
+        &self,
+        bucket: &str,
+        l1: &str,
+        want_bytes: u64,
+        want_ranges: u64,
+    ) -> Result<ShardPrefixRead> {
+        let files = Self::ledger_files_in(&Self::shard_dir(&self.cache_dir, bucket, l1))?;
+        tokio::task::spawn_blocking(move || {
+            Self::read_prefix_blocking(files, want_bytes, want_ranges)
+        })
+        .await
+        .map_err(|e| ProxyError::CacheError(format!("Write-ledger prefix read task failed: {e}")))
+    }
+
+    fn read_prefix_blocking(
+        mut files: Vec<PathBuf>,
+        want_bytes: u64,
+        want_ranges: u64,
+    ) -> ShardPrefixRead {
+        use std::io::BufRead;
+        files.sort();
+        let mut out = ShardPrefixRead {
+            files: files.len(),
+            ..Default::default()
+        };
+        let mut locks: Vec<std::fs::File> = Vec::with_capacity(files.len());
+        let mut readers: Vec<std::io::Lines<std::io::BufReader<std::fs::File>>> =
+            Vec::with_capacity(files.len());
+        for path in &files {
+            #[cfg(test)]
+            AUTHORITY_FILES_READ
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(path.clone());
+            let opened = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(Self::lock_path_for(path))
+                .and_then(|lock| fs4::FileExt::lock(&lock).map(|()| lock))
+                .and_then(|lock| std::fs::File::open(path).map(|file| (lock, file)));
+            match opened {
+                Ok((lock, file)) => {
+                    locks.push(lock);
+                    readers.push(std::io::BufReader::new(file).lines());
+                }
+                Err(e) => {
+                    warn!(
+                        "Write-ledger prefix read could not open {:?}: {}. The shard's staging \
+                         candidates are refused this pass.",
+                        path, e
+                    );
+                    out.incomplete = true;
+                    break;
+                }
+            }
+        }
+        let file_count = readers.len();
+        // The next entry of file `i`, or `None` at its end. Headers are passed over and counted;
+        // anything else that is not an entry makes the read incomplete.
+        let mut next_entry = |i: usize, out: &mut ShardPrefixRead| -> Option<WriteLedgerEntry> {
+            loop {
+                let line = match readers[i].next()? {
+                    Ok(line) => line,
+                    Err(e) => {
+                        warn!("Write-ledger prefix read failed on {:?}: {}", files[i], e);
+                        out.incomplete = true;
+                        return None;
+                    }
+                };
+                out.lines_read += 1;
+                if let Ok(entry) = serde_json::from_str::<WriteLedgerEntry>(&line) {
+                    return Some(entry);
+                }
+                if !line.trim().is_empty() && serde_json::from_str::<LedgerHeader>(&line).is_ok() {
+                    out.lines_skipped += 1;
+                    continue;
+                }
+                out.incomplete = true;
+                return None;
+            }
+        };
+        if !out.incomplete {
+            let mut heads: Vec<Option<WriteLedgerEntry>> = Vec::with_capacity(file_count);
+            for i in 0..file_count {
+                let head = next_entry(i, &mut out);
+                heads.push(head);
+            }
+            let (mut bytes, mut ranges) = (0u64, 0u64);
+            while !out.incomplete && (bytes < want_bytes || ranges < want_ranges) {
+                let Some(i) = heads
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, h)| h.as_ref().map(|e| (i, e)))
+                    .min_by(|a, b| Self::oldest_first(a.1, b.1))
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
+                let entry = heads[i].take().expect("the head chosen is present");
+                bytes = bytes.saturating_add(entry.compressed_size);
+                ranges += 1;
+                out.entries.push(entry);
+                heads[i] = next_entry(i, &mut out);
+            }
+            out.more = !out.incomplete && heads.iter().any(Option::is_some);
+        }
+        for lock in &locks {
+            let _ = fs4::FileExt::unlock(lock);
+        }
+        out
+    }
+
     /// The per-file half of an authority read, shared by the whole-volume and the per-shard
     /// reader.
     ///
@@ -2474,6 +2602,11 @@ impl WriteLedger {
         };
 
         for path in files {
+            #[cfg(test)]
+            AUTHORITY_FILES_READ
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(path.clone());
             let lock_path = Self::lock_path_for(&path);
             let path_for_task = path.clone();
             let instance = Self::instance_of(&path);
@@ -2558,14 +2691,14 @@ impl WriteLedger {
     ///
     /// The whole-volume traversal this needs is `1 + B + (B × 256)` listings and up to
     /// `B × 256 × instances` file reads on shared storage, and it used to run on every scrape.
-    /// It now runs at most once per [`LEDGER_COUNT_MAX_AGE_SECS`], and usually not at all,
-    /// because [`Self::retire_identities`] donates the figure it already computes. The age of
+    /// It now runs at most once per [`LEDGER_COUNT_MAX_AGE_SECS`]. The age of
     /// whatever is reported is published beside it as `write_cache.ledger_entries_age_secs` —
     /// see [`Self::entry_count_age_secs`] — so bounded staleness is visible rather than silent.
     ///
     /// **A running count cannot replace this**, and that is a property of the volume rather than
     /// of the instrumentation. Four of the paths that mutate the counted set are in this process
-    /// (`append`, `retire_identities`, `migrate_legacy_ledgers`, and legacy-file removal) and
+    /// (`append`, retirement by `retire_identities_in`, `migrate_legacy_ledgers`, and legacy-file
+    /// removal) and
     /// **five are in other processes**: a peer's append, a peer's compaction — which rewrites
     /// *this* instance's files, by design, under the global consolidation lock — a peer's legacy
     /// conversion, a peer's file removal between our listing and our read, and out-of-band volume
@@ -2617,22 +2750,6 @@ impl WriteLedger {
             .lock()
             .await
             .map(|observation| observation.observed_at.elapsed().as_secs())
-    }
-
-    /// Record a whole-volume count observed by a caller that had already traversed the volume.
-    ///
-    /// The donor is [`Self::retire_identities`], whose read is strictly **better** than the
-    /// traversal in [`Self::count_entries_by_traversal`]: it holds each file's `fs4` lock across
-    /// its read, so no file can be a partial view of an append in flight, where the count's own
-    /// traversal takes no lock at all.
-    ///
-    /// Only ever called with a count the donor knows covers the whole volume. A pass that could
-    /// not read a file donates nothing, so a short figure cannot be installed as a real one.
-    async fn record_entry_count(&self, count: u64) {
-        *self.entry_count.lock().await = Some(LedgerCountObservation {
-            count,
-            observed_at: std::time::Instant::now(),
-        });
     }
 
     /// Test-only: install an entry-count observation of a chosen age, so the
@@ -2714,145 +2831,37 @@ impl WriteLedger {
         Ok(keys)
     }
 
-    /// Remove exactly the entries named in `retire` from every ledger file, leaving
-    /// everything else untouched.
-    ///
-    /// # Why this names what to REMOVE rather than what to keep
-    ///
-    /// This replaced a `rewrite_retaining(retain)` that deleted every entry absent from
-    /// the caller's set, which made the caller's read completeness load-bearing — and
-    /// task 77 is what happens when it is not complete. `evict_staging_tier_locked`
-    /// reads at most `STAGING_EVICTION_CANDIDATE_CAP` (10,000) entries and built its set
-    /// from that truncated vector, so on a ledger longer than the cap every unread entry
-    /// was silently deleted. The Write_Ledger is the only index driving staging
-    /// eviction, and since Phase F `reserve_for_sizing` no longer refuses on capacity,
-    /// so losing entries means losing the ability to reclaim the objects they name.
-    ///
-    /// A retire-set cannot express that failure. An entry the caller never read is not
-    /// in the set, so it is not removed — the safe answer arrives by construction rather
-    /// than by the caller having read everything.
-    ///
-    /// # What the inversion did NOT fix, and what does
-    ///
-    /// This comment used to claim the inversion "closes the read-then-rewrite window".
-    /// It does not, and the distinction is worth stating precisely because the two holes
-    /// present identically as "an entry this pass never saw was deleted":
-    ///
-    /// - the **cap-shaped** hole is about entries beyond the caller's read limit, and the
-    ///   inversion does close it: an entry that is not named is not removed;
-    /// - the **time-shaped** hole is about this function's *own* read. Naming removals
-    ///   changed which entries are marked for deletion; it did not make the rewrite
-    ///   incremental. The rewrite is still a whole-file replace, so it can only retain
-    ///   entries its own read observed, and an append committing after that read was
-    ///   erased by the rename — silently, and without appearing in
-    ///   [`LedgerCompactionStats::entries_dropped`].
-    ///
-    /// The time-shaped hole is closed by lock scope, not by set polarity: the read, the
-    /// keep/drop filter, the temp write and the rename all happen inside a single hold of
-    /// the file's `fs4` lock — the same lock an append takes — so an append is serialised
-    /// either wholly before the read or wholly after the rename, and is never lost. The
-    /// stats are likewise computed from what was read under that lock.
-    ///
-    /// A read error inside the lock therefore aborts that file, leaving it untouched. It
-    /// used to produce zero entries, hence an empty keep set, hence deletion of a file
-    /// whose contents had never been read — reported as a successful compaction.
-    ///
-    /// # Fleet-wide by design
-    ///
-    /// Rewrites **all** instances' files, not just this one's: a decommissioned
-    /// instance's file would otherwise accumulate forever with nobody to tidy it. Each
-    /// file is rewritten under its own append lock.
-    ///
-    /// The previous version of this comment justified that with "the only caller runs
-    /// under the global consolidation lock, so exactly one instance fleet-wide is
-    /// compacting at a time". That has not been true since Phase E: there are two
-    /// callers holding two **different** lock files — `evict_staging_tier_locked` under
-    /// `global_eviction.lock` and `maybe_compact_write_ledger` under
-    /// `global_consolidation.lock` — so an eviction pass and a compaction pass can
-    /// interleave. Two things make that interleaving benign. The per-file lock now spans
-    /// each pass's whole read-decide-rename sequence, so the two cannot interleave within
-    /// one file at all; and naming removals means the worst case across files is that an
-    /// entry one pass already removed is named again by the other, which is a no-op.
-    ///
-    /// Each pass's *caller-side* window — between the caller's own read and its call to
-    /// this function — is a separate and wider thing that lock scope here cannot address.
-    /// The retire-set inversion is what makes that one safe, and it genuinely does.
-    ///
-    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.6, 3.1
-    pub(crate) async fn retire_identities(
+    /// Remove exactly the entries named in `retire` from every ledger file on the volume,
+    /// legacy flat files included. Test-only since the staging pass retires shard by shard
+    /// ([`Self::retire_identities_in`]); tests use it to compact the whole volume at once. The
+    /// per-file guarantees are [`Self::retire_identities_in`]'s.
+    #[cfg(test)]
+    pub(crate) async fn retire_identities_for_tests(
         &self,
         retire: &HashSet<(String, u64, u64, SystemTime, String)>,
     ) -> Result<LedgerCompactionStats> {
-        // Legacy flat files included: a decommissioned pre-upgrade instance's file has nobody
-        // else to tidy it, and retiring a terminal entry there is one fewer entry the
-        // conversion has to carry.
-        let started = std::time::Instant::now();
         let files = self.all_ledger_files().await?;
-        let (stats, files_unreadable) = Self::retire_in_files(files, retire).await;
-
-        // Donate the figure to the `ledger_entries` gauge, so the scrape path does not have to
-        // traverse the volume for it. This pass has just read every ledger file on the volume
-        // under its own lock, which is a STRICTLY better read than the gauge's own unlocked
-        // traversal, and it runs off the request path on the compaction interval.
-        //
-        // `entries_after`, not `entries_before`: the gauge is the ledger's length now, and this
-        // pass may have shortened it.
-        //
-        // Nothing is donated when a file could not be read, which makes a donation-path failure
-        // indistinguishable from no donation at all — deliberately. The gauge then falls back to
-        // its own traversal, which reaches the same files and publishes the UNREADABLE sentinel
-        // from there. Two routes to `None` would be two places for that discipline to drift.
-        if files_unreadable == 0 {
-            self.record_entry_count(stats.entries_after).await;
-        }
-
-        // `elapsed_ms` and `unchanged` are here because neither was observable before, and the
-        // cost this pass carries is `O(files on the volume)` locked reads whatever it drops. A
-        // fleet checkpoint could size the rewrite count from these logs and could not size the
-        // wall clock from anything at all, so a compaction getting slower as the shard population
-        // grows toward the design point was invisible in production.
-        //
-        // `debug!` on the no-drop path rather than nothing, so a pass that reclaims nothing still
-        // reports what it cost. It runs once per `LEDGER_COMPACTION_INTERVAL_SECS`, so this is not
-        // a hot log line even at DEBUG.
-        if stats.entries_dropped() > 0 {
-            info!(
-                "Write-ledger compacted: before={}, after={}, dropped={}, rewritten={}, \
-                 unchanged={}, removed={}, files_read={}, elapsed_ms={}",
-                stats.entries_before,
-                stats.entries_after,
-                stats.entries_dropped(),
-                stats.files_rewritten,
-                stats.files_unchanged,
-                stats.files_removed,
-                stats.files_rewritten + stats.files_unchanged + stats.files_removed,
-                started.elapsed().as_millis()
-            );
-        } else {
-            debug!(
-                "Write-ledger compaction dropped nothing: files_read={}, unchanged={}, \
-                 rewritten={}, removed={}, elapsed_ms={}",
-                stats.files_rewritten + stats.files_unchanged + stats.files_removed,
-                stats.files_unchanged,
-                stats.files_rewritten,
-                stats.files_removed,
-                started.elapsed().as_millis()
-            );
-        }
-        Ok(stats)
+        Ok(Self::retire_in_files(files, retire).await.0)
     }
 
-    /// [`Self::retire_identities`] over a caller-chosen set of ledger files.
+    /// Remove exactly the entries named in `retire` from a caller-chosen set of ledger files.
     ///
-    /// The per-file guarantees are the same ones `retire_identities` documents, because the
-    /// per-file loop is shared: each file is read, filtered, written and renamed inside one hold
-    /// of its own `fs4` lock, and only named identities are removed. What differs is scope. An
-    /// identity named here that lives in a file not in `files` is simply not retired this time,
-    /// which is the safe direction: an entry is only ever kept too long, never removed unread.
+    /// # Why this names what to REMOVE rather than what to keep
     ///
-    /// Exists for the consolidation cycle's compaction pass, which visits a bounded number of
-    /// shards per pass and so must not pay for every ledger file on the volume to retire what
-    /// it assessed in those shards. Neither logs nor donates the `ledger_entries` figure: a
+    /// A retain-set rewrite deletes every entry absent from its set, so a caller whose read was
+    /// partial (capped, or racing another instance's append) would delete entries it never read.
+    /// A retire-set cannot express that failure: an entry the caller never read is not named.
+    /// Each file is read, filtered, written and renamed inside one hold of its own `fs4` lock,
+    /// the lock every append takes, so no append is lost to it; a read error inside the lock
+    /// aborts that file and leaves it untouched.
+    ///
+    /// An identity named here that lives in a file not in `files` is simply not retired this
+    /// time, which is the safe direction: an entry is only ever kept too long, never removed
+    /// unread.
+    ///
+    /// For the consolidation cycle's compaction pass and the staging pass, which visit a bounded
+    /// number of shards and so must not pay for every ledger file on the volume to retire what
+    /// they assessed in those shards. Neither logs nor records the `ledger_entries` figure: a
     /// partial read is not the ledger's length.
     pub(crate) async fn retire_identities_in(
         &self,
@@ -2967,7 +2976,7 @@ impl WriteLedger {
         all
     }
 
-    /// The per-file loop shared by [`Self::retire_identities`] and
+    /// The per-file loop shared by the test-only whole-volume `retire_identities_for_tests` and
     /// [`Self::retire_identities_in`]. Returns the stats and how many files could not be read.
     async fn retire_in_files(
         files: Vec<PathBuf>,
@@ -3249,6 +3258,9 @@ impl WriteLedger {
                     if entry.timestamp < existing.oldest_entry_at {
                         existing.oldest_entry_at = entry.timestamp;
                     }
+                    existing.estimated_bytes = existing
+                        .estimated_bytes
+                        .saturating_add(entry.compressed_size);
                     existing.identities.push(entry.identity());
                 }
                 None => {
@@ -3259,6 +3271,7 @@ impl WriteLedger {
                             cache_key: entry.cache_key.clone(),
                             oldest_entry_at: entry.timestamp,
                             newest_entry_at: entry.timestamp,
+                            estimated_bytes: entry.compressed_size,
                             identities: vec![entry.identity()],
                         },
                     );
@@ -3333,6 +3346,9 @@ pub(crate) struct StagedCandidate {
     /// Latest entry for this key, used as the supersede reference so a re-PUT is not
     /// mistaken for a stale entry.
     pub newest_entry_at: SystemTime,
+    /// Sum of the entries' `compressed_size`: the staging pass's estimate of what evicting the
+    /// object frees, used to stop dispatching and to cap a batch. Never debited.
+    pub estimated_bytes: u64,
     /// Identities of the entries that produced this candidate, so compaction can retire
     /// exactly the entries an eviction consumed.
     pub identities: Vec<(String, u64, u64, SystemTime, String)>,
@@ -4619,7 +4635,7 @@ mod tests {
         let file_count = files.len() as u64;
 
         let retire: HashSet<_> = [drop.identity()].into_iter().collect();
-        let stats = ledger.retire_identities(&retire).await.unwrap();
+        let stats = ledger.retire_identities_for_tests(&retire).await.unwrap();
         assert_eq!(stats.entries_before, 2);
         assert_eq!(stats.entries_after, 1);
         assert_eq!(stats.entries_dropped(), 1);
@@ -4643,7 +4659,10 @@ mod tests {
         // Retiring the last entry drains the file of entries but KEEPS it, so its
         // `max_seq_ever` survives.
         let retire_rest: HashSet<_> = [keep.identity()].into_iter().collect();
-        let stats = ledger.retire_identities(&retire_rest).await.unwrap();
+        let stats = ledger
+            .retire_identities_for_tests(&retire_rest)
+            .await
+            .unwrap();
         assert_eq!(
             stats.files_removed, 0,
             "a schema-3 file carries a high-water mark and must not be deleted"
@@ -4660,14 +4679,19 @@ mod tests {
              drop-2 cost came from"
         );
         assert_eq!(
-            ledger.count_entries().await,
-            Some(0),
+            ledger
+                .read_for_authority_for_tests(0)
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            0,
             "no entries remain — the surviving line is the header, which is not an entry"
         );
         // The mark survived, which is the property the retention exists for. Asserted on
         // `max_seq_per_instance`, the value a cut is computed from, with the entries gone so
         // it can only be coming from the header.
-        let drained = ledger.read_for_authority(0).await.unwrap();
+        let drained = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert!(drained.entries.is_empty());
         assert_eq!(drained.max_seq_per_instance.get("host:1"), Some(&2));
         assert!(
@@ -4694,7 +4718,10 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = ledger.retire_identities(&HashSet::new()).await.unwrap();
+        let stats = ledger
+            .retire_identities_for_tests(&HashSet::new())
+            .await
+            .unwrap();
         assert_eq!(stats.entries_dropped(), 0);
         assert_eq!(stats.files_removed, 0);
         assert_eq!(
@@ -4727,7 +4754,7 @@ mod tests {
     /// not it held anything named. The read stays whole-volume on purpose; only the write is
     /// conditional.
     ///
-    /// A failure implicates the skip gate in [`WriteLedger::retire_identities`].
+    /// A failure implicates the skip gate in `WriteLedger::retire_in_files`.
     #[tokio::test]
     async fn a_file_holding_no_named_identity_is_not_rewritten_at_all() {
         let tmp = TempDir::new().unwrap();
@@ -4760,7 +4787,7 @@ mod tests {
         );
 
         let stats = ledger
-            .retire_identities(&[doomed.identity()].into_iter().collect())
+            .retire_identities_for_tests(&[doomed.identity()].into_iter().collect())
             .await
             .unwrap();
 
@@ -4772,7 +4799,7 @@ mod tests {
         );
         assert_eq!(
             ledger
-                .read_for_authority(0)
+                .read_for_authority_for_tests(0)
                 .await
                 .unwrap()
                 .max_seq_per_instance
@@ -4892,7 +4919,7 @@ mod tests {
         // read-but-not-walked case the old retain-set comment reasoned about.
         let retired: HashSet<_> = candidates.iter().take(4).map(|e| e.identity()).collect();
 
-        let stats = ledger.retire_identities(&retired).await.unwrap();
+        let stats = ledger.retire_identities_for_tests(&retired).await.unwrap();
 
         assert_eq!(
             stats.entries_dropped(),
@@ -4900,8 +4927,13 @@ mod tests {
             "exactly the retired entries may be dropped"
         );
         assert_eq!(
-            ledger.count_entries().await,
-            Some((TOTAL - 4) as u64),
+            ledger
+                .read_for_authority_for_tests(0)
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            TOTAL - 4,
             "the {} entries beyond the simulated cap were never read and must survive. \
              A count of {} means the retain-set rewrite treated 'not in the set I \
              happened to read' as 'delete', so the ledger loses every entry past the \
@@ -4957,7 +4989,7 @@ mod tests {
 
         // Retire one entry that lives in the OTHER instance's file.
         let retired: HashSet<_> = [c.identity()].into_iter().collect();
-        mine.retire_identities(&retired).await.unwrap();
+        mine.retire_identities_for_tests(&retired).await.unwrap();
 
         let remaining: HashSet<String> = mine
             .read_merged_oldest_first(0)
@@ -5005,7 +5037,7 @@ mod tests {
 
         // The pass now retires what it evicted.
         let retired: HashSet<_> = [old.identity()].into_iter().collect();
-        ledger.retire_identities(&retired).await.unwrap();
+        ledger.retire_identities_for_tests(&retired).await.unwrap();
 
         let remaining: HashSet<String> = ledger
             .read_merged_oldest_first(0)
@@ -5082,7 +5114,10 @@ mod tests {
         // Step 2: the retire starts. Buggy build: reads now, outside the lock.
         let retired: HashSet<_> = [old.identity()].into_iter().collect();
         let ledger_for_pass = Arc::clone(&ledger);
-        let pass = tokio::spawn(async move { ledger_for_pass.retire_identities(&retired).await });
+        let pass =
+            tokio::spawn(
+                async move { ledger_for_pass.retire_identities_for_tests(&retired).await },
+            );
 
         // Long enough that a build reading outside the lock has certainly read by now.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -5136,7 +5171,7 @@ mod tests {
         let ledger = WriteLedger::new(tmp.path().to_path_buf(), "host:1".to_string());
 
         // No ledger directory at all: complete, and empty.
-        let empty = ledger.read_for_authority(0).await.unwrap();
+        let empty = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert!(empty.entries.is_empty());
         assert_eq!(empty.files_expected, 0);
         assert!(
@@ -5153,7 +5188,7 @@ mod tests {
             .await
             .unwrap();
 
-        let full = ledger.read_for_authority(0).await.unwrap();
+        let full = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert_eq!(full.entries.len(), 2);
         // One file per distinct SHARD per instance, derived from the production path builder
         // rather than hardcoded: the two keys may or may not hash to the same `l1`, and which
@@ -5192,7 +5227,7 @@ mod tests {
         content.push_str("this is not json\n");
         tokio::fs::write(&path, content).await.unwrap();
 
-        let torn = ledger.read_for_authority(0).await.unwrap();
+        let torn = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert_eq!(torn.entries.len(), 2, "the good lines still parse");
         assert_eq!(torn.malformed_lines, 1);
         assert!(
@@ -5201,7 +5236,7 @@ mod tests {
         );
 
         // Truncation is signalled rather than silent.
-        let capped = ledger.read_for_authority(1).await.unwrap();
+        let capped = ledger.read_for_authority_for_tests(1).await.unwrap();
         assert_eq!(capped.entries.len(), 1);
         assert!(capped.truncated);
         assert!(!capped.is_complete());
@@ -5239,7 +5274,7 @@ mod tests {
         // Nothing is named for retirement, so on a working build this is a no-op anyway;
         // the point is what the unreadable file provokes.
         let retire: HashSet<(String, u64, u64, SystemTime, String)> = HashSet::new();
-        let stats = ledger.retire_identities(&retire).await.unwrap();
+        let stats = ledger.retire_identities_for_tests(&retire).await.unwrap();
 
         // Best-effort: on a build that deleted the file there is nothing to chmod back,
         // and the assertion below is the diagnosis, not this `unwrap`.
@@ -5386,97 +5421,107 @@ mod tests {
         );
     }
 
-    /// Compaction DONATES its figure, so the scrape path reports the post-compaction length
-    /// immediately even though its own observation is still inside the max age.
-    ///
-    /// This is the assertion that makes the traversal genuinely disappear rather than merely
-    /// becoming less frequent, and it is also the answer to "assert the count after each
-    /// mutating path, not only after an append": the mutation here is `retire_identities`.
-    ///
-    /// Its failure would be caused by the `files_unreadable == 0` donation at the end of
-    /// `retire_identities` — with the donation removed, the still-fresh observation is served and
-    /// the pre-compaction length is reported.
-    #[tokio::test]
-    async fn compaction_donates_its_count_so_the_scrape_path_does_not_traverse() {
-        let tmp = TempDir::new().unwrap();
-        let ledger = WriteLedger::new(tmp.path().to_path_buf(), "hostA:1".to_string());
-        let seeded = seed_multi_shard_multi_instance(tmp.path());
-
-        // Populate the observation, so anything the compaction does NOT donate would be masked
-        // by a fresh memo rather than re-counted.
-        assert_eq!(ledger.count_entries().await, Some(seeded));
-
-        // Retire one entry belonging to a PEER's file, which compaction is entitled to do.
-        let all = ledger.read_merged_oldest_first(0).await.unwrap();
-        let victim = all
+    /// Two instances' files in one shard with interleaved timestamps, `per_file` entries each,
+    /// every entry `size` bytes. Returns the ledgers, so they outlive the test body, and one key
+    /// of the shard.
+    async fn interleaved_shard_one_shard(
+        dir: &Path,
+        per_file: usize,
+        size: u64,
+    ) -> (Vec<WriteLedger>, String) {
+        let base = SystemTime::now() - Duration::from_secs(10_000);
+        let ledgers: Vec<WriteLedger> = ["host-a:1", "host-b:2"]
             .iter()
-            .find(|e| e.instance_id == "hostB:2")
-            .expect("the fixture seeds hostB:2");
-        let mut retire = HashSet::new();
-        retire.insert(victim.identity());
+            .map(|id| WriteLedger::new(dir.to_path_buf(), id.to_string()))
+            .collect();
+        let first = "prefix-bucket/k-0".to_string();
+        let l1 = crate::staged_fold::shard_of(&first).unwrap().1;
+        let mut keys = (0u64..)
+            .map(|j| format!("prefix-bucket/k-{j}"))
+            .filter(|k| crate::staged_fold::shard_of(k).unwrap().1 == l1);
+        for i in 0..per_file {
+            for (n, ledger) in ledgers.iter().enumerate() {
+                ledger
+                    .append_staged_entry(WriteLedgerEntry {
+                        // Instance b's entries sit between instance a's, so neither file's
+                        // order is the merged order.
+                        timestamp: base + Duration::from_millis((2 * i + n) as u64 * 10),
+                        cache_key: keys.next().unwrap(),
+                        range_start: 0,
+                        range_end: size - 1,
+                        compressed_size: size,
+                        instance_id: ledger.instance_id().to_string(),
+                        seq: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        (ledgers, first)
+    }
 
-        let stats = ledger.retire_identities(&retire).await.unwrap();
+    /// The prefix read stops at the quota: the lines it reads are at most the entries it
+    /// selected, plus the header lines it passed over, plus one entry read ahead per file. A
+    /// whole-file read reads every line.
+    #[tokio::test]
+    async fn a_prefix_read_reads_no_further_than_its_quota_needs() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let ledgers = interleaved_shard_one_shard(dir, 200, 1_000).await;
+        let (bucket, l1) = crate::staged_fold::shard_of(&ledgers.1).unwrap();
+        let read = ledgers.0[0]
+            .read_shard_prefix(&bucket, &l1, 10_000, 0)
+            .await
+            .unwrap();
+        assert!(!read.incomplete, "fixture: the read must be complete");
         assert_eq!(
-            stats.entries_dropped(),
-            1,
-            "fixture precondition: the pass must actually have dropped the named entry"
+            read.entries.len(),
+            10,
+            "ten 1,000-byte entries cover a 10,000-byte quota"
         );
-
-        assert_eq!(
-            ledger.count_entries().await,
-            Some(seeded - 1),
-            "compaction must donate the length it already computed, so the gauge reflects the \
-             post-compaction volume without the scrape path traversing it"
+        let bound = read.entries.len() as u64 + read.lines_skipped + read.files as u64;
+        assert!(
+            read.lines_read <= bound,
+            "the prefix read read {} lines for {} selected entries, {} headers and {} files \
+             (bound {bound}): it read past its quota",
+            read.lines_read,
+            read.entries.len(),
+            read.lines_skipped,
+            read.files
         );
     }
 
-    /// A compaction pass that could not read a file DONATES NOTHING, so a short count cannot be
-    /// installed as a real one.
-    ///
-    /// `entries_after` sums only the files the pass succeeded on, and short is the reassuring
-    /// direction for a length gauge — the exact shape of the sentinel defect `count_entries`
-    /// returns `Option` for. The discriminator is two clearly different values rather than a
-    /// margin: `None` (correct, the gauge falls back to its own traversal and that traversal hits
-    /// the same unreadable file) against `Some(readable_only)`.
-    ///
-    /// Its failure would be caused by the `files_unreadable == 0` guard on the donation.
+    /// On two instances' interleaved files, the prefix the reader selects is exactly the first
+    /// entries of the whole shard sorted oldest first.
     #[tokio::test]
-    #[cfg(unix)]
-    async fn a_compaction_pass_that_could_not_read_a_file_donates_nothing() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new().unwrap();
-        let ledger = WriteLedger::new(tmp.path().to_path_buf(), "hostA:1".to_string());
-        seed_peer_shard_ledger(tmp.path(), "bucket-a", "ab", "hostA:1", 3);
-        let blocked = seed_peer_shard_ledger(tmp.path(), "bucket-b", "cd", "hostB:2", 4);
-
-        // Stale, so nothing can be served from the observation and the verdict comes from this
-        // pass alone.
-        ledger
-            .install_entry_count_observation_aged(
-                0,
-                Duration::from_secs(LEDGER_COUNT_MAX_AGE_SECS + 1),
-            )
-            .await;
-
-        let original = std::fs::metadata(&blocked).unwrap().permissions();
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // Root ignores the mode bits, so there is no unreadable file to provoke anything with.
-        // Same apparatus carve-out as `an_unreadable_ledger_file_is_not_deleted`.
-        if std::fs::read_to_string(&blocked).is_ok() {
-            std::fs::set_permissions(&blocked, original).unwrap();
-            return;
-        }
-
-        let _ = ledger.retire_identities(&HashSet::new()).await;
-        let counted = ledger.count_entries().await;
-        let _ = std::fs::set_permissions(&blocked, original);
-
-        assert_eq!(
-            counted, None,
-            "a pass that could not read one of two ledger files must donate nothing, so the \
-             gauge reports UNREADABLE rather than the 3 entries it could see"
+    async fn a_prefix_read_equals_the_sorted_whole_reads_prefix_on_interleaved_instances() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let ledgers = interleaved_shard_one_shard(dir, 50, 1_000).await;
+        let (bucket, l1) = crate::staged_fold::shard_of(&ledgers.1).unwrap();
+        let whole = ledgers.0[0]
+            .read_shard_for_authority(&bucket, &l1, 0)
+            .await
+            .unwrap();
+        assert!(
+            whole.is_complete(),
+            "fixture: the whole read must be complete"
         );
+        for want in [1u64, 7, 33, 100] {
+            let read = ledgers.0[0]
+                .read_shard_prefix(&bucket, &l1, want * 1_000, 0)
+                .await
+                .unwrap();
+            let got: Vec<_> = read.entries.iter().map(|e| e.identity()).collect();
+            let expected: Vec<_> = whole.entries[..want as usize]
+                .iter()
+                .map(|e| e.identity())
+                .collect();
+            assert_eq!(
+                got, expected,
+                "the {want}-entry prefix must be the sorted whole read's first {want} entries"
+            );
+        }
     }
 
     /// The three states stay distinguishable, and a stale observation never masks the UNREADABLE
@@ -5916,7 +5961,7 @@ mod tests {
         tokio::fs::write(&path, &body).await.unwrap();
 
         // ---- Arm 1: the fixture precondition. The file must read as INCOMPLETE.
-        let before = ledger.read_for_authority(0).await.unwrap();
+        let before = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert_eq!(
             before.malformed_lines, 1,
             "fixture precondition: the torn line must be classified as malformed, or nothing \
@@ -5938,7 +5983,10 @@ mod tests {
         // Compact with an EMPTY retire set: this test is about the torn line, not about retirement,
         // and an empty set proves the quarantine is a property of compaction rather than of
         // whatever it was asked to remove.
-        ledger.retire_identities(&HashSet::new()).await.unwrap();
+        ledger
+            .retire_identities_for_tests(&HashSet::new())
+            .await
+            .unwrap();
 
         // ---- Arm 2: the line survives, verbatim, in the quarantine.
         let torn_path = WriteLedger::torn_path_for(&path);
@@ -5958,7 +6006,7 @@ mod tests {
         );
 
         // ---- Arm 3: the ledger reads as complete again, so the repair rotation is not deadlocked.
-        let after = ledger.read_for_authority(0).await.unwrap();
+        let after = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert_eq!(
             after.malformed_lines, 0,
             "the compacted ledger must no longer carry the torn line. If it does, is_complete() is \
@@ -6541,7 +6589,7 @@ mod tests {
             refused.is_err(),
             "an unshardable key has no shard ledger file to append to, so the append must refuse"
         );
-        let read = ledger.read_for_authority(0).await.unwrap();
+        let read = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert!(
             read.entries.is_empty() && read.files_expected == 0,
             "and nothing may have been written anywhere: {:?}",
@@ -6580,14 +6628,17 @@ mod tests {
         let mut content = std::fs::read_to_string(&torn_file).unwrap();
         content.push_str("{\"partial\": tru\n");
         std::fs::write(&torn_file, content).unwrap();
-        let read = ledger.read_for_authority(0).await.unwrap();
+        let read = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert_eq!(
             read.malformed_lines, 1,
             "fixture precondition: the line must really be discarded"
         );
 
         // A compaction that names nothing still rewrites, which is what quarantines the line.
-        ledger.retire_identities(&HashSet::new()).await.unwrap();
+        ledger
+            .retire_identities_for_tests(&HashSet::new())
+            .await
+            .unwrap();
 
         let torn_quarantine = WriteLedger::torn_path_for(&torn_file);
         assert!(
@@ -6613,7 +6664,11 @@ mod tests {
             "the sibling shard's entries must be untouched"
         );
         assert!(
-            ledger.read_for_authority(0).await.unwrap().is_complete(),
+            ledger
+                .read_for_authority_for_tests(0)
+                .await
+                .unwrap()
+                .is_complete(),
             "and the read is clean again, so the fold is not deadlocked on it"
         );
     }

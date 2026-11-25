@@ -4206,7 +4206,7 @@ mod tests {
 
     /// Every `(cache_key, start, end)` the ledger currently covers.
     async fn covered_identities(ledger: &WriteLedger) -> BTreeSet<(String, u64, u64)> {
-        let read = ledger.read_for_authority(0).await.unwrap();
+        let read = ledger.read_for_authority_for_tests(0).await.unwrap();
         read.entries
             .iter()
             .map(|e| (e.cache_key.clone(), e.range_start, e.range_end))
@@ -4448,7 +4448,7 @@ mod tests {
             ledger: &WriteLedger,
             key: &str,
         ) -> (StagedCandidateVerdict, u64) {
-            let read = ledger.read_for_authority(0).await.unwrap();
+            let read = ledger.read_for_authority_for_tests(0).await.unwrap();
             let candidate = WriteLedger::group_by_key(read.entries)
                 .into_iter()
                 .find(|c| c.cache_key == key)
@@ -4982,7 +4982,11 @@ mod tests {
             run_ledger_repair(dir, &ledger, "host:1").await;
         }
 
-        let entries = ledger.read_for_authority(0).await.unwrap().entries;
+        let entries = ledger
+            .read_for_authority_for_tests(0)
+            .await
+            .unwrap()
+            .entries;
         let appended = entries
             .iter()
             .filter(|e| e.cache_key == subject && e.range_start == 0 && e.range_end == 1023)
@@ -5801,7 +5805,7 @@ mod tests {
         assert_eq!(sweep.ranges_reappended as usize, keys.len());
 
         // `Ledger_Seq` is assigned by the append itself, so ordering by seq IS append order.
-        let read = ledger2.read_for_authority(0).await.unwrap();
+        let read = ledger2.read_for_authority_for_tests(0).await.unwrap();
         let mut entries = read.entries.clone();
         entries.sort_by_key(|e| e.seq.expect("every appended entry carries a seq"));
         let appended: Vec<String> = entries.iter().map(|e| e.cache_key.clone()).collect();

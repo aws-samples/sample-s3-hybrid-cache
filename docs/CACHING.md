@@ -648,15 +648,16 @@ Objects uploaded through the proxy and then read back, including multipart uploa
 cache:
   write_cache_enabled: true
   put_ttl: "2h"
-  write_cache_percent: 20.0               # The write cache's reclamation target, as a share of the cache
+  write_cache_percent: 20.0               # The write cache's bound, as a share of the cache
   write_cache_max_object_size: 536870912  # 512 MiB: the largest single PUT that is cached
   # incomplete_upload_ttl (default 1d, valid 1h to 7d) sets when abandoned uploads are removed
 ```
 
-- Multipart uploads count towards the same `write_cache_percent`, which is a reclamation target,
-  not an admission limit.
+- Multipart uploads count towards the same `write_cache_percent`. Once staged bytes reach it, new
+  uploads and parts are forwarded to S3 uncached until reclamation frees room.
 - Each part is checked against the remaining cache capacity as it arrives. A part that does not fit
-  is forwarded unstaged, and the completed object is then not cached.
+  is forwarded unstaged, and the completed object is then not cached. Every part of an upload whose
+  `CreateMultipartUpload` was not cached is forwarded unstaged too.
 - At most 5,000 in-progress multipart entries (uploads plus uploaded parts, across every proxy
   sharing the volume) are write-cached at once. That is about 38 concurrent 1 GiB uploads at the
   AWS CLI's 8 MiB part size. Further uploads go to S3 uncached and are counted in
@@ -710,6 +711,11 @@ The proxy invalidates a key's cached entry when:
    until `get_ttl` expires (see
    [Writes the origin stops answering](ERROR_HANDLING.md#10-writes-the-origin-stops-answering)).
 
+**A write S3 may have applied.** When S3 answers a write with `500 InternalError`, or a DELETE with
+any `5xx`, S3 may have applied it. The proxy then expires the key's cached entry, and the next GET
+or HEAD revalidates it with S3: `304` keeps the entry, `200` replaces it and `404` removes it.
+`503 SlowDown` and other `5xx` answers to other writes leave the entry as it is.
+
 Multipart uploads that stay idle for longer than `incomplete_upload_ttl` (default `1d`) are also
 removed, with their staged parts.
 
@@ -732,12 +738,14 @@ response when it fits within the write's cache budget (see
   A body it cannot read exactly (a DOCTYPE, a CDATA section, an unknown entity, an encoding other
   than UTF-8, or malformed XML) is answered `400 MalformedXML` without being forwarded, and the
   proxy logs a warning naming the cause. AWS SDKs and the AWS CLI never send those forms. After a
-  `2xx`, every requested key is invalidated except those S3 reported an `<Error>` for. When the
-  result document is larger than 4 MiB or cannot be read, or S3 answers `5xx` or not at all, every
-  requested key is invalidated. A `4xx` invalidates nothing.
+  `2xx`, every requested key is invalidated except those S3 reported an `<Error>` for, and a key
+  reported with `InternalError` is expired. When the result document is larger than 4 MiB or cannot
+  be read, or S3 does not answer, every requested key is invalidated. A `5xx` from S3 expires every
+  requested key, and a `4xx` invalidates nothing.
 - **Form POST.** The proxy forwards the body as it streams and reads the `key` field on the way
-  past; it does not keep the file content. A `2xx`, a `3xx` redirect, a `5xx` or a forward that
-  failed after the request was sent invalidates the key, and a `4xx` does not. When the `key` field cannot be read, the proxy
+  past; it does not keep the file content. A `2xx`, a `3xx` redirect or a forward that
+  failed after the request was sent invalidates the key, `500 InternalError` expires it, and a `4xx`
+  or another `5xx` leaves it. When the `key` field cannot be read, the proxy
   invalidates the object named in S3's `Location` header instead. Form POST uploads are not
   write-cached.
 
@@ -846,7 +854,9 @@ acknowledged, on this proxy or any other sharing the volume. Such a miss does no
 returned to it, and the next request misses and fetches the current object.
 
 This ordering rests on a small `{object}.wtok` file per key. Each acknowledged write rewrites it
-before the proxy responds. Before each GET or HEAD miss goes to S3, the proxy reads the file, or
+before the proxy responds, and so does a GET or HEAD that learns from S3 that a cached object has
+changed or been deleted, and a removal that cannot delete one of the key's range files
+([Write-order file cost](../README.md#write-order-file-cost)). Before each GET or HEAD miss goes to S3, the proxy reads the file, or
 creates it when the key has none, and stores the response only if the file is unchanged when the
 store runs. A miss that S3 answers with `404` or `403`, or that fails before its response reaches
 the cache store, removes the file and any directories it created for it. It retries the removal for
@@ -863,7 +873,8 @@ response. Before it responds, it appends a record of the key to a small log on t
 disk (`logging.local_state_dir`, default `/var/lib/s3-proxy`) and flushes it. It then retries the
 `{object}.wtok` file in the background until it lands. A restarted proxy reads the log before it
 accepts requests and resumes those retries. While that directory is writable, neither a volume
-outage nor a restart during one drops a pending invalidation.
+outage nor a restart during one drops a write's pending invalidation. A GET or HEAD that found the
+object changed at S3 retries its write-order file from memory only.
 
 The shipped systemd unit creates the directory with `StateDirectory=s3-proxy`. Under
 `ProtectSystem=strict`, a unit without that line, or without the directory in `ReadWritePaths`,
@@ -1076,8 +1087,8 @@ covers the mechanism, the full set of counters, and the one cached read the limi
 **Write cache**:
 
 - The write cache is `write_cache_percent` (default 10%) of the total cache, shared by PUTs and
-  multipart uploads. It is a reclamation target, not an admission limit: staged bytes above it are
-  reclaimed in the background.
+  multipart uploads. Once staged bytes reach it, new uploads are forwarded to S3 uncached until
+  background reclamation frees room.
 - A PUT or upload part that would take the cache past `max_cache_size` is not cached; the upload
   continues to S3 normally.
 

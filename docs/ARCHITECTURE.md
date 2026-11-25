@@ -558,7 +558,6 @@ The proxy is a shared cache. It does not authenticate clients or authorize reque
 cache:
   get_ttl: "0s"
   head_ttl: "0s"
-  actively_remove_cached_data: false  # Lazy expiration (default)
 ```
 
 **Behavior with TTL>0 (expired)**: When a cached object's TTL has elapsed, the next request triggers the same conditional revalidation flow described below. See [Cache Revalidation](CACHE_FRESHNESS.md#get-ttl-get_ttl) in the Caching documentation for full details including 304, 200, and 403 outcomes.
@@ -572,7 +571,7 @@ cache:
 - S3 returns 200 OK if changed → fresh data fetched and cached
 - S3 returns 403 Forbidden if client lacks access → error returned, cache unchanged
 
-**Important**: With TTL=0, an expired entry stays on disk for revalidation under either value of `actively_remove_cached_data`; keep the default `false` (lazy expiration).
+**Important**: With TTL=0, an expired entry stays on disk for revalidation, so an unchanged object is served from it after a `304`.
 
 **Use cases**:
 - **Per-request IAM authentication and authorization**: Ensures every client's credentials are validated by S3, preventing unauthorized access to cached data

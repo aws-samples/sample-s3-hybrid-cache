@@ -995,6 +995,7 @@ async fn part_scoped_lookup_remains_fresh_only_for_expired_entries() {
     metadata.object_metadata.parts_count = Some(1);
     metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (start, end));
+    metadata.object_metadata.part_layout_marked.insert(1);
     std::fs::write(
         &meta_path,
         serde_json::to_string_pretty(&metadata).expect("serialize"),

@@ -269,8 +269,8 @@ cache:
   write_cache_percent: 10.0  # Default: 10% of max_cache_size
 ```
 
-- The share is a reclamation target, not an admission limit: an upload is cached even when the share is already full, and the excess is reclaimed in the background.
-- Reclamation takes the oldest staged objects first, starting with those whose `put_ttl` elapsed unread. An object never read has no recency or frequency score, so the read cache's TinyLFU scoring does not apply.
+- The share bounds staged bytes. Once they reach it, or an upload would take them past it, new uploads are forwarded to S3 uncached until reclamation frees room; the uploads themselves succeed as usual.
+- Reclamation takes the oldest staged objects first within each cache shard, starting with those whose `put_ttl` elapsed unread. An object never read has no recency or frequency score, so the read cache's TinyLFU scoring does not apply.
 - Reclamation runs in the background maintenance cycle, never on the request path.
 - Staged bytes also leave the share without any reclamation when they are read for the first time, the normal case for a read-after-write workload.
 - The S3 operation succeeds whatever happens to the cached copy.
@@ -282,7 +282,7 @@ Write-cached objects are stored on disk only, which keeps the RAM cache for read
 #### Limitations
 
 - A single PUT is cached only up to `write_cache_max_object_size` (default 256 MiB); a larger object bypasses the cache.
-- Caching is also declined when it would take the cache past `max_cache_size`, or when the cache volume has under 1 GiB free beyond the object's own size. Both are reported as `disk_safety` in `signed_put.skipped_puts_total`. This is the only capacity-shaped refusal; `write_cache_percent` declines nothing (see above).
+- Caching is also declined when it would take the cache past `max_cache_size`, or when the cache volume has under 1 GiB free beyond the object's own size. Both are reported as `disk_safety` in `signed_put.skipped_puts_total`, and uploads past the staging bound above as `staging_bound`.
 - A POST object upload is not cached; see the next section.
 
 #### POST object upload is not write-through cached
@@ -581,7 +581,8 @@ The request-level behavior is described under [Part number cache](#part-number-c
 
 When a GET with a `partNumber` parameter returns from S3, the proxy:
 
-1. parses the `Content-Range` header (for example `bytes 0-8388607/5368709120`);
+1. parses the `Content-Range` header (for example `bytes 0-8388607/5368709120`), or
+   `x-amz-content-range` when S3 answers `200` with an MD5 trailer appended;
 2. takes the key's metadata lock and reads the object's cached metadata, and records the layout
    only if the part response's ETag matches the cached object's;
 3. stores the exact `(start, end)` byte range in `part_ranges` for that part number;
@@ -634,7 +635,7 @@ A waiter waits up to `wait_timeout_secs` for the fetcher to finish:
 
 - **The fetcher succeeds**: the waiter tries the cache first, since the fetcher should have cached the data. On a hit, it serves the response from disk or RAM with no S3 request. If the lookup misses, for example because the metadata is not yet consolidated, it makes its own S3 fetch.
 - **The fetcher fails**: the waiter makes its own S3 fetch.
-- **The wait times out**: the waiter waits on the same fetch again, up to `max_waiter_resubscriptions` times (default `3`). After that, the waiter makes its own S3 fetch, whether it asked for a full object, a range or a part. A whole-object GET or HEAD waiter makes it after at most 30 seconds of waiting in total, whatever `wait_timeout_secs` says.
+- **The wait times out**: the waiter makes its own S3 fetch, whether it asked for a full object, a range, a part or a page. It logs `Download coordination: waiter had no answer from the fill within wait_timeout_secs, fetching from S3 itself` at WARN, naming the kind of waiter. Keep `wait_timeout_secs` at 60 or less, within the AWS CLI's 60-second read timeout.
 
 ```yaml
 cache:

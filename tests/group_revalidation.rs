@@ -42,6 +42,8 @@ mod head_expiration_property_test;
 mod head_ttl_zero_pin_test;
 #[path = "object_ttl_refresh_property_test.rs"]
 mod object_ttl_refresh_property_test;
+#[path = "overwrite_client_range_forward_test.rs"]
+mod overwrite_client_range_forward_test;
 #[path = "range_spec_ttl_test.rs"]
 mod range_spec_ttl_test;
 #[path = "recovery_refetch_version_pin_test.rs"]

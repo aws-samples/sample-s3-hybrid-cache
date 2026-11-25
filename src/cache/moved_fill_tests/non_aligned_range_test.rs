@@ -85,12 +85,14 @@ async fn test_non_aligned_range_request() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store each cached range
@@ -260,12 +262,14 @@ async fn test_non_aligned_range_multiple_boundaries() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store each cached range
@@ -377,12 +381,14 @@ async fn test_non_aligned_range_at_start() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     for (start, end) in &cached_ranges {
@@ -479,12 +485,14 @@ async fn test_non_aligned_range_at_end() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     for (start, end) in &cached_ranges {

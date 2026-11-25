@@ -4,8 +4,8 @@
 //! # What this asserts, and why it is not an adjacent figure
 //!
 //! Every `.meta` publisher holds the key's slot lock —
-//! `CacheManager::store_new_metadata`, `JournalConsolidator::write_metadata_to_disk` and
-//! `HybridMetadataWriter::write_metadata_to_disk` all take `&MetadataLock` as a parameter, and
+//! `CacheManager::store_new_metadata` and `JournalConsolidator::write_metadata_to_disk` both
+//! take `&MetadataLock` as a parameter, and
 //! the consolidator (the production publisher) obtains it from
 //! `MetadataLockManager::try_acquire_lock`. So the resource the ordering argument rests on is a
 //! single exclusive `flock` on `metadata/_meta_locks/{slot}.lock`, and **this file holds that

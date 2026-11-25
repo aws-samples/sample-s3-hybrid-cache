@@ -549,6 +549,7 @@ mod tests {
             head_access_count: 0,
             head_cached_at: None,
             last_validated_at: None,
+            write_expired_at: None,
         }
     }
 

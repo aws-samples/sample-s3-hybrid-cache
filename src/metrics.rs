@@ -1759,8 +1759,9 @@ pub struct WriteCacheMetrics {
     ///
     /// `None` exactly when `ledger_entries` is `None`: no observation has been taken, or the last
     /// attempt could not read the volume. The bound is
-    /// `write_ledger::LEDGER_COUNT_MAX_AGE_SECS`, and in the steady state the value here is well
-    /// inside it because ledger compaction donates the figure it already computes.
+    /// `write_ledger::LEDGER_COUNT_MAX_AGE_SECS`: the count is re-taken by a traversal once the
+    /// observation is older than that, since the staging pass and the compaction rotation retire
+    /// shard by shard and neither reads the whole ledger.
     ///
     /// Spec: cache-eviction-at-scale § 16.6.3.
     pub ledger_entries_age_secs: Option<u64>,
@@ -3991,20 +3992,37 @@ impl MetricsManager {
             // Background-derived for the scan age only. A request passes an empty set, which
             // yields the two live atomics and a `None` age, and then takes the age from the last
             // full collection, advanced to now.
-            st_size_fold: match volume {
-                VolumeSource::Fresh(shard_checkpoints, ..) => {
-                    crate::st_size_fold::collect_st_size_fold_gauges(shard_checkpoints)
-                }
-                VolumeSource::Snapshot(last) => crate::st_size_fold::StSizeFoldGauges {
-                    st_size_fold_oldest_shard_scan_age_secs: aged(
-                        last.and_then(|l| l.cache.as_ref())
-                            .and_then(|c| c.st_size_fold.st_size_fold_oldest_shard_scan_age_secs),
-                        volume.age_secs(),
-                    ),
-                    ..crate::st_size_fold::collect_st_size_fold_gauges(
-                        &crate::staged_fold::ShardCheckpointSet::default(),
-                    )
-                },
+            //
+            // The shard sum rides the same set: summed from it on a full collection, carried from
+            // the last collection unaged on a request (a sum has no age to advance), and the drift
+            // against `total_size` is taken here, where the total is.
+            st_size_fold: {
+                let mut gauges = match volume {
+                    VolumeSource::Fresh(shard_checkpoints, ..) => {
+                        crate::st_size_fold::collect_st_size_fold_gauges(shard_checkpoints)
+                    }
+                    VolumeSource::Snapshot(last) => crate::st_size_fold::StSizeFoldGauges {
+                        st_size_fold_oldest_shard_scan_age_secs: aged(
+                            last.and_then(|l| l.cache.as_ref()).and_then(|c| {
+                                c.st_size_fold.st_size_fold_oldest_shard_scan_age_secs
+                            }),
+                            volume.age_secs(),
+                        ),
+                        shard_sum_bytes: last
+                            .and_then(|l| l.cache.as_ref())
+                            .and_then(|c| c.st_size_fold.shard_sum_bytes),
+                        ..crate::st_size_fold::collect_st_size_fold_gauges(
+                            &crate::staged_fold::ShardCheckpointSet::default(),
+                        )
+                    },
+                };
+                gauges.shard_sum_drift_bytes = crate::st_size_fold::shard_sum_drift_bytes(
+                    gauges.shard_sum_bytes,
+                    // `total_size`, not `total_cache_size`: the latter adds in-progress part
+                    // bytes, which the shard sum cannot hold (it counts `ranges/` only).
+                    sizes.total_size,
+                );
+                gauges
             },
             // A process-local atomic carrying the configured cap (the floor is always 0), two more
             // counting this process's rebuilds, and one read of the per-instance tail-delta files.

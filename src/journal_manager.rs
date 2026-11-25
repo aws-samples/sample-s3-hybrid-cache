@@ -556,8 +556,6 @@ pub struct JournalEntry {
 pub enum JournalOperation {
     /// Add a new range to the cache
     Add,
-    /// Update an existing range
-    Update,
     /// Remove a range from the cache
     Remove,
     /// Refresh TTL for a cached range (cache-hit operation)
@@ -2018,13 +2016,12 @@ mod tests {
         // Generate valid range (end must be >= start)
         let range_end = range_start.saturating_add(range_end_offset);
 
-        // Generate operation type (0-4 for Add, Update, Remove, TtlRefresh, AccessUpdate)
-        let operation = match operation_type % 5 {
+        // Generate operation type (0-3 for Add, Remove, TtlRefresh, AccessUpdate)
+        let operation = match operation_type % 4 {
             0 => JournalOperation::Add,
-            1 => JournalOperation::Update,
-            2 => JournalOperation::Remove,
-            3 => JournalOperation::TtlRefresh,
-            4 => JournalOperation::AccessUpdate,
+            1 => JournalOperation::Remove,
+            2 => JournalOperation::TtlRefresh,
+            3 => JournalOperation::AccessUpdate,
             _ => unreachable!(),
         };
 

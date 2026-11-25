@@ -581,27 +581,19 @@ pub struct DownloadCoordinationConfig {
     #[serde(default = "default_download_coordination_enabled")]
     pub enabled: bool,
 
-    /// Maximum time a waiter will wait for the fetcher to complete (default: 30s)
-    /// If the fetcher takes longer than this, the waiter re-subscribes to the in-flight fetch
-    /// (or becomes the fetcher if that fetch has gone). Once `max_waiter_resubscriptions`
-    /// is exceeded, a full-object GET or HEAD waiter fetches from S3 itself, as an
-    /// uncoalesced request does, and a part or range waiter returns 504. A full-object
-    /// GET or HEAD waiter also stops waiting 30 s after it began, whatever this and
-    /// `max_waiter_resubscriptions` allow, so its response head comes before the AWS
-    /// SDKs' 60 s read timeout.
+    /// How long a coalesced waiter (full object, range or part) waits for the fill it joined
+    /// before it fetches from S3 itself, as an uncoalesced request does (default: 30s). The
+    /// waiter's response head waits for that fill to commit, so a value above 60 can delay
+    /// the head past the AWS SDKs' 60 s read timeout.
     /// Valid range: 5-120 seconds (values outside this range are clamped with a warning)
     /// Requirement: 18.2, 18.3, 18.5
     #[serde(default = "default_download_coordination_wait_timeout_secs")]
     pub wait_timeout_secs: u64,
 
-    /// Maximum number of times a waiter will re-subscribe after timeout before it
-    /// stops waiting on the in-flight fetch (default: 3).
-    /// When a waiter's timeout fires and the FetchGuard is still present, the waiter
-    /// re-subscribes to the in-flight fetch rather than launching a duplicate S3 request.
-    /// After this many re-subscriptions without receiving a result, a full-object waiter
-    /// fetches from S3 itself and a part or range waiter fails with HTTP 504 Gateway
-    /// Timeout.
-    /// Requirement: 7.5
+    /// Deprecated: has no effect. A waiter no longer re-subscribes: it waits one
+    /// `wait_timeout_secs` and then fetches from S3 itself. It still parses (default 3); any
+    /// other value logs a warning at startup
+    /// ([`DownloadCoordinationConfig::warn_deprecated_fields`]).
     #[serde(default = "default_max_waiter_resubscriptions")]
     pub max_waiter_resubscriptions: u32,
 }
@@ -629,6 +621,19 @@ impl Default for DownloadCoordinationConfig {
 }
 
 impl DownloadCoordinationConfig {
+    /// Log one warning when `max_waiter_resubscriptions` carries a non-default value: it still
+    /// parses (the config compatibility rule), and nothing reads it. Called once, from
+    /// `Config::load`.
+    pub fn warn_deprecated_fields(&self) {
+        if self.max_waiter_resubscriptions != default_max_waiter_resubscriptions() {
+            warn!(
+                "cache.download_coordination.max_waiter_resubscriptions ({}) is deprecated and \
+                 has no effect: a waiter waits one wait_timeout_secs ({}s) for the fill it \
+                 joined, then fetches from S3 itself. Remove this field from your config.",
+                self.max_waiter_resubscriptions, self.wait_timeout_secs
+            );
+        }
+    }
     /// Validate and clamp configuration values
     /// Returns the clamped wait_timeout_secs value
     /// Requirement: 18.5
@@ -1837,7 +1842,10 @@ pub struct CacheConfig {
     /// TTL for metadata validation (HEAD requests) - typically shorter than data TTL
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub head_ttl: Duration,
-    /// Whether to actively remove cached data when get_ttl expires (default: false for lazy expiration)
+    /// Deprecated: has no effect. It was meant to remove expired entries during the cache size
+    /// scan, and that removal no longer runs, so an expired entry stays until it is revalidated
+    /// or evicted. It still parses (default false); `true` logs a warning at startup
+    /// ([`CacheConfig::warn_actively_remove_cached_data`]).
     #[serde(default)]
     pub actively_remove_cached_data: bool,
 
@@ -2122,6 +2130,17 @@ impl Default for CacheConfig {
 }
 
 impl CacheConfig {
+    /// Log one warning when `actively_remove_cached_data` is `true`: it still parses (the
+    /// config compatibility rule), and it removes nothing. Called once, from `Config::load`.
+    pub fn warn_actively_remove_cached_data(&self) {
+        if self.actively_remove_cached_data {
+            warn!(
+                "cache.actively_remove_cached_data is deprecated and has no effect: it removes \
+                 nothing. Expired entries stay until a read revalidates them or eviction \
+                 removes them. Remove this field from your config."
+            );
+        }
+    }
     /// Maximum allowed TTL value: 315,360,000 seconds (10 years).
     /// TTL fields exceeding this are rejected at startup.
     /// Requirement: 8.5
@@ -3452,6 +3471,9 @@ impl Config {
 
         // The retired orphan-sweep fields parse and are ignored; one warning if any is set.
         config.cache.shared_storage.warn_retired_orphan_fields();
+        // Deprecated fields that parse and do nothing; one warning each when set.
+        config.cache.warn_actively_remove_cached_data();
+        config.cache.download_coordination.warn_deprecated_fields();
 
         // Validate shared storage configuration
         if let Err(e) = config.cache.shared_storage.validate() {
@@ -6812,6 +6834,96 @@ metrics:
             "expected exactly one {:?} call site (in Config::load)",
             needle
         );
+    }
+    const DEPRECATION_MINIMAL_YAML: &str = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+    /// `cache.actively_remove_cached_data: true` still loads, keeps its value (which nothing
+    /// acts on), and warns that it removes nothing; omitted or `false`, nothing is logged.
+    #[test]
+    fn actively_remove_cached_data_true_loads_and_warns_that_it_removes_nothing() {
+        let set = DEPRECATION_MINIMAL_YAML.replace(
+            "  cache_dir: \"./cache\"\n",
+            "  cache_dir: \"./cache\"\n  actively_remove_cached_data: true\n",
+        );
+        let config: Config = serde_yaml_ng::from_str(&set).expect("the field must still parse");
+        assert!(config.cache.actively_remove_cached_data);
+        let logged = capture_warnings(|| config.cache.warn_actively_remove_cached_data());
+        assert!(
+            logged.contains("actively_remove_cached_data is deprecated and has no effect")
+                && logged.contains("removes nothing"),
+            "set true, the field must warn that it removes nothing. got={:?}",
+            logged
+        );
+        // Unchanged behaviour: the warning leaves the value as loaded, and the default is off.
+        assert!(config.cache.actively_remove_cached_data);
+        let unset: Config = serde_yaml_ng::from_str(DEPRECATION_MINIMAL_YAML).unwrap();
+        assert!(!unset.cache.actively_remove_cached_data);
+        let off = DEPRECATION_MINIMAL_YAML.replace(
+            "  cache_dir: \"./cache\"\n",
+            "  cache_dir: \"./cache\"\n  actively_remove_cached_data: false\n",
+        );
+        let off: Config = serde_yaml_ng::from_str(&off).unwrap();
+        for config in [unset, off] {
+            let logged = capture_warnings(|| config.cache.warn_actively_remove_cached_data());
+            assert!(
+                !logged.contains("actively_remove_cached_data"),
+                "omitted or false must not warn. got={:?}",
+                logged
+            );
+        }
+    }
+    /// `cache.download_coordination.max_waiter_resubscriptions` still loads and warns that it
+    /// has no effect when set to anything but its default.
+    #[test]
+    fn max_waiter_resubscriptions_set_loads_and_warns_that_it_has_no_effect() {
+        let set = DEPRECATION_MINIMAL_YAML.replace(
+            "  cache_dir: \"./cache\"\n",
+            "  cache_dir: \"./cache\"\n  download_coordination:\n    max_waiter_resubscriptions: 5\n",
+        );
+        let config: Config = serde_yaml_ng::from_str(&set).expect("the field must still parse");
+        assert_eq!(
+            config
+                .cache
+                .download_coordination
+                .max_waiter_resubscriptions,
+            5
+        );
+        let logged =
+            capture_warnings(|| config.cache.download_coordination.warn_deprecated_fields());
+        assert!(
+            logged.contains("max_waiter_resubscriptions (5) is deprecated and has no effect"),
+            "a set value must warn. got={:?}",
+            logged
+        );
+        let unset: Config = serde_yaml_ng::from_str(DEPRECATION_MINIMAL_YAML).unwrap();
+        let logged =
+            capture_warnings(|| unset.cache.download_coordination.warn_deprecated_fields());
+        assert!(
+            !logged.contains("max_waiter_resubscriptions"),
+            "got={:?}",
+            logged
+        );
+    }
+    /// Pins the deprecation warnings' call sites in `Config::load`.
+    #[test]
+    fn the_deprecation_warnings_are_wired_into_config_load() {
+        let source = include_str!("config.rs");
+        for needle in [
+            concat!("config.cache.", "warn_actively_remove_cached_data();"),
+            concat!("download_coordination.", "warn_deprecated_fields();"),
+        ] {
+            assert_eq!(
+                source.matches(needle).count(),
+                1,
+                "expected exactly one {:?} call site (in Config::load)",
+                needle
+            );
+        }
     }
 
     #[test]

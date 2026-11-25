@@ -228,7 +228,8 @@ impl StubResponse {
     }
 
     /// Convert this stub into an [`S3Response`] suitable for returning from
-    /// [`S3ClientApi::forward_request`]. The body is always buffered.
+    /// [`S3ClientApi::forward_request`], with the body buffered.
+    /// [`StubS3Client::forward_request`] streams it when the request asks for streaming.
     fn into_s3_response(self) -> S3Response {
         S3Response {
             status: self.status,
@@ -238,6 +239,56 @@ impl StubResponse {
         }
     }
 }
+
+/// `bytes` as the body of a real HTTP/1 response over loopback: the type `S3Client` returns for
+/// a streamed request, which has no public constructor. The server and the client connection
+/// run on spawned tasks, so the body keeps flowing after this returns, until it is read to the
+/// end or dropped.
+pub async fn loopback_incoming(bytes: Bytes) -> hyper::body::Incoming {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the loopback body server");
+    let addr = listener.local_addr().expect("loopback body server address");
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let service =
+                hyper::service::service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                    let bytes = bytes.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                            http_body_util::Full::new(bytes),
+                        ))
+                    }
+                });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        }
+    });
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to the loopback body server");
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .expect("loopback handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = hyper::Request::builder()
+        .uri("/")
+        .header("host", "loopback")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("loopback request");
+    sender
+        .send_request(request)
+        .await
+        .expect("loopback response")
+        .into_body()
+}
+
+/// A request-dependent answer for [`StubS3Client::with_responder`].
+pub type StubResponder = Arc<dyn Fn(&S3RequestContext) -> Option<StubResponse> + Send + Sync>;
 
 /// Builder-style [`S3ClientApi`] stub for in-process tests.
 ///
@@ -259,6 +310,8 @@ struct StubInner {
     /// Routed on the exact `If-Match` value, checked before every other rule.
     /// Models S3 answering a pinned request for a version it no longer holds.
     if_match_responses: Mutex<HashMap<String, StubResponse>>,
+    /// Consulted before every rule; `None` from it falls through to the rules.
+    responder: Mutex<Option<StubResponder>>,
     default_response: Mutex<Option<StubResponse>>,
     /// Defaults to a disabled ledger (matching the trait's default impl), but
     /// can be overridden via [`StubS3Client::with_inflight_ledger`] so
@@ -285,6 +338,7 @@ impl StubS3Client {
                 etag_responses: Mutex::new(HashMap::new()),
                 auth_responses: Mutex::new(HashMap::new()),
                 if_match_responses: Mutex::new(HashMap::new()),
+                responder: Mutex::new(None),
                 default_response: Mutex::new(None),
                 inflight_ledger: Mutex::new(Arc::new(
                     s3_proxy::inflight_ledger::InflightLedger::disabled(),
@@ -304,6 +358,21 @@ impl StubS3Client {
             .inflight_ledger
             .lock()
             .expect("stub inflight_ledger poisoned") = ledger;
+        self
+    }
+
+    /// Answer every request with `responder` first, falling through to the other rules
+    /// when it returns `None`. For an origin whose answer depends on the request, such
+    /// as [`expired_fixture::model_s3_responder`].
+    pub fn with_responder(
+        self,
+        responder: impl Fn(&S3RequestContext) -> Option<StubResponse> + Send + Sync + 'static,
+    ) -> Self {
+        *self
+            .inner
+            .responder
+            .lock()
+            .expect("stub responder poisoned") = Some(Arc::new(responder));
         self
     }
 
@@ -386,6 +455,15 @@ impl StubS3Client {
     }
 
     fn resolve_response(&self, context: &S3RequestContext) -> StubResponse {
+        let responder = self
+            .inner
+            .responder
+            .lock()
+            .expect("stub responder poisoned")
+            .clone();
+        if let Some(resp) = responder.and_then(|answer| answer(context)) {
+            return resp;
+        }
         if let Some(if_match) = context
             .headers
             .iter()
@@ -494,7 +572,15 @@ impl S3ClientApi for StubS3Client {
         if !response.delay.is_zero() {
             tokio::time::sleep(response.delay).await;
         }
-        Ok(response.into_s3_response())
+        let mut s3_response = response.into_s3_response();
+        // `S3Client` streams every body whose request context sets `allow_streaming`, and the
+        // GET fill stores only a streamed one, so the stub streams it too.
+        if context.allow_streaming {
+            if let Some(S3ResponseBody::Buffered(bytes)) = s3_response.body.take() {
+                s3_response.body = Some(S3ResponseBody::Streaming(loopback_incoming(bytes).await));
+            }
+        }
+        Ok(s3_response)
     }
 
     fn extract_metadata_from_response(&self, headers: &HashMap<String, String>) -> CacheMetadata {
@@ -621,6 +707,41 @@ pub async fn consolidate(
         consolidator.consolidate_object(cache_key).await?;
     }
     Ok(())
+}
+
+/// Wait, at most 10 s, until a GET-miss fill of `cache_key` is listed in the key's `.meta`,
+/// folding the key's journal on each try. A GET miss streams its body to the client while the
+/// cache writer stores it, and the store commits after the response ends and reaches the `.meta`
+/// through the journal, so a test that reads the entry right after the response races the fill.
+/// The response body must have been read to the end first, or the fill never completes.
+pub async fn wait_for_fill(cache_manager: &s3_proxy::cache::CacheManager, cache_key: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = consolidate(cache_manager, cache_key).await;
+        // The document itself: `get_metadata_from_disk` answers from this instance's
+        // fill-visibility record while no `.meta` exists.
+        let listed = cache_manager.get_new_metadata_file_path(cache_key).exists()
+            && cache_manager
+                .get_metadata_from_disk(cache_key)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|m| !m.ranges.is_empty());
+        if listed {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the GET-miss fill of {cache_key} was not in its .meta within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// [`wait_for_fill`] for the cache key a request path names.
+pub async fn wait_for_fill_of_path(cache_manager: &s3_proxy::cache::CacheManager, path: &str) {
+    let key = s3_proxy::cache::CacheManager::generate_cache_key(path, None);
+    wait_for_fill(cache_manager, &key).await;
 }
 
 /// Writes a `NewCacheMetadata` as the key's `.meta` document, creating its directory. It

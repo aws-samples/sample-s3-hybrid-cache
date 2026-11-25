@@ -592,7 +592,7 @@ pub(crate) fn compute_local_ceiling(aggregate_bps: u64, instance_count: u32) -> 
 ///
 /// Heartbeats live in a dedicated `qos/heartbeats/` subtree — never under
 /// `metadata/` — so they are isolated from the cache-metadata sweeps
-/// (consolidator, eviction, `is_cache_entry_active`, dead-journal cleanup) that
+/// (consolidator, eviction and its activity set, dead-journal cleanup) that
 /// walk `metadata/_journals/`, and so a cache-metadata reset never wipes live
 /// liveness state.
 ///

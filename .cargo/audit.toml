@@ -15,4 +15,12 @@ ignore = [
     # drops the rand 0.8 pin as of 2026-07-20; re-check on next dependency bump.
     # Reviewed at 2.3.0.
     "RUSTSEC-2026-0097",
+    # RUSTSEC-2026-0543: chrono is unmaintained (informational). It names no vulnerability,
+    # and lists no patched version: every chrono release is affected, so `cargo update -p
+    # chrono` cannot clear it. chrono 0.4.42 is a direct dependency (timestamp formatting in
+    # src/) and reaches the binary through tracing-subscriber's `chrono` timer and
+    # tracing-appender. The resolution is a move to `jiff` or `time`, the advisory's named
+    # alternatives, in its own change; re-check at the next dependency bump, and remove this
+    # entry if a vulnerability is published against chrono. Reviewed at 3.0.7.
+    "RUSTSEC-2026-0543",
 ]

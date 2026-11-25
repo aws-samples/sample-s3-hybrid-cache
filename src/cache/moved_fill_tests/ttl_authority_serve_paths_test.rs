@@ -118,6 +118,7 @@ async fn seed_part(fixture: &Fixture, cache_key: &str, etag: &str) -> String {
     metadata.object_metadata.parts_count = Some(4);
     metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
+    metadata.object_metadata.part_layout_marked.insert(1);
     std::fs::write(
         fixture.meta_path(cache_key),
         serde_json::to_string_pretty(&metadata).expect("serialize"),
@@ -412,6 +413,7 @@ async fn expired_part_revalidates_and_a_304_starts_a_new_window() {
     metadata.object_metadata.parts_count = Some(4);
     metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
+    metadata.object_metadata.part_layout_marked.insert(1);
     std::fs::write(
         fixture.meta_path(key),
         serde_json::to_string_pretty(&metadata).expect("serialize"),
@@ -513,6 +515,7 @@ async fn zero_ttl_waiters_get_the_5xx_and_non_zero_keep_stale_if_error() {
     let mut metadata = fixture.read_meta(key).expect(".meta");
     metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
+    metadata.object_metadata.part_layout_marked.insert(1);
     std::fs::write(
         fixture.meta_path(key),
         serde_json::to_string_pretty(&metadata).expect("serialize"),
@@ -1327,6 +1330,7 @@ async fn write_cached_part_with_no_last_modified_is_fetched_not_revalidated() {
     metadata.object_metadata.parts_count = Some(4);
     metadata.object_metadata.part_layout_verified = true;
     metadata.object_metadata.part_ranges.insert(1, (0, 1023));
+    metadata.object_metadata.part_layout_marked.insert(1);
     std::fs::write(
         fixture.meta_path(key),
         serde_json::to_string_pretty(&metadata).expect("serialize"),

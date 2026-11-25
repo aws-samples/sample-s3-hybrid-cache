@@ -139,7 +139,7 @@ async fn fold_until_settled(cache_dir: &Path, ledger: &WriteLedger, instance: &s
 /// `(cache_key, range_start, range_end, seq, instance)`.
 async fn record_set(ledger: &WriteLedger) -> BTreeSet<(String, u64, u64, Option<u64>, String)> {
     ledger
-        .read_for_authority(0)
+        .read_for_authority_for_tests(0)
         .await
         .unwrap()
         .entries
@@ -238,7 +238,7 @@ async fn the_fold_installs_correct_totals_across_two_instances_and_three_shards(
         .iter()
         .any(|r| r.0 == "bucket/shared.bin" && r.4 == "hostB:2" && r.1 == 4096 && r.3 == Some(1)));
 
-    let read = a.read_for_authority(0).await.unwrap();
+    let read = a.read_for_authority_for_tests(0).await.unwrap();
     assert_eq!(
         read.max_seq_per_instance.len(),
         2,
@@ -300,7 +300,7 @@ async fn a_header_only_shard_file_contributes_nothing_but_still_carries_its_mark
         "fixture precondition: two distinct shards"
     );
 
-    let before = ledger.read_for_authority(0).await.unwrap();
+    let before = ledger.read_for_authority_for_tests(0).await.unwrap();
     let top = *before.max_seq_per_instance.get("host:1").unwrap();
 
     let retire: HashSet<_> = before
@@ -309,13 +309,13 @@ async fn a_header_only_shard_file_contributes_nothing_but_still_carries_its_mark
         .filter(|e| e.cache_key == "bucket/drain-me.bin")
         .map(|e| e.identity())
         .collect();
-    ledger.retire_identities(&retire).await.unwrap();
+    ledger.retire_identities_for_tests(&retire).await.unwrap();
     assert!(
         drained_path.is_file(),
         "the drained file must SURVIVE, header-only, or its mark is gone: {drained_path:?}"
     );
 
-    let after = ledger.read_for_authority(0).await.unwrap();
+    let after = ledger.read_for_authority_for_tests(0).await.unwrap();
     assert!(
         !after
             .entries

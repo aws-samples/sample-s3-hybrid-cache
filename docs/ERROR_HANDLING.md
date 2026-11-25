@@ -10,7 +10,7 @@ Cache corruption, missing files and disk space errors do not stop the proxy. The
 - A read streamed from the cache that finds a damaged range file ends early with a connection error; see [Damaged range files](#damaged-range-files).
 - A write whose origin stops answering gets `504 Gateway Timeout`; see [Writes the origin stops answering](#10-writes-the-origin-stops-answering).
 
-Damaged state is cleared without operator action. Confidently corrupt metadata is overwritten by the next full-object fetch (see [Self-healing via overwrite-in-place](#self-healing-via-overwrite-in-place)), and range files that no metadata lists are deleted by the orphan reclamation rotation (see [Orphaned files](#6-orphaned-files)). A single damaged cache entry never stops the process.
+Damaged state is cleared without operator action. Confidently corrupt metadata is replaced or removed by the next fetch of the key (see [Self-healing via overwrite-in-place](#self-healing-via-overwrite-in-place)), and range files that no metadata lists are deleted by the orphan reclamation rotation (see [Orphaned files](#6-orphaned-files)). A single damaged cache entry never stops the process.
 
 ## Failure classes
 
@@ -32,7 +32,7 @@ A file that meets none of these stays on the "treat as a miss, do not delete" pa
 
 The heal happens on a later fetch:
 
-- **GET**: the normal cache-miss handling fetches the object from S3 and writes a fresh `.meta` at the same sharded path, over the corrupt file. A full-object fill does this during the request. It publishes the range file first. It then holds the key's metadata lock while it reads whatever `.meta` is there, releases the ranges the new copy supersedes, and renames the new document into place. A document that cannot be parsed is not read, and the fresh one replaces it whole. A range fill instead records the range in this proxy's journal for consolidation to fold in, and folding reads the existing document, so a range fill does not replace an unparseable one. A corrupt `.meta` is therefore cleared by the next full-object fetch of that key, and until then every request for the key is served from S3 as a miss.
+- **GET**: the normal cache-miss handling fetches the object from S3 and writes a fresh `.meta` at the same sharded path, over the corrupt file. A full-object fill does this during the request. It publishes the range file first. It then holds the key's metadata lock while it reads whatever `.meta` is there, releases the ranges the new copy supersedes, and renames the new document into place. A document that cannot be parsed is not read, and the fresh one replaces it whole. A range fill removes the unparseable file when it publishes its range, logging `[METADATA_HEAL] Unparseable .meta removed by a range fill's publish`, and consolidation rebuilds the document from the fill's journal record. If a range file under 10 minutes old already holds the fill's path, the fill does not publish, and the key misses until a later fill publishes. Until the corrupt file is replaced or removed, every request for the key is served from S3 as a miss.
 - **HEAD**: a HEAD response does not write a fresh `.meta`, since it caches only in the HEAD cache, and it does not remove the corrupt file either. The file stays until a GET's fill replaces it.
 
 The overwrite is always backed by a real S3 fetch: the proxy never builds metadata from internal state alone.
@@ -40,7 +40,7 @@ The overwrite is always backed by a real S3 fetch: the proxy never builds metada
 | Metric | Description |
 |--------|-------------|
 | `corruption_metadata_total` | Corrupt metadata detections, all reasons |
-| `metadata_heal_overwrite_total` | Unparseable `.meta` documents replaced by a fresh one, from a full-object fill, a zero-length fill or a range store. Counted once the replacement is renamed into place, per proxy, and exported over OTLP. A rising `corruption_metadata_total` with a flat heal count means the damaged keys are not being fetched as full objects, so they stay unhealed and keep going to S3 |
+| `metadata_heal_overwrite_total` | Unparseable `.meta` documents a fill took out of service. A full-object fill, a zero-length fill, a range store or a consolidation that folds a fill into one replaces the document; a range fill removes it, and its journal record then rebuilds it. Each document is counted once, per proxy, and exported over OTLP. A rising `corruption_metadata_total` with a flat heal count means the damaged keys are not being fetched, so they stay unhealed and keep going to S3 |
 
 A heal cannot interleave with a consolidation. Every writer of a `.meta`, the fill paths and the consolidator alike, holds the key's metadata lock across the whole read-modify-write and releases it only after the rename. The lock is never taken from its holder. A fill retries a contended lock a bounded number of times, then abandons the write and leaves the corrupt file for a later request to heal. Consolidation skips a contended key and retries on its next cycle. A file caught mid-write is never healed; only confident corruption triggers the overwrite.
 
@@ -258,7 +258,7 @@ The error counters sit in the `cache` section of `/metrics` (`curl http://localh
 | Field | Meaning |
 |---|---|
 | `corruption_metadata_total` | Corrupt `.meta` files detected, all reasons |
-| `metadata_heal_overwrite_total` | Corrupt `.meta` files replaced by a fresh document |
+| `metadata_heal_overwrite_total` | Corrupt `.meta` files a fill replaced or removed |
 | `corruption_missing_range_total` | Range files the metadata listed that were missing |
 | `disk_full_events_total` | Counted cache writes that failed with `ENOSPC` |
 

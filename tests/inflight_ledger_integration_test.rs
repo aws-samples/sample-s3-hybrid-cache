@@ -278,7 +278,7 @@ async fn warm_cache(
 ) {
     let server = spawn_proxy_server(
         config,
-        cache_manager,
+        Arc::clone(&cache_manager),
         range_handler,
         cached_object_stub().into_trait_object(),
     )
@@ -291,6 +291,7 @@ async fn warm_cache(
         response.status
     );
     assert_eq!(response.body, cached_object_body());
+    common::wait_for_fill_of_path(&cache_manager, CACHE_PATH).await;
     let _ = server.shutdown_tx.send(());
 }
 
@@ -577,7 +578,7 @@ async fn warm_large_cache(
 ) {
     let server = spawn_proxy_server(
         config,
-        cache_manager,
+        Arc::clone(&cache_manager),
         range_handler,
         large_object_stub().into_trait_object(),
     )
@@ -591,6 +592,7 @@ async fn warm_large_cache(
             response.status
         );
         assert_eq!(response.body.len(), LARGE_OBJECT_SIZE);
+        common::wait_for_fill_of_path(&cache_manager, path).await;
     }
     let _ = server.shutdown_tx.send(());
 }

@@ -113,8 +113,6 @@ async fn setup(cache_dir: &Path) -> (Arc<DiskCacheManager>, Arc<JournalConsolida
     ));
 
     let hybrid_writer = Arc::new(Mutex::new(HybridMetadataWriter::new(
-        cache_dir.clone(),
-        lock_manager.clone(),
         journal_manager.clone(),
     )));
 

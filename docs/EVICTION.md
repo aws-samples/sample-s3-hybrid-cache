@@ -76,9 +76,11 @@ consolidation lock. The pass frees down to `eviction_target_percent`, as an over
 does, so the next copy of the object can be cached.
 
 A declined object starts a pass when it is no larger than half the gap between `max_cache_size`
-and the target, which is 10% of `max_cache_size` at the default target. GET-miss fills and
-uploads both count. A larger object starts no pass, and
-`cache.eviction_demand_refusals_over_cap_total` counts it.
+and the target, which is 10% of `max_cache_size` at the default target. A larger object starts no
+pass, and `cache.eviction_demand_refusals_over_cap_total` counts it. GET-miss fills count, and so
+do uploads the write cache has room for: staged bytes plus the upload fit within
+`write_cache_percent` of `max_cache_size`. Any other upload starts no pass and is forwarded to S3
+uncached.
 
 Under the eviction lock, a pass for declined objects skips when the last read cache pass, on any
 proxy, completed after the latest decline it is for. A pass that has already run for those
@@ -494,14 +496,14 @@ signal for it.
 The write cache holds objects uploaded through the proxy and not yet read. It is reclaimed
 differently from the read cache, and the differences follow from one property: an object that
 has never been read cannot change its own eviction rank. Its last-access time is its write time,
-so there is no frequency or recency score to compute, and TinyLFU scoring reduces to "oldest
-first" over a population where nothing has been read.
+so there is no frequency or recency score to compute, and write cache eviction removes the oldest
+staged objects first within each cache shard.
 
 | | Read cache | Write cache |
 |---|---|---|
 | Trigger | `eviction_trigger_percent` of `max_cache_size`, or a declined object that would not fit | `eviction_trigger_percent` of the write cache allocation and of the staged range limit |
 | Target | `eviction_target_percent` of `max_cache_size` | `eviction_target_percent` of the allocation and of the limit |
-| Order | TinyLFU score, lowest first | oldest staged first; objects past `put_ttl` and still unread go first |
+| Order | TinyLFU score, lowest first | oldest staged first within each cache shard, objects past `put_ttl` first; each shard gives up a share of the shortfall in proportion to its staged bytes |
 | Candidate discovery | cache index | append-only record of staged objects |
 | Runs on the request path | no | no |
 
@@ -549,6 +551,18 @@ ranges the pass set out to reclaim, how many it reclaimed, and `shortfall_reason
 An absent document while `write_cache.staged_range_budget_declines_total` is climbing is a
 different signal: the count trigger is not running at all.
 
+### Uploads past the bound
+
+Once staged bytes reach the write cache allocation, or an upload would take them past it, the
+proxy forwards new uploads to S3 without caching them, counted as `staging_bound` in
+[`signed_put.skipped_puts_total`](METRICS_REFERENCE.md#skipped_puts_total). The uploads succeed
+as usual, and caching resumes once reclamation brings staged bytes below the allocation. Each proxy
+counts its own uploads in flight against the allocation, and other proxies' uploads once they are
+stored and its staged figure has refreshed. Staged bytes can therefore pass the allocation by what
+the fleet stores in that time, plus uploads other proxies have admitted and not yet stored. A
+proxy that has not computed a staged figure since it started admits uploads without this check, up
+to `max_cache_size`.
+
 ### How candidates are found
 
 The proxy keeps a compact append-only record of the objects it has staged, under
@@ -564,13 +578,13 @@ object's authoritative metadata, and skipped if the object has since been read (
 of the write cache), replaced by a later upload, or removed. An object whose metadata cannot be
 read is also skipped, rather than deleted on the strength of a failed read.
 
-One pass examines a bounded number of records, so a long record set is worked through over
-several passes. A pass removes only the records for objects it reclaimed; the rest are left for
-the next pass, including any another proxy appended while it ran. Removing them reads every
-record file under that file's own lock and writes back only the files a record is being dropped
-from, so the write cost follows what was reclaimed while the read cost follows the size of the
-record set. A pass that reclaims nothing therefore still reads every record file and writes
-none.
+A pass works through the cache shards together. It splits the shortfall between shards in
+proportion to each shard's staged bytes and reads each shard's records only as far as its share
+needs. It groups neighboring shards into chunks and deletes up to 32 objects at a time, in
+batches of up to 64 objects or 64 MiB plus one object. After each batch it records what it removed,
+so the staged figure reflects the removals. A pass removes only the records for objects it
+reclaimed, and only in the shards it reclaimed from; the rest are left for the next pass, including
+any another proxy appended while it ran.
 
 Because a record is only a hint, losing one does not affect correctness: the object stays cached
 and counted in the cache size, and it is invisible to write cache reclamation until the
@@ -782,8 +796,9 @@ buckets ([What a pass reads](#what-a-pass-reads)). Where one takes 60 s or more,
 above `0` for the rest of it in normal operation, so set any alert above the values it shows on
 your volume. OTLP records the gauge when a collection finishes.
 
-The proxy logs an error when a recomputation finishes without a figure and the figure has been
-unknown for 60 s or more. It repeats it at most every 10 minutes until a recomputation produces a
+The proxy logs an error when two recomputations in a row finish without a figure and the figure
+has been unknown for 60 s or more, or for 15 minutes while the only missing input is a new cache
+volume's first shard checkpoints. It repeats it at most every 10 minutes until a recomputation produces a
 figure. A recomputation that never finishes logs no error of its own. When a metrics collection
 has not returned after twice `metrics.collection_interval`, or 60 s if that is longer, the proxy
 logs an error. It then records the figures a `/metrics` request reads to OTLP once, so OTLP shows

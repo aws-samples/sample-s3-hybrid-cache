@@ -86,7 +86,7 @@ These cases also invalidate the key's cached copy when S3 succeeds:
 - a key whose cache rules turn the write cache off, counted as `write_cache_disabled` in `skipped_puts_total`;
 - a Create forwarded uncached because the bucket's origin marker or the first cache-size read did not finish within 250 ms, counted as `origin_marker_unresolved` or `capacity_unknown`.
 
-Past the same 5,000-entry limit, an `UploadPart` is forwarded without being staged and its upload stops being cached: the upload's directory and any parts it had recorded are removed. A part whose upload directory does not exist yet counts as two entries, because staging it creates the directory too. When the count cannot be read, the part is forwarded unstaged and the parts already recorded are kept.
+Past the same 5,000-entry limit, an `UploadPart` is forwarded without being staged and its upload stops being cached: the upload's directory and any parts it had recorded are removed. When the count cannot be read, the part is forwarded unstaged and the parts already recorded are kept.
 
 ### Uploading parts
 
@@ -127,7 +127,7 @@ When the completion replaces an object that is still cached, it removes that obj
 
 The completed object is published as a staged object in the write cache. Each of its ranges gets a staging record in the write ledger (see [Eviction](EVICTION.md)) before its `.meta` is renamed into place. A proxy that stops between the two steps leaves records for an object that was never published; staging reclamation reads those as absent and discards them once they are older than 60 seconds. It never leaves a published staged object that staging reclamation cannot find. If a record cannot be written, the completion is not cached.
 
-CompleteMultipartUpload caches an upload only when its `upload.meta` records the representation headers from CreateMultipartUpload. An upload without that record is not cached, and its staged parts are removed at Complete. That happens when the Create was answered while the backlog was full or its cache setup took longer than 500 ms. It also happens when the disk-safety check or the in-progress multipart limit refused it, or when no proxy in the fleet saw the Create.
+CompleteMultipartUpload caches an upload only when its `upload.meta` records the representation headers from CreateMultipartUpload. An upload without that record is not cached, and its parts are forwarded without being staged. That happens when the Create was answered while the backlog was full or its cache setup took longer than 500 ms. It also happens when the disk-safety check, the staging bound or the in-progress multipart limit refused it, or when no proxy in the fleet saw the Create.
 
 ## Correctness gates
 

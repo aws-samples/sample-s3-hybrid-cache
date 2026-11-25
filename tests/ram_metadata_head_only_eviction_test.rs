@@ -135,6 +135,7 @@ fn head_only_metadata(cache_key: &str) -> NewCacheMetadata {
         head_access_count: 0,
         head_cached_at: Some(now),
         last_validated_at: None,
+        write_expired_at: None,
     }
 }
 

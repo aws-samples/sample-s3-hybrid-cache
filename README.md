@@ -253,6 +253,10 @@ See [this article](https://repost.aws/articles/ARRnpZ4QYrS9CtnYyTleS5bg/storage-
 
 Against a cross-Region bucket the proxy is 3× faster at p50 and delivers 4.5× the aggregate throughput of direct S3 access, with zero errors across 10,000 requests per run. The download coordinator collapses the 100 concurrent first-touch requests for each file into a single S3 fetch, and the other 99 wait and serve from the freshly cached copy. Every subsequent read is served from the sharded RAM/disk cache without the ~116 ms cross-Region round-trip. Even though the cache starts empty, only ~1% of requests (one per file) actually reach S3; the rest are cache hits.
 
+### Write-order file cost
+
+A GET or HEAD that learns from S3 that a cached object has changed or been deleted writes the key's write-order file (`.wtok`) on the cache volume before it answers. Measured on EFS by repeating the same file operations with the proxies otherwise idle, that write took about 10 to 12 ms at p50 and 15 to 17 ms at p99. On a local disk it added about 80 microseconds at p99. Requests that find the object unchanged do not pay it.
+
 ### Single-proxy bandwidth ceiling
 
 One proxy and one client (both `c6in.16xlarge`, 100 Gbps NIC), same Availability Zone, intra-region bucket, 64 MiB objects over a boto3 connection sweep (1–200 connections). This isolates the per-proxy ceiling for each cache tier.

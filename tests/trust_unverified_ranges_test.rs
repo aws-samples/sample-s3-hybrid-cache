@@ -220,6 +220,10 @@ async fn an_identity_less_listing_is_served_with_the_override_on() {
 /// checks for it, the `Add` with no file identity and no version witness, and the object's
 /// metadata carried on the entry. Returns nothing; the `Add` is appended to the key's journal.
 async fn journal_a_2x_add(fixture: &Fixture, key: &str, start: u64, data: &[u8]) {
+    journal_a_2x_add_of(fixture, key, start, data, ETAG).await;
+}
+/// [`journal_a_2x_add`] for the version `etag`.
+async fn journal_a_2x_add_of(fixture: &Fixture, key: &str, start: u64, data: &[u8], etag: &str) {
     let end = start + data.len() as u64 - 1;
     let ranges_dir = fixture.cache_manager.get_cache_dir().join("ranges");
     let bin =
@@ -258,7 +262,7 @@ async fn journal_a_2x_add(fixture: &Fixture, key: &str, start: u64, data: &[u8])
         object_ttl_secs: Some(3600),
         access_increment: None,
         object_metadata: Some(ObjectMetadata {
-            etag: ETAG.to_string(),
+            etag: etag.to_string(),
             content_length: OBJECT_LEN,
             last_modified: LAST_MODIFIED.to_string(),
             upload_state: UploadState::Complete,
@@ -486,6 +490,173 @@ async fn an_over_long_file_under_an_identity_less_listing_never_completes() {
             served.body.len(),
             len,
             served.broken
+        );
+    })
+    .await
+    .expect("the case must finish inside its bound");
+}
+
+/// Another version's bytes for one listed extent: what a fill of that version renamed over the
+/// version-independent `.bin` path.
+fn other_version_bytes() -> Vec<u8> {
+    vec![0xA5; MIB as usize]
+}
+
+/// Move the key's one listing to the sharded path production writers use, which is where the
+/// consolidator unlinks an extent's file (it resolves the path from the key and the extent).
+/// Returns the new path.
+async fn list_at_sharded_path(fixture: &Fixture, key: &str) -> std::path::PathBuf {
+    let ranges_dir = fixture.cache_manager.get_cache_dir().join("ranges");
+    let path = fixture.meta_path(key);
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the .meta")).unwrap();
+    let listing = &doc["ranges"][0];
+    let (start, end) = (
+        listing["start"].as_u64().unwrap(),
+        listing["end"].as_u64().unwrap(),
+    );
+    let from = ranges_dir.join(listing["file_path"].as_str().unwrap());
+    let to =
+        s3_proxy::disk_cache::get_sharded_path(&ranges_dir, key, &format!("_{start}-{end}.bin"))
+            .expect("the sharded path");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::rename(&from, &to).expect("fixture: move the .bin");
+    doc["ranges"][0]["file_path"] = serde_json::Value::String(
+        to.strip_prefix(&ranges_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    fixture.invalidate_metadata_cache(key).await;
+    to
+}
+
+/// Mark the key's one listing unservable in its `.meta`, as a fold leaves an extent whose file
+/// may hold another version's bytes and could not be unlinked.
+async fn mark_listing_unservable(fixture: &Fixture, key: &str) {
+    let path = fixture.meta_path(key);
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the .meta")).unwrap();
+    doc["ranges"][0]["unservable"] = serde_json::Value::Bool(true);
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    fixture.invalidate_metadata_cache(key).await;
+    assert!(
+        fixture.read_meta(key).expect("the key is listed").ranges[0].unservable,
+        "fixture: the listing is marked unservable"
+    );
+}
+
+/// With the override on, a listing marked unservable over another version's file is not
+/// replaced by a newer journal `Add` with no file identity (a 2.x writer's, for this version,
+/// whose file the other version has since overwritten). Replaced, the listing would be served
+/// unverified: the other version's bytes under this document's headers. The fold keeps the
+/// mark and unlinks the file, so the read goes to S3. Red side: `resolve_conflicts` without
+/// its unservable check. The control at the default is in `marked_listing_fold_test`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_listing_is_not_replaced_by_an_identity_less_add_with_the_override_on() {
+    tokio::time::timeout(TEST_BOUND, async {
+        let config = config();
+        apply_override(&config);
+        let key = "test-bucket/override-marked-listing.bin";
+        let fixture = Fixture::new(config).await;
+        identity_less_listing(&fixture, key, OFF, &other_version_bytes()).await;
+        list_at_sharded_path(&fixture, key).await;
+        mark_listing_unservable(&fixture, key).await;
+        journal_a_2x_add(&fixture, key, OFF, &other_version_bytes()).await;
+        fixture
+            .cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("journal consolidator must be configured")
+            .consolidate_object(key)
+            .await
+            .expect("consolidation");
+        fixture.invalidate_metadata_cache(key).await;
+
+        let (a, b) = (OFF + 100, OFF + 199);
+        let stub = Arc::new(origin(a, b));
+        let server = fixture.spawn_proxy(stub.clone()).await;
+        let served = get(server.addr, key, a, b).await;
+        assert_eq!(served.status, StatusCode::PARTIAL_CONTENT);
+        assert!(
+            served.body == object_bytes(a, b + 1),
+            "WITH THE OVERRIDE ON, THE FOLD REPLACED A MARKED LISTING WITH AN IDENTITY-LESS ADD \
+             AND THE READ SERVED ITS FILE: other version's bytes={}, S3 GETs={}, listing after \
+             the fold={:?}",
+            served.body == other_version_bytes()[..100],
+            gets(&stub),
+            listed(&fixture, key)
+        );
+    })
+    .await
+    .expect("the case must finish inside its bound");
+}
+
+/// With the override on, an extent the fold had to keep listed because it could not unlink a
+/// fill of another version stays refused after its `unservable` key is lost (a damaged
+/// document) and its expiry moved forward. The mark records an identity no file has, so the
+/// identity check refuses the listing whatever the override says. Red side: `mark_unservable`
+/// without the identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listing_the_fold_marked_stays_refused_without_its_unservable_key_with_the_override_on() {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::time::timeout(TEST_BOUND, async {
+        let config = config();
+        apply_override(&config);
+        let key = "test-bucket/override-marked-key-lost.bin";
+        let fixture = Fixture::new(config).await;
+        identity_less_listing(&fixture, key, OFF, &object_bytes(OFF, OFF + MIB)).await;
+        let bin = list_at_sharded_path(&fixture, key).await;
+        journal_a_2x_add_of(
+            &fixture,
+            key,
+            OFF,
+            &other_version_bytes(),
+            "\"0ther0ther0ther0ther0ther0ther00\"",
+        )
+        .await;
+        // The fold retires the other version's fill; a read-only directory fails the unlink.
+        let dir = bin.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let folded = fixture
+            .cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("journal consolidator must be configured")
+            .consolidate_object(key)
+            .await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        folded.expect("consolidation");
+        assert!(
+            bin.exists(),
+            "fixture: the read-only directory kept the .bin"
+        );
+        let mut meta = fixture.read_meta(key).expect("fixture: the .meta stays");
+        assert!(
+            meta.ranges.len() == 1 && meta.ranges[0].unservable,
+            "fixture: the fold kept the extent listed and marked unservable: {:?}",
+            listed(&fixture, key)
+        );
+
+        // The document loses the key, and its expiry moves forward (as a TTL refresh moves it).
+        meta.ranges[0].unservable = false;
+        meta.expires_at = std::time::SystemTime::now() + Duration::from_secs(3600);
+        std::fs::write(fixture.meta_path(key), serde_json::to_vec(&meta).unwrap()).unwrap();
+        fixture.invalidate_metadata_cache(key).await;
+
+        let (a, b) = (OFF + 100, OFF + 199);
+        let stub = Arc::new(origin(a, b));
+        let server = fixture.spawn_proxy(stub.clone()).await;
+        let served = get(server.addr, key, a, b).await;
+        assert_eq!(served.status, StatusCode::PARTIAL_CONTENT);
+        assert!(
+            served.body == object_bytes(a, b + 1),
+            "WITH THE OVERRIDE ON, A LISTING THE FOLD MARKED WAS SERVED ONCE ITS UNSERVABLE KEY \
+             WAS LOST: other version's bytes={}, S3 GETs={}, recorded identity={:?}",
+            served.body == other_version_bytes()[..100],
+            gets(&stub),
+            meta.ranges[0].file_identity
         );
     })
     .await

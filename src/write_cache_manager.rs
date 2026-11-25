@@ -50,6 +50,9 @@ pub(crate) struct StagingEviction {
     /// figure and in the staged-entry gauge, and a later pass removes it again, so the caller
     /// debits nothing for it.
     pub(crate) meta_removed: bool,
+    /// Staged bytes and ranges of the `.meta` this call read under the slot lock, by the staged
+    /// range predicate the fold counts with. What the staged figure loses when `meta_removed`.
+    pub(crate) staged: crate::staged_fold::StagedRemoval,
 }
 
 /// Which staged object a `.meta` describes: its ETag and the time it was published staged.
@@ -760,10 +763,14 @@ impl WriteCacheManager {
     /// `Ok(Some(eviction))` is an eviction; `expected: None` never declines. An eviction whose
     /// `.meta` unlink failed reports `meta_removed: false` and leaves the staged-entry gauge
     /// alone, because the object is still staged on disk.
+    ///
+    /// `flush_accumulator: false` leaves the size accumulator's debit in memory for the caller to
+    /// flush: the staging pass flushes once per batch of evictions rather than once per object.
     pub(crate) async fn evict_write_cached_object_if_unchanged(
         &self,
         cache_key: &str,
         expected: Option<&StagedObjectIdentity>,
+        flush_accumulator: bool,
     ) -> Result<Option<StagingEviction>> {
         // Read metadata to get range files
         let metadata_path = self.get_metadata_path(cache_key)?;
@@ -825,6 +832,21 @@ impl WriteCacheManager {
             }
         }
 
+        // The staged figure's share of this object, from the `.meta` read under the lock: what the
+        // fold counts for it, whichever of its `.bin` files still exist.
+        let staged = crate::staged_fold::StagedRemoval {
+            bytes: metadata.staged_compressed_size(),
+            ranges: metadata
+                .ranges
+                .iter()
+                .filter(|r| {
+                    crate::cache_types::is_staged_range_spec(
+                        r,
+                        metadata.object_metadata.is_write_cached,
+                    )
+                })
+                .count() as u64,
+        };
         let mut total_freed: u64 = 0;
         // Ranges whose `.bin` existed AND was removed without error. R5.4: this is the
         // only list the accounting below may be built from — `metadata.ranges` would
@@ -943,8 +965,14 @@ impl WriteCacheManager {
                 // periodic flush. The files are already gone; leaving the subtraction
                 // in memory means losing it entirely on a crash, with the bytes
                 // unrecoverable until the next full validation scan. Read-tier
-                // eviction flushes for the same reason before releasing its lock.
-                if let Err(e) = consolidator.size_accumulator().flush().await {
+                // eviction flushes for the same reason before releasing its lock. A caller
+                // that passes `flush_accumulator: false` flushes after its batch instead.
+                let flushed = if flush_accumulator {
+                    consolidator.size_accumulator().flush().await
+                } else {
+                    Ok(())
+                };
+                if let Err(e) = flushed {
                     warn!(
                         "Failed to flush accumulator after staging eviction: cache_key={}, error={}",
                         cache_key, e
@@ -986,6 +1014,7 @@ impl WriteCacheManager {
         Ok(Some(StagingEviction {
             freed: total_freed,
             meta_removed: metadata_deleted,
+            staged,
         }))
     }
 
@@ -995,7 +1024,7 @@ impl WriteCacheManager {
     #[cfg(test)]
     pub(crate) async fn evict_write_cached_object(&self, cache_key: &str) -> Result<u64> {
         Ok(self
-            .evict_write_cached_object_if_unchanged(cache_key, None)
+            .evict_write_cached_object_if_unchanged(cache_key, None, true)
             .await?
             .map_or(0, |eviction| eviction.freed))
     }
@@ -1505,6 +1534,7 @@ mod tests {
             cache_key: cache_key.to_string(),
             oldest_entry_at: now,
             newest_entry_at: now,
+            estimated_bytes: 0,
             identities: vec![(
                 cache_key.to_string(),
                 0,
@@ -1549,7 +1579,7 @@ mod tests {
         );
 
         let outcome = manager
-            .evict_write_cached_object_if_unchanged(cache_key, Some(&assessed))
+            .evict_write_cached_object_if_unchanged(cache_key, Some(&assessed), true)
             .await
             .unwrap();
         assert_eq!(
@@ -1576,6 +1606,7 @@ mod tests {
             .evict_write_cached_object_if_unchanged(
                 cache_key,
                 reassessed.assessed_identity.as_ref(),
+                true,
             )
             .await
             .unwrap();

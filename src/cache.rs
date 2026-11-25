@@ -185,6 +185,38 @@ pub(crate) const DISK_SAFETY_SKIP_REASON: &str = "disk_safety";
 /// them apart cannot act on either.
 pub(crate) const STAGED_RANGE_BUDGET_SKIP_REASON: &str = "staged_range_budget";
 
+/// Reason label for the staged-share admission cap ([`CacheManager::staging_bound_admission`]):
+/// staged uploads have reached the Staging_Bound, so an upload is forwarded uncached.
+///
+/// Distinct from [`DISK_SAFETY_SKIP_REASON`] because the remedy differs: disk or a lower
+/// `max_cache_size` there, staging eviction throughput or a higher `write_cache_percent` here.
+pub(crate) const STAGING_BOUND_SKIP_REASON: &str = "staging_bound";
+
+/// Unix seconds of the most recent staged-share cap WARN, process-wide, so a saturated fill logs
+/// one line per [`STAGING_BOUND_WARN_INTERVAL_SECS`] rather than one per declined upload.
+static LAST_STAGING_BOUND_WARN_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The shortest interval between two staged-share cap WARNs.
+const STAGING_BOUND_WARN_INTERVAL_SECS: u64 = 60;
+/// A write-through upload the staged-share cap admitted
+/// ([`CacheManager::staging_bound_admission`]). Its declared size counts against the
+/// Staging_Bound in this process until the guard drops, which the upload's store does when
+/// it commits or aborts. The staged figure sees an upload only once it commits, so without
+/// this term every upload admitted against one figure would pass against the same figure.
+#[must_use]
+pub(crate) struct StagingAdmission {
+    admitted: Arc<AtomicU64>,
+    bytes: u64,
+}
+impl Drop for StagingAdmission {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.admitted.fetch_sub(self.bytes, AtomicOrdering::AcqRel);
+        }
+    }
+}
+
 /// Unix seconds of the most recent `Staged_Range_Budget` WARN, process-wide.
 static LAST_STAGED_RANGE_BUDGET_WARN_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -255,6 +287,37 @@ const LAZY_TAIL_REBUILD_MAX_SHARDS: usize = 1024;
 /// about 390,000 for a one-bucket cache of 100 million ranges, about 100 s on EFS at its
 /// measured 3,801 `.meta`/s, and about 4,000 at 100 buckets.
 const LAZY_TAIL_REBUILD_BUDGET: Duration = Duration::from_secs(5);
+/// Test seam: per-cache-directory overrides of [`LAZY_TAIL_REBUILD_BUDGET`] for integration tests,
+/// which cannot reach the `#[cfg(test)]` seams. Read only once the seam has been set in this
+/// process, so production pays one atomic load per lazy-rebuild round.
+static LAZY_TAIL_REBUILD_BUDGET_FOR_TESTS: std::sync::Mutex<Vec<(PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+static LAZY_TAIL_REBUILD_BUDGET_SEAM_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test seam: the wall time one selection may spend on lazy rebuilds for `cache_dir`, in place of
+/// [`LAZY_TAIL_REBUILD_BUDGET`], so a fixture's verdict does not depend on how fast the machine
+/// rebuilds its shards.
+#[doc(hidden)]
+pub fn set_lazy_tail_rebuild_budget_for_tests(cache_dir: &Path, budget: Duration) {
+    let mut overrides = LAZY_TAIL_REBUILD_BUDGET_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    overrides.retain(|(dir, _)| dir != cache_dir);
+    overrides.push((cache_dir.to_path_buf(), budget));
+    LAZY_TAIL_REBUILD_BUDGET_SEAM_USED.store(true, std::sync::atomic::Ordering::Release);
+}
+/// [`LAZY_TAIL_REBUILD_BUDGET`], or a test's override for `cache_dir`.
+fn lazy_tail_rebuild_budget(cache_dir: &Path) -> Duration {
+    if !LAZY_TAIL_REBUILD_BUDGET_SEAM_USED.load(std::sync::atomic::Ordering::Acquire) {
+        return LAZY_TAIL_REBUILD_BUDGET;
+    }
+    LAZY_TAIL_REBUILD_BUDGET_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(dir, _)| dir == cache_dir)
+        .map_or(LAZY_TAIL_REBUILD_BUDGET, |(_, budget)| *budget)
+}
 
 /// A shard whose partition was rebuilt this recently, by any proxy or by the rolling pass, is
 /// not rebuilt lazily again. One consolidation interval apart would rebuild a shard the pass
@@ -1289,10 +1352,59 @@ pub(crate) fn register_eviction_demand(
     map.entry(cache_dir.to_path_buf()).or_default().cap = cap;
 }
 
+/// The write cache's allocation and its last known staged figure, per cache directory, for
+/// [`note_upload_size_refusal`]. `bound` is `write_cache_percent` of `max_cache_size`
+/// (`CacheManager::get_staging_bound_bytes`), `0` until registered; `staged` is the
+/// `write_cache_size` of the last staged figure `CacheManager::staged_authority` resolved.
+#[derive(Debug, Default, Clone, Copy)]
+struct UploadAllocation {
+    bound: u64,
+    staged: Option<u64>,
+}
+static UPLOAD_ALLOCATION: std::sync::Mutex<std::collections::BTreeMap<PathBuf, UploadAllocation>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+fn with_upload_allocation<T>(cache_dir: &Path, f: impl FnOnce(&mut UploadAllocation) -> T) -> T {
+    let mut map = match UPLOAD_ALLOCATION.lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(map.entry(cache_dir.to_path_buf()).or_default())
+}
+/// Register the write cache's allocation for `cache_dir`, beside [`register_eviction_demand`].
+pub(crate) fn register_upload_allocation(cache_dir: &Path, write_cache_bound: u64) {
+    with_upload_allocation(cache_dir, |a| a.bound = write_cache_bound);
+}
+/// Record the staged figure `CacheManager::staged_authority` resolved, for the next upload
+/// refusal. In memory only.
+pub(crate) fn note_staged_bytes(cache_dir: &Path, staged_bytes: u64) {
+    with_upload_allocation(cache_dir, |a| a.staged = Some(staged_bytes));
+}
+/// An upload's `max_cache_size` size refusal (the PUT router and write-through component 1):
+/// recorded as eviction demand, as [`note_size_refusal`] records a read fill's, only when the
+/// write cache could hold the object, that is when the last known staged figure plus
+/// `incoming_bytes` is within the write cache's allocation. An upload that would not fit there
+/// is forwarded uncached whatever the read tier frees, so evicting read-cache data for it would
+/// buy nothing. With no allocation registered or no staged figure known yet, it records, the
+/// fail-open posture of the admission it follows. One mutex and no I/O.
+pub(crate) fn note_upload_size_refusal(cache_dir: &Path, incoming_bytes: u64) {
+    let allocation = with_upload_allocation(cache_dir, |a| *a);
+    if let (bound @ 1.., Some(staged)) = (allocation.bound, allocation.staged) {
+        if staged.saturating_add(incoming_bytes) > bound {
+            debug!(
+                "Upload size refusal of {} bytes records no eviction demand: staged {} + incoming \
+                 exceeds the write cache's allocation {}",
+                incoming_bytes, staged, bound
+            );
+            return;
+        }
+    }
+    note_size_refusal(cache_dir, incoming_bytes);
+}
 /// Record a `max_cache_size` size refusal of `incoming_bytes` for `cache_dir`. Called on the
 /// decline branch of each admission that adds its incoming object to [`whole_cache_usage`]:
-/// [`read_fill_refusal`], write-through component 1 (`CacheManager::disk_safety_refusal`) and
-/// the PUT router (`SignedPutHandler::should_cache`). One mutex and no I/O.
+/// [`read_fill_refusal`] directly, and through [`note_upload_size_refusal`] write-through
+/// component 1 (`CacheManager::disk_safety_refusal`) and the PUT router
+/// (`SignedPutHandler::should_cache`). One mutex and no I/O.
 pub(crate) fn note_size_refusal(cache_dir: &Path, incoming_bytes: u64) {
     with_eviction_demand(cache_dir, |demand| {
         if incoming_bytes == 0 {
@@ -2366,25 +2478,9 @@ pub(crate) fn volume_consumed_bytes(path: &std::path::Path) -> Option<u64> {
     }
 }
 
-/// Maximum Write_Ledger entries examined in one staging eviction pass.
-///
-/// The pass is O(evicted + skipped) by design, but "skipped" is unbounded if the ledger
-/// has accumulated a long tail of stale entries, so this caps one pass's work. Entries
-/// beyond the cap are the *newest* ones (the read is oldest-first), so they are exactly
-/// the ones eviction wants least, and the next pass sees them again.
-///
-/// **They are only preserved because the retire step names what to remove.** This
-/// comment used to claim "entries beyond the cap are not lost" as though it followed
-/// from the ordering, and it did not: the pass then handed
-/// `read_entries - retired` to a retain-set rewrite that deleted everything absent from
-/// it, so every entry past the cap was destroyed unread, across all instances' files
-/// (task 77). `read_merged_oldest_first` truncates after the global sort and returns no
-/// truncation signal, so the caller could not detect that its view was partial. The
-/// invariant now holds by construction via `WriteLedger::retire_identities` — do not
-/// reintroduce a retain-set API here, and do not treat this ordering argument as the
-/// thing that makes the cap safe.
-const STAGING_EVICTION_CANDIDATE_CAP: usize = 10_000;
-
+/// The least interval between two log lines for staging nudges declined while a pass is in
+/// progress.
+const STAGING_NUDGE_DECLINED_LOG_INTERVAL_SECS: u64 = 60;
 /// Idle duration after which a decayed frequency halves. Compile-time constant
 /// (not config). Decay bounds immortality under capacity pressure; TTL expiry is the
 /// hard ceiling for the no-pressure case.
@@ -2907,6 +3003,11 @@ pub struct CacheSizes {
     /// not growth. `total_size` itself is unchanged and remains the admission and eviction
     /// comparand.
     pub total_cache_size: u64,
+    /// The persisted `SizeState::total_size` alone: the bytes under `ranges/`, **without**
+    /// `in_progress_part_bytes`. It is what `cache.shard_sum_drift_bytes` is taken against,
+    /// because the shard sum counts `ranges/` only. Not serialized: no published wire field.
+    #[serde(skip)]
+    pub total_size: u64,
     /// Non-staged bytes on the shared cache volume: `total_size − resident_staged_bytes`.
     ///
     /// The same on every instance that shares the cache volume (a proxy with its own cache
@@ -3993,8 +4094,8 @@ struct ActiveKeySet {
 ///
 /// # What this replaces, and why it is not just a cache
 ///
-/// `CacheManager::is_cache_entry_active` reads every journal file line by line. The executor called
-/// it once per candidate object, so a pass evicting K objects performed K full traversals of the
+/// The per-key activity check this replaced read every journal file line by line. The executor
+/// called it once per candidate object, so a pass evicting K objects performed K full traversals of the
 /// same files, parsed the same lines K times, and discarded each result. This holds one traversal's
 /// answer and tests membership instead.
 ///
@@ -4199,7 +4300,7 @@ impl EvictionActivityOracle {
             .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 
-    /// The batch form of `is_cache_entry_active`. Never blocks on the journal walk: it swaps in a
+    /// The cross-instance activity predicate, per pass. Never blocks on the journal walk: it swaps in a
     /// finished rebuild, starts one when the set has aged past `refresh_after`, and answers from
     /// the set it has.
     ///
@@ -5597,6 +5698,53 @@ fn clear_head_fields_locked(metadata_path: &std::path::Path, cache_key: &str) ->
     Ok(())
 }
 
+/// After an invalidation that decided the cached version is stale could not unlink its
+/// `.meta`: rewrite the document at `metadata_path` so no proxy reading it serves that version.
+/// It lists only `kept`, the extents whose `.bin` unlink also failed, so their files stay named,
+/// counted and evictable. Each is marked unservable, the document reads expired for GET
+/// (`expires_at`), and its HEAD fields are unset, which is what `is_head_fresh` reads as not
+/// cached. The next removal of the key unlinks what is left. A failed rewrite is logged and
+/// leaves the document as it was. Returns whether the rewrite was published.
+///
+/// Blocking shared-storage I/O, run with the key's slot lock held, on a blocking thread.
+fn retire_unremoved_document_locked(
+    metadata_path: &std::path::Path,
+    cache_key: &str,
+    metadata: &crate::cache_types::NewCacheMetadata,
+    kept: Vec<crate::cache_types::RangeSpec>,
+    _meta_lock: &crate::metadata_lock_manager::MetadataLock,
+) -> bool {
+    let mut retired = metadata.clone();
+    retired.ranges = kept;
+    for range in &mut retired.ranges {
+        range.mark_unservable();
+    }
+    retired.expires_at = SystemTime::now();
+    retired.head_expires_at = None;
+    retired.head_cached_at = None;
+    let written = serde_json::to_string_pretty(&retired)
+        .map_err(|e| ProxyError::CacheError(format!("Failed to serialize metadata: {}", e)))
+        .and_then(|json| write_new_metadata_file(metadata_path, json, cache_key));
+    match written {
+        Ok(()) => {
+            warn!(
+                "Invalidation could not unlink the .meta; it now lists only the ranges whose \
+                 unlink failed, unservable and expired: cache_key={}, retained_ranges={}",
+                cache_key,
+                retired.ranges.len()
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "Invalidation could not unlink the .meta or rewrite it expired: cache_key={}, \
+                 path={:?}, error={}",
+                cache_key, metadata_path, e
+            );
+            false
+        }
+    }
+}
 /// `path.exists()` on the blocking pool: a `statx` on shared storage is a network round trip.
 ///
 /// If the blocking task cannot run, answers `true`, so an invalidation still takes the lock
@@ -5977,6 +6125,21 @@ fn stamp_write_marker_locked(
     })
 }
 
+/// Stamp a fresh token as the key's marker, for a removal that leaves the marker alone but
+/// could not unlink every range file it removes. The bytes of such a file stay on the volume, and
+/// its journal `Add`, if it has one, is retired only by a `Remove` marker that is itself a
+/// best-effort append. A new token makes the journal fallback refuse every earlier `Add` of the
+/// key, the fold retire it, and every proxy's fill-visibility entry for the key stop serving at
+/// its next lookup. Caller holds the key's slot lock. A fill of the key in flight then declines,
+/// a miss.
+pub(crate) fn stamp_fresh_write_marker_locked(
+    meta_path: &Path,
+    cache_key: &str,
+    meta_lock: &crate::metadata_lock_manager::MetadataLock,
+) -> Result<()> {
+    stamp_write_marker_locked(meta_path, cache_key, &WriteToken::fresh(), meta_lock)
+}
+
 /// The marker's token, or `None` when it is absent or unreadable.
 pub(crate) fn read_write_marker(meta_path: &Path) -> Option<WriteMarker> {
     let text = std::fs::read_to_string(write_marker_path(meta_path)).ok()?;
@@ -6072,6 +6235,9 @@ pub(crate) enum WriteStampRetry {
     /// older write of the key until its TTL. Counted, and logged at most once per
     /// [`WRITE_STAMP_RETRY_WARN_INTERVAL`].
     Abandoned,
+    /// An origin-change stamp ([`CacheManager::spawn_origin_change_stamp_retry`]) found half
+    /// its directory's retry tasks busy: it is not retried, and the key is not pending here.
+    Shed,
 }
 
 /// Every key awaiting a stamp retry in this process, and the tasks and queues that retry them.
@@ -6101,6 +6267,9 @@ struct WriteStampRetries {
     /// bounded by [`WRITE_STAMP_UNTRACKED_MAX_BYTES`].
     untracked: HashMap<Arc<str>, u32>,
     untracked_bytes: usize,
+    /// Keys in `keys` whose retry is an origin-change stamp that no failed write has joined
+    /// ([`CacheManager::spawn_origin_change_stamp_retry`]).
+    origin_only: std::collections::HashSet<Arc<str>>,
 }
 
 #[derive(Default)]
@@ -6378,6 +6547,25 @@ fn note_write_stamp_retry_failed(cache_key: &str, attempts: u64, error: &ProxyEr
     }
 }
 
+static ORIGIN_CHANGE_STAMP_SHED_LAST_WARN: AtomicU64 = AtomicU64::new(0);
+/// An origin-change stamp that is not retried ([`WriteStampRetry::Shed`]): WARN at most once
+/// per [`WRITE_STAMP_RETRY_WARN_INTERVAL`], debug otherwise.
+fn note_origin_change_stamp_shed(cache_key: &str, reason: &str) {
+    if write_stamp_warn_due(&ORIGIN_CHANGE_STAMP_SHED_LAST_WARN) {
+        warn!(
+            "Write-order marker retry not run for a key S3 showed deleted or replaced: {}, so a \
+             fill of the key whose S3 request began before the invalidation can still publish: \
+             cache_key={}",
+            reason, cache_key
+        );
+    } else {
+        debug!(
+            "Write-order marker retry not run for a key S3 showed deleted or replaced: {}: \
+             cache_key={}",
+            reason, cache_key
+        );
+    }
+}
 /// Count a write whose failed stamp is not retried, and WARN with the running count at most
 /// once per [`WRITE_STAMP_RETRY_WARN_INTERVAL`].
 fn note_write_stamp_retry_abandoned(cache_key: &str, reason: &str) {
@@ -6406,6 +6594,55 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     pub(crate) static WRITE_STAMP_OVERFLOW_MAX_BYTES_OVERRIDE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// What the GET's append-md5 probe found ([`CacheManager::probe_entry_for_append_md5`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendMd5Probe {
+    /// No entry, or one the serve path judges on its own merits.
+    Clean,
+    /// An entry filled from an `x-amz-te: append-md5` response by a release before 3.0.7.
+    AppendMd5Entry,
+    /// The `.meta` does not parse and is left in place, and the request is a miss. A streamed
+    /// GET fill's publish then classifies the unparseable `.meta` and unlinks it, and declines
+    /// while the final path still holds a range file under 600 s old, so the entry is cached
+    /// again on a later read. The removal counts one heal on
+    /// `cache.metadata_heal_overwrite_total`.
+    Corrupt,
+    /// The `.meta` exists and could not be read, for the reason given.
+    Unreadable(String),
+}
+
+/// Set once any key has an injected probe read failure, so the GET path takes no lock until a
+/// test uses the seam.
+static PROBE_READ_FAILURE_SEAM_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static PROBE_READ_FAILURES_FOR_TESTS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: the next append-md5 probe of `cache_key`
+/// ([`CacheManager::probe_entry_for_append_md5`]) fails its first read, as a `.meta` that
+/// exists and does not read would, and the classifying re-read then reads the file as it is.
+/// One-shot, per key, process-wide.
+#[doc(hidden)]
+pub fn fail_next_append_md5_probe_read_for_tests(cache_key: &str) {
+    PROBE_READ_FAILURES_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(cache_key.to_string());
+    PROBE_READ_FAILURE_SEAM_USED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn take_injected_probe_read_failure(cache_key: &str) -> bool {
+    if !PROBE_READ_FAILURE_SEAM_USED.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    PROBE_READ_FAILURES_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .is_some_and(|keys| keys.remove(cache_key))
 }
 
 /// Process-wide overrides of the retry bounds for integration tests, which cannot reach
@@ -6502,6 +6739,7 @@ impl Drop for WriteStampRetryTask {
             let mut state = lock_write_stamp_retries();
             let st = &mut *state;
             st.keys.remove(&*slot);
+            let origin = st.origin_only.remove(&*slot);
             let logged = st.log_tokens.remove(&*slot).is_some();
             let Some(dir) = st.dirs.get_mut(&self.scope) else {
                 return;
@@ -6521,8 +6759,9 @@ impl Drop for WriteStampRetryTask {
                     .saturating_sub(write_stamp_overflow_cost(queued));
             }
             // a key with no log record stays pending here, untracked, until a task takes it.
-            let newly_overflowed =
-                !logged && note_untracked_write_stamp(st, &self.scope, &slot, early_ends);
+            let newly_overflowed = !logged
+                && !origin
+                && note_untracked_write_stamp(st, &self.scope, &slot, early_ends);
             let next = match queued {
                 Some(queued) => Some((queued, 0)),
                 None if can_spawn => next_untracked_or_end(st, &self.scope),
@@ -7483,6 +7722,8 @@ enum LockedEntryRead {
         total_evicted_size: u64,
         /// Indices into `metadata.ranges` of the range files this call unlinked.
         unlinked_ranges: Vec<usize>,
+        /// Indices into `metadata.ranges` of the range files present whose unlink failed.
+        failed_ranges: Vec<usize>,
     },
 }
 
@@ -7501,7 +7742,18 @@ struct LockedEntryRemoval {
     removal: ObjectEntryRemoval,
     /// Part numbers and bytes for the per-part eviction metric, recorded on the async side.
     part_eviction: Option<(Vec<u32>, u64)>,
+    /// A `Remove` marker for every unfolded journal `Add` the removal was handed and the `.meta`
+    /// did not list, whether its file was unlinked, could not be, or was already gone. In the
+    /// shape `JournalConsolidator::write_eviction_journal_entries` takes; written after the
+    /// slot lock is released.
+    pending_markers: Vec<(String, u64, u64, u64, String)>,
+    /// A range file the removal named, listed or pending, could not be unlinked.
+    unlink_failed: bool,
 }
+
+/// One `Remove` marker, `(cache_key, start, end, size, relative_bin_path)`, the shape
+/// `JournalConsolidator::write_eviction_journal_entries` takes.
+type RemoveMarker = (String, u64, u64, u64, String);
 
 /// What `CacheManager::store_head_cache_entry_unified_witnessed`'s locked closure published, handed back
 /// from its blocking thread.
@@ -7742,6 +7994,10 @@ pub struct CacheManager {
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 3.2
     staging_eviction_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    /// Staging nudges declined because a pass was in progress, since the last line logging them.
+    staging_nudges_declined: std::sync::atomic::AtomicU64,
+    /// When the last declined-nudge line was logged, epoch seconds.
+    staging_nudge_declined_logged_at_secs: std::sync::atomic::AtomicU64,
     // Eviction lock file handle (kept open while lock is held)
     eviction_lock_file: Arc<Mutex<Option<std::fs::File>>>,
     // UUID fence token for the current eviction pass (Requirement 5)
@@ -7765,6 +8021,9 @@ pub struct CacheManager {
     // `CacheConfig::disk_safety_free_space_floor` before Arc-wrapping.
     // Spec: cache-eviction-at-scale task 36 (A1).
     disk_safety_free_space_floor: u64,
+    // This process's write-through bytes the staged-share cap admitted and whose stores have
+    // not yet committed or aborted: the declared sizes of the live `StagingAdmission`s.
+    staging_admitted_bytes: Arc<AtomicU64>,
     // Maximum .meta file size before classifying as corrupt/oversized (Req 3/4)
     // Forwarded to DiskCacheManager in create_configured_disk_cache_manager.
     // Spec: cache-metadata-resilience Req 3, 4
@@ -7791,7 +8050,7 @@ pub struct CacheManager {
     // Bucket-level settings manager for per-bucket/prefix cache configuration
     bucket_settings_manager: Arc<crate::bucket_settings::BucketSettingsManager>,
     // RAM cache flush interval for cross-instance access visibility (Req 19)
-    // Used by is_cache_entry_active to determine the journal scan window (2× this value)
+    // Used by cross_instance_activity_window to determine the journal scan window (2× this value)
     pub(crate) ram_cache_flush_interval: std::time::Duration,
     // Sharded RAM cache — extracted from CacheManagerInner so reads don't need the global lock.
     // None when ram_cache_enabled is false or max_ram_cache_size is 0.
@@ -8596,6 +8855,8 @@ impl CacheManager {
             hybrid_metadata_writer: Arc::new(tokio::sync::RwLock::new(None)), // Will be initialized in create_configured_disk_cache_manager()
             journal_components: std::sync::OnceLock::new(), // Populated once, on the first create_configured_disk_cache_manager()
             staging_eviction_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            staging_nudges_declined: std::sync::atomic::AtomicU64::new(0),
+            staging_nudge_declined_logged_at_secs: std::sync::atomic::AtomicU64::new(0),
             metadata_cache: Arc::new(crate::metadata_cache::MetadataCache::new(
                 metadata_cache_config.to_metadata_cache_config(),
             )),
@@ -8603,6 +8864,7 @@ impl CacheManager {
             eviction_lock_file: Arc::new(Mutex::new(None)),
             eviction_uuid: Arc::new(Mutex::new(None)),
             eviction_lock_held_since_ms: Arc::new(AtomicU64::new(0)),
+            staging_admitted_bytes: Arc::new(AtomicU64::new(0)),
             compression_batch_size,
             disk_safety_free_space_floor: DISK_SAFETY_FREE_SPACE_FLOOR_BYTES, // overridden by config in http_proxy.rs
             max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default; HttpProxy::new sets it from config
@@ -8973,11 +9235,7 @@ impl CacheManager {
 
         // Create HybridMetadataWriter
         let hybrid_writer = Arc::new(tokio::sync::Mutex::new(
-            crate::hybrid_metadata_writer::HybridMetadataWriter::new(
-                self.cache_dir.clone(),
-                lock_manager.clone(),
-                journal_manager,
-            ),
+            crate::hybrid_metadata_writer::HybridMetadataWriter::new(journal_manager),
         ));
 
         // Create CacheHitUpdateBuffer for journal-based cache-hit updates
@@ -9874,11 +10132,6 @@ impl CacheManager {
         }
     }
 
-    /// Invalidate cached entry by removing files
-    pub async fn invalidate_cache(&self, cache_key: &str) -> Result<()> {
-        self.invalidate_cache_hierarchy(cache_key).await
-    }
-
     /// Invalidate cache entry across all cache layers (RAM + Disk)
     /// Updated to support new range storage architecture:
     /// - Deletes metadata AND all associated range files
@@ -9895,8 +10148,9 @@ impl CacheManager {
     /// as [`Self::invalidate_cache_hierarchy`] does and, in the same slot-lock hold, stamp a
     /// fresh write-order marker for the key. Returns the token. A store of an older
     /// acknowledged write of this key can no longer publish once this returns, on any proxy
-    /// sharing the volume. An `Err` means the marker may not hold this token, so a store must
-    /// not be handed one; the prior version's removal may still have succeeded.
+    /// sharing the volume. An `Err` means the marker may not hold this token, or the prior
+    /// version's `.meta` could not be unlinked, so a store must not be handed one; the prior
+    /// version's removal may still have succeeded.
     pub(crate) async fn invalidate_for_write(&self, cache_key: &str) -> Result<WriteToken> {
         let token = WriteToken::fresh();
         self.invalidate_cache_hierarchy_stamped(cache_key, Some(token.clone()))
@@ -9912,6 +10166,9 @@ impl CacheManager {
         self.invalidate_cache_hierarchy_marked(
             cache_key,
             MarkerMode::Stamp(token.clone()),
+            // The attempt before this one failed, perhaps before its stamp landed, so the
+            // `Add`s it would have retired are unlinked and marked here.
+            true,
             crate::metadata_lock_manager::LockExhaustionLog::Debug,
         )
         .await?;
@@ -9949,6 +10206,64 @@ impl CacheManager {
     pub(crate) fn spawn_write_stamp_retry(self: &Arc<Self>, cache_key: &str) -> WriteStampRetry {
         let logged = self.log_pending_stamp(cache_key);
         self.enqueue_write_stamp_retry(cache_key, logged)
+    }
+    /// [`Self::spawn_write_stamp_retry`] for the failed stamp of
+    /// [`Self::invalidate_after_origin_change`], whose key S3 showed deleted or replaced. Those
+    /// stamps come from GETs and HEADs, which can fail in bursts far larger than writes do, so
+    /// they are kept out of the capacity acknowledged writes' retries need:
+    ///
+    /// - The key starts a retry task only while its directory runs fewer than half of
+    ///   [`WRITE_STAMP_RETRY_MAX_TASKS`]; otherwise it is not retried ([`WriteStampRetry::Shed`]).
+    ///   At most half the tasks therefore hold such a key at any time.
+    /// - It is never put in the overflow queue or the node-local pending-stamp log, so it
+    ///   costs no queue memory and no fsync on the response path, and no write waits in the
+    ///   queue behind it.
+    /// - A task that has failed [`WRITE_STAMP_RETRY_ROTATE_AFTER`] attempts on it while a
+    ///   write waits in the queue gives it up and takes the write, where a write's key would be
+    ///   re-queued.
+    ///
+    /// A failed write of the same key joins the retry and makes it a write's retry from then
+    /// on. While it runs this proxy forwards the key's GET and HEAD to S3 and declines its
+    /// fills, as for a write. A shed or given-up stamp leaves the key as the failed invalidation
+    /// left it: a fill of it whose S3 request began before the invalidation can publish once the
+    /// key's slot lock admits it, as before these invalidations stamped. Logged at WARN at most
+    /// once per [`WRITE_STAMP_RETRY_WARN_INTERVAL`].
+    pub(crate) fn spawn_origin_change_stamp_retry(
+        self: &Arc<Self>,
+        cache_key: &str,
+    ) -> WriteStampRetry {
+        let scope = self.stamp_retry_scope();
+        let slot = Self::stamp_retry_slot(&scope, cache_key);
+        let max_tasks = write_stamp_retry_max_tasks();
+        let outcome = {
+            let mut state = lock_write_stamp_retries();
+            let st = &mut *state;
+            if let Some(joined) = st.keys.get_mut(&*slot) {
+                *joined += 1;
+                WriteStampRetry::Joined
+            } else {
+                let dir = st.dirs.entry(scope).or_default();
+                if dir.tasks < max_tasks / 2 {
+                    dir.tasks += 1;
+                    st.keys.insert(Arc::clone(&slot), 0);
+                    st.origin_only.insert(Arc::clone(&slot));
+                    WriteStampRetry::Started
+                } else {
+                    WriteStampRetry::Shed
+                }
+            }
+        };
+        match outcome {
+            WriteStampRetry::Started => {
+                WRITE_STAMP_RETRIED.fetch_add(1, AtomicOrdering::Relaxed);
+                self.run_write_stamp_retry_task(slot, 0);
+            }
+            WriteStampRetry::Joined => {
+                WRITE_STAMP_RETRIED.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            _ => note_origin_change_stamp_shed(cache_key, "half the stamp-retry tasks are busy"),
+        }
+        outcome
     }
 
     /// Append and fsync the failed write's pending record to the node-local log, on
@@ -10018,6 +10333,14 @@ impl CacheManager {
         self.pending_stamp_probe(cache_key).pending()
     }
 
+    /// Test seam: [`Self::invalidate_after_origin_change`] for integration tests.
+    #[doc(hidden)]
+    pub async fn invalidate_after_origin_change_for_tests(
+        self: &Arc<Self>,
+        cache_key: &str,
+    ) -> Result<()> {
+        self.invalidate_after_origin_change(cache_key).await
+    }
     /// Test seam: [`Self::write_stamp_pending`] for integration tests.
     #[doc(hidden)]
     pub fn write_stamp_pending_for_tests(&self, cache_key: &str) -> bool {
@@ -10042,6 +10365,7 @@ impl CacheManager {
             let st = &mut *state;
             if let Some(joined) = st.keys.get_mut(&*slot) {
                 *joined += 1;
+                st.origin_only.remove(&*slot);
                 if let Some(logged) = logged.clone() {
                     note_log_token(&mut st.log_tokens, &slot, logged);
                 }
@@ -10091,7 +10415,10 @@ impl CacheManager {
                 WRITE_STAMP_RETRIED.fetch_add(1, AtomicOrdering::Relaxed);
                 self.run_write_stamp_retry_task(slot, 0);
             }
-            WriteStampRetry::Joined | WriteStampRetry::Queued | WriteStampRetry::Spilled => {
+            WriteStampRetry::Joined
+            | WriteStampRetry::Queued
+            | WriteStampRetry::Spilled
+            | WriteStampRetry::Shed => {
                 WRITE_STAMP_RETRIED.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
@@ -10332,6 +10659,7 @@ impl CacheManager {
                                 continue;
                             }
                             st.keys.remove(&*slot);
+                            st.origin_only.remove(&*slot);
                             let log_token = st.log_tokens.remove(&*slot).map(|(_, token)| token);
                             let dir = st.dirs.entry(task.scope.clone()).or_default();
                             let queued = dir.queue.pop_front();
@@ -10359,6 +10687,20 @@ impl CacheManager {
                                 let st = &mut *state;
                                 let dir = st.dirs.entry(task.scope.clone()).or_default();
                                 if let Some(queued) = dir.queue.pop_front() {
+                                    if st.origin_only.remove(&*slot) {
+                                        // An origin-change stamp gives way to the waiting
+                                        // write rather than queueing behind it.
+                                        st.keys.remove(&*slot);
+                                        st.queued_keys = st.queued_keys.saturating_sub(1);
+                                        st.queued_bytes = st
+                                            .queued_bytes
+                                            .saturating_sub(write_stamp_overflow_cost(&queued));
+                                        note_origin_change_stamp_shed(
+                                            &key,
+                                            "a write waited for its retry task",
+                                        );
+                                        break (false, Some((queued, 0)), None, false);
+                                    }
                                     // Head-of-line bound: this key stays pending and
                                     // waits its turn again; the queue's count is unchanged.
                                     dir.queue.push_back(Arc::clone(&slot));
@@ -10440,6 +10782,29 @@ impl CacheManager {
         result
     }
 
+    /// The invalidation a GET or HEAD runs when S3 has shown that the cached entry is not its
+    /// current object: S3 answered `404`, or named another version than the cached one (a
+    /// revalidation or refetch naming another ETag). Remove the entry as
+    /// [`Self::invalidate_cache_hierarchy`] does and, in the same slot-lock hold, stamp a fresh
+    /// write-order marker, as an acknowledged write or DELETE does. A fill of the replaced or
+    /// deleted object whose S3 request was in flight then cannot publish, and an `Add` it
+    /// already journalled is refused by the journal fallback and retired by the fold, on every
+    /// proxy. Without the stamp the next fold rebuilt the old object's document from such an
+    /// `Add`, served until `get_ttl`. Because of the stamp this reads no journal (see
+    /// `invalidate_cache_hierarchy_stamped`). On an `Err` the key goes to the background stamp
+    /// retry, within the share kept for these stamps ([`Self::spawn_origin_change_stamp_retry`]),
+    /// and while it is pending this proxy forwards the key's GET and HEAD to S3.
+    pub(crate) async fn invalidate_after_origin_change(
+        self: &Arc<Self>,
+        cache_key: &str,
+    ) -> Result<()> {
+        let result = self.invalidate_for_write(cache_key).await.map(|_| ());
+        if result.is_err() {
+            self.spawn_origin_change_stamp_retry(cache_key);
+        }
+        result
+    }
+
     /// [`Self::invalidate_acknowledged_write`] within what remains of `budget`. If it does
     /// not finish in time it is dropped and handed to the background stamp retry
     /// ([`Self::hand_invalidation_to_retry`]), and the `Err` says so. The in-memory tiers are
@@ -10474,6 +10839,126 @@ impl CacheManager {
             }
             None => Err(self.hand_invalidation_to_retry(cache_key)),
         }
+    }
+
+    /// The response-path handling of a write S3 answered with a `5xx` that leaves it possibly
+    /// applied ([`crate::signed_request_proxy::WriteEffect::MayHaveApplied`]): keep the entry
+    /// and expire it, so the next GET or HEAD asks S3 with the cached ETag before serving it.
+    /// A `304` keeps the entry, a `200` replaces it and a `404` removes it.
+    ///
+    /// One slot-lock hold stamps a fresh write-order marker and rewrites the shared `.meta`
+    /// with [`crate::cache_types::NewCacheMetadata::expire_for_write`]. So on every proxy
+    /// sharing the volume, a store or fill of the old version already in flight cannot
+    /// publish a fresh entry over the expired one, and every read of the `.meta` sees the
+    /// expiry. This proxy's in-memory copies are dropped before and after the hold; another
+    /// proxy's RAM copies stop serving at their next verification against the `.meta`.
+    ///
+    /// A key with no `.meta` this can read has nothing to keep, and is invalidated as an
+    /// acknowledged write is ([`Self::invalidate_acknowledged_write`]), which also removes a
+    /// fill still waiting in the journal. On an `Err` the key goes to the background stamp
+    /// retry, which invalidates it. `operation` is `"PUT"`, `"DELETE"` or
+    /// `"CompleteMultipartUpload"`.
+    pub(crate) async fn expire_for_write(
+        self: &Arc<Self>,
+        cache_key: &str,
+        operation: &str,
+    ) -> Result<()> {
+        match self.expire_entry_stamped(cache_key).await {
+            Ok(true) => {
+                debug!(
+                    "Cache entry expired after a {} S3 may have applied: cache_key={}",
+                    operation, cache_key
+                );
+                Ok(())
+            }
+            Ok(false) => {
+                self.invalidate_acknowledged_write(cache_key, operation)
+                    .await
+            }
+            Err(e) => {
+                self.spawn_write_stamp_retry(cache_key);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::expire_for_write`] within what remains of `budget`, as
+    /// [`Self::invalidate_acknowledged_write_within`] runs an invalidation: while the volume is
+    /// stalled, or past the budget, the key is handed to the background stamp retry, which
+    /// invalidates it, and the `Err` says so.
+    pub(crate) async fn expire_for_write_within(
+        self: &Arc<Self>,
+        cache_key: &str,
+        operation: &str,
+        budget: &CacheDelayBudget,
+    ) -> Result<()> {
+        if self.volume_stalled() {
+            self.clear_in_memory_tiers(cache_key).await;
+            return Err(self.hand_invalidation_to_retry(cache_key));
+        }
+        match budget
+            .run(
+                WRITE_CACHE_DELAY_BUDGET,
+                self.expire_for_write(cache_key, operation),
+            )
+            .await
+        {
+            Some(result) => {
+                if result.is_ok() {
+                    budget.note_volume_success();
+                }
+                result
+            }
+            None => Err(self.hand_invalidation_to_retry(cache_key)),
+        }
+    }
+
+    /// The locked half of [`Self::expire_for_write`]: stamp a fresh marker and, in the same
+    /// hold, rewrite the `.meta` expired. `Ok(false)` when there is no `.meta` it can read,
+    /// with the marker stamped.
+    async fn expire_entry_stamped(&self, cache_key: &str) -> Result<bool> {
+        self.clear_in_memory_tiers(cache_key).await;
+        let token = WriteToken::fresh();
+        let path = self.get_new_metadata_file_path(cache_key);
+        let key = cache_key.to_string();
+        let expired = self
+            .metadata_lock_manager()
+            .run_locked_blocking_logged(
+                cache_key,
+                crate::metadata_lock_manager::LockExhaustionLog::Error,
+                move |meta_lock| -> Result<bool> {
+                    // The stamp first: a store or fill that checks its token before this hold
+                    // published before the expiry below, which then covers what it published;
+                    // one that checks after sees its token gone and declines.
+                    stamp_write_marker_locked(&path, &key, &token, &meta_lock)?;
+                    let Ok(mut metadata) = Self::read_new_cache_metadata_file(&path) else {
+                        return Ok(false);
+                    };
+                    metadata.expire_for_write(SystemTime::now());
+                    let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
+                        ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
+                    })?;
+                    let temp_path = instance_scoped_meta_tmp_path(&path);
+                    std::fs::write(&temp_path, &json).map_err(|e| {
+                        crate::disk_cache::note_disk_full(&e, "write_expiry.meta_tmp");
+                        ProxyError::CacheError(format!("Failed to write temp metadata: {}", e))
+                    })?;
+                    if let Err(e) = std::fs::rename(&temp_path, &path) {
+                        let _ = std::fs::remove_file(&temp_path);
+                        return Err(ProxyError::CacheError(format!(
+                            "Failed to rename metadata: {}",
+                            e
+                        )));
+                    }
+                    drop(meta_lock);
+                    Ok(true)
+                },
+            )
+            .await??;
+        // Again after the hold, as the stamped invalidation does: a fill that published before
+        // the stamp may have recorded its visibility or RAM copy after the first clear.
+        self.clear_in_memory_tiers(cache_key).await;
+        Ok(expired)
     }
 
     /// [`Self::invalidate_for_write`] within what remains of `budget`. `Err` when it did
@@ -10589,6 +11074,7 @@ impl CacheManager {
         self.invalidate_cache_hierarchy_marked(
             cache_key,
             MarkerMode::IfCurrent(token.clone()),
+            false,
             crate::metadata_lock_manager::LockExhaustionLog::Error,
         )
         .await
@@ -10634,9 +11120,11 @@ impl CacheManager {
             Some(token) => MarkerMode::Stamp(token),
             None => MarkerMode::Ignore,
         };
+        let scan_pending_adds = matches!(mode, MarkerMode::Ignore);
         self.invalidate_cache_hierarchy_marked(
             cache_key,
             mode,
+            scan_pending_adds,
             crate::metadata_lock_manager::LockExhaustionLog::Error,
         )
         .await
@@ -10646,6 +11134,7 @@ impl CacheManager {
         &self,
         cache_key: &str,
         mode: MarkerMode,
+        scan_pending_adds: bool,
         exhaustion_log: crate::metadata_lock_manager::LockExhaustionLog,
     ) -> Result<()> {
         let stamping = matches!(mode, MarkerMode::Stamp(_));
@@ -10726,7 +11215,37 @@ impl CacheManager {
         // `.meta` exists yet, since a peer's store of an older write may still be pending.
         let mut stamp_result: Result<()> = Ok(());
         let mut superseded = false;
-        let removal = if stamping || path_exists_off_worker(&new_metadata_file_path).await {
+        // Every instance's unfolded journal `Add`s for the key, enumerated before the slot lock as
+        // `DiskCacheManager::invalidate_all_ranges` does, so the hold does not span a scan of every
+        // journal. The locked removal unlinks them with the `.meta`'s ranges, and a `Remove`
+        // marker for each is written after the hold. Left alone, such an `Add` stays coverage
+        // for the journal fallback, and once the `.meta` is gone the next fold rebuilds a
+        // document of the removed version from it. An `Add` appended after this enumeration
+        // is missed, exactly as one appended after the hold is; a stamping removal's new token
+        // still retires it, at the read and at the fold.
+        //
+        // The scan reads every instance's journal files whole, so it costs a read of every line
+        // since the last consolidation, and more when consolidation falls behind. Only a removal
+        // that leaves the marker alone (`scan_pending_adds`) needs it. Every range-fill `Add` this
+        // release journals carries the token its fill saw as its witness, so a stamp's new token
+        // makes the journal fallback refuse every earlier such `Add` of the key and the fold
+        // retire it. CompleteMultipartUpload's `Add`s carry no witness, and a stamp retires none
+        // of them: they name range files its published `.meta` lists, which this removal unlinks
+        // with the rest of that listing, and the fold never folds an `Add` whose `.bin` is
+        // missing. A listed file whose unlink fails stays named by the kept `.meta`, marked
+        // unservable. An `IfCurrent` removal keeps the token, and an `Add` that witnessed it was
+        // fetched after the write S3 acknowledged. So a PUT, a DELETE, a guarded store's
+        // re-invalidation, and a GET or HEAD that S3 showed a version change or a `404`, read no
+        // journal; the stamp retry does, since an earlier attempt's stamp may not have landed.
+        let pending_adds = if scan_pending_adds {
+            crate::disk_cache::unfolded_journal_add_ranges(&self.cache_dir, cache_key).await
+        } else {
+            Vec::new()
+        };
+        let removal = if stamping
+            || !pending_adds.is_empty()
+            || path_exists_off_worker(&new_metadata_file_path).await
+        {
             #[cfg(test)]
             if stamping {
                 stamp_pre_hold_gate::hit(cache_key).await;
@@ -10739,7 +11258,7 @@ impl CacheManager {
             // cache data the caller has already decided is stale, so waiting is correct here.
             // Contrast `refresh_write_cache_ttl`, which is awaited inline on every cached GET and
             // deliberately prefers to skip.
-            let (locked, stamped, remove) = self
+            let (locked, stamped, remove, failure_stamp) = self
                 .metadata_lock_manager()
                 .run_locked_blocking_logged(cache_key, exhaustion_log, move |meta_lock| {
                     // The stamp and the removal share this hold, so no store can publish between
@@ -10757,14 +11276,29 @@ impl CacheManager {
                     };
                     let locked = if remove {
                         Self::delete_object_entry_locked(
-                            &cache_dir, &key, &path, &sinks, &meta_lock,
+                            &cache_dir,
+                            &key,
+                            &path,
+                            &pending_adds,
+                            &sinks,
+                            &meta_lock,
                         )
                     } else {
                         LockedEntryRemoval {
                             removal: ObjectEntryRemoval::NothingRemoved,
                             part_eviction: None,
+                            pending_markers: Vec::new(),
+                            unlink_failed: false,
                         }
                     };
+                    // A removal that leaves the marker alone and could not unlink a range file
+                    // stamps a fresh token in this hold, so neither a failed `Remove`-marker
+                    // append nor a peer's fill-visibility entry leaves that file's bytes
+                    // servable (`stamp_fresh_write_marker_locked`). A stamping removal already
+                    // replaced the token.
+                    let failure_stamp = (locked.unlink_failed
+                        && !matches!(mode, MarkerMode::Stamp(_)))
+                    .then(|| stamp_fresh_write_marker_locked(&path, &key, &meta_lock));
                     drop(meta_lock);
                     // The `cached_objects` debit for a removed valid document, after the slot is
                     // released (the same order `evict_write_cached_object` keeps; the debit is
@@ -10784,9 +11318,34 @@ impl CacheManager {
                     }
                     #[cfg(test)]
                     invalidation_unlink_gate::closure_done(&key);
-                    (locked, stamped, remove)
+                    (locked, stamped, remove, failure_stamp)
                 })
                 .await?;
+            if let Some(Err(e)) = failure_stamp {
+                warn!(
+                    "Invalidation could not unlink a range file and could not stamp the key's \
+                     write marker either: cache_key={}, error={}",
+                    cache_key, e
+                );
+            }
+            let mut locked = locked;
+            let pending_markers = std::mem::take(&mut locked.pending_markers);
+            if !pending_markers.is_empty() {
+                let consolidator = self.journal_consolidator.read().await.clone();
+                match consolidator {
+                    Some(consolidator) => {
+                        consolidator
+                            .write_eviction_journal_entries(pending_markers)
+                            .await
+                    }
+                    None => debug!(
+                        "Invalidation: no journal consolidator configured, skipping {} Remove \
+                         markers for pending journal Adds: cache_key={}",
+                        pending_markers.len(),
+                        cache_key
+                    ),
+                }
+            }
             if let Some(stamped) = stamped {
                 stamp_result = stamped;
                 // Again after the hold: a streamed fill records its visibility inside
@@ -10830,6 +11389,25 @@ impl CacheManager {
                     "Failed to invalidate HEAD cache entry: cache_key={}, error={}",
                     cache_key, e
                 );
+            }
+            // A stamping invalidation follows a write or DELETE S3 acknowledged. If its `.meta`
+            // unlink failed, the version it was called to remove is still on the volume, and
+            // only the locked removal's rewrite, when that landed, stops a proxy serving it. So
+            // it is an `Err`: the caller hands the key to the stamp retry, which repeats the
+            // removal until the `.meta` goes, and this proxy forwards the key's GET and HEAD to
+            // S3 until then.
+            if stamping
+                && removal
+                    == (ObjectEntryRemoval::ValidDocument {
+                        meta_removed: false,
+                    })
+            {
+                stamp_result.and(ram_result)?;
+                return Err(ProxyError::CacheError(format!(
+                    "the invalidation could not unlink the .meta of the version it removes: \
+                     cache_key={}",
+                    cache_key
+                )));
             }
             return stamp_result.and(ram_result);
         }
@@ -10877,37 +11455,68 @@ impl CacheManager {
     /// delete (absent or unreadable) the caller falls through to the HEAD-only invalidation.
     /// An unparseable `.meta` is removed without touching any range file, since it names
     /// none this proxy can read; those become orphans for the orphan rotation.
+    ///
+    /// `pending_adds` is the key's unfolded journal `Add`s, enumerated by the caller before the
+    /// hold. Each one whose file the `.meta` does not list is unlinked here and debited when the
+    /// unlink succeeds, whatever the `.meta` read found, and gets a `Remove` marker in
+    /// `pending_markers` either way.
     fn delete_object_entry_locked(
         cache_dir: &std::path::Path,
         cache_key: &str,
         new_metadata_file_path: &std::path::Path,
+        pending_adds: &[crate::cache_types::RangeSpec],
         sinks: &InvalidationSinks,
         _meta_lock: &crate::metadata_lock_manager::MetadataLock,
     ) -> LockedEntryRemoval {
-        let (new_metadata, evicted_part_numbers, total_evicted_size, unlinked_ranges) =
-            match Self::read_and_unlink_ranges_blocking(
-                cache_dir,
-                cache_key,
-                new_metadata_file_path,
-            ) {
-                LockedEntryRead::Done(removal) => {
-                    return LockedEntryRemoval {
-                        removal,
-                        part_eviction: None,
-                    }
-                }
-                LockedEntryRead::Parsed {
-                    metadata,
-                    evicted_part_numbers,
-                    total_evicted_size,
-                    unlinked_ranges,
-                } => (
-                    *metadata,
-                    evicted_part_numbers,
-                    total_evicted_size,
-                    unlinked_ranges,
-                ),
-            };
+        let (
+            new_metadata,
+            evicted_part_numbers,
+            total_evicted_size,
+            unlinked_ranges,
+            failed_ranges,
+        ) = match Self::read_and_unlink_ranges_blocking(
+            cache_dir,
+            cache_key,
+            new_metadata_file_path,
+        ) {
+            LockedEntryRead::Done(removal) => {
+                let (pending_markers, unlink_failed) = Self::unlink_pending_adds_locked(
+                    cache_dir,
+                    cache_key,
+                    pending_adds,
+                    &[],
+                    sinks,
+                );
+                return LockedEntryRemoval {
+                    removal,
+                    part_eviction: None,
+                    pending_markers,
+                    unlink_failed,
+                };
+            }
+            LockedEntryRead::Parsed {
+                metadata,
+                evicted_part_numbers,
+                total_evicted_size,
+                unlinked_ranges,
+                failed_ranges,
+            } => (
+                *metadata,
+                evicted_part_numbers,
+                total_evicted_size,
+                unlinked_ranges,
+                failed_ranges,
+            ),
+        };
+
+        let (pending_markers, pending_unlink_failed) = Self::unlink_pending_adds_locked(
+            cache_dir,
+            cache_key,
+            pending_adds,
+            &new_metadata.ranges,
+            sinks,
+        );
+        let unlink_failed = pending_unlink_failed || !failed_ranges.is_empty();
 
         // Whether this removal drops staged bytes, through the same shared predicate the debit
         // below and the fold use. A read-tier-only removal leaves the staged figure alone and
@@ -10921,7 +11530,22 @@ impl CacheManager {
         // Delete metadata file. Whether it went decides the dirty mark, the staged-entry gauge
         // and the caller's `cached_objects` debit (see `ObjectEntryRemoval::ValidDocument`).
         let metadata_deleted = Self::remove_meta_file_blocking(new_metadata_file_path);
-
+        // The document stayed. Unchanged, it would keep listing every extent whose unlink also
+        // failed, unmarked and fresh, and every proxy would serve the version this removal was
+        // called for until `get_ttl`.
+        if !metadata_deleted {
+            let kept = failed_ranges
+                .iter()
+                .map(|&i| new_metadata.ranges[i].clone())
+                .collect();
+            retire_unremoved_document_locked(
+                new_metadata_file_path,
+                cache_key,
+                &new_metadata,
+                kept,
+                _meta_lock,
+            );
+        }
         // Decrement the size accumulator for the range files this removal unlinked, whether or
         // not the `.meta` unlink succeeded: those bytes are off the volume either way. A later
         // removal of this key finds the files gone and debits nothing for them, as every other
@@ -11000,13 +11624,80 @@ impl CacheManager {
             },
             part_eviction: (!evicted_part_numbers.is_empty())
                 .then_some((evicted_part_numbers, total_evicted_size)),
+            pending_markers,
+            unlink_failed,
         }
+    }
+
+    /// The pending half of [`Self::delete_object_entry_locked`]: unlink the file of each
+    /// unfolded journal `Add` in `pending_adds` that `listed` (the `.meta`'s ranges, already
+    /// handled) does not name, and return a `Remove` marker for every one of them. Blocking
+    /// shared-storage I/O, run with the key's slot lock held.
+    ///
+    /// An unlinked file is debited (the fill credited it when it published). A file whose unlink
+    /// fails is not, since its bytes are still on the volume, but it is marked as well: the
+    /// caller has decided its version is stale, and without a marker its `Add` would stay
+    /// coverage for a lookup and for the fold. The file is then unlisted, for the orphan
+    /// rotation. A file already gone is marked too, so no lookup reports coverage for it.
+    fn unlink_pending_adds_locked(
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        pending_adds: &[crate::cache_types::RangeSpec],
+        listed: &[crate::cache_types::RangeSpec],
+        sinks: &InvalidationSinks,
+    ) -> (Vec<RemoveMarker>, bool) {
+        let mut markers: Vec<(String, u64, u64, u64, String)> = Vec::new();
+        let mut failed = false;
+        for pending in pending_adds {
+            if listed.iter().any(|r| r.file_path == pending.file_path)
+                || markers.iter().any(|m| m.4 == pending.file_path)
+            {
+                continue;
+            }
+            let range_file_path = cache_dir.join("ranges").join(&pending.file_path);
+            if range_file_path.exists() {
+                match crate::disk_cache::remove_range_file(&range_file_path) {
+                    Ok(()) => {
+                        debug!(
+                            "Removed pending journal range file: cache_key={}, range={}-{}, path={:?}",
+                            cache_key, pending.start, pending.end, range_file_path
+                        );
+                        // A journal fill is never staged (it writes no ledger entry), so only
+                        // the total is debited.
+                        if let Some(accumulator) = sinks.accumulator.as_ref() {
+                            accumulator.subtract_range(
+                                cache_key,
+                                pending.start,
+                                pending.end,
+                                pending.compressed_size,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        failed = true;
+                        warn!(
+                            "Failed to remove pending journal range file, marking it removed: \
+                             cache_key={}, range={}-{}, path={:?}, error={}",
+                            cache_key, pending.start, pending.end, range_file_path, e
+                        )
+                    }
+                }
+            }
+            markers.push((
+                cache_key.to_string(),
+                pending.start,
+                pending.end,
+                pending.compressed_size,
+                pending.file_path.clone(),
+            ));
+        }
+        (markers, failed)
     }
 
     /// The `.meta` unlink of [`Self::delete_object_entry_locked`]. Blocking shared-storage I/O,
     /// run with the key's slot lock held.
     fn remove_meta_file_blocking(new_metadata_file_path: &std::path::Path) -> bool {
-        match std::fs::remove_file(new_metadata_file_path) {
+        match crate::disk_cache::remove_range_file(new_metadata_file_path) {
             Ok(_) => {
                 debug!("Removed new metadata file: {:?}", new_metadata_file_path);
                 true
@@ -11078,6 +11769,7 @@ impl CacheManager {
 
         // Delete all range binary files
         let mut unlinked_ranges = Vec::new();
+        let mut failed_ranges = Vec::new();
         for (index, range_spec) in new_metadata.ranges.iter().enumerate() {
             let range_file_path = cache_dir.join("ranges").join(&range_spec.file_path);
             if range_file_path.exists() {
@@ -11097,12 +11789,15 @@ impl CacheManager {
                     }
                 }
 
-                match std::fs::remove_file(&range_file_path) {
+                match crate::disk_cache::remove_range_file(&range_file_path) {
                     Ok(_) => {
                         debug!("Removed range file: {:?}", range_file_path);
                         unlinked_ranges.push(index);
                     }
-                    Err(e) => warn!("Failed to remove range file {:?}: {}", range_file_path, e),
+                    Err(e) => {
+                        warn!("Failed to remove range file {:?}: {}", range_file_path, e);
+                        failed_ranges.push(index);
+                    }
                 }
                 #[cfg(test)]
                 invalidation_unlink_gate::after_unlink(cache_key);
@@ -11116,6 +11811,7 @@ impl CacheManager {
             evicted_part_numbers,
             total_evicted_size,
             unlinked_ranges,
+            failed_ranges,
         }
     }
 
@@ -11150,6 +11846,7 @@ impl CacheManager {
         object_metadata.parts_count = None;
         object_metadata.part_ranges.clear();
         object_metadata.part_layout_verified = false;
+        object_metadata.part_layout_marked.clear();
         object_metadata.upload_id = None;
 
         if had_parts_count || had_part_ranges || had_upload_id {
@@ -11891,21 +12588,24 @@ impl CacheManager {
                     age_secs
                 );
             }
-            return Some(StagedFigure {
+            let staged = StagedFigure {
                 resident_staged_bytes: figure.resident_staged_bytes,
                 in_progress_part_bytes: figure.in_progress_part_bytes,
                 fold_derived: true,
-            });
+            };
+            note_staged_bytes(&self.cache_dir, staged.write_cache_size());
+            return Some(staged);
         }
-        Some(StagedFigure {
+        let staged = StagedFigure {
             // `unwrap_or(0)` flattens the UNREADABLE sentinel to the permissive value:
             // pre-existing fail-open behaviour, logged at `warn!` in the getter.
             resident_staged_bytes: consolidator.get_write_cache_size().await.unwrap_or(0),
             in_progress_part_bytes: 0,
             fold_derived: false,
-        })
+        };
+        note_staged_bytes(&self.cache_dir, staged.write_cache_size());
+        Some(staged)
     }
-
     /// The staged fold's resident staged bytes for a full validation scan to compare its staged
     /// census with at epoch 1: the figure write cache reclamation sizes from, without the
     /// in-progress multipart parts the census does not count. `None` when it cannot be derived.
@@ -11981,8 +12681,15 @@ impl CacheManager {
     /// At epoch 0 the figure is the fold's resident staged bytes alone, without `P`: the
     /// incumbent never counted in-progress multipart parts, and neither does the epoch-0 trigger
     /// that started the pass, so the bound compares like with like.
-    async fn staging_pass_sizing_figure(&self) -> Option<u64> {
-        let consolidator = self.journal_consolidator.read().await.clone()?;
+    async fn staging_pass_sizing_figure(
+        &self,
+    ) -> (
+        Option<u64>,
+        Option<std::sync::Arc<crate::staged_fold::ShardWeights>>,
+    ) {
+        let Some(consolidator) = self.journal_consolidator.read().await.clone() else {
+            return (None, None);
+        };
         let incumbent_bound = if crate::staged_authority::fold_authority_active(&self.cache_dir) {
             None
         } else {
@@ -11995,8 +12702,9 @@ impl CacheManager {
                     .unwrap_or(0),
             )
         };
-        let Some(figure) = crate::staged_fold::staged_authority_figure_fresh(&self.cache_dir).await
-        else {
+        let (figure, weights) =
+            crate::staged_fold::staged_authority_figure_fresh_with_weights(&self.cache_dir).await;
+        let Some(figure) = figure else {
             // `debug!`: each timeout is already logged at WARN where it happens, and the
             // derivation logs an `error!` once the figure has stayed unknown for a minute.
             debug!(
@@ -12008,7 +12716,7 @@ impl CacheManager {
             if let Some(wcm) = self.write_cache_manager.read().await.as_ref() {
                 wcm.read().await.increment_staging_figure_unknown_passes();
             }
-            return None;
+            return (None, weights);
         };
         let fold = StagedFigure {
             resident_staged_bytes: figure.resident_staged_bytes,
@@ -12016,7 +12724,10 @@ impl CacheManager {
             fold_derived: true,
         }
         .write_cache_size();
-        Some(incumbent_bound.map_or(fold, |bound| figure.resident_staged_bytes.min(bound)))
+        (
+            Some(incumbent_bound.map_or(fold, |bound| figure.resident_staged_bytes.min(bound))),
+            weights,
+        )
     }
 
     /// Resident_Bytes: the staged figure the Staging_Bound is enforced against (R7.1).
@@ -12074,13 +12785,137 @@ impl CacheManager {
         self.get_write_cache_capacity()
     }
 
+    /// The staged-share admission cap: `Err(reason)` when write-through caching of an upload
+    /// of `incoming_bytes` must be declined, because the staged figure plus this process's
+    /// admitted uploads has reached the Staging_Bound or would pass it with this upload. Only
+    /// the local copy is skipped: the caller forwards the upload and returns S3's answer as for
+    /// any uncached write. `Ok` holds the upload's declared size against the bound until the
+    /// caller's store drops it, at commit or abort.
+    ///
+    /// Reads the fold's figure, `F + post-cut pending + P`, without waiting
+    /// ([`crate::staged_fold::admission_figure_without_waiting`]), at either epoch. Never the
+    /// incumbent counter, which over-counts and would decline on bytes that are not there. The
+    /// figure sees an upload only once it commits, so this process's admitted uploads are added
+    /// to it: uploads admitted against one figure cannot together pass the bound. The figure's
+    /// inputs are at most one memo TTL plus one derivation old, so the staged total can pass the
+    /// bound by what the fleet commits over that age, plus what peers have admitted and not yet
+    /// committed.
+    ///
+    /// Callers check this before [`Self::disk_safety_refusal`], so a declined upload records no
+    /// eviction demand: evicting read-cache data cannot make room for it in the write cache.
+    ///
+    /// Fails open: with no figure known it admits (R7.5), and `max_cache_size` through
+    /// [`Self::disk_safety_refusal`] is the bound, as before the cap; the admitted bytes still
+    /// count once a figure is known. Two in-memory mutex reads and no I/O; a stale figure starts
+    /// its refresh on a spawned task.
+    pub(crate) fn staging_bound_admission(
+        &self,
+        incoming_bytes: u64,
+    ) -> std::result::Result<StagingAdmission, &'static str> {
+        let bound = self.get_staging_bound_bytes();
+        let admit = |bytes: u64| StagingAdmission {
+            admitted: self.staging_admitted_bytes.clone(),
+            bytes,
+        };
+        if bound == 0 {
+            return Ok(admit(0));
+        }
+        let Some((figure, age_secs)) =
+            crate::staged_fold::admission_figure_without_waiting(&self.cache_dir)
+        else {
+            self.staging_admitted_bytes
+                .fetch_add(incoming_bytes, AtomicOrdering::AcqRel);
+            return Ok(admit(incoming_bytes));
+        };
+        let staged = StagedFigure {
+            resident_staged_bytes: figure.resident_staged_bytes,
+            in_progress_part_bytes: figure.in_progress_part_bytes,
+            fold_derived: true,
+        }
+        .write_cache_size();
+        // Check and take in one step, so two concurrent admissions cannot both pass against
+        // the same remaining room.
+        let mut in_flight = self.staging_admitted_bytes.load(AtomicOrdering::Acquire);
+        loop {
+            let held = staged.saturating_add(in_flight);
+            if held >= bound || held.saturating_add(incoming_bytes) > bound {
+                Self::log_staging_bound_rate_limited(
+                    staged,
+                    in_flight,
+                    age_secs,
+                    bound,
+                    incoming_bytes,
+                );
+                return Err(STAGING_BOUND_SKIP_REASON);
+            }
+            match self.staging_admitted_bytes.compare_exchange_weak(
+                in_flight,
+                in_flight.saturating_add(incoming_bytes),
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return Ok(admit(incoming_bytes)),
+                Err(now) => in_flight = now,
+            }
+        }
+    }
+    /// This process's admitted, not yet committed or aborted, write-through bytes.
+    #[cfg(test)]
+    pub(crate) fn staging_admitted_bytes_for_tests(&self) -> u64 {
+        self.staging_admitted_bytes.load(AtomicOrdering::Acquire)
+    }
+
+    /// One WARN per [`STAGING_BOUND_WARN_INTERVAL_SECS`] for the staged-share cap, `debug!`
+    /// otherwise. The counter (`signed_put.skipped_puts_total["staging_bound"]`) is the
+    /// machine-readable half.
+    fn log_staging_bound_rate_limited(
+        staged: u64,
+        in_flight: u64,
+        age_secs: u64,
+        bound: u64,
+        incoming: u64,
+    ) {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_STAGING_BOUND_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if now_secs >= last + STAGING_BOUND_WARN_INTERVAL_SECS
+            && LAST_STAGING_BOUND_WARN_SECS
+                .compare_exchange(
+                    last,
+                    now_secs,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            warn!(
+                staged_bytes = staged,
+                admitted_in_flight_bytes = in_flight,
+                staged_figure_age_secs = age_secs,
+                staging_bound_bytes = bound,
+                "Write-through caching declined: staged uploads have reached the staging bound \
+                 (write_cache_percent of max_cache_size), so new uploads are forwarded to S3 \
+                 uncached until staging eviction frees room. The uploads themselves are \
+                 unaffected."
+            );
+        } else {
+            debug!(
+                "Staging bound: declining to write-through cache {} bytes, staged {} ({}s old) \
+                 plus {} admitted in flight, against a bound of {}",
+                incoming, staged, age_secs, in_flight, bound
+            );
+        }
+    }
+
     /// Trigger and target for staging eviction, as absolute byte figures.
     ///
     /// # Why the read tier's percentages, deliberately rather than by omission
     ///
     /// R3.4 requires a trigger/target gap so eviction does not thrash at the boundary,
     /// and task 28 required the gap be *sized against measured staging-eviction
-    /// throughput* rather than guessed. **That measurement does not exist and could not
+    /// throughput* rather than guessed. **When this was written that measurement could not
     /// be taken**: task 6b tried, and `discussion.md` §6 records why it failed — nothing
     /// was staged on the fleet to evict, so there was no throughput to time, and it
     /// explicitly defers the figure to "once Phase E lands".
@@ -12091,19 +12926,21 @@ impl CacheManager {
     /// 1. The gap is proportional, so it scales with the allocation instead of being a
     ///    fixed byte figure that is wrong at some size. At the fleet's 10 GiB allocation
     ///    it is ~1.5 GiB of hysteresis.
-    /// 2. Overshoot is now *safe* rather than merely tolerated. The Staging_Bound no
-    ///    longer refuses anything (R3.1), so a gap that turns out too narrow costs extra
-    ///    eviction wake-ups, not refused uploads — the failure mode the old hard gate had.
+    /// 2. Overshoot is now *safe* rather than merely tolerated. The Staging_Bound refuses
+    ///    no upload (R3.1); at the bound itself the staged-share cap declines only the local
+    ///    copy ([`Self::staging_bound_admission`]). So a gap that turns out too narrow costs
+    ///    extra eviction wake-ups, not refused uploads — the failure mode the old hard gate had.
     ///    That asymmetry is what makes guessing acceptable here where it would not be for
     ///    an admission gate.
     /// 3. Using the same knobs as the read tier means an operator who has already tuned
     ///    hysteresis for their volume gets that tuning applied here too, rather than
     ///    discovering a second independent pair of percentages.
     ///
-    /// **The measurement is still owed**, and it is now takeable for the first time,
-    /// because Phase E is what finally produces staged objects to evict. If small-object
-    /// staging eviction turns out to free bytes materially slower than the write path
-    /// fills them, widen the gap here — do not reintroduce a refusal.
+    /// **The drain has since been measured, and widening the gap does not answer it.** On FSx
+    /// for OpenZFS a serial staging pass removed about 25 objects/s, below the rate two or three
+    /// proxies filled the tier, so a wider gap only delays the same shortfall. The staging pass
+    /// therefore evicts concurrently and shard by shard (`evict_staging_tier_locked`). The
+    /// percentages stay the read tier's; do not reintroduce a refusal of the upload.
     ///
     /// Returns `(trigger_bytes, target_bytes)`. `(0, 0)` when no bound is configured,
     /// which callers read as "no staging eviction".
@@ -12119,10 +12956,12 @@ impl CacheManager {
 
     /// Whether caching `incoming_bytes` would breach the Disk_Safety_Bound.
     ///
-    /// # This is the only bound that may decline caching (`write-cache-accounting-and-eviction` R4.1, R4.2)
+    /// # The volume's wall (`write-cache-accounting-and-eviction` R4.1, R4.2)
     ///
-    /// The Staging_Bound is a target — going over it triggers eviction and still caches.
-    /// This one is a genuine wall, because the failure it prevents is running the shared
+    /// The Staging_Bound is a target: going over its trigger starts eviction and still caches,
+    /// and only at the bound itself does the staged-share cap
+    /// ([`Self::staging_bound_admission`]) decline new write-through caching. This one is a
+    /// genuine wall, because the failure it prevents is running the shared
     /// volume out of space, which degrades every instance and every tier at once.
     ///
     /// Two independent components, and it is **not** a fraction of the Staging_Bound
@@ -12271,7 +13110,7 @@ impl CacheManager {
                          is unaffected and still streams to S3.",
                         incoming_bytes, total, usage.unconsolidated, max_cache_size
                     );
-                    note_size_refusal(&self.cache_dir, incoming_bytes);
+                    note_upload_size_refusal(&self.cache_dir, incoming_bytes);
                     return Some(DISK_SAFETY_SKIP_REASON);
                 }
             }
@@ -12343,6 +13182,21 @@ impl CacheManager {
     /// Spec: write-cache-accounting-and-eviction.
     /// Requirements: 2.2, 2.3, 2.4, 7.1, 7.3, 7.4, 7.5
     pub async fn evict_staging_tier(&self) -> u64 {
+        self.evict_staging_tier_nudged("direct", tokio::time::Instant::now())
+            .await
+    }
+
+    /// [`Self::evict_staging_tier`] for a pass a nudge spawned. `source` names the nudge (`idle`,
+    /// `loop` or `cycle`, from the consolidation loop's call sites, or `direct`) and `nudged_at` is
+    /// when the nudge spawned the pass. Both go on the pre-lock log line, with how long the
+    /// pre-lock checks took and the age of the figure they read, so the time from a crossing of
+    /// the trigger to the first deletion can be split by phase.
+    pub(crate) async fn evict_staging_tier_nudged(
+        &self,
+        source: &'static str,
+        nudged_at: tokio::time::Instant,
+    ) -> u64 {
+        let prelock_started = tokio::time::Instant::now();
         let (trigger, target) = self.get_staging_eviction_thresholds();
 
         // The BYTE arm, unchanged in shape. R7.5: fail open. An unreadable Resident_Bytes means
@@ -12353,11 +13207,13 @@ impl CacheManager {
         // suppresses the COUNT arm below. The two bounds are independent — that independence is
         // the defect § 16.6.12 point 5 fixes — so one being unreadable must not disable the
         // other.
+        let mut byte_figure_known = trigger == 0;
         let byte_over_trigger = if trigger == 0 {
             false
         } else {
             match self.get_staging_resident_bytes().await {
                 Some(resident) => {
+                    byte_figure_known = true;
                     if resident <= trigger {
                         debug!(
                             "Staging eviction not needed on bytes: resident={} <= trigger={}",
@@ -12400,8 +13256,25 @@ impl CacheManager {
             self.eviction_target_percent,
         )
         .await;
+        let prelock_ms = prelock_started.elapsed().as_millis();
+        // The age of the figure the byte arm's read was served, `none` when this process holds
+        // none. A figure derived by this read reads as about 0.
+        let prelock_figure_age_s = crate::staged_fold::authority_memo_age_secs(&self.cache_dir)
+            .map_or_else(|| "none".to_string(), |age| age.to_string());
 
         if !byte_over_trigger && !count_verdict.is_needed() {
+            info!(
+                "Staging eviction skipped: reason={}, nudge_source={}, prelock_ms={}, \
+                 prelock_figure_age_s={}",
+                if byte_figure_known {
+                    "below_trigger"
+                } else {
+                    "no_figure"
+                },
+                source,
+                prelock_ms,
+                prelock_figure_age_s
+            );
             return 0;
         }
 
@@ -12411,15 +13284,26 @@ impl CacheManager {
         // the holder's descriptor is open. So passes are serialised fleet-wide for as long as
         // the holder lives, however long its sizing derivation takes. The one exception is a
         // holder whose NFS lease expires.
+        let nudge_to_lock_ms = nudged_at.elapsed().as_millis();
         match self.try_acquire_global_eviction_lock().await {
             Ok(true) => {
                 info!(
-                    "Acquired global eviction lock: pass=staging, time_budget_secs={}",
-                    self.shared_storage.eviction_lock_timeout.as_secs()
+                    "Acquired global eviction lock: pass=staging, time_budget_secs={}, \
+                     lock_outcome=won, nudge_source={}, nudge_to_lock_ms={}, prelock_ms={}, \
+                     prelock_figure_age_s={}",
+                    self.shared_storage.eviction_lock_timeout.as_secs(),
+                    source,
+                    nudge_to_lock_ms,
+                    prelock_ms,
+                    prelock_figure_age_s
                 );
             }
             Ok(false) => {
-                debug!("Staging eviction: another instance holds the eviction lock, skipping");
+                info!(
+                    "Staging eviction skipped: reason=lock_busy, lock_outcome=busy, \
+                     nudge_source={}, nudge_to_lock_ms={}, prelock_ms={}, prelock_figure_age_s={}",
+                    source, nudge_to_lock_ms, prelock_ms, prelock_figure_age_s
+                );
                 if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
                     metrics_manager
                         .read()
@@ -12430,7 +13314,11 @@ impl CacheManager {
                 return 0;
             }
             Err(e) => {
-                warn!("Staging eviction: failed to acquire eviction lock: {}", e);
+                warn!(
+                    "Staging eviction: failed to acquire eviction lock: {} (lock_outcome=error, \
+                     nudge_source={}, nudge_to_lock_ms={})",
+                    e, source, nudge_to_lock_ms
+                );
                 return 0;
             }
         }
@@ -12458,13 +13346,13 @@ impl CacheManager {
             warn!("Staging eviction: failed to release eviction lock: {}", e);
         }
 
-        // R2.6: retire the consumed and terminal Write_Ledger entries, after the release.
+        // R2.6: retire the consumed and terminal Write_Ledger entries, after the release, in the
+        // ledger files of the shards they belong to and no others.
         //
-        // This whole-volume compaction reads and may rewrite every ledger file, so it is the
-        // step whose cost grows with the cache volume. It needs no fleet-wide exclusion:
+        // It needs no fleet-wide exclusion:
         //
         // - Each file is read, filtered and renamed inside one hold of that file's own lock, the
-        //   lock every append takes, so no append is lost to it (`retire_identities`).
+        //   lock every append takes, so no append is lost to it (`retire_identities_in`).
         // - It only removes the identities it names. A peer's pass that starts once the lock is
         //   released may read an entry named here before it goes. Its object's `.meta` is gone
         //   or terminal, so the peer assesses it terminal and names it again, which is a no-op.
@@ -12474,19 +13362,38 @@ impl CacheManager {
         // - This proxy starts no other staging pass meanwhile: `staging_eviction_in_progress`
         //   stays set until this function returns.
         //
-        // The removal debits and the re-fold, which the next pass sizes from, were published
-        // before the release, so moving this step changes no figure a pass reads.
+        // The removal debits and the re-folds, which the next pass sizes from, were published
+        // before the release, so this step changes no figure a pass reads.
         if let Some(StagingRetirement { ledger, retired }) = retirement {
             #[cfg(test)]
             run_before_staging_retire_hook(&self.cache_dir);
-            if let Err(e) = ledger.retire_identities(&retired).await {
-                warn!(
-                    "Staging eviction: failed to retire {} consumed Write_Ledger entries: {}. \
-                     They will be re-verified and skipped next pass.",
-                    retired.len(),
-                    e
-                );
+            let mut dropped: u64 = 0;
+            for (shard, identities) in &retired {
+                match ledger.shard_ledger_files_of(&shard.bucket, &shard.l1) {
+                    Ok(files) => {
+                        dropped = dropped.saturating_add(
+                            ledger
+                                .retire_identities_in(files, identities)
+                                .await
+                                .entries_dropped(),
+                        );
+                    }
+                    Err(e) => warn!(
+                        "Staging eviction: could not list the Write_Ledger files of shard {}/{} \
+                         to retire {} consumed entries: {}. They will be re-verified and skipped \
+                         next pass.",
+                        shard.bucket,
+                        shard.l1,
+                        identities.len(),
+                        e
+                    ),
+                }
             }
+            debug!(
+                "Staging eviction: retired {} Write_Ledger entries across {} shard(s)",
+                dropped,
+                retired.len()
+            );
         }
         freed
     }
@@ -12540,24 +13447,98 @@ impl CacheManager {
             .unwrap_or_else(|p| p.into_inner())
             .push((cache_dir.to_path_buf(), delay));
     }
+    /// A hook a staging pass on `cache_dir` runs before and after each batch's debit publish.
+    #[cfg(test)]
+    pub(crate) fn set_staging_batch_hook_for_tests(
+        cache_dir: &std::path::Path,
+        hook: Arc<dyn Fn(StagingBatchPoint) + Send + Sync>,
+    ) {
+        STAGING_BATCH_HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((cache_dir.to_path_buf(), hook));
+    }
+    /// A one-shot hook a staging pass on `cache_dir` runs between `cache_key`'s unlocked
+    /// assessment and its eviction.
+    #[cfg(test)]
+    pub(crate) fn set_staging_after_assess_hook_for_tests(
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        hook: Box<dyn FnOnce() + Send>,
+    ) {
+        STAGING_AFTER_ASSESS_HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((cache_dir.to_path_buf(), cache_key.to_string(), hook));
+    }
+    /// Park the next staging assessment of `cache_key` on `cache_dir` just before it returns.
+    /// The first receiver fires once it is parked; it returns once the sender is sent or dropped.
+    #[cfg(test)]
+    pub(crate) fn pause_staging_assessment_for_tests(
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        STAGING_ASSESSMENT_PAUSES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((
+                cache_dir.to_path_buf(),
+                cache_key.to_string(),
+                (reached_tx, resume_rx),
+            ));
+        (reached_rx, resume_tx)
+    }
+    /// The staging executor's concurrency and batch limits on `cache_dir`, for a test.
+    #[cfg(test)]
+    pub(crate) fn set_staging_limits_for_tests(
+        cache_dir: &std::path::Path,
+        concurrency: usize,
+        batch_objects: usize,
+        batch_bytes: u64,
+    ) {
+        STAGING_TEST_LIMITS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((
+                cache_dir.to_path_buf(),
+                (concurrency, batch_objects, batch_bytes),
+            ));
+    }
     /// The locked body's time budget.
     ///
     /// `deadline` bounds how long the pass holds the lock. Each stage stops at a safe point once
-    /// it has passed: the sizing reads fail open (no figure, nothing to free), the ledger read is
-    /// abandoned before any candidate is assessed, and the candidate loop stops between objects,
-    /// each of whose evictions has already done its own accounting. What was removed is still
-    /// published (removal debits, the count result), and the re-fold is skipped for dirty marks
-    /// once the budget is spent. A stage that has started is not interrupted, so the hold can
-    /// exceed the budget by one stage. Returns the bytes freed and the ledger entries the caller
-    /// retires after the release.
+    /// it has passed: the sizing reads fail open (no figure, nothing to free), a chunk's ledger
+    /// read is abandoned before any of its candidates is assessed, and the executor stops
+    /// dispatching, waits for the evictions in flight to resolve, and publishes their batch's
+    /// debits before it returns. What was removed is still published (removal debits, the count
+    /// result), and a chunk's re-fold is skipped for dirty marks once the budget is spent. A stage
+    /// that has started is not interrupted, so the hold can exceed the budget by one stage.
+    /// Returns the bytes freed and the ledger entries the caller retires after the release.
+    ///
+    /// # Shape: shard-scoped quotas, executed concurrently
+    ///
+    /// The shortfall (`bytes_to_free`, `ranges_to_free`) is shared across shards in proportion to
+    /// each shard's terms of the figure from the same derivation that sized it (its checkpoint and
+    /// its post-cut pending credits less its applied debit), with any part those cannot place
+    /// shared equally over the Write_Ledger's shard directories ([`staging_chunk_plan`]), and the
+    /// shards are grouped into chunks of contiguous `l1` values
+    /// in one bucket. Each chunk reads only its own shards' ledger files, orders their candidates
+    /// oldest first (expired before fresh), and evicts them [`STAGING_OBJECT_CONCURRENCY`] at a
+    /// time in batches, stopping dispatch once what it has removed plus the ledger estimate of
+    /// what is in flight covers the quota carried so far. So the order is approximately the
+    /// globally oldest: each shard gives up its own oldest share.
     async fn evict_staging_tier_locked(
         &self,
         trigger: u64,
         target: u64,
         deadline: tokio::time::Instant,
     ) -> (u64, Option<StagingRetirement>) {
-        use crate::write_ledger::StagedCandidateVerdict;
-
+        let derivation_started = tokio::time::Instant::now();
         // R7.3: re-read after acquiring the lock. Another instance may have evicted
         // while we waited, in which case there is nothing left to do and proceeding
         // would delete data that is now within bound.
@@ -12570,17 +13551,17 @@ impl CacheManager {
         // abandoning the wait cancels nothing, because the derivation runs on its own task and
         // installs its result for later readers.
         let mut deadline_hit: Option<&'static str> = None;
-        let resident = if trigger == 0 {
-            None
+        let (resident, weights) = if trigger == 0 {
+            (None, None)
         } else {
             match tokio::time::timeout_at(deadline, self.staging_pass_sizing_figure()).await {
-                Ok(figure) => figure,
+                Ok(sized) => sized,
                 Err(_) => {
                     deadline_hit = Some("sizing");
                     if let Some(wcm) = self.write_cache_manager.read().await.as_ref() {
                         wcm.read().await.increment_staging_figure_unknown_passes();
                     }
-                    None
+                    (None, None)
                 }
             }
         };
@@ -12628,99 +13609,49 @@ impl CacheManager {
         };
         let ledger = consolidator.write_ledger().clone();
 
-        // The AUTHORITY read, not the hint read (cache-eviction-at-scale § 16.6.3).
-        //
-        // # What changed, and what deliberately did not
-        //
-        // This used to call `read_merged_oldest_first`, which folds an unopenable ledger
-        // file, a torn line and a genuinely empty ledger into one value: a shorter `Vec`.
-        // The `is_empty()` branch below then reported that as "a fleet upgrading in
-        // place", which is a real and benign state — but it is not distinguishable from
-        // "every ledger file on the shared volume just became unreadable", and the pass
-        // proceeded either way. On the failure reading it silently declined to reclaim
-        // anything while logging a reassuring message about upgrades.
-        //
-        // The figure driving eviction is NOT decided here: `resident` above is
-        // `staging_pass_sizing_figure`, a fresh derivation of the fold's figure, bounded by the
-        // projected incumbent Size_State figure in Phase L.
-        // What this read changed is the failure path only.
-        //
-        // New failure behaviour: an unreadable file, a discarded line, or a
-        // listing/read count mismatch aborts the pass with a WARN naming the class,
-        // instead of proceeding on a partial candidate list. That is the safe direction —
-        // this pass *deletes objects*, and a truncated candidate list is a list assembled
-        // from an incomplete view of what is staged. A complete-but-empty read keeps the
-        // in-place-upgrade message it had, which is now an accurate statement rather than
-        // a guess.
-        //
-        // Truncation is NOT treated as a refusal, and that is the one clause of
-        // Complete_Install this call site deliberately does not adopt: the cap is this
-        // pass's own deliberate bound (`STAGING_EVICTION_CANDIDATE_CAP`), so `truncated`
-        // is the expected state on any ledger longer than it, and refusing on it would
-        // disable staging eviction exactly when the tier is largest. `retire_identities`
-        // names removals rather than retentions, so acting on a capped prefix cannot
-        // delete an entry this pass never read. `is_complete()` is therefore NOT the
-        // predicate used here — the fields are checked individually.
-        //
-        // Abandoned at the deadline before any candidate is assessed. The read only reads, each
-        // file under its own lock inside a blocking task that finishes and unlocks on its own.
-        let read_ledger = async {
-            #[cfg(test)]
-            if let Some(delay) = take_staging_ledger_read_delay(&self.cache_dir) {
-                tokio::time::sleep(delay).await;
+        // The weights come from the derivation that sized the pass: each shard's terms of the
+        // figure, so they sum to it. Where they carry less than the shortfall (none were read, an
+        // incomplete checkpoint read or an unbounded byte arm, or the count arm's later read saw
+        // more), the plan shares the rest equally over the Write_Ledger's shard directories, one
+        // `readdir` per bucket.
+        let weights = weights.unwrap_or_default();
+        let ledger_shards = if staging_plan_needs_uniform(bytes_to_free, ranges_to_free, &weights) {
+            match ledger.ledger_shards().await {
+                Ok(shards) => shards
+                    .into_iter()
+                    .map(|(bucket, l1)| crate::staged_fold::Shard::new(bucket, l1))
+                    .collect(),
+                Err(e) if weights.is_empty() => {
+                    warn!(
+                        "Staging eviction: failed to list the Write_Ledger shards: {}; retrying \
+                         next pass",
+                        e
+                    );
+                    return (0, None);
+                }
+                Err(e) => {
+                    warn!(
+                        "Staging eviction: failed to list the Write_Ledger shards: {}; this pass \
+                         shares its shortfall over the derived weights alone",
+                        e
+                    );
+                    Vec::new()
+                }
             }
-            ledger
-                .read_for_authority(STAGING_EVICTION_CANDIDATE_CAP)
-                .await
+        } else {
+            Vec::new()
         };
-        let read = match tokio::time::timeout_at(deadline, read_ledger).await {
-            Ok(Ok(read)) => read,
-            Ok(Err(e)) => {
-                warn!("Staging eviction: failed to read Write_Ledger: {}", e);
-                return (0, None);
-            }
-            Err(_) => {
-                self.log_staging_pass_deadline("ledger read", 0, 0, 0, 0);
-                return (0, None);
-            }
-        };
-        if read.files_unreadable > 0 || read.malformed_lines > 0 {
-            warn!(
-                "Staging eviction: the Write_Ledger read was incomplete \
-                 (files_unreadable={}, malformed_lines={}), so the candidate list may omit \
-                 staged objects. Refusing to evict on a partial view; retrying next pass.",
-                read.files_unreadable, read.malformed_lines
-            );
-            return (0, None);
-        }
-        if read.files_read != read.files_expected {
-            warn!(
-                "Staging eviction: the Write_Ledger listing named {} file(s) but {} were \
-                 read. Refusing to evict on a partial view; retrying next pass.",
-                read.files_expected, read.files_read
-            );
-            return (0, None);
-        }
-        let entries = read.entries;
-        if entries.is_empty() {
-            // Now a genuine emptiness rather than an unread one: the read above refused on
-            // every class of incompleteness except its own deliberate cap, and a capped
-            // read cannot be empty.
-            //
-            // **Falls through rather than returning early**, changed by § 16.6.12 point 5. An
-            // empty ledger under a count trigger IS state (a) — nothing was reclaimable — and a
-            // pass that returned here published no count document, which reads identically to
-            // state (c), the trigger never firing. Everything below is a no-op on an empty
-            // candidate list, so the fall-through costs nothing and makes the state legible.
-            info!(
-                "Staging eviction: over trigger (resident={:?}, trigger={}) but the Write_Ledger \
-                 is empty. If this deployment was just upgraded, the next full validation scan \
-                 populates it; no migration step is required.",
-                resident, trigger
-            );
-        }
-
-        let candidates = crate::write_ledger::WriteLedger::group_by_key(entries);
+        let rotation = STAGING_PLAN_ROTATION.fetch_add(1, AtomicOrdering::Relaxed);
+        let plan = staging_chunk_plan(
+            bytes_to_free,
+            ranges_to_free,
+            &weights,
+            &ledger_shards,
+            rotation,
+        );
+        #[cfg(test)]
+        record_staging_plan_for_tests(&self.cache_dir, &plan, rotation);
+        let derivation_ms = derivation_started.elapsed().as_millis();
 
         // R2.4: expired-unread ranks ahead of fresh-unread, via a `now - put_ttl`
         // watermark. Under a uniform `put_ttl` write order already *is* expiry order, so
@@ -12734,207 +13665,136 @@ impl CacheManager {
         let watermark = SystemTime::now()
             .checked_sub(self.put_ttl)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let ordered = crate::write_ledger::order_staging_candidates(candidates, watermark);
 
-        let mut total_freed: u64 = 0;
-        let mut evicted_objects: u64 = 0;
-        // § 16.6.12 point 5's count arm, and the figures its result document publishes.
-        let mut total_ranges_freed: u64 = 0;
-        let mut candidates_considered: u64 = 0;
-        let mut reclaimable_candidates: u64 = 0;
-        let mut expired_candidates: u64 = 0;
-        let mut unreadable_candidate_ranges: u64 = 0;
-        let mut retired: std::collections::HashSet<(String, u64, u64, SystemTime, String)> =
-            std::collections::HashSet::new();
-        let mut skips: std::collections::HashMap<&'static str, u64> =
-            std::collections::HashMap::new();
-        // The shards this pass removed staged objects from, re-folded at the end of the pass.
-        let mut evicted_shards: std::collections::BTreeSet<crate::staged_fold::Shard> =
-            std::collections::BTreeSet::new();
-        // What this pass removed from each shard, from the same `.meta` read each eviction acted
-        // on: published as this instance's removal debits before the re-fold.
-        let mut evicted_debits: std::collections::BTreeMap<
-            crate::staged_fold::Shard,
-            crate::staged_fold::StagedRemoval,
-        > = std::collections::BTreeMap::new();
-
-        #[cfg(test)]
-        if let Some(delay) = take_staging_candidate_delay(&self.cache_dir) {
-            tokio::time::sleep(delay).await;
+        let mut state = StagingPassState::default();
+        // A plan that dropped runs (more than `STAGING_MAX_CHUNKS`) leaves shards unread.
+        let planned = plan.iter().fold((0u64, 0u64), |acc, c| {
+            (
+                acc.0.saturating_add(c.quota_bytes),
+                acc.1.saturating_add(c.quota_ranges),
+            )
+        });
+        if planned.0 < bytes_to_free || planned.1 < ranges_to_free {
+            state.partial_view = true;
         }
-        for candidate in &ordered {
-            // BOTH arms have to be satisfied before the walk stops. A count-driven pass has
-            // `bytes_to_free == 0`, so testing bytes alone would break on the first candidate
-            // and reclaim nothing — the count trigger would fire, log, publish a zero-freed
-            // result, and change nothing. § 16.6.12 point 5.
-            if total_freed >= bytes_to_free && total_ranges_freed >= ranges_to_free {
-                break;
+        // The quota carried so far: the sum of this and every earlier chunk's quota. One counter
+        // across chunks, so a chunk that freed less than its share (its shards ran out) leaves
+        // the rest to the next, and the pass overshoots its shortfall by less than one object.
+        let mut allowance = (0u64, 0u64);
+        let mut first_chunk = true;
+        for chunk in &plan {
+            allowance.0 = allowance.0.saturating_add(chunk.quota_bytes);
+            allowance.1 = allowance.1.saturating_add(chunk.quota_ranges);
+            if state.debited_bytes >= allowance.0 && state.debited_ranges >= allowance.1 {
+                // Covered by debits, after which the pass has reclaimed a range and cannot latch
+                // the count trigger, or, before any debit, by a zero quota, whose shards are
+                // outside the pass's view as a zero share inside a chunk is. Neither leaves the
+                // pass partial.
+                continue;
             }
-            // Between objects: every eviction above finished its own accounting, and what this
-            // pass removed is published below as for a pass that ran out of candidates.
             if tokio::time::Instant::now() >= deadline {
                 deadline_hit = Some("candidate loop");
                 break;
             }
-            candidates_considered += 1;
-            if candidate.oldest_entry_at < watermark {
-                expired_candidates += 1;
+            // Materialise the chunk: its shards' ledger files only. Abandoned at the deadline
+            // before any candidate is assessed; the read only reads, each file under its own lock
+            // inside a blocking task that finishes and unlocks on its own.
+            let read_started = tokio::time::Instant::now();
+            let remaining = (
+                allowance.0.saturating_sub(state.debited_bytes),
+                allowance.1.saturating_sub(state.debited_ranges),
+            );
+            let read = tokio::time::timeout_at(
+                deadline,
+                self.read_staging_chunk(&ledger, chunk, remaining, first_chunk),
+            )
+            .await;
+            state.ledger_read += read_started.elapsed();
+            let Ok((entries, refused, lines_read, more)) = read else {
+                deadline_hit = Some("ledger read");
+                break;
+            };
+            state.partial_view |= more;
+            state.refused_shards = state.refused_shards.saturating_add(refused);
+            state.ledger_lines_read = state.ledger_lines_read.saturating_add(lines_read);
+            let ordered = crate::write_ledger::order_staging_candidates(
+                crate::write_ledger::WriteLedger::group_by_key(entries),
+                watermark,
+            );
+            #[cfg(test)]
+            if first_chunk {
+                if let Some(delay) = take_staging_candidate_delay(&self.cache_dir) {
+                    tokio::time::sleep(delay).await;
+                }
             }
+            first_chunk = false;
+            state.candidates_listed = state.candidates_listed.saturating_add(ordered.len() as u64);
 
-            // R2.2: verify against the authoritative `.meta` before acting. One decision
-            // covering absent / graduated / superseded / unreadable.
-            //
-            // `assess_` rather than `verify_` so the terminal branch below can retire the entries
-            // whose OWN extent is terminal instead of every entry the candidate carries. Same
-            // `.meta` read, same verdict; see `StagedCandidateAssessment` for loss mode L6.
-            let assessment =
-                crate::write_ledger::assess_staged_candidate(&self.cache_dir, candidate).await;
-            let verdict = assessment.verdict;
+            let walk_started = tokio::time::Instant::now();
+            let (evicted_shards, stopped_by_deadline) = self
+                .execute_staging_chunk(
+                    ordered,
+                    allowance,
+                    deadline,
+                    watermark,
+                    &StagingExecutor {
+                        ledger: &ledger,
+                        consolidator: &consolidator,
+                        #[cfg(test)]
+                        chunk: state.chunks_executed + 1,
+                        #[cfg(test)]
+                        chunk_shards: chunk.shards.len(),
+                    },
+                    &mut state,
+                )
+                .await;
+            state.walk += walk_started.elapsed();
+            state.chunks_executed += 1;
 
-            match verdict {
-                StagedCandidateVerdict::Evictable => {
-                    reclaimable_candidates += 1;
-                    match self
-                        .evict_staged_object(
-                            &candidate.cache_key,
-                            assessment.assessed_identity.as_ref(),
-                        )
-                        .await
-                    {
-                        Ok(None) => {
-                            // A different object was published at the key between the
-                            // assessment's unlocked read and the slot acquisition. Nothing was
-                            // removed, so nothing was consumed: retire no entries, and leave the
-                            // new object to its own assessment on a later pass.
-                            *skips.entry("replaced_since_assessment").or_insert(0) += 1;
-                        }
-                        Ok(Some(eviction)) if !eviction.meta_removed => {
-                            // The range files went and the `.meta` did not, so the fold still
-                            // counts the object and its ledger entries are its only hint. Debit
-                            // nothing and retire nothing: the next pass assesses the surviving
-                            // `.meta` and debits it once, when its unlink succeeds.
-                            total_freed = total_freed.saturating_add(eviction.freed);
-                            *skips.entry("meta_unlink_failed").or_insert(0) += 1;
-                        }
-                        Ok(Some(eviction)) => {
-                            total_freed = total_freed.saturating_add(eviction.freed);
-                            // The RANGE count reclaimed, from the same `.meta` read that
-                            // produced the verdict the eviction acted on — not a re-derivation
-                            // and not the ledger's hint, so the figure the count trigger is
-                            // measured against and the figure debited from it agree.
-                            total_ranges_freed =
-                                total_ranges_freed.saturating_add(assessment.staged_range_count);
-                            evicted_objects += 1;
-                            // Retire only identities older than `ABSENT_RETIREMENT_GRACE`, the
-                            // same gate `assess_staged_candidate` applies to every terminal arm.
-                            // In the overwrite race the `.meta` evicted here is the OLD object's,
-                            // read after a multipart completion appended its entries and before
-                            // it renamed its own `.meta` into place, so the candidate carries the
-                            // new object's fresh identities too. Retiring them left the new object
-                            // staged with no entry. The eviction above is not delayed; a consumed
-                            // entry younger than the grace is retired by a later pass, which reads
-                            // it as `MetadataAbsent` or matches it to the new `.meta`.
-                            let cutoff = SystemTime::now()
-                                .checked_sub(crate::write_ledger::ABSENT_RETIREMENT_GRACE)
-                                .unwrap_or(SystemTime::UNIX_EPOCH);
-                            retired.extend(
-                                candidate
-                                    .identities
-                                    .iter()
-                                    .filter(|(_, _, _, entry_at, _)| *entry_at <= cutoff)
-                                    .cloned(),
-                            );
-                            if let Some((bucket, l1)) =
-                                crate::staged_fold::shard_of(&candidate.cache_key)
-                            {
-                                let shard = crate::staged_fold::Shard::new(bucket, l1);
-                                let debit = evicted_debits.entry(shard.clone()).or_default();
-                                debit.bytes = debit.bytes.saturating_add(assessment.staged_bytes);
-                                debit.ranges =
-                                    debit.ranges.saturating_add(assessment.staged_range_count);
-                                evicted_shards.insert(shard);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Staging eviction: failed to evict {}: {}",
-                                candidate.cache_key, e
-                            );
-                        }
-                    }
-                }
-                StagedCandidateVerdict::MetadataAbsent
-                | StagedCandidateVerdict::Graduated
-                | StagedCandidateVerdict::Superseded => {
-                    // Terminal: these entries can never become evictable, so retire them here.
-                    // Eviction therefore compacts opportunistically as it scans, which is
-                    // most of what keeps the ledger proportional to the staged set.
-                    //
-                    // **`assessment.retirable`, NOT `candidate.identities`.** For an absent or
-                    // graduated object the two are the same set. For `Superseded` they are not: the
-                    // verdict fires when the object's NEWEST extent is newer than every entry
-                    // naming the key, which says nothing about its other extents. Retiring all of
-                    // them turned a re-PUT whose ledger append was lost into total loss of the
-                    // object's staging record — loss mode L6, and it biases the eviction trigger
-                    // LATE, the direction § 16.6.2 rules out by name.
-                    *skips.entry(verdict.reason()).or_insert(0) += 1;
-                    retired.extend(assessment.retirable.iter().cloned());
-                }
-                StagedCandidateVerdict::Unreadable => {
-                    // Deliberately NOT retired. A `.meta` we failed to read may be
-                    // perfectly valid and transiently unavailable on shared storage;
-                    // dropping the entry would lose a live staged object's only eviction
-                    // hint on the strength of one failed read.
-                    *skips.entry(verdict.reason()).or_insert(0) += 1;
-                    // The named component of the COUNT shortfall. `identities.len()` rather
-                    // than `assessment.staged_range_count`, which is 0 for this verdict by
-                    // construction (`retire_none`): the ledger names one entry per staged
-                    // extent, so its own claim is the only range figure available for a
-                    // `.meta` that could not be read.
-                    unreadable_candidate_ranges = unreadable_candidate_ranges
-                        .saturating_add(candidate.identities.len() as u64);
-                }
+            let refold_started = tokio::time::Instant::now();
+            self.refold_staging_chunk(&ledger, &evicted_shards, deadline, &mut state, deadline_hit)
+                .await;
+            state.refold += refold_started.elapsed();
+            if stopped_by_deadline {
+                deadline_hit = Some("candidate loop");
+                break;
             }
         }
 
         if let Some(stage) = deadline_hit {
             self.log_staging_pass_deadline(
                 stage,
-                evicted_objects,
-                total_freed,
-                total_ranges_freed,
-                candidates_considered,
+                state.evicted_objects,
+                state.total_freed,
+                state.debited_ranges,
+                state.candidates_considered,
             );
         }
-
-        // R2.6: retire consumed and terminal entries, naming exactly what to remove. The caller
-        // does it after releasing the lock; see `evict_staging_tier`.
-        //
-        // This used to compute `all_identities - retired` and hand it to a retain-set
-        // rewrite that deleted everything absent from it. That is only correct if
-        // `all_identities` covers the whole ledger, and it does not: the read above is
-        // capped at `STAGING_EVICTION_CANDIDATE_CAP`, so on a longer ledger every entry
-        // past the cap was absent from the retain set and silently deleted — from every
-        // instance's file, without ever having been read. Task 77.
-        //
-        // Naming the removals removes the dependency on the read being complete. An
-        // entry beyond the cap, and an entry appended by another instance after the read,
-        // are both simply not named.
 
         info!(
             "Staging eviction complete: resident_before={:?}, trigger={}, target={}, \
              bytes_to_free={}, ranges_to_free={}, evicted_objects={}, freed={}, \
-             ranges_freed={}, candidates={}, skips={:?}",
+             ranges_freed={}, candidates={}, skips={:?}, chunks={}, chunks_executed={}, \
+             refused_shards={}, ledger_lines_read={}, derivation_ms={}, ledger_read_ms={}, \
+             walk_ms={}, refold_ms={}",
             resident,
             trigger,
             target,
             bytes_to_free,
             ranges_to_free,
-            evicted_objects,
-            total_freed,
-            total_ranges_freed,
-            ordered.len(),
-            skips
+            state.evicted_objects,
+            state.total_freed,
+            state.debited_ranges,
+            state.candidates_listed,
+            state.skips,
+            plan.len(),
+            state.chunks_executed,
+            state.refused_shards,
+            state.ledger_lines_read,
+            derivation_ms,
+            state.ledger_read.as_millis(),
+            state.walk.as_millis(),
+            state.refold.as_millis()
         );
 
         // =====================================================================
@@ -12947,29 +13807,9 @@ impl CacheManager {
         // indistinguishable from "the count trigger never fired" — which is exactly the
         // state (a)/(c) confusion this document exists to remove.
         //
-        // Recording the reclaim is what stops the next evaluation re-asking for it: the count
-        // comes from the shard checkpoints and does not move until a fold installs, so an
-        // undebited pass would drain the tier at the consolidation interval.
+        // The ranges reclaimed were debited batch by batch, as removal debits, before each
+        // chunk's re-fold.
         // =====================================================================
-        //
-        // The debit is the removal debits published here, per shard, before the re-fold below and
-        // before anything else can read the figure: a re-fold visit begins after them, so each
-        // shard it installs makes its entry inert, and a shard it cannot install (a peer's claim,
-        // any retain) keeps its debit for every reader on the volume until a visit that began
-        // after this re-installs it. A crash between the evictions and this write leaves those
-        // shards undebited until they re-install, the behaviour before debits existed.
-        if let Err(e) = crate::staged_fold::publish_removal_debits(
-            &self.cache_dir,
-            ledger.instance_id(),
-            &evicted_debits,
-        ) {
-            warn!(
-                "Staging eviction: could not publish the removal debits for {} shard(s) ({}); \
-                 until they re-fold, later passes size from a figure that still holds these bytes",
-                evicted_debits.len(),
-                e
-            );
-        }
         if let crate::staged_fold::CountEvictionVerdict::Needed {
             count,
             observed_count,
@@ -12979,11 +13819,18 @@ impl CacheManager {
             ranges_to_free: requested,
         } = count_verdict
         {
+            // A pass the deadline stopped, one that refused a shard's incomplete ledger read, and
+            // one that read a shard only up to its share or left part of its plan unread have
+            // not looked at every candidate, so they do not latch the count trigger. A pass that
+            // reclaimed no range debited nothing, so its executor never stopped on the allowance
+            // with candidates left. A shard with a zero share and a chunk with a zero quota were
+            // asked for nothing: they are outside the pass's view, not partly seen, and wait for
+            // the next fold install, which clears the latch and plans again.
             let (passes_total, ranges_freed_total) = crate::staged_fold::record_count_eviction_pass(
                 &self.cache_dir,
                 ledger.instance_id(),
-                total_ranges_freed,
-                deadline_hit.is_some(),
+                state.debited_ranges,
+                deadline_hit.is_some() || state.refused_shards > 0 || state.partial_view,
             );
             let pass_result = crate::eviction_result::WriteCacheCountPassResult::new(
                 format!(
@@ -12997,12 +13844,12 @@ impl CacheManager {
                 count,
                 observed_count,
                 requested,
-                total_ranges_freed,
-                unreadable_candidate_ranges,
-                evicted_objects,
-                candidates_considered,
-                reclaimable_candidates,
-                expired_candidates,
+                state.debited_ranges,
+                state.unreadable_candidate_ranges,
+                state.evicted_objects,
+                state.candidates_considered,
+                state.reclaimable_candidates,
+                state.expired_candidates,
                 passes_total,
                 ranges_freed_total,
                 crate::staged_fold::budget_declines_total(),
@@ -13026,87 +13873,531 @@ impl CacheManager {
             }
         }
 
+        let retired = std::mem::take(&mut state.retired);
+        let retirement = (!retired.is_empty()).then_some(StagingRetirement { ledger, retired });
+        (state.total_freed, retirement)
+    }
+
+    /// One chunk's candidates: each shard's oldest ledger entries, read only until their estimate
+    /// covers the shard's share of `remaining` (bytes, ranges), the quota this chunk still has to
+    /// free ([`crate::write_ledger::WriteLedger::read_shard_prefix`]). A shard's share is its own
+    /// quota scaled by `remaining` over the chunk's quota. A shard whose read is incomplete (a
+    /// file unreadable or a line neither an entry nor a header) contributes nothing, which
+    /// under-evicts. A shard whose share is zero on both arms is not read: the pass asked it for
+    /// nothing, so it is outside the pass's view rather than partly seen. Returns the entries, the
+    /// count of refused shards, the lines read, and whether any shard's read stopped at its share
+    /// with entries left.
+    async fn read_staging_chunk(
+        &self,
+        ledger: &crate::write_ledger::WriteLedger,
+        chunk: &StagingChunk,
+        remaining: (u64, u64),
+        first: bool,
+    ) -> (Vec<crate::write_ledger::WriteLedgerEntry>, u64, u64, bool) {
         #[cfg(test)]
-        run_before_staging_refold_hook(&self.cache_dir);
-        // Re-fold the shards this pass evicted from, while the global eviction lock is still
-        // held (cache-eviction-at-scale § 16.6.2).
-        //
-        // The fold never subtracts: an evicted object leaves its shard's figure only when a
-        // visit re-reads that shard's `.meta`s, and the periodic pass reaches a given shard
-        // once per rotation. At epoch 1 the byte arm above reads exactly that figure, so
-        // without this the next pass — one consolidation interval later — finds the tier as
-        // far over its trigger as before these objects were freed and evicts again, down past
-        // the target. The count arm has the same exposure and is covered by the same visit.
-        //
-        // AFTER the removal debits are published, deliberately: a visit that began after them
-        // makes the entry of each shard it installs inert, so nothing is subtracted twice.
-        //
-        // Best-effort. A shard a peer holds, or a pass the fold refuses, keeps its pre-eviction
-        // checkpoint until a later visit, and its removal debit stands in for the eviction until
-        // then.
-        //
-        // Skipped once the budget is spent: the removal debits above already stand in for these
-        // evictions, and a dirty mark sends each shard to the front of the periodic fold.
-        if !evicted_shards.is_empty() && tokio::time::Instant::now() >= deadline {
-            for shard in &evicted_shards {
-                crate::staged_fold::mark_dirty_shard(
-                    &self.cache_dir,
-                    ledger.instance_id(),
-                    shard.clone(),
-                );
-            }
-            if deadline_hit.is_none() {
-                self.log_staging_pass_deadline(
-                    "re-fold",
-                    evicted_objects,
-                    total_freed,
-                    total_ranges_freed,
-                    candidates_considered,
-                );
-            }
-        } else if !evicted_shards.is_empty() {
-            let outcome = crate::staged_fold::run_staged_fold_over_shards(
-                &self.cache_dir,
-                &ledger,
-                ledger.instance_id(),
-                &evicted_shards,
-            )
-            .await;
-            let summary = outcome.summary();
-            // A shard the re-fold did not install (a peer held it, or it refused) keeps its
-            // pre-eviction figure; marking it sends it to the front of this instance's next
-            // periodic pass rather than leaving it to the rotation. § 16.6.9, "Dirty shards
-            // first".
-            let installed: std::collections::BTreeSet<crate::staged_fold::Shard> =
-                summary.installed.iter().map(|c| c.shard()).collect();
-            for shard in evicted_shards.iter().filter(|s| !installed.contains(s)) {
-                crate::staged_fold::mark_dirty_shard(
-                    &self.cache_dir,
-                    ledger.instance_id(),
-                    shard.clone(),
-                );
-            }
-            if summary.installed.len() < evicted_shards.len() {
-                info!(
-                    "Staging eviction: re-folded {} of {} evicted shard(s) ({} busy, {} \
-                     retained, reason={:?}); the rest keep their pre-eviction figure until \
-                     the periodic fold reaches them",
-                    summary.installed.len(),
-                    evicted_shards.len(),
-                    summary.busy.len(),
-                    summary.retained.len(),
-                    outcome.retain_reason().map(|r| r.label())
-                );
-            } else {
-                debug!(
-                    "Staging eviction: re-folded all {} evicted shard(s)",
-                    evicted_shards.len()
-                );
+        if first {
+            if let Some(delay) = take_staging_ledger_read_delay(&self.cache_dir) {
+                tokio::time::sleep(delay).await;
             }
         }
+        #[cfg(not(test))]
+        let _ = first;
+        let share = |own: u64, chunk_total: u64, remaining: u64| -> u64 {
+            if chunk_total == 0 {
+                remaining.div_ceil(chunk.shards.len().max(1) as u64)
+            } else {
+                u64::try_from((own as u128 * remaining as u128).div_ceil(chunk_total as u128))
+                    .unwrap_or(u64::MAX)
+            }
+        };
+        let mut entries = Vec::new();
+        let mut refused: u64 = 0;
+        let mut lines_read: u64 = 0;
+        let mut more = false;
+        for (shard, &(own_bytes, own_ranges)) in chunk.shards.iter().zip(&chunk.shard_quotas) {
+            let want_bytes = share(own_bytes, chunk.quota_bytes, remaining.0);
+            let want_ranges = share(own_ranges, chunk.quota_ranges, remaining.1);
+            if want_bytes == 0 && want_ranges == 0 {
+                // Read with a zero want, the prefix read stops before its first entry and reports
+                // every file's head as left behind, so a pass that reclaimed nothing would never
+                // latch the count trigger while this shard held an entry.
+                continue;
+            }
+            match ledger
+                .read_shard_prefix(&shard.bucket, &shard.l1, want_bytes, want_ranges)
+                .await
+            {
+                Ok(read) if !read.incomplete => {
+                    lines_read = lines_read.saturating_add(read.lines_read);
+                    more |= read.more;
+                    entries.extend(read.entries);
+                }
+                Ok(read) => {
+                    refused += 1;
+                    lines_read = lines_read.saturating_add(read.lines_read);
+                    warn!(
+                        "Staging eviction: the Write_Ledger read of shard {}/{} was incomplete \
+                         (files={}, lines_read={}); evicting nothing from it this pass",
+                        shard.bucket, shard.l1, read.files, read.lines_read
+                    );
+                }
+                Err(e) => {
+                    refused += 1;
+                    warn!(
+                        "Staging eviction: failed to read the Write_Ledger of shard {}/{}: {}; \
+                         evicting nothing from it this pass",
+                        shard.bucket, shard.l1, e
+                    );
+                }
+            }
+        }
+        (entries, refused, lines_read, more)
+    }
 
-        let retirement = (!retired.is_empty()).then_some(StagingRetirement { ledger, retired });
-        (total_freed, retirement)
+    /// Execute one chunk's ordered candidates against the carried `allowance` (bytes, ranges).
+    ///
+    /// Batches of at most [`STAGING_BATCH_MAX_OBJECTS`] objects or about
+    /// [`STAGING_BATCH_MAX_BYTES`], with at most [`STAGING_OBJECT_CONCURRENCY`] in flight. Each
+    /// candidate is assessed first and deleted second, and the delete is admitted only by the
+    /// staged figure of the `.meta` the assessment read, never by the ledger estimate: a prefix read
+    /// can stop part-way through an object's entries (a multipart upload's parts are appended one
+    /// at a time, so another key's entries can sit between them), and the estimate then counts
+    /// only the parts read while the delete removes the whole object. A delete is admitted while
+    /// what this pass has debited plus the assessed figures of the deletes already admitted leaves
+    /// either arm of the allowance uncovered, so the pass overshoots it by less than one object,
+    /// and while the batch's admitted figures are under its byte cap, so a batch holds at most the
+    /// cap plus one object; a candidate the cap holds back starts the next batch. The ledger
+    /// estimate only paces the assessments dispatched. At the deadline nothing more is dispatched
+    /// or admitted, and the deletes already admitted always resolve first. After each batch, in
+    /// order: one flush of the size accumulator, then the batch's removal debits by the replace
+    /// rule (`staged_fold::publish_removal_debits_replacing`). A crash between batches loses at most
+    /// the batch in flight's debit.
+    ///
+    /// Each object's debit is the staged figure of the `.meta` its eviction read under the slot
+    /// lock, and only when that `.meta` was unlinked. Returns the shards an object was removed from
+    /// and whether the deadline stopped it.
+    async fn execute_staging_chunk(
+        &self,
+        ordered: Vec<crate::write_ledger::StagedCandidate>,
+        allowance: (u64, u64),
+        deadline: tokio::time::Instant,
+        watermark: SystemTime,
+        executor: &StagingExecutor<'_>,
+        state: &mut StagingPassState,
+    ) -> (std::collections::BTreeSet<crate::staged_fold::Shard>, bool) {
+        use crate::write_ledger::StagedCandidateVerdict;
+        #[cfg(test)]
+        let (concurrency, batch_max_objects, batch_max_bytes) =
+            staging_test_limits(&self.cache_dir);
+        #[cfg(not(test))]
+        let (concurrency, batch_max_objects, batch_max_bytes) = (
+            STAGING_OBJECT_CONCURRENCY,
+            STAGING_BATCH_MAX_OBJECTS,
+            STAGING_BATCH_MAX_BYTES,
+        );
+        let mut candidates = ordered.into_iter();
+        // Candidates assessed evictable that a full batch held back. Each starts the next batch,
+        // and is assessed again there.
+        let mut deferred: std::collections::VecDeque<crate::write_ledger::StagedCandidate> =
+            std::collections::VecDeque::new();
+        let mut evicted_shards = std::collections::BTreeSet::new();
+        // Per shard, the removal debit entry this chunk execution last wrote: the replace rule's
+        // memory, so one entry per shard stands for the whole execution.
+        let mut last_entries = std::collections::BTreeMap::new();
+        let mut exhausted = false;
+        let mut stopped_by_deadline = false;
+        #[cfg(test)]
+        let mut batch_index: u64 = 0;
+        loop {
+            if (exhausted && deferred.is_empty()) || stopped_by_deadline {
+                break;
+            }
+            if state.debited_bytes >= allowance.0 && state.debited_ranges >= allowance.1 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                stopped_by_deadline = true;
+                break;
+            }
+            let mut in_flight = futures::stream::FuturesUnordered::new();
+            let mut batch_objects: usize = 0;
+            // The batch's bytes so far: the ledger estimate of each assessment in flight and the
+            // assessed figure of each delete admitted.
+            let mut batch_estimate: u64 = 0;
+            // The assessed staged bytes of the deletes this batch admitted, for the byte cap.
+            let mut batch_admitted: u64 = 0;
+            // Paces dispatch: the ledger estimate of each assessment in flight plus the assessed
+            // figure of each delete in flight.
+            let mut in_flight_estimate = (0u64, 0u64);
+            // The assessed figures of the deletes admitted and not yet resolved, for admission.
+            let mut admitted = (0u64, 0u64);
+            let mut stop_dispatch = false;
+            let mut batch_debits: std::collections::BTreeMap<
+                crate::staged_fold::Shard,
+                crate::staged_fold::StagedRemoval,
+            > = std::collections::BTreeMap::new();
+            let mut flush_needed = false;
+            loop {
+                while !stop_dispatch
+                    && in_flight.len() < concurrency
+                    && batch_objects < batch_max_objects
+                    && batch_estimate < batch_max_bytes
+                {
+                    if state.debited_bytes.saturating_add(in_flight_estimate.0) >= allowance.0
+                        && state.debited_ranges.saturating_add(in_flight_estimate.1) >= allowance.1
+                    {
+                        stop_dispatch = true;
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        stopped_by_deadline = true;
+                        stop_dispatch = true;
+                        break;
+                    }
+                    let Some(candidate) = deferred.pop_front().or_else(|| candidates.next()) else {
+                        exhausted = true;
+                        stop_dispatch = true;
+                        break;
+                    };
+                    let estimate = (candidate.estimated_bytes, candidate.identities.len() as u64);
+                    batch_objects += 1;
+                    batch_estimate = batch_estimate.saturating_add(estimate.0);
+                    in_flight_estimate.0 = in_flight_estimate.0.saturating_add(estimate.0);
+                    in_flight_estimate.1 = in_flight_estimate.1.saturating_add(estimate.1);
+                    state.candidates_considered += 1;
+                    if candidate.oldest_entry_at < watermark {
+                        state.expired_candidates += 1;
+                    }
+                    in_flight.push(self.assess_or_evict_staged(candidate, estimate, None));
+                }
+                let Some((candidate, estimate, assessment, eviction)) =
+                    futures::StreamExt::next(&mut in_flight).await
+                else {
+                    break;
+                };
+                in_flight_estimate.0 = in_flight_estimate.0.saturating_sub(estimate.0);
+                in_flight_estimate.1 = in_flight_estimate.1.saturating_sub(estimate.1);
+                if matches!(assessment.verdict, StagedCandidateVerdict::Evictable)
+                    && eviction.is_none()
+                {
+                    // An assessment came back evictable: admit its delete by the `.meta`'s staged
+                    // figure. `estimate` was the ledger's, and leaves the batch's bytes here.
+                    batch_estimate = batch_estimate.saturating_sub(estimate.0);
+                    let assessed = (assessment.staged_bytes, assessment.staged_range_count);
+                    if tokio::time::Instant::now() >= deadline {
+                        state.reclaimable_candidates += 1;
+                        stopped_by_deadline = true;
+                        stop_dispatch = true;
+                        continue;
+                    }
+                    if state.debited_bytes.saturating_add(admitted.0) >= allowance.0
+                        && state.debited_ranges.saturating_add(admitted.1) >= allowance.1
+                    {
+                        // The deletes admitted already cover the allowance, but one can still
+                        // decline (the object was replaced, an I/O error, a `.meta` that would not
+                        // unlink) and debit nothing. Hold the object for the next batch, which
+                        // runs only if the allowance is still uncovered, and count it there.
+                        #[cfg(test)]
+                        note_staging_covered_hold(&self.cache_dir);
+                        state.candidates_considered = state.candidates_considered.saturating_sub(1);
+                        if candidate.oldest_entry_at < watermark {
+                            state.expired_candidates = state.expired_candidates.saturating_sub(1);
+                        }
+                        deferred.push_back(candidate);
+                        exhausted = false;
+                        stop_dispatch = true;
+                        continue;
+                    }
+                    if batch_admitted >= batch_max_bytes {
+                        // The batch is full by bytes: hold the object for the next batch, and
+                        // count it there.
+                        state.candidates_considered = state.candidates_considered.saturating_sub(1);
+                        if candidate.oldest_entry_at < watermark {
+                            state.expired_candidates = state.expired_candidates.saturating_sub(1);
+                        }
+                        deferred.push_back(candidate);
+                        exhausted = false;
+                        stop_dispatch = true;
+                        continue;
+                    }
+                    state.reclaimable_candidates += 1;
+                    admitted.0 = admitted.0.saturating_add(assessed.0);
+                    admitted.1 = admitted.1.saturating_add(assessed.1);
+                    batch_admitted = batch_admitted.saturating_add(assessed.0);
+                    batch_estimate = batch_estimate.saturating_add(assessed.0);
+                    in_flight_estimate.0 = in_flight_estimate.0.saturating_add(assessed.0);
+                    in_flight_estimate.1 = in_flight_estimate.1.saturating_add(assessed.1);
+                    in_flight.push(self.assess_or_evict_staged(
+                        candidate,
+                        assessed,
+                        Some(assessment),
+                    ));
+                    continue;
+                }
+                if eviction.is_some() {
+                    // A delete resolved: `estimate` is the assessed figure it was admitted by.
+                    admitted.0 = admitted.0.saturating_sub(estimate.0);
+                    admitted.1 = admitted.1.saturating_sub(estimate.1);
+                }
+                let shard = crate::staged_fold::shard_of(&candidate.cache_key)
+                    .map(|(bucket, l1)| crate::staged_fold::Shard::new(bucket, l1));
+                match assessment.verdict {
+                    StagedCandidateVerdict::Evictable => {
+                        match eviction {
+                            Some(Ok(None)) => {
+                                // A different object was published at the key between the
+                                // assessment's unlocked read and the slot acquisition. Nothing
+                                // was removed, so nothing was consumed: retire no entries, and
+                                // leave the new object to its own assessment on a later pass.
+                                *state.skips.entry("replaced_since_assessment").or_insert(0) += 1;
+                            }
+                            Some(Ok(Some(eviction))) if !eviction.meta_removed => {
+                                // The range files went and the `.meta` did not, so the fold still
+                                // counts the object and its ledger entries are its only hint.
+                                // Debit nothing and retire nothing: the next pass assesses the
+                                // surviving `.meta` and debits it once, when its unlink succeeds.
+                                flush_needed = true;
+                                state.total_freed =
+                                    state.total_freed.saturating_add(eviction.freed);
+                                *state.skips.entry("meta_unlink_failed").or_insert(0) += 1;
+                            }
+                            Some(Ok(Some(eviction))) => {
+                                flush_needed = true;
+                                state.total_freed =
+                                    state.total_freed.saturating_add(eviction.freed);
+                                state.evicted_objects += 1;
+                                // The debit, from the `.meta` the eviction read under the slot
+                                // lock. A heal that stripped a range after the unlocked
+                                // assessment published its own debit for that range, so the
+                                // assessment's figure would debit it twice.
+                                state.debited_bytes =
+                                    state.debited_bytes.saturating_add(eviction.staged.bytes);
+                                state.debited_ranges =
+                                    state.debited_ranges.saturating_add(eviction.staged.ranges);
+                                if let Some(shard) = shard {
+                                    let debit = batch_debits.entry(shard.clone()).or_default();
+                                    debit.bytes = debit.bytes.saturating_add(eviction.staged.bytes);
+                                    debit.ranges =
+                                        debit.ranges.saturating_add(eviction.staged.ranges);
+                                    // Retire only identities older than `ABSENT_RETIREMENT_GRACE`,
+                                    // the same gate `assess_staged_candidate` applies to every
+                                    // terminal arm. In the overwrite race the `.meta` evicted here
+                                    // is the OLD object's, read after a multipart completion
+                                    // appended its entries and before it renamed its own `.meta`
+                                    // into place, so the candidate carries the new object's fresh
+                                    // identities too. A consumed entry younger than the grace is
+                                    // retired by a later pass.
+                                    let cutoff = SystemTime::now()
+                                        .checked_sub(crate::write_ledger::ABSENT_RETIREMENT_GRACE)
+                                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                                    state.retired.entry(shard.clone()).or_default().extend(
+                                        candidate
+                                            .identities
+                                            .iter()
+                                            .filter(|(_, _, _, entry_at, _)| *entry_at <= cutoff)
+                                            .cloned(),
+                                    );
+                                    evicted_shards.insert(shard);
+                                }
+                            }
+                            Some(Err(e)) => {
+                                warn!(
+                                    "Staging eviction: failed to evict {}: {}",
+                                    candidate.cache_key, e
+                                );
+                            }
+                            None => {}
+                        }
+                    }
+                    StagedCandidateVerdict::MetadataAbsent
+                    | StagedCandidateVerdict::Graduated
+                    | StagedCandidateVerdict::Superseded => {
+                        // Terminal: these entries can never become evictable, so retire them.
+                        // `assessment.retirable`, NOT `candidate.identities`: for `Superseded`
+                        // only the entries whose own extent is terminal (loss mode L6).
+                        *state.skips.entry(assessment.verdict.reason()).or_insert(0) += 1;
+                        if let Some(shard) = shard {
+                            state
+                                .retired
+                                .entry(shard)
+                                .or_default()
+                                .extend(assessment.retirable.iter().cloned());
+                        }
+                    }
+                    StagedCandidateVerdict::Unreadable => {
+                        // Deliberately NOT retired. A `.meta` we failed to read may be
+                        // perfectly valid and transiently unavailable on shared storage.
+                        *state.skips.entry(assessment.verdict.reason()).or_insert(0) += 1;
+                        // The named component of the COUNT shortfall: the ledger names one entry
+                        // per staged extent, so its own claim is the only range figure available
+                        // for a `.meta` that could not be read.
+                        state.unreadable_candidate_ranges = state
+                            .unreadable_candidate_ranges
+                            .saturating_add(candidate.identities.len() as u64);
+                    }
+                }
+            }
+            // The batch is resolved: flush once, then publish its debits.
+            if flush_needed {
+                if let Err(e) = executor.consolidator.size_accumulator().flush().await {
+                    warn!(
+                        "Staging eviction: failed to flush the size accumulator after a batch: {}",
+                        e
+                    );
+                }
+            }
+            #[cfg(test)]
+            {
+                batch_index += 1;
+                run_staging_batch_hook(
+                    &self.cache_dir,
+                    StagingBatchPoint::BeforePublish { batch: batch_index },
+                );
+            }
+            if let Err(e) = crate::staged_fold::publish_removal_debits_replacing(
+                &self.cache_dir,
+                executor.ledger.instance_id(),
+                &batch_debits,
+                &mut last_entries,
+            ) {
+                warn!(
+                    "Staging eviction: could not publish the removal debits for {} shard(s) ({}); \
+                     they are queued for the consolidation cycle's flush",
+                    batch_debits.len(),
+                    e
+                );
+            }
+            #[cfg(test)]
+            run_staging_batch_hook(
+                &self.cache_dir,
+                StagingBatchPoint::AfterPublish {
+                    batch: batch_index,
+                    chunk: executor.chunk,
+                    chunk_shards: executor.chunk_shards,
+                },
+            );
+        }
+        // Objects assessed evictable and held back when the chunk stopped: counted once here, as
+        // the batch that took them would have counted them. Nothing was consumed, so nothing is
+        // retired; they stay for a later chunk or pass.
+        for candidate in &deferred {
+            state.candidates_considered += 1;
+            state.reclaimable_candidates += 1;
+            if candidate.oldest_entry_at < watermark {
+                state.expired_candidates += 1;
+            }
+        }
+        (evicted_shards, stopped_by_deadline)
+    }
+
+    /// One step of a candidate: with no `assessed`, its assessment; with one, its eviction against
+    /// the assessed identity, with the accumulator flush left to the batch. Returns the candidate
+    /// and the figure it is in flight by (the ledger estimate for an assessment, the assessed
+    /// figure for an eviction) with the results, so the executor can account for them.
+    async fn assess_or_evict_staged(
+        &self,
+        candidate: crate::write_ledger::StagedCandidate,
+        estimate: (u64, u64),
+        assessed: Option<crate::write_ledger::StagedCandidateAssessment>,
+    ) -> (
+        crate::write_ledger::StagedCandidate,
+        (u64, u64),
+        crate::write_ledger::StagedCandidateAssessment,
+        Option<Result<Option<crate::write_cache_manager::StagingEviction>>>,
+    ) {
+        let Some(assessment) = assessed else {
+            // R2.2: verify against the authoritative `.meta` before acting. One decision
+            // covering absent / graduated / superseded / unreadable.
+            let assessment =
+                crate::write_ledger::assess_staged_candidate(&self.cache_dir, &candidate).await;
+            #[cfg(test)]
+            run_staging_after_assess_hook(&self.cache_dir, &candidate.cache_key);
+            #[cfg(test)]
+            pause_staging_assessment(&self.cache_dir, &candidate.cache_key).await;
+            return (candidate, estimate, assessment, None);
+        };
+        let eviction = self
+            .evict_staged_object(&candidate.cache_key, assessment.assessed_identity.as_ref())
+            .await;
+        (candidate, estimate, assessment, Some(eviction))
+    }
+
+    /// Re-fold the shards a chunk removed staged objects from, while the global eviction lock is
+    /// still held (cache-eviction-at-scale § 16.6.2), or mark them dirty once the budget is spent.
+    ///
+    /// The fold never subtracts: an evicted object leaves its shard's figure only when a visit
+    /// re-reads that shard's `.meta`s. AFTER the chunk's removal debits are published,
+    /// deliberately: a visit that began after them makes the entry of each shard it installs
+    /// inert, so nothing is subtracted twice. Best-effort: a shard a peer holds, or a pass the
+    /// fold refuses, keeps its pre-eviction checkpoint and its removal debit stands in for the
+    /// eviction until a later visit; a dirty mark sends it to the front of the periodic fold.
+    async fn refold_staging_chunk(
+        &self,
+        ledger: &Arc<crate::write_ledger::WriteLedger>,
+        evicted_shards: &std::collections::BTreeSet<crate::staged_fold::Shard>,
+        deadline: tokio::time::Instant,
+        state: &mut StagingPassState,
+        deadline_hit: Option<&'static str>,
+    ) {
+        if evicted_shards.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        run_before_staging_refold_hook(&self.cache_dir);
+        if tokio::time::Instant::now() >= deadline {
+            for shard in evicted_shards {
+                crate::staged_fold::mark_dirty_shard(
+                    &self.cache_dir,
+                    ledger.instance_id(),
+                    shard.clone(),
+                );
+            }
+            if deadline_hit.is_none() && !state.refold_deadline_logged {
+                state.refold_deadline_logged = true;
+                self.log_staging_pass_deadline(
+                    "re-fold",
+                    state.evicted_objects,
+                    state.total_freed,
+                    state.debited_ranges,
+                    state.candidates_considered,
+                );
+            }
+            return;
+        }
+        let outcome = crate::staged_fold::run_staged_fold_over_shards(
+            &self.cache_dir,
+            ledger,
+            ledger.instance_id(),
+            evicted_shards,
+        )
+        .await;
+        let summary = outcome.summary();
+        let installed: std::collections::BTreeSet<crate::staged_fold::Shard> =
+            summary.installed.iter().map(|c| c.shard()).collect();
+        for shard in evicted_shards.iter().filter(|s| !installed.contains(s)) {
+            crate::staged_fold::mark_dirty_shard(
+                &self.cache_dir,
+                ledger.instance_id(),
+                shard.clone(),
+            );
+        }
+        if summary.installed.len() < evicted_shards.len() {
+            info!(
+                "Staging eviction: re-folded {} of {} evicted shard(s) ({} busy, {} \
+                 retained, reason={:?}); the rest keep their pre-eviction figure until \
+                 the periodic fold reaches them",
+                summary.installed.len(),
+                evicted_shards.len(),
+                summary.busy.len(),
+                summary.retained.len(),
+                outcome.retain_reason().map(|r| r.label())
+            );
+        } else {
+            debug!(
+                "Staging eviction: re-folded all {} evicted shard(s)",
+                evicted_shards.len()
+            );
+        }
     }
 
     /// The one line a staging pass stopped by its time budget logs, with what it did.
@@ -13154,7 +14445,7 @@ impl CacheManager {
             ));
         };
         let wcm = wcm_arc.read().await;
-        wcm.evict_write_cached_object_if_unchanged(cache_key, expected)
+        wcm.evict_write_cached_object_if_unchanged(cache_key, expected, false)
             .await
     }
 
@@ -13175,8 +14466,12 @@ impl CacheManager {
     /// rather than one per upload. That flag is per-process; the global eviction lock
     /// inside `evict_staging_tier` is what makes it safe fleet-wide.
     ///
+    /// `source` names the call site for the pass's pre-lock log line. A nudge declined because a
+    /// pass is in flight is counted, and logged at most once a minute with the count since the
+    /// last such line.
+    ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 3.1, 3.2
-    pub(crate) fn nudge_staging_eviction(self: &Arc<Self>) {
+    pub(crate) fn nudge_staging_eviction(self: &Arc<Self>, source: &'static str) {
         if self
             .staging_eviction_in_progress
             .compare_exchange(
@@ -13187,13 +14482,43 @@ impl CacheManager {
             )
             .is_err()
         {
-            debug!("Staging eviction already in progress, not spawning another");
+            let declined = self
+                .staging_nudges_declined
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last = self
+                .staging_nudge_declined_logged_at_secs
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if now_secs >= last.saturating_add(STAGING_NUDGE_DECLINED_LOG_INTERVAL_SECS)
+                && self
+                    .staging_nudge_declined_logged_at_secs
+                    .compare_exchange(
+                        last,
+                        now_secs,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                self.staging_nudges_declined
+                    .fetch_sub(declined, std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    "Staging eviction nudge declined: a pass is already in progress in this \
+                     process (nudge_source={}, declined_since_last_line={})",
+                    source, declined
+                );
+            }
             return;
         }
 
         let this = Arc::clone(self);
+        let nudged_at = tokio::time::Instant::now();
         tokio::spawn(async move {
-            let freed = this.evict_staging_tier().await;
+            let freed = this.evict_staging_tier_nudged(source, nudged_at).await;
             this.staging_eviction_in_progress
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             if freed > 0 {
@@ -16194,9 +17519,10 @@ impl CacheManager {
         use crate::cache_size_tracker as cst;
         let cap = self.tail_max_entries_in_force();
         let max_shards = lazy_tail_rebuild_max_shards(&self.cache_dir);
+        let budget = lazy_tail_rebuild_budget(&self.cache_dir);
         let min_interval_nanos = LAZY_TAIL_REBUILD_MIN_INTERVAL.as_nanos() as u64;
         for (position, (bucket, l1)) in order.into_iter().enumerate() {
-            if round.rebuilt >= max_shards || started.elapsed() >= LAZY_TAIL_REBUILD_BUDGET {
+            if round.rebuilt >= max_shards || started.elapsed() >= budget {
                 break;
             }
             if round.fresh.contains(&(bucket.clone(), l1.clone())) {
@@ -17757,6 +19083,7 @@ impl CacheManager {
                 max_cache_size,
                 self.eviction_target_percent,
             );
+            register_upload_allocation(&self.cache_dir, self.get_staging_bound_bytes());
         }
         let weak = Arc::downgrade(self);
         let tx = self.put_usage.clone();
@@ -18220,6 +19547,7 @@ impl CacheManager {
         // Spec: write-cache-accounting-and-eviction. Requirements: 8.3
         stats.sizes = Some(CacheSizes {
             total_cache_size: total_size.saturating_add(in_progress_part_bytes),
+            total_size,
             read_cache_size,
             read_cache_size_inverted_secs,
             write_cache_size,
@@ -18414,7 +19742,38 @@ impl CacheManager {
     /// 3. Updates MetadataCache on disk reads
     ///
     /// Use this method instead of directly reading from disk for better performance.
+    ///
+    /// An entry filled from an `x-amz-te: append-md5` response by a release before 3.0.7
+    /// ([`Self::is_append_md5_entry`]) is reported absent and never held in RAM. An older proxy
+    /// sharing the volume can publish one at any moment, including after the GET's own probe
+    /// (`handle_get_head_request`) found none, so nothing that reads through here may serve it.
+    /// The probe reads through [`Self::metadata_cached_unjudged`] and invalidates it.
     pub async fn get_metadata_cached(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<crate::cache_types::NewCacheMetadata>> {
+        match self.metadata_cached_unjudged(cache_key).await {
+            Ok(Some(metadata)) if Self::is_append_md5_entry(&metadata.object_metadata) => {
+                self.metadata_cache.invalidate(cache_key).await;
+                debug!(
+                    "Metadata for key {} was filled from an append-md5 response by a release before 3.0.7; reporting it absent",
+                    cache_key
+                );
+                Ok(None)
+            }
+            Err(e) => {
+                warn!("Failed to read metadata from disk for {}: {}", cache_key, e);
+                Err(e)
+            }
+            other => other,
+        }
+    }
+
+    /// [`Self::get_metadata_cached`] without its append-md5 judgement and without a WARN on a
+    /// failed read, for the GET's append-md5 probe, which judges the document itself and logs
+    /// at most one line for the request. An append-md5 entry read from disk is returned but
+    /// not held in RAM.
+    pub(crate) async fn metadata_cached_unjudged(
         &self,
         cache_key: &str,
     ) -> Result<Option<crate::cache_types::NewCacheMetadata>> {
@@ -18455,8 +19814,11 @@ impl CacheManager {
                 // Census row 1, the site the v1.9.4 fix guarded. The predicate moved into
                 // `ram_admission_permitted` by `ram-tier-effectiveness:R1.6` so that the rule
                 // exists once and every site applying it is greppable; the expression is
-                // unchanged, so this site's behaviour is unchanged.
-                if crate::metadata_cache::ram_admission_permitted(&metadata) {
+                // unchanged, so this site's behaviour is unchanged. An append-md5 entry is
+                // never held (see `get_metadata_cached`).
+                if crate::metadata_cache::ram_admission_permitted(&metadata)
+                    && !Self::is_append_md5_entry(&metadata.object_metadata)
+                {
                     self.metadata_cache
                         .put(
                             cache_key,
@@ -18475,9 +19837,8 @@ impl CacheManager {
                 Ok(Some(metadata))
             }
             Err(e) => {
-                // The `.meta` exists but could not be read. Disk wins.
+                // The `.meta` exists but could not be read. Disk wins. The WARN is the caller's.
                 self.fill_visibility_tracker.note_disk_meta(cache_key);
-                warn!("Failed to read metadata from disk for {}: {}", cache_key, e);
                 Err(e)
             }
         }
@@ -18529,16 +19890,9 @@ impl CacheManager {
         }
     }
 
-    /// Walk `metadata/_journals/*.journal` once, handing every `AccessUpdate` line's
-    /// `(cache_key, timestamp)` to `visit`. `visit` returns `false` to stop the walk.
-    ///
-    /// # Why this exists as a primitive
-    ///
-    /// Two callers need the same traversal with different verdicts — [`Self::is_cache_entry_active`]
-    /// wants "is THIS key present" with an early return, and [`Self::build_activity_set_in`]
-    /// wants "which keys are present" with no early return. Sharing one walk keeps them from
-    /// drifting apart on what counts as an activity record, which is the part that has to stay
-    /// identical for the batch form to be a safe substitution for the per-key form.
+    /// Walk `journals_dir`'s `*.journal` files once, handing every `AccessUpdate` line's
+    /// `(cache_key, timestamp)` to `visit`. `visit` returns `false` to stop the walk. It takes no
+    /// `&self`, so the eviction oracle can run it inside `spawn_blocking`.
     ///
     /// # The projection struct is the point, not an incidental tidy-up
     ///
@@ -18554,15 +19908,6 @@ impl CacheManager {
     /// Note this is synchronous blocking `std::fs` I/O. It is deliberately NOT converted to
     /// `tokio::fs` — see [`Self::build_activity_set_in`] for why that is coupled to the
     /// executor's directory affinity and why the two must not be changed apart.
-    fn scan_journal_activity<F>(&self, visit: F)
-    where
-        F: FnMut(&str, SystemTime) -> bool,
-    {
-        Self::scan_journal_activity_in(&self.cache_dir.join("metadata").join("_journals"), visit)
-    }
-
-    /// [`Self::scan_journal_activity`] against an explicit journals directory, with no `&self`, so
-    /// the eviction oracle can run it inside `spawn_blocking`.
     fn scan_journal_activity_in<F>(journals_dir: &Path, mut visit: F)
     where
         F: FnMut(&str, SystemTime) -> bool,
@@ -18707,64 +20052,10 @@ impl CacheManager {
         self.ram_cache_flush_interval * 2
     }
 
-    /// Check if cache entry is actively being used by other instances
-    ///
-    /// The predicate is a scan of `metadata/_journals/*.journal` for an `AccessUpdate`
-    /// entry for this key newer than 2× `ram_cache_flush_interval` (Req 19.2). A recent
-    /// cross-instance access is treated as evidence of activity, preventing premature
-    /// eviction.
-    ///
-    /// `Req 19.2` is the review fixes feature, **not**
-    /// `cache-eviction-at-scale`, whose R19.2 is about rotation being fleet-parallel. The citation
-    /// was ambiguous for long enough that one scoping unit recorded it as unresolvable; it is
-    /// written out here so the next reader does not have to re-derive it.
-    ///
-    /// It used to have a second, shorter branch first: a read of the retired
-    /// `locks/{key}.lock` write sentinel, which reported the key busy for the ~5 s a
-    /// publication held it. That namespace is gone, so this is the whole predicate — and
-    /// it is the longer-lived and the cross-instance one of the two, so nothing local
-    /// replaces the branch that went.
-    ///
-    /// # This is no longer the eviction executor's caller
-    ///
-    /// The executor used to call this once per candidate object, which re-read every journal file
-    /// per object. It now consults an [`EvictionActivityOracle`] built once per pass. This function
-    /// is kept, `pub`, and semantically unchanged: it is the contract pin
-    /// (`tests/shared_cache_coordination_test.rs` calls it from outside the crate) and the form the
-    /// four production-unreachable callers still use. Do not delete it, and do not narrow it to
-    /// `pub(crate)`.
-    pub async fn is_cache_entry_active(&self, cache_key: &str) -> Result<bool> {
-        // Requirement 19.2: Scan journal for recent AccessUpdate entries from other instances
-        // within 2× ram_cache_flush_interval to detect cross-instance access activity
-        let journal_window = self.cross_instance_activity_window();
-        let cutoff = SystemTime::now()
-            .checked_sub(journal_window)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-
-        let mut active = false;
-        self.scan_journal_activity(|key, timestamp| {
-            if key == cache_key && timestamp >= cutoff {
-                active = true;
-                return false; // Found it — stop the walk.
-            }
-            true
-        });
-
-        if active {
-            debug!(
-                "Cache entry {} has recent cross-instance access (age within {:?})",
-                cache_key, journal_window
-            );
-        }
-
-        Ok(active)
-    }
-
     /// Build the pass-scoped set of keys with a recent cross-instance access.
     ///
-    /// One traversal, whatever the candidate count. The returned set is the batch form of
-    /// [`Self::is_cache_entry_active`]'s verdict: membership means "some instance journalled an
-    /// access to this key inside the window".
+    /// One traversal, whatever the candidate count. Membership means "some instance journalled
+    /// an access to this key inside the window".
     ///
     /// # The cap fails in the CONSERVATIVE direction
     ///
@@ -19112,11 +20403,112 @@ impl CacheManager {
             .await
     }
 
-    /// Clear a part layout no 3.0.1 gate recorded, under the key's slot
-    /// lock. The `.meta` is re-read there, so a layout recorded, or a document replaced, since
-    /// the caller's read is left alone. Best effort: on failure the layout stays, and the next
-    /// lookup refuses it again.
-    async fn clear_unverified_part_layout(&self, cache_key: &str) {
+    /// Whether the part lookup may use `part_ranges[part_number] = extent`: an entry a release
+    /// from 3.0.7 on recorded (`part_layout_marked`), and not a part after the first at offset 0.
+    /// Parts are contiguous from byte 0, so a later part at offset 0 is the shape a release
+    /// before 3.0.7 recorded for a part it stored with S3's MD5 trailer, whatever the marker says.
+    pub(crate) fn part_layout_entry_trusted(
+        object_metadata: &crate::cache_types::ObjectMetadata,
+        part_number: u32,
+        extent: (u64, u64),
+    ) -> bool {
+        !(part_number > 1 && extent.0 == 0)
+            && object_metadata.part_layout_marked.contains(&part_number)
+    }
+
+    /// Whether the listing `start..=end` is the one a part layout entry the part lookup refuses
+    /// ([`Self::part_layout_entry_trusted`]) was written with: a release before 3.0.7 recorded
+    /// the entry and the range together for a part it stored with S3's MD5 trailer at offset 0.
+    /// Such a listing is no coverage for any read until the part's lookup retires it
+    /// ([`Self::clear_unverified_part_layout`]). Part 1's listing of the whole object of a
+    /// layout of at most one part is not refused, as [`Self::retire_paired_part_listings`]
+    /// keeps it.
+    pub(crate) fn listing_pairs_untrusted_part_entry(
+        object_metadata: &crate::cache_types::ObjectMetadata,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        if object_metadata.part_ranges.is_empty() {
+            return false;
+        }
+        let whole_object = start == 0 && end.checked_add(1) == Some(object_metadata.content_length);
+        let single_part = object_metadata.parts_count.is_none_or(|n| n <= 1);
+        object_metadata
+            .part_ranges
+            .iter()
+            .any(|(&part_number, &extent)| {
+                extent == (start, end)
+                    && !Self::part_layout_entry_trusted(object_metadata, part_number, extent)
+                    && !(part_number == 1 && single_part && whole_object)
+            })
+    }
+
+    /// Remove from `metadata`, under the caller's slot lock, the listing of exactly each cleared
+    /// part layout entry's extent, delete its range file and debit it. A release before 3.0.7
+    /// wrote a part's layout entry together with the part's range, so the pair identifies a range
+    /// that may hold the part plus S3's MD5 trailer at offset 0. Whole-object listings and other
+    /// ranges are kept, and so is part 1's listing when it spans the whole object of a layout of
+    /// at most one part, where part 1 is the object. Returns how many listings were retired.
+    async fn retire_paired_part_listings(
+        &self,
+        cache_key: &str,
+        metadata: &mut crate::cache_types::NewCacheMetadata,
+        cleared: &[(u32, (u64, u64))],
+    ) -> usize {
+        let content_length = metadata.object_metadata.content_length;
+        let single_part = metadata.object_metadata.parts_count.is_none_or(|n| n <= 1);
+        let paired: Vec<crate::cache_types::RangeSpec> = metadata
+            .ranges
+            .iter()
+            .filter(|r| {
+                cleared.iter().any(|&(part_number, (start, end))| {
+                    let whole_object = start == 0 && end.checked_add(1) == Some(content_length);
+                    r.start == start
+                        && r.end == end
+                        && !(part_number == 1 && single_part && whole_object)
+                })
+            })
+            .cloned()
+            .collect();
+        if paired.is_empty() {
+            return 0;
+        }
+        let (removed, failed) = Self::remove_range_files_in(
+            &self.cache_dir,
+            cache_key,
+            &paired,
+            metadata.object_metadata.is_write_cached,
+        );
+        if failed > 0 {
+            warn!(
+                "Part layout listing cleanup incomplete: cache_key={}, removed={}, failed={}; \
+                 the undeleted files are orphaned and are deliberately not debited",
+                cache_key,
+                removed.len(),
+                failed
+            );
+        }
+        self.debit_removed_ranges(cache_key, &removed).await;
+        metadata
+            .ranges
+            .retain(|r| !paired.iter().any(|p| p.file_path == r.file_path));
+        if let Err(e) = self.invalidate_ram_ranges(cache_key).await {
+            debug!(
+                "RAM ranges not invalidated after retiring a part listing: key={}, error={}",
+                cache_key, e
+            );
+        }
+        paired.len()
+    }
+
+    /// Clear part layout entries the part lookup may not use, under the key's slot lock, with
+    /// the listing of exactly each cleared entry's extent ([`Self::retire_paired_part_listings`]).
+    /// `only: None` clears every entry of a layout no 3.0.1 gate recorded
+    /// (`part_layout_verified` false); `only: Some((n, extent))` clears entry `n` when it still
+    /// reads `extent` and [`Self::part_layout_entry_trusted`] refuses it. The `.meta` is re-read
+    /// there, so a layout recorded, or a document replaced, since the caller's read is left alone.
+    /// Best effort: on failure the layout stays, and the next lookup refuses it again.
+    async fn clear_unverified_part_layout(&self, cache_key: &str, only: Option<(u32, (u64, u64))>) {
         let metadata_file_path = self.get_new_metadata_file_path(cache_key);
         let _meta_lock = match crate::metadata_lock_manager::acquire_slot_lock_within_budget(
             &self.cache_dir,
@@ -19136,15 +20528,41 @@ impl CacheManager {
         let Ok(Some(mut metadata)) = self.read_metadata_file(cache_key).await else {
             return;
         };
+        let layout = &metadata.object_metadata;
+        let cleared: Vec<(u32, (u64, u64))> = match only {
+            None => {
+                if layout.part_layout_verified
+                    || (layout.part_ranges.is_empty() && layout.parts_count.is_none())
+                {
+                    return;
+                }
+                layout.part_ranges.iter().map(|(&n, &e)| (n, e)).collect()
+            }
+            Some((part_number, extent)) => {
+                if layout.part_ranges.get(&part_number) != Some(&extent)
+                    || Self::part_layout_entry_trusted(layout, part_number, extent)
+                {
+                    return;
+                }
+                vec![(part_number, extent)]
+            }
+        };
+        let (parts, parts_count) = (cleared.len(), layout.parts_count);
+        let listings = self
+            .retire_paired_part_listings(cache_key, &mut metadata, &cleared)
+            .await;
         let layout = &mut metadata.object_metadata;
-        if layout.part_layout_verified
-            || (layout.part_ranges.is_empty() && layout.parts_count.is_none())
-        {
-            return;
+        match only {
+            None => {
+                layout.part_ranges.clear();
+                layout.parts_count = None;
+                layout.part_layout_marked.clear();
+            }
+            Some((part_number, _)) => {
+                layout.part_ranges.remove(&part_number);
+                layout.part_layout_marked.remove(&part_number);
+            }
         }
-        let (parts, parts_count) = (layout.part_ranges.len(), layout.parts_count);
-        layout.part_ranges.clear();
-        layout.parts_count = None;
         let written = serde_json::to_string_pretty(&metadata)
             .map_err(|e| e.to_string())
             .and_then(|metadata_json| {
@@ -19160,14 +20578,20 @@ impl CacheManager {
                     e.to_string()
                 })
             });
-        match written {
-            Ok(()) => info!(
+        match (written, only) {
+            (Ok(()), None) => info!(
                 "Cleared a part layout recorded before 3.0.1, which may describe another \
                  object version; each part is fetched from S3 once and recorded again: \
-                 key={}, parts={}, parts_count={:?}",
-                cache_key, parts, parts_count
+                 key={}, parts={}, parts_count={:?}, listings_retired={}",
+                cache_key, parts, parts_count, listings
             ),
-            Err(e) => warn!(
+            (Ok(()), Some((part_number, (start, end)))) => info!(
+                "Cleared a part layout entry recorded before 3.0.7, which may name a part stored \
+                 with S3's MD5 trailer; the part is fetched from S3 once and recorded again: \
+                 key={}, part_number={}, range={}-{}, listings_retired={}",
+                cache_key, part_number, start, end, listings
+            ),
+            (Err(e), _) => warn!(
                 "Failed to clear an unverified part layout: key={}, error={}",
                 cache_key, e
             ),
@@ -19209,6 +20633,15 @@ impl CacheManager {
 
         // Load ObjectMetadata for cache key - Handle metadata read failures (Requirement 11.3)
         let metadata = match self.read_metadata_file(cache_key).await {
+            // An append-md5 entry of a release before 3.0.7 is a miss (see
+            // `get_metadata_cached`): a part stored from one carries S3's MD5 trailer.
+            Ok(Some(metadata)) if Self::is_append_md5_entry(&metadata.object_metadata) => {
+                debug!(
+                    "Part lookup: entry filled from an append-md5 response by a release before 3.0.7, treated as a miss: cache_key={}, part_number={}",
+                    cache_key, part_number
+                );
+                return Ok(None);
+            }
             Ok(Some(metadata)) => metadata,
             Ok(None) => {
                 debug!(
@@ -19288,7 +20721,9 @@ impl CacheManager {
         let age = SystemTime::now()
             .duration_since(metadata.freshness_anchor())
             .unwrap_or(std::time::Duration::ZERO);
-        if !for_revalidation && (get_ttl.is_zero() || age > get_ttl) {
+        // An entry a write expired is served only after an origin `304`.
+        if !for_revalidation && (get_ttl.is_zero() || age > get_ttl || metadata.is_write_expired())
+        {
             debug!(
                 "Part lookup: live get_ttl verdict is expired, forwarding to S3: cache_key={}, part_number={}, get_ttl={:?}, age={:?}",
                 cache_key, part_number, get_ttl, age
@@ -19311,7 +20746,7 @@ impl CacheManager {
                  version's; clearing it and forwarding to S3: cache_key={}, part_number={}",
                 cache_key, part_number
             );
-            self.clear_unverified_part_layout(cache_key).await;
+            self.clear_unverified_part_layout(cache_key, None).await;
             return Ok(None);
         }
 
@@ -19334,6 +20769,22 @@ impl CacheManager {
                 return Ok(None);
             }
         };
+
+        // A layout entry a release before 3.0.7 recorded, or a part after the first at offset
+        // 0: it may name the part plus S3's MD5 trailer, stored at offset 0 from an append-md5
+        // answer. Clear it and its listing, and miss: the part is fetched from S3 once and
+        // recorded marked. No setting keeps it; a kept one serves wrong bytes.
+        if !Self::part_layout_entry_trusted(&metadata.object_metadata, part_number, (start, end)) {
+            debug!(
+                "Part lookup: the layout entry was recorded before 3.0.7 or puts a later part at \
+                 offset 0; clearing it and forwarding to S3: cache_key={}, part_number={}, \
+                 range={}-{}",
+                cache_key, part_number, start, end
+            );
+            self.clear_unverified_part_layout(cache_key, Some((part_number, (start, end))))
+                .await;
+            return Ok(None);
+        }
 
         // Validate part number is within bounds if parts_count is available (Requirement 5.4)
         if let Some(parts_count) = metadata.object_metadata.parts_count {
@@ -19690,8 +21141,11 @@ impl CacheManager {
             // fingerprint as a poisoned one, which would otherwise make
             // `is_part_scoped_entry` revalidate a healthy entry on every read: a
             // cache-hit-rate regression with no obvious cause. The part count is
-            // preserved in the typed field just below.
-            response_headers: Self::strip_response_scoped_headers(headers),
+            // preserved in the typed field just below. The part's checksum headers go too:
+            // they describe the part, not the object (`strip_part_checksum_headers`).
+            response_headers: Self::strip_part_checksum_headers(
+                Self::strip_response_scoped_headers(headers),
+            ),
             parts_count: multipart_info.parts_count,
             ..Default::default()
         };
@@ -19906,16 +21360,36 @@ impl CacheManager {
             && (!metadata.object_metadata.part_ranges.is_empty()
                 || metadata.object_metadata.parts_count.is_some())
         {
+            let cleared: Vec<(u32, (u64, u64))> = metadata
+                .object_metadata
+                .part_ranges
+                .iter()
+                .map(|(&n, &e)| (n, e))
+                .collect();
+            self.retire_paired_part_listings(cache_key, &mut metadata, &cleared)
+                .await;
             metadata.object_metadata.part_ranges.clear();
             metadata.object_metadata.parts_count = None;
+            metadata.object_metadata.part_layout_marked.clear();
             metadata_updated = true;
         }
 
         // Store part byte range in part_ranges map (Requirements 3.1, 3.2)
         if let (Some(pn), Some((start, end))) = (part_number, part_range) {
             // Only update if this part is not already in part_ranges or has different range
-            let existing_range = metadata.object_metadata.part_ranges.get(&pn);
-            if existing_range != Some(&(start, end)) {
+            let existing_range = metadata.object_metadata.part_ranges.get(&pn).copied();
+            if let Some(old) = existing_range.filter(|&old| {
+                old != (start, end)
+                    && !Self::part_layout_entry_trusted(&metadata.object_metadata, pn, old)
+            }) {
+                self.retire_paired_part_listings(cache_key, &mut metadata, &[(pn, old)])
+                    .await;
+            }
+            // Recorded from a part stored at its own offsets (3.0.7 on).
+            if metadata.object_metadata.part_layout_marked.insert(pn) {
+                metadata_updated = true;
+            }
+            if existing_range != Some((start, end)) {
                 metadata
                     .object_metadata
                     .part_ranges
@@ -20094,7 +21568,7 @@ impl CacheManager {
                 metadata.created_at,
                 current_head_ttl,
                 now,
-            );
+            ) && !metadata.is_write_expired();
             if head_fresh {
                 // An entry written by a pre-fix release from a part-scoped
                 // response cannot be trusted for its length, so it is not
@@ -20112,6 +21586,15 @@ impl CacheManager {
                     // the rewrite lands on disk, but a HEAD-only entry has no
                     // ranges and so is not re-published to RAM, leaving this
                     // stale copy to be detected again on every subsequent read.
+                    self.metadata_cache.invalidate(cache_key).await;
+                } else if Self::is_append_md5_entry(&metadata.object_metadata) {
+                    // Same shape as the part-scoped guard above, for an entry filled from an
+                    // append-md5 response (`is_append_md5_entry`). The HEAD that follows
+                    // reaches S3, and its merge clears the entry's ranges.
+                    warn!(
+                        "Ignoring a HEAD cache entry for {} filled from an append-md5 response by a release before 3.0.7 (RAM tier); revalidating against S3",
+                        cache_key
+                    );
                     self.metadata_cache.invalidate(cache_key).await;
                 } else if metadata.object_metadata.effective_last_modified().is_none() {
                     // Same precedent, different defect (R5.1, R5.2): a write-through PUT
@@ -20225,7 +21708,7 @@ impl CacheManager {
                         metadata.created_at,
                         current_head_ttl,
                         now,
-                    );
+                    ) && !metadata.is_write_expired();
                     if head_fresh {
                         // Same poisoned-entry guard as the RAM tier above.
                         if Self::is_part_scoped_entry(&metadata.object_metadata) {
@@ -20237,6 +21720,13 @@ impl CacheManager {
                             // (when it carried ranges — see the admission guard
                             // there), before the freshness check. Undo that, for
                             // the same convergence reason as the RAM tier.
+                            self.metadata_cache.invalidate(cache_key).await;
+                        } else if Self::is_append_md5_entry(&metadata.object_metadata) {
+                            // Same guard as the RAM tier above.
+                            warn!(
+                                "Ignoring a HEAD cache entry for {} filled from an append-md5 response by a release before 3.0.7 (disk tier); revalidating against S3",
+                                cache_key
+                            );
                             self.metadata_cache.invalidate(cache_key).await;
                         } else if metadata.object_metadata.effective_last_modified().is_none() {
                             // Same disk-tier guard as the RAM tier above (R5.1, R5.2,
@@ -20286,7 +21776,7 @@ impl CacheManager {
 
     /// Convert NewCacheMetadata to HeadCacheEntry for backward compatibility
     /// This allows the new unified metadata format to work with existing HEAD cache consumers
-    fn convert_new_metadata_to_head_entry(
+    pub(crate) fn convert_new_metadata_to_head_entry(
         &self,
         metadata: &crate::cache_types::NewCacheMetadata,
     ) -> HeadCacheEntry {
@@ -20306,9 +21796,15 @@ impl CacheManager {
             last_accessed: metadata.head_last_accessed.unwrap_or_else(SystemTime::now),
         };
 
+        // A part's checksum stored as the object's is not replayed
+        // (`stored_checksum_is_a_parts`).
+        let mut headers = metadata.object_metadata.response_headers.clone();
+        if Self::stored_checksum_is_a_parts(&metadata.object_metadata) {
+            headers.retain(|k, _| !Self::is_checksum_header(k));
+        }
         HeadCacheEntry {
             cache_key: metadata.cache_key.clone(),
-            headers: metadata.object_metadata.response_headers.clone(),
+            headers,
             metadata: legacy_metadata,
             created_at: metadata.created_at,
             expires_at: metadata.head_expires_at.unwrap_or(metadata.expires_at),
@@ -20577,12 +22073,20 @@ impl CacheManager {
     /// without firing on entries this release itself writes. Nothing is lost:
     /// the part count survives as the typed `ObjectMetadata::parts_count` field,
     /// which `store_part_as_range_witnessed` populates from this same header.
+    ///
+    /// `x-amz-transfer-encoding` and `x-amz-content-range` describe an `append-md5` response
+    /// (`crate::append_md5`), not the object, so a HEAD merge drops them too. Their presence in
+    /// a stored entry is [`Self::is_append_md5_entry`]'s fingerprint.
     fn strip_response_scoped_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
         headers
             .iter()
             .filter(|(k, _)| {
                 let k = k.to_ascii_lowercase();
-                k != "content-length" && k != "content-range" && k != "x-amz-mp-parts-count"
+                k != "content-length"
+                    && k != "content-range"
+                    && k != "x-amz-mp-parts-count"
+                    && k != crate::append_md5::TRANSFER_ENCODING_HEADER
+                    && k != crate::append_md5::CONTENT_RANGE_HEADER
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
@@ -20622,6 +22126,151 @@ impl CacheManager {
         })
     }
 
+    /// What the GET's append-md5 probe (`handle_get_head_request`) finds for `cache_key`.
+    ///
+    /// The first read is [`Self::metadata_cached_unjudged`] (RAM, then disk). When it fails
+    /// (the `.meta` exists and does not read or parse), the file is classified under the key's
+    /// slot lock by [`crate::disk_cache::read_and_parse_metadata_blocking`], the classifier the
+    /// fill path uses, which retries a stale handle, an empty read and a parse failure:
+    /// `Corrupt` is left in place and reported [`AppendMd5Probe::Corrupt`], and the request is
+    /// a miss: a streamed GET fill's publish unlinks the unparseable file, declines while the
+    /// final path still holds a range file under 600 s old, and counts the removal on
+    /// `cache.metadata_heal_overwrite_total`; `Parsed` is judged like a first read,
+    /// `Missing` is [`AppendMd5Probe::Clean`], and `TransientMiss`, or a slot lock not acquired
+    /// within its budget, is [`AppendMd5Probe::Unreadable`]. The slot lock is released before
+    /// this returns. Logs nothing itself.
+    pub async fn probe_entry_for_append_md5(&self, cache_key: &str) -> AppendMd5Probe {
+        let first = if take_injected_probe_read_failure(cache_key) {
+            Err(ProxyError::CacheError(
+                "injected probe read failure".to_string(),
+            ))
+        } else {
+            self.metadata_cached_unjudged(cache_key).await
+        };
+        let first_error = match first {
+            Ok(Some(metadata)) if Self::is_append_md5_entry(&metadata.object_metadata) => {
+                return AppendMd5Probe::AppendMd5Entry;
+            }
+            Ok(_) => return AppendMd5Probe::Clean,
+            Err(e) => e,
+        };
+        let _slot = match crate::metadata_lock_manager::acquire_slot_lock_within_budget(
+            &self.cache_dir,
+            cache_key,
+        )
+        .await
+        {
+            Ok(lock) => lock,
+            Err(e) => {
+                return AppendMd5Probe::Unreadable(format!(
+                    "{}; the slot lock to classify it was not acquired: {}",
+                    first_error, e
+                ));
+            }
+        };
+        let path = self.get_new_metadata_file_path(cache_key);
+        let outcome = match tokio::task::spawn_blocking(move || {
+            crate::disk_cache::read_and_parse_metadata_blocking(&path, u64::MAX)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return AppendMd5Probe::Unreadable(format!(
+                    "{}; the task classifying it failed: {}",
+                    first_error, e
+                ));
+            }
+        };
+        match outcome {
+            crate::disk_cache::MetadataReadOutcome::Parsed(metadata)
+                if Self::is_append_md5_entry(&metadata.object_metadata) =>
+            {
+                AppendMd5Probe::AppendMd5Entry
+            }
+            crate::disk_cache::MetadataReadOutcome::Parsed(_)
+            | crate::disk_cache::MetadataReadOutcome::Missing => AppendMd5Probe::Clean,
+            crate::disk_cache::MetadataReadOutcome::Corrupt { .. } => AppendMd5Probe::Corrupt,
+            crate::disk_cache::MetadataReadOutcome::TransientMiss => {
+                AppendMd5Probe::Unreadable(format!(
+                    "{}; it stayed unreadable across the classifier's retries",
+                    first_error
+                ))
+            }
+        }
+    }
+
+    /// Was this entry filled from an `x-amz-te: append-md5` response by a release before 3.0.7?
+    ///
+    /// Those releases stored such a response as received: the body with S3's 16-byte MD5
+    /// trailer as object bytes, `content_length` 16 bytes long, and, for a part answer, the
+    /// part plus its MD5 at offset 0 as the whole object. They also stored
+    /// `x-amz-transfer-encoding` and, for a part, `x-amz-content-range`, which no write site of
+    /// this release stores (`crate::append_md5::fill_shape` removes both with the trailer, the
+    /// signed range path's `whole_object_200_fits_range_spec` and
+    /// `content_range_fits_range_spec` refuse a response carrying them, and
+    /// [`Self::strip_response_scoped_headers`] drops them on every merge). Either header is
+    /// therefore the fingerprint of an entry whose bytes and length cannot be trusted. A GET
+    /// invalidates such an entry before serving (`handle_get_head_request`), a HEAD treats it
+    /// as a miss, and the HEAD merge clears its ranges (`update_metadata_head_fields_locked`).
+    ///
+    /// # This is compatibility code with an expiry
+    ///
+    /// It can be deleted once no pre-3.0.7 entry can still be within its TTL: one release
+    /// cycle after every fleet has upgraded and the configured `get_ttl` and `head_ttl` have
+    /// elapsed. Delete the detector, its call sites and the tests that plant such an entry.
+    pub(crate) fn is_append_md5_entry(om: &crate::cache_types::ObjectMetadata) -> bool {
+        om.response_headers.keys().any(|k| {
+            k.eq_ignore_ascii_case(crate::append_md5::TRANSFER_ENCODING_HEADER)
+                || k.eq_ignore_ascii_case(crate::append_md5::CONTENT_RANGE_HEADER)
+        })
+    }
+    /// An `x-amz-checksum-*` header, or its SDK-style `Checksum*` form.
+    pub(crate) fn is_checksum_header(key: &str) -> bool {
+        let k = key.to_ascii_lowercase();
+        k.starts_with("x-amz-checksum-") || k.starts_with("checksum")
+    }
+    /// `headers` without any checksum header. A part response's `x-amz-checksum-*` describes
+    /// the part (S3 sends part 1's CRC32 as `f0fpIA==` where the object's is `2ZyZAw==-2`), so
+    /// it is never stored as the object's.
+    pub(crate) fn strip_part_checksum_headers(
+        headers: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        headers
+            .into_iter()
+            .filter(|(k, _)| !Self::is_checksum_header(k))
+            .collect()
+    }
+    /// Does this entry hold a part's checksum as the object's?
+    ///
+    /// Releases before 3.0.7 stored a `partNumber` response's checksum headers as the
+    /// object's, so a validating client (boto3, `aws s3api get-object`) failed every
+    /// whole-object read with `FlexibleChecksumError`. S3's checksum of an object with more
+    /// than one part ends `-N`; a part's does not. So on an object of more than one part, a
+    /// stored checksum value without a `-N` suffix is a part's, and serving drops every
+    /// checksum header of the entry. This also drops a full-object checksum (type
+    /// `FULL_OBJECT`) of a multipart upload, which S3 also writes without a suffix: that read
+    /// then carries no checksum to validate, which costs the client a check, never bytes.
+    ///
+    /// Only entries written before 3.0.7 are judged: a fill's metadata since then carries
+    /// `checksums_object_scoped`, and its checksums are the object's, `FULL_OBJECT` included.
+    pub(crate) fn stored_checksum_is_a_parts(om: &crate::cache_types::ObjectMetadata) -> bool {
+        if om.checksums_object_scoped {
+            return false;
+        }
+        fn part_suffix(value: &str) -> Option<u32> {
+            let (_, n) = value.trim().trim_matches('"').rsplit_once('-')?;
+            n.parse::<u32>().ok()
+        }
+        let multi_part =
+            om.parts_count.is_some_and(|n| n > 1) || part_suffix(&om.etag).is_some_and(|n| n > 1);
+        multi_part
+            && om.response_headers.iter().any(|(k, v)| {
+                Self::is_checksum_header(k)
+                    && !k.to_ascii_lowercase().ends_with("type")
+                    && part_suffix(v).is_none()
+            })
+    }
     /// Does this entry claim to be the zero-byte object AND claim a positive length?
     ///
     /// Those two claims cannot both be true, so an entry making both is corrupt
@@ -20871,7 +22520,18 @@ impl CacheManager {
             && metadata.object_metadata.content_length > 0
             && metadata.object_metadata.content_length != legacy_metadata.content_length;
 
-        let object_changed = etag_changed || size_changed;
+        // An entry filled from an append-md5 response by an earlier release holds bytes that
+        // are not the object's, even when its ETag and length now agree with the HEAD (a HEAD
+        // of that release already corrected the length and kept the fingerprint), so its
+        // ranges and part layout are cleared like a changed object's (`is_append_md5_entry`).
+        let append_md5_entry = Self::is_append_md5_entry(&metadata.object_metadata);
+        if append_md5_entry {
+            warn!(
+                "HEAD merge clearing the ranges of a cache entry filled from an append-md5 response by a release before 3.0.7: cache_key={}",
+                cache_key
+            );
+        }
+        let object_changed = etag_changed || size_changed || append_md5_entry;
         if object_changed {
             info!(
                 "HEAD response indicates object changed: cache_key={}, etag_changed={} (cached={}, head={}), size_changed={} (cached={}, head={})",
@@ -21067,6 +22727,7 @@ impl CacheManager {
             head_access_count: 1,
             head_cached_at: Some(now),
             last_validated_at: None,
+            write_expired_at: None,
         };
 
         // Write to disk
@@ -21313,12 +22974,14 @@ impl CacheManager {
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         };
 
         // Store full object as range using new architecture
@@ -21964,8 +23627,7 @@ impl CacheManager {
         // held for the sink's lifetime, auto-releasing on drop — preserving the
         // buffered path's capacity accounting.
         let reservation = if content_length > 0 {
-            // R4.1: the Disk_Safety_Bound is the only bound that may decline caching.
-            // Checked before reserving so a declined upload never appears as in-flight.
+            // R4.1: the Disk_Safety_Bound may decline caching. Checked before reserving so a declined upload never appears as in-flight.
             // The upload itself is unaffected — the caller still streams the body to S3
             // and returns S3's response unchanged.
             if self.disk_safety_refusal(content_length).await.is_some() {
@@ -22003,12 +23665,14 @@ impl CacheManager {
                 parts_count: None,
                 part_ranges: HashMap::new(),
                 part_layout_verified: false,
+                part_layout_marked: Default::default(),
                 upload_id: None,
                 is_write_cached: true,
                 write_cache_expires_at: Some(now + effective_put_ttl),
                 write_cache_created_at: Some(now),
                 write_cache_last_accessed: Some(now),
                 graduation_accounted: false,
+                checksums_object_scoped: false,
             };
 
             let metadata = NewCacheMetadata {
@@ -22165,6 +23829,7 @@ impl CacheManager {
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             // Write cache tracking fields (Requirement 1.3)
             is_write_cached: true,
@@ -22172,6 +23837,7 @@ impl CacheManager {
             write_cache_created_at: Some(now),
             write_cache_last_accessed: Some(now),
             graduation_accounted: false,
+            checksums_object_scoped: false,
         };
 
         // Record staging membership ON the range before the `.meta` is written, so
@@ -22349,10 +24015,10 @@ impl CacheManager {
         write_cache_setup_step(cache_key, "disk_safety");
         #[cfg(test)]
         write_cache_setup_stall_hook(cache_key);
-        // R4.1: the Disk_Safety_Bound is the only bound that may decline caching. The
-        // Staging_Bound no longer refuses — going over it triggers asynchronous eviction
-        // instead (R3.1) — so this is the one check that can turn a cacheable upload into
-        // an uncached one. The upload still streams to S3 either way.
+        // R4.1: the Disk_Safety_Bound may decline caching. The Staging_Bound refuses no
+        // upload (R3.1): going over its trigger starts asynchronous eviction, and the
+        // staged-share cap at the bound is checked by the caller before this
+        // (`SignedPutHandler::setup_put_cache_tee`). The upload still streams to S3 either way.
         if self.disk_safety_refusal(content_length).await.is_some() {
             return Ok(None);
         }
@@ -22640,7 +24306,7 @@ impl CacheManager {
                 );
                 continue;
             }
-            match std::fs::remove_file(&range_file_path) {
+            match crate::disk_cache::remove_range_file(&range_file_path) {
                 Ok(()) => removed.push(RemovedRange {
                     start: range_spec.start,
                     end: range_spec.end,
@@ -22809,7 +24475,7 @@ impl CacheManager {
                 failed
             );
         }
-        let meta_removed = match std::fs::remove_file(meta_path) {
+        let meta_removed = match crate::disk_cache::remove_range_file(meta_path) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
@@ -22818,6 +24484,19 @@ impl CacheManager {
                      cache_key={}, path={:?}, error={}",
                     cache_key, meta_path, e
                 );
+                // Unchanged, the document would keep listing the extents whose unlink failed,
+                // unmarked and fresh, until `get_ttl`. The next fill of another version that
+                // meets it repeats this removal.
+                let kept = published
+                    .ranges
+                    .iter()
+                    .filter(|r| {
+                        !removed.iter().any(|x| x.start == r.start && x.end == r.end)
+                            && cache_dir.join("ranges").join(&r.file_path).exists()
+                    })
+                    .cloned()
+                    .collect();
+                retire_unremoved_document_locked(meta_path, cache_key, published, kept, slot);
                 false
             }
         };
@@ -25296,6 +26975,12 @@ impl CacheManager {
             return Ok(self.tracked_fill_metadata(cache_key).await);
         }
         match self.read_metadata_file(cache_key).await? {
+            // An append-md5 entry of a release before 3.0.7 is never served: absent here, as in
+            // `get_metadata_cached`. Disk wins over the tracker.
+            Some(disk) if Self::is_append_md5_entry(&disk.object_metadata) => {
+                self.fill_visibility_tracker.note_disk_meta(cache_key);
+                Ok(None)
+            }
             // Disk wins, except over a HEAD-only `.meta` of the tracked fill's version.
             Some(disk) => Ok(Some(
                 match self.tracked_fill_over_disk_meta(cache_key, &disk).await {
@@ -25375,12 +27060,21 @@ impl CacheManager {
         match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content) {
             Ok(meta) => {
                 let content_length = meta.object_metadata.content_length;
+                // An entry a write expired lists nothing a RAM copy may serve: the read goes to
+                // the disk tier, which revalidates it.
+                let write_expired = meta.is_write_expired();
                 let servable = meta
                     .ranges
                     .iter()
                     .filter(|r| {
-                        !r.unservable
+                        !write_expired
+                            && !r.unservable
                             && !crate::disk_cache::unverified_listing_refused(r, content_length)
+                            && !Self::listing_pairs_untrusted_part_entry(
+                                &meta.object_metadata,
+                                r.start,
+                                r.end,
+                            )
                     })
                     .map(|r| (r.start, r.end))
                     .collect();
@@ -27191,12 +28885,14 @@ mod cache_key_sanitization_tests {
             parts_count: Some(2), // 2 parts
             part_ranges,
             part_layout_verified: true,
+            part_layout_marked: (1..=2).collect(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         };
 
         // Create range for part 1 (0-8388607)
@@ -27381,12 +29077,14 @@ mod cache_key_sanitization_tests {
                 parts_count: Some(parts_count),
                 part_ranges: part_ranges_map.clone(),
                 part_layout_verified: true,
+                part_layout_marked: (1..=parts_count).collect(),
                 upload_id: None,
                 is_write_cached: false,
                 write_cache_expires_at: None,
                 write_cache_created_at: None,
                 write_cache_last_accessed: None,
                 graduation_accounted: false,
+                checksums_object_scoped: false,
             };
 
             // Get expected range from part_ranges
@@ -27627,12 +29325,14 @@ mod cache_key_sanitization_tests {
                 parts_count: Some(parts_count),
                 part_ranges: part_ranges_map.clone(),
                 part_layout_verified: true,
+                part_layout_marked: (1..=parts_count).collect(),
                 upload_id: None,
                 is_write_cached: false,
                 write_cache_expires_at: None,
                 write_cache_created_at: None,
                 write_cache_last_accessed: None,
                 graduation_accounted: false,
+                checksums_object_scoped: false,
             };
 
             // Get expected range from part_ranges
@@ -30910,6 +32610,7 @@ mod head_anchor_integration_tests {
             head_access_count: 1,
             head_cached_at: Some(now),
             last_validated_at: None,
+            write_expired_at: None,
         };
         manager.write_metadata_to_disk(&metadata).await.unwrap();
 
@@ -31092,6 +32793,7 @@ mod part_scoped_head_storage_tests {
             head_access_count: 1,
             head_cached_at: Some(now),
             last_validated_at: None,
+            write_expired_at: None,
         };
         manager.write_metadata_to_disk(&metadata).await.unwrap();
 
@@ -31286,6 +32988,7 @@ mod head_last_modified_guard_tests {
             head_access_count: 0,
             head_cached_at: None,
             last_validated_at: None,
+            write_expired_at: None,
         }
     }
 
@@ -31317,6 +33020,7 @@ mod head_last_modified_guard_tests {
             head_access_count: 1,
             head_cached_at: Some(now),
             last_validated_at: None,
+            write_expired_at: None,
         }
     }
 
@@ -31450,6 +33154,7 @@ mod head_last_modified_guard_tests {
             head_access_count: 1,
             head_cached_at: Some(now),
             last_validated_at: None,
+            write_expired_at: None,
         };
         plant_meta(&manager, key, metadata);
 
@@ -42736,10 +44441,14 @@ mod write_cache_count_eviction_tests {
 
         // ---- Fixture gate 2: the COUNT arm must fire. Seeded through `staged_fold`, because
         // the containment guard forbids this file from naming the fold's figure fields.
+        // On the object's own shard: the pass shares its shortfall by shard, so a figure seeded
+        // anywhere else gives this object no quota.
+        let (seed_bucket, seed_l1) =
+            crate::staged_fold::shard_of(key).expect("fixture key names a shard");
         crate::staged_fold::seed_shard_figure_for_tests(
             dir,
-            "seeded",
-            "01",
+            &seed_bucket,
+            &seed_l1,
             4_096,
             crate::staged_fold::STAGED_RANGE_BUDGET,
         );
@@ -42876,10 +44585,14 @@ mod write_cache_count_eviction_tests {
             .unwrap();
 
         // Count trigger over, byte trigger under, as in the test above.
+        // On the object's own shard: the pass shares its shortfall by shard, so a figure seeded
+        // anywhere else gives this object no quota.
+        let (seed_bucket, seed_l1) =
+            crate::staged_fold::shard_of(key).expect("fixture key names a shard");
         crate::staged_fold::seed_shard_figure_for_tests(
             dir,
-            "seeded",
-            "01",
+            &seed_bucket,
+            &seed_l1,
             4_096,
             crate::staged_fold::STAGED_RANGE_BUDGET,
         );
@@ -42902,7 +44615,7 @@ mod write_cache_count_eviction_tests {
             );
         }
         let remaining = ledger
-            .read_for_authority(usize::MAX)
+            .read_for_authority_for_tests(usize::MAX)
             .await
             .expect("ledger must be readable")
             .entries;
@@ -44106,10 +45819,8 @@ mod head_change_range_orphan_tests {
 // arm and then the production sweep. That is no longer possible on this tree, and the reason
 // is that this release has no orphan re-adoption sweep at all, so the corruption is
 // UNPRODUCIBLE by this release. The plant below therefore drives every field-mutating step through production
-// code — the seed, the zero-length publish, and the `add_or_update_range` heal via the same
-// `write_range_metadata_witnessed(.., WriteMode::Hybrid, None, Duration::ZERO)` call the sweep makes —
-// and does by hand only the one thing a pre-3.0.0 release did for it: leave the dereferenced
-// range file on disk.
+// code — the seed and the zero-length publish — and does by hand what a pre-3.0.0 release did:
+// leave the dereferenced range file on disk, and heal the document's length (see step 4).
 // =============================================================================
 /// `ram-tier-effectiveness:R1.2`'s contingency on the RAM admission rule, pinned at
 /// `has_cached_ranges` itself.
@@ -44737,7 +46448,7 @@ mod no_validator_no_fresh_serve_tests {
         );
         assert_eq!(
             readopted.object_metadata.content_length, BODY_LEN as u64,
-            "fixture: `add_or_update_range` must have HEALED content_length from 0 to the \
+            "fixture: the plant must have HEALED content_length from 0 to the \
              range's length — this is the dangerous case (c1), and without the heal the entry \
              is the INERT case (c2) that `has_cached_ranges` refuses on `content_length > 0` \
              and the assertion below would pass for the wrong reason. got={}",
@@ -49146,6 +50857,84 @@ mod stamp_overflow_tests {
         Some(bytes)
     }
 
+    /// Origin-change stamps (a GET or HEAD that S3 showed a `404` or another version) take at
+    /// most half the stamp-retry tasks and no place in the overflow queue, so a burst of them
+    /// leaves acknowledged writes' retries the other half of the tasks and the whole queue.
+    #[tokio::test]
+    async fn origin_change_stamps_take_at_most_half_the_retry_tasks_and_no_queue_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(setup(dir.path()).await);
+        let origin_keys = [
+            "test-bucket/origin-a",
+            "test-bucket/origin-b",
+            "test-bucket/origin-c",
+        ];
+        let write_keys = [
+            "test-bucket/write-a",
+            "test-bucket/write-b",
+            "test-bucket/write-c",
+        ];
+        // Every retry is held before its first attempt, so every started task stays busy.
+        let gates: Vec<_> = origin_keys
+            .iter()
+            .chain(write_keys.iter())
+            .map(|k| write_stamp_retry_gate::arm(k))
+            .collect();
+        WRITE_STAMP_RETRY_MAX_TASKS_OVERRIDE.with(|c| c.set(Some(4)));
+        let origin: Vec<_> = origin_keys
+            .iter()
+            .map(|k| manager.spawn_origin_change_stamp_retry(k))
+            .collect();
+        let writes: Vec<_> = write_keys
+            .iter()
+            .map(|k| manager.spawn_write_stamp_retry(k))
+            .collect();
+        WRITE_STAMP_RETRY_MAX_TASKS_OVERRIDE.with(|c| c.set(None));
+        let origin_pending: Vec<bool> = origin_keys
+            .iter()
+            .map(|k| manager.write_stamp_pending(k))
+            .collect();
+        let queued: Vec<String> = lock_write_stamp_retries()
+            .dirs
+            .get(&manager.stamp_retry_scope())
+            .map(|d| {
+                d.queue
+                    .iter()
+                    .map(|s| cache_key_of_slot(s).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for gate in &gates {
+            gate.resume.notify_one();
+        }
+        assert_eq!(
+            (
+                origin.as_slice(),
+                writes.as_slice(),
+                origin_pending.as_slice()
+            ),
+            (
+                &[
+                    WriteStampRetry::Started,
+                    WriteStampRetry::Started,
+                    WriteStampRetry::Shed
+                ][..],
+                &[
+                    WriteStampRetry::Started,
+                    WriteStampRetry::Started,
+                    WriteStampRetry::Queued
+                ][..],
+                &[true, true, false][..]
+            ),
+            "with 4 retry tasks, origin-change stamps must start at most 2 and shed the rest, and \
+             writes must still start 2 and queue the next"
+        );
+        assert_eq!(
+            queued,
+            vec!["test-bucket/write-c".to_string()],
+            "the overflow queue must hold only the write"
+        );
+    }
     #[tokio::test]
     async fn a_write_past_the_retry_task_cap_is_queued_and_its_stamp_lands() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -55785,6 +57574,7 @@ mod part_layout_version_tests {
         doc.object_metadata.part_ranges = (1..=PARTS)
             .map(|n| (n, ((n as u64 - 1) * PART_LEN, n as u64 * PART_LEN - 1)))
             .collect();
+        doc.object_metadata.part_layout_marked = (1..=PARTS).collect();
         std::fs::write(
             manager.get_new_metadata_file_path(key),
             serde_json::to_string_pretty(&doc).unwrap(),
@@ -56045,6 +57835,7 @@ mod part_layout_version_tests {
         let len = BODY_LEN as u64;
         let mut doc = seed_crossed_layout(&manager, key, 77).await;
         doc.object_metadata.part_layout_verified = true;
+        doc.object_metadata.part_layout_marked = [1, 2].into_iter().collect();
         std::fs::write(
             manager.get_new_metadata_file_path(key),
             serde_json::to_string_pretty(&doc).unwrap(),
@@ -56199,7 +57990,476 @@ static BEFORE_STAGING_REFOLD_HOOKS: std::sync::Mutex<
 /// The Write_Ledger entries a staging pass retires once it has released `global_eviction.lock`.
 struct StagingRetirement {
     ledger: Arc<crate::write_ledger::WriteLedger>,
-    retired: std::collections::HashSet<(String, u64, u64, SystemTime, String)>,
+    retired: StagingRetiredByShard,
+}
+
+/// The Write_Ledger identities a staging pass retires, by the shard whose files hold them.
+type StagingRetiredByShard = std::collections::BTreeMap<
+    crate::staged_fold::Shard,
+    std::collections::HashSet<(String, u64, u64, SystemTime, String)>,
+>;
+
+/// Staged objects a staging pass evicts at once. The read tier's figure
+/// (`LEAF_CONCURRENCY_LIMIT`): each eviction is a slot-lock acquire, a `.meta` read and a few
+/// unlinks on shared storage, so the pass's rate is bounded by round trips, not by bandwidth.
+const STAGING_OBJECT_CONCURRENCY: usize = 32;
+/// Objects in one batch of a staging pass. A batch is the unit of its accumulator flush and its
+/// removal debit publish, so a crash loses at most one batch's debit.
+const STAGING_BATCH_MAX_OBJECTS: usize = 64;
+/// A batch stops taking objects once their ledger estimate reaches this, so a batch holds at
+/// most this plus one object.
+const STAGING_BATCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// The fewest chunks a pass's shortfall is split into, before lowering to the number of weighted
+/// shards, so a small shortfall is shared across shards rather than taken from one.
+const STAGING_MIN_CHUNKS: usize = 8;
+/// The most chunks one pass plans. Runs of weighted shards beyond it are left to the next pass,
+/// which under-evicts and never over-evicts.
+const STAGING_MAX_CHUNKS: usize = 256;
+/// Bytes of shortfall per chunk, for the chunk count.
+const STAGING_CHUNK_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Ranges of shortfall per chunk, for the chunk count.
+const STAGING_CHUNK_TARGET_RANGES: u64 = 10_000;
+/// Where this process's next staging plan starts the tie order of its largest-remainder shares.
+/// One step per pass, so equal-weight shards that rounding leaves without a share in one plan get
+/// it in a later one rather than never.
+static STAGING_PLAN_ROTATION: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A contiguous run of `l1` shards of one bucket, with its share of a staging pass's shortfall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagingChunk {
+    pub(crate) shards: Vec<crate::staged_fold::Shard>,
+    /// Each shard's own share, in `shards` order: (bytes, ranges).
+    pub(crate) shard_quotas: Vec<(u64, u64)>,
+    pub(crate) quota_bytes: u64,
+    pub(crate) quota_ranges: u64,
+}
+
+/// Whether `weights` carry less than the shortfall on either arm, so a plan from them alone
+/// cannot place all of it and [`staging_chunk_plan`] takes the rest over the Write_Ledger's shard
+/// directories. True for empty weights and a nonzero shortfall.
+pub(crate) fn staging_plan_needs_uniform(
+    bytes_to_free: u64,
+    ranges_to_free: u64,
+    weights: &crate::staged_fold::ShardWeights,
+) -> bool {
+    let (bytes, ranges) = weights.values().fold((0u64, 0u64), |acc, w| {
+        (
+            acc.0.saturating_add(w.bytes),
+            acc.1.saturating_add(w.ranges),
+        )
+    });
+    bytes < bytes_to_free || ranges < ranges_to_free
+}
+
+/// `total` shared in proportion to `basis` by largest remainder, so the shares sum to `total`
+/// exactly. An all-zero basis shares it equally.
+///
+/// Equal remainders are taken in index order starting at `rotation` (modulo the length), so a
+/// caller that advances `rotation` by one per plan reaches every index of a tie within as many
+/// plans as the basis has entries. Index order alone gives the same entries a zero share in
+/// every plan while the basis is unchanged.
+fn staging_largest_remainder(total: u64, basis: &[u64], rotation: usize) -> Vec<u64> {
+    if basis.is_empty() {
+        return Vec::new();
+    }
+    let sum: u128 = basis.iter().map(|&b| b as u128).sum();
+    let ones;
+    let (basis, sum) = if sum == 0 {
+        ones = vec![1u64; basis.len()];
+        (ones.as_slice(), basis.len() as u128)
+    } else {
+        (basis, sum)
+    };
+    let mut shares: Vec<u64> = Vec::with_capacity(basis.len());
+    let mut remainders: Vec<(u128, usize)> = Vec::with_capacity(basis.len());
+    for (i, &b) in basis.iter().enumerate() {
+        let product = total as u128 * b as u128;
+        shares.push((product / sum) as u64);
+        remainders.push((product % sum, i));
+    }
+    let mut left = total.saturating_sub(shares.iter().sum::<u64>());
+    let (len, offset) = (basis.len(), rotation % basis.len());
+    let tie_order = |i: usize| (i + len - offset) % len;
+    remainders.sort_by(|a, b| b.0.cmp(&a.0).then(tie_order(a.1).cmp(&tie_order(b.1))));
+    for (_, i) in remainders {
+        if left == 0 {
+            break;
+        }
+        shares[i] += 1;
+        left -= 1;
+    }
+    shares
+}
+
+/// A staging pass's chunks: `bytes_to_free` and `ranges_to_free` shared across the weighted
+/// shards in proportion to their weights (largest remainder, so each sums to its total), then the
+/// shards grouped into chunks that never span a bucket or a shard without weight.
+///
+/// The weights are each shard's terms of the figure that sized the pass, so they sum to it. Where
+/// they carry less than the shortfall on an arm ([`staging_plan_needs_uniform`]), each weighted
+/// shard takes its whole weight on that arm and the rest is shared equally over `ledger_shards`,
+/// the Write_Ledger's shard directories, which then all count as weighted: a shard the figure does
+/// not count still gets a share. With `ledger_shards` empty the weights share the whole shortfall.
+/// `rotation` starts the tie order of every largest-remainder share ([`STAGING_PLAN_ROTATION`]).
+///
+/// The chunk count is the larger of `bytes_to_free / STAGING_CHUNK_TARGET_BYTES` and
+/// `ranges_to_free / STAGING_CHUNK_TARGET_RANGES`, rounded up, clamped to
+/// [`STAGING_MIN_CHUNKS`, `STAGING_MAX_CHUNKS`], lowered to the number of weighted shards and
+/// raised to the number of weighted buckets. Runs of contiguous weighted `l1` values are split,
+/// largest share first, until there are that many; if the runs alone are more than
+/// `STAGING_MAX_CHUNKS`, the largest are kept and the rest wait for the next pass.
+pub(crate) fn staging_chunk_plan(
+    bytes_to_free: u64,
+    ranges_to_free: u64,
+    weights: &crate::staged_fold::ShardWeights,
+    ledger_shards: &[crate::staged_fold::Shard],
+    rotation: usize,
+) -> Vec<StagingChunk> {
+    if bytes_to_free == 0 && ranges_to_free == 0 {
+        return Vec::new();
+    }
+    let weighted = weights.iter().filter(|(_, w)| w.bytes > 0 || w.ranges > 0);
+    let (shards, quota_bytes, quota_ranges) = if !ledger_shards.is_empty()
+        && staging_plan_needs_uniform(bytes_to_free, ranges_to_free, weights)
+    {
+        // Every weighted shard and every ledger shard, in shard order; the flag marks a ledger
+        // shard, which takes an equal part of what the weights cannot place.
+        let mut all: std::collections::BTreeMap<
+            crate::staged_fold::Shard,
+            (crate::staged_fold::ShardWeight, bool),
+        > = weighted.map(|(s, w)| (s.clone(), (*w, false))).collect();
+        for s in ledger_shards {
+            all.entry(s.clone()).or_default().1 = true;
+        }
+        let uniform: Vec<u64> = all.values().map(|(_, u)| u64::from(*u)).collect();
+        // Each arm: the weights place no more than they carry, in proportion, and the rest is
+        // shared equally over the ledger shards. Both parts sum exactly, so the arm does.
+        let arm = |total: u64, basis: Vec<u64>| -> Vec<u64> {
+            let carried = basis.iter().fold(0u64, |acc, &b| acc.saturating_add(b));
+            let placed = total.min(carried);
+            staging_largest_remainder(placed, &basis, rotation)
+                .into_iter()
+                .zip(staging_largest_remainder(
+                    total - placed,
+                    &uniform,
+                    rotation,
+                ))
+                .map(|(w, u)| w + u)
+                .collect()
+        };
+        let quota_bytes = arm(bytes_to_free, all.values().map(|(w, _)| w.bytes).collect());
+        let quota_ranges = arm(
+            ranges_to_free,
+            all.values().map(|(w, _)| w.ranges).collect(),
+        );
+        (
+            all.into_keys().collect::<Vec<_>>(),
+            quota_bytes,
+            quota_ranges,
+        )
+    } else {
+        let weighted: Vec<(&crate::staged_fold::Shard, &crate::staged_fold::ShardWeight)> =
+            weighted.collect();
+        if weighted.is_empty() {
+            return Vec::new();
+        }
+        // A shard with ranges and no bytes still takes a byte share by its ranges, and the
+        // reverse, so a total is never stranded on an all-zero basis.
+        let any_bytes = weighted.iter().any(|(_, w)| w.bytes > 0);
+        let any_ranges = weighted.iter().any(|(_, w)| w.ranges > 0);
+        let byte_basis: Vec<u64> = weighted
+            .iter()
+            .map(|(_, w)| if any_bytes { w.bytes } else { w.ranges })
+            .collect();
+        let range_basis: Vec<u64> = weighted
+            .iter()
+            .map(|(_, w)| if any_ranges { w.ranges } else { w.bytes })
+            .collect();
+        (
+            weighted
+                .iter()
+                .map(|(s, _)| (*s).clone())
+                .collect::<Vec<_>>(),
+            staging_largest_remainder(bytes_to_free, &byte_basis, rotation),
+            staging_largest_remainder(ranges_to_free, &range_basis, rotation),
+        )
+    };
+
+    let l1_value = |s: &crate::staged_fold::Shard| u16::from_str_radix(&s.l1, 16).ok();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for i in 0..shards.len() {
+        let contiguous = i > 0 && {
+            let (prev, cur) = (&shards[i - 1], &shards[i]);
+            prev.bucket == cur.bucket
+                && matches!((l1_value(prev), l1_value(cur)), (Some(a), Some(b)) if a + 1 == b)
+        };
+        match runs.last_mut() {
+            Some(run) if contiguous => run.push(i),
+            _ => runs.push(vec![i]),
+        }
+    }
+    let share = |run: &Vec<usize>| -> (u64, u64) {
+        run.iter().fold((0u64, 0u64), |acc, &i| {
+            (
+                acc.0.saturating_add(quota_bytes[i]),
+                acc.1.saturating_add(quota_ranges[i]),
+            )
+        })
+    };
+    let buckets = shards
+        .iter()
+        .map(|s| s.bucket.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let wanted = bytes_to_free
+        .div_ceil(STAGING_CHUNK_TARGET_BYTES)
+        .max(ranges_to_free.div_ceil(STAGING_CHUNK_TARGET_RANGES));
+    let target = usize::try_from(wanted)
+        .unwrap_or(usize::MAX)
+        .clamp(STAGING_MIN_CHUNKS, STAGING_MAX_CHUNKS)
+        .min(shards.len())
+        .max(buckets);
+    while runs.len() < target {
+        let Some(idx) = runs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.len() > 1)
+            .max_by_key(|(i, r)| (share(r), std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        let mut run = runs.remove(idx);
+        let tail = run.split_off(run.len() / 2);
+        runs.insert(idx, tail);
+        runs.insert(idx, run);
+    }
+    if runs.len() > STAGING_MAX_CHUNKS {
+        let mut ranked: Vec<(usize, Vec<usize>)> = runs.into_iter().enumerate().collect();
+        ranked.sort_by_key(|(i, r)| (std::cmp::Reverse(share(r)), *i));
+        ranked.truncate(STAGING_MAX_CHUNKS);
+        ranked.sort_by_key(|(i, _)| *i);
+        runs = ranked.into_iter().map(|(_, r)| r).collect();
+    }
+    runs.into_iter()
+        .map(|run| {
+            let shard_quotas = run
+                .iter()
+                .map(|&i| (quota_bytes[i], quota_ranges[i]))
+                .collect();
+            let (quota_bytes, quota_ranges) = share(&run);
+            StagingChunk {
+                shards: run.into_iter().map(|i| shards[i].clone()).collect(),
+                shard_quotas,
+                quota_bytes,
+                quota_ranges,
+            }
+        })
+        .collect()
+}
+
+/// Per cache directory, the candidates staging passes held for the next batch because the
+/// deletes already admitted covered the allowance.
+#[cfg(test)]
+static STAGING_COVERED_HOLDS: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn note_staging_covered_hold(cache_dir: &std::path::Path) {
+    let mut holds = STAGING_COVERED_HOLDS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    match holds.iter_mut().find(|(d, _)| d == cache_dir) {
+        Some((_, n)) => *n += 1,
+        None => holds.push((cache_dir.to_path_buf(), 1)),
+    }
+}
+/// How many candidates staging passes on `cache_dir` held as covered, for a test.
+#[cfg(test)]
+pub(crate) fn staging_covered_holds_for_tests(cache_dir: &std::path::Path) -> u64 {
+    STAGING_COVERED_HOLDS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(d, _)| d == cache_dir)
+        .map_or(0, |(_, n)| *n)
+}
+/// Per cache directory, the plan of its last staging pass and the rotation it was planned with.
+#[cfg(test)]
+#[allow(clippy::type_complexity)] // a test record: (directory, plan, rotation)
+static LAST_STAGING_PLANS: std::sync::Mutex<Vec<(std::path::PathBuf, Vec<StagingChunk>, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn record_staging_plan_for_tests(
+    cache_dir: &std::path::Path,
+    plan: &[StagingChunk],
+    rotation: usize,
+) {
+    let mut plans = LAST_STAGING_PLANS.lock().unwrap_or_else(|p| p.into_inner());
+    plans.retain(|(d, _, _)| d != cache_dir);
+    plans.push((cache_dir.to_path_buf(), plan.to_vec(), rotation));
+}
+/// The tie-break rotation the last staging pass on `cache_dir` planned with, for a test.
+#[cfg(test)]
+pub(crate) fn last_staging_plan_rotation_for_tests(cache_dir: &std::path::Path) -> Option<usize> {
+    LAST_STAGING_PLANS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(d, _, _)| d == cache_dir)
+        .map(|(_, _, r)| *r)
+}
+/// The plan of the last staging pass on `cache_dir`, for a test.
+#[cfg(test)]
+pub(crate) fn last_staging_plan_for_tests(
+    cache_dir: &std::path::Path,
+) -> Option<Vec<StagingChunk>> {
+    LAST_STAGING_PLANS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(d, _, _)| d == cache_dir)
+        .map(|(_, p, _)| p.clone())
+}
+/// What a staging pass has done so far, across its chunks.
+#[derive(Debug, Default)]
+struct StagingPassState {
+    /// Compressed bytes of the range files removed.
+    total_freed: u64,
+    evicted_objects: u64,
+    /// Staged bytes and ranges debited: the locked `.meta` figures of the objects removed. The
+    /// quota is measured against these.
+    debited_bytes: u64,
+    debited_ranges: u64,
+    candidates_listed: u64,
+    candidates_considered: u64,
+    reclaimable_candidates: u64,
+    expired_candidates: u64,
+    unreadable_candidate_ranges: u64,
+    refused_shards: u64,
+    /// The pass did not see every candidate of its plan: a shard read for a nonzero share stopped
+    /// at it with entries left, or the plan dropped runs that carried a quota.
+    partial_view: bool,
+    ledger_lines_read: u64,
+    chunks_executed: u64,
+    refold_deadline_logged: bool,
+    skips: HashMap<&'static str, u64>,
+    retired: StagingRetiredByShard,
+    ledger_read: Duration,
+    walk: Duration,
+    refold: Duration,
+}
+
+/// What a staging chunk's execution writes through.
+struct StagingExecutor<'a> {
+    ledger: &'a Arc<crate::write_ledger::WriteLedger>,
+    consolidator: &'a Arc<crate::journal_consolidator::JournalConsolidator>,
+    /// The chunk's 1-based number within the pass and its shard count, for a test's hook.
+    #[cfg(test)]
+    chunk: u64,
+    #[cfg(test)]
+    chunk_shards: usize,
+}
+
+/// Where in a staging batch a test hook runs: before or after the batch's debit publish, with
+/// the batch's 1-based number within its chunk execution, and after it the chunk's 1-based
+/// number within the pass and its shard count.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagingBatchPoint {
+    BeforePublish {
+        batch: u64,
+    },
+    AfterPublish {
+        batch: u64,
+        chunk: u64,
+        chunk_shards: usize,
+    },
+}
+#[cfg(test)]
+#[allow(clippy::type_complexity)] // a test-only registry; a named alias would be used once
+static STAGING_BATCH_HOOKS: std::sync::Mutex<
+    Vec<(
+        std::path::PathBuf,
+        Arc<dyn Fn(StagingBatchPoint) + Send + Sync>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn run_staging_batch_hook(cache_dir: &std::path::Path, point: StagingBatchPoint) {
+    let hook = STAGING_BATCH_HOOKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(d, _)| d == cache_dir)
+        .map(|(_, h)| Arc::clone(h));
+    if let Some(hook) = hook {
+        hook(point);
+    }
+}
+#[cfg(test)]
+#[allow(clippy::type_complexity)] // a test-only registry; a named alias would be used once
+static STAGING_AFTER_ASSESS_HOOKS: std::sync::Mutex<
+    Vec<(std::path::PathBuf, String, Box<dyn FnOnce() + Send>)>,
+> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn run_staging_after_assess_hook(cache_dir: &std::path::Path, cache_key: &str) {
+    let hook = {
+        let mut hooks = STAGING_AFTER_ASSESS_HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        hooks
+            .iter()
+            .position(|(d, k, _)| d == cache_dir && k == cache_key)
+            .map(|i| hooks.remove(i).2)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+/// Per cache directory and key, a parked staging assessment's (reached, resume) pair.
+#[cfg(test)]
+static STAGING_ASSESSMENT_PAUSES: std::sync::Mutex<
+    Vec<(
+        std::path::PathBuf,
+        String,
+        crate::write_cache_manager::EvictionPause,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+async fn pause_staging_assessment(cache_dir: &std::path::Path, cache_key: &str) {
+    let pause = {
+        let mut pauses = STAGING_ASSESSMENT_PAUSES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        pauses
+            .iter()
+            .position(|(d, k, _)| d == cache_dir && k == cache_key)
+            .map(|i| pauses.remove(i).2)
+    };
+    if let Some((reached, resume)) = pause {
+        let _ = reached.send(());
+        let _ = resume.await;
+    }
+}
+/// Per cache directory, the staging executor's (concurrency, batch objects) for a test that
+/// needs small batches.
+#[cfg(test)]
+#[allow(clippy::type_complexity)] // a test-only registry; a named alias would be used once
+static STAGING_TEST_LIMITS: std::sync::Mutex<Vec<(std::path::PathBuf, (usize, usize, u64))>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn staging_test_limits(cache_dir: &std::path::Path) -> (usize, usize, u64) {
+    STAGING_TEST_LIMITS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(d, _)| d == cache_dir)
+        .map(|(_, l)| *l)
+        .unwrap_or((
+            STAGING_OBJECT_CONCURRENCY,
+            STAGING_BATCH_MAX_OBJECTS,
+            STAGING_BATCH_MAX_BYTES,
+        ))
 }
 #[cfg(test)]
 #[allow(clippy::type_complexity)] // a test-only registry; a named alias would be used once
@@ -56508,7 +58768,7 @@ mod census_release_target_tests {
 }
 
 /// A staging pass holds `global_eviction.lock` for at most its time budget plus one stage, and
-/// runs its whole-volume Write_Ledger compaction after the release.
+/// runs its Write_Ledger compaction after the release.
 #[cfg(test)]
 mod staging_pass_budget_tests {
     use super::*;
@@ -56577,10 +58837,13 @@ mod staging_pass_budget_tests {
         let meta_path =
             crate::disk_cache::get_sharded_path(&dir.join("metadata"), key, ".meta").unwrap();
         assert!(meta_path.exists(), "fixture: the object must be staged");
+        // On the object's own shard: the pass shares its shortfall by shard, so a figure seeded
+        // anywhere else gives this object no quota.
+        let (bucket, l1) = crate::staged_fold::shard_of(key).expect("fixture key names a shard");
         crate::staged_fold::seed_shard_figure_for_tests(
             dir,
-            "seeded",
-            "01",
+            &bucket,
+            &l1,
             4_096,
             crate::staged_fold::STAGED_RANGE_BUDGET,
         );
@@ -56692,6 +58955,49 @@ mod staging_pass_budget_tests {
         );
     }
 
+    /// A pass that refused its only shard's ledger read (a torn line) reclaimed nothing without
+    /// having looked at the shard, so the next count verdict still asks for a pass.
+    ///
+    /// A failure implicates the `state.refused_shards > 0` argument to
+    /// `record_count_eviction_pass` in `evict_staging_tier_locked`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn staging_pass_budget_a_pass_that_refused_a_shard_does_not_latch_the_count_trigger() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let m = manager(dir, Duration::from_secs(30));
+        m.initialize().await.expect("cache manager must initialize");
+        let key = "bucket/budget-refused-shard-latch.bin";
+        let meta_path = staged_over_the_count_trigger(&m, dir, key).await;
+        let (bucket, l1) = crate::staged_fold::shard_of(key).unwrap();
+        let shard_dir = dir
+            .join("metadata")
+            .join("_write_ledger")
+            .join(&bucket)
+            .join(&l1);
+        let ledger_file = std::fs::read_dir(&shard_dir)
+            .expect("fixture: the object's shard has a ledger directory")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "ledger"))
+            .expect("fixture: the object's shard has a ledger file");
+        let mut body = std::fs::read_to_string(&ledger_file).unwrap();
+        body.push_str("{\"torn\": \n");
+        std::fs::write(&ledger_file, body).unwrap();
+
+        let freed = tokio::time::timeout(Duration::from_secs(20), m.evict_staging_tier())
+            .await
+            .expect("the pass must return");
+
+        assert_eq!(freed, 0, "a pass that refused its only shard frees nothing");
+        assert!(meta_path.exists(), "and evicts nothing");
+        assert!(
+            crate::staged_fold::count_eviction_verdict(dir, 95, 80)
+                .await
+                .is_needed(),
+            "a pass that refused a shard's ledger read latched the count trigger off until the \
+             next fold install"
+        );
+    }
+
     /// `eviction_lock_held_secs` reads the live hold while a hooked pass holds the lock, and 0
     /// once the pass has released it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -56723,8 +59029,8 @@ mod staging_pass_budget_tests {
         assert_eq!(after, 0, "the gauge must read 0 once the lock is released");
     }
 
-    /// The whole-volume Write_Ledger compaction runs after `global_eviction.lock` is released,
-    /// and still retires what the pass consumed.
+    /// The Write_Ledger compaction runs after `global_eviction.lock` is released, and still
+    /// retires what the pass consumed.
     #[tokio::test]
     async fn staging_pass_budget_the_ledger_compaction_runs_after_the_release() {
         let temp = TempDir::new().unwrap();
@@ -56786,7 +59092,7 @@ mod staging_pass_budget_tests {
         );
         let cutoff = SystemTime::now() - crate::write_ledger::ABSENT_RETIREMENT_GRACE;
         let aged_left = ledger
-            .read_for_authority(usize::MAX)
+            .read_for_authority_for_tests(usize::MAX)
             .await
             .expect("ledger must be readable")
             .entries
@@ -56797,5 +59103,391 @@ mod staging_pass_budget_tests {
             aged_left, 0,
             "the compaction after the release must still retire the consumed entry"
         );
+    }
+}
+
+/// The expiry of a write S3 answered `5xx` and may have applied: the marker it stamps and what a
+/// peer's RAM verification reads.
+#[cfg(test)]
+mod write_expiry_tests {
+    use super::*;
+    use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
+    use tempfile::TempDir;
+
+    async fn manager_with_entry(key: &str) -> (TempDir, Arc<CacheManager>) {
+        let temp = TempDir::new().unwrap();
+        let manager = Arc::new(CacheManager::new(
+            temp.path().to_path_buf(),
+            false,
+            0,
+            1024,
+            false,
+        ));
+        let now = SystemTime::now();
+        let mut metadata = NewCacheMetadata {
+            cache_key: key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"version-1\"".to_string(),
+                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                content_length: 1024,
+                ..Default::default()
+            },
+            ranges: vec![RangeSpec::new(
+                0,
+                1023,
+                "expiry_0-1023.bin".to_string(),
+                CompressionAlgorithm::None,
+                1024,
+                1024,
+            )],
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: Some(now + Duration::from_secs(3600)),
+            head_last_accessed: Some(now),
+            head_access_count: 1,
+            head_cached_at: Some(now),
+            last_validated_at: None,
+            write_expired_at: None,
+        };
+        // A listing a 3.0.x fill recorded, so RAM verification may serve it.
+        metadata.ranges[0].file_identity = Some(crate::cache_types::RangeFileIdentity {
+            size: 1024,
+            mtime_ns: 0,
+        });
+        manager.write_metadata_to_disk(&metadata).await.unwrap();
+        (temp, manager)
+    }
+
+    #[tokio::test]
+    async fn an_expiry_stamps_the_marker_so_an_older_fill_cannot_publish() {
+        let key = "bucket/expiry-stamp";
+        let (_temp, manager) = manager_with_entry(key).await;
+        let meta_path = manager.get_new_metadata_file_path(key);
+        let witness = manager.capture_fill_witness(key).await;
+        assert!(
+            witness.holds(&meta_path),
+            "the witness holds before the expiry"
+        );
+        manager.expire_for_write(key, "PUT").await.unwrap();
+        let entry = manager.get_metadata_from_disk(key).await.unwrap();
+        assert_eq!(
+            (
+                witness.holds(&meta_path),
+                entry.as_ref().map(|m| m.write_expired_at.is_some()),
+                entry.as_ref().map(|m| m.ranges.len()),
+                entry.as_ref().map(|m| m.expires_at <= SystemTime::now()),
+            ),
+            (false, Some(true), Some(1), Some(true)),
+            "after the expiry (an older fill's witness, the expiry, the data kept, stored expiry passed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expiry_stops_a_peers_ram_hit() {
+        let key = "bucket/expiry-ram";
+        let (_temp, manager) = manager_with_entry(key).await;
+        let servable = |check: RamVerifyDiskCheck| match check {
+            RamVerifyDiskCheck::Listed { servable, .. } => servable,
+            other => panic!("unexpected {:?}", other),
+        };
+        assert_eq!(
+            servable(manager.get_metadata_etag_for_ram_verify(key).await),
+            vec![(0, 1023)],
+            "before the expiry a RAM copy of the range may serve"
+        );
+        manager.expire_for_write(key, "DELETE").await.unwrap();
+        assert_eq!(
+            servable(manager.get_metadata_etag_for_ram_verify(key).await),
+            Vec::<(u64, u64)>::new(),
+            "after the expiry no RAM copy may serve until the entry is revalidated"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expiry_with_no_entry_stamps_and_creates_nothing() {
+        let temp = TempDir::new().unwrap();
+        let manager = Arc::new(CacheManager::new(
+            temp.path().to_path_buf(),
+            false,
+            0,
+            1024,
+            false,
+        ));
+        let key = "bucket/expiry-absent";
+        let meta_path = manager.get_new_metadata_file_path(key);
+        let witness = manager.capture_fill_witness(key).await;
+        manager.expire_for_write(key, "PUT").await.unwrap();
+        assert_eq!(
+            (
+                meta_path.exists(),
+                write_marker_path(&meta_path).exists(),
+                witness.holds(&meta_path)
+            ),
+            (false, true, false),
+            "(a .meta, a marker, an older fill's witness)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_a_write_expired_is_no_fresh_serve_coverage_after_a_ttl_refresh() {
+        let key = "bucket/expiry-fresh-serve";
+        let (_temp, manager) = manager_with_entry(key).await;
+        let disk = manager.create_configured_disk_cache_manager();
+        disk.initialize().await.unwrap();
+        async fn fresh_serve(disk: &crate::disk_cache::DiskCacheManager, key: &str) -> usize {
+            disk.find_cached_ranges(
+                key,
+                0,
+                1023,
+                None,
+                crate::cache_types::RangeLookupPurpose::FreshServe,
+            )
+            .await
+            .unwrap()
+            .ranges
+            .len()
+        }
+        assert_eq!(
+            fresh_serve(&disk, key).await,
+            1,
+            "control: fresh coverage before the expiry"
+        );
+        manager.expire_for_write(key, "PUT").await.unwrap();
+        // A TTL refresh that is not an origin `304` moves stored expiry and leaves the expiry.
+        let mut metadata = manager.get_metadata_from_disk(key).await.unwrap().unwrap();
+        metadata.refresh_object_ttl(Duration::from_secs(3600));
+        manager.write_metadata_to_disk(&metadata).await.unwrap();
+        assert_eq!(
+            fresh_serve(&disk, key).await,
+            0,
+            "after the expiry and a TTL refresh no lookup serves the entry on its own authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_is_no_head_hit() {
+        let key = "bucket/expiry-head";
+        let (_temp, manager) = manager_with_entry(key).await;
+        let ttl = Duration::from_secs(3600);
+        assert!(manager
+            .get_head_cache_entry_unified(key, ttl)
+            .await
+            .unwrap()
+            .is_some());
+        manager.expire_for_write(key, "PUT").await.unwrap();
+        assert!(
+            manager
+                .get_head_cache_entry_unified(key, ttl)
+                .await
+                .unwrap()
+                .is_none(),
+            "a HEAD of an expired entry goes to S3"
+        );
+    }
+}
+
+/// Part 1's listing of the whole object of a layout of at most one part is the object, so it is
+/// neither refused as paired with an unmarked entry nor retired with it.
+#[cfg(test)]
+mod whole_object_part_listing_tests {
+    use super::*;
+    use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
+    use tempfile::TempDir;
+
+    fn layout(parts_count: Option<u32>) -> ObjectMetadata {
+        ObjectMetadata {
+            etag: "\"whole\"".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 1024,
+            part_ranges: HashMap::from([(1u32, (0u64, 1023u64))]),
+            parts_count,
+            part_layout_verified: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_single_part_whole_object_listing_is_not_paired() {
+        assert_eq!(
+            [None, Some(1), Some(2)].map(|count| {
+                CacheManager::listing_pairs_untrusted_part_entry(&layout(count), 0, 1023)
+            }),
+            [false, false, true],
+            "an unmarked part 1 spanning the object, by parts_count (none, 1, 2)"
+        );
+    }
+
+    async fn listings_left_after_clearing(parts_count: Option<u32>) -> (usize, bool) {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/whole-part";
+        let now = SystemTime::now();
+        let metadata = NewCacheMetadata {
+            cache_key: key.to_string(),
+            object_metadata: layout(parts_count),
+            ranges: vec![RangeSpec::new(
+                0,
+                1023,
+                "whole-part_0-1023.bin".to_string(),
+                CompressionAlgorithm::None,
+                1024,
+                1024,
+            )],
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+        manager.write_metadata_to_disk(&metadata).await.unwrap();
+        manager
+            .clear_unverified_part_layout(key, Some((1, (0, 1023))))
+            .await;
+        let after = manager.read_metadata_file(key).await.unwrap().unwrap();
+        (
+            after.ranges.len(),
+            after.object_metadata.part_ranges.is_empty(),
+        )
+    }
+
+    #[tokio::test]
+    async fn retiring_a_single_part_layout_keeps_the_whole_object_listing() {
+        assert_eq!(
+            (
+                listings_left_after_clearing(None).await,
+                listings_left_after_clearing(Some(1)).await,
+                listings_left_after_clearing(Some(2)).await,
+            ),
+            ((1, true), (1, true), (0, true)),
+            "(listings left, layout entry cleared) by parts_count (none, 1, 2)"
+        );
+    }
+}
+#[cfg(test)]
+mod acknowledged_write_double_unlink_failure_tests {
+    use super::*;
+    use crate::cache_types::RangeLookupPurpose;
+    /// An acknowledged DELETE or PUT whose invalidation fails to unlink both the object's `.bin`
+    /// and its `.meta` (any error but `ENOENT`). Until the removal lands, the acknowledging
+    /// proxy forwards the key to S3 because its stamp retry is pending, and a peer reading the
+    /// volume, which holds no such state, must not be served the previous version from the
+    /// document left behind. Once the fault clears, the retry removes both files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledged_write_never_leaves_the_old_version_servable_when_both_unlinks_fail() {
+        for operation in ["DELETE", "PUT"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+                std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+            }
+            let manager = Arc::new(CacheManager::new_with_defaults(
+                dir.path().to_path_buf(),
+                false,
+                0,
+            ));
+            let _ = manager.create_configured_disk_cache_manager();
+            manager.initialize().await.unwrap();
+            // A peer proxy's view of the shared volume: a separate disk cache over the same
+            // directory, with no pending-stamp state of the acknowledging proxy.
+            let mut peer = crate::disk_cache::DiskCacheManager::new(
+                dir.path().to_path_buf(),
+                true,
+                1024,
+                false,
+                1_048_576,
+            );
+            peer.initialize().await.unwrap();
+            let key = format!("test-bucket/double-unlink-failure/{operation}");
+            let stale = vec![0x5Au8; 1024];
+            peer.store_range_witnessed(
+                &key,
+                0,
+                1023,
+                &stale,
+                crate::cache_types::ObjectMetadata {
+                    etag: "\"previous\"".to_string(),
+                    last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+                    content_length: 1024,
+                    upload_state: crate::cache_types::UploadState::Complete,
+                    cumulative_size: 1024,
+                    ..Default::default()
+                },
+                Duration::from_secs(3600),
+                true,
+            )
+            .await
+            .unwrap();
+            let meta = manager.get_new_metadata_file_path(&key);
+            let listed = peer
+                .get_metadata(&key)
+                .await
+                .unwrap()
+                .expect("fixture: cached");
+            let bin = dir.path().join("ranges").join(&listed.ranges[0].file_path);
+            assert!(
+                meta.exists() && bin.exists(),
+                "fixture: the entry is cached"
+            );
+            crate::disk_cache::unlink_fault::arm(&bin);
+            crate::disk_cache::unlink_fault::arm(&meta);
+            let retry = write_stamp_retry_gate::arm(&key);
+            let result = manager.invalidate_acknowledged_write(&key, operation).await;
+            let retry_started =
+                tokio::time::timeout(Duration::from_secs(5), retry.reached.notified())
+                    .await
+                    .is_ok();
+            let pending = manager.write_stamp_pending(&key);
+            assert!(
+                meta.exists() && bin.exists(),
+                "{operation}: fixture: the injected failures must leave the .meta and the .bin"
+            );
+            assert!(
+                result.is_err() && retry_started && pending,
+                "{operation}: THE ACKNOWLEDGED WRITE'S INVALIDATION LEFT THE .meta ON THE VOLUME \
+                 AND REPORTED {result:?}: stamp retry started={retry_started}, key pending on \
+                 this proxy={pending}, so nothing repeats the removal and this proxy serves the \
+                 previous version"
+            );
+            for purpose in [
+                RangeLookupPurpose::FreshServe,
+                RangeLookupPurpose::RevalidationCandidate,
+            ] {
+                let found = peer
+                    .find_cached_ranges(&key, 0, 1023, None, purpose)
+                    .await
+                    .unwrap();
+                let left = peer.get_metadata(&key).await.unwrap();
+                for range in &found.ranges {
+                    let served = peer.load_range_data(range).await.unwrap();
+                    assert_ne!(
+                        served,
+                        stale,
+                        "{operation} purpose={purpose:?}: A PEER WAS SERVED THE PREVIOUS \
+                         VERSION'S BYTES after S3 acknowledged the write, from the extent whose \
+                         unlink failed (document left: {:?})",
+                        left.as_ref().map(|m| (
+                            m.expires_at,
+                            m.ranges.iter().map(|r| r.unservable).collect::<Vec<_>>()
+                        ))
+                    );
+                }
+                assert!(
+                    found.ranges.is_empty(),
+                    "{operation} purpose={purpose:?}: the extent whose unlink failed counted as \
+                     coverage after the acknowledged write"
+                );
+            }
+            retry.resume.notify_one();
+            let landed = tokio::time::timeout(Duration::from_secs(30), retry.stamped.notified())
+                .await
+                .is_ok();
+            assert!(
+                landed && !meta.exists() && !bin.exists() && !manager.write_stamp_pending(&key),
+                "{operation}: once the fault cleared the retry must land and remove both files \
+                 (landed={landed}, .meta present={}, .bin present={}, pending={})",
+                meta.exists(),
+                bin.exists(),
+                manager.write_stamp_pending(&key)
+            );
+        }
     }
 }

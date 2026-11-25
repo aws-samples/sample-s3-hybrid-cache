@@ -274,6 +274,30 @@ pub struct StSizeFoldGauges {
     /// has a figure yet, or **at least one shard has no `scanned_at`** — a partial membership.
     /// A maximum taken over a subset of shards is indistinguishable from a fresher cache.
     pub st_size_fold_oldest_shard_scan_age_secs: Option<u64>,
+
+    /// Σ `byte_sum` over every shard document on the volume, bytes: the per-shard aggregate's own
+    /// total, published beside `total_cache_size` so the two can be compared. **Observation only**:
+    /// nothing in this release reads it to decide anything.
+    ///
+    /// `None` is the UNREADABLE-or-INCOMPLETE sentinel and never a partial sum. It means no shard
+    /// document exists, a document could not be read, or **at least one document carries no
+    /// `byte_sum`** (a shard no `st_size` pass has folded). A sum over a subset of shards reads as a
+    /// smaller cache and would show up as a drift that is not one.
+    ///
+    /// Sums every `.bin` file under the shards, orphans included (see the module doc), so it can
+    /// exceed `SizeState.total_size` by the orphan bytes. Legacy flat `ranges/` root files are in no
+    /// shard document and are not in this sum.
+    pub shard_sum_bytes: Option<u64>,
+
+    /// `shard_sum_bytes − SizeState.total_size`, signed bytes; `None` exactly when `shard_sum_bytes`
+    /// is. `total_size` is the `ranges/` bytes alone: `total_cache_size` also holds in-progress part
+    /// bytes, which no shard document counts, so it is not the operand. Expected near zero on a
+    /// settled cache, plus the orphan bytes; a positive value means the shard documents hold more
+    /// than the accounted total.
+    ///
+    /// On a `/metrics` request the sum is the last full collection's and the total is read now, so
+    /// the difference mixes a membership of up to one collection interval old with the live total.
+    pub shard_sum_drift_bytes: Option<i64>,
 }
 
 /// Collect the three gauges. Safe to call from a metrics scrape.
@@ -307,7 +331,33 @@ pub fn collect_st_size_fold_gauges(checkpoints: &ShardCheckpointSet) -> StSizeFo
         st_size_fold_oldest_shard_scan_age_secs: oldest_shard_scan_age_from_checkpoints(
             checkpoints,
         ),
+        shard_sum_bytes: shard_sum_from_checkpoints(checkpoints),
+        // The total is the caller's: this function holds only the document set.
+        shard_sum_drift_bytes: None,
     }
+}
+
+/// Σ `byte_sum` over the set, or `None` unless the set is complete, non-empty, and **every**
+/// document carries a `byte_sum`. Never a partial sum. See
+/// [`StSizeFoldGauges::shard_sum_bytes`].
+pub fn shard_sum_from_checkpoints(set: &ShardCheckpointSet) -> Option<u64> {
+    if !set.is_complete() {
+        return None;
+    }
+    let mut sum: Option<u64> = None;
+    for (_shard, checkpoint) in set.iter() {
+        // `?` on a missing key is the whole point: one unfolded shard makes the sum unknown.
+        let bytes = checkpoint.other.get("byte_sum").and_then(|v| v.as_u64())?;
+        sum = Some(sum.unwrap_or(0).saturating_add(bytes));
+    }
+    sum
+}
+
+/// `sum − total` in signed bytes, saturating at the `i64` range; `None` when there is no sum.
+pub fn shard_sum_drift_bytes(sum: Option<u64>, total: u64) -> Option<i64> {
+    sum.map(|s| {
+        (i128::from(s) - i128::from(total)).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    })
 }
 
 /// Age in seconds of the stalest shard figure this pass has installed, or `None`.

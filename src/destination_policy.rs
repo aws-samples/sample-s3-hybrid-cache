@@ -770,18 +770,26 @@ fn getifaddrs_addresses() -> std::io::Result<HashSet<IpAddr>> {
     let mut node = head;
     // SAFETY: `node` is null or an element of the list `getifaddrs` returned, not yet freed.
     while let Some(ifa) = unsafe { node.as_ref() } {
-        if !ifa.ifa_addr.is_null() {
-            // SAFETY: `ifa_addr` is non-null and its family says which sockaddr it is.
-            let family = libc::c_int::from(unsafe { (*ifa.ifa_addr).sa_family });
+        // SAFETY: `ifa_addr` is null or points at a sockaddr `getifaddrs` filled in, which lives
+        // until `freeifaddrs`; `as_ref` maps null to `None`.
+        if let Some(addr) = unsafe { ifa.ifa_addr.as_ref() } {
+            let family = libc::c_int::from(addr.sa_family);
             if family == libc::AF_INET {
-                // SAFETY: an AF_INET address is a `sockaddr_in`.
-                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                // SAFETY: the family says this sockaddr is a `sockaddr_in`, which `getifaddrs`
+                // allocated in full. `read_unaligned` copies it without relying on the
+                // alignment of a pointer typed as the shorter `sockaddr`.
+                let sin = unsafe {
+                    std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in>().cast_const())
+                };
                 addresses.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(
                     sin.sin_addr.s_addr,
                 ))));
             } else if family == libc::AF_INET6 {
-                // SAFETY: an AF_INET6 address is a `sockaddr_in6`.
-                let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                // SAFETY: the family says this sockaddr is a `sockaddr_in6`, which `getifaddrs`
+                // allocated in full; copied as for `sockaddr_in` above.
+                let sin6 = unsafe {
+                    std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in6>().cast_const())
+                };
                 addresses.insert(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
             }
         }

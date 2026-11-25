@@ -32,9 +32,10 @@ use bytes::Bytes;
 use hyper::StatusCode;
 
 use common::expired_fixture::{
-    assert_all_new, assert_all_old, conditional_requests, fill_summary, not_modified, proxy_get,
-    proxy_get_with_auth, signed_authorization_without_range,
-    test_config_full_object_checks_with_get_ttl, Fixture, SeedSpec, NEW_FILL, OLD_FILL,
+    assert_all_new, assert_all_old, conditional_requests, fill_summary, model_s3_responder,
+    not_modified, proxy_get, proxy_get_with_auth, signed_authorization_without_range,
+    test_config_full_object_checks_with_get_ttl, Fixture, OriginVersion, SeedSpec, NEW_FILL,
+    OLD_FILL,
 };
 use common::{StubResponse, StubS3Client};
 
@@ -666,5 +667,195 @@ async fn expired_partial_coverage_full_object_merge_is_pinned_to_the_cached_etag
          merged response could splice two different versions of the object together \
          and no authority would cover the cached half. Captured requests: {:#?}",
         etag, captured
+    );
+}
+
+/// A GET with no `Range` for a key with part of an old version cached, after the object was
+/// overwritten at the origin with `new_len` bytes. The partial-merge path pins its hole
+/// fetch to the cached ETag, S3 answers `412`, and the client must then get what S3 gives
+/// its own request: `200`, no `content-range`, the whole new version under its ETag. No
+/// upstream request after the `412` may carry a `Range`: the only one the client could
+/// have meant is none, and one minted from the cached length gets the new version cut at
+/// that length, as a `206`.
+async fn whole_object_get_after_origin_overwrite(new_len: u64, name: &str) {
+    let config = test_config_full_object_checks_with_get_ttl(OBJECT_SIZE, Duration::ZERO);
+    let fixture = Fixture::new(config).await;
+    let key = format!("{}/{}-{}", BUCKET, name, OBJECT);
+    let path = format!("/{}", key);
+    let old_etag = fixture.seed(
+        &key,
+        &SeedSpec::expired(
+            vec![(0, OBJECT_SIZE / 2 - 1)],
+            OBJECT_SIZE,
+            &format!("\"{}-v1\"", name),
+        ),
+    );
+    fixture.invalidate_metadata_cache(&key).await;
+    let new = OriginVersion::patterned(&format!("\"{}-v2\"", name), new_len, 3);
+    let stub = StubS3Client::new().with_responder(model_s3_responder(new.clone()));
+    let server = fixture.spawn_proxy(stub.clone().into_trait_object()).await;
+
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(30),
+        proxy_get_with_auth(
+            server.addr,
+            &path,
+            &signed_authorization_without_range(),
+            &[],
+        ),
+    )
+    .await
+    .expect("the GET must complete within 30 s");
+    let captured = stub.captured();
+    let header_of = |r: &common::CapturedRequest, name: &str| {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let requests: Vec<(Option<String>, Option<String>)> = captured
+        .iter()
+        .map(|r| (header_of(r, "range"), header_of(r, "if-match")))
+        .collect();
+    let pinned = captured
+        .iter()
+        .position(|r| header_of(r, "if-match").as_deref() == Some(old_etag.as_str()));
+    let Some(pinned) = pinned else {
+        panic!(
+            "PRECONDITION MISSING: no upstream request was pinned to the cached ETag {}, so the \
+             partial-merge path was not entered. Requests (range, if-match): {:?}",
+            old_etag, requests
+        );
+    };
+    // After the `412` every request is the client's own: no Range, no If-Match.
+    let not_the_clients_after_412: Vec<&(Option<String>, Option<String>)> = requests[pinned + 1..]
+        .iter()
+        .filter(|(range, if_match)| range.is_some() || if_match.is_some())
+        .collect();
+    let header = |n: &str| {
+        headers
+            .get(n)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    assert_eq!(
+        (
+            status,
+            header("content-range"),
+            header("etag"),
+            body.len(),
+            body == new.body,
+            not_the_clients_after_412.len(),
+        ),
+        (
+            StatusCode::OK,
+            None,
+            Some(new.etag.clone()),
+            new.body.len(),
+            true,
+            0,
+        ),
+        "a GET with no Range after an origin overwrite ({} cached, {} now) must get 200, no \
+         content-range, the new ETag and the whole new body, and every upstream request after \
+         the 412 on the pin must be the client's own, with no Range and no If-Match (status, \
+         content-range, etag, body length, body equals the new version, requests after the \
+         412 that are not the client's). Requests (range, if-match): {:?}",
+        OBJECT_SIZE,
+        new_len,
+        requests
+    );
+}
+
+#[tokio::test]
+async fn whole_object_get_after_a_longer_origin_overwrite_gets_the_whole_new_version() {
+    whole_object_get_after_origin_overwrite(6000, "overwrite-grown").await;
+}
+
+#[tokio::test]
+async fn whole_object_get_after_a_shorter_origin_overwrite_gets_the_whole_new_version() {
+    whole_object_get_after_origin_overwrite(3000, "overwrite-shrunk").await;
+}
+
+#[tokio::test]
+async fn whole_object_get_after_a_same_length_origin_overwrite_gets_200() {
+    whole_object_get_after_origin_overwrite(OBJECT_SIZE, "overwrite-same").await;
+}
+
+/// The object is unchanged, but S3 fails the hole fetch (`503`). The fallback must still
+/// answer a GET with no `Range` with `200` and the whole object, not pass on S3's `206` to a
+/// Range the proxy minted.
+#[tokio::test]
+async fn whole_object_get_whose_hole_fetch_fails_is_answered_200() {
+    let config = test_config_full_object_checks_with_get_ttl(OBJECT_SIZE, Duration::ZERO);
+    let fixture = Fixture::new(config).await;
+    let key = format!("{}/hole-503-{}", BUCKET, OBJECT);
+    let path = format!("/{}", key);
+    let half = OBJECT_SIZE / 2;
+    let etag = fixture.seed(
+        &key,
+        &SeedSpec::expired(vec![(0, half - 1)], OBJECT_SIZE, "\"hole-503-v1\""),
+    );
+    fixture.invalidate_metadata_cache(&key).await;
+    // The same version the cache holds: the seeded half is OLD_FILL, so is the rest.
+    let current = OriginVersion {
+        etag: etag.clone(),
+        last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+        body: vec![OLD_FILL; OBJECT_SIZE as usize],
+    };
+    let model = model_s3_responder(current);
+    let hole = format!("bytes={}-{}", half, OBJECT_SIZE - 1);
+    let stub = StubS3Client::new().with_responder(move |context| {
+        let range = context
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+            .map(|(_, v)| v.as_str());
+        if range == Some(hole.as_str()) {
+            return Some(StubResponse::with_status(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        model(context)
+    });
+    let server = fixture.spawn_proxy(stub.clone().into_trait_object()).await;
+
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(30),
+        proxy_get_with_auth(
+            server.addr,
+            &path,
+            &signed_authorization_without_range(),
+            &[],
+        ),
+    )
+    .await
+    .expect("the GET must complete within 30 s");
+    let requests: Vec<Option<String>> = stub
+        .captured()
+        .iter()
+        .map(|r| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+                .map(|(_, v)| v.clone())
+        })
+        .collect();
+    assert!(
+        requests.contains(&Some(format!("bytes={}-{}", half, OBJECT_SIZE - 1))),
+        "PRECONDITION MISSING: no upstream request was the hole fetch. Ranges: {:?}",
+        requests
+    );
+    assert_eq!(
+        (
+            status,
+            headers
+                .get("content-range")
+                .map(|v| v.to_str().unwrap_or("").to_string()),
+            body.len(),
+        ),
+        (StatusCode::OK, None, OBJECT_SIZE as usize),
+        "a GET with no Range whose hole fetch failed must get 200 with no content-range and \
+         the whole object (status, content-range, body length). Body: {}. Ranges sent \
+         upstream: {:?}",
+        fill_summary(&body),
+        requests
     );
 }

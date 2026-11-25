@@ -207,7 +207,9 @@ async fn test_cache_eviction_new_format() -> Result<()> {
     }
 
     // Invalidate first entry
-    cache_manager.invalidate_cache(cache_keys[0]).await?;
+    cache_manager
+        .invalidate_cache_hierarchy(cache_keys[0])
+        .await?;
 
     // Verify first is gone, others remain
     assert!(cache_manager
@@ -250,7 +252,7 @@ async fn test_all_associated_files_deleted() -> Result<()> {
     assert!(!files_before.is_empty());
 
     // Invalidate and verify cleanup
-    cache_manager.invalidate_cache(cache_key).await?;
+    cache_manager.invalidate_cache_hierarchy(cache_key).await?;
     assert!(cache_manager.read_stored_object(cache_key).await?.is_none());
 
     // Verify associated files are deleted
@@ -325,7 +327,9 @@ async fn test_cache_size_calculation_new_format() -> Result<()> {
     );
 
     // Delete one entry
-    cache_manager.invalidate_cache("bucket/file1.bin").await?;
+    cache_manager
+        .invalidate_cache_hierarchy("bucket/file1.bin")
+        .await?;
 
     // Run consolidation cycle again to update size_state.json after invalidation
     if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
@@ -383,7 +387,9 @@ async fn test_cache_cleanup_versioned_objects_new_format() -> Result<()> {
         .is_some());
 
     // Invalidate version 1, verify version 2 remains
-    cache_manager.invalidate_cache(cache_key_v1).await?;
+    cache_manager
+        .invalidate_cache_hierarchy(cache_key_v1)
+        .await?;
     assert!(cache_manager
         .read_stored_object(cache_key_v1)
         .await?
@@ -434,7 +440,9 @@ async fn test_cache_cleanup_range_requests_new_format() -> Result<()> {
         .is_some());
 
     // Invalidate range 1, verify range 2 remains
-    cache_manager.invalidate_cache(cache_key_range1).await?;
+    cache_manager
+        .invalidate_cache_hierarchy(cache_key_range1)
+        .await?;
     assert!(cache_manager
         .read_stored_object(cache_key_range1)
         .await?

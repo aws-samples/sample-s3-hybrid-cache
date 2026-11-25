@@ -20,6 +20,8 @@
 //! 58 test files that declare it.
 #![allow(clippy::duplicate_mod)]
 
+#[path = "append_md5_trailer_test.rs"]
+mod append_md5_trailer_test;
 #[path = "download_coordination_integration_test.rs"]
 mod download_coordination_integration_test;
 #[path = "download_coordination_stampede_test.rs"]

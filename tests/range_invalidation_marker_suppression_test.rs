@@ -96,7 +96,6 @@ use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::DiskCacheManager;
 use s3_proxy::hybrid_metadata_writer::HybridMetadataWriter;
 use s3_proxy::journal_manager::{JournalEntry, JournalOperation};
-use s3_proxy::metadata_lock_manager::MetadataLockManager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -140,18 +139,11 @@ async fn seed() -> Fixture {
     let mut manager = DiskCacheManager::new(cache_dir.clone(), false, 1024, false, 1_048_576);
     manager.initialize().await.expect("disk cache init");
 
-    let lock_manager = Arc::new(MetadataLockManager::new(
-        cache_dir.clone(),
-        Duration::from_millis(300),
-        0,
-    ));
     let journal_manager = Arc::new(s3_proxy::journal_manager::JournalManager::new(
         cache_dir.clone(),
         INVALIDATING_INSTANCE.to_string(),
     ));
     manager.set_hybrid_metadata_writer(Arc::new(Mutex::new(HybridMetadataWriter::new(
-        cache_dir.clone(),
-        lock_manager,
         journal_manager,
     ))));
     assert!(

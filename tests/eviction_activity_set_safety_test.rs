@@ -213,9 +213,9 @@ fn key_for(i: u64) -> String {
 /// # What a failure means
 ///
 /// **Protected arm red** — the journalled object was evicted. The hoisted
-/// `EvictionActivityOracle` is not consulting the same predicate
-/// `CacheManager::is_cache_entry_active` does: either the set builder's window/cutoff arithmetic is
-/// wrong, or it is filtering on something the per-key form does not. This is the
+/// `EvictionActivityOracle` is not consulting the predicate the per-key check it replaced did (a
+/// peer's `AccessUpdate` inside 2× `ram_cache_flush_interval`): either the set builder's
+/// window/cutoff arithmetic is wrong, or it is filtering on something else. This is the
 /// cross-instance-delete-safety regression, and it is the reason the hoist needed an argument rather
 /// than an assumption.
 ///
@@ -294,7 +294,7 @@ async fn a_peer_journalled_hit_survives_the_pass_while_unjournalled_objects_do_n
         "the object with a peer's journalled AccessUpdate inside the \
          2x-ram_cache_flush_interval window was EVICTED, while {unjournalled_evicted} \
          unjournalled objects were also evicted in the same pass. The hoisted activity set is not \
-         reproducing `is_cache_entry_active`'s verdict, which means a peer's in-progress read can \
+         honouring a peer's in-window AccessUpdate, which means a peer's in-progress read can \
          now have its data deleted underneath it — and on shared storage the instance that loses \
          the data cannot observe who took it."
     );

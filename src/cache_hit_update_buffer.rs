@@ -168,8 +168,8 @@ impl PendingBuffer {
     /// `expires_at` from consolidation time plus `new_ttl_secs` and `last_accessed` to the
     /// entry's timestamp. So one folded entry leaves the `.meta` as the sequence would have.
     ///
-    /// One case differs: hits recorded before an `Update` that replaces the range, or before the
-    /// `Add` of a range not yet in `.meta`, are credited after it in the same window, so
+    /// One case differs: hits recorded before the `Add` of a range not yet in `.meta` are
+    /// credited after it in the same window, so
     /// `access_count` can read slightly high and eviction keeps the range a little longer. This
     /// is accepted.
     fn merge(&mut self, entry: BufferedCacheHitUpdate, updates: u64) {

@@ -124,18 +124,17 @@ header; it is never queued. AWS SDKs retry 503 responses with backoff.
 
 #### Memory impact
 
-A streamed cache hit whose client reads more slowly than the disk holds about 3.9 MiB, whatever the object size. The proxy reads the cached range in 512 KiB chunks into a queue of four, and hyper's write queue holds about 400 KiB more. A range smaller than one chunk is read into a buffer of its own size. The 3.9 MiB is measured. With 16 clients that request a 32 MiB cached object and stop reading after the response head, the heap grows by 4,017 KiB per hit. A cache miss whose client stops reading holds about 46 KiB, measured the same way with the object not cached and a test origin in place of S3.
+A streamed cache hit whose client reads more slowly than the disk holds about 3.9 MiB, whatever the object size. The proxy reads the cached range in 512 KiB chunks into a queue of four, and hyper's write queue holds about 400 KiB more. A range smaller than one chunk is read into a buffer of its own size. The 3.9 MiB is measured. With 16 clients that request a 32 MiB cached object and stop reading after the response head, the heap grows by 4,017 KiB per hit. A cache miss whose client stops reading holds about 46 KiB, measured the same way with the object not cached and a test origin in place of S3. A cache miss whose cache write runs slower than S3 holds up to about 46 MiB, measured with a 192 MiB object at the default `cache.compression_batch_size` of 1 MiB. That is the usual case for a client that reads quickly: up to 100 frames from S3 queue for the cache, and the figure grows with `compression_batch_size`.
 
 These figures are derived from the code, not measured:
 
-- A cache miss whose cache write stalls can queue up to 100 frames from S3 for the cache, of up to 408 KiB each, so about 40 MiB. Frames from S3 may be smaller.
 - A hit on a range file written with 4 MiB LZ4 blocks holds about 8.25 MiB of decoder state on top of the hit figure above. The proxy writes 64 KiB blocks and reads the larger ones; see [Compression](COMPRESSION.md).
 - A hit served from several cached ranges in turn reads each of them the same way, so it is expected to hold about 3.9 MiB too.
 
 Size three memory budgets together. They add up, none covers another, and nothing enforces a
 combined ceiling:
 
-1. Streamed transfers: about `max_concurrent_requests` × 3.9 MiB per proxy if every request is a streamed hit with a slow client. A miss with a slow client holds about 46 KiB, and one whose cache write stalls can hold up to about 40 MiB.
+1. Streamed transfers: about `max_concurrent_requests` × 3.9 MiB per proxy if every request is a streamed hit with a slow client. A miss with a slow client holds about 46 KiB, and one whose cache write runs slower than S3 up to about 46 MiB at the default `compression_batch_size`, so count concurrent misses too.
 2. Buffered bodies, on the paths that hold a whole body or range in memory: bounded by
    [`server.max_inflight_buffer_bytes`](#in-flight-memory-ceiling), apart from S3's answers to
    writes already sent, which it counts but never refuses. At its default of `0` this budget
@@ -368,7 +367,7 @@ cache:
 
 **`cache.trust_unverified_ranges`** (`bool`, default `false`) applies to every bucket. A range whose cached metadata or pending journal entry records no file identity may hold another object version's bytes, and every range a 2.x release cached is such a range. At `false` the proxy refuses such a range, fetches it from S3 and caches it again with an identity, counted in [`atomic_metadata.unverified_ranges_refused`](METRICS_REFERENCE.md#atomic_metadata). It also discards a part layout that carries no version mark, as every layout a 2.x release or 3.0.0 recorded does, and fetches each of its parts from S3 once. See [Cache integrity](../SECURITY.md#cache-integrity).
 
-Set `true` only where objects are never overwritten in place outside the proxy, to keep a cache volume that a 2.x release populated warm after upgrading. `true` serves those ranges and keeps those part layouts. It also serves ranges that a 2.x release from public 1.9.7 may have stored from an error reply. An S3 XML error reply is still refused. A non-XML error body, such as an intermediary's HTML error page or an S3-compatible origin's JSON error, is served as object data. Every other check stays on. Ranges that record a file identity are still checked, fills of another version are still dropped, and the RAM cache still checks the cache volume's metadata. A range with no identity that starts at an object's first byte and ends before its last is still fetched again.
+Set `true` only where objects are never overwritten in place outside the proxy, to keep a cache volume that a 2.x release populated warm after upgrading. `true` serves those ranges, but not part layouts: a part layout the proxy has not checked is still fetched from S3 once. It also serves ranges that a 2.x release from public 1.9.7 may have stored from an error reply. An S3 XML error reply is still refused. A non-XML error body, such as an intermediary's HTML error page or an S3-compatible origin's JSON error, is served as object data. Every other check stays on. Ranges that record a file identity are still checked, fills of another version are still dropped, and the RAM cache still checks the cache volume's metadata. A range with no identity that starts at an object's first byte and ends before its last is still fetched again.
 
 ## Time-to-live (TTL) configuration
 
@@ -389,12 +388,11 @@ cache:
   head_ttl: "60s"
   put_ttl: "1h"
   incomplete_upload_ttl: "1d"
-  actively_remove_cached_data: false
 ```
 
 ### GET TTL
 
-`get_ttl` (default `1d`, range `0s` to `315360000s`, which is 10 years) bounds how long the proxy keeps serving an object that was overwritten or deleted without passing through it. An overwrite or delete through the proxy invalidates the cached copy at once. When `get_ttl` expires, the entry stays on disk and the next GET sends S3 a conditional request, serving the cached bytes on `304`. No background pass removes an expired read-cache entry, and eviction frees the space. A revalidation that finds the object changed invalidates the entry. See [Active vs lazy expiration](#active-vs-lazy-expiration).
+`get_ttl` (default `1d`, range `0s` to `315360000s`, which is 10 years) bounds how long the proxy keeps serving an object that was overwritten or deleted without passing through it. An overwrite or delete through the proxy invalidates the cached copy at once. When `get_ttl` expires, the entry stays on disk and the next GET sends S3 a conditional request, serving the cached bytes on `304`. No background pass removes an expired read-cache entry, and eviction frees the space. A revalidation that finds the object changed invalidates the entry. See [Expired entries](#expired-entries).
 
 ```yaml
 cache:
@@ -415,20 +413,12 @@ A client that sends a HeadObject before each download, as the AWS CRT transfer c
 
 `head_ttl` (default `60s`) is how long the proxy answers HEAD requests from cached metadata. It affects HEAD requests only: a GET within `get_ttl` is served from the cache whatever the state of `head_ttl`, and an expired `head_ttl` does not make a GET revalidate.
 
-### Active vs lazy expiration
+### Expired entries
 
-```yaml
-cache:
-  actively_remove_cached_data: false  # Default: lazy expiration
-```
-
-With `false`, the default and the recommended setting, an expired entry stays on disk until
-a request revalidates it or eviction removes it. `true` behaves the same way: the
-[validation scan](#validation-scan) leaves an expired read-cache entry in place, and eviction
-frees the space. For storage that bills by usage, set `max_cache_size` to the amount you want to keep.
-
-Either value leaves an expired entry on disk for revalidation, including with `get_ttl: "0s"`;
-keep the default `false`. See [Minimum TTL values](CACHE_FRESHNESS.md#minimum-ttl-values).
+An expired entry stays on disk until a request revalidates it or eviction removes it, including
+with `get_ttl: "0s"`. The [validation scan](#validation-scan) leaves expired read-cache entries in
+place, and eviction frees the space. For storage that bills by usage, set `max_cache_size` to the
+amount you want to keep. See [Minimum TTL values](CACHE_FRESHNESS.md#minimum-ttl-values).
 
 The validation scan removes a HEAD-only entry, one with no cached ranges, once its HEAD expiry
 has passed by more than a day, whatever this setting.
@@ -487,14 +477,16 @@ read. An object leaves the bound at its first read
 ([TTL transition on first read](#how-write-caching-works)), so a workload that reads back
 what it writes keeps little against it however much it uploads. The bound covers every
 staged byte on the cache volume, across the fleet, so it does not grow with the number of
-proxies. Going over it starts reclamation and refuses nothing. To keep a larger unread
+proxies. Once staged bytes reach it, new uploads are forwarded to S3 uncached until reclamation
+frees room; the uploads themselves are never refused. To keep a larger unread
 working set, raise `write_cache_percent`. The proxy uses the value as set, with no clamp or range check, so `80` gives a bound of 80% of `max_cache_size`.
 
 Reclamation, described in [Eviction](EVICTION.md), uses these rules:
 
 - It starts when staged bytes reach `eviction_trigger_percent` of the allocation and stops
   at `eviction_target_percent`, the same two fields the read cache uses.
-- It removes the oldest staged objects first, with those past `put_ttl` ahead of the rest.
+- It removes the oldest staged objects first within each cache shard, with those past `put_ttl`
+  ahead of the rest, and takes from each shard in proportion to its staged bytes.
 - It runs in the background, never on the request path, so no upload waits for it.
 
 An upload is not cached when caching it would take the cache past `max_cache_size`, or would
@@ -979,7 +971,7 @@ cache:
 ```
 `wait_timeout_secs` outside 5 to 120 is clamped to that range, with a startup warning.
 
-When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter that times out rejoins the fetch still in flight, up to `download_coordination.max_waiter_resubscriptions` times (default `3`). After that, the waiter fetches from S3 itself, as an uncoalesced request does. A whole-object GET or HEAD waits at most 30 seconds in total, then fetches from S3 itself, so a `wait_timeout_secs` above 30 applies only to range and part waiters. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
+When several requests miss the cache for the same object, range or part at once, one fetches from S3 and the others wait for it and are served from the cache. A waiter waits one `wait_timeout_secs` for the fetch, then fetches from S3 itself, as an uncoalesced request does. Keep `wait_timeout_secs` at 60 or less, so a waiting request gets its response within the AWS CLI's 60-second read timeout. See [Download coordination](CACHE_READ_PATHS.md#download-coordination).
 
 ## Cache size tracking
 

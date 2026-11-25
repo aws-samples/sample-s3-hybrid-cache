@@ -152,12 +152,14 @@ async fn test_atomic_write_operations_with_sharded_paths() {
             parts_count: None,
             part_ranges: std::collections::HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         };
 
         // Store range using atomic operations

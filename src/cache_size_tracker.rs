@@ -183,11 +183,12 @@ pub struct ValidationMetadata {
     /// Number of metadata files scanned
     pub metadata_files_scanned: u64,
 
-    /// Number of expired GET cache entries deleted (active expiration)
+    /// Always written 0: no validation pass deletes or skips a GET entry for its age. Kept, with
+    /// its default, so a validation record parses whichever release wrote it, on a shared volume
+    /// a mixed fleet reads.
     #[serde(default)]
     pub cache_entries_expired: u64,
-
-    /// Number of GET cache entries skipped (actively being used)
+    /// Always written 0, as `cache_entries_expired`.
     #[serde(default)]
     pub cache_entries_skipped: u64,
 
@@ -344,10 +345,6 @@ struct ScanFileResult {
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 6.1, 6.2
     staged_bytes: u64,
-    /// Whether GET cache entry was expired and deleted (active expiration)
-    cache_expired: bool,
-    /// Whether GET cache entry was skipped (actively being used)
-    cache_skipped: bool,
     /// Whether GET cache expiration encountered an error
     cache_error: bool,
     /// Whether this scan pass left no `.meta` at the scanned path — because the pass
@@ -434,8 +431,6 @@ struct ShardVisitResult {
     staged_bytes: u64,
     objects_visited: u64,
     metas_removed: u64,
-    cache_expired: u64,
-    cache_skipped: u64,
     cache_errors: u64,
     staged_paths: Vec<PathBuf>,
     /// What this visit's own arms debited; see [`ScanFileResult::self_debit`].
@@ -451,8 +446,6 @@ impl ShardVisitResult {
         self.staged_bytes += other.staged_bytes;
         self.objects_visited += other.objects_visited;
         self.metas_removed += other.metas_removed;
-        self.cache_expired += other.cache_expired;
-        self.cache_skipped += other.cache_skipped;
         self.cache_errors += other.cache_errors;
         self.staged_paths.extend(other.staged_paths.iter().cloned());
     }
@@ -2990,8 +2983,6 @@ impl CacheSizeTracker {
         drift: i64,
         duration: Duration,
         files_scanned: u64,
-        cache_expired: u64,
-        cache_skipped: u64,
         cache_errors: u64,
         write_cache_size: u64,
         write_cache_expired: u64,
@@ -3003,8 +2994,6 @@ impl CacheSizeTracker {
             drift,
             duration,
             files_scanned,
-            cache_expired,
-            cache_skipped,
             cache_errors,
             write_cache_size,
             write_cache_expired,
@@ -3024,8 +3013,6 @@ impl CacheSizeTracker {
         drift: i64,
         duration: Duration,
         files_scanned: u64,
-        cache_expired: u64,
-        cache_skipped: u64,
         cache_errors: u64,
         write_cache_size: u64,
         write_cache_expired: u64,
@@ -3040,8 +3027,8 @@ impl CacheSizeTracker {
             drift_bytes: drift,
             scan_duration_ms: duration.as_millis() as u64,
             metadata_files_scanned: files_scanned,
-            cache_entries_expired: cache_expired,
-            cache_entries_skipped: cache_skipped,
+            cache_entries_expired: 0,
+            cache_entries_skipped: 0,
             cache_expiration_errors: cache_errors,
             active_expiration_enabled: self.actively_remove_cached_data,
             write_cache_size,
@@ -3527,7 +3514,7 @@ impl CacheSizeTracker {
             return;
         };
         if let Err(e) = self
-            .write_validation_metadata_inner(0, 0, 0, Duration::ZERO, 0, 0, 0, 0, 0, 0, 0, false)
+            .write_validation_metadata_inner(0, 0, 0, Duration::ZERO, 0, 0, 0, 0, 0, false)
             .await
         {
             warn!(
@@ -4045,11 +4032,9 @@ impl CacheSizeTracker {
             .await;
         let start = Instant::now();
 
-        // Scan metadata files using shared validator (returns size, cache_expired, cache_skipped, cache_errors, object_count, staged_size)
+        // Scan metadata files using shared validator (returns size, cache_errors, object_count, staged_size)
         let (
             scanned_size,
-            cache_expired,
-            cache_skipped,
             cache_errors,
             files_visited,
             metas_removed,
@@ -4086,11 +4071,10 @@ impl CacheSizeTracker {
         let duration = start.elapsed();
         let drift_sign = if drift >= 0 { "+" } else { "" };
         info!(
-            "Cache validation: {} scanned, drift {}{}, expired {} GET, {}",
+            "Cache validation: {} scanned, drift {}{}, {}",
             format_bytes_human(scanned_size),
             drift_sign,
             format_bytes_human(drift.unsigned_abs()),
-            cache_expired,
             format_duration_human(duration)
         );
 
@@ -4218,8 +4202,6 @@ impl CacheSizeTracker {
             drift,
             duration,
             files_scanned,
-            cache_expired,
-            cache_skipped,
             cache_errors,
             0,
             0,
@@ -4662,8 +4644,6 @@ impl CacheSizeTracker {
             scanned_drift,
             elapsed,
             cycle.objects_visited,
-            cycle.cache_expired,
-            cycle.cache_skipped,
             cycle.cache_errors,
             cycle.staged_bytes,
             0,
@@ -4739,8 +4719,6 @@ impl CacheSizeTracker {
         let staged_bytes = AtomicU64::new(0);
         let objects_visited = AtomicU64::new(0);
         let metas_removed = AtomicU64::new(0);
-        let cache_expired = AtomicU64::new(0);
-        let cache_skipped = AtomicU64::new(0);
         let cache_errors = AtomicU64::new(0);
         let self_debit_bytes = AtomicU64::new(0);
         let self_debit_staged = AtomicU64::new(0);
@@ -4812,12 +4790,6 @@ impl CacheSizeTracker {
                     if result.meta_removed {
                         metas_removed.fetch_add(1, Ordering::Relaxed);
                     }
-                    if result.cache_expired {
-                        cache_expired.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if result.cache_skipped {
-                        cache_skipped.fetch_add(1, Ordering::Relaxed);
-                    }
                     if result.cache_error {
                         cache_errors.fetch_add(1, Ordering::Relaxed);
                     }
@@ -4837,8 +4809,6 @@ impl CacheSizeTracker {
             staged_bytes: staged_bytes.into_inner(),
             objects_visited: objects_visited.into_inner(),
             metas_removed: metas_removed.into_inner(),
-            cache_expired: cache_expired.into_inner(),
-            cache_skipped: cache_skipped.into_inner(),
             cache_errors: cache_errors.into_inner(),
             staged_paths: staged_paths.into_inner().unwrap_or_default(),
             self_debit: ScanSelfDebit {
@@ -5401,8 +5371,8 @@ impl CacheSizeTracker {
     ///
     /// The coordinated initialization handles the initial scan, and this method is used
     /// only for periodic validation scans.
-    /// Returns `(total_size, cache_expired, cache_skipped, cache_errors, files_scanned,
-    /// staged_size, staged_paths)`. `staged_size` is the write-tier subset of `total_size`
+    /// Returns `(total_size, cache_errors, files_scanned, staged_size,
+    /// staged_paths)`. `staged_size` is the write-tier subset of `total_size`
     /// (Requirement 6.1) and is what the caller passes to `install_validation_correction` as the
     /// census's write-cache figure.
     ///
@@ -5429,8 +5399,6 @@ impl CacheSizeTracker {
     async fn scan_metadata_with_shared_validator(
         self: &Arc<Self>,
     ) -> Result<(
-        u64,
-        u64,
         u64,
         u64,
         u64,
@@ -5463,8 +5431,6 @@ impl CacheSizeTracker {
         u64,
         u64,
         u64,
-        u64,
-        u64,
         Vec<std::path::PathBuf>,
         ScanSelfDebit,
     )> {
@@ -5475,7 +5441,7 @@ impl CacheSizeTracker {
         let metadata_dir = self.cache_dir.join("metadata");
 
         if !metadata_dir.exists() {
-            return Ok((0, 0, 0, 0, 0, 0, 0, Vec::new(), ScanSelfDebit::default()));
+            return Ok((0, 0, 0, 0, 0, Vec::new(), ScanSelfDebit::default()));
         }
 
         // Paths of `.meta` files found still staged, for the ledger re-append.
@@ -5486,8 +5452,6 @@ impl CacheSizeTracker {
         let total_size = AtomicU64::new(0);
         // Staged (write-tier) subset of total_size. Requirement 6.1.
         let staged_total = AtomicU64::new(0);
-        let cache_expired = AtomicU64::new(0);
-        let cache_skipped = AtomicU64::new(0);
         let cache_errors = AtomicU64::new(0);
         let files_processed = AtomicU64::new(0);
         // `.meta` files this pass removed — self-healed as unparseable, or deleted by
@@ -5592,12 +5556,6 @@ impl CacheSizeTracker {
                             paths.push(path.clone());
                         }
                     }
-                    if result.cache_expired {
-                        cache_expired.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if result.cache_skipped {
-                        cache_skipped.fetch_add(1, Ordering::Relaxed);
-                    }
                     if result.cache_error {
                         cache_errors.fetch_add(1, Ordering::Relaxed);
                     }
@@ -5633,8 +5591,6 @@ impl CacheSizeTracker {
 
         Ok((
             total_size.load(Ordering::Relaxed),
-            cache_expired.load(Ordering::Relaxed),
-            cache_skipped.load(Ordering::Relaxed),
             cache_errors.load(Ordering::Relaxed),
             files_processed.load(Ordering::Relaxed),
             removed,
@@ -5767,38 +5723,6 @@ impl CacheSizeTracker {
         })
     }
 
-    /// The handle the two deliberately-inert GET-expiry sites below ask for. It is `None`,
-    /// always, by construction.
-    ///
-    /// # Why the gate is a constant instead of `Handle::try_current()`
-    ///
-    /// Both sites used to be gated on `try_current().ok()`, and their inertness was a
-    /// consequence of the thread the scan happened to land on rather than a decision. That
-    /// held while the scan ran on rayon pool workers, which carry no runtime context — and
-    /// it stopped holding the moment the visit moved onto the blocking pool, because a
-    /// blocking-pool thread DOES carry one and does permit `block_on`. Both facts are
-    /// measured by `a_blocking_thread_carries_a_context_and_still_permits_block_on`.
-    ///
-    /// So the move would have revived both sites silently, on the unsplit-batch path only,
-    /// which is precisely the revival `SIZE-TRACKER-BLOCK-ON-DEAD` established as unsafe:
-    /// `invalidate_cache` deletes unconditionally and never re-tests expiry under the slot
-    /// lock, so the verdict would come from this pass's unlocked read while the deletion
-    /// lands on a volume peers are writing. Reviving the predicate alone is worse still —
-    /// it routes idle entries into a deletion that is still inert.
-    ///
-    /// Making the gate explicit keeps that decision where a reader can see it, and removes
-    /// something worse than an inert site: on the unsplit path the old gate succeeded on a
-    /// runtime WORKER, where `block_on` panics, so an operator running with
-    /// `actively_remove_cached_data` on a single-shard cache had a latent abort of the whole
-    /// validation pass rather than two dead branches.
-    ///
-    /// Reviving the pair needs a deletion primitive that re-decides under the key's slot
-    /// lock. That is a separate change with its own red side; when it exists, this function
-    /// is the one place to change.
-    fn get_expiry_handle_deliberately_none() -> Option<&'static tokio::runtime::Handle> {
-        None
-    }
-
     /// Every range of one parsed `.meta`, as [`TailRecord`]s. There is no floor: the per-shard
     /// rank cap is the only membership bound.
     ///
@@ -5869,10 +5793,9 @@ impl CacheSizeTracker {
     /// and does permit `block_on`
     /// (`a_blocking_thread_carries_a_context_and_still_permits_block_on`). So a captured
     /// handle is still required — `try_current()` is not a usable gate in either direction,
-    /// which is why `Self::block_on_from_scan` asks about the thread instead of assuming, and
-    /// why the two inert sites below no longer gate on `try_current()` at all.
+    /// which is why `Self::block_on_from_scan` asks about the thread instead of assuming.
     ///
-    /// # One of the three inert sites is now revived; two are deliberately left inert
+    /// # The write-cache-expiry deletion
     ///
     /// The write-cache-expiry deletion below now uses the captured `runtime` handle, so it
     /// runs for the first time. Its callee re-reads the `.meta` under the key's metadata
@@ -5880,26 +5803,9 @@ impl CacheSizeTracker {
     /// only a filter and the authoritative decision is taken under the lock — a stale
     /// filter can cost a deferred deletion, never a wrong one.
     ///
-    /// The GET-expiry pair below it — the `is_cache_entry_active` consultation and the
-    /// `invalidate_cache` deletion — are **left inert on purpose**, and the reason is
-    /// shared storage rather than threading. `invalidate_cache` deletes unconditionally: it
-    /// takes the slot lock for the mutation but never re-tests `now > expires_at` under it,
-    /// so the verdict would come from this pass's unlocked read while the effect lands on a
-    /// volume other instances are writing. `expires_at` is refreshed on the shared `.meta`
-    /// by any peer's cached GET, graduation or re-PUT, so a peer that refreshed between
-    /// this pass's read and the delete would silently lose the entry — the
-    /// local-decision / shared-effect corollary in
-    /// the cache coherency invariants, and the same class
-    /// `SHARED-DELETE-SAFETY` fixed in the parse-failure branch above. Reviving that pair
-    /// needs a deletion primitive that re-decides under the lock, which is a different
-    /// change with its own red side.
-    ///
-    /// The two are also interlocked, so neither can be revived alone: the
-    /// `is_cache_entry_active` result feeds `.unwrap_or(true)`, and "assume active" is what
-    /// currently makes the GET-expiry branch return `cache_skipped` instead of reaching the
-    /// delete. Reviving only the predicate would route genuinely-idle entries into a
-    /// deletion that is still inert, turning a silent skip into a logged failure and a
-    /// `cache_error` on every expired entry.
+    /// A GET entry past its expiry is counted and left: its next read revalidates it, and
+    /// eviction reclaims it. This pass once had an unlocked deletion for it, which never ran
+    /// (its gate was `None` by construction) and is gone.
     fn scan_metadata_file(
         &self,
         path: &PathBuf,
@@ -5916,8 +5822,6 @@ impl CacheSizeTracker {
                 return ScanFileResult {
                     size_bytes: 0,
                     staged_bytes: 0,
-                    cache_expired: false,
-                    cache_skipped: false,
                     cache_error: true,
                     meta_removed: false,
                     tail_candidates: Vec::new(),
@@ -5986,8 +5890,6 @@ impl CacheSizeTracker {
                     return ScanFileResult {
                         size_bytes: 0,
                         staged_bytes: 0,
-                        cache_expired: false,
-                        cache_skipped: false,
                         cache_error: true,
                         meta_removed: false,
                         tail_candidates: Vec::new(),
@@ -6013,8 +5915,6 @@ impl CacheSizeTracker {
                 return ScanFileResult {
                     size_bytes: 0,
                     staged_bytes: 0,
-                    cache_expired: false,
-                    cache_skipped: false,
                     cache_error: true,
                     // Self-heal. Ask the filesystem rather than trusting the
                     // `remove_file` result — a failed unlink leaves a countable object.
@@ -6091,10 +5991,7 @@ impl CacheSizeTracker {
                             // ranges, matching how every other branch that changes what is
                             // on disk reports its own outcome.
                             //
-                            // Not `cache_expired`: that counter feeds
-                            // `cache_entries_expired` in validation.json and an operator
-                            // reading it means "entries whose TTL ran out". A repair is
-                            // neither an expiry nor an error, so the pass reports a clean
+                            // A repair is not an error, so the pass reports a clean
                             // visit and the `info!` in the repair itself is the greppable
                             // record of how many fired.
                             //
@@ -6103,8 +6000,6 @@ impl CacheSizeTracker {
                             return ScanFileResult {
                                 size_bytes: 0,
                                 staged_bytes: 0,
-                                cache_expired: false,
-                                cache_skipped: false,
                                 cache_error: false,
                                 meta_removed: false,
                                 tail_candidates: Vec::new(),
@@ -6133,8 +6028,6 @@ impl CacheSizeTracker {
                             return ScanFileResult {
                                 size_bytes: total_size,
                                 staged_bytes: staged_size,
-                                cache_expired: false,
-                                cache_skipped: false,
                                 cache_error: true,
                                 meta_removed: false,
                                 tail_candidates: tail_candidates.clone(),
@@ -6166,8 +6059,6 @@ impl CacheSizeTracker {
                     return ScanFileResult {
                         size_bytes: total_size,
                         staged_bytes: staged_size,
-                        cache_expired: false,
-                        cache_skipped: false,
                         cache_error: true,
                         meta_removed: false,
                         tail_candidates: tail_candidates.clone(),
@@ -6198,8 +6089,6 @@ impl CacheSizeTracker {
                     return ScanFileResult {
                         size_bytes: 0,
                         staged_bytes: 0,
-                        cache_expired: false,
-                        cache_skipped: false,
                         cache_error: false,
                         meta_removed,
                         tail_candidates: Vec::new(),
@@ -6217,151 +6106,10 @@ impl CacheSizeTracker {
         // `get_ttl` is: its next read revalidates it, and only eviction near `max_cache_size`
         // reclaims it (staging eviction and read-tier eviction both take expired entries first).
 
-        // Check if GET cache active expiration is enabled and entry is expired
-        if self.actively_remove_cached_data && now > metadata.expires_at {
-            debug!(
-                "GET cache entry expired during validation: {}",
-                metadata.cache_key
-            );
-
-            // Get cache manager reference to check if entry is active
-            let cache_manager = match self.cache_manager.lock().unwrap().as_ref() {
-                Some(weak_ref) => match weak_ref.upgrade() {
-                    Some(cm) => cm,
-                    None => {
-                        warn!("Cache manager reference is no longer valid");
-                        return ScanFileResult {
-                            size_bytes: total_size,
-                            staged_bytes: staged_size,
-                            cache_expired: false,
-                            cache_skipped: false,
-                            cache_error: true,
-                            meta_removed: false,
-                            tail_candidates: tail_candidates.clone(),
-                            self_debit: ScanSelfDebit::default(),
-                        };
-                    }
-                },
-                None => {
-                    // Cache manager not set, skip expiration
-                    return ScanFileResult {
-                        size_bytes: total_size,
-                        staged_bytes: staged_size,
-                        cache_expired: false,
-                        cache_skipped: false,
-                        cache_error: false,
-                        meta_removed: false,
-                        tail_candidates: tail_candidates.clone(),
-                        self_debit: ScanSelfDebit::default(),
-                    };
-                }
-            };
-
-            // INERT, AND LEFT THAT WAY DELIBERATELY — see this function's doc comment.
-            //
-            // `is_active` is `unwrap_or(true)`'s fallback on every visit, and the branch
-            // below always takes the `cache_skipped` return rather than the delete, because
-            // `get_expiry_handle_deliberately_none` yields `None` by construction. It used to
-            // be inert for a weaker reason — `try_current()` failing on a rayon worker, 0
-            // successes against 512 failures when measured — which stopped being true once
-            // the visit moved onto the blocking pool. See that function's doc comment.
-            //
-            // That fallback is currently the only thing making the `invalidate_cache` site
-            // below unreachable, so it is load-bearing rather than vestigial: reviving this
-            // predicate alone would route idle entries into a deletion that is still inert.
-            // Reviving the pair needs a deletion primitive that re-decides under the key's
-            // slot lock — `invalidate_cache` does not — and that is a separate change.
-            let is_active = Self::get_expiry_handle_deliberately_none()
-                .and_then(|handle| {
-                    handle.block_on(async {
-                        cache_manager
-                            .is_cache_entry_active(&metadata.cache_key)
-                            .await
-                            .ok()
-                    })
-                })
-                .unwrap_or(true); // If we can't check, assume active to be safe
-
-            if is_active {
-                debug!(
-                    "Skipping deletion of {} - actively being used",
-                    metadata.cache_key
-                );
-                return ScanFileResult {
-                    size_bytes: total_size,
-                    staged_bytes: staged_size,
-                    cache_expired: false,
-                    cache_skipped: true,
-                    cache_error: false,
-                    meta_removed: false,
-                    tail_candidates: tail_candidates.clone(),
-                    self_debit: ScanSelfDebit::default(),
-                };
-            }
-
-            // INERT, AND LEFT THAT WAY DELIBERATELY — see this function's doc comment.
-            //
-            // Unreachable twice over: `is_active` above is always true, and the gate here
-            // yields `None` by construction. Do NOT revive this by swapping in the captured
-            // `runtime` handle, which is the one-line change it looks like.
-            // `invalidate_cache` deletes unconditionally — it takes the slot lock for the
-            // mutation but never re-tests `now > expires_at` under it — so the verdict would
-            // come from the unlocked read at the top of this function while the deletion
-            // lands on shared storage. `expires_at` is refreshed there by any peer's cached
-            // GET, graduation or re-PUT, so a peer that refreshed inside that window loses
-            // its entry and never learns. Contrast the write-cache site above, which is
-            // revived precisely because its callee re-decides under the lock.
-            let delete_result = Self::get_expiry_handle_deliberately_none().and_then(|handle| {
-                handle.block_on(async {
-                    cache_manager
-                        .invalidate_cache(&metadata.cache_key)
-                        .await
-                        .ok()
-                })
-            });
-
-            match delete_result {
-                Some(_) => {
-                    debug!("Deleted expired GET cache entry: {}", metadata.cache_key);
-                    // Don't count size since we deleted it
-                    return ScanFileResult {
-                        size_bytes: 0,
-                        staged_bytes: 0,
-                        cache_expired: true,
-                        cache_skipped: false,
-                        cache_error: false,
-                        // `invalidate_cache` returns `Ok(())` without stating which
-                        // paths it managed to unlink, so read the path.
-                        meta_removed: !path.exists(),
-                        tail_candidates: Vec::new(),
-                        self_debit: ScanSelfDebit::default(),
-                    };
-                }
-                None => {
-                    warn!(
-                        "Failed to delete expired GET cache entry: {}",
-                        metadata.cache_key
-                    );
-                    return ScanFileResult {
-                        size_bytes: total_size,
-                        staged_bytes: staged_size,
-                        cache_expired: false,
-                        cache_skipped: false,
-                        cache_error: true,
-                        meta_removed: false,
-                        tail_candidates: tail_candidates.clone(),
-                        self_debit: ScanSelfDebit::default(),
-                    };
-                }
-            }
-        }
-
         // Entry not expired or active expiration disabled
         ScanFileResult {
             size_bytes: total_size,
             staged_bytes: staged_size,
-            cache_expired: false,
-            cache_skipped: false,
             cache_error: false,
             meta_removed: false,
             // Moved rather than cloned: this is the common path, taken once per scanned
@@ -6551,6 +6299,39 @@ mod tests {
     // Size tracking is now handled by JournalConsolidator through journal entries.
     // See Task 10 in journal-based-size-tracking spec.
 
+    /// `validation.json` sits on the shared volume, so this release reads records earlier
+    /// releases wrote: one carrying the two GET-expiry counts, and one written before they
+    /// existed.
+    #[test]
+    fn a_validation_record_parses_with_or_without_the_get_expiry_counts() {
+        let with_counts = serde_json::json!({
+            "last_validation": 1_700_000_000u64,
+            "scanned_size": 10,
+            "tracked_size": 10,
+            "drift_bytes": 0,
+            "scan_duration_ms": 1,
+            "metadata_files_scanned": 1,
+            "cache_entries_expired": 5,
+            "cache_entries_skipped": 1
+        });
+        let mut without_counts = with_counts.clone();
+        without_counts
+            .as_object_mut()
+            .expect("object")
+            .retain(|k, _| !k.starts_with("cache_entries_"));
+        let parsed: ValidationMetadata =
+            serde_json::from_value(with_counts).expect("a record with the counts parses");
+        assert_eq!(
+            (parsed.cache_entries_expired, parsed.cache_entries_skipped),
+            (5, 1)
+        );
+        let parsed: ValidationMetadata =
+            serde_json::from_value(without_counts).expect("a record without the counts parses");
+        assert_eq!(
+            (parsed.cache_entries_expired, parsed.cache_entries_skipped),
+            (0, 0)
+        );
+    }
     #[tokio::test]
     async fn test_validation_metadata_persistence() {
         let (tracker, _consolidator, _temp_dir) = create_test_tracker().await;
@@ -6563,8 +6344,6 @@ mod tests {
                 -500,    // drift
                 Duration::from_secs(120),
                 50000, // files_scanned
-                5,     // cache_expired
-                1,     // cache_skipped
                 0,     // cache_errors
                 0,
                 0,
@@ -6581,8 +6360,8 @@ mod tests {
         assert_eq!(metadata.drift_bytes, -500);
         assert_eq!(metadata.scan_duration_ms, 120000);
         assert_eq!(metadata.metadata_files_scanned, 50000);
-        assert_eq!(metadata.cache_entries_expired, 5);
-        assert_eq!(metadata.cache_entries_skipped, 1);
+        assert_eq!(metadata.cache_entries_expired, 0);
+        assert_eq!(metadata.cache_entries_skipped, 0);
         assert_eq!(metadata.cache_expiration_errors, 0);
         assert!(!metadata.active_expiration_enabled);
     }
@@ -7729,8 +7508,6 @@ mod tests {
                 0,
                 0,
                 0,
-                0,
-                0,
             )
             .await
             .unwrap();
@@ -7884,12 +7661,14 @@ mod tests {
                     parts_count: None,
                     part_ranges: HashMap::new(),
                     part_layout_verified: false,
+                    part_layout_marked: Default::default(),
                     upload_id: None,
                     is_write_cached: false,
                     write_cache_expires_at: None,
                     write_cache_created_at: None,
                     write_cache_last_accessed: None,
                     graduation_accounted: false,
+                    checksums_object_scoped: false,
                 },
                 ranges: vec![RangeSpec {
                     start: 0,
@@ -7913,6 +7692,7 @@ mod tests {
                 head_access_count: 0,
                 head_cached_at: None,
                 last_validated_at: None,
+                write_expired_at: None,
             };
             std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
         }
@@ -7926,8 +7706,6 @@ mod tests {
                 0,
                 Duration::from_secs(10),
                 4,
-                0,
-                0,
                 0,
                 0,
                 0,
@@ -8048,17 +7826,14 @@ mod tests {
     }
 
     // =====================================================================
-    // What moving the scan onto the blocking pool does to the two deliberately
-    // inert GET-expiry sites
+    // What moving the scan onto the blocking pool does to `block_on`
     //
-    // Spec: cache-eviction-at-scale § 6.3. Unit SIZE-TRACKER-BLOCK-ON-DEAD left
-    // `is_cache_entry_active` and the GET-expiry `invalidate_cache` inert on
-    // purpose, and recorded that reviving either alone is worse than reviving
-    // neither. Both are gated on `Handle::try_current().ok()`, so whether they are
-    // inert is a fact about the thread the scan lands on — which this change moves.
+    // Spec: cache-eviction-at-scale § 6.3. `Self::block_on_from_scan` asks about the
+    // thread it runs on rather than gating on `Handle::try_current().ok()`, which
+    // cannot tell the two threads the scan lands on apart.
     //
-    // The two facts below are MEASURED here rather than reasoned about, because the
-    // decision to make those sites explicitly inert rests on them:
+    // The two facts below are MEASURED here rather than reasoned about, because that
+    // choice rests on them:
     //
     //  1. A blocking-pool thread DOES carry a runtime context, so `try_current()`
     //     succeeds there. Topology-gated inertness would therefore have ended
@@ -8068,8 +7843,7 @@ mod tests {
     //     panics. So before this change the unsplit path did not have two inert
     //     sites — it had a latent abort of the whole validation pass.
     //
-    // Which is why the gate is no longer `try_current()`: see
-    // `get_expiry_handle_deliberately_none`.
+    // Which is why the write-cache deletion is not gated on `try_current()`.
     // =====================================================================
     #[test]
     fn a_blocking_thread_carries_a_context_and_still_permits_block_on() {
@@ -8359,7 +8133,7 @@ mod tests {
                     }
                 });
 
-                let (scanned, _, _, _, files, _, _, _, _) = tracker
+                let (scanned, _, files, _, _, _, _) = tracker
                     .scan_metadata_with_shared_validator()
                     .await
                     .expect("scan should succeed");
@@ -8435,12 +8209,14 @@ mod tests {
                 parts_count: None,
                 part_ranges: HashMap::new(),
                 part_layout_verified: false,
+                part_layout_marked: Default::default(),
                 upload_id: None,
                 is_write_cached: false,
                 write_cache_expires_at: None,
                 write_cache_created_at: None,
                 write_cache_last_accessed: None,
                 graduation_accounted: false,
+                checksums_object_scoped: false,
             },
             ranges: vec![RangeSpec {
                 start: 0,
@@ -8466,6 +8242,7 @@ mod tests {
             head_access_count: 0,
             head_cached_at: None,
             last_validated_at: None,
+            write_expired_at: None,
         };
         std::fs::write(path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
     }
@@ -9729,8 +9506,6 @@ mod validation_spacing_tests {
                 0,
                 0,
                 0,
-                0,
-                0,
             )
             .await
             .unwrap();
@@ -9801,8 +9576,6 @@ mod validation_spacing_tests {
                 0,
                 Duration::from_secs(10),
                 4,
-                0,
-                0,
                 0,
                 0,
                 0,
@@ -9977,12 +9750,9 @@ mod empty_object_etag_cold_repair_tests {
              census downward"
         );
         assert!(
-            !result.cache_error && !result.cache_expired && !result.cache_skipped,
-            "a successful repair is a clean visit, not an expiry, a skip or an error. \
-             error={} expired={} skipped={}",
-            result.cache_error,
-            result.cache_expired,
-            result.cache_skipped
+            !result.cache_error,
+            "a successful repair is a clean visit, not an error. error={}",
+            result.cache_error
         );
     }
 
@@ -10506,9 +10276,8 @@ mod write_cache_expiry_revival_tests {
             "the entry must be counted at its real size"
         );
         assert!(
-            !result.cache_expired && !result.meta_removed && !result.cache_error,
-            "nothing expired, nothing removed, no error. expired={} meta_removed={} error={}",
-            result.cache_expired,
+            !result.meta_removed && !result.cache_error,
+            "nothing removed, no error. meta_removed={} error={}",
             result.meta_removed,
             result.cache_error
         );
@@ -10582,9 +10351,8 @@ mod write_cache_expiry_revival_tests {
              on disk while the census forgets its bytes."
         );
         assert!(
-            !result.cache_expired && !result.cache_error,
-            "a live entry is neither an expiry nor an error. expired={} error={}",
-            result.cache_expired,
+            !result.cache_error,
+            "a live entry is not an error. error={}",
             result.cache_error
         );
     }
@@ -10611,9 +10379,8 @@ mod write_cache_expiry_revival_tests {
             "AN EXPIRED WRITE-CACHE ENTRY WAS DELETED FOR ITS AGE on an unsplit batch"
         );
         assert!(
-            !result.cache_expired && !result.meta_removed && !result.cache_error,
-            "the unsplit topology reaches the same verdict. expired={} meta_removed={} error={}",
-            result.cache_expired,
+            !result.meta_removed && !result.cache_error,
+            "the unsplit topology reaches the same verdict. meta_removed={} error={}",
             result.meta_removed,
             result.cache_error
         );
@@ -10755,6 +10522,7 @@ mod tail_partition_tests {
                 parts_count: None,
                 part_ranges: HashMap::new(),
                 part_layout_verified: false,
+                part_layout_marked: Default::default(),
                 upload_id: None,
                 is_write_cached: object_is_write_cached,
                 // No write-cache expiry, so the write-cache-expiry branch cannot fire and remove
@@ -10763,6 +10531,7 @@ mod tail_partition_tests {
                 write_cache_created_at: Some(now),
                 write_cache_last_accessed: Some(now),
                 graduation_accounted: false,
+                checksums_object_scoped: false,
             },
             ranges: specs
                 .iter()
@@ -10791,6 +10560,7 @@ mod tail_partition_tests {
             head_access_count: 0,
             head_cached_at: None,
             last_validated_at: None,
+            write_expired_at: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
         path

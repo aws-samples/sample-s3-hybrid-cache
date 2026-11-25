@@ -45,11 +45,7 @@ impl TestProxyInstance {
 
         let journal_manager = Arc::new(JournalManager::new(cache_dir.clone(), instance_id.clone()));
 
-        let hybrid_writer = HybridMetadataWriter::new(
-            cache_dir.clone(),
-            lock_manager.clone(),
-            journal_manager.clone(),
-        );
+        let hybrid_writer = HybridMetadataWriter::new(journal_manager.clone());
 
         let consolidator = JournalConsolidator::new(
             cache_dir.clone(),
@@ -86,27 +82,38 @@ impl TestProxyInstance {
         range_spec: RangeSpec,
         write_mode: WriteMode,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Create the actual range file that the metadata will reference
+        // The range file a production fill publishes: at the sharded path the consolidator
+        // validates, with its identity recorded, and the object's metadata on the `Add`, so
+        // the fold can create the `.meta` from it.
         let ranges_dir = self.cache_dir.join("ranges");
-        tokio::fs::create_dir_all(&ranges_dir).await?;
-
-        let range_file = ranges_dir.join(format!(
-            "{}_{}-{}.bin",
-            cache_key.replace('/', "%2F"),
-            range_spec.start,
-            range_spec.end
-        ));
-
+        let range_file = s3_proxy::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_{}-{}.bin", range_spec.start, range_spec.end),
+        )
+        .map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(range_file.parent().unwrap()).await?;
         let range_data = vec![0u8; (range_spec.end - range_spec.start + 1) as usize];
         tokio::fs::write(&range_file, range_data).await?;
-
+        let mut range_spec = range_spec;
+        range_spec.file_path = range_file
+            .strip_prefix(&ranges_dir)?
+            .to_string_lossy()
+            .into_owned();
+        range_spec.file_identity =
+            s3_proxy::cache_types::RangeFileIdentity::of(&std::fs::metadata(&range_file)?);
         // Write metadata
         self.hybrid_writer
             .write_range_metadata_witnessed(
                 cache_key,
                 range_spec,
                 write_mode,
-                None,
+                Some(ObjectMetadata {
+                    etag: "\"multi-instance-object\"".to_string(),
+                    last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                    content_length: 64 * 1024 * 1024,
+                    ..Default::default()
+                }),
                 std::time::Duration::from_secs(3600),
                 None,
             )
@@ -244,17 +251,17 @@ async fn test_concurrent_writes_from_multiple_instances() {
     // Spawn concurrent write tasks
     let write_task1 = async {
         instance1
-            .write_range(cache_key, range1, WriteMode::Hybrid)
+            .write_range(cache_key, range1, WriteMode::JournalOnly)
             .await
     };
     let write_task2 = async {
         instance2
-            .write_range(cache_key, range2, WriteMode::Hybrid)
+            .write_range(cache_key, range2, WriteMode::JournalOnly)
             .await
     };
     let write_task3 = async {
         instance3
-            .write_range(cache_key, range3, WriteMode::Hybrid)
+            .write_range(cache_key, range3, WriteMode::JournalOnly)
             .await
     };
 
@@ -563,12 +570,7 @@ async fn test_high_concurrent_write_load_performance() {
             let cache_key = cache_key.to_string();
             let temp_dir_path = temp_dir.path().to_path_buf();
 
-            // Use different write modes to test various scenarios
-            let write_mode = match range_idx % 3 {
-                0 => WriteMode::Immediate,
-                1 => WriteMode::Hybrid,
-                _ => WriteMode::JournalOnly,
-            };
+            let write_mode = WriteMode::JournalOnly;
 
             let task = async move {
                 // Simulate some processing time

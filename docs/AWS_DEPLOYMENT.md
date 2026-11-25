@@ -237,7 +237,7 @@ The limit lets the proxies re-read every staged range's metadata within 24 hours
 
 A proxy's memory has four parts:
 
-- **Streaming paths.** `server.max_concurrent_requests` bounds each request for its whole life, transfer included. If every request is a streamed cache hit, the streaming paths take about 200 MiB + `max_concurrent_requests` × 3.9 MiB per proxy, and a cache miss whose cache write stalls holds more ([Memory impact](CONFIGURATION.md#memory-impact)). Upload paths and cache-miss GETs stream rather than buffering whole objects, so their memory does not grow with object size.
+- **Streaming paths.** `server.max_concurrent_requests` bounds each request for its whole life, transfer included. If every request is a streamed cache hit, the streaming paths take about 200 MiB + `max_concurrent_requests` × 3.9 MiB per proxy. A cache miss whose cache write runs slower than S3 holds up to about 46 MiB ([Memory impact](CONFIGURATION.md#memory-impact)). Upload paths and cache-miss GETs stream rather than buffering whole objects, so their memory does not grow with object size.
 - **Write-cache backlog.** A PUT's response returns before its background cache store finishes, and up to 1,024 stores can be pending per proxy. Each holds up to min(object size, `cache.compression_batch_size`) of buffer and one open file. The backlog is therefore at most 1,024 × min(object size, `cache.compression_batch_size`) of buffer and 1,024 file descriptors ([Write-through ordering](CACHING.md#write-through-ordering)). That is 1 GiB of buffer at the 1 MiB default, and 16 GiB at the 16 MiB maximum.
 - **Buffered read paths.** Range merge, page widening, buffered range serving, and the recovery fallbacks buffer a whole range. `server.max_inflight_buffer_bytes` bounds them in aggregate and is off by default ([In-flight memory ceiling](CONFIGURATION.md#in-flight-memory-ceiling)). On a 4 GiB `c8gn.large` with the default 512 MiB RAM cache, 512 MiB (`536870912`) is a reasonable starting value.
 - **RAM cache.** `cache.max_ram_cache_size` (default 512 MiB) is a separate budget on top of the others.
@@ -297,12 +297,31 @@ On AWS, `<proxy-host>` is a name in a Route 53 private hosted zone that resolves
 
 A private hosted zone associated with the client VPCs can resolve a proxy name you own, for the recommended pattern, or S3's own hostnames, for the DNS alternative. In either zone, add one multi-value answer `A` record per proxy, each with a distinct set identifier and a short TTL.
 
-- **A proxy name** needs one zone and one record set, which cover every Region and bucket, and does not conflict with an interface endpoint's private DNS. Clients connect to the proxies by that name, so one certificate with the name as a SAN serves every proxy ([Fleet behind one proxy name](GETTING_STARTED.md#fleet-behind-one-proxy-name)).
+- **A proxy name** needs one zone and, without AZ-local preference, one record set, which cover every Region and bucket, and does not conflict with an interface endpoint's private DNS. Clients connect to the proxies by that name, so one certificate with the name as a SAN serves every proxy ([Fleet behind one proxy name](GETTING_STARTED.md#fleet-behind-one-proxy-name)).
 - **S3's hostnames** need a zone for each hostname the fleet serves: `s3.<region>.amazonaws.com` for each Region whose buckets clients access, plus any access-point hostnames.
 
 The proxy resolves origin hostnames through public resolvers by default, or through `connection_pool.dns_servers` when it is set, and never reads `/etc/hosts`, so neither zone creates a resolution loop ([DNS server configuration](CONFIGURATION.md#dns-server-configuration)). Keep `dns_servers` off any resolver that answers from a zone for S3's hostnames, such as the VPC resolver. Otherwise the proxy sends requests to the fleet instead of S3, and each request passes between proxies until it reaches one it has already visited, which answers `508 Loop Detected` ([Request loops](ERROR_HANDLING.md#9-request-loops-via-and-508-loop-detected)).
 
-**AZ-local preference**: Route 53 multi-value answers do not prefer same-AZ proxies, and a private hosted zone is associated with whole VPCs rather than with subnets or AZs. For AZ affinity with a proxy name, give each AZ its own name that resolves only to that AZ's proxies, and point each AZ's clients at their own name.
+**AZ-local preference**: To keep each client on proxies in its own AZ, put [AZ-affinity routing](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-azaffinity.html) on the proxy name. Build it in two layers in the same private hosted zone:
+
+1. **Pools.** For each AZ, a pool name such as `usw2-az1.pool.internal.example.com` with one multi-value answer `A` record per proxy in that AZ, each with its own health check. Add a pool name such as `all.pool.internal.example.com` that holds every proxy the same way, reusing each proxy's health check.
+2. **The proxy name.** One AZ-affinity alias record per AZ that points at that AZ's pool, plus a `Region` record and a `Global` record that point at the all-proxies pool. Set **Evaluate target health** to **Yes** on every one.
+
+```json
+{
+  "Name": "s3-proxy.internal.example.com", "Type": "A", "SetIdentifier": "usw2-az1",
+  "AZAffinity": { "LocationType": "AvailabilityZone", "LocationId": "usw2-az1" },
+  "AliasTarget": { "HostedZoneId": "<zone-id>", "DNSName": "usw2-az1.pool.internal.example.com", "EvaluateTargetHealth": true }
+}
+```
+
+Each client then receives only its own AZ's healthy proxies, and resolver rotation spreads it across them as described below. A failed proxy leaves its pool's answer while the rest of its AZ keeps serving. When every proxy in an AZ is unhealthy, that AZ's clients receive the healthy proxies from the all-proxies pool. Clients in an AZ with no record of its own receive the `Region` record.
+
+- **Identify AZs by AZ ID**, such as `usw2-az1`, never by AZ name, because each account maps AZ names to AZs differently. `aws ec2 describe-availability-zones --query 'AvailabilityZones[].[ZoneName,ZoneId]'` lists both.
+- **In a zone for S3's hostnames, build both layers in every zone**, because an alias record points only at records in its own zone. Put the pools under a label with an underscore, such as `usw2-az1._pool.s3.<region>.amazonaws.com`, which no bucket name can contain. Wildcard CNAMEs to the primary zone's apex then follow its AZ selection.
+- **Keep the health checks on the pool records.** An AZ-affinity record that holds several addresses itself carries one health check, so it can only withdraw its whole AZ.
+- **Test from an instance in each AZ** with `dig` against the VPC Resolver. The Route 53 console's DNS checking tool and `TestDNSAnswer` do not evaluate AZ-affinity records.
+- Use an AWS CLI or SDK release that includes AZ-affinity routing; older releases reject the `AZAffinity` field.
 
 A hosts-file entry on each client host is the minimal form of either shape, for a single proxy in a proof of concept. It holds one address, so it gives no rotation, does not adapt to proxy failures, and must be edited by hand on every fleet change. Use a hosted zone or an NLB beyond a proof of concept.
 
@@ -339,9 +358,9 @@ Application status checks work against the proxy's health endpoint unchanged. Th
 - A restarting proxy fails the check, so a rolling deploy under Auto Scaling can become a replacement storm. Set `Aggregation` to `excluded` while trying out a check, and suppress or disassociate it around a deploy.
 - Defaults are a 60-second interval, a failure threshold of 2, and a 300-second startup grace period, so detection takes around two minutes. Billing is $0.01 per managed network interface per hour, per Availability Zone.
 
-**Auto Scaling with DNS**: use EventBridge to react to EC2 instance state changes. Create a rule matching `EC2 Instance State-change Notification` for the states `running` and `terminated`, filtered to the Auto Scaling group's instances by tag. Target it at a Lambda function that looks up the instance's private IP address and AZ, then upserts (on `running`) or deletes (on `terminated`) its multi-value `A` record. With a name per AZ, the record goes in that AZ's record set. No lifecycle hook is needed: the proxy must mount the file system and pass health checks before serving traffic anyway, and the short TTL keeps the propagation window after `running` brief.
+**Auto Scaling with DNS**: use EventBridge to react to EC2 instance state changes. Create a rule matching `EC2 Instance State-change Notification` for the states `running` and `terminated`, filtered to the Auto Scaling group's instances by tag. Target it at a Lambda function that looks up the instance's private IP address and AZ ID, then upserts (on `running`) or deletes (on `terminated`) its multi-value `A` record. With AZ-local preference, the proxy has a record in its AZ's pool and one in the all-proxies pool. No lifecycle hook is needed: the proxy must mount the file system and pass health checks before serving traffic anyway, and the short TTL keeps the propagation window after `running` brief.
 
-**Static fleet**: update the records by hand on every fleet change, keeping each per-AZ name to that AZ's proxies.
+**Static fleet**: update the records by hand on every fleet change, keeping each AZ's pool to that AZ's proxies.
 
 ### Load balancer: encrypting the client hop
 
@@ -425,13 +444,13 @@ DNS comes in two shapes, which differ in whether the client hop is encrypted. Cl
 | Distribution | Per lookup, by resolver rotation | Per connection | Per lookup, by resolver rotation |
 | Health checking | Application status check → CloudWatch alarm → Route 53 | Target group, built in | As for a proxy name |
 | Failover | Detection + TTL + client re-resolve | Detection alone | As for a proxy name |
-| AZ affinity | A name per AZ (manual) | Built in, with cross-zone off | None within a VPC |
+| AZ affinity | AZ-affinity alias records over per-AZ pools | Built in, with cross-zone off | As for a proxy name, in each zone |
 | Auto Scaling | EventBridge + Lambda for records; Auto Scaling replaces on application status | Attach the group to a target group | As for a proxy name |
 | Cost | < $1/month, plus $0.01/hr per managed network interface | ~$450/month at 100 GB/hr; ~$2,200/month at 500 GB/hr: $0.0225/hour plus $0.006 per LCU-hour, one LCU per GB/hour processed ([pricing](https://aws.amazon.com/elasticloadbalancing/pricing/), us-east-1, as of September 2026) | As for a proxy name |
 
 Use a proxy name where clients can set `HTTP_PROXY`. It gives an encrypted and cached client hop, even distribution, and server-side health checking at DNS prices, two to three orders of magnitude below the NLB's per-GB charge.
 
-Choose the NLB for per-connection balance, failover that does not wait on a TTL, built-in AZ affinity, or one stable endpoint.
+Choose the NLB for per-connection balance, failover that does not wait on a TTL, or one stable endpoint.
 
 A DNS zone for S3's hostnames is the simpler alternative where the network segment between clients and proxies is secure and cleartext on it is acceptable: clients need no proxy setting. SigV4 authenticates each request but does not encrypt it; see [What a cleartext hop exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes). For clients inside a VPC, [VPC Encryption Controls](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-encryption-controls.html) in monitor or enforce mode encrypt traffic between instances in Nitro hardware, even when the application layer is cleartext. They do not cover clients outside the VPC, such as on-premises clients.
 

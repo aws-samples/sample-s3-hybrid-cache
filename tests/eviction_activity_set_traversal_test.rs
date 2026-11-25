@@ -202,7 +202,7 @@ fn seed_peer_journal(cache_dir: &std::path::Path, cache_key: &str, line_count: u
 ///
 /// A count at or near the object count implicates the activity check in
 /// `CacheManager::perform_eviction_with_lock`: the `EvictionActivityOracle` built before
-/// `run_leaf_groups` has been bypassed and `is_cache_entry_active` is being called from inside the
+/// `run_leaf_groups` has been bypassed and a per-key journal read is being made from inside the
 /// per-object body again. A count of zero implicates the fixture, not the product — it means the
 /// predicate never ran, so the test proves nothing about the hoist and must not be read as a pass.
 /// Those two are deliberately different failures with different messages.

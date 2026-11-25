@@ -1286,6 +1286,14 @@ async fn fetcher_branch_completes_success_on_2xx() {
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    // The streamed fill completes the guard once the body is read and the store commits.
+    let _ = http_body_util::BodyExt::collect(response.into_body()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while flights_registered(&inflight_tracker, &cache_key) != 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // After fetcher completes successfully, the flight key should be removed
     assert_eq!(
@@ -1491,7 +1499,6 @@ async fn part_fetcher_branch_completes_success_on_2xx() {
         std::sync::Arc::new(s3_proxy::config::Config::default()),
         true,
         wait_timeout,
-        3,
         None,
         &ResolvedSettings::default(),
         &None,
@@ -1541,7 +1548,6 @@ async fn part_fetcher_branch_completes_error_on_non_2xx() {
         std::sync::Arc::new(s3_proxy::config::Config::default()),
         true,
         wait_timeout,
-        3,
         None,
         &ResolvedSettings::default(),
         &None,

@@ -50,6 +50,7 @@ fn write_cache(root: &Path) {
             head_access_count: 0,
             head_cached_at: None,
             last_validated_at: None,
+            write_expired_at: None,
         };
         std::fs::write(
             dir.join(format!("object-{i}.meta")),

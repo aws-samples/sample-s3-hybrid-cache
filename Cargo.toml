@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "3.0.6"
+version = "3.0.7"
 edition = "2021"
 # MSRV. `time` and `hickory-{resolver,proto,net}` declare rust-version = "1.88", so the floor
 # cannot go below 1.88 whatever this crate does. 1.89 is retained rather than lowered to 1.88:
@@ -46,6 +46,8 @@ twox-hash = "2.1.2"
 
 # Hashing
 blake3 = "1.5"
+# MD5 of a cached body, checked against S3's append-md5 trailer before a fill commits.
+md-5 = "0.10"
 
 # File locking for shared cache coordination
 fs4 = "1.1"
@@ -278,6 +280,11 @@ path = "tests/consolidation_journal_read_memory_test.rs"
 name = "consolidation_journal_offset_index_cost_test"
 path = "tests/consolidation_journal_offset_index_cost_test.rs"
 
+# write_invalidation_journal_cost_test: the process-wide /proc/self/io rchar counter, measuring the journal bytes one write invalidation reads, and an ignored wall-time test
+[[test]]
+name = "write_invalidation_journal_cost_test"
+path = "tests/write_invalidation_journal_cost_test.rs"
+
 # eviction_activity_set_traversal_test: FAILED 2/3 grouped and passed 3/3 filtered to its own tests in the same binary: asserts a journal-set read count against a ceiling of 2, and the group's neighbours push it to 3
 [[test]]
 name = "eviction_activity_set_traversal_test"
@@ -437,6 +444,10 @@ path = "tests/download_coordination_bug_condition_property_test.rs"
 [[test]]
 name = "part_layout_trust_unverified_test"
 path = "tests/part_layout_trust_unverified_test.rs"
+# get_heal_counter_test: asserts exact deltas on cache.metadata_heal_overwrite_total, a process-global counter other tests' heals move
+[[test]]
+name = "get_heal_counter_test"
+path = "tests/get_heal_counter_test.rs"
 # trust_unverified_ranges_test: sets cache.trust_unverified_ranges, a process-global read by every serve path and the consolidator, so it cannot share a process with tests that run under the default
 [[test]]
 name = "trust_unverified_ranges_test"

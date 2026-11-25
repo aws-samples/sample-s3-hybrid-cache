@@ -190,8 +190,6 @@ async fn test_validation_metadata_persistence() {
             -500,    // drift
             Duration::from_secs(120),
             50000, // files_scanned
-            5,     // cache_expired
-            1,     // cache_skipped
             0,     // cache_errors
             0,
             0,
@@ -207,8 +205,8 @@ async fn test_validation_metadata_persistence() {
     assert_eq!(metadata.tracked_size, 1000500);
     assert_eq!(metadata.drift_bytes, -500);
     assert_eq!(metadata.scan_duration_ms, 120000);
-    assert_eq!(metadata.cache_entries_expired, 5);
-    assert_eq!(metadata.cache_entries_skipped, 1);
+    assert_eq!(metadata.cache_entries_expired, 0);
+    assert_eq!(metadata.cache_entries_skipped, 0);
 }
 
 #[tokio::test]

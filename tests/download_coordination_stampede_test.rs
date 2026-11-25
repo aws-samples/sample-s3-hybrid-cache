@@ -573,7 +573,7 @@ async fn run_scenario(
     match scenario.cache_state {
         CacheState::Cold => {
             // Ensure cache is clean
-            let _ = cache_manager.invalidate_cache(&cache_key).await;
+            let _ = cache_manager.invalidate_cache_hierarchy(&cache_key).await;
         }
         CacheState::Expired => {
             // Pre-warm the cache

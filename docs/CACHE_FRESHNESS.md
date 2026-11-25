@@ -25,12 +25,12 @@ What always holds:
 | An object is written through one hostname and read through another: an access point or Multi-Region Access Point and the bucket's own hostname, or two access points | The older object, or a deleted one | As the first row: `get_ttl` for GET, `head_ttl` for HEAD, including the HEAD-before-GET check | Write and read each object through the same hostname, or give the access point's key prefix a short or `"0s"` TTL | [Access points and Multi-Region Access Points](CACHING.md#access-points-and-multi-region-access-points) |
 | Another proxy sharing the cache volume acknowledges an overwrite or delete while this proxy holds the object in RAM | The older object, or a deleted one, from this proxy | A RAM range hit: up to `cache.ram_cache_verification_interval` (default `1s`). An answer from the RAM metadata cache, such as a HEAD: up to `cache.metadata_cache.refresh_interval` (default `5s`). A key with `page_widening: true`: a widened read re-checks a page held in this proxy's RAM against the shared metadata after `cache.ram_cache_verification_interval`, like a RAM range hit | Read after write through the proxy that took the write. Lower both intervals on every proxy, since each bounds only its own RAM. For keys where even one second of RAM staleness matters, set `ram_cache_eligible: false` | [RAM cache coherency](#ram-tier-coherency-contract), [Write-through ordering](CACHING.md#write-through-ordering) |
 | A key has `page_widening: true`, and a PUT, CompleteMultipartUpload or DELETE is acknowledged within one consolidation cycle of a page of that key being cached | On a widened read, the earlier object, or a deleted one, from any proxy including the one that took the write | About one consolidation cycle after the acknowledgement: `cache.shared_storage.consolidation_interval`, default `5s` | Leave `page_widening` off for keys that are read back right after they are written or deleted | [Write-through ordering](CACHING.md#write-through-ordering) |
-| The cache volume is slow or unavailable when a proxy acknowledges a write or delete, so the invalidation does not finish within the write's cache budget (1 second, or 3 seconds for a DeleteObjects) | From other proxies sharing the volume: the object the write replaced or deleted. The proxy that took the write sends the key to S3 | Until that proxy's background retry lands after the volume recovers, plus the RAM bounds in the row above on the other proxies. The other proxies wait on that retry only while the proxy that took the write keeps running, or has the key in `logging.local_state_dir`, and still tracks the key by name. That ends early if the proxy restarts before the retry lands and the key had no record in `logging.local_state_dir`. It also ends if the proxy ran out of room to track keys by name and sent every read to S3 instead. The other proxies can then serve the replaced or deleted object until `get_ttl` (GET, default `1d`) or `head_ttl` (HEAD, default `60s`) passes, or until the key's next write | Keep `logging.local_state_dir` (default `/var/lib/s3-proxy`) writable on a local file system. Alert on `cache.write_stamp_log_memory_only` and `cache.volume_stall_breaker_open`. Fix the volume's metadata-operation latency | [Write-through ordering](CACHING.md#write-through-ordering), [A slow cache volume on the write path](ERROR_HANDLING.md#8-a-slow-cache-volume-on-the-write-path-bounded-waits) |
+| The cache volume is slow or unavailable when a proxy acknowledges a write or delete, so the invalidation does not finish within the write's cache budget (1 second, or 3 seconds for a DeleteObjects). The same holds when the volume refuses both to delete the object's `.meta` file and to rewrite it | From other proxies sharing the volume: the object the write replaced or deleted. The proxy that took the write sends the key to S3 | Until that proxy's background retry lands after the volume recovers, plus the RAM bounds in the row above on the other proxies. The other proxies wait on that retry only while the proxy that took the write keeps running, or has the key in `logging.local_state_dir`, and still tracks the key by name. That ends early if the proxy restarts before the retry lands and the key had no record in `logging.local_state_dir`. It also ends if the proxy ran out of room to track keys by name and sent every read to S3 instead. The other proxies can then serve the replaced or deleted object until `get_ttl` (GET, default `1d`) or `head_ttl` (HEAD, default `60s`) passes, or until the key's next write | Keep `logging.local_state_dir` (default `/var/lib/s3-proxy`) writable on a local file system. Alert on `cache.write_stamp_log_memory_only` and `cache.volume_stall_breaker_open`. Fix the volume's metadata-operation latency | [Write-through ordering](CACHING.md#write-through-ordering), [A slow cache volume on the write path](ERROR_HANDLING.md#8-a-slow-cache-volume-on-the-write-path-bounded-waits) |
 | A write through the proxy is sent in full, then times out, loses its connection or gets an answer cut short, and S3 applies it after the proxy has given up | The object the write replaced, from a GET or HEAD that reached S3 before S3 finished applying the write. The proxy drops its cached copy before it answers the write, so only such a request can cache the older object | GET: until `get_ttl` has passed since that GET cached it (default `1d`). HEAD: until `head_ttl` has passed (default `60s`). A later write of the key through a proxy ends it sooner | Retry the write through the proxy: a write that succeeds drops the cached copy again. Lower `get_ttl` for the prefix | [Writes the origin stops answering](ERROR_HANDLING.md#10-writes-the-origin-stops-answering) |
 | One bucket name is in use at two S3-compatible stores and the proxy cannot tell them apart: the stores share a hostname (two ports, or two transports), or the bucket's cached entries were written before the proxy recorded which store the bucket belongs to | An object, or HEAD headers, from the other store | GET: until `get_ttl` has passed since the copy was cached or last confirmed (default `1d`). HEAD: until `head_ttl` has passed (default `60s`). With a shared hostname this recurs for as long as both stores are in use | Give each store its own bucket names: that is the only way both stores are cached. Otherwise give each store its own hostname, so the bucket name binds to one of them and the other's requests are forwarded uncached. Or set `get_ttl: "0s"`, `head_ttl: "0s"` and `evaluate_conditions_from_cache: false` on the bucket, so every read is checked against the client's own store | [Cache-key note](CONFIGURATION.md#cache-key-note), [One bucket name at two origins](CACHING.md#one-bucket-name-at-two-origins), [Removing one bucket's cached data](CACHING.md#removing-one-buckets-cached-data) |
 | A proxy fronts Amazon S3 in both the commercial and GovCloud (US) partitions on one cache volume, and one bucket name exists in both | An object, or HEAD headers, from the other partition | As the row above | Use a separate cache volume for each partition, or set `get_ttl: "0s"`, `head_ttl: "0s"` and `evaluate_conditions_from_cache: false` for the shared bucket names | [What counts as one origin](CACHING.md#what-counts-as-one-origin) |
-| S3 fails with a transport error or a retryable `5xx` while the proxy revalidates a cached entry for several coalesced requests | The cached copy, which can be older than S3's current object | One failed revalidation: only the requests already queued behind it are answered from the cached copy, and the next request revalidates again. The copy is at most `get_ttl` old, counted from when the object was cached or last confirmed by S3, and is never served for a key with `get_ttl: "0s"` | Set `get_ttl: "0s"` for keys where an error must not be answered from cache | [GET TTL](#get-ttl-get_ttl) (availability exception) |
-| A cached range file is damaged on disk | For a read the proxy assembles in memory (one cached extent smaller than `cache.disk_streaming_threshold`, 1 MiB by default, or a slice or merge of up to 8 MiB): nothing wrong, the proxy fetches from S3. For a read streamed from the cache (one extent at or above that threshold, or a larger read over several extents): the response stops partway with a connection error when the check fails. The bytes sent before it can be wrong. The check comes after a range file's last block, so a streamed response that ends before the end of its cached range can complete with damaged bytes | On each proxy, the streamed read that finds the damage and any already reading the file. That read marks the file, and later reads of it on that proxy are fetched from S3 until the range is removed or cached again. A mark lapses two minutes after the last read it turned away, so a damaged file no one reads for that long can break one more streamed read. A response that ends before the check can carry damaged bytes until a read that reaches the check finds the damage | Validate checksums in the client: a full-object GET carries the stored `x-amz-checksum-*` headers. Watch `range_file_corruption_detected` on `/metrics` | [Integrity](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame), [Damaged range files](../SECURITY.md#damaged-range-files) |
+| S3 fails with a transport error or a retryable `5xx` while the proxy revalidates a cached entry for several coalesced requests | The cached copy, which can be older than S3's current object | One failed revalidation: only the requests already queued behind it are answered from the cached copy, and the next request revalidates again. The copy is at most `get_ttl` old, counted from when the object was cached or last confirmed by S3, and is never served for a key with `get_ttl: "0s"` or for an entry a write expired | Set `get_ttl: "0s"` for keys where an error must not be answered from cache | [GET TTL](#get-ttl-get_ttl) (availability exception) |
+| A cached range file is damaged on disk | For a read the proxy assembles in memory (one cached extent smaller than `cache.disk_streaming_threshold`, 1 MiB by default, or a slice or merge of up to 8 MiB): nothing wrong, the proxy fetches from S3. For a read streamed from the cache (one extent at or above that threshold, or a larger read over several extents): the response stops partway with a connection error when the check fails. The bytes sent before it can be wrong. The check comes after a range file's last block, so a streamed response that ends before the end of its cached range can complete with damaged bytes | On each proxy, the streamed read that finds the damage and any already reading the file. That read marks the file, and later reads of it on that proxy are fetched from S3 until the range is removed or cached again. A mark lapses two minutes after the last read it turned away, so a damaged file no one reads for that long can break one more streamed read. A response that ends before the check can carry damaged bytes until a read that reaches the check finds the damage | Validate checksums in the client: a full-object GET carries the stored `x-amz-checksum-*` headers ([Header restoration on cache hits](#header-restoration-on-cache-hits) lists the exceptions). Watch `range_file_corruption_detected` on `/metrics` | [Integrity](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame), [Damaged range files](../SECURITY.md#damaged-range-files) |
 | Something other than the proxy writes to the cache volume | Whatever bytes and headers were written, served as the object | Until the entry is replaced, invalidated, expires or is evicted | Restrict write access to the cache volume to the proxies. The frame checksum detects accidental damage, not deliberate edits | [Trust and integrity model](ARCHITECTURE.md#trust-and-integrity-model) |
 
 Each proxy measures an entry's age on its own clock against the time recorded by the proxy that
@@ -46,7 +46,6 @@ Default: `1d` (1 day). `get_ttl` controls how long cached data stays valid for G
 ```yaml
 cache:
   get_ttl: "1d"  # Default
-  actively_remove_cached_data: false  # Lazy expiration (default)
 ```
 
 - An overwrite or delete through a proxy sharing the cache volume invalidates the cached copy. A
@@ -59,8 +58,7 @@ cache:
 
 When `get_ttl` passes, the entry stays on disk until it is read or evicted, and the next request
 revalidates with S3 as described below. The daily validation scan deletes no expired read-cache
-entry, with either value of `actively_remove_cached_data`, so eviction manages space. Keep the
-default `false`.
+entry, so eviction manages space.
 
 **Revalidation.** When a request reads an expired entry under lazy expiration, the proxy sends S3
 a conditional request:
@@ -119,8 +117,8 @@ however large it is. Two limits apply:
 
 **Availability exception: coordinated stale-if-error.** Several concurrent requests for one key can
 be coalesced behind one revalidation. When that revalidation fails with a transport error or a
-retryable upstream `5xx`, the waiting requests may be served the cached data instead of an error.
-It is the one case in which the proxy serves expired data without a successful validation. It does
+retryable upstream `5xx`, the waiting requests may be served the cached data instead of an error,
+unless a write expired the entry. It is the one case in which the proxy serves expired data without a successful validation. It does
 not extend to `403`, `401`, signature failures or any other client error; those return the error
 to the client.
 
@@ -228,8 +226,8 @@ requests in three cases:
    fetch the missing bytes, it adds `If-Match: <cached-etag>` and
    `If-Unmodified-Since: <cached-last-modified>`. S3 then refuses with `412` instead of returning
    bytes from a newer object version, which would corrupt the merged response. On a `412`, the
-   proxy invalidates the stale entry and retries once without the added headers. The client never
-   sees the `412`.
+   proxy invalidates the stale entry and sends S3 the client's own request instead, uncached, so the
+   client gets the new version and the next read caches it. The client never sees the `412`.
 
    A local `If-Range` serve uses the same pin: the proxy replaces the client's `If-Range` with an
    `If-Match` on the ETag it just matched, so the `If-Range` never reaches a gap fetch. A stale
@@ -304,7 +302,6 @@ No minimum is enforced. `get_ttl` and `head_ttl` accept any valid duration, incl
 cache:
   get_ttl: "0s"
   head_ttl: "0s"
-  actively_remove_cached_data: false  # Lazy expiration (default)
 ```
 
 - The cache still stores the data, so range merging and bandwidth savings still work.
@@ -328,8 +325,8 @@ ETag is revalidated, so an unchanged object is served from cache after a bodyles
 If S3 must evaluate IAM on every read, and not only check freshness, both settings are needed: a
 request answered from cache is a request S3 never authorizes.
 
-**Keep lazy expiration.** With a zero TTL, an expired entry stays on disk for revalidation under
-either value of `actively_remove_cached_data`; leave it at the default `false`.
+**Expired entries stay for revalidation.** With a zero TTL, an expired entry stays on disk, so an
+unchanged object is served from it after a `304`.
 
 [Shared cache access model](ARCHITECTURE.md#shared-cache-access-model) covers the security side of
 a zero TTL and when to use one.
@@ -359,18 +356,9 @@ For example:
 4. An object not read within the hour stays cached, and its next GET revalidates it with S3 (see
    [Lazy vs periodic cleanup](#lazy-vs-periodic-cleanup)).
 
-### Cache expiration modes (`actively_remove_cached_data`)
+### Expired entries
 
-The default is `false`, lazy expiration:
-
-```yaml
-cache:
-  actively_remove_cached_data: false  # Lazy expiration (default)
-```
-
-#### Lazy expiration (`false`)
-
-For fixed-capacity deployments, where eviction manages the cache size:
+Eviction manages the cache size, and expired entries stay available for revalidation:
 
 - Expired read-cache entries stay on disk until they are read or evicted.
 - A GET of an entry past `get_ttl` revalidates with S3 (see
@@ -382,18 +370,12 @@ For fixed-capacity deployments, where eviction manages the cache size:
 - No background pass spends I/O removing expired read-cache entries, and an expired entry stays
   available for a bodyless `304` revalidation.
 
-Typical deployments are a local SSD with a fixed cache size, a container with a persistent volume
-claim, or a single proxy with dedicated cache storage.
-
-#### Active expiration (`true`)
-
-The daily validation scan deletes no expired read-cache entry with this value either, so eviction
-frees the space. For storage that bills by usage, such as an elastic NFS file system, set
-`max_cache_size` to the amount you want to keep.
+For storage that bills by usage, such as an elastic NFS file system, set `max_cache_size` to the
+amount you want to keep.
 
 #### HEAD metadata expiration
 
-HEAD expiry works the same way in both modes: an expired HEAD is forwarded to S3, and the response
+An expired HEAD is forwarded to S3, and the response
 refreshes the `.meta`, whose cached ranges are unaffected. See [HEAD TTL](#head-ttl-head_ttl).
 
 ### Presigned URL support
@@ -529,8 +511,11 @@ records name between them. It does so on an ETag or Last-Modified mismatch found
 response, and after a proxy-added `If-Match` produces a `412` on the partial-merge path. One case is
 not reached. A cached range's file becomes visible on disk before its journal record is written. A
 range cached between those two steps, or whose journal record then fails to write, is named by no
-record, and an invalidation that runs meanwhile leaves that range file in place. The proxy does not
-invalidate ranges selectively: any version mismatch removes the whole object.
+record, and an invalidation that runs meanwhile leaves that range file in place. No proxy serves it:
+the invalidation rewrites the key's write-order file, so reads skip a journal record written
+afterwards for that range and consolidation drops it, and orphan reclamation removes a range file
+that no record names. The proxy does not invalidate ranges selectively: any version mismatch
+removes the whole object.
 
 #### Scenario 3a: Partial cache hit with cache validation
 
@@ -553,8 +538,8 @@ Client GET for bytes 0-6291455 (6 MiB)
              - 412: the object changed on S3 since it was cached
                    → proxy invalidates the object's cached ranges (see Cache invalidation
                      behavior above for the one case not reached)
-                   → proxy retries the S3 fetch once WITHOUT the added If-Match
-                   → serves fresh data to the client and caches the fresh ranges
+                   → proxy sends S3 the client's own request, WITHOUT the added If-Match
+                   → serves fresh data to the client; the next read caches it
                    → the client never sees the 412 (it sent no conditional header)
           → return the complete response
 ```
@@ -886,9 +871,14 @@ what S3 would send. AWS SDKs read specific headers for checksums, encryption sta
 
 ### Headers stored in cache
 
-The proxy stores every S3 response header in the cache metadata except six that belong to one
-response or connection: `x-amz-request-id`, `x-amz-id-2`, `Date`, `Server`, `Connection` and
-`Transfer-Encoding`. Because it stores everything else, a header S3 adds later is kept with no
+The proxy stores every S3 response header in the cache metadata except eight that belong to one
+response or connection: `x-amz-request-id`, `x-amz-id-2`, `Date`, `Server`, `Connection`,
+`Transfer-Encoding`, `x-amz-transfer-encoding` and `x-amz-content-range`. It also leaves out a
+`partNumber` response's checksum headers, which describe the part rather than the object. When S3
+appends an MD5 trailer to a body, as it does for the AWS SDK for Java 2.x, the proxy caches the
+object's own bytes, checks the trailer against them, and caches nothing when they differ. An entry
+whose stored headers include `x-amz-transfer-encoding` or `x-amz-content-range` is fetched from S3
+again on its first read. Because it stores everything else, a header S3 adds later is kept with no
 change to the proxy. The stored headers include:
 
 | Category | Headers |
@@ -912,6 +902,9 @@ When the proxy serves from cache, it restores every stored header, with these ex
 - It leaves the checksum headers (`x-amz-checksum-*`) out of partial-range responses, because a
   checksum covers the whole object, not a byte range. It includes them when it serves the full
   object (range 0 to the object's length minus 1).
+- It leaves the checksum headers out of a response for an object of more than one part when a
+  stored checksum has no `-N` suffix and the entry does not record its checksums as the object's
+  own, because such a checksum can be one part's. Every entry the proxy writes records that.
 
 ### Verifying header consistency
 
@@ -945,7 +938,7 @@ The proxy handles conditional headers in three ways, each described above:
 2. **Revalidating an expired entry** adds `If-None-Match` and `If-Modified-Since` from the cached
    entry. See [Scenario 3c](#scenario-3c-ttl-expired-cache-entry-revalidation).
 3. **Merging partly cached data** adds `If-Match` and `If-Unmodified-Since` from the cached entry,
-   and on a `412` invalidates the key and retries once without them. See
+   and on a `412` invalidates the key and sends S3 the client's own request instead. See
    [Scenario 3a](#scenario-3a-partial-cache-hit-with-cache-validation).
 
 The client never sees a header the proxy added, or a `304` or `412` that such a header caused.
@@ -993,11 +986,11 @@ The `.meta` file and its cached ranges stay in place throughout.
 **On read**: an expired HEAD entry is refreshed from S3 when it is next requested, as above.
 Nothing is deleted.
 
-**Periodic** removal happens in two background passes, in either expiration mode:
+**Periodic** removal happens in two background passes:
 
 - **The daily validation scan** (once a day, around midnight local time) deletes `.meta` files
   that hold no cached ranges and whose HEAD expiry passed more than a day ago. It deletes no
-  read-cache entry for `get_ttl`, with either value of `actively_remove_cached_data`.
+  read-cache entry for `get_ttl`.
 - **The incomplete-upload sweep** (at startup, then every `min(incomplete_upload_ttl / 4, 1h)`)
   removes multipart uploads idle for longer than `incomplete_upload_ttl`. See
   [What reaps abandoned staging](MULTIPART_UPLOAD.md#what-reaps-abandoned-staging).

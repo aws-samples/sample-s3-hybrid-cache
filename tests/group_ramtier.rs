@@ -32,5 +32,3 @@ mod ram_cache_sharding_property_test;
 mod ram_verify_decision_table_test;
 #[path = "ram_verify_locks_bound_test.rs"]
 mod ram_verify_locks_bound_test;
-#[path = "shared_cache_coordination_test.rs"]
-mod shared_cache_coordination_test;

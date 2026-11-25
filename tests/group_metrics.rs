@@ -44,5 +44,7 @@ mod logging_test;
 mod metrics_wire_shape_test;
 #[path = "objects_scan_results_test.rs"]
 mod objects_scan_results_test;
+#[path = "shard_sum_publication_test.rs"]
+mod shard_sum_publication_test;
 #[path = "test_otlp.rs"]
 mod test_otlp;

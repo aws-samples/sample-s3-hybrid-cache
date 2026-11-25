@@ -4,6 +4,7 @@
 //! including HTTP/HTTPS request handling, caching, compression, and logging.
 
 pub mod accept_policy;
+pub(crate) mod append_md5;
 pub mod aws_chunked_decoder;
 pub mod bandwidth_limiter;
 pub mod bench_metadata;

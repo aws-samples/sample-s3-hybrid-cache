@@ -71,6 +71,51 @@
 //! at its own startup, so a multi-process run passes every process the same
 //! `--max-cache-size-gib`, computed from the fixture, instead.
 //!
+//! # `--fill-mode staging`: write-through uploads that are never read
+//!
+//! The default (`read`) admits read fills, as above. `staging` admits signed single-part PUTs
+//! through the same `HttpProxy`, with write-through caching on at `--write-cache-percent`
+//! (default 10, the production default) and the production `put_ttl`. The origin acknowledges
+//! each PUT, so the proxy stores the body as a staged object, and nothing reads it, so it never
+//! graduates. The read tier stays empty and its pass never triggers, so the staging pass is the
+//! only deleting process. It is the shipped one: every consolidation cycle this binary drives
+//! ends with `maybe_trigger_staging_eviction`, which nudges `CacheManager::evict_staging_tier`,
+//! one holder at a time under `global_eviction.lock`, as on a proxy. A fresh directory is
+//! accepted (`metadata/` and `ranges/` are created), and `--max-cache-size-gib` is required.
+//!
+//! A setup run brings a fresh volume to epoch 1 and fills it:
+//!
+//! - `--await-epoch1-secs <n>`: if `metadata/_shard_state/staged_authority_epoch.json` does not
+//!   read epoch 1, stage one object before the first consolidation cycle (an empty checkpoint
+//!   set never shows a completed fold rotation; one key keeps the volume to one shard, which
+//!   the fold and the ledger-repair rotations each cover in one pass), then run the consolidation
+//!   loop until this process's consolidator activates the staged authority, for at most `n`
+//!   seconds, staging a new object in the same shard every second meanwhile: a consolidation cycle
+//!   that finds no write to consolidate returns before it evaluates activation. The epoch is
+//!   printed at window start and at window end either way.
+//! - `--prefill-percent <p>`: before the window, upload until the staged figure
+//!   (`get_staging_resident_bytes`) reaches `p` percent of the staging bound.
+//!
+//! - `--put-threads <n>`: the number of PUT workers (default: the `--admission-threads` value).
+//! - `--staging-mode legacy|worklist`: which staging pass the run is meant to measure (default
+//!   `legacy`). It is printed and nothing else reads it until the staging work list ships.
+//!
+//! The admission proxy takes its `max_cache_size` from the harness's own, so PUT admission is
+//! not capped at the 10 GiB `Config` default.
+//!
+//! With `--duration-secs 0` such a run only sets the volume up. Measurement processes then run
+//! against it.
+//!
+//! The staging summary (`STAGING_SUMMARY` JSON line) reports this process's fill, the staging
+//! passes it ran (its own `Staging eviction complete` lines, and the passes that found nothing
+//! left to free after taking the lock), each pass's lock hold from a 100 ms sampler of the
+//! lockfile, split at its completion line into the part before it (derivation, ledger read,
+//! assessments, deletions) and after it (removal debits, re-fold), the strict drains (passes that
+//! finished inside the window: freed bytes over the window, and over their summed lock hold),
+//! the margins against this process's fill, and the staged figure sampled every 2 s against the
+//! staging bound. A multi-process margin sums the processes' fill. The summary is printed in
+//! both fill modes, so a read run reports no staging pass.
+//!
 //! `RUST_LOG` sets the log capture's filter (default `info`).
 //!
 //! # Why one process with two loops, not two processes
@@ -248,7 +293,23 @@ fn usage() -> ! {
          \x20 --eviction-mode legacy|worklist        default worklist (the shipped behaviour);\n\
          \x20                                       legacy keeps a phantom pre-3.0.0 journal\n\
          \x20                                       on the volume so every trigger runs the\n\
-         \x20                                       legacy single-holder pass\n"
+         \x20                                       legacy single-holder pass\n\
+         \x20 --fill-mode read|staging             default read (cache-miss GET fills);\n\
+         \x20                                       staging writes signed single-part PUTs\n\
+         \x20                                       that are never read, with write-through\n\
+         \x20                                       caching on (needs --max-cache-size-gib)\n\
+         \x20 --write-cache-percent <n>            staging bound, percent of max_cache_size\n\
+         \x20                                       (default 10, the production default)\n\
+         \x20 --await-epoch1-secs <n>              staging: seed, then run consolidation until\n\
+         \x20                                       the staged authority reads epoch 1 (default 0)\n\
+         \x20 --prefill-percent <p>                staging: before the window, upload until\n\
+         \x20                                       the staged figure is p% of the bound\n\
+         \x20 --put-threads <n>                    staging: number of PUT workers (default: the\n\
+         \x20                                       --admission-threads value, 8)\n\
+         \x20 --staging-mode legacy|worklist       staging: which staging pass the run is meant\n\
+         \x20                                       to measure (default legacy; recorded in the\n\
+         \x20                                       summary, no effect until the staging work\n\
+         \x20                                       list ships)\n"
     );
     std::process::exit(2);
 }
@@ -264,6 +325,19 @@ struct Args {
     eviction_trigger_percent: u8,
     eviction_target_percent: u8,
     eviction_mode: EvictionMode,
+    fill_mode: FillMode,
+    write_cache_percent: f32,
+    await_epoch1_secs: u64,
+    prefill_percent: Option<f64>,
+    staging_mode: StagingMode,
+}
+
+/// Which staging pass a staging-fill run is meant to measure. Recorded in the summary only: the
+/// worklist pass does not exist yet, so both values run the shipped pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingMode {
+    Legacy,
+    Worklist,
 }
 
 fn parse_args() -> Args {
@@ -278,6 +352,12 @@ fn parse_args() -> Args {
     let mut eviction_trigger_percent = 80u8;
     let mut eviction_target_percent = 70u8;
     let mut eviction_mode = EvictionMode::Worklist;
+    let mut fill_mode = FillMode::Read;
+    let mut put_threads: Option<usize> = None;
+    let mut staging_mode = StagingMode::Legacy;
+    let mut write_cache_percent = 10.0f32;
+    let mut await_epoch1_secs = 0u64;
+    let mut prefill_percent: Option<f64> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -347,6 +427,54 @@ fn parse_args() -> Args {
                 };
                 i += 2;
             }
+            "--fill-mode" => {
+                fill_mode = match need(i).as_str() {
+                    "read" => FillMode::Read,
+                    "staging" => FillMode::Staging,
+                    other => {
+                        eprintln!("--fill-mode must be read or staging, not {other}");
+                        usage()
+                    }
+                };
+                i += 2;
+            }
+            "--write-cache-percent" => {
+                write_cache_percent = need(i).parse().unwrap_or_else(|_| usage());
+                i += 2;
+            }
+            "--await-epoch1-secs" => {
+                await_epoch1_secs = need(i).parse().unwrap_or_else(|_| usage());
+                i += 2;
+            }
+            "--prefill-percent" => {
+                let v: f64 = need(i).parse().unwrap_or_else(|_| usage());
+                if !(v > 0.0 && v <= 100.0) {
+                    eprintln!("--prefill-percent must be in (0, 100]");
+                    usage()
+                }
+                prefill_percent = Some(v);
+                i += 2;
+            }
+            "--put-threads" => {
+                let v: usize = need(i).parse().unwrap_or_else(|_| usage());
+                if v == 0 {
+                    eprintln!("--put-threads must be at least 1");
+                    usage()
+                }
+                put_threads = Some(v);
+                i += 2;
+            }
+            "--staging-mode" => {
+                staging_mode = match need(i).as_str() {
+                    "legacy" => StagingMode::Legacy,
+                    "worklist" => StagingMode::Worklist,
+                    other => {
+                        eprintln!("--staging-mode must be legacy or worklist, not {other}");
+                        usage()
+                    }
+                };
+                i += 2;
+            }
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("unknown argument: {other}");
@@ -359,7 +487,25 @@ fn parse_args() -> Args {
         eprintln!("--max-cache-size-gib and --fixture-start-percent cannot be combined");
         usage()
     }
+    if fill_mode == FillMode::Staging && max_cache_size_gib.is_none() {
+        eprintln!(
+            "--fill-mode staging needs --max-cache-size-gib (there is no fixture to size it from)"
+        );
+        usage()
+    }
+    if fill_mode == FillMode::Read && (await_epoch1_secs > 0 || prefill_percent.is_some()) {
+        eprintln!("--await-epoch1-secs and --prefill-percent apply to --fill-mode staging only");
+        usage()
+    }
 
+    if fill_mode == FillMode::Read && (put_threads.is_some() || staging_mode != StagingMode::Legacy)
+    {
+        eprintln!("--put-threads and --staging-mode apply to --fill-mode staging only");
+        usage()
+    }
+    if let Some(n) = put_threads {
+        admission_threads = n;
+    }
     Args {
         cache_dir: cache_dir.unwrap_or_else(|| {
             eprintln!("--cache-dir is required");
@@ -374,6 +520,11 @@ fn parse_args() -> Args {
         eviction_trigger_percent,
         eviction_target_percent,
         eviction_mode,
+        fill_mode,
+        write_cache_percent,
+        await_epoch1_secs,
+        prefill_percent,
+        staging_mode,
     }
 }
 
@@ -409,6 +560,486 @@ enum EvictionMode {
     /// The control: a phantom pre-3.0.0 instance on the volume holds the gate at `NotCapable`,
     /// so every trigger runs the legacy single-holder pass.
     Legacy,
+}
+
+/// What the admission workers write. See the module doc's `--fill-mode staging` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillMode {
+    /// A cache-miss GET through the proxy: a read fill.
+    Read,
+    /// A signed single-part PUT through the proxy that nothing reads: a write-through upload that
+    /// stays staged until the staging pass removes it.
+    Staging,
+}
+
+/// The one object a setup run stages before its first consolidation cycle, and re-writes every
+/// second until activation. One key, so one shard: an empty checkpoint set never shows a completed
+/// fold rotation, and on a small volume the fold and the ledger-repair rotations each visit about
+/// one shard per 300 s pass, so every further shard the seed opened would delay activation by
+/// about one pass.
+const STAGING_LATCH_PATH: &str = "/staging-admission/latch/obj000000";
+const STAGING_SEED_SIZE: u64 = 64 * 1024;
+
+/// The `{XX}` shard directory a key's range files land in, or `None` if the path does not have
+/// the expected `ranges/{bucket}/{XX}/...` shape.
+fn shard_l1(
+    cache_dir: &Path,
+    disk_cache: &s3_proxy::disk_cache::DiskCacheManager,
+    cache_key: &str,
+) -> Option<String> {
+    let p = disk_cache.get_new_range_file_path(cache_key, 0, 0);
+    let rel = p.strip_prefix(cache_dir.join("ranges")).ok()?;
+    rel.components()
+        .nth(1)
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+}
+
+/// The staged authority's epoch document, read from the volume.
+#[derive(Debug, Clone, Default)]
+struct EpochReadout {
+    epoch: u64,
+    activated_at: u64,
+    activated_by: String,
+}
+
+fn read_staged_epoch(cache_dir: &Path) -> EpochReadout {
+    let path = cache_dir
+        .join("metadata")
+        .join("_shard_state")
+        .join("staged_authority_epoch.json");
+    match read_json(&path) {
+        Some(v) => EpochReadout {
+            epoch: v["epoch"].as_u64().unwrap_or(0),
+            activated_at: v["activated_at"].as_u64().unwrap_or(0),
+            activated_by: v["activated_by"].as_str().unwrap_or_default().to_string(),
+        },
+        None => EpochReadout::default(),
+    }
+}
+
+fn epoch_json(e: &EpochReadout) -> serde_json::Value {
+    serde_json::json!({
+        "epoch": e.epoch,
+        "activated_at": e.activated_at,
+        "activated_by": e.activated_by,
+    })
+}
+
+/// `(unix seconds, staged figure, this process's admitted bytes so far)`, every 2 s.
+type FigureSamples = Arc<Mutex<Vec<(f64, Option<u64>, u64)>>>;
+
+/// One `global_eviction.lock` holding, as sampled from the lockfile every 100 ms. The release is
+/// the last sample that still showed it, so a hold reads up to one interval short.
+#[derive(Debug, Clone)]
+struct LockHold {
+    acquired_at_ms: u64,
+    last_seen_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Sample the eviction lockfile until `stop`, keying each holding by its fence token.
+fn spawn_lock_sampler(
+    lock_path: PathBuf,
+    holds: Arc<Mutex<BTreeMap<String, LockHold>>>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            if let Ok(text) = std::fs::read_to_string(&lock_path) {
+                if let Ok(p) = serde_json::from_str::<s3_proxy::cache::EvictionLockPayload>(&text) {
+                    let now = now_ms();
+                    let mut h = holds.lock().unwrap_or_else(|e| e.into_inner());
+                    h.entry(p.uuid)
+                        .and_modify(|x| x.last_seen_ms = now)
+                        .or_insert(LockHold {
+                            acquired_at_ms: p.acquired_at_ms,
+                            last_seen_ms: now,
+                        });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+}
+
+/// One staging pass from this process's log: its `Staging eviction complete` line, or, with
+/// `freed == None`, a pass that found nothing left to free after taking the lock.
+#[derive(Debug, Clone)]
+struct StagingPassLine {
+    at: f64,
+    freed: Option<u64>,
+    evicted_objects: u64,
+    bytes_to_free: u64,
+    resident_before: Option<u64>,
+}
+
+fn field_u64(line: &str, key: &str) -> Option<u64> {
+    let pos = line.find(key)?;
+    let digits: String = line[pos + key.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn line_unix_secs(line: &str) -> Option<f64> {
+    let ts = line.split_whitespace().next()?;
+    let t = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some(t.timestamp_micros() as f64 / 1e6)
+}
+
+fn parse_staging_passes(log_path: &Path) -> Vec<StagingPassLine> {
+    content_after_window_marker(log_path)
+        .lines()
+        .filter_map(|line| {
+            if line.contains("Staging eviction complete:") {
+                Some(StagingPassLine {
+                    at: line_unix_secs(line)?,
+                    freed: field_u64(line, " freed="),
+                    evicted_objects: field_u64(line, "evicted_objects=").unwrap_or(0),
+                    bytes_to_free: field_u64(line, "bytes_to_free=").unwrap_or(0),
+                    resident_before: field_u64(line, "resident_before=Some("),
+                })
+            } else if line
+                .contains("Staging eviction: no longer over either trigger after acquiring lock")
+            {
+                Some(StagingPassLine {
+                    at: line_unix_secs(line)?,
+                    freed: None,
+                    evicted_objects: 0,
+                    bytes_to_free: 0,
+                    resident_before: field_u64(line, "resident=Some("),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+struct StagingSummaryInput<'a> {
+    fill_mode: FillMode,
+    me: &'a str,
+    log_path: &'a Path,
+    holds: &'a BTreeMap<String, LockHold>,
+    window_start: f64,
+    window_end: f64,
+    admitted_bytes: u64,
+    admitted_entries: u64,
+    measured_secs: f64,
+    staging_bound: u64,
+    trigger: u64,
+    target: u64,
+    epoch_start: &'a EpochReadout,
+    epoch_end: &'a EpochReadout,
+    /// `(unix seconds, staged figure, this process's admitted bytes so far)`.
+    samples: &'a [(f64, Option<u64>, u64)],
+    prefill: Option<serde_json::Value>,
+}
+
+/// The staging section and one `STAGING_SUMMARY` JSON line. See the module doc.
+fn print_staging_summary(input: &StagingSummaryInput<'_>) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let passes = parse_staging_passes(input.log_path);
+    let in_window = |at: f64| at > input.window_start && at <= input.window_end;
+    // The holding a pass's line was logged inside: the latest acquisition at or before it whose
+    // last sample is no more than one sampling interval (plus slack) before it.
+    let hold_of = |at: f64| -> Option<(f64, f64)> {
+        let at_ms = (at * 1000.0) as u64;
+        input
+            .holds
+            .values()
+            .filter(|h| h.acquired_at_ms <= at_ms && at_ms <= h.last_seen_ms + 150)
+            .max_by_key(|h| h.acquired_at_ms)
+            .map(|h| {
+                (
+                    h.acquired_at_ms as f64 / 1000.0,
+                    (h.last_seen_ms as f64 / 1000.0).max(at),
+                )
+            })
+    };
+    let mut rows = Vec::new();
+    let (mut evicting, mut nothing, mut unmatched) = (0u64, 0u64, 0u64);
+    let (mut freed, mut objects, mut hold_secs, mut evicting_hold_secs) = (0u64, 0u64, 0f64, 0f64);
+    for p in &passes {
+        let hold = hold_of(p.at);
+        let inside = in_window(p.at);
+        if inside {
+            match p.freed {
+                Some(f) => {
+                    evicting += 1;
+                    freed += f;
+                    objects += p.evicted_objects;
+                }
+                None => nothing += 1,
+            }
+            match hold {
+                Some((a, r)) => {
+                    hold_secs += r - a;
+                    if p.freed.is_some() {
+                        evicting_hold_secs += r - a;
+                    }
+                }
+                None => unmatched += 1,
+            }
+        }
+        rows.push(serde_json::json!({
+            "at": p.at,
+            "in_window": inside,
+            "freed": p.freed,
+            "evicted_objects": p.evicted_objects,
+            "bytes_to_free": p.bytes_to_free,
+            "resident_before": p.resident_before,
+            "lock_acquired_at": hold.map(|h| h.0),
+            "lock_released_at": hold.map(|h| h.1),
+            "hold_secs": hold.map(|h| h.1 - h.0),
+            "before_line_secs": hold.map(|h| p.at - h.0),
+            "after_line_secs": hold.map(|h| h.1 - p.at),
+        }));
+    }
+    // Lock occupancy inside the window, by any holder.
+    let lock_busy_secs: f64 = input
+        .holds
+        .values()
+        .map(|h| {
+            let a = (h.acquired_at_ms as f64 / 1000.0).max(input.window_start);
+            let r = (h.last_seen_ms as f64 / 1000.0).min(input.window_end);
+            (r - a).max(0.0)
+        })
+        .sum();
+    let window_secs = (input.window_end - input.window_start).max(1e-9);
+    let fill = input.admitted_bytes as f64 / input.measured_secs.max(1e-9);
+    let drain_window = freed as f64 / window_secs;
+    let drain_active = if hold_secs > 0.0 {
+        freed as f64 / hold_secs
+    } else {
+        0.0
+    };
+    let ratio = |d: f64| if fill > 0.0 { d / fill } else { 0.0 };
+    let windowed: Vec<&(f64, Option<u64>, u64)> = input
+        .samples
+        .iter()
+        .filter(|s| s.0 >= input.window_start && s.0 <= input.window_end + 2.5)
+        .collect();
+    let peak = windowed
+        .iter()
+        .filter_map(|s| s.1.map(|f| (f, s.0)))
+        .max_by_key(|x| x.0);
+    let pct = |b: u64| 100.0 * b as f64 / input.staging_bound.max(1) as f64;
+
+    println!("\n=== STAGING TIER ({:?} fill) ===", input.fill_mode);
+    println!(
+        "staged authority epoch    : {} at window start, {} at window end (activated_at {}, by {})",
+        input.epoch_start.epoch,
+        input.epoch_end.epoch,
+        input.epoch_end.activated_at,
+        input.epoch_end.activated_by
+    );
+    println!(
+        "staging bound / trigger / target: {} / {} / {} B",
+        input.staging_bound, input.trigger, input.target
+    );
+    println!(
+        "fill, this process        : {:.2} MiB/s, {:.1} entries/s",
+        fill / MIB,
+        input.admitted_entries as f64 / input.measured_secs.max(1e-9)
+    );
+    println!(
+        "staging passes, strict    : {evicting} that freed bytes, {nothing} that found nothing left \
+         after the lock, {unmatched} not matched to a sampled lock hold; {freed} B, {objects} \
+         objects; {hold_secs:.1} s held ({evicting_hold_secs:.1} s by the passes that freed bytes)"
+    );
+    println!(
+        "drain, strict-window      : {:.2} MiB/s; strict-active {:.2} MiB/s; margin vs this \
+         process's fill: window {:.2}x, active {:.2}x (sum fill across processes for a \
+         multi-process margin)",
+        drain_window / MIB,
+        drain_active / MIB,
+        ratio(drain_window),
+        ratio(drain_active)
+    );
+    println!(
+        "eviction lock held in the window, any holder: {:.1} s of {:.1} s",
+        lock_busy_secs, window_secs
+    );
+    match peak {
+        Some((p, at)) => println!(
+            "staged figure peak        : {p} B ({:.1}% of the staging bound) at {at:.1}",
+            pct(p)
+        ),
+        None => println!("staged figure peak        : no readable sample inside the window"),
+    }
+    if input.fill_mode == FillMode::Staging && input.epoch_start.epoch != 1 {
+        println!(
+            "WARNING: the window started at epoch {}, not 1; this run measures the epoch-0 pass",
+            input.epoch_start.epoch
+        );
+    }
+
+    let summary = serde_json::json!({
+        "instance": input.me,
+        "fill_mode": format!("{:?}", input.fill_mode).to_lowercase(),
+        "epoch_start": epoch_json(input.epoch_start),
+        "epoch_end": epoch_json(input.epoch_end),
+        "window_start": input.window_start,
+        "window_end": input.window_end,
+        "measured_secs": input.measured_secs,
+        "staging_bound": input.staging_bound,
+        "staging_trigger": input.trigger,
+        "staging_target": input.target,
+        "admitted_bytes": input.admitted_bytes,
+        "admitted_entries": input.admitted_entries,
+        "fill_bytes_per_sec": fill,
+        "passes_evicting_in_window": evicting,
+        "passes_nothing_in_window": nothing,
+        "passes_unmatched_in_window": unmatched,
+        "freed_in_window": freed,
+        "objects_in_window": objects,
+        "hold_secs_in_window": hold_secs,
+        "evicting_hold_secs_in_window": evicting_hold_secs,
+        "drain_window_bytes_per_sec": drain_window,
+        "drain_active_bytes_per_sec": drain_active,
+        "margin_window_own": ratio(drain_window),
+        "margin_active_own": ratio(drain_active),
+        "lock_busy_secs_in_window": lock_busy_secs,
+        "peak_figure": peak.map(|p| p.0),
+        "peak_figure_at": peak.map(|p| p.1),
+        "passes": rows,
+        "samples": input.samples.iter().map(|s| serde_json::json!([s.0, s.1, s.2])).collect::<Vec<_>>(),
+        "prefill": input.prefill.clone(),
+    });
+    println!("STAGING_SUMMARY {summary}");
+}
+
+/// The tokio-side consolidation loop: `run_consolidation_cycle` on a fixed interval until
+/// `stop`, refreshing the legacy control's journal first when there is one.
+fn spawn_consolidation_loop(
+    consolidator: Arc<s3_proxy::journal_consolidator::JournalConsolidator>,
+    eviction_passes: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    interval_secs: u64,
+    legacy_control: Option<PathBuf>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        while !stop.load(Ordering::Relaxed) {
+            tick.tick().await;
+            if let Some(dir) = &legacy_control {
+                if let Err(e) = touch_legacy_control(dir) {
+                    eprintln!("[legacy control] journal refresh failed: {e}");
+                }
+            }
+            match consolidator.run_consolidation_cycle().await {
+                Ok(result) => {
+                    if result.eviction_triggered {
+                        eviction_passes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[consolidation] cycle failed: {e}");
+                }
+            }
+        }
+    });
+}
+
+/// Upload until the staged figure reaches `target_bytes` or `deadline` passes. Returns what it
+/// did, for the summary.
+async fn staging_prefill(
+    admission: Arc<AdmissionProxy>,
+    cache_manager: Arc<CacheManager>,
+    threads: usize,
+    sizes: Vec<u64>,
+    body: Bytes,
+    target_bytes: u64,
+    deadline: Duration,
+) -> serde_json::Value {
+    let stop = Arc::new(AtomicBool::new(false));
+    let admitted = Arc::new(AtomicU64::new(0));
+    let entries = Arc::new(AtomicU64::new(0));
+    let prefix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    for worker_id in 0..threads {
+        let (admission, cache_manager, sizes, body) = (
+            admission.clone(),
+            cache_manager.clone(),
+            sizes.clone(),
+            body.clone(),
+        );
+        let (stop, admitted, entries) = (stop.clone(), admitted.clone(), entries.clone());
+        handles.push(tokio::spawn(async move {
+            let disk_cache = cache_manager.create_configured_disk_cache_manager();
+            let mut counter = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let size = sizes[counter as usize % sizes.len()];
+                let raw_path =
+                    format!("/staging-admission/p{prefix}/w{worker_id}/s{size}/obj{counter:012}");
+                let key = CacheManager::generate_cache_key(&raw_path, None);
+                if let Ok(true) = admission
+                    .put_object(
+                        &raw_path,
+                        body.slice(0..size as usize),
+                        &disk_cache,
+                        &key,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                {
+                    admitted.fetch_add(size, Ordering::Relaxed);
+                    entries.fetch_add(1, Ordering::Relaxed);
+                }
+                counter += 1;
+            }
+        }));
+    }
+    let mut reached = false;
+    while started.elapsed() < deadline {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if cache_manager
+            .get_staging_resident_bytes()
+            .await
+            .is_some_and(|f| f >= target_bytes)
+        {
+            reached = true;
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        let _ = h.await;
+    }
+    let figure = cache_manager.get_staging_resident_bytes().await;
+    let secs = started.elapsed().as_secs_f64();
+    println!(
+        "prefill                 : {} B in {} objects over {secs:.1}s, staged figure {:?} \
+         (target {target_bytes}, {})",
+        admitted.load(Ordering::Relaxed),
+        entries.load(Ordering::Relaxed),
+        figure,
+        if reached {
+            "reached"
+        } else {
+            "NOT reached before the deadline"
+        }
+    );
+    serde_json::json!({
+        "admitted_bytes": admitted.load(Ordering::Relaxed),
+        "admitted_entries": entries.load(Ordering::Relaxed),
+        "secs": secs,
+        "target_bytes": target_bytes,
+        "reached": reached,
+        "figure_after": figure,
+    })
 }
 
 /// The phantom instance the `legacy` control keeps on the volume. Its host part is not this
@@ -1050,8 +1681,8 @@ struct AdmissionProxy {
 impl AdmissionProxy {
     const AUTH: &'static str = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000"; // gitleaks:allow
 
-    async fn start(args: &Args, cache_manager: &Arc<CacheManager>) -> Self {
-        use http_body_util::Full;
+    async fn start(args: &Args, cache_manager: &Arc<CacheManager>, max_cache_size: u64) -> Self {
+        use http_body_util::{BodyExt, Full};
         use hyper::server::conn::http1;
         use hyper::service::service_fn;
         use hyper_util::rt::TokioIo;
@@ -1069,6 +1700,24 @@ impl AdmissionProxy {
                         let Ok((stream, _)) = accept else { break };
                         tokio::spawn(async move {
                             let service = service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                                if req.method() == hyper::Method::PUT {
+                                    // A write-through upload: read the body to the end and
+                                    // acknowledge it, as S3 does.
+                                    let len = req
+                                        .into_body()
+                                        .collect()
+                                        .await
+                                        .map(|b| b.to_bytes().len())
+                                        .unwrap_or(0);
+                                    return Ok::<_, hyper::Error>(
+                                        hyper::Response::builder()
+                                            .status(200)
+                                            .header("etag", format!("\"staged-{len}\""))
+                                            .header("content-length", "0")
+                                            .body(Full::new(Bytes::new()))
+                                            .unwrap(),
+                                    );
+                                }
                                 let size = req
                                     .uri()
                                     .path()
@@ -1099,8 +1748,15 @@ impl AdmissionProxy {
         // The proxy, over the cache this binary measures.
         let mut config = Config::default();
         config.cache.cache_dir = args.cache_dir.clone();
+        // PUT admission checks Content-Length against this field, not the cache manager's, so
+        // the 10 GiB default would refuse every PUT once usage nears it.
+        config.cache.max_cache_size = max_cache_size;
         config.cache.ram_cache_enabled = false;
         config.cache.read_cache_enabled = true;
+        if args.fill_mode == FillMode::Staging {
+            config.cache.write_cache_enabled = true;
+            config.cache.write_cache_percent = args.write_cache_percent;
+        }
         config.cache.download_coordination.enabled = false;
         config.cache.get_ttl = Duration::from_secs(315_360_000);
         config.cache.head_ttl = Duration::from_secs(315_360_000);
@@ -1241,6 +1897,56 @@ impl AdmissionProxy {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
+
+    /// One signed single-part PUT of `body` to `raw_path` through the proxy, then wait up to
+    /// `publish_bound` for the staged `.bin` to be published. `Ok(true)` is a staged upload and
+    /// `Ok(false)` one the proxy forwarded without caching (or that did not publish in time).
+    async fn put_object(
+        &self,
+        raw_path: &str,
+        body: Bytes,
+        disk_cache: &s3_proxy::disk_cache::DiskCacheManager,
+        cache_key: &str,
+        publish_bound: Duration,
+    ) -> s3_proxy::Result<bool> {
+        use http_body_util::{BodyExt, Full};
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+        let size = body.len() as u64;
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+        let request = hyper::Request::builder()
+            .method("PUT")
+            .uri(format!("http://{}{}", self.proxy, raw_path))
+            .header("host", self.origin_host.as_str())
+            .header("authorization", Self::AUTH)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("x-amz-date", "20260101T000000Z")
+            .header("content-length", size.to_string())
+            .body(Full::new(body))
+            .map_err(|e| s3_proxy::ProxyError::CacheError(e.to_string()))?;
+        let response = client
+            .request(request)
+            .await
+            .map_err(|e| s3_proxy::ProxyError::CacheError(e.to_string()))?;
+        let status = response.status();
+        let _ = response.into_body().collect().await;
+        if !status.is_success() {
+            return Err(s3_proxy::ProxyError::CacheError(format!(
+                "staging PUT answered {status}"
+            )));
+        }
+        let bin = disk_cache.get_new_range_file_path(cache_key, 0, size.saturating_sub(1));
+        let until = Instant::now() + publish_bound;
+        loop {
+            if bin.exists() {
+                return Ok(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 }
 
 #[tokio::main]
@@ -1252,6 +1958,17 @@ async fn main() {
     let _log_file = init_log_capture(&log_path);
     println!("eviction log capture   : {}", log_path.display());
 
+    if args.fill_mode == FillMode::Staging {
+        for sub in ["metadata", "ranges"] {
+            if let Err(e) = std::fs::create_dir_all(args.cache_dir.join(sub)) {
+                eprintln!(
+                    "FATAL: could not create {}/{sub}: {e}",
+                    args.cache_dir.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     if !args.cache_dir.join("metadata").is_dir() || !args.cache_dir.join("ranges").is_dir() {
         eprintln!(
             "FATAL: {} does not contain metadata/ and ranges/ — populate a fixture first",
@@ -1292,6 +2009,10 @@ async fn main() {
     );
     println!("duration                : {}s", args.duration_secs);
     println!("eviction mode           : {:?}", args.eviction_mode);
+    println!("fill mode               : {:?}", args.fill_mode);
+    if args.fill_mode == FillMode::Staging {
+        println!("staging mode            : {:?}", args.staging_mode);
+    }
 
     // Construction per the traced pattern in examples/eviction_candidate_probe.rs +
     // tests/eviction_buffer_test.rs's create_test_cache_manager, generalised to
@@ -1315,11 +2036,17 @@ async fn main() {
         false,                            // compression_enabled
         Duration::from_secs(315_360_000), // get_ttl ~10yr: nothing should expire mid-run
         Duration::from_secs(315_360_000), // head_ttl
-        Duration::from_secs(315_360_000), // put_ttl
-        false,                            // actively_remove_cached_data
+        // put_ttl: the production default under staging, so the pass's expired-first candidate
+        // order is production's.
+        if args.fill_mode == FillMode::Staging {
+            Config::default().cache.put_ttl
+        } else {
+            Duration::from_secs(315_360_000)
+        },
+        false, // actively_remove_cached_data
         SharedStorageConfig::default(),
-        10.0,  // write_cache_percent — unused; nothing here is write-cached
-        false, // write_cache_enabled
+        args.write_cache_percent, // the staging bound; unused under read fill
+        args.fill_mode == FillMode::Staging, // write_cache_enabled
         Duration::from_secs(86400),
         MetadataCacheConfig::default(),
         args.eviction_trigger_percent,
@@ -1504,6 +2231,112 @@ async fn main() {
     let eviction_passes = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let staging = args.fill_mode == FillMode::Staging;
+    let admission = Arc::new(AdmissionProxy::start(&args, &cache_manager, max_cache_size).await);
+    let staging_bound = cache_manager.get_write_cache_capacity();
+    let (staging_trigger, staging_target) = cache_manager.get_staging_eviction_thresholds();
+    // One pseudo-random buffer, sliced per upload, so no layer can compress the bodies away.
+    let staging_body = if staging {
+        let max = args
+            .admission_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(STAGING_SEED_SIZE) as usize;
+        let mut v = vec![0u8; max];
+        fastrand::Rng::with_seed(7).fill(&mut v);
+        Bytes::from(v)
+    } else {
+        Bytes::new()
+    };
+    let mut prefill_result: Option<serde_json::Value> = None;
+    if staging {
+        println!(
+            "staging bound           : {staging_bound} B (write_cache_percent {}), trigger {staging_trigger}, target {staging_target}",
+            args.write_cache_percent
+        );
+        let before = read_staged_epoch(&args.cache_dir);
+        if args.await_epoch1_secs > 0 && before.epoch != 1 {
+            // Staged before the first consolidation cycle, so the first fold has shards to visit.
+            let disk_cache = cache_manager.create_configured_disk_cache_manager();
+            let key = CacheManager::generate_cache_key(STAGING_LATCH_PATH, None);
+            let seeded = admission
+                .put_object(
+                    STAGING_LATCH_PATH,
+                    staging_body.slice(0..STAGING_SEED_SIZE as usize),
+                    &disk_cache,
+                    &key,
+                    Duration::from_secs(30),
+                )
+                .await;
+            println!("staging seed            : {STAGING_LATCH_PATH} ({STAGING_SEED_SIZE} B) staged: {seeded:?}");
+        }
+        spawn_consolidation_loop(
+            consolidator.clone(),
+            eviction_passes.clone(),
+            stop.clone(),
+            args.consolidation_interval_secs,
+            (args.eviction_mode == EvictionMode::Legacy).then(|| args.cache_dir.clone()),
+        );
+        if args.await_epoch1_secs > 0 {
+            let waited = Instant::now();
+            let disk_cache = cache_manager.create_configured_disk_cache_manager();
+            let key = CacheManager::generate_cache_key(STAGING_LATCH_PATH, None);
+            let seed_l1 = shard_l1(&args.cache_dir, &disk_cache, &key);
+            let (mut trickle, mut probe) = (0u64, 0u64);
+            let mut e = read_staged_epoch(&args.cache_dir);
+            while e.epoch != 1 && waited.elapsed() < Duration::from_secs(args.await_epoch1_secs) {
+                // An idle cycle returns before it evaluates activation, so keep each one busy
+                // with a new object (a re-write of one key leaves the cycle idle), in the seed's
+                // shard so no shard opens that the rotations have not covered.
+                let (raw_path, trickle_key) = loop {
+                    probe += 1;
+                    let p = format!("/staging-admission/latch/t{probe:08}");
+                    let k = CacheManager::generate_cache_key(&p, None);
+                    if shard_l1(&args.cache_dir, &disk_cache, &k) == seed_l1 {
+                        break (p, k);
+                    }
+                };
+                let _ = admission
+                    .put_object(
+                        &raw_path,
+                        staging_body.slice(0..STAGING_SEED_SIZE as usize),
+                        &disk_cache,
+                        &trickle_key,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                trickle += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                e = read_staged_epoch(&args.cache_dir);
+            }
+            println!("staging latch trickle   : {trickle} objects of {STAGING_SEED_SIZE} B");
+            println!(
+                "staged authority epoch  : {} after {:.1}s of consolidation (activated_at {}, by {}){}",
+                e.epoch,
+                waited.elapsed().as_secs_f64(),
+                e.activated_at,
+                e.activated_by,
+                if e.epoch == 1 { "" } else { " -- NOT ACTIVATED" }
+            );
+        }
+        if let Some(pct) = args.prefill_percent {
+            prefill_result = Some(
+                staging_prefill(
+                    admission.clone(),
+                    cache_manager.clone(),
+                    args.admission_threads,
+                    args.admission_sizes.clone(),
+                    staging_body.clone(),
+                    (staging_bound as f64 * pct / 100.0) as u64,
+                    Duration::from_secs(1800),
+                )
+                .await,
+            );
+        }
+    }
+
     // Mark the measurement window's start in the captured log, so eviction that
     // `initialize()` itself may have triggered above (a startup catch-up pass on a
     // fixture already over its ceiling) is excluded from the eviction-rate figures
@@ -1514,6 +2347,16 @@ async fn main() {
     // window-scoped log parsers are the fix.
     tracing::info!("{MEASUREMENT_WINDOW_MARKER}");
     let run_start = Instant::now();
+    let window_start_unix = unix_now_f64();
+    let epoch_start = read_staged_epoch(&args.cache_dir);
+    let lock_holds: Arc<Mutex<BTreeMap<String, LockHold>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let lock_stop = Arc::new(AtomicBool::new(false));
+    let lock_sampler = spawn_lock_sampler(
+        cache_manager.get_global_eviction_lock_path(),
+        lock_holds.clone(),
+        lock_stop.clone(),
+    );
+    let figure_samples: FigureSamples = Arc::new(Mutex::new(Vec::new()));
 
     // --- Admission workers: one DiskCacheManager per task, all writing under distinct
     // cache_key prefixes so they cannot collide on
@@ -1533,7 +2376,6 @@ async fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     println!("run_id (key namespace): {run_id}");
-    let admission = Arc::new(AdmissionProxy::start(&args, &cache_manager).await);
     let mut admission_handles = Vec::new();
     for worker_id in 0..args.admission_threads {
         let cache_manager = cache_manager.clone();
@@ -1546,6 +2388,8 @@ async fn main() {
         let stop = stop.clone();
         let sizes = args.admission_sizes.clone();
         let admission = admission.clone();
+        let staging_body = staging_body.clone();
+        let fill_mode = args.fill_mode;
         admission_handles.push(tokio::spawn(async move {
             let disk_cache = cache_manager.create_configured_disk_cache_manager();
             let mut counter: u64 = 0;
@@ -1563,8 +2407,14 @@ async fn main() {
                 // makes this key genuinely new admission rather than an overwrite of a previous
                 // invocation's object at the same key (see the run_id comment above main's
                 // admission loop for the incident this fixes).
-                let raw_path =
-                    format!("/task13-admission/r{run_id}/w{worker_id}/s{size}/obj{counter:012}");
+                let raw_path = match fill_mode {
+                    FillMode::Read => {
+                        format!("/task13-admission/r{run_id}/w{worker_id}/s{size}/obj{counter:012}")
+                    }
+                    FillMode::Staging => format!(
+                        "/staging-admission/r{run_id}/w{worker_id}/s{size}/obj{counter:012}"
+                    ),
+                };
                 let cache_key = CacheManager::generate_cache_key(&raw_path, None);
                 attempted_bytes.fetch_add(size, Ordering::Relaxed);
                 attempted_entries.fetch_add(1, Ordering::Relaxed);
@@ -1577,9 +2427,24 @@ async fn main() {
                 // streams the origin's response to the client and fills the cache from it, and the
                 // fill is stored or declined by the same guards a proxy applies. `Ok(false)` is a
                 // declined fill.
-                let stored = admission
-                    .get_miss(&raw_path, &disk_cache, &cache_key, size, publish_bound)
-                    .await;
+                let stored = match fill_mode {
+                    FillMode::Read => {
+                        admission
+                            .get_miss(&raw_path, &disk_cache, &cache_key, size, publish_bound)
+                            .await
+                    }
+                    FillMode::Staging => {
+                        admission
+                            .put_object(
+                                &raw_path,
+                                staging_body.slice(0..size as usize),
+                                &disk_cache,
+                                &cache_key,
+                                publish_bound,
+                            )
+                            .await
+                    }
+                };
                 match stored {
                     Ok(true) => {
                         admitted_bytes.fetch_add(size, Ordering::Relaxed);
@@ -1618,32 +2483,32 @@ async fn main() {
     // because the second fired before the first's freed bytes had been consolidated).
     // Driving ONLY this one mechanism, exactly as `main.rs` does, is what makes this
     // measurement's coupling match production rather than an artifact of the harness.
+    if !staging {
+        spawn_consolidation_loop(
+            consolidator.clone(),
+            eviction_passes.clone(),
+            stop.clone(),
+            args.consolidation_interval_secs,
+            (args.eviction_mode == EvictionMode::Legacy).then(|| args.cache_dir.clone()),
+        );
+    }
+    // The staged figure every 2 s, with this process's admitted bytes at the same moment.
     {
-        let consolidator = consolidator.clone();
-        let eviction_passes = eviction_passes.clone();
+        let cache_manager = cache_manager.clone();
+        let admitted_bytes = admitted_bytes.clone();
+        let samples = figure_samples.clone();
         let stop = stop.clone();
-        let interval_secs = args.consolidation_interval_secs;
-        let legacy_control =
-            (args.eviction_mode == EvictionMode::Legacy).then(|| args.cache_dir.clone());
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
             while !stop.load(Ordering::Relaxed) {
                 tick.tick().await;
-                if let Some(dir) = &legacy_control {
-                    if let Err(e) = touch_legacy_control(dir) {
-                        eprintln!("[legacy control] journal refresh failed: {e}");
-                    }
-                }
-                match consolidator.run_consolidation_cycle().await {
-                    Ok(result) => {
-                        if result.eviction_triggered {
-                            eviction_passes.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[consolidation] cycle failed: {e}");
-                    }
-                }
+                let figure = cache_manager.get_staging_resident_bytes().await;
+                let admitted = admitted_bytes.load(Ordering::Relaxed);
+                samples.lock().unwrap_or_else(|p| p.into_inner()).push((
+                    unix_now_f64(),
+                    figure,
+                    admitted,
+                ));
             }
         });
     }
@@ -1755,6 +2620,29 @@ async fn main() {
         }
     }
 
+    // A staging pass is spawned detached by the consolidation cycle's nudge; one still running here
+    // would be cut off between an unlink and its accounting. A running pass holds the eviction
+    // lock, so winning it means none is in flight on the volume.
+    if staging {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            if matches!(
+                cache_manager.try_acquire_global_eviction_lock().await,
+                Ok(true)
+            ) {
+                let _ = cache_manager.release_global_eviction_lock().await;
+                break;
+            }
+            if Instant::now() >= deadline {
+                eprintln!("WARNING: the eviction lock was still held 300 s after the window ended");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    lock_stop.store(true, Ordering::Relaxed);
+    let _ = lock_sampler.join();
+
     // One final consolidation cycle so admitted-but-not-yet-consolidated bytes are
     // counted in the closing size_state.json read, though not in the throughput
     // figures above (which are measured directly from the fill/enforce_disk_cache_limits
@@ -1829,6 +2717,33 @@ async fn main() {
             declined_entries: declined_e,
             max_cache_size,
             measured_secs,
+        });
+    }
+
+    {
+        let holds = lock_holds.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let samples = figure_samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let epoch_end = read_staged_epoch(&args.cache_dir);
+        print_staging_summary(&StagingSummaryInput {
+            fill_mode: args.fill_mode,
+            me: &me,
+            log_path: &log_path,
+            holds: &holds,
+            window_start: window_start_unix,
+            window_end: window_end_unix,
+            admitted_bytes: ab,
+            admitted_entries: ae,
+            measured_secs,
+            staging_bound,
+            trigger: staging_trigger,
+            target: staging_target,
+            epoch_start: &epoch_start,
+            epoch_end: &epoch_end,
+            samples: &samples,
+            prefill: prefill_result.clone(),
         });
     }
 

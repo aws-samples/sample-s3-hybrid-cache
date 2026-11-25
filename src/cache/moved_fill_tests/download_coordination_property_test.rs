@@ -721,7 +721,6 @@ async fn launch_part_concurrent(
                 std::sync::Arc::new(s3_proxy::config::Config::default()),
                 true,
                 wait_timeout,
-                3,
                 None,
                 &ResolvedSettings::default(),
                 &None,
@@ -763,7 +762,6 @@ async fn launch_part_concurrent(
                 std::sync::Arc::new(s3_proxy::config::Config::default()),
                 true,
                 wait_timeout,
-                3,
                 None,
                 &ResolvedSettings::default(),
                 &None,
@@ -1668,11 +1666,9 @@ async fn run_preservation_fetcher_error(seed: u64) -> TestResult {
 
 /// Fetcher timeout (Requirement 3.9).
 ///
-/// When the fetcher exceeds wait_timeout_secs, waiters re-subscribe to the
-/// in-flight fetch (Requirement 7.1). After max_waiter_resubscriptions
-/// re-subscriptions without receiving a result, the waiter fetches from S3 itself,
-/// as an uncoalesced request does, and serves S3's bytes. The fill it gave up on keeps
-/// its flight registration.
+/// When the fetcher exceeds wait_timeout_secs, the waiter stops waiting and fetches from
+/// S3 itself, as an uncoalesced request does, and serves S3's bytes. The fill it gave up on
+/// keeps its flight registration.
 async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
     let mut config_inner = Config::default();
     config_inner.cache.get_ttl = Duration::from_secs(3600);
@@ -1680,11 +1676,6 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
     config_inner.cache.download_coordination.enabled = true;
     // Very short timeout so the test completes quickly.
     config_inner.cache.download_coordination.wait_timeout_secs = 1;
-    // Set max_waiter_resubscriptions to 1 so the test completes quickly.
-    config_inner
-        .cache
-        .download_coordination
-        .max_waiter_resubscriptions = 1;
     config_inner.cache.ram_cache_enabled = false;
     let config = Arc::new(config_inner);
 
@@ -1757,8 +1748,7 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
         (status, body)
     });
 
-    // Wait for the waiter to exhaust re-subscriptions and fetch for itself.
-    // With wait_timeout=1s and max_waiter_resubscriptions=1, this takes ~2s.
+    // Wait for the waiter to spend its one wait and fetch for itself: about 1 s.
     let (waiter_status, waiter_body) = waiter_handle.await.expect("waiter join");
     // The waiter neither completed nor took the fill's registration.
     // Counted over every key shape the waiter's request can produce, not only the fill's own.
@@ -1771,7 +1761,7 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
         ),
         s3_proxy::inflight_tracker::InFlightTracker::make_part_key(&cache_key, 1),
     ];
-    let fill_still_registered = inflight_tracker.try_resubscribe(&flight_key).is_some();
+    let fill_still_registered = inflight_tracker.is_registered(&flight_key);
     let other_registrations = crate::inflight_tracker::registered(
         &inflight_tracker,
         &waiter_keys[1..]
@@ -1838,10 +1828,6 @@ async fn run_waiter_fallback(shape: WaiterShape, version_changed: bool) {
     config_inner.cache.head_ttl = Duration::from_secs(3600);
     config_inner.cache.download_coordination.enabled = true;
     config_inner.cache.download_coordination.wait_timeout_secs = 1;
-    config_inner
-        .cache
-        .download_coordination
-        .max_waiter_resubscriptions = 1;
     config_inner.cache.ram_cache_enabled = false;
     let config = Arc::new(config_inner);
 
@@ -1904,7 +1890,6 @@ async fn run_waiter_fallback(shape: WaiterShape, version_changed: bool) {
                     Arc::clone(&config),
                     true,
                     Duration::from_millis(200),
-                    1,
                     None,
                     &ResolvedSettings::default(),
                     &None,
@@ -1955,7 +1940,7 @@ async fn run_waiter_fallback(shape: WaiterShape, version_changed: bool) {
     let (status, etag, body) = tokio::time::timeout(Duration::from_secs(30), call)
         .await
         .expect("the waiter must answer once its budget is spent");
-    let fill_still_registered = inflight_tracker.try_resubscribe(&flight_key).is_some();
+    let fill_still_registered = inflight_tracker.is_registered(&flight_key);
     let requests = stub.captured();
     let fetches = requests.len();
     drop(guard);
@@ -2113,10 +2098,6 @@ async fn race_fixture(
     config_inner.cache.head_ttl = Duration::from_secs(3600);
     config_inner.cache.download_coordination.enabled = true;
     config_inner.cache.download_coordination.wait_timeout_secs = 1;
-    config_inner
-        .cache
-        .download_coordination
-        .max_waiter_resubscriptions = 1;
     config_inner.cache.ram_cache_enabled = false;
     let config = Arc::new(config_inner);
     let (temp_dir, cache_manager, disk_cache_manager) = make_cache_infra(&config).await;
@@ -2201,7 +2182,6 @@ impl RaceFixture {
                         Arc::clone(&fx.config),
                         true,
                         Duration::from_millis(200),
-                        1,
                         None,
                         &ResolvedSettings::default(),
                         &None,
@@ -2255,7 +2235,7 @@ impl RaceFixture {
     async fn start_leader(self: &Arc<Self>) -> tokio::task::JoinHandle<Reply> {
         let leader = self.spawn_request(&self.leader_auth, true);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while self.tracker.try_resubscribe(&self.flight_key).is_none() {
+        while !self.tracker.is_registered(&self.flight_key) {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the leader never registered its flight"
@@ -2459,7 +2439,7 @@ async fn an_unsigned_range_waiter_whose_budget_runs_out_fetches_for_itself() {
         .await
         .expect("the unsigned waiter must answer once its budget is spent")
         .expect("waiter join");
-    let fill_still_registered = fx.tracker.try_resubscribe(&fx.flight_key).is_some();
+    let fill_still_registered = fx.tracker.is_registered(&fx.flight_key);
     let fetches = fx.stub.captured().len();
     drop(guard);
     assert!(

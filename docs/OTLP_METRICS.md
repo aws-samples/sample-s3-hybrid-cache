@@ -184,7 +184,7 @@ by roughly the proxy count. See [What to alarm on](LOCAL_NVME_CACHE.md#what-to-a
 | `cache.tee_abandoned_total_put` | Gauge | Streamed PUT and UploadPart bodies whose cache writer stalled for up to 5 s, less when the write's 1-second cache budget is spent; the upload went to S3 uncached. Per-proxy |
 | `cache.volume_stall_breaker_open` | Gauge | `1` while this proxy treats its cache volume as stalled (see [Metrics reference](METRICS_REFERENCE.md)). Per-proxy |
 | `cache.volume_stall_breaker_trips_total` | Gauge | Times this proxy has started treating its cache volume as stalled. Per-proxy |
-| `cache.metadata_heal_overwrite_total` | Gauge | Unparseable `.meta` documents replaced by a fresh one fetched from S3. Read against `cache.corruption_metadata_total`. Per-proxy |
+| `cache.metadata_heal_overwrite_total` | Gauge | Unparseable `.meta` documents a fill replaced or removed. Read against `cache.corruption_metadata_total`. Per-proxy |
 | `cache.upstream_idle_abort_total_mid_stream` | Gauge | GET-miss responses cut off because S3 sent no bytes for `upstream_idle_timeout` mid-body; each is a truncated client response. Per-proxy |
 | `cache.upstream_idle_abort_total_pre_stream` | Gauge | GET and HEAD misses answered `504` after every attempt missed `upstream_first_byte_timeout`. Per-proxy |
 | `cache.upstream_idle_retry_total` | Gauge | First-byte timeouts that were retried. Per-proxy |

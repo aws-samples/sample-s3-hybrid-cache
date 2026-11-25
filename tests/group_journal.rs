@@ -28,6 +28,8 @@ mod inflight_ledger_integration_test;
 mod journal_based_metadata_updates_test;
 #[path = "journal_size_tracking_property_test.rs"]
 mod journal_size_tracking_property_test;
+#[path = "marked_listing_fold_test.rs"]
+mod marked_listing_fold_test;
 #[path = "range_invalidation_journal_window_test.rs"]
 mod range_invalidation_journal_window_test;
 #[path = "rolling_validation_scan_integration_test.rs"]
@@ -42,5 +44,3 @@ mod staged_authority_activation_holder_count_wire_test;
 mod staging_tier_fail_open_and_read_tier_coverage_test;
 #[path = "write_ledger_append_throughput_test.rs"]
 mod write_ledger_append_throughput_test;
-#[path = "write_ledger_candidate_merge_test.rs"]
-mod write_ledger_candidate_merge_test;

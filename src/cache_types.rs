@@ -490,6 +490,17 @@ pub struct ObjectMetadata {
     /// leaves the document unmarked.
     #[serde(default)]
     pub part_layout_verified: bool,
+    /// The part numbers whose `part_ranges` entry was recorded by a release from 3.0.7 on, from
+    /// a part stored at its own offsets. A release before 3.0.7 stored a `partNumber` answer
+    /// that carried S3's append-md5 trailer as the part plus its MD5 at offset 0, and recorded
+    /// that extent as the part's, so the part lookup treats an entry not named here as
+    /// unverified: it clears the entry and the listing of exactly its extent, and misses
+    /// (`CacheManager::clear_unverified_part_layout`). Per part, so recording one part cannot
+    /// vouch for another. Empty for every document a release before 3.0.7 wrote
+    /// (`#[serde(default)]`); a release that does not know the field drops it on rewrite, which
+    /// leaves every entry unmarked. No setting keeps an unmarked entry.
+    #[serde(default)]
+    pub part_layout_marked: std::collections::BTreeSet<u32>,
 
     // For multipart upload tracking
     #[serde(default)]
@@ -536,8 +547,18 @@ pub struct ObjectMetadata {
     /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 1.2, 1.3
     #[serde(default)]
     pub graduation_accounted: bool,
+    /// Whether every `x-amz-checksum-*` value in `response_headers` is the object's own.
+    ///
+    /// Set by [`Self::new_with_headers`], the constructor a fill's metadata comes from, which
+    /// since 3.0.7 is never given a part's checksum (a part answer's checksum headers are not
+    /// stored). `false` for any `.meta` written before 3.0.7 (`#[serde(default)]`), which may
+    /// hold a `partNumber` answer's checksum as the object's: on such an entry
+    /// `CacheManager::stored_checksum_is_a_parts` drops the checksum headers of a multi-part
+    /// object whose stored value has no `-N` suffix. A marked entry keeps them, a `FULL_OBJECT`
+    /// checksum included. Every other construction leaves it `false`, the conservative value.
+    #[serde(default)]
+    pub checksums_object_scoped: bool,
 }
-
 impl Default for ObjectMetadata {
     fn default() -> Self {
         Self {
@@ -554,16 +575,17 @@ impl Default for ObjectMetadata {
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         }
     }
 }
-
 impl ObjectMetadata {
     /// The `Last-Modified` value this entry actually has, from either source.
     ///
@@ -631,12 +653,14 @@ impl ObjectMetadata {
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         }
     }
 
@@ -662,12 +686,14 @@ impl ObjectMetadata {
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: true,
         }
     }
 }
@@ -831,8 +857,8 @@ pub struct RangeSpec {
     /// The extent is listed only so its `.bin` stays named and evictable; its bytes may
     /// belong to another object version and must never be served.
     ///
-    /// Set by `retire_other_version_fills` when an other-version fill's `.bin` cannot be
-    /// unlinked. Every range lookup ([`crate::disk_cache::DiskCacheManager::find_cached_ranges`])
+    /// Set by [`Self::mark_unservable`] when a `.bin` that may hold another version's bytes
+    /// cannot be unlinked. Every range lookup ([`crate::disk_cache::DiskCacheManager::find_cached_ranges`])
     /// skips such an extent, so it reads as missing and the request refetches. A later
     /// consolidation that unlinks the file, an eviction of the extent, or a current-version
     /// fill that republishes the extent removes or replaces the listing.
@@ -951,6 +977,12 @@ impl RangeFileIdentity {
     pub fn matches(&self, found: &Self) -> bool {
         self.size == found.size && self.mtime_ns.abs_diff(found.mtime_ns) < MTIME_MATCH_WINDOW_NS
     }
+    /// The identity [`RangeSpec::mark_unservable`] records. No file is `u64::MAX` bytes long,
+    /// so it describes no file, and a read refuses the listing on the identity check alone.
+    pub(crate) const NEVER_MATCHES: Self = Self {
+        size: u64::MAX,
+        mtime_ns: i64::MIN,
+    };
 }
 
 /// Read a recorded [`RangeFileIdentity`] without ever failing the document that carries it. A
@@ -983,6 +1015,16 @@ where
 }
 
 impl RangeSpec {
+    /// Mark the listing [`Self::unservable`] and record [`RangeFileIdentity::NEVER_MATCHES`]
+    /// as its file identity. The identity check then refuses the listing too, whatever
+    /// `cache.trust_unverified_ranges` says, so the listing is still never served if a rewrite
+    /// or a damaged document loses the `unservable` key. Every 3.0.x release keeps both fields
+    /// when it rewrites a `.meta`; a 2.x release drops both.
+    pub(crate) fn mark_unservable(&mut self) {
+        self.unservable = true;
+        self.file_identity = Some(RangeFileIdentity::NEVER_MATCHES);
+    }
+
     /// Create a new RangeSpec with initial access tracking.
     ///
     /// Leaves `staged` as `None`. Every **live write path** must record membership
@@ -1144,6 +1186,15 @@ pub struct NewCacheMetadata {
     /// before the field existed; omitted from the `.meta` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_validated_at: Option<SystemTime>,
+    /// When a write that S3 answered with a `5xx`, and may have applied, expired this entry
+    /// ([`Self::expire_for_write`]). While set, no read serves the entry on the cache's own
+    /// authority: the next GET or HEAD asks S3 with the cached ETag first, and only an origin
+    /// `304` sent after this instant clears it ([`Self::record_origin_validation_asked_at`]).
+    /// `None` for every other entry, and for metadata written before the field existed;
+    /// omitted from the `.meta` when `None`. A release that does not know the field drops it
+    /// when it rewrites the `.meta`, and its own reads ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_expired_at: Option<SystemTime>,
 }
 
 impl NewCacheMetadata {
@@ -1164,6 +1215,43 @@ impl NewCacheMetadata {
         let now = SystemTime::now();
         self.expires_at = safe_expiry(now, ttl);
         self.last_validated_at = Some(now);
+        self.write_expired_at = None;
+    }
+
+    /// [`Self::record_origin_validation`] for a `304` whose conditional request was sent at
+    /// `asked_at`. Returns `false`, changing nothing, when a write expired the entry at or
+    /// after that instant: S3 may have answered before applying that write, so the `304`
+    /// says nothing about it, and the entry stays expired for the next read to revalidate.
+    pub(crate) fn record_origin_validation_asked_at(
+        &mut self,
+        ttl: Duration,
+        asked_at: SystemTime,
+    ) -> bool {
+        if self
+            .write_expired_at
+            .is_some_and(|expired_at| expired_at >= asked_at)
+        {
+            return false;
+        }
+        self.record_origin_validation(ttl);
+        true
+    }
+
+    /// Expire the entry for a write that S3 answered with a `5xx` and may have applied, at
+    /// `now`. The data, the ranges and the validators are kept, so the next read can
+    /// revalidate with the cached ETag: stored expiry moves to `now` at the latest, and
+    /// [`Self::write_expired_at`] makes the live-TTL verdict, the HEAD tiers and RAM
+    /// verification read the entry as expired until an origin `304` clears it.
+    pub(crate) fn expire_for_write(&mut self, now: SystemTime) {
+        self.write_expired_at = Some(now);
+        if self.expires_at > now {
+            self.expires_at = now;
+        }
+    }
+
+    /// Whether a write expired this entry and no origin `304` has confirmed it since.
+    pub(crate) fn is_write_expired(&self) -> bool {
+        self.write_expired_at.is_some()
     }
 
     /// Refresh HEAD TTL and freshness anchor from the same instant.
@@ -1227,6 +1315,7 @@ impl Default for NewCacheMetadata {
             head_access_count: 0,
             head_cached_at: None,
             last_validated_at: None,
+            write_expired_at: None,
         }
     }
 }
@@ -1236,6 +1325,22 @@ mod tests {
     use quickcheck::TestResult;
     use quickcheck_macros::quickcheck;
     use serde_json::json;
+
+    #[test]
+    fn an_origin_304_asked_before_a_write_expiry_does_not_clear_it() {
+        let mut metadata = NewCacheMetadata::default();
+        let asked_before = SystemTime::now() - Duration::from_secs(1);
+        metadata.expire_for_write(SystemTime::now());
+        assert!(
+            !metadata.record_origin_validation_asked_at(Duration::from_secs(60), asked_before),
+            "a 304 to a request sent before the expiry"
+        );
+        assert!(metadata.is_write_expired());
+        let asked_after = SystemTime::now() + Duration::from_millis(1);
+        assert!(metadata.record_origin_validation_asked_at(Duration::from_secs(60), asked_after));
+        assert!(!metadata.is_write_expired());
+        assert!(metadata.expires_at > SystemTime::now());
+    }
 
     #[test]
     fn test_upload_state_serialization() {
@@ -1757,12 +1862,14 @@ mod tests {
             parts_count,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: upload_id.clone(),
             is_write_cached: false,
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
             graduation_accounted: false,
+            checksums_object_scoped: false,
         };
 
         // Serialize
@@ -1829,6 +1936,7 @@ mod tests {
             parts_count: None,
             part_ranges: HashMap::new(),
             part_layout_verified: false,
+            part_layout_marked: Default::default(),
             upload_id: None,
             is_write_cached,
             write_cache_expires_at: if is_write_cached {
@@ -1839,6 +1947,7 @@ mod tests {
             write_cache_created_at: if is_write_cached { Some(now) } else { None },
             write_cache_last_accessed: if is_write_cached { Some(now) } else { None },
             graduation_accounted: false,
+            checksums_object_scoped: false,
         };
 
         // Serialize
@@ -2395,6 +2504,7 @@ mod head_cached_at_tests {
         // an entry look older than it is.
         let recached = NewCacheMetadata {
             last_validated_at: Some(created),
+            write_expired_at: None,
             ..Default::default()
         };
         assert_eq!(recached.freshness_anchor(), recached.created_at);

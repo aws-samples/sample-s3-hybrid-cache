@@ -8,14 +8,13 @@
 
 use std::io::Write;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use s3_proxy::cache_types::RangeSpec;
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::DiskCacheManager;
 use s3_proxy::hybrid_metadata_writer::HybridMetadataWriter;
 use s3_proxy::journal_manager::{JournalEntry, JournalManager, JournalOperation};
-use s3_proxy::metadata_lock_manager::MetadataLockManager;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -67,15 +66,9 @@ async fn manager_over_journal(journal_target: usize) -> (DiskCacheManager, usize
     let cache_dir = dir.path().to_path_buf();
     let mut manager = DiskCacheManager::new(cache_dir.clone(), false, 1024, false, 1_048_576);
     manager.initialize().await.unwrap();
-    manager.set_hybrid_metadata_writer(Arc::new(Mutex::new(HybridMetadataWriter::new(
-        cache_dir.clone(),
-        Arc::new(MetadataLockManager::new(
-            cache_dir.clone(),
-            Duration::from_millis(300),
-            0,
-        )),
-        Arc::new(JournalManager::new(cache_dir.clone(), INSTANCE.to_string())),
-    ))));
+    manager.set_hybrid_metadata_writer(Arc::new(Mutex::new(HybridMetadataWriter::new(Arc::new(
+        JournalManager::new(cache_dir.clone(), INSTANCE.to_string()),
+    )))));
     assert!(manager.is_shared_storage_mode(), "fixture precondition");
 
     let journals = cache_dir.join("metadata").join("_journals");

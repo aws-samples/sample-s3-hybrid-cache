@@ -483,6 +483,7 @@ async fn class_a_head_ttl_zero_forces_revalidation_after_rule_change() {
         s1.is_success(),
         "initial GET should succeed (populates body cache)"
     );
+    common::wait_for_fill_of_path(&cache_manager, path).await;
 
     // The first HEAD will either be served from the cached object metadata
     // (if the GET path also stores head_expires_at) or fetch from S3. Either
@@ -763,6 +764,8 @@ async fn class_b_default_path_eager_delete_on_read_cache_disabled() {
         "initial GET for sibling key should succeed"
     );
 
+    common::wait_for_fill_of_path(&cache_manager, nocache_path).await;
+    common::wait_for_fill_of_path(&cache_manager, sibling_path).await;
     // Verify both keys are now cached on disk (.meta and .bin files exist)
     let nocache_meta_before = find_meta_files_for(temp_dir.path(), "sensitive");
     let nocache_bin_before = find_bin_files_for(temp_dir.path(), "sensitive");
@@ -871,6 +874,7 @@ async fn class_b_mode_b_conditional_get_not_served_from_cache() {
         s1.is_success(),
         "initial GET should succeed (populates cache)"
     );
+    common::wait_for_fill_of_path(&cache_manager, path).await;
     let fetches_after_cache = s3_get_fetches_for(&stub, "/nocache/cond-get");
     assert_eq!(
         fetches_after_cache, 1,
@@ -978,6 +982,7 @@ async fn class_b_mode_b_conditional_head_not_served_from_cache() {
         s1.is_success(),
         "initial GET should succeed (populates body cache)"
     );
+    common::wait_for_fill_of_path(&cache_manager, path).await;
     let h1 = proxy_head(server.addr, path).await;
     assert!(
         h1.is_success(),
@@ -1231,6 +1236,7 @@ async fn read_cache_disable_rule_forces_s3_refetch_while_control_key_is_cached()
     // --- control key: matches no rule → second GET served from cache ---
     let control_path = "/mybucket/other/file.bin";
     let c1 = proxy_get(server.addr, control_path).await;
+    common::wait_for_fill_of_path(&cache_manager, control_path).await;
     let c2 = proxy_get(server.addr, control_path).await;
     assert!(c1.is_success(), "first control GET should succeed");
     assert!(c2.is_success(), "second control GET should succeed");
@@ -1298,6 +1304,7 @@ async fn full_bucket_key_glob_matches_only_the_named_bucket() {
 
     // otherbucket → same object key, different bucket → rule does NOT match.
     assert!(proxy_get(server.addr, other_path).await.is_success());
+    common::wait_for_fill_of_path(&cache_manager, other_path).await;
     assert!(proxy_get(server.addr, other_path).await.is_success());
     assert_eq!(
         s3_fetches_for(&stub, "/otherbucket/"),
@@ -1343,6 +1350,7 @@ async fn full_key_matching_is_case_sensitive_on_request_path() {
     // Lower-cased bucket — must NOT match the capitalized pattern.
     let lower_path = "/specificbucket/data/file.bin";
     assert!(proxy_get(server.addr, lower_path).await.is_success());
+    common::wait_for_fill_of_path(&cache_manager, lower_path).await;
     assert!(proxy_get(server.addr, lower_path).await.is_success());
     assert_eq!(
         s3_fetches_for(&stub, "/specificbucket/"),
@@ -1404,6 +1412,7 @@ async fn preservation_unchanged_rules_get_in_window_served_from_cache() {
     assert_eq!(s3_get_fetches_for(&stub, "/preserve-get-inwindow/"), 1);
 
     // Second GET (unchanged rules, within TTL): should be served from cache
+    common::wait_for_fill_of_path(&cache_manager, path).await;
     let s2 = proxy_get(server.addr, path).await;
     assert!(s2.is_success(), "second GET should succeed");
     assert_eq!(
@@ -1447,6 +1456,7 @@ async fn preservation_unchanged_rules_head_in_window_served_from_cache() {
     // then HEAD to populate head_expires_at.
     let g1 = proxy_get(server.addr, path).await;
     assert!(g1.is_success(), "initial GET should succeed");
+    common::wait_for_fill_of_path(&cache_manager, path).await;
 
     let h1 = proxy_head(server.addr, path).await;
     assert!(h1.is_success(), "first HEAD should succeed");
@@ -1504,6 +1514,7 @@ async fn preservation_read_cache_enabled_true_not_deleted() {
     assert_eq!(s3_get_fetches_for(&stub, "/preserve-not-deleted/"), 1);
 
     // Second GET: served from cache (confirms read_cache_enabled=true is honored)
+    common::wait_for_fill_of_path(&cache_manager, path).await;
     let s2 = proxy_get(server.addr, path).await;
     assert!(s2.is_success(), "second GET should succeed");
     assert_eq!(
@@ -1574,6 +1585,7 @@ async fn preservation_head_not_cached_gate_reports_miss() {
     // the HEAD metadata should be expired immediately / never fresh).
     let g1 = proxy_get(server.addr, path).await;
     assert!(g1.is_success(), "initial GET should succeed");
+    common::wait_for_fill_of_path(&cache_manager, path).await;
 
     // First HEAD: must contact S3 (HEAD metadata not cached / expired)
     let total_before = stub.captured().len();
@@ -1706,6 +1718,7 @@ async fn preservation_resolve_once_head_request() {
     // Populate cache with a GET first so HEAD has metadata to check
     let g1 = proxy_get(server.addr, path).await;
     assert!(g1.is_success(), "initial GET should succeed");
+    common::wait_for_fill_of_path(&cache_manager, path).await;
 
     // Record the count after the GET
     let manager = cache_manager.get_bucket_settings_manager();

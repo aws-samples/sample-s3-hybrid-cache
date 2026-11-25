@@ -327,6 +327,7 @@ fn plant_meta(
         head_access_count: 1,
         head_cached_at: Some(now),
         last_validated_at: None,
+        write_expired_at: None,
     };
     let path = cache_manager.get_new_metadata_file_path(cache_key);
     std::fs::create_dir_all(path.parent().unwrap()).expect("create metadata dir");

@@ -935,7 +935,12 @@ async fn an_upload_part_copy_stages_nothing() {
         "fixture: S3 accepts the copy part"
     );
     // Control: a plain UploadPart on another upload stages a part, so the apparatus can
-    // observe staging.
+    // observe staging. A part stages only into an upload with a tracker, written here as its
+    // CreateMultipartUpload would.
+    let control_tracker =
+        s3_proxy::signed_put_handler::mpu_upload_dir(&cache_dir, "scn1-control-upload");
+    std::fs::create_dir_all(&control_tracker).unwrap();
+    std::fs::write(control_tracker.join("upload.meta"), "{}").unwrap();
     let control = h
         .put(
             "control-mpu",

@@ -192,11 +192,9 @@ async fn instance(
         0,
     ));
 
-    let writer = Arc::new(Mutex::new(HybridMetadataWriter::new(
-        cache_dir.to_path_buf(),
-        Arc::clone(&lock_manager),
-        Arc::clone(&journal_manager),
-    )));
+    let writer = Arc::new(Mutex::new(HybridMetadataWriter::new(Arc::clone(
+        &journal_manager,
+    ))));
     manager.set_hybrid_metadata_writer(Arc::clone(&writer));
 
     manager.set_journal_consolidator(Arc::new(JournalConsolidator::new(

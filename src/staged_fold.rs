@@ -785,6 +785,19 @@ fn write_removal_debits(
     instance_id: &str,
     new: Vec<RemovalDebitEntry>,
 ) -> std::io::Result<()> {
+    write_removal_debits_with(cache_dir, instance_id, new, false, |_| {})
+}
+
+/// [`write_removal_debits`] with `after_retain` run on the entries once the age floor and the
+/// own-install prune have been applied, and before the cap merge. `adds` says `after_retain` may
+/// add entries, so an absent document is still written.
+fn write_removal_debits_with(
+    cache_dir: &Path,
+    instance_id: &str,
+    new: Vec<RemovalDebitEntry>,
+    adds: bool,
+    after_retain: impl FnOnce(&mut Vec<RemovalDebitEntry>),
+) -> std::io::Result<()> {
     let _write = DEBIT_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let key = (dir_tag(cache_dir), instance_id.to_string());
     let installs = OWN_INSTALLS
@@ -803,7 +816,7 @@ fn write_removal_debits(
             return Err(e);
         }
     };
-    if entries.is_empty() && new.is_empty() {
+    if entries.is_empty() && new.is_empty() && !adds {
         return Ok(());
     }
     entries.extend(new);
@@ -815,9 +828,18 @@ fn write_removal_debits(
                 .get(&e.shard())
                 .is_none_or(|&visit_started| e.removed_at_unix_nanos > visit_started)
     });
+    after_retain(&mut entries);
     if entries.len() > REMOVAL_DEBIT_MAX_ENTRIES {
         entries = merged_per_shard(entries);
         REMOVAL_DEBIT_MERGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            *MERGES_BY_DIR
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(key.0)
+                .or_default() += 1;
+        }
     }
     let result = if entries.is_empty() {
         match std::fs::remove_file(&path) {
@@ -869,43 +891,94 @@ fn merged_per_shard(entries: Vec<RemovalDebitEntry>) -> Vec<RemovalDebitEntry> {
     by_shard.into_values().collect()
 }
 
-/// A staging pass's evictions, published as this instance's debits before its re-fold.
+/// One batch of a staging pass's evictions, published by the replace rule: per shard, the entry
+/// this chunk execution last wrote (`last`) is replaced by one entry holding the cumulative
+/// removal, stamped now.
 ///
-/// Stamped now, after every eviction's `.meta` change, so a re-fold visit (which begins after this)
-/// makes each entry it installs inert. Also expires this directory's memos, so the next decision
-/// in this process derives with the debit rather than from a figure taken before the pass.
-pub(crate) fn publish_removal_debits(
+/// Whether the last entry is still there is judged after the age floor and the own-install
+/// prune, inside the same write. If it is gone (an install of the shard pruned it, the cap merged
+/// it, or it aged out), only this batch's removal is added and the shard's cumulative total
+/// restarts from it. Republishing the earlier batches stamped now would subtract them a second
+/// time from a checkpoint whose visit began between the two stamps. On success `last` holds the
+/// entries written; on failure it is unchanged and the batch is queued for the consolidation
+/// cycle's flush, as [`publish_removal_debits`] queues a failed pass.
+pub(crate) fn publish_removal_debits_replacing(
     cache_dir: &Path,
     instance_id: &str,
-    removed: &BTreeMap<Shard, StagedRemoval>,
+    batch: &BTreeMap<Shard, StagedRemoval>,
+    last: &mut BTreeMap<Shard, RemovalDebitEntry>,
 ) -> std::io::Result<()> {
-    let now = now_nanos();
-    let new: Vec<RemovalDebitEntry> = removed
-        .iter()
-        .filter(|(_, r)| !r.is_empty())
-        .map(|(shard, r)| RemovalDebitEntry {
-            bucket: shard.bucket.clone(),
-            l1: shard.l1.clone(),
-            removed_at_unix_nanos: now,
-            bytes: r.bytes,
-            ranges: r.ranges,
-        })
-        .collect();
-    if new.is_empty() {
+    let batch: Vec<(&Shard, &StagedRemoval)> =
+        batch.iter().filter(|(_, r)| !r.is_empty()).collect();
+    if batch.is_empty() {
         return Ok(());
     }
-    let result = write_removal_debits(cache_dir, instance_id, new);
-    if result.is_err() {
-        // The pass's evictions are done and its debits did not reach the volume. Queue them
-        // for the consolidation cycle's flush, which retries, and which this process's own
-        // reads already add: dropping them would size the next pass from bytes just freed.
-        for (shard, r) in removed.iter().filter(|(_, r)| !r.is_empty()) {
-            accumulate_removal(cache_dir, instance_id, shard.clone(), *r);
+    let mut written: BTreeMap<Shard, RemovalDebitEntry> = BTreeMap::new();
+    let result = write_removal_debits_with(cache_dir, instance_id, Vec::new(), true, |entries| {
+        let now = now_nanos();
+        for (shard, removal) in &batch {
+            let previous = last
+                .get(*shard)
+                .and_then(|prev| entries.iter().position(|e| e == prev));
+            let (bytes, ranges) = match previous {
+                Some(pos) => {
+                    let prev = entries.remove(pos);
+                    (
+                        prev.bytes.saturating_add(removal.bytes),
+                        prev.ranges.saturating_add(removal.ranges),
+                    )
+                }
+                None => (removal.bytes, removal.ranges),
+            };
+            let entry = RemovalDebitEntry {
+                bucket: shard.bucket.clone(),
+                l1: shard.l1.clone(),
+                removed_at_unix_nanos: now,
+                bytes,
+                ranges,
+            };
+            entries.push(entry.clone());
+            written.insert((*shard).clone(), entry);
+        }
+    });
+    match &result {
+        Ok(()) => last.extend(written),
+        Err(_) => {
+            for (shard, r) in &batch {
+                accumulate_removal(cache_dir, instance_id, (*shard).clone(), **r);
+            }
         }
     }
     invalidate_budget_snapshot(cache_dir);
     expire_authority_snapshot(cache_dir);
     result
+}
+
+/// Cap merges of removal debit documents per cache directory ([`dir_tag`]), so a test can read
+/// its own directory's count beside the process-global `REMOVAL_DEBIT_MERGES_TOTAL`.
+#[cfg(test)]
+static MERGES_BY_DIR: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+/// [`MERGES_BY_DIR`] for `cache_dir`.
+#[cfg(test)]
+pub(crate) fn removal_debit_merges_for_tests(cache_dir: &Path) -> u64 {
+    MERGES_BY_DIR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&dir_tag(cache_dir))
+        .copied()
+        .unwrap_or(0)
+}
+/// This instance's removal debit document's entries, for tests that assert its shape.
+#[cfg(test)]
+pub(crate) fn removal_debit_entries_for_tests(
+    cache_dir: &Path,
+    instance_id: &str,
+) -> Vec<RemovalDebitEntry> {
+    std::fs::read_to_string(RemovalDebitDocument::path(cache_dir, instance_id))
+        .ok()
+        .and_then(|body| RemovalDebitDocument::parse(&body))
+        .map(|d| d.entries)
+        .unwrap_or_default()
 }
 
 /// Write this instance's unflushed removals into its document. Called once per consolidation
@@ -1047,6 +1120,16 @@ async fn read_published_removal_debits(cache_dir: &Path) -> Vec<RemovalDebitEntr
     out
 }
 
+/// One shard's net staged figure: its checkpoint's staged bytes and ranges, plus its post-cut
+/// pending credits, less the removal debits that apply to it. The staging pass shares its
+/// shortfall across shards in proportion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ShardWeight {
+    pub bytes: u64,
+    pub ranges: u64,
+}
+/// Every shard with a non-zero [`ShardWeight`], from one derivation's read.
+pub(crate) type ShardWeights = BTreeMap<Shard, ShardWeight>;
 /// What the removal debits take off a figure composed from `pending` and `checkpoints`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AppliedDebit {
@@ -1054,7 +1137,74 @@ pub(crate) struct AppliedDebit {
     pub ranges: u64,
 }
 
+/// One shard's terms of the figure a read composes: `F_s` plus its post-cut pending credits
+/// (`gross`), and the removal debits that apply to it (`debit`), each as (bytes, ranges).
+#[derive(Debug, Clone, Copy, Default)]
+struct ShardFigureTerms {
+    gross: (u64, u64),
+    debit: (u64, u64),
+}
+impl ShardFigureTerms {
+    /// The debit this shard takes off the figure: clamped to its gross, so a debit can never
+    /// take a shard below zero.
+    fn applied(&self) -> (u64, u64) {
+        (
+            self.debit.0.min(self.gross.0),
+            self.debit.1.min(self.gross.1),
+        )
+    }
+}
 impl PendingReadOutcome {
+    /// Every shard's terms of the figure this read composes against `checkpoints`. A credit with
+    /// no checkpoint for its shard is post-cut ([`Self::post_cut`]), and a debit applies to a
+    /// shard with no checkpoint, so a shard need not have a checkpoint to appear.
+    fn shard_figure_terms(
+        &self,
+        checkpoints: &ShardCheckpointSet,
+    ) -> BTreeMap<Shard, ShardFigureTerms> {
+        let mut terms: BTreeMap<Shard, ShardFigureTerms> = BTreeMap::new();
+        for (shard, c) in checkpoints.iter() {
+            let t = terms.entry(shard.clone()).or_default();
+            t.gross.0 = t.gross.0.saturating_add(c.staged_byte_sum);
+            t.gross.1 = t.gross.1.saturating_add(c.staged_range_count);
+        }
+        for c in self.post_cut(checkpoints) {
+            let t = terms.entry(c.shard()).or_default();
+            t.gross.0 = t.gross.0.saturating_add(c.bytes);
+            t.gross.1 = t.gross.1.saturating_add(1);
+        }
+        for e in &self.removal_debits {
+            let shard = e.shard();
+            let applies = checkpoints
+                .get(&shard)
+                .is_none_or(|c| c.visit_started_at() < e.removed_at_unix_nanos);
+            if applies {
+                let t = terms.entry(shard).or_default();
+                t.debit.0 = t.debit.0.saturating_add(e.bytes);
+                t.debit.1 = t.debit.1.saturating_add(e.ranges);
+            }
+        }
+        terms
+    }
+    /// Each shard's share of the figure this read composes: its checkpoint's staged bytes and
+    /// ranges, plus its post-cut pending credits, less the removal debits that apply to it, by
+    /// the rule and with the clamp [`Self::applied_debit`] uses. These are the terms the figure
+    /// sums, per shard, so the weights sum to the byte figure without `P` and to the count figure
+    /// less its debit. A shard written since its last fold visit, or never visited, carries
+    /// weight by its post-cut credits. Shards that net to zero are left out.
+    pub(crate) fn shard_weights(&self, checkpoints: &ShardCheckpointSet) -> ShardWeights {
+        self.shard_figure_terms(checkpoints)
+            .into_iter()
+            .filter_map(|(shard, t)| {
+                let (db, dr) = t.applied();
+                let w = ShardWeight {
+                    bytes: t.gross.0 - db,
+                    ranges: t.gross.1 - dr,
+                };
+                (w.bytes > 0 || w.ranges > 0).then_some((shard, w))
+            })
+            .collect()
+    }
     /// The removal debits this read carries, applied by [`RemovalDebitEntry`]'s rule against
     /// `checkpoints`, and clamped per shard to that shard's figure (`F_s` plus its post-cut
     /// pending term), so a debit can never take a shard below zero.
@@ -1062,40 +1212,11 @@ impl PendingReadOutcome {
         if self.removal_debits.is_empty() {
             return AppliedDebit::default();
         }
-        let mut applied: HashMap<Shard, (u64, u64)> = HashMap::new();
-        for e in &self.removal_debits {
-            let shard = e.shard();
-            let applies = checkpoints
-                .get(&shard)
-                .is_none_or(|c| c.visit_started_at() < e.removed_at_unix_nanos);
-            if applies {
-                let slot = applied.entry(shard).or_default();
-                slot.0 = slot.0.saturating_add(e.bytes);
-                slot.1 = slot.1.saturating_add(e.ranges);
-            }
-        }
-        if applied.is_empty() {
-            return AppliedDebit::default();
-        }
-        let mut pending_by_shard: HashMap<Shard, (u64, u64)> = HashMap::new();
-        for c in self.post_cut(checkpoints) {
-            let slot = pending_by_shard.entry(c.shard()).or_default();
-            slot.0 = slot.0.saturating_add(c.bytes);
-            slot.1 = slot.1.saturating_add(1);
-        }
         let mut total = AppliedDebit::default();
-        for (shard, (bytes, ranges)) in applied {
-            let (pend_bytes, pend_ranges) = pending_by_shard.get(&shard).copied().unwrap_or((0, 0));
-            let (f_bytes, f_ranges) = checkpoints
-                .get(&shard)
-                .map(|c| (c.staged_byte_sum, c.staged_range_count))
-                .unwrap_or((0, 0));
-            total.bytes = total
-                .bytes
-                .saturating_add(bytes.min(f_bytes.saturating_add(pend_bytes)));
-            total.ranges = total
-                .ranges
-                .saturating_add(ranges.min(f_ranges.saturating_add(pend_ranges)));
+        for t in self.shard_figure_terms(checkpoints).values() {
+            let (db, dr) = t.applied();
+            total.bytes = total.bytes.saturating_add(db);
+            total.ranges = total.ranges.saturating_add(dr);
         }
         total
     }
@@ -1383,8 +1504,10 @@ struct CountEvictionState {
     /// same event that makes a removal debit inert, for the same reason.
     ///
     /// **Not** set by a pass that reclaimed something, however little: partial progress means
-    /// the population was non-empty, so the next cycle has real work to do. Nor by a pass the
-    /// deadline stopped, which did not assess every candidate.
+    /// the population was non-empty, so the next cycle has real work to do. Nor by a pass that
+    /// did not assess every candidate: one the deadline stopped, one that refused a shard's
+    /// ledger read, or one that read some shard only up to its share or left part of its plan
+    /// unread.
     found_nothing: bool,
     /// Count-driven passes completed against this directory, and the ranges they reclaimed.
     ///
@@ -1580,7 +1703,22 @@ static AUTHORITY_SNAPSHOT_RECOMPUTES: AtomicU64 = AtomicU64::new(0);
 /// `error!` is logged. Contention alone does not sustain it: at the measured 4% to 9% per-attempt
 /// failure rate, six failures in a row (30 s at one attempt per 5 s) are expected less than once in
 /// a hundred days. A minute is twice that, so a run this long points at a persistent cause.
+///
+/// One attempt per 5 s holds only under write load. On an idle proxy the metrics collector is the
+/// only derivation, once per `metrics.collection_interval` (60 s by default), and the figure is
+/// dated by the previous one, so one failed derivation alone already reads as a minute unknown.
+/// The `error!` therefore also needs [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_FAILURES`] failed
+/// derivations in a row.
 pub(crate) const STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS: u64 = 60;
+/// Failed derivations in a row before the sustained-unknown `error!` is due, as well as
+/// [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS`]: two, so the error rests on two separate reads of
+/// the volume, a collection interval apart on an idle proxy, rather than on one contended read.
+pub(crate) const STAGING_FIGURE_UNKNOWN_ERROR_AFTER_FAILURES: u32 = 2;
+/// How long the figure may be unknown only because no fold has installed a shard checkpoint yet,
+/// the window between a volume's first upload and its first fold install, before the `error!` is
+/// logged. Nothing is wrong in that window, which lasts about one fold interval
+/// ([`STAGED_FOLD_INTERVAL_SECS`]); three intervals means the first fold is not installing.
+pub(crate) const STAGING_FIGURE_FIRST_FOLD_ERROR_AFTER_SECS: u64 = 3 * STAGED_FOLD_INTERVAL_SECS;
 /// Minimum seconds between two of those `error!` lines.
 pub(crate) const STAGING_FIGURE_UNKNOWN_ERROR_INTERVAL_SECS: u64 = 600;
 
@@ -1609,6 +1747,11 @@ struct AuthorityAttempts {
     /// When the sustained-unknown `error!` was last logged, `0` since the last complete
     /// derivation.
     last_error_at_secs: u64,
+    /// Finished derivations in a row that produced no figure, `0` after a complete one.
+    consecutive_failures: u32,
+    /// Whether the most recent derivation found every input readable and lacked a figure only
+    /// because no fold has installed a shard checkpoint yet ([`awaiting_first_fold`]).
+    last_failure_awaiting_first_fold: bool,
     /// Start time of each derivation still in flight, by attempt id, so a derivation that never
     /// returns (a holder stuck in shared-storage I/O) still shows as unknown.
     in_flight: BTreeMap<u64, u64>,
@@ -1651,12 +1794,14 @@ fn begin_authority_attempt(tag: u64, now_secs: u64) -> AuthorityAttemptGuard {
 
 /// Record a finished derivation whose inputs date from `taken_at_secs`. Returns the seconds to
 /// report when the sustained-unknown `error!` is due now; the caller logs it after this returns,
-/// so it is never logged under a lock.
+/// so it is never logged under a lock. `awaiting_first_fold` is [`awaiting_first_fold`] of an
+/// incomplete derivation's inputs.
 fn finish_authority_attempt(
     tag: u64,
     now_secs: u64,
     taken_at_secs: u64,
     complete: bool,
+    awaiting_first_fold: bool,
 ) -> Option<u64> {
     let mut map = AUTHORITY_ATTEMPTS.lock().unwrap_or_else(|p| p.into_inner());
     let record = map.entry(tag).or_default();
@@ -1668,8 +1813,12 @@ fn finish_authority_attempt(
     if complete {
         record.last_complete_at_secs = record.last_complete_at_secs.max(taken_at_secs);
         record.last_error_at_secs = 0;
+        record.consecutive_failures = 0;
+        record.last_failure_awaiting_first_fold = false;
         return None;
     }
+    record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+    record.last_failure_awaiting_first_fold = awaiting_first_fold;
     let unknown_for = unknown_error_due(record, now_secs)?;
     record.last_error_at_secs = now_secs;
     Some(unknown_for)
@@ -1705,15 +1854,25 @@ fn unknown_seconds_of(record: Option<&AuthorityAttempts>, now_secs: u64) -> u64 
 }
 
 /// Whether the sustained-unknown `error!` is due at `now_secs`: the most recent attempt failed,
-/// the figure has been unknown for at least [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS`], and none
-/// was logged in the last [`STAGING_FIGURE_UNKNOWN_ERROR_INTERVAL_SECS`]. The seconds unknown when
-/// due.
+/// as did the [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_FAILURES`] before it in all, the figure has been
+/// unknown for at least [`STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS`] (or
+/// [`STAGING_FIGURE_FIRST_FOLD_ERROR_AFTER_SECS`] when the only thing missing is a first fold
+/// install), and none was logged in the last [`STAGING_FIGURE_UNKNOWN_ERROR_INTERVAL_SECS`]. The
+/// seconds unknown when due.
 fn unknown_error_due(record: &AuthorityAttempts, now_secs: u64) -> Option<u64> {
     if record.last_attempt_at_secs == 0 || record.last_attempt_complete {
         return None;
     }
+    if record.consecutive_failures < STAGING_FIGURE_UNKNOWN_ERROR_AFTER_FAILURES {
+        return None;
+    }
     let unknown_for = now_secs.saturating_sub(known_until(record));
-    if unknown_for < STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS {
+    let threshold = if record.last_failure_awaiting_first_fold {
+        STAGING_FIGURE_FIRST_FOLD_ERROR_AFTER_SECS
+    } else {
+        STAGING_FIGURE_UNKNOWN_ERROR_AFTER_SECS
+    };
+    if unknown_for < threshold {
         return None;
     }
     if record.last_error_at_secs != 0
@@ -1740,7 +1899,8 @@ fn log_staging_figure_unknown(unknown_for: u64) {
          so staged bytes can grow until caching of new uploads stops at max_cache_size. Likely \
          causes: a malformed or unreadable file in metadata/_shard_state/staged_pending, an \
          unreadable shard checkpoint, an unreadable in-progress multipart part record, or a \
-         proxy holding its pending-credit lock without releasing it. See docs/EVICTION.md, \
+         proxy holding its pending-credit lock without releasing it, or no fold having \
+         installed a shard checkpoint since this volume's first upload. See docs/EVICTION.md, \
          \"When the recomputed figure cannot be read\"."
     );
 }
@@ -2231,6 +2391,29 @@ pub(crate) fn seed_shard_figure_for_tests(
         .expect("test fixture must be able to install a shard checkpoint");
 }
 
+/// [`seed_shard_figure_for_tests`] whose `staged_fold_cut` also names each `(instance, cut)`
+/// pair, so the instance's credits up to its cut are inside the seeded figure.
+#[cfg(test)]
+pub(crate) fn seed_shard_figure_and_cuts_for_tests(
+    cache_dir: &Path,
+    bucket: &str,
+    l1: &str,
+    bytes: u64,
+    ranges: u64,
+    cuts: &[(&str, u64)],
+) {
+    let shard = Shard::new(bucket, l1);
+    let mut c = StagedShardCheckpoint::empty(&shard);
+    c.staged_byte_sum = bytes;
+    c.staged_range_count = ranges;
+    c.staged_scanned_at = now_nanos();
+    c.staged_scanned_by = "host:seed".to_string();
+    for (instance, cut) in cuts {
+        c.staged_fold_cut.insert(instance.to_string(), *cut);
+    }
+    c.install(cache_dir)
+        .expect("test fixture must be able to install a shard checkpoint");
+}
 /// Install a folded checkpoint for `(bucket, l1)` whose `staged_fold_cut` names each
 /// `(instance, cut)` pair, for another module's tests.
 #[cfg(test)]
@@ -2682,9 +2865,12 @@ async fn peer_303_reclaimed_ranges(cache_dir: &Path) -> u64 {
 
 /// Record a count-driven pass: its totals, and the latch when it reclaimed nothing.
 ///
-/// `stopped_by_deadline` is true when the pass ended at its time budget. Such a pass did not
-/// assess every candidate, so reclaiming nothing does not show the population is empty and the
-/// latch stays clear.
+/// `partial` is true when the pass did not assess every candidate it asked for: it ended at its
+/// time budget, refused a shard's ledger read, read a shard asked for a nonzero share only up to
+/// that share with entries left behind, or dropped runs of its plan that carried a quota.
+/// Reclaiming nothing then does not show the population is empty, and the latch stays clear. A
+/// shard with a zero share and a chunk with a zero quota were asked for nothing, so leaving them
+/// unread does not make the pass partial.
 ///
 /// The ranges it reclaimed are not debited here. The staging pass publishes them per shard as
 /// removal debits ([`publish_removal_debits`]) before its re-fold, and [`count_eviction_verdict`]
@@ -2694,7 +2880,7 @@ pub(crate) fn record_count_eviction_pass(
     cache_dir: &Path,
     instance_id: &str,
     ranges_reclaimed: u64,
-    stopped_by_deadline: bool,
+    partial: bool,
 ) -> (u64, u64) {
     let tag = dir_tag(cache_dir);
     if ranges_reclaimed > 0 {
@@ -2705,9 +2891,9 @@ pub(crate) fn record_count_eviction_pass(
     };
     let state = states.entry(tag).or_default();
     // Latch only on a pass that reclaimed NOTHING and ran to the end of its candidates. Partial
-    // progress means the population was non-empty, so the next cycle has real work to do; a pass
-    // the deadline stopped has not looked at every candidate. See `found_nothing`.
-    if ranges_reclaimed == 0 && !stopped_by_deadline {
+    // progress means the population was non-empty, so the next cycle has real work to do; a
+    // partial pass has not looked at every candidate. See `found_nothing`.
+    if ranges_reclaimed == 0 && !partial {
         state.found_nothing = true;
     }
     state.passes_total = state.passes_total.saturating_add(1);
@@ -6850,6 +7036,49 @@ pub(crate) fn authority_memo_or_last_complete(cache_dir: &Path) -> Option<Staged
         .figure
         .or_else(|| snapshot.last_complete.map(|(_, figure)| figure))
 }
+/// The staged figure the write-through admission cap reads (`CacheManager::staging_bound_admission`),
+/// with the age in seconds of its inputs, and never a wait: the memo's figure of any age, else
+/// this process's last complete figure. `None` when this process holds neither.
+///
+/// When a deciding reader would not accept the memo (older than [`AUTHORITY_SNAPSHOT_TTL_SECS`]
+/// plus its read, expired by a fold install, or absent) and no derivation is in flight, this
+/// starts one deciding derivation on its own task. The admission that starts it reads the older
+/// figure and the admissions after the install read the new one, so an admission's figure has
+/// inputs at most one TTL plus one derivation old. A derivation that finds the figure unreadable
+/// is memoised for the TTL too, so this starts at most one derivation per TTL whatever the
+/// outcome.
+pub(crate) fn admission_figure_without_waiting(
+    cache_dir: &Path,
+) -> Option<(StagedAuthorityFigure, u64)> {
+    let now_secs = unix_secs();
+    let tag = dir_tag(cache_dir);
+    let (found, stale) = {
+        let map = AUTHORITY_SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(&tag) {
+            Some(snapshot) => (
+                snapshot
+                    .figure
+                    .map(|figure| (figure, snapshot.taken_at_secs))
+                    .or_else(|| {
+                        snapshot
+                            .last_complete
+                            .map(|(taken, figure)| (figure, taken))
+                    }),
+                !snapshot.fresh_for_decider(now_secs),
+            ),
+            None => (None, true),
+        }
+    };
+    if stale && !derivation_in_flight(tag) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let dir = cache_dir.to_path_buf();
+            handle.spawn(async move {
+                let _ = staged_authority_figure(&dir).await;
+            });
+        }
+    }
+    found.map(|(figure, taken_at)| (figure, now_secs.saturating_sub(taken_at)))
+}
 
 /// [`staged_authority_figure`] derived now: never served from the memo, and never the last
 /// complete figure. The result is installed in the memo as any deciding derivation's is.
@@ -6862,12 +7091,32 @@ pub(crate) fn authority_memo_or_last_complete(cache_dir: &Path) -> Option<Staged
 ///
 /// It may wait only for a derivation begun after this call, and none can be in flight when it
 /// checks, so it always starts its own; readers arriving after it join that one.
-pub(crate) async fn staged_authority_figure_fresh(
+///
+/// Returns the per-shard weights the same derivation read ([`PendingReadOutcome::shard_weights`])
+/// beside it, `None` when the checkpoint read was incomplete: the staging pass sizes from the
+/// figure and shares the shortfall by the weights, so both come from one read.
+pub(crate) async fn staged_authority_figure_fresh_with_weights(
     cache_dir: &Path,
-) -> Option<StagedAuthorityFigure> {
-    joined_derivation(cache_dir, Join::StartedAfter(std::time::Instant::now()))
-        .await
-        .figure
+) -> (
+    Option<StagedAuthorityFigure>,
+    Option<std::sync::Arc<ShardWeights>>,
+) {
+    let derived = joined_derivation(cache_dir, Join::StartedAfter(std::time::Instant::now())).await;
+    (derived.figure, derived.weights)
+}
+
+/// The age in seconds of the figure the authority memo holds for `cache_dir`, or of this
+/// process's last complete figure when the memo holds none. For the staging pass's pre-lock log
+/// line. `None` when this process holds neither.
+pub(crate) fn authority_memo_age_secs(cache_dir: &Path) -> Option<u64> {
+    let map = AUTHORITY_SNAPSHOT.lock().ok()?;
+    let snapshot = map.get(&dir_tag(cache_dir))?;
+    let taken_at = if snapshot.figure.is_some() {
+        snapshot.taken_at_secs
+    } else {
+        snapshot.last_complete?.0
+    };
+    Some(unix_secs().saturating_sub(taken_at))
 }
 
 /// The staged figure the trigger and the published composites read, or `None` when it is
@@ -6954,12 +7203,17 @@ pub(crate) async fn staged_authority_figure(cache_dir: &Path) -> Option<StagedAu
 /// checkpoints) and differ only in which per-shard field and which pending term they sum. Two
 /// reads a moment apart could straddle an install, so admission and the staging trigger could
 /// see two different volumes; one read cannot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DerivedFigures {
     figure: Option<StagedAuthorityFigure>,
     count: Option<u64>,
     /// The removal debits' range half, which the count verdict subtracts and admission does not.
     count_debit: u64,
+    /// [`awaiting_first_fold`] of the inputs read.
+    awaiting_first_fold: bool,
+    /// [`PendingReadOutcome::shard_weights`] of the inputs read, for the staging pass's quotas.
+    /// `None` when the checkpoint read was incomplete, and from the collector's derivation.
+    weights: Option<std::sync::Arc<ShardWeights>>,
 }
 
 /// Which derivation in flight a reader may wait for instead of starting its own.
@@ -7150,7 +7404,7 @@ async fn joined_derivation(cache_dir: &Path, join: Join) -> DerivedFigures {
     rx.wait_for(|v| v.is_some())
         .await
         .ok()
-        .and_then(|v| *v)
+        .and_then(|v| v.clone())
         .unwrap_or_default()
 }
 
@@ -7259,9 +7513,11 @@ async fn run_derivation(
                 figure: figure_of(&pending, &checkpoints, nothing_staged, p),
                 count: staged_range_count_of(&pending, &checkpoints),
                 count_debit: pending.applied_debit(&checkpoints).ranges,
+                awaiting_first_fold: awaiting_first_fold(&pending, &checkpoints, nothing_staged),
+                weights: None,
             };
             (
-                figures,
+                figures.clone(),
                 Some(CollectorInputs {
                     pending,
                     checkpoints,
@@ -7271,8 +7527,14 @@ async fn run_derivation(
             )
         }
     };
-    install_derived(tag, generation, now_secs, read_secs, figures);
-    let due = finish_authority_attempt(tag, unix_secs(), now_secs, figures.figure.is_some());
+    install_derived(tag, generation, now_secs, read_secs, figures.clone());
+    let due = finish_authority_attempt(
+        tag,
+        unix_secs(),
+        now_secs,
+        figures.figure.is_some(),
+        figures.awaiting_first_fold,
+    );
     drop(attempt);
     // Out of the slot before the figures go out, so a reader that arrives after them finds the
     // memo rather than a finished derivation.
@@ -7389,7 +7651,8 @@ async fn rederive_authority_snapshot_from_kept_walk(
     let generation = authority_generation(tag);
     AUTHORITY_SNAPSHOT_RECOMPUTES.fetch_add(1, Ordering::Relaxed);
     let attempt = begin_authority_attempt(tag, unix_secs());
-    let fresh = derive_figures(cache_dir, Some(kept.walk)).await.figure;
+    let derived = derive_figures(cache_dir, Some(kept.walk)).await;
+    let fresh = derived.figure;
     let installed_at_secs = if authority_generation(tag) == generation {
         unix_secs()
     } else {
@@ -7422,7 +7685,13 @@ async fn rederive_authority_snapshot_from_kept_walk(
         }
     }
     // An attempt either way, installed or not: the derivation ran and found what it found.
-    let due = finish_authority_attempt(tag, unix_secs(), taken_at_secs, fresh.is_some());
+    let due = finish_authority_attempt(
+        tag,
+        unix_secs(),
+        taken_at_secs,
+        fresh.is_some(),
+        derived.awaiting_first_fold,
+    );
     drop(attempt);
     if let Some(unknown_for) = due {
         log_staging_figure_unknown(unknown_for);
@@ -7509,6 +7778,20 @@ fn figure_inputs_complete(
         && (!checkpoints.shards().is_empty() || nothing_staged)
 }
 
+/// Whether the figure is unknown only because no fold has installed a shard checkpoint yet:
+/// pending and checkpoints read completely, the set is empty, and the write ledger has an entry
+/// (`nothing_staged` false). The window between a volume's first upload and its first fold
+/// install, which is no fault.
+fn awaiting_first_fold(
+    pending: &PendingReadOutcome,
+    checkpoints: &ShardCheckpointSet,
+    nothing_staged: bool,
+) -> bool {
+    pending.is_complete()
+        && checkpoints.is_complete()
+        && checkpoints.shards().is_empty()
+        && !nothing_staged
+}
 /// Whether an empty, complete checkpoint set means nothing is staged on this volume: the write
 /// ledger has no shard directory and no legacy flat file. A credited staged range always has its
 /// ledger entry first, so with no ledger there is no credited range, and the figure is `0` plus
@@ -7576,12 +7859,17 @@ async fn derive_figures(
     let checkpoints = read_shard_checkpoints_bounded(cache_dir).await;
     let count = staged_range_count_of(&pending, &checkpoints);
     let count_debit = pending.applied_debit(&checkpoints).ranges;
+    let weights = checkpoints
+        .is_complete()
+        .then(|| std::sync::Arc::new(pending.shard_weights(&checkpoints)));
     let nothing_staged = nothing_staged_on(cache_dir, &checkpoints).await;
     if !figure_inputs_complete(&pending, &checkpoints, nothing_staged) {
         return DerivedFigures {
             figure: None,
             count,
             count_debit,
+            awaiting_first_fold: awaiting_first_fold(&pending, &checkpoints, nothing_staged),
+            weights,
         };
     }
     // `P`: a full walk no older than `PUBLISHED_WALK_BASE_MAX_AGE` plus every instance's
@@ -7616,6 +7904,8 @@ async fn derive_figures(
         figure: figure_of(&pending, &checkpoints, nothing_staged, p),
         count,
         count_debit,
+        awaiting_first_fold: false,
+        weights,
     }
 }
 
@@ -8037,7 +8327,7 @@ mod tests {
             .unwrap();
         // The seq the credit actually carries, read back from the ledger rather than
         // recomputed, so the fixture cannot disagree with the code.
-        let read = ledger.read_for_authority(0).await.unwrap();
+        let read = ledger.read_for_authority_for_tests(0).await.unwrap();
         read.entries
             .iter()
             .filter(|e: &&WriteLedgerEntry| e.cache_key == cache_key)
@@ -8407,7 +8697,7 @@ mod tests {
             "A's record was GC'd when its cut passed, so the unfiltered sum is exactly B"
         );
         let meta_side = {
-            let read = ledger.read_for_authority(0).await.unwrap();
+            let read = ledger.read_for_authority_for_tests(0).await.unwrap();
             let mut sum = 0u64;
             for c in WriteLedger::group_by_key(read.entries) {
                 sum += crate::write_ledger::fold_staged_candidate(dir, &c)
@@ -8605,7 +8895,11 @@ mod tests {
 
         // The fixture really did move the clock backwards, read off the ledger rather than
         // assumed. Without this the test could pass on a fixture that quietly went forwards.
-        let entries = ledger.read_for_authority(0).await.unwrap().entries;
+        let entries = ledger
+            .read_for_authority_for_tests(0)
+            .await
+            .unwrap()
+            .entries;
         let ts = |key: &str| {
             entries
                 .iter()
@@ -8689,7 +8983,7 @@ mod tests {
     /// from, and asserts the file no longer contains the entry that produced it — so the mark
     /// can only be coming from the header.
     ///
-    /// A failure implicates the header write in `WriteLedger::retire_identities` and
+    /// A failure implicates the header write in `WriteLedger::retire_in_files` and
     /// `ParsedLedgerFile::max_seq_ever`.
     #[tokio::test]
     async fn compaction_cannot_lower_the_observed_high_water_mark() {
@@ -8699,7 +8993,7 @@ mod tests {
 
         publish_staged_range(dir, &ledger, "bucket/keep.bin", 4096).await;
         let top = publish_staged_range(dir, &ledger, "bucket/top.bin", 8192).await;
-        let before = ledger.read_for_authority(0).await.unwrap();
+        let before = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert_eq!(before.max_seq_per_instance.get("host:1"), Some(&top));
 
         // Retire the highest-seq entry.
@@ -8710,9 +9004,9 @@ mod tests {
             .map(|e| e.identity())
             .collect();
         assert_eq!(retire.len(), 1);
-        ledger.retire_identities(&retire).await.unwrap();
+        ledger.retire_identities_for_tests(&retire).await.unwrap();
 
-        let after = ledger.read_for_authority(0).await.unwrap();
+        let after = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert!(
             !after
                 .entries
@@ -9391,7 +9685,7 @@ mod tests {
             "fixture precondition: two distinct shards"
         );
 
-        let before = ledger.read_for_authority(0).await.unwrap();
+        let before = ledger.read_for_authority_for_tests(0).await.unwrap();
         assert_eq!(
             before.max_seq_per_instance.get("host:1"),
             Some(&drained_seq),
@@ -9403,7 +9697,7 @@ mod tests {
             .filter(|e| e.cache_key == "bucket/drain-me.bin")
             .map(|e| e.identity())
             .collect();
-        ledger.retire_identities(&retire).await.unwrap();
+        ledger.retire_identities_for_tests(&retire).await.unwrap();
         let drained_path = ledger.shard_path_for_key("bucket/drain-me.bin").unwrap();
         assert!(
             drained_path.is_file(),
@@ -9477,7 +9771,7 @@ mod tests {
         }
 
         // What a WHOLE-VOLUME read folds to, computed independently of the pass.
-        let whole = a.read_for_authority(0).await.unwrap();
+        let whole = a.read_for_authority_for_tests(0).await.unwrap();
         assert!(whole.is_complete(), "the fixture's ledger must be readable");
         let mut expected_bytes = 0u64;
         let mut expected_ranges = 0u64;
@@ -10053,7 +10347,7 @@ mod tests {
     async fn a_volume_that_has_taken_no_upload_derives_a_zero_figure() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
-        let figure = staged_authority_figure_fresh(dir).await;
+        let figure = staged_authority_figure_fresh_with_weights(dir).await.0;
         let now = unix_secs();
         let unknown = authority_unknown_seconds(dir, now + 61);
         println!("no-upload volume: figure={figure:?} unknown_seconds_after_61s={unknown}");
@@ -10085,7 +10379,7 @@ mod tests {
             "fixture precondition: no checkpoint"
         );
         assert_eq!(
-            staged_authority_figure_fresh(dir).await,
+            staged_authority_figure_fresh_with_weights(dir).await.0,
             None,
             "A STAGED UPLOAD THE FOLD HAS NOT VISITED WAS READ AS NOTHING STAGED"
         );
@@ -10200,7 +10494,7 @@ mod tests {
         )
         .unwrap();
         let retire: std::collections::HashSet<_> = x
-            .read_for_authority(0)
+            .read_for_authority_for_tests(0)
             .await
             .unwrap()
             .entries
@@ -10213,7 +10507,7 @@ mod tests {
             1,
             "fixture precondition: host:2 had one entry"
         );
-        x.retire_identities(&retire).await.unwrap();
+        x.retire_identities_for_tests(&retire).await.unwrap();
         let x_file = WriteLedger::shard_ledger_path(dir, &shard.bucket, &shard.l1, "host:2");
         assert!(
             x_file.is_file(),
@@ -11686,7 +11980,8 @@ mod tests {
                     let _ = prop57_bounded(
                         60,
                         "a compaction pass",
-                        ledgers[inst].retire_identities(&std::collections::HashSet::new()),
+                        ledgers[inst]
+                            .retire_identities_for_tests(&std::collections::HashSet::new()),
                     )
                     .await;
                 }
@@ -11732,7 +12027,7 @@ mod tests {
             let _ = prop57_bounded(
                 90,
                 "the quiesce compaction",
-                ledgers[i].retire_identities(&std::collections::HashSet::new()),
+                ledgers[i].retire_identities_for_tests(&std::collections::HashSet::new()),
             )
             .await;
             // A rotation, not a pass: the per-pass shard budget on a four-shard population is
@@ -11882,7 +12177,7 @@ mod tests {
     /// never appends, folds or GCs again, so every mechanism that could clear the credit by
     /// accident is gone. Its `staged_fold_cut` in that shard cannot move (nothing writes under
     /// it), `PendingStore::gc` only ever runs under the owning identity, and
-    /// `WriteLedger::retire_identities` rewrites ledger files and never touches a `.pending`.
+    /// `WriteLedger::retire_identities_in` rewrites ledger files and never touches a `.pending`.
     /// The over-count was therefore permanent for the life of the volume and accumulated one
     /// credit per crash-torn line per shard — which is the severity the review re-derived
     /// and this case is the regression for.
@@ -12203,7 +12498,7 @@ mod tests {
             let _ = prop57_bounded(
                 90,
                 "the quiesce compaction",
-                ledgers[i].retire_identities(&std::collections::HashSet::new()),
+                ledgers[i].retire_identities_for_tests(&std::collections::HashSet::new()),
             )
             .await;
             for _ in 0..all.len() * 2 {
@@ -16530,6 +16825,28 @@ mod authority_unknown_tests {
         }
     }
 
+    /// `awaiting_first_fold` from a real derivation, not passed in: a volume whose write ledger
+    /// has a shard and which has no shard checkpoint is waiting for its first fold install; an
+    /// empty volume is not (nothing is staged there, so its figure is not unknown for that).
+    #[tokio::test]
+    async fn derive_figures_reads_a_ledger_without_a_checkpoint_as_awaiting_the_first_fold() {
+        let staged = tempfile::TempDir::new().unwrap();
+        let ledger = WriteLedger::new(staged.path().to_path_buf(), String::new()).ledger_dir();
+        std::fs::create_dir_all(ledger.join("bucket").join("ab")).unwrap();
+        let empty = tempfile::TempDir::new().unwrap();
+        let a = derive_figures(staged.path(), None).await;
+        let b = derive_figures(empty.path(), None).await;
+        assert_eq!(
+            (
+                (a.figure.is_some(), a.awaiting_first_fold),
+                b.awaiting_first_fold
+            ),
+            ((false, true), false),
+            "(the ledger-without-checkpoint volume's (figure known, awaiting its first fold), \
+             the empty volume's awaiting its first fold)"
+        );
+    }
+
     /// T1a: the gauge over constructed records.
     #[test]
     fn authority_unknown_seconds_is_a_function_of_the_memo() {
@@ -16565,19 +16882,73 @@ mod authority_unknown_tests {
             .lock()
             .unwrap()
             .insert(tag, record(1_000, 1_000, 1_000, true));
-        let due = |now: u64| finish_authority_attempt(tag, now, now, false);
+        let due = |now: u64| finish_authority_attempt(tag, now, now, false, false);
         assert_eq!(due(1_059), None, "not due at 59 s");
         assert_eq!(due(1_060), Some(60), "due at 60 s");
         assert_eq!(due(1_065), None, "not again inside 600 s");
         assert_eq!(due(1_660), Some(660), "due again 600 s after the last");
         assert_eq!(
-            finish_authority_attempt(tag, 1_661, 1_661, true),
+            finish_authority_attempt(tag, 1_661, 1_661, true, false),
             None,
             "a complete derivation logs nothing"
         );
         assert_eq!(due(1_720), None, "a new run is not due at 59 s");
         assert_eq!(due(1_721), Some(60), "a new run is due at 60 s again");
         AUTHORITY_ATTEMPTS.lock().unwrap().remove(&tag);
+    }
+    /// The idle cadence: the collector derives once a minute and the figure is dated by the
+    /// previous derivation, so one failure alone reads as more than 60 s unknown. It logs
+    /// nothing; the next failure in a row does.
+    #[test]
+    fn one_failed_derivation_after_an_idle_minute_logs_nothing() {
+        let tag = u64::MAX - 0x7732;
+        AUTHORITY_ATTEMPTS
+            .lock()
+            .unwrap()
+            .insert(tag, record(1_000, 1_000, 1_000, true));
+        let due = |now: u64| finish_authority_attempt(tag, now, now, false, false);
+        let first = due(1_062);
+        let second = due(1_122);
+        AUTHORITY_ATTEMPTS.lock().unwrap().remove(&tag);
+        assert_eq!(
+            (first, second),
+            (None, Some(122)),
+            "(one failure 62 s after the last figure, the next failure a minute later)"
+        );
+    }
+    /// The first-fold window: every input reads and no fold has installed a shard checkpoint
+    /// yet. No error for three fold intervals; a figure that stays underivable past them is
+    /// still an error, and an unreadable input at the same times is one at 60 s.
+    #[test]
+    fn the_first_fold_window_logs_nothing_until_it_outlasts_three_fold_intervals() {
+        let window = u64::MAX - 0x7733;
+        let fault = u64::MAX - 0x7734;
+        let mut seen = Vec::new();
+        for (tag, awaiting) in [(window, true), (fault, false)] {
+            AUTHORITY_ATTEMPTS
+                .lock()
+                .unwrap()
+                .insert(tag, record(1_000, 0, 0, false));
+            let due = |now: u64| finish_authority_attempt(tag, now, now, false, awaiting);
+            seen.push((
+                awaiting,
+                [
+                    due(1_005),
+                    due(1_100),
+                    due(1_000 + STAGING_FIGURE_FIRST_FOLD_ERROR_AFTER_SECS - 1),
+                    due(1_000 + STAGING_FIGURE_FIRST_FOLD_ERROR_AFTER_SECS),
+                ],
+            ));
+            AUTHORITY_ATTEMPTS.lock().unwrap().remove(&tag);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (true, [None, None, None, Some(STAGING_FIGURE_FIRST_FOLD_ERROR_AFTER_SECS)]),
+                (false, [None, Some(100), Some(STAGING_FIGURE_FIRST_FOLD_ERROR_AFTER_SECS - 1), None]),
+            ],
+            "(awaiting the first fold, [due at 5 s, 100 s, just under and at three fold intervals])"
+        );
     }
 
     /// T1e: a derivation that never returns installs nothing, and still
@@ -16601,7 +16972,7 @@ mod authority_unknown_tests {
         );
         let task = {
             let d = dir.clone();
-            tokio::spawn(async move { staged_authority_figure_fresh(&d).await })
+            tokio::spawn(async move { staged_authority_figure_fresh_with_weights(&d).await.0 })
         };
         // Waits on the hook, not on the record under test, so a missing in-flight record reads
         // as the assertion below failing rather than as a fixture failure.
@@ -16738,11 +17109,12 @@ mod one_derivation_tests {
         }
         let probe = register_checkpoint_load_probe_for_tests(&dir, Duration::from_millis(25));
         let caller = std::thread::current().id();
-        let figure =
-            tokio::time::timeout(Duration::from_secs(60), staged_authority_figure_fresh(&dir))
-                .await
-                .expect("the derivation did not finish within 60 s")
-                .expect("readable");
+        let figure = tokio::time::timeout(Duration::from_secs(60), async {
+            staged_authority_figure_fresh_with_weights(&dir).await.0
+        })
+        .await
+        .expect("the derivation did not finish within 60 s")
+        .expect("readable");
         let (peak, loads, on_caller) = (probe.peak(), probe.loads(), probe.ran_on(caller));
         println!(
             "ONE-DERIVATION parallel read: loads={loads} peak_in_flight={peak} \
@@ -16795,8 +17167,10 @@ mod one_derivation_tests {
             .expect("fixture: the earlier derivation never reached its hook")
             .unwrap();
         seed_shard_figure_for_tests(&dir, "bucket", "ab", 8192, 1);
-        let fresh =
-            tokio::time::timeout(Duration::from_secs(5), staged_authority_figure_fresh(&dir)).await;
+        let fresh = tokio::time::timeout(Duration::from_secs(5), async {
+            staged_authority_figure_fresh_with_weights(&dir).await.0
+        })
+        .await;
         let _ = release_tx.send(());
         let _ = tokio::time::timeout(Duration::from_secs(10), earlier).await;
         let fresh = fresh.expect(

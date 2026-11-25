@@ -183,8 +183,9 @@ async fn an_epoch_0_pass_does_not_size_in_progress_parts_as_staged_bytes() {
             dir,
             s3_proxy::signed_put_handler::PUBLISHED_WALK_BASE_MAX_AGE + Duration::from_secs(1),
         );
-        let fold = crate::staged_fold::staged_authority_figure_fresh(dir)
+        let fold = crate::staged_fold::staged_authority_figure_fresh_with_weights(dir)
             .await
+            .0
             .expect("fixture: the fold has a figure");
         assert_eq!(
             fold.in_progress_part_bytes, part_bytes,

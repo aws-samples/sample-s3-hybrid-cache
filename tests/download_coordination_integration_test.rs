@@ -445,7 +445,7 @@ async fn integration_coalesce_full_flow() {
     let cache_key = format!("{}/{}", TEST_BUCKET, TEST_OBJECT_KEY);
 
     // Ensure cache is clean for this object
-    let _ = cache_manager.invalidate_cache(&cache_key).await;
+    let _ = cache_manager.invalidate_cache_hierarchy(&cache_key).await;
 
     let wait_timeout = Duration::from_secs(config.cache.download_coordination.wait_timeout_secs);
     let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
@@ -601,7 +601,7 @@ async fn integration_coalesce_head_flow() {
     let cache_key = format!("{}/{}", TEST_BUCKET, TEST_OBJECT_KEY);
 
     // Ensure cache is clean for this object
-    let _ = cache_manager.invalidate_cache(&cache_key).await;
+    let _ = cache_manager.invalidate_cache_hierarchy(&cache_key).await;
 
     let wait_timeout = Duration::from_secs(config.cache.download_coordination.wait_timeout_secs);
     let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
@@ -735,7 +735,7 @@ async fn integration_coalesce_range_flow() {
     let cache_key = format!("{}/{}", TEST_BUCKET, TEST_OBJECT_KEY);
 
     // Ensure cache is clean for this object
-    let _ = cache_manager.invalidate_cache(&cache_key).await;
+    let _ = cache_manager.invalidate_cache_hierarchy(&cache_key).await;
 
     let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
     let uri_path = format!("/{}", TEST_OBJECT_KEY);
@@ -899,7 +899,7 @@ async fn integration_coalesce_expired_cache() {
     let cache_key = format!("{}/{}", TEST_BUCKET, TEST_OBJECT_KEY);
 
     // Ensure cache is clean for this object
-    let _ = cache_manager.invalidate_cache(&cache_key).await;
+    let _ = cache_manager.invalidate_cache_hierarchy(&cache_key).await;
 
     let wait_timeout = Duration::from_secs(config.cache.download_coordination.wait_timeout_secs);
     let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);

@@ -87,12 +87,14 @@ async fn test_range_consolidation_small_gaps() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store each cached range
@@ -256,12 +258,14 @@ async fn test_range_consolidation_large_gaps() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store each cached range
@@ -386,12 +390,14 @@ async fn test_range_consolidation_mixed_gaps() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store each cached range
@@ -504,12 +510,14 @@ async fn test_range_consolidation_with_fetch_and_merge() {
         parts_count: None,
         part_ranges: std::collections::HashMap::new(),
         part_layout_verified: false,
+        part_layout_marked: Default::default(),
         upload_id: None,
         is_write_cached: false,
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
         graduation_accounted: false,
+        checksums_object_scoped: false,
     };
 
     // Store each cached range
